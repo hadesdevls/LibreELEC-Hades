@@ -120,6 +120,12 @@ makeinstall_target() {
     cp ${PKG_DIR}/scripts/fs-resize ${INSTALL}/usr/lib/libreelec
     sed -e "s/@DISTRONAME@/${DISTRONAME}/g" \
         -i ${INSTALL}/usr/lib/libreelec/fs-resize
+    # Hades: the setting "show the internal disks", which is the default entry of the boot menus of a
+    # PC (syslinux.cfg, grub.cfg): see hades_bootmenu_default in scripts/init
+    if [ ${TARGET_ARCH} = x86_64 ]; then
+      cp ${PKG_DIR}/scripts/internal-disks ${INSTALL}/usr/lib/libreelec
+      chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-disks
+    fi
 
   mkdir -p ${INSTALL}/usr/lib/systemd/system-generators/
     cp ${PKG_DIR}/scripts/libreelec-target-generator ${INSTALL}/usr/lib/systemd/system-generators/

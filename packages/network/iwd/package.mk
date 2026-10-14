@@ -10,6 +10,9 @@ PKG_URL="https://www.kernel.org/pub/linux/network/wireless/iwd-${PKG_VERSION}.ta
 PKG_DEPENDS_TARGET="autotools:host gcc:host readline dbus"
 PKG_LONGDESC="Wireless daemon for Linux"
 PKG_TOOLCHAIN="autotools"
+# Hades: stack protector, FORTIFY and full RELRO for a daemon that parses untrusted network
+# or radio input
+PKG_BUILD_FLAGS="+hardening"
 
 PKG_CONFIGURE_OPTS_TARGET="--enable-client \
                            --enable-monitor \

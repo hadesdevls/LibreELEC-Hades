@@ -18,7 +18,7 @@ PKG_CONFIGURE_OPTS_TARGET="ac_cv_header_rpc_types_h=no \
                            --libexecdir=/usr/lib/openssh \
                            --disable-strip \
                            --disable-lastlog \
-                           --with-sandbox=no \
+                           --with-sandbox=seccomp_filter \
                            --disable-utmp \
                            --disable-utmpx \
                            --disable-wtmp \
@@ -50,6 +50,19 @@ post_makeinstall_target() {
   sed -e "s|^#PermitRootLogin.*|PermitRootLogin yes|g" \
       -e "s|^#StrictModes.*|StrictModes no|g" \
       -i ${INSTALL}/etc/ssh/sshd_config
+
+  # Hades: runtime settings, e.g. no password logins while root has the default password;
+  # the Include must come first, since the first value of each keyword wins
+  { echo "# Hades: runtime settings; keep first, the first value of each keyword wins"
+    echo "Include /run/libreelec/sshd_config.d/*.conf"
+    echo ""
+    cat ${INSTALL}/etc/ssh/sshd_config
+  } >${INSTALL}/etc/ssh/sshd_config.hades
+  mv ${INSTALL}/etc/ssh/sshd_config.hades ${INSTALL}/etc/ssh/sshd_config
+
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+    cp ${PKG_DIR}/scripts/sshd-default-password ${INSTALL}/usr/lib/libreelec
+    sed -e "s|@ROOT_PASSWORD@|${ROOT_PASSWORD}|g" -i ${INSTALL}/usr/lib/libreelec/sshd-default-password
 
   debug_strip ${INSTALL}/usr
 }

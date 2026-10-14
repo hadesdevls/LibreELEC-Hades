@@ -11,6 +11,9 @@ PKG_URL="https://git.kernel.org/pub/scm/network/connman/connman.git/snapshot/con
 PKG_DEPENDS_TARGET="autotools:host gcc:host dbus glib iptables iwd nftables readline"
 PKG_LONGDESC="A modular network connection manager."
 PKG_TOOLCHAIN="autotools"
+# Hades: stack protector, FORTIFY and full RELRO for a daemon that parses untrusted network
+# or radio input
+PKG_BUILD_FLAGS="+hardening"
 
 PKG_CONFIGURE_OPTS_TARGET="--srcdir=.. \
                            --disable-debug \

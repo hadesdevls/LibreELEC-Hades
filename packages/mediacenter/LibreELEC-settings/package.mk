@@ -30,6 +30,14 @@ post_makeinstall_target() {
       -i ${INSTALL}/usr/lib/libreelec/factory-reset
 
   ADDON_INSTALL_DIR=${INSTALL}/usr/share/kodi/addons/service.libreelec.settings
+
+  # Hades: the two pictures of the add-on that carry the logo of LibreELEC and its words "Just
+  # enough OS for KODI" are the build's own (packages/mediacenter/kodi/brand/README.md): this is not
+  # LibreELEC's build, and it does not show itself as Kodi.
+  for f in logo.png wizard.png; do
+    [ -f ${ADDON_INSTALL_DIR}/resources/skins/Default/media/${f} ] || die "LibreELEC-settings: its picture ${f} is not where it was"
+    cp ${PKG_DIR}/brand/${f} ${ADDON_INSTALL_DIR}/resources/skins/Default/media/${f}
+  done
   python_compile ${ADDON_INSTALL_DIR}/resources/lib/
 }
 

@@ -35,6 +35,10 @@ post_makeinstall_target() {
   mkdir -p ${INSTALL}/usr/lib/libreelec
     cp ${PKG_DIR}/scripts/iptables_helper ${INSTALL}/usr/lib/libreelec
 
+  # Hades: the firewall starts in home mode on a new installation
+  mkdir -p ${INSTALL}/usr/share/services
+    cp -P ${PKG_DIR}/default.d/*.conf ${INSTALL}/usr/share/services
+
   ln -sf xtables-nft-multi ${INSTALL}/usr/sbin/iptables
   ln -sf xtables-nft-multi ${INSTALL}/usr/sbin/iptables-restore
   ln -sf xtables-nft-multi ${INSTALL}/usr/sbin/iptables-save
@@ -44,5 +48,6 @@ post_makeinstall_target() {
 }
 
 post_install() {
+  enable_service iptables-defaults.service
   enable_service iptables.service
 }

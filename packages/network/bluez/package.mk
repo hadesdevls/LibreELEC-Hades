@@ -11,7 +11,9 @@ PKG_URL="https://www.kernel.org/pub/linux/bluetooth/${PKG_NAME}-${PKG_VERSION}.t
 PKG_DEPENDS_TARGET="toolchain dbus glib readline systemd"
 PKG_LONGDESC="Bluetooth Tools and System Daemons for Linux."
 PKG_TOOLCHAIN="autotools"
-PKG_BUILD_FLAGS="+lto"
+# Hades: stack protector, FORTIFY and full RELRO for a daemon that parses untrusted network
+# or radio input
+PKG_BUILD_FLAGS="+lto +hardening"
 
 if build_with_debug; then
   BLUEZ_CONFIG="--enable-debug"
@@ -56,14 +58,23 @@ post_makeinstall_target() {
   safe_remove ${INSTALL}/usr/bin/bluemoon
   safe_remove ${INSTALL}/usr/bin/ciptool
 
-  mkdir -p ${INSTALL}/etc/bluetooth
-    cp src/main.conf ${INSTALL}/etc/bluetooth
-    sed -i ${INSTALL}/etc/bluetooth/main.conf \
+  # Hades: main.conf and input.conf are generated before bluetoothd starts by bluez-config from these
+  # templates, with secure input defaults and an opt-in legacy mode
+  mkdir -p ${INSTALL}/usr/share/bluetooth
+    cp src/main.conf ${INSTALL}/usr/share/bluetooth
+    sed -i ${INSTALL}/usr/share/bluetooth/main.conf \
         -e "s|^#\[Policy\]|\[Policy\]|g" \
         -e "s|^#AutoEnable.*|AutoEnable=true|g" \
-        -e "s|^#JustWorksRepairing.*|JustWorksRepairing=always|g"
-    echo "[General]" >${INSTALL}/etc/bluetooth/input.conf
-    echo "ClassicBondedOnly=false" >>${INSTALL}/etc/bluetooth/input.conf
+        -e "s|^#JustWorksRepairing.*|JustWorksRepairing=confirm|g"
+    echo "[General]" >${INSTALL}/usr/share/bluetooth/input.conf
+    echo "ClassicBondedOnly=true" >>${INSTALL}/usr/share/bluetooth/input.conf
+
+  mkdir -p ${INSTALL}/etc/bluetooth
+    ln -sf /run/libreelec/bluetooth/main.conf ${INSTALL}/etc/bluetooth/main.conf
+    ln -sf /run/libreelec/bluetooth/input.conf ${INSTALL}/etc/bluetooth/input.conf
+
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+    cp ${PKG_DIR}/scripts/bluez-config ${INSTALL}/usr/lib/libreelec
 
   mkdir -p ${INSTALL}/usr/bin
     cp ${PKG_BUILD}/tools/btmgmt ${INSTALL}/usr/bin

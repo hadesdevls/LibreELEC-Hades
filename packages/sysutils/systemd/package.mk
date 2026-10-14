@@ -202,6 +202,15 @@ post_makeinstall_target() {
   # remove the userdbctl load-credentials script - no service (addon) require the creation of static users
   safe_remove ${INSTALL}/usr/lib/systemd/system/systemd-userdb-load-credentials.service
 
+  # Hades: do not listen on the Varlink system installer by default (new in systemd 262): it lists
+  # disks and writes images to them, and nothing in LibreELEC uses it. The unit stays installed.
+  # If a later systemd enables it in another way, stop the build rather
+  # than ship it enabled.
+  if [ ! -L ${INSTALL}/usr/lib/systemd/system/sockets.target.wants/systemd-sysinstall.socket ]; then
+    die "systemd-sysinstall.socket is no longer enabled through sockets.target.wants: review how this systemd enables it"
+  fi
+  rm ${INSTALL}/usr/lib/systemd/system/sockets.target.wants/systemd-sysinstall.socket
+
   # tune journald.conf
   sed -e "s,^.*Compress=.*$,Compress=no,g" -i ${INSTALL}/etc/systemd/journald.conf
   sed -e "s,^.*MaxFileSec=.*$,MaxFileSec=0,g" -i ${INSTALL}/etc/systemd/journald.conf

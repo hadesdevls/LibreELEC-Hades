@@ -24,7 +24,9 @@ post_makeinstall_target() {
 
   rm -rf ${INSTALL}/etc
   mkdir -p ${INSTALL}/etc
-    ln -sf /var/run/localtime ${INSTALL}/etc/localtime
+  # The link tz-data.service keeps in /storage: the zone is known when systemd starts, before
+  # /var exists, so the local-time RTC of a dual boot with Windows is read with the right offset.
+  ln -sf /storage/.cache/localtime ${INSTALL}/etc/localtime
 }
 
 post_install() {

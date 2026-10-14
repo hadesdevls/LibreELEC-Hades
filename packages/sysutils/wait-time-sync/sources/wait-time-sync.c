@@ -11,6 +11,23 @@
 
 #define POLL_FREQ 10
 
+/* Hades: flag files created by the NTP clients once they have synchronized the
+ * clock. When the RTC runs in local time (/etc/adjtime says LOCAL) they keep the
+ * kernel's STA_UNSYNC set, so that it never writes the RTC, and adjtimex() keeps
+ * returning TIME_ERROR. */
+static const char *const sync_flags[] = {
+  "/run/connman/ntp-synchronized",
+  "/run/systemd/timesync/synchronized",
+};
+
+static int sync_flag_present(void)
+{
+  for (size_t i = 0; i < sizeof(sync_flags) / sizeof(sync_flags[0]); i++)
+    if (access(sync_flags[i], F_OK) == 0)
+      return 1;
+  return 0;
+}
+
 void usage(char *name)
 {
   if (!name)
@@ -47,6 +64,11 @@ int main(int argc, char** argv)
     rc = adjtimex(&tx);
     if (rc != TIME_ERROR)
       break;
+    if (sync_flag_present())
+    {
+      rc = TIME_OK;
+      break;
+    }
     usleep(1000000U / POLL_FREQ);
   }
 

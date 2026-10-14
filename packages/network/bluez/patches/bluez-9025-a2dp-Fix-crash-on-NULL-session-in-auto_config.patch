@@ -1,0 +1,269 @@
+From 79aedd33f8faed29c9e53d6bd245f3c2a552d5d4 Mon Sep 17 00:00:00 2001
+From: Eduardo Alves <eduardoalves8006@gmail.com>
+Date: Thu, 1 Oct 2026 10:34:36 -0400
+Subject: [PATCH] a2dp: Fix crash on NULL session in auto_config
+
+If the AVDTP channel is disconnected while bluetoothd is still waiting
+for the MediaEndpoint1 to reply to SetConfiguration, channel_free()
+sets setup->session to NULL but the setup stays alive since the pending
+endpoint request holds a reference to it. Once the endpoint replies, or
+the call times out and the request is canceled, endpoint_setconf_cb()
+calls auto_config() which passes the NULL session to avdtp_get_device()
+and then dereferences the resulting NULL device:
+
+  bluetoothd[820]: profiles/audio/media.c:endpoint_reply() Endpoint
+    replied with an error: org.freedesktop.DBus.Error.NoReply
+  kernel: bluetoothd[820]: segfault at 1a0 ip 00005633dd741323
+    sp 00007ffe51923650 error 4 in bluetoothd
+
+  #0  auto_config (data=0x56340361a120) at profiles/audio/a2dp.c:723
+  #1  endpoint_setconf_cb (setup=...) at profiles/audio/a2dp.c:768
+  #2  media_endpoint_cancel (request=...) at profiles/audio/media.c:208
+  #3  media_endpoint_cancel_all () at profiles/audio/media.c:216
+  #4  clear_endpoint () at profiles/audio/media.c:379
+  #5  endpoint_reply (user_data=...) at profiles/audio/media.c:407
+
+  (gdb) p *setup
+  $1 = {chan = 0x0, session = 0x0, ...,
+        setconf_cb = 0x5633dd74c780 <setconf_cb>, ..., ref = 2}
+
+Commit 14750a2e48f4 ("audio/a2dp: Fix Access session device only when
+its valid") fixed the same crash, but commit 77932f2dac1a
+("profiles/audio: add nullity checks") moved avdtp_get_device() back
+ahead of the checks. Just reordering is not enough though: the
+a2dp_stream is still on sep->streams, so the aborted check passes and
+setconf_cb() would then be called with a NULL session as well.
+
+Fix it by making finalize_all() abort the pending Set Configuration
+while the session is still valid: clearing the endpoint configuration
+sends ClearConfiguration, removes the MediaTransport created for the
+request and cancels the request, so auto_config() rejects the
+configuration and frees the pending avdtp_stream and a2dp_stream, both
+previously leaked together with the session reference held by the
+latter. If no request is pending, the configuration is rejected
+directly. auto_config() bails out when setup->session is NULL, as it
+may still run from idle, and setconf_cb is cleared once called so it
+cannot be called twice.
+
+Removing a transport now cancels the endpoint requests pending for it,
+so a late reply is ignored instead of leaving the transport registered,
+which made the next connection fail with "Resource temporarily
+unavailable".
+
+Assisted-by: Claude:claude-opus-5-5
+---
+ profiles/audio/a2dp.c  | 132 +++++++++++++++++++++++++++--------------
+ profiles/audio/media.c |  20 ++++++-
+ 2 files changed, 106 insertions(+), 46 deletions(-)
+
+diff --git a/profiles/audio/a2dp.c b/profiles/audio/a2dp.c
+index 08a9e1c..37f6d4a 100644
+--- a/profiles/audio/a2dp.c
++++ b/profiles/audio/a2dp.c
+@@ -507,41 +507,6 @@ static void finalize_discover(struct a2dp_setup *s)
+ 	}
+ }
+ 
+-static gboolean finalize_all(gpointer data)
+-{
+-	struct a2dp_setup *s = data;
+-	struct avdtp_stream *stream = s->err ? NULL : s->stream;
+-	GSList *l;
+-
+-	for (l = s->cb; l != NULL; ) {
+-		struct a2dp_setup_cb *cb = l->data;
+-
+-		l = l->next;
+-
+-		if (cb->discover_cb) {
+-			cb->discover_cb(s->session, s->seps,
+-					error_to_errno(s->err), cb->user_data);
+-		} else if (cb->select_cb) {
+-			cb->select_cb(s->session, s->sep, s->caps,
+-					error_to_errno(s->err), cb->user_data);
+-		} else if (cb->suspend_cb) {
+-			cb->suspend_cb(s->session,
+-					error_to_errno(s->err), cb->user_data);
+-		} else if (cb->resume_cb) {
+-			cb->resume_cb(s->session,
+-					error_to_errno(s->err), cb->user_data);
+-		} else if (cb->config_cb) {
+-			cb->config_cb(s->session, s->sep, stream,
+-					error_to_errno(s->err), cb->user_data);
+-		} else
+-			warn("setup_cb doesn't have any callback function");
+-
+-		setup_cb_free(cb);
+-	}
+-
+-	return FALSE;
+-}
+-
+ static struct a2dp_setup *find_setup_by_session(struct avdtp *session)
+ {
+ 	GSList *l;
+@@ -711,6 +676,86 @@ static void stream_state_changed(struct avdtp_stream *stream,
+ 		sep->endpoint->clear_configuration(sep, dev, sep->user_data);
+ }
+ 
++static void setup_setconf_reply(struct a2dp_setup *setup,
++					struct avdtp_error *err)
++{
++	avdtp_set_configuration_cb cb = setup->setconf_cb;
++
++	if (!cb)
++		return;
++
++	setup->setconf_cb = NULL;
++
++	/* Rejecting the configuration frees the avdtp_stream */
++	if (err)
++		a2dp_stream_destroy(setup->sep, setup->stream);
++
++	cb(setup->session, setup->stream, err);
++
++	if (err)
++		setup->stream = NULL;
++}
++
++/* Reject a pending Set Configuration while setup->session is still valid */
++static void setup_abort_setconf(struct a2dp_setup *setup)
++{
++	struct a2dp_sep *sep = setup->sep;
++	struct avdtp_error err;
++
++	if (!setup->setconf_cb)
++		return;
++
++	/* Clearing the endpoint configuration cancels its pending request
++	 * which rejects the configuration via auto_config().
++	 */
++	if (sep->endpoint && sep->endpoint->clear_configuration)
++		sep->endpoint->clear_configuration(sep,
++					avdtp_get_device(setup->session),
++					sep->user_data);
++
++	/* Reject it if it was not pending on the endpoint */
++	avdtp_error_init(&err, AVDTP_MEDIA_CODEC,
++					AVDTP_UNSUPPORTED_CONFIGURATION);
++	setup_setconf_reply(setup, &err);
++}
++
++static gboolean finalize_all(gpointer data)
++{
++	struct a2dp_setup *s = data;
++	struct avdtp_stream *stream = s->err ? NULL : s->stream;
++	GSList *l;
++
++	for (l = s->cb; l != NULL; ) {
++		struct a2dp_setup_cb *cb = l->data;
++
++		l = l->next;
++
++		if (cb->discover_cb) {
++			cb->discover_cb(s->session, s->seps,
++					error_to_errno(s->err), cb->user_data);
++		} else if (cb->select_cb) {
++			cb->select_cb(s->session, s->sep, s->caps,
++					error_to_errno(s->err), cb->user_data);
++		} else if (cb->suspend_cb) {
++			cb->suspend_cb(s->session,
++					error_to_errno(s->err), cb->user_data);
++		} else if (cb->resume_cb) {
++			cb->resume_cb(s->session,
++					error_to_errno(s->err), cb->user_data);
++		} else if (cb->config_cb) {
++			cb->config_cb(s->session, s->sep, stream,
++					error_to_errno(s->err), cb->user_data);
++		} else
++			warn("setup_cb doesn't have any callback function");
++
++		setup_cb_free(cb);
++	}
++
++	setup_abort_setconf(s);
++
++	return FALSE;
++}
++
+ static gboolean auto_config(gpointer data)
+ {
+ 	struct a2dp_setup *setup = data;
+@@ -718,6 +763,12 @@ static gboolean auto_config(gpointer data)
+ 	struct btd_service *service;
+ 	struct a2dp_stream *stream;
+ 
++	/* Check if the channel has been disconnected, in which case
++	 * channel_free() has already rejected the configuration.
++	 */
++	if (!setup->session)
++		goto done;
++
+ 	dev = avdtp_get_device(setup->session);
+ 
+ 	if (setup->sep->type == AVDTP_SEP_TYPE_SOURCE)
+@@ -748,16 +799,7 @@ static gboolean auto_config(gpointer data)
+ 	}
+ 
+ done:
+-	if (setup->setconf_cb) {
+-		/* Rejecting the configuration frees the avdtp_stream */
+-		if (setup->err)
+-			a2dp_stream_destroy(setup->sep, setup->stream);
+-
+-		setup->setconf_cb(setup->session, setup->stream, setup->err);
+-
+-		if (setup->err)
+-			setup->stream = NULL;
+-	}
++	setup_setconf_reply(setup, setup->err);
+ 
+ 	finalize_config(setup);
+ 
+diff --git a/profiles/audio/media.c b/profiles/audio/media.c
+index e841828..34ff251 100644
+--- a/profiles/audio/media.c
++++ b/profiles/audio/media.c
+@@ -359,12 +359,26 @@ static struct media_adapter *find_adapter(struct btd_device *device)
+ 	return NULL;
+ }
+ 
++static int request_transport_cmp(gconstpointer data, gconstpointer user_data)
++{
++	const struct endpoint_request *request = data;
++
++	return request->transport == user_data ? 0 : -1;
++}
++
+ static void endpoint_remove_transport(struct media_endpoint *endpoint,
+ 					struct media_transport *transport)
+ {
++	GSList *l;
++
+ 	if (!endpoint || !transport)
+ 		return;
+ 
++	/* Cancel pending requests for the transport */
++	while ((l = g_slist_find_custom(endpoint->requests, transport,
++						request_transport_cmp)))
++		media_endpoint_cancel(l->data);
++
+ 	endpoint->transports = g_slist_remove(endpoint->transports, transport);
+ 	media_transport_destroy(transport);
+ }
+@@ -431,7 +445,11 @@ static void endpoint_reply(DBusPendingCall *call, void *user_data)
+ 		if (dbus_message_is_method_call(request->msg,
+ 					MEDIA_ENDPOINT_INTERFACE,
+ 					"SetConfiguration")) {
+-			endpoint_remove_transport(endpoint, request->transport);
++			struct media_transport *transport = request->transport;
++
++			/* Detach so the request is not canceled */
++			request->transport = NULL;
++			endpoint_remove_transport(endpoint, transport);
+ 			error_code = a2dp_parse_config_error(err.name);
+ 			ret = &error_code;
+ 			size = 1;
+-- 
+2.53.0
+

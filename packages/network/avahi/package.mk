@@ -11,6 +11,9 @@ PKG_URL="https://github.com/lathiat/avahi/archive/v${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="autotools:host gcc:host expat libdaemon dbus connman gettext"
 PKG_LONGDESC="Service Discovery for Linux using mDNS/DNS-SD, compatible with Bonjour."
 PKG_TOOLCHAIN="configure"
+# Hades: stack protector, FORTIFY and full RELRO for a daemon that parses untrusted network
+# or radio input
+PKG_BUILD_FLAGS="+hardening"
 
 PKG_CONFIGURE_OPTS_TARGET="py_cv_mod_gtk_=yes \
                            py_cv_mod_dbus_=yes \
@@ -80,6 +83,17 @@ post_makeinstall_target() {
     rm -rf ${INSTALL}/etc/avahi/services/ssh.service
     rm -rf ${INSTALL}/etc/avahi/services/sftp-ssh.service
   fi
+
+  # Hades: announce SSH and SFTP only while sshd runs; sshd.service.d/avahi-announce.conf copies them
+  # into the runtime directory behind /etc/avahi/services
+  mkdir -p ${INSTALL}/usr/share/avahi/sshd
+    for service in ssh.service sftp-ssh.service; do
+      if [ -f ${INSTALL}/etc/avahi/services/${service} ]; then
+        mv ${INSTALL}/etc/avahi/services/${service} ${INSTALL}/usr/share/avahi/sshd/
+      fi
+    done
+  rmdir ${INSTALL}/etc/avahi/services
+  ln -sf /run/libreelec/avahi-services ${INSTALL}/etc/avahi/services
   rm -rf ${INSTALL}/usr/lib/systemd
   rm -f ${INSTALL}/usr/share/dbus-1/system-services/org.freedesktop.Avahi.service
   rm -f ${INSTALL}/usr/sbin/avahi-dnsconfd
