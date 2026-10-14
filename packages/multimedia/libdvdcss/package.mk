@@ -3,8 +3,8 @@
 # Copyright (C) 2016-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="libdvdcss"
-PKG_VERSION="1.5.0"
-PKG_SHA256="529463e4d1befef82e5c6e470db7661a2db0343e092a2fb0d6c037cab8a5c399"
+PKG_VERSION="1.6.0"
+PKG_SHA256="7ea556c846b7bfc32d47b41cae56d1863a6b6d5f706bb162778d6f298490977c"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE="https://www.videolan.org/"
 PKG_URL="https://download.videolan.org/pub/videolan/${PKG_NAME}/${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.xz"

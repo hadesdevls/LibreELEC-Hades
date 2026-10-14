@@ -8,13 +8,20 @@ PKG_SHA256="c2215904f02b175596dc49351585104f4bc20341e1c47378b26a2c274360ce73"
 PKG_LICENSE="PSF-2.0"
 PKG_SITE="https://www.python.org/"
 PKG_URL="https://www.python.org/ftp/python/${PKG_VERSION}/${PKG_NAME::-1}-${PKG_VERSION}.tar.xz"
-PKG_DEPENDS_HOST="zlib:host bzip2:host libffi:host mpdecimal:host util-linux:host autoconf-archive:host openssl:host"
-PKG_DEPENDS_TARGET="autotools:host gcc:host Python3:host sqlite expat zlib bzip2 xz openssl libffi readline mpdecimal ncurses util-linux"
+PKG_DEPENDS_HOST="zlib:host bzip2:host libffi:host mpdecimal:host util-linux:host autoconf-archive:host openssl3:host"
+PKG_DEPENDS_TARGET="autotools:host gcc:host Python3:host sqlite expat zlib bzip2 xz zstd openssl3 libffi readline mpdecimal ncurses util-linux"
 PKG_LONGDESC="Python3 is an interpreted object-oriented programming language."
 PKG_BUILD_FLAGS="-cfg-libs -cfg-libs:host"
 PKG_TOOLCHAIN="autotools"
 
 PKG_PYTHON_VERSION="python3.14"
+
+# Hades: Python 3.14 does not build against OpenSSL 4 (it calls the fixed-version TLS methods that
+# OpenSSL 4.0 removed; its authors support OpenSSL 4 from Python 3.15 on, and Python 3.15 removes things
+# that add-ons of Kodi written for 3.14 still call). The OpenSSL of the image and of the toolchain is 4,
+# so the ssl and hashlib modules are built against the OpenSSL 3 of the openssl3 package (the 3.5
+# long-term series), whose libraries are beside those of OpenSSL 4: in the image, and in the toolchain
+# for the interpreter of the build host (Samba's build imports ssl).
 
 PKG_CONFIGURE_OPTS_HOST="ac_cv_prog_HAS_HG=/bin/false
                          ac_cv_prog_SVNVERSION=/bin/false
@@ -44,6 +51,7 @@ PKG_CONFIGURE_OPTS_HOST="ac_cv_prog_HAS_HG=/bin/false
                          --with-doc-strings
                          --without-pymalloc
                          --with-ensurepip=no
+                         --with-openssl=${TOOLCHAIN}/lib/openssl-3
                          --enable-shared
 "
 
@@ -85,6 +93,7 @@ PKG_CONFIGURE_OPTS_TARGET="ac_cv_prog_HAS_HG=/bin/false
                            --without-ensurepip
                            --enable-ipv6
                            --with-build-python=${TOOLCHAIN}/bin/python
+                           --with-openssl=${SYSROOT_PREFIX}/usr/lib/openssl-3
                            --enable-shared
 "
 
@@ -93,6 +102,10 @@ pre_configure_host() {
   # this needs to be set when building host based py file
   # do not set this for py compiles being done for target use
   export DONT_BUILD_LEGACY_PYC=1
+
+  # Hades: the host flags name the library folder of the toolchain first, and its libssl.so is the one of
+  # OpenSSL 4: the folder of OpenSSL 3 goes before it, or ssl is compiled for one and linked to the other
+  export LDFLAGS="-L${TOOLCHAIN}/lib/openssl-3/lib ${LDFLAGS}"
 }
 
 post_make_host() {
@@ -117,6 +130,11 @@ pre_configure_target() {
   export PYTHON_MODULES_INCLUDE="${TARGET_INCDIR}"
   export PYTHON_MODULES_LIB="${TARGET_LIBDIR}"
   export DISABLED_EXTENSIONS="${PKG_PY_DISABLED_MODULES}"
+
+  # Hades: ncurses is a static library here, and libreadline leaves the terminal functions it calls
+  # (tgetent, UP...) to whoever loads it. The programs that use readline link ncurses in; Python's
+  # readline module did not, and could not be imported ("undefined symbol: UP").
+  export LIBREADLINE_LIBS="-lreadline -lncursesw"
 }
 
 post_makeinstall_target() {
