@@ -1,0 +1,681 @@
+From ffbdddff99f748cf6c84fb07233d7287be4d26c0 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 21:52:29 +0000
+Subject: [PATCH] windowing/gbm: a 3D display is given the mode of the layout
+ that is drawn
+
+While Kodi draws the two eyes of a stereoscopic picture one above the
+other or side by side, a display that takes 3D over HDMI was given an
+ordinary 2D mode with the two halves in it, and had to be switched to
+3D by hand; frame packing, the layout that keeps every line of both
+eyes, could not be sent at all.
+
+The GBM window system now has a 3D output for a resolution
+(GetStereoOutputMode(), which CGraphicContext asks when it sets one in a
+split stereoscopic mode), chosen by STEREO::Choose() from the 3D modes
+that the driver lists for the display:
+
+- frame packing when the eyes are drawn one above the other: the 3D mode
+  of the timing that Kodi chose or, without a whitelist of modes, the
+  largest frame-packed mode of that refresh rate (a 2160p desktop takes
+  3D films at 1080p). Kodi draws into one frame of twice the lines and
+  the gap, 1920x2205 or 1280x1470;
+- else the mode of the half layout that is drawn, top-and-bottom or
+  side-by-side;
+- else nothing: the 2D mode, as before.
+
+The refresh rate is always the one of the mode that Kodi chose by its
+own rules: a film at 24.000 Hz on a display or driver that has frame
+packing at 23.976 Hz only gets no frame packing. A mode of another size
+is never one of fewer lines than a 3D film has, unless Kodi's own mode
+has fewer: the 720p that HDMI has for 50 and 60 Hz is not taken in place
+of a 1080p or 2160p mode (what the picture itself has is not known
+there).
+
+Asked for side by side, the eyes are to be drawn one above the other
+where that gives frame packing (GetStereoOutputArrangement(), for the
+commit that asks).
+
+Fail closed:
+- by the setting videoscreen.hades3doutput, without atomic modesetting,
+  and while native Dolby Vision output has the output, there is none;
+- after the commit of a 3D mode the mode that the output is in is read
+  back from the kernel. If it does not have the layout of that mode,
+  that kind of 3D output (frame packing, or the half modes) is not
+  chosen again while the eyes are drawn split, one line at info level
+  says so, and the resolution is set once more for the next choice;
+- a window for the frame of both eyes that cannot be made is replaced by
+  the window of the resolution, the same way, instead of the exception
+  that ends Kodi;
+- a 3D mode that is still there after a 2D mode was set is set again, up
+  to three times.
+The log says what the 3D output is whenever that changes ("3D output:").
+
+A mode with a 3D layout is no Dolby Vision transport mode.
+
+For a 2D mode that is set while the output is in no 3D mode and the eyes
+are not drawn split, CheckStereoOutput() returns after its first test,
+and SetFullScreen() of the OpenGL ES window system makes the window and
+sets the mode with the statements it had: the other branch is taken only
+when making the window failed and what was to be set has a 3D layout.
+
+DRMStereo.h also gets what nvidia-drm asks of the buffer of a
+frame-packed frame, for the commit that follows.
+
+Not covered: the picture is not known where the output is chosen, so a
+720p 3D video shown in a larger mode gets no frame packing; frame
+packing that the driver refuses after the eyes were turned from side by
+side to one above the other leaves them so, in top-and-bottom.
+
+Read and compiled (syntax check of DRMUtils.cpp, WinSystemGbm.cpp,
+WinSystemGbmGLESContext.cpp and WinSystemGbmEGLContext.cpp with the
+commands of the last build). The choice has its host test
+(drmstereo_test.cpp, 167 checks with the address and undefined behaviour
+sanitizers). Nothing of this has run on a GPU or been seen on a 3D
+display.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 277 +++++++++++++++++-
+ xbmc/windowing/gbm/WinSystemGbm.h             |  40 +++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  16 +-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   1 +
+ xbmc/windowing/gbm/drm/DRMStereo.h            |  65 +++-
+ xbmc/windowing/gbm/drm/DRMUtils.cpp           |  27 ++
+ xbmc/windowing/gbm/drm/DRMUtils.h             |   7 +
+ 7 files changed, 424 insertions(+), 9 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index d25860f..443e318 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -42,6 +42,7 @@
+ #include <algorithm>
+ #include <mutex>
+ #include <cmath>
++#include <cstdlib>
+ #include <string.h>
+ #include <tuple>
+ 
+@@ -387,6 +388,9 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+   if (result && std::dynamic_pointer_cast<CDRMAtomic>(m_DRM))
+     FlipPage(true, false, false);
+ 
++  // Hades: where a 3D mode was asked for, or the output was in one, what it is in now
++  CheckStereoOutput();
++
+   auto delay =
+       std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
+                                     "videoscreen.delayrefreshchange") *
+@@ -397,6 +401,275 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+   return result;
+ }
+ 
++// Hades: stereoscopic 3D over HDMI. While Kodi draws the two eyes of a picture one above the
++// other or side by side, the display is given the mode that tells it of that layout, and shows
++// 3D by itself. What is chosen, and the rules of it, are in drm/DRMStereo.h.
++namespace
++{
++bool IsSplitStereoMode(RenderStereoMode mode)
++{
++  return mode == RenderStereoMode::SPLIT_HORIZONTAL || mode == RenderStereoMode::SPLIT_VERTICAL;
++}
++
++STEREO::Arrangement ArrangementOf(RenderStereoMode mode)
++{
++  return mode == RenderStereoMode::SPLIT_HORIZONTAL ? STEREO::Arrangement::TOP_AND_BOTTOM
++                                                   : STEREO::Arrangement::SIDE_BY_SIDE;
++}
++} // namespace
++
++bool CWinSystemGbm::GetStereoOffers(std::vector<STEREO::Offer>& offers,
++                                    STEREO::Allowed& allowed,
++                                    const char*& reason,
++                                    bool drawing) const
++{
++  const auto component = CServiceBroker::GetSettingsComponent();
++  const auto settings = component ? component->GetSettings() : nullptr;
++  if (!settings || !settings->GetSetting(CSettings::SETTING_VIDEOSCREEN_HADES3DOUTPUT) ||
++      settings->GetInt(CSettings::SETTING_VIDEOSCREEN_HADES3DOUTPUT) == 0)
++  {
++    reason = "the setting for it is off";
++    return false;
++  }
++  if (!m_DRM || !std::dynamic_pointer_cast<CDRMAtomic>(m_DRM) || !m_DRM->GetConnector())
++  {
++    reason = "the output is not set by atomic modesetting";
++    return false;
++  }
++  // (the state of the thread that draws: asked of it only)
++  if (drawing && NativeDVOutputInUse())
++  {
++    reason = "native Dolby Vision output is in use";
++    return false;
++  }
++
++  offers = STEREO::Offers(m_DRM->GetStereoModes());
++  allowed.framePacking = !m_stereoRefusedFramePacking;
++  allowed.halfModes = !m_stereoRefusedHalfModes;
++  allowed.infoFrame = false;
++  allowed.otherSize = !CResolutionUtils::HasWhitelist();
++  return true;
++}
++
++bool CWinSystemGbm::GetStereoOutputMode(RESOLUTION res,
++                                        RenderStereoMode mode,
++                                        RESOLUTION_INFO& info)
++{
++  if (!IsSplitStereoMode(mode) || !m_DRM)
++    return false;
++
++  // The mode of the connector behind the resolution (CDRMUtils::GetModes() puts its index in
++  // strId). A resolution without one is no mode of this output.
++  const RESOLUTION_INFO entry = CDisplaySettings::GetInstance().GetResolutionInfo(res);
++  if (entry.strId.empty())
++    return false;
++  const int base = std::atoi(entry.strId.c_str());
++
++  std::vector<STEREO::Offer> offers;
++  STEREO::Allowed allowed;
++  const char* reason = "its modes cannot be read";
++  STEREO::Choice choice;
++  if (GetStereoOffers(offers, allowed, reason, true))
++  {
++    choice = STEREO::Choose(offers, base, ArrangementOf(mode), allowed);
++    if (choice.layout == STEREO::Layout::NONE)
++      reason = allowed.framePacking && allowed.halfModes
++                   ? "the display has no 3D mode for it at this refresh rate"
++                   : "the driver did not take the 3D modes that the display has for it";
++    else
++      reason = "its modes cannot be read";
++  }
++
++  // what Kodi is told of the mode to set, and of the 2D mode whose timing that one has
++  RESOLUTION_INFO chosen;
++  RESOLUTION_INFO timing;
++  if (choice.layout == STEREO::Layout::NONE || choice.infoFrame ||
++      !m_DRM->GetModeInfo(choice.mode, chosen) || !m_DRM->GetModeInfo(choice.base, timing))
++  {
++    TellStereoOutput(StringUtils::Format(
++        "none for {}: {}. The two halves go out as they are, and the display is switched to 3D "
++        "by hand",
++        entry.strMode, reason));
++    return false;
++  }
++
++  auto& gfx = GetGfxContext();
++  if (choice.layout == STEREO::Layout::FRAME_PACKING)
++  {
++    // The frame of both eyes: its lines are those of the first eye, of the gap and of the
++    // second eye (iHeight, with iBlanking for the gap), of which CGraphicContext makes an eye.
++    info = chosen;
++    // An eye is shown on as many lines as it is drawn on: what compares the lines of the
++    // display with those that are drawn (the view modes of the video) is told of the lines
++    // of the 2D timing.
++    info.iScreenWidth = timing.iScreenWidth;
++    info.iScreenHeight = timing.iScreenHeight;
++    info.strMode = timing.strMode + ", 3D frame packing";
++    info.strOutput = entry.strOutput;
++    gfx.ResetOverscan(info);
++    // Each eye is the picture of that 2D mode. Where it is the mode of the resolution, what
++    // was calibrated for the resolution holds for each eye.
++    if (choice.base == base && entry.iWidth == info.iWidth &&
++        entry.iHeight * 2 + info.iBlanking == info.iHeight)
++    {
++      info.Overscan.left = entry.Overscan.left;
++      info.Overscan.right = entry.Overscan.right;
++      info.Overscan.top = entry.Overscan.top * 2;
++      info.Overscan.bottom = entry.Overscan.bottom * 2 + info.iBlanking;
++      info.iSubtitles = entry.iSubtitles * 2 + info.iBlanking;
++      info.fPixelRatio = entry.fPixelRatio;
++      info.guiInsets = entry.guiInsets;
++    }
++  }
++  else if (choice.base == base)
++  {
++    // The frame of the resolution itself, sent in the mode that tells of its layout: drawn
++    // and calibrated as the resolution is.
++    info = entry;
++    info.strId = chosen.strId;
++  }
++  else
++  {
++    info = chosen;
++    info.strOutput = entry.strOutput;
++    gfx.ResetOverscan(info);
++  }
++  return true;
++}
++
++RenderStereoMode CWinSystemGbm::GetStereoOutputArrangement(RenderStereoMode wanted)
++{
++  if (wanted != RenderStereoMode::SPLIT_VERTICAL || !m_DRM)
++    return wanted;
++
++  const RESOLUTION_INFO entry =
++      CDisplaySettings::GetInstance().GetResolutionInfo(GetGfxContext().GetVideoResolution());
++  std::vector<STEREO::Offer> offers;
++  STEREO::Allowed allowed;
++  const char* reason = nullptr;
++  const bool packed =
++      !entry.strId.empty() && GetStereoOffers(offers, allowed, reason, false) &&
++      STEREO::PrefersTopAndBottom(offers, std::atoi(entry.strId.c_str()), allowed);
++  if (m_stereoArrangementTold.exchange(packed) != packed && packed)
++    CLog::Log(LOGINFO,
++              "3D output: the display takes frame packing for {}: the eyes are drawn one above "
++              "the other, not side by side",
++              entry.strMode);
++  return packed ? RenderStereoMode::SPLIT_HORIZONTAL : wanted;
++}
++
++void CWinSystemGbm::TellStereoOutput(const std::string& status)
++{
++  if (status == m_stereoStatus)
++    return;
++
++  m_stereoStatus = status;
++  CLog::Log(LOGINFO, "3D output: {}", status);
++}
++
++void CWinSystemGbm::RefuseStereoOutput(STEREO::Layout layout, const std::string& why)
++{
++  auto& refused = layout == STEREO::Layout::FRAME_PACKING ? m_stereoRefusedFramePacking
++                                                          : m_stereoRefusedHalfModes;
++  if (refused.exchange(true))
++    return;
++
++  CLog::Log(LOGINFO,
++            "3D output: {} is not used: {}. What comes next in the choice is taken; it is tried "
++            "again when the eyes are next drawn split",
++            STEREO::LayoutName(layout), why);
++  // The resolution is set once more, for what is chosen without it
++  CServiceBroker::GetAppMessenger()->PostMsg(
++      TMSG_SETVIDEORESOLUTION, static_cast<int>(GetGfxContext().GetVideoResolution()), 1);
++}
++
++bool CWinSystemGbm::StereoWindowFailed(const RESOLUTION_INFO& res,
++                                       const char* why,
++                                       RESOLUTION_INFO& plain)
++{
++  const STEREO::Layout layout = m_DRM ? m_DRM->GetModeLayout(res) : STEREO::Layout::NONE;
++  if (layout == STEREO::Layout::NONE)
++    return false;
++
++  RefuseStereoOutput(layout, why);
++  plain = CDisplaySettings::GetInstance().GetResolutionInfo(GetGfxContext().GetVideoResolution());
++  return true;
++}
++
++void CWinSystemGbm::CheckStereoOutput()
++{
++  const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
++  const STEREO::Layout asked = mode ? STEREO::LayoutOf(mode->flags) : STEREO::Layout::NONE;
++  const bool split = IsSplitStereoMode(GetGfxContext().GetStereoMode());
++
++  // Nothing here is for a 2D mode that is set while the output is in no 3D mode, the eyes are
++  // not drawn split and nothing was refused: every mode that is set without a 3D display.
++  if (asked == STEREO::Layout::NONE && m_stereoLayout == STEREO::Layout::NONE && !split &&
++      !m_stereoRefusedFramePacking && !m_stereoRefusedHalfModes)
++    return;
++
++  // The eyes are drawn another way: what was refused may be tried when they are next split
++  if (!split)
++  {
++    m_stereoRefusedFramePacking = false;
++    m_stereoRefusedHalfModes = false;
++  }
++
++  if (asked == STEREO::Layout::NONE && m_stereoLayout == STEREO::Layout::NONE)
++    return;
++
++  // What the output is in, whatever became of the commit: where the driver does not take a
++  // commit, CDRMAtomic commits what it committed last, and the mode stays the one before.
++  uint32_t flags = 0;
++  const STEREO::Layout shown =
++      m_DRM->GetOutputModeFlags(flags) ? STEREO::LayoutOf(flags) : STEREO::Layout::NONE;
++  m_stereoLayout = shown;
++
++  if (asked != STEREO::Layout::NONE && shown != asked)
++  {
++    RefuseStereoOutput(asked, "the driver did not take its mode (the kernel log may say why)");
++    return;
++  }
++
++  if (asked == STEREO::Layout::NONE && shown != STEREO::Layout::NONE)
++  {
++    // A 2D mode was set and the output stays in a 3D one: the display would show a 2D
++    // picture as two eyes. The mode is set again, a few times.
++    constexpr int TRIES = 3;
++    if (m_stereoLeaveTries < TRIES)
++    {
++      ++m_stereoLeaveTries;
++      CLog::Log(LOGWARNING,
++                "3D output: the output is still in a {} mode after a 2D mode was set (the "
++                "driver did not take the commit): the mode is set again ({} of {})",
++                STEREO::LayoutName(shown), m_stereoLeaveTries, TRIES);
++      m_DRM->AllowModeset();
++      CServiceBroker::GetAppMessenger()->PostMsg(
++          TMSG_SETVIDEORESOLUTION, static_cast<int>(GetGfxContext().GetVideoResolution()), 1);
++    }
++    return;
++  }
++  m_stereoLeaveTries = 0;
++
++  if (shown == STEREO::Layout::NONE)
++  {
++    TellStereoOutput("off: the display is in a 2D mode again");
++    return;
++  }
++
++  const bool interlaced = (mode->flags & DRM_MODE_FLAG_INTERLACE) != 0;
++  const double rate = mode->htotal && mode->vtotal
++                          ? mode->clock * 1000.0 / mode->htotal / mode->vtotal * (interlaced ? 2 : 1)
++                          : 0.0;
++  std::string status =
++      StringUtils::Format("{} with {}x{}{} @ {:.3f} Hz", STEREO::LayoutName(shown), mode->hdisplay,
++                          mode->vdisplay, interlaced ? "i" : "", rate);
++  if (shown == STEREO::Layout::FRAME_PACKING)
++    status += StringUtils::Format(" (a frame of {}x{}, {} lines between the eyes)", mode->hdisplay,
++                                  mode->vdisplay + mode->vtotal, mode->vtotal - mode->vdisplay);
++  TellStereoOutput(status);
++}
++
+ #ifdef HAVE_DVBRIDGE
+ namespace
+ {
+@@ -407,9 +680,11 @@ double ModeRate(const drmModeModeInfo& mode)
+ 
+ bool IsDVTransportMode(const drmModeModeInfo& mode)
+ {
++  // (nor a mode with a 3D layout: the display takes what it is given in one as two eyes)
+   return DVBRIDGE::IsTransportMode(
+       mode.hdisplay, mode.vdisplay, ModeRate(mode),
+-      (mode.flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN)) != 0);
++      (mode.flags &
++       (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN | DRM_MODE_FLAG_3D_MASK)) != 0);
+ }
+ 
+ // The refresh rate is not adjusted to the video: the output keeps the current one.
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index e535743..86e920c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -155,6 +155,10 @@ public:
+   std::vector<std::string> GetConnectedOutputs() override;
+   void MoveToScreen(unsigned int screenIdx) override;
+ 
++  // Hades: stereoscopic 3D over HDMI (see drm/DRMStereo.h)
++  bool GetStereoOutputMode(RESOLUTION res, RenderStereoMode mode, RESOLUTION_INFO& info) override;
++  RenderStereoMode GetStereoOutputArrangement(RenderStereoMode wanted) override;
++
+ protected:
+   void OnLostDevice();
+   void OnResetDisplay();
+@@ -165,6 +169,17 @@ protected:
+   //! being set: the outputs are not looked at for a while after it (CDRMDisplayWatch). From
+   //! the thread that draws.
+   void VideoSeen();
++  //! \brief Hades: native Dolby Vision output has the output. Its transport is no picture
++  //! that the display could take as two eyes: no 3D output is chosen meanwhile.
++  virtual bool NativeDVOutputInUse() const { return false; }
++  //! \brief Hades: the window of what was to be set could not be made
++  //! \param res what was to be set
++  //! \param why for the log
++  //! \param[out] plain the resolution in use as the list has it, without a 3D output
++  //! \return whether res was a 3D output. That kind is then not chosen again while the eyes
++  //!         are drawn split, and the resolution is set once more; the window to make in its
++  //!         place is the one of plain.
++  bool StereoWindowFailed(const RESOLUTION_INFO& res, const char* why, RESOLUTION_INFO& plain);
+ 
+   std::unique_ptr<CVideoSync> GetVideoSync(CVideoReferenceClock* clock) override;
+ 
+@@ -219,6 +234,31 @@ protected:
+   std::unique_ptr<CDRMDisplayWatch> m_displayWatch;
+ 
+ private:
++  //! Hades, 3D over HDMI: what the display offers for each of its 2D modes, and what of it
++  //! may be used now
++  //! \param[out] reason why there is no 3D output at all, when there is none
++  //! \param drawing asked by the thread that draws, for a mode that is being set; not: by
++  //!        another thread, for the way to draw (GetStereoOutputArrangement())
++  bool GetStereoOffers(std::vector<STEREO::Offer>& offers,
++                       STEREO::Allowed& allowed,
++                       const char*& reason,
++                       bool drawing) const;
++  //! After the commit of a mode: whether the output is in the 3D mode that was asked for, or
++  //! has left the one it was in
++  void CheckStereoOutput();
++  //! A kind of 3D output cannot be used: it is not chosen again while the eyes are drawn
++  //! split. The first time, it is told and the resolution is set once more.
++  void RefuseStereoOutput(STEREO::Layout layout, const std::string& why);
++  //! Tells the log what the 3D output is, when that is something else than it was told last
++  void TellStereoOutput(const std::string& status);
++  //! (read by other threads: GetStereoOutputArrangement())
++  std::atomic<bool> m_stereoRefusedFramePacking{false};
++  std::atomic<bool> m_stereoRefusedHalfModes{false};
++  STEREO::Layout m_stereoLayout{STEREO::Layout::NONE}; //!< of the mode the output was last seen in
++  int m_stereoLeaveTries{0}; //!< times in a row that a 3D mode stayed when a 2D one was set
++  std::string m_stereoStatus; //!< see TellStereoOutput()
++  std::atomic<bool> m_stereoArrangementTold{false};
++
+   CDRMPropertyBlob m_hdrBlob;
+   //! The values queued last for the Colorspace and HDR_OUTPUT_METADATA of the connector, if any
+   std::optional<uint64_t> m_queuedColorspace;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index e64aa62..caf7f4d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -198,11 +198,21 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+   m_dvBridge.reset();
+   EndDVConversion();
+ #endif
++  // Hades: what is set is res. Only when res is a 3D output whose window cannot be made (the
++  // frame of both eyes, in a buffer that the driver takes for it) is it the resolution without
++  // that output, until the resolution is set once more (StereoWindowFailed()).
++  RESOLUTION_INFO plain;
++  RESOLUTION_INFO* output = &res;
+   if (res.iWidth != m_nWidth || res.iHeight != m_nHeight)
+   {
+     CLog::Log(LOGDEBUG, "CWinSystemGbmGLESContext::{} - resolution changed, creating a new window",
+               __FUNCTION__);
+-    CreateNewWindow("", fullScreen, res);
++    if (!CreateNewWindow("", fullScreen, res) &&
++        StereoWindowFailed(res, "its window could not be made", plain))
++    {
++      output = &plain;
++      CreateNewWindow("", fullScreen, plain);
++    }
+   }
+ 
+   if (!m_eglContext.TrySwapBuffers())
+@@ -211,8 +221,8 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+     throw std::runtime_error("eglSwapBuffers failed");
+   }
+ 
+-  CWinSystemGbm::SetFullScreen(fullScreen, res, blankOtherDisplays);
+-  CRenderSystemGLES::ResetRenderSystem(res.iWidth, res.iHeight);
++  CWinSystemGbm::SetFullScreen(fullScreen, *output, blankOtherDisplays);
++  CRenderSystemGLES::ResetRenderSystem(output->iWidth, output->iHeight);
+ 
+   return true;
+ }
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 559e756..aa06eee 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -142,6 +142,7 @@ protected:
+   bool CreateContext() override;
+ #ifdef HAVE_DVBRIDGE
+   int VideoOutputBitDepth(const VideoPicture* picture) const override;
++  bool NativeDVOutputInUse() const override { return m_dvState.Captured(); }
+ #endif
+ 
+ private:
+diff --git a/xbmc/windowing/gbm/drm/DRMStereo.h b/xbmc/windowing/gbm/drm/DRMStereo.h
+index c79b5f6..f1b5289 100644
+--- a/xbmc/windowing/gbm/drm/DRMStereo.h
++++ b/xbmc/windowing/gbm/drm/DRMStereo.h
+@@ -259,8 +259,9 @@ struct Allowed
+   bool framePacking{true};
+   bool halfModes{true}; //!< the modes of top-and-bottom and of side-by-side (half)
+   bool infoFrame{true}; //!< those layouts told by the InfoFrame alone
+-  //! A mode of another size than the one Kodi chose, at the same refresh rate: where Kodi
+-  //! may change the mode for a video at all (the adjustment of the refresh rate is on)
++  //! A mode of another size than the one Kodi chose, at the same refresh rate: where the user
++  //! has no whitelist of modes. (The 3D mode of a mode of the whitelist is that mode, sent
++  //! another way; a mode of another size is another mode, which the whitelist may not have.)
+   bool otherSize{true};
+ };
+ 
+@@ -298,6 +299,11 @@ struct Choice
+  *   the InfoFrame.
+  * - Else nothing: the 2D mode, in which the display shows the two halves as they are and is
+  *   switched to 3D by hand, as it always was.
++ *
++ * A timing of another size is never one of fewer lines than a 3D film has (1080), unless the
++ * mode that Kodi chose has fewer itself: the 720p that HDMI has at 50 and 60 Hz would take
++ * lines from a picture that is shown at 1080p or 2160p, where sending the two halves as they
++ * are takes none. (What the picture itself has is not known here.)
+  */
+ inline Choice Choose(std::span<const Offer> offers,
+                      int base,
+@@ -313,6 +319,11 @@ inline Choice Choose(std::span<const Offer> offers,
+   const auto sameRate = [&own](const Offer& offer)
+   { return offer.interlaced == own.interlaced && std::fabs(offer.refresh - own.refresh) < 0.01; };
+   const auto area = [](const Offer& offer) { return offer.width * offer.height; };
++  const auto enoughLines = [&own](const Offer& offer)
++  {
++    constexpr int FILM_LINES = 1080;
++    return offer.height >= (own.height < FILM_LINES ? own.height : FILM_LINES);
++  };
+ 
+   if (arrangement == Arrangement::TOP_AND_BOTTOM && allowed.framePacking && !own.interlaced)
+   {
+@@ -324,7 +335,8 @@ inline Choice Choose(std::span<const Offer> offers,
+       const Offer* best = nullptr;
+       for (const Offer& offer : offers)
+       {
+-        if (offer.framePacking >= 0 && sameRate(offer) && (!best || area(offer) > area(*best)))
++        if (offer.framePacking >= 0 && sameRate(offer) && enoughLines(offer) &&
++            (!best || area(offer) > area(*best)))
+           best = &offer;
+       }
+       if (best)
+@@ -356,8 +368,8 @@ inline Choice Choose(std::span<const Offer> offers,
+     const Offer* best = nullptr;
+     for (const Offer& offer : offers)
+     {
+-      if (sameRate(offer) && area(offer) <= area(own) && half(offer).layout != Layout::NONE &&
+-          (!best || area(offer) > area(*best)))
++      if (sameRate(offer) && area(offer) <= area(own) && enoughLines(offer) &&
++          half(offer).layout != Layout::NONE && (!best || area(offer) > area(*best)))
+         best = &offer;
+     }
+     if (best)
+@@ -379,6 +391,49 @@ inline bool PrefersTopAndBottom(std::span<const Offer> offers, int base, const A
+          Layout::FRAME_PACKING;
+ }
+ 
++/*!
++ * \brief Frame packing where the driver makes a surface for each eye out of the one buffer
++ *
++ * nvidia-drm takes a frame-packed frame as the other drivers do, in one buffer of
++ * ScanoutHeight() lines, and gives NVKMS, whose hardware does the packing, the lines of each
++ * eye as a surface of its own. The second eye begins at line vtotal of the buffer, pitch x
++ * vtotal bytes into it, and NVKMS takes a surface only at an offset that is a multiple of
++ * 1024 bytes. With 4 bytes for a pixel, a buffer 1280 pixels wide has such an offset at line
++ * 750 (720p); one 1920 pixels wide has none at line 1125 (1080p), and one 2048 wide does.
++ * The buffer of such a mode is made that wide, and the 1920 columns of the mode are shown.
++ * The lines also have to lie one after another in memory, not in blocks: the buffer is made
++ * with DRM_FORMAT_MOD_LINEAR, and its framebuffer says so.
++ */
++inline constexpr uint32_t NVKMS_SURFACE_OFFSET_ALIGNMENT = 1024;
++
++//! \brief Whether the second eye of a frame-packed frame, in a buffer of this pitch, begins at
++//! an offset that is a multiple of alignment
++constexpr bool SecondEyeAligned(uint32_t pitch, const Mode& mode, uint32_t alignment)
++{
++  return pitch != 0 && alignment != 0 &&
++         (static_cast<uint64_t>(pitch) * mode.vtotal) % alignment == 0;
++}
++
++/*!
++ * \brief The width to make the buffer of a frame-packed mode with, for SecondEyeAligned()
++ * \param bytesPerPixel of its format: the pitch is taken to be the width times this, which is
++ *        then asked of the buffer that was made
++ * \return the smallest such width that is not less than that of the mode; 0 without one
++ */
++constexpr int FramePackedBufferWidth(const Mode& mode, uint32_t bytesPerPixel, uint32_t alignment)
++{
++  if (mode.hdisplay == 0 || bytesPerPixel == 0 || alignment == 0)
++    return 0;
++
++  // (one of any 'alignment' widths in a row is a multiple of it)
++  for (uint32_t width = mode.hdisplay; width < mode.hdisplay + alignment; ++width)
++  {
++    if (SecondEyeAligned(width * bytesPerPixel, mode, alignment))
++      return static_cast<int>(width);
++  }
++  return 0;
++}
++
+ /*!
+  * \brief The video format number of CTA-861 (VIC) of a 2D mode, of those HDMI has 3D for
+  * \return the number of its 16:9 form, or 0 for any other mode
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index b4dfc28..bb45c3e 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -1395,6 +1395,33 @@ bool CDRMUtils::GetModeInfo(int index, RESOLUTION_INFO& info)
+   return true;
+ }
+ 
++STEREO::Layout CDRMUtils::GetModeLayout(const RESOLUTION_INFO& res) const
++{
++  if (!m_connector || res.strId.empty())
++    return STEREO::Layout::NONE;
++
++  const int index = std::atoi(res.strId.c_str());
++  if (index < 0 || index >= m_connector->GetModesCount())
++    return STEREO::Layout::NONE;
++
++  return STEREO::LayoutOf(m_connector->GetModeForIndex(index)->flags);
++}
++
++bool CDRMUtils::GetOutputModeFlags(uint32_t& flags) const
++{
++  if (m_fd < 0 || !m_crtc)
++    return false;
++
++  drmModeCrtcPtr crtc = drmModeGetCrtc(m_fd, m_crtc->GetCrtcId());
++  if (!crtc)
++    return false;
++
++  const bool valid = crtc->mode_valid != 0;
++  flags = crtc->mode.flags;
++  drmModeFreeCrtc(crtc);
++  return valid;
++}
++
+ uint32_t CDRMUtils::ScanoutHeight() const
+ {
+   return static_cast<uint32_t>(STEREO::ScanoutHeight(StereoModeOf(*m_mode)));
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index b231208..7239c0b 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -148,6 +148,13 @@ public:
+   //! GetModes() leaves out
+   //! \return whether there is such a mode
+   bool GetModeInfo(int index, RESOLUTION_INFO& info);
++  //! \brief The 3D layout of the mode of the connector that a resolution information names
++  //! (its strId); none where it names no mode
++  STEREO::Layout GetModeLayout(const RESOLUTION_INFO& res) const;
++  //! \brief The flags of the mode that the output is in now, as the kernel tells them: what
++  //! the last commit of a mode left there, whether the driver took that commit or not
++  //! \return whether the output has a mode
++  bool GetOutputModeFlags(uint32_t& flags) const;
+ 
+   void SetInFenceFd(int fd) { m_inFenceFd = fd; }
+   int TakeOutFenceFd()
+-- 
+2.53.0
+

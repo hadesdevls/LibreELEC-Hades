@@ -1,0 +1,213 @@
+From 557d06ca944a606f44f27548d8a8ed480cb24142 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:59:24 +0000
+Subject: [PATCH] dvbridge: pair by the frame's pts; a repeated RPU counts as
+ missing
+
+- The base picture was paired with its enhancement picture by
+  best_effort_timestamp, while the enhancement picture takes the pts of
+  the base-layer packet. FFmpeg's best-effort heuristic switches to the
+  dts after timestamp faults, and then nothing paired again. The frame's
+  own pts is used when it has one.
+- FFmpeg attaches the last parsed RPU again to a picture whose access
+  unit carried none (ff_dovi_attach_side_data() keeps the context), so
+  the "12 pictures without metadata" rule never saw a stretch without
+  RPUs, which went on with stale metadata. Such a picture is marked by
+  the absence of the raw RPU buffer (attached only with a parsed RPU):
+  it is still drawn, and counts as missing. Profile 5 is the exception:
+  its base layer has no ordinary rendition (IPTPQc2), so the previous
+  RPU is the best there is and the stream stays native.
+- A stream whose metadata keeps coming and going switched the output
+  every few seconds. The number of pictures with metadata needed to
+  return to native output (48) now doubles each time the stream leaves
+  it again, up to 1440 (one minute at 24 fps).
+
+The Dolby Vision constants of the decoder move to the top of the file.
+---
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |  1 +
+ .../DVDCodecs/Video/DVDVideoCodec.h           |  2 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 82 +++++++++++++------
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |  2 +
+ 4 files changed, 61 insertions(+), 26 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index e5ee3f3..18bdaea 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -53,6 +53,7 @@ void VideoPicture::Reset()
+   doviSourcePts = AV_NOPTS_VALUE;
+ #ifdef HAVE_DVBRIDGE
+   doviEnhancement.reset();
++  doviRpuRepeated = false;
+ #endif
+ 
+   hasDisplayMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index 32d82a0..60528a3 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -73,6 +73,8 @@ public:
+   int64_t doviSourcePts = AV_NOPTS_VALUE;
+ #ifdef HAVE_DVBRIDGE
+   std::shared_ptr<AVFrame> doviEnhancement;
++  //! doviMetadata is the previous RPU, repeated by FFmpeg for an access unit that carried none
++  bool doviRpuRepeated = false;
+ #endif
+ 
+   bool hasDisplayMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index f9be664..e7d3b28 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -58,6 +58,32 @@ extern "C" {
+ #define RINT lrint
+ #endif
+ 
++#ifdef HAVE_DVBRIDGE
++namespace
++{
++// Consecutive Dolby Vision pictures without their RPU after which the stream leaves native output
++// (a single one is not drawn; many would end in DisableNativeDVOutput() for the whole session).
++constexpr unsigned int DV_MISSING_RPU_MAX = 12;
++
++// Consecutive pictures with Dolby Vision metadata after which a stream that left native output
++// because the metadata was missing returns to it (2 s at 24 fps). It doubles each time the stream
++// leaves native output again, up to DV_RPU_BACK_MAX (1 min at 24 fps), so that metadata that keeps
++// coming and going does not switch the output back and forth.
++constexpr unsigned int DV_RPU_BACK = 48;
++constexpr unsigned int DV_RPU_BACK_MAX = 1440;
++
++// Base pictures waiting for their enhancement pictures. Both layers are decoded side by side, so
++// the enhancement picture of the oldest one normally arrives within a few pictures; with this many
++// waiting it is late or missing. Each waiting picture holds a base-layer decoder surface and a
++// VAAPI render picture (VAAPI adds as many of both for dual-layer streams, so that the
++// renderer's queue stays full meanwhile).
++constexpr size_t DV_EL_LATE_PENDING = 6;
++
++// Late or missing enhancement pictures in a row after which the layer is resynchronized.
++constexpr unsigned int DV_EL_LATE_RESYNC = 3;
++} // namespace
++#endif
++
+ enum DecoderState
+ {
+   STATE_NONE,
+@@ -532,6 +558,8 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvLate = 0;
+   m_dvLateInRow = 0;
+   m_dvSoftware = false;
++  m_dvRpuBack = DV_RPU_BACK;
++  m_dvRpuReturns = 0;
+   m_dvNativeOutput = false;
+ #endif
+   av_frame_free(&m_pFrame);
+@@ -725,26 +753,6 @@ bool CDVDVideoCodecFFmpeg::AddData(const DemuxPacket &packet)
+ }
+ 
+ #ifdef HAVE_DVBRIDGE
+-namespace
+-{
+-// Consecutive Dolby Vision pictures without their RPU after which the stream leaves native output
+-// (a single one is not drawn; many would end in DisableNativeDVOutput() for the whole session).
+-constexpr unsigned int DV_MISSING_RPU_MAX = 12;
+-
+-// Consecutive pictures with Dolby Vision metadata after which a stream that left native output
+-// because the metadata was missing returns to it (2 s at 24 fps).
+-constexpr unsigned int DV_RPU_BACK = 48;
+-
+-// Base pictures waiting for their enhancement pictures. Both layers are decoded side by side, so
+-// the enhancement picture of the oldest one normally arrives within a few pictures; with this many
+-// waiting it is late or missing. Each waiting picture holds a base-layer decoder surface (VAAPI
+-// adds as many surfaces for dual-layer streams).
+-constexpr size_t DV_EL_LATE_PENDING = 6;
+-
+-// Late or missing enhancement pictures in a row after which the layer is resynchronized.
+-constexpr unsigned int DV_EL_LATE_RESYNC = 3;
+-} // namespace
+-
+ void CDVDVideoCodecFFmpeg::ResyncDVEnhancement(const char* reason)
+ {
+   // The enhancement layer is never given up: it starts again at the next random-access point
+@@ -767,26 +775,33 @@ void CDVDVideoCodecFFmpeg::CheckNativeDVPicture(VideoPicture* picture)
+   // Pictures without Dolby Vision metadata cannot be drawn natively (a single one is only not
+   // drawn). When the metadata stays missing, this stream uses the ordinary output, and it
+   // returns to native output as soon as the metadata is steadily back. Native output is not
+-  // disabled for the session.
+-  if (!picture->doviMetadata.Data())
++  // disabled for the session. A picture that carries the previous RPU again (its access unit had
++  // none) is still drawn with it, but counts as missing: a stretch without RPUs must not go on
++  // with stale metadata. Except in profile 5: its base layer has no ordinary rendition
++  // (IPTPQc2), so the previous RPU is the best there is.
++  const bool repeatedIsMissing = m_hints.dovi.dv_profile != 5;
++  if (!picture->doviMetadata.Data() || (picture->doviRpuRepeated && repeatedIsMissing))
+   {
+     m_dvPresentRpu = 0;
+     if (!m_dvOrdinary && ++m_dvMissingRpu == DV_MISSING_RPU_MAX)
+     {
+-      CLog::Log(LOGWARNING, "DV: {} consecutive pictures came without Dolby Vision metadata "
+-                            "(RPU); ordinary output until the metadata is back",
++      CLog::Log(LOGWARNING, "DV: {} consecutive pictures came without their own Dolby Vision "
++                            "metadata (RPU); ordinary output until the metadata is back",
+                 DV_MISSING_RPU_MAX);
++      if (m_dvRpuReturns)
++        m_dvRpuBack = std::min(m_dvRpuBack * 2, DV_RPU_BACK_MAX);
+       m_dvOrdinary = true;
+     }
+   }
+   else
+   {
+     m_dvMissingRpu = 0;
+-    if (m_dvOrdinary && ++m_dvPresentRpu == DV_RPU_BACK)
++    if (m_dvOrdinary && ++m_dvPresentRpu == m_dvRpuBack)
+     {
+       CLog::Log(LOGINFO, "DV: Dolby Vision metadata is back ({} consecutive pictures); native "
+                          "output again",
+-                DV_RPU_BACK);
++                m_dvRpuBack);
++      ++m_dvRpuReturns;
+       m_dvOrdinary = false;
+     }
+   }
+@@ -1452,7 +1467,16 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   }
+ 
+   pVideoPicture->doviMetadata.Reset();
++#ifdef HAVE_DVBRIDGE
++  // The frame's own pts pairs it with its enhancement picture, which takes the pts of the
++  // base-layer packet; best_effort_timestamp can switch to the dts on timestamp faults.
++  pVideoPicture->doviSourcePts = m_pFrame->pts != AV_NOPTS_VALUE
++                                     ? m_pFrame->pts
++                                     : m_pFrame->best_effort_timestamp;
++  pVideoPicture->doviRpuRepeated = false;
++#else
+   pVideoPicture->doviSourcePts = m_pFrame->best_effort_timestamp;
++#endif
+   if (pVideoPicture->hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
+   {
+     sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA);
+@@ -1460,6 +1484,12 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+     {
+       if (!pVideoPicture->doviMetadata.Assign(sd->data, sd->size))
+         CLog::Log(LOGWARNING, "Unable to retain Dolby Vision picture metadata");
++#ifdef HAVE_DVBRIDGE
++      // FFmpeg attaches the last parsed RPU again to a picture whose access unit carried none;
++      // only the raw RPU buffer, attached with a parsed RPU, tells them apart.
++      pVideoPicture->doviRpuRepeated =
++          !av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++#endif
+       AVDOVIMetadata* dovi = (AVDOVIMetadata*)sd->data;
+       const AVDOVIRpuDataHeader* hdr = av_dovi_get_header(dovi);
+       const AVDOVIDataMapping* mapping = av_dovi_get_mapping(dovi);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 25413e9..8e7f879 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -70,6 +70,8 @@ protected:
+   bool m_dvOrdinary{false}; //!< RPU missing: ordinary output until the metadata is back
+   unsigned int m_dvMissingRpu{0}; //!< consecutive DV pictures without their RPU
+   unsigned int m_dvPresentRpu{0}; //!< consecutive DV pictures with their RPU, while ordinary
++  unsigned int m_dvRpuBack{48}; //!< pictures with their RPU needed to return to native output
++  unsigned int m_dvRpuReturns{0}; //!< returns to native output after the RPU was missing
+   unsigned int m_dvLate{0}; //!< base pictures whose enhancement picture was late or missing
+   unsigned int m_dvLateInRow{0}; //!< the same, in a row
+   bool m_dvSoftware{false}; //!< the base layer is decoded in software: no enhancement layer

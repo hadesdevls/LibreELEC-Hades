@@ -1,0 +1,484 @@
+From 23c68594f8358304e9a99b389bbfbf60329e0dd6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:19:38 +0000
+Subject: [PATCH] dvbridge: write the bars of a letterboxed picture before the
+ reconstruction
+
+Outside the active picture (the bars of a letterboxed film, level 5 of
+the metadata) the output is black: in the transport, luma 256 and
+chroma 2048 with the metadata bit of each pixel. The shader wrote that
+after having reconstructed those pixels like the others: reshaping, the
+enhancement layer with its residual and the colour conversion, thrown
+away. In a 2.39:1 film that is a quarter of the pixels.
+
+A picture that fills the output without scaling is drawn by libplacebo
+in one shader, from the planes to the target. A hook at the native
+stage of that shader now writes those pixels and returns. What they
+skip is what follows that stage: reshaping, the second pass of the
+enhancement layer with the residual, the colour conversion and the
+packing. The fetches of the base layer and the first passes of the
+chroma and enhancement scalers come before it and still run.
+
+Both kinds of render get it:
+
+- the packed one, which draws a frame without GUI elements in one pass.
+  This is the "Opt1" change of the Intel Dolby Vision LibreELEC fork
+  (commit d5976b3338, in every release of it since), which measured
+  about 11% less render load in letterboxed sections on an i7-11390H.
+  The bytes are the ones the packing made of a pair of black pixels
+  (the two values have even parity, so the bit is stored as it is); a
+  pair that the edge of the active picture divides is left to the
+  packing, whose chroma takes both;
+- the one into the full-precision picture, which draws every frame
+  with GUI elements, and every frame on a GPU where it is the faster
+  way. That is the integrated GPU of a Ryzen 9 7950X3D, the one this
+  is for: 30 ms for a FEL frame, against 35 to 37 drawn packed, of the
+  41.7 ms of a refresh (hardware test of 2026-10-03). Hades had left
+  Opt1 in a variant branch because an RTX 4080 SUPER has time to
+  spare.
+
+The return must leave the shader that writes the target. The first hook
+defines a name in that shader and the second one adds a line that only
+compiles where it is defined, so in any other arrangement the render
+fails instead of handing the bars on as picture. The hooks cannot tell
+by the shader object they are given: libplacebo hands the same one out
+again after a pass.
+
+A render that fails with the first hook is made again without it. When
+that one succeeds, the hook was what failed, and after two such frames
+in a row (none between them whose render succeeded with the hook) this
+kind of render stops using it: a single one may have had a cause that
+the second render did not meet again. When the second render fails too,
+the reason was another one and nothing is concluded. Without this,
+three failures would turn the packed path off, pictures without bars
+included. One such cause is taken away: the render into the
+full-precision picture now discards the GL errors that earlier,
+unrelated work left, as the packed one already did (run on the software
+renderer with an error left pending: the first GL object libplacebo
+makes fails on it, and the render with it). Each form has its own hook
+signature, and the log says once, for each kind of render, which one is
+in use and when it stops using the hook.
+
+<video><dvearlymask>false</dvearlymask></video> in advancedsettings.xml
+turns the first hook off for both kinds of render, for comparing on a
+GPU.
+
+Run on a software OpenGL ES (Mesa 26.0.8, zink on lavapipe), with the
+libplacebo and the FFmpeg of the image built for the host: 36 drawings
+of six pictures of a profile 7 FEL stream, with their own margins and
+with four other sets. With and without the first hook the packed render
+gives the same bytes and the other one the same floats, bit for bit,
+and no render fell back (tests/dvrender_test.c). The hook was also
+forced onto a picture that is scaled, which libplacebo draws in two
+shaders: the render fails with the line above and is made again
+without the hook, with the output of a render that never had it. With
+a comparison of the shader objects in its place, the forced render went
+through and 2.1 million pixels were wrong. Not run on a GPU: what it
+saves there is not measured.
+---
+ tools/dvbridge/dvbridge_render.c              | 151 +++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h              |   9 ++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  35 ++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   3 +
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   3 +
+ 6 files changed, 195 insertions(+), 8 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index b859e2f..a9f1cb3 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -17,6 +17,12 @@ struct dvbridge_renderer {
+     bool ready;
+     bool packed, fragment_quad;
+     bool residual_omitted; /* Hades: last prepared FEL picture drawn without its residual */
++    /* Hades: the area outside the active picture was written before the reconstruction in the
++     * last render (see skip_inactive_area()). That is left out while it is turned off
++     * (dvbridge_render_allow_early_mask()), and by the packed render [1] or the other one [0]
++     * once it has failed with it and not without it in two frames in a row. */
++    bool early_mask, early_off, early_unusable[2];
++    unsigned char early_failures[2];
+ };
+ 
+ struct active_mask {
+@@ -24,14 +30,77 @@ struct active_mask {
+     bool called, failed;
+     const uint32_t *packets;
+     uint32_t count, flip;
++    bool early_mask, early_called;
+ };
+ 
++/* Hades: the area outside the active picture is written at the start of the shader, which a
++ * return then leaves, so that those pixels are not reconstructed (reshaping, the enhancement
++ * layer, the colour conversion) to be overwritten afterwards. They get the value they got
++ * afterwards:
++ *  - packed: black with the metadata bit of the pixel, luma 256 and chroma 2048, whose bits
++ *    have even parity, so the bit goes in as it is. That is what pack_active_area() makes of a
++ *    pair of black pixels. A pair that the edge of the active picture divides is left to it:
++ *    its chroma takes both pixels;
++ *  - not packed: black, as mask_active_area() writes it.
++ * The packed form is the "Opt1" change of the Intel Dolby Vision LibreELEC fork (commit
++ * d5976b3338). */
++static struct pl_hook_res skip_inactive_area(struct active_mask *mask,
++                                             const struct pl_hook_params *p, bool packed)
++{
++    mask->early_called = true;
++    struct pl_shader_var vars[] = {
++        {.var=pl_var_vec4("early_area"), .data=mask->rect, .dynamic=true},
++        {.var={.name="early_words", .type=PL_VAR_UINT, .dim_v=4, .dim_m=1, .dim_a=128},
++         .data=mask->packets, .dynamic=true},
++        {.var=pl_var_uint("early_count"), .data=&mask->count, .dynamic=true},
++        {.var=pl_var_uint("early_flip"), .data=&mask->flip, .dynamic=true}};
++    struct pl_custom_shader shader = {
++        .prelude="#define DVBRIDGE_BARS_WRITTEN 1\n", /* see bars_written_in_this_shader() */
++        .input=PL_SHADER_SIG_COLOR, .output=PL_SHADER_SIG_COLOR,
++        .description="Skip reconstruction outside the DV active picture",
++        .variables=vars, .num_variables=packed ? 4 : 1,
++        .body=packed ?
++        "ivec2 ep=ivec2(gl_FragCoord.xy); if(early_flip!=0u) ep.y=2159-ep.y;\n"
++        // Keep boundary pairs together: their chroma also uses the active neighbor.
++        "int ex=ep.x&~1;\n"
++        "if(float(ex+1)<early_area.x || float(ex)>=early_area.z || float(ep.y)<early_area.y || float(ep.y)>=early_area.w){\n"
++        "uint ei=uint(ep.y*3840+ep.x), ek=ei/3072u, ev=0u;\n"
++        "if(ek<early_count){uint eb=ei%1024u, ew=ek*128u+eb/8u;\n"
++        "ev=(early_words[ew/4u][int(ew%4u)]>>(7u-eb%8u))&1u;}\n"
++        "return vec4(128.0,16.0,float(ev*16u),255.0)/255.0;}\n"
++        :
++        "if(gl_FragCoord.x < early_area.x || gl_FragCoord.x >= early_area.z || "
++        "gl_FragCoord.y < early_area.y || gl_FragCoord.y >= early_area.w) "
++        "return vec4(0.0, 0.0, 0.0, 1.0);\n"};
++    mask->failed = pl_shader_is_compute(p->sh) || !pl_shader_custom(p->sh, &shader);
++    return (struct pl_hook_res){.failed=mask->failed, .output=PL_HOOK_SIG_NONE};
++}
++
++/* Hades: the return of skip_inactive_area() has to leave the shader that writes the target. In
++ * a shader before that one it would hand its value on as if it were picture. The two hooks
++ * cannot tell by the shader they are given, because libplacebo hands the same object out again
++ * after a pass. So the first hook defines a name, and the second one adds a line that only
++ * compiles where that name is defined: in any other shader the render fails, and is made again
++ * without the first hook (render_bars_first()). */
++static bool bars_written_in_this_shader(const struct active_mask *mask,
++                                        const struct pl_hook_params *p)
++{
++    static const struct pl_custom_shader check = {
++        .prelude="#ifndef DVBRIDGE_BARS_WRITTEN\n"
++                 "#error dvbridge bars written in another shader\n"
++                 "#endif\n",
++        .input=PL_SHADER_SIG_COLOR, .output=PL_SHADER_SIG_COLOR};
++    return !mask->early_mask || (mask->early_called && pl_shader_custom(p->sh, &check));
++}
++
+ /* Same arithmetic/packing as pack_gles300.frag. Subgroup exchange replaces
+  * only the full-precision intermediate texture fetch of the adjacent pixel.
+  * Adapted from the existing mpv_dvbridge_fused1.h implementation. */
+ static struct pl_hook_res pack_active_area(void *priv, const struct pl_hook_params *p)
+ {
+     struct active_mask *mask = priv;
++    if (p->stage == PL_HOOK_NATIVE)
++        return skip_inactive_area(mask, p, true);
+     mask->called = true;
+     struct pl_shader_var vars[] = {
+         {.var = pl_var_vec4("active_area"), .data = mask->rect, .dynamic = true},
+@@ -66,14 +135,16 @@ static struct pl_hook_res pack_active_area(void *priv, const struct pl_hook_para
+         "uint value=(metadata_words[byte_index/4u][int(byte_index%4u)]>>(7u-bit%8u))&1u;\n"
+         "uint parity=uint(bitCount(c>>1u)+bitCount(y))&1u; c=(c&4094u)|(value^parity); }\n"
+         "color=vec4(float(c>>4u),float(y>>4u),float((y&15u)|((c&15u)<<4u)),255.0)/255.0;\n"};
+-    mask->failed = p->stage != PL_HOOK_OUTPUT || pl_shader_is_compute(p->sh) ||
+-                   !pl_shader_custom(p->sh, &shader);
++    mask->failed = mask->failed || p->stage != PL_HOOK_OUTPUT || pl_shader_is_compute(p->sh) ||
++                   !bars_written_in_this_shader(mask, p) || !pl_shader_custom(p->sh, &shader);
+     return (struct pl_hook_res){.failed=mask->failed, .output=PL_HOOK_SIG_NONE};
+ }
+ 
+ static struct pl_hook_res mask_active_area(void *priv, const struct pl_hook_params *p)
+ {
+     struct active_mask *mask = priv;
++    if (p->stage == PL_HOOK_NATIVE)
++        return skip_inactive_area(mask, p, false);
+     mask->called = true;
+     struct pl_shader_var variable = {
+         .var = pl_var_vec4("dvbridge_active"), .data = mask->rect, .dynamic = true};
+@@ -89,7 +160,8 @@ static struct pl_hook_res mask_active_area(void *priv, const struct pl_hook_para
+                 "color = clamp(color, 0.0, 1.0);",
+         .variables = &variable, .num_variables = 1,
+         .description = "DV active picture blanking before target overlays"};
+-    mask->failed = p->stage != PL_HOOK_OUTPUT || !pl_shader_custom(p->sh, &shader);
++    mask->failed = mask->failed || p->stage != PL_HOOK_OUTPUT ||
++                   !bars_written_in_this_shader(mask, p) || !pl_shader_custom(p->sh, &shader);
+     return (struct pl_hook_res){.failed = mask->failed, .output = PL_HOOK_SIG_NONE};
+ }
+ 
+@@ -193,11 +265,13 @@ static void restore_gl_state(const struct saved_gl_state *s)
+ 
+ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                         const void *metadata, size_t bytes, double pts, double el_pts,
+-                        struct dvbridge_geometry geometry, pl_tex packed, bool flip)
++                        struct dvbridge_geometry geometry, pl_tex packed, bool flip,
++                        bool early)
+ {
+     if (!r)
+         return false;
+     r->ready = false;
++    r->early_mask = false;
+     r->residual_omitted = false;
+     r->packed = packed != NULL;
+     dvbridge_candidate_destroy(r->pending);
+@@ -259,9 +333,19 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                                        3840 - margins[1], 2160 - margins[3]}};
+     mask.flip = flip;
+     mask.packets = dvbridge_packets(r->pending, &mask.count);
+-    const struct pl_hook hook = {.stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR,
++    /* Only a picture that is not scaled is one shader from its planes to the target. */
++    mask.early_mask = early &&
++                      geometry.source_width == 3840 && geometry.source_height == 2160 &&
++                      !geometry.x && !geometry.y &&
++                      geometry.width == 3840 && geometry.height == 2160 &&
++                      (margins[0] || margins[1] || margins[2] || margins[3]);
++    /* libplacebo disables a hook that failed by its signature: each form has its own. */
++    const struct pl_hook hook = {
++        .stages = PL_HOOK_OUTPUT | (mask.early_mask ? PL_HOOK_NATIVE : 0),
++        .input = PL_HOOK_SIG_COLOR,
+         .priv = &mask, .hook = packed ? pack_active_area : mask_active_area,
+-        .signature = packed ? 0x4456425246555301ULL : 0x445642524c350001ULL};
++        .signature = packed ? (mask.early_mask ? 0x4456425246555302ULL : 0x4456425246555301ULL)
++                            : (mask.early_mask ? 0x445642524c350002ULL : 0x445642524c350001ULL)};
+     const struct pl_hook *hooks[] = {&hook};
+     params.hooks = hooks;
+     params.num_hooks = 1;
+@@ -271,6 +355,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     /* An EL sampling failure can otherwise return a successfully rendered BL-only frame. */
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     r->ready = r->ready && !errors.errors && !errors.num_disabled_hooks;
++    r->early_mask = mask.early_mask;
+     if (!r->ready) {
+         dvbridge_candidate_destroy(r->pending);
+         r->pending = NULL;
+@@ -278,13 +363,48 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     return r->ready;
+ }
+ 
++/* Hades: a render that wrote the bars first (skip_inactive_area()) and failed is made again
++ * without that. When the second one succeeds, the first hook was what failed; after two such
++ * frames in a row this kind of render no longer uses it (a single one may have had a cause
++ * that the second render did not meet again). In a row: with no frame between them whose
++ * render succeeded with the hook; a frame whose render did not use it (a picture without
++ * bars) counts neither way. When the second one fails as well, the reason is another one and
++ * nothing is concluded. libplacebo keeps a failed hook disabled until its errors are reset,
++ * and the first render may have left GL errors. The second one writes the whole target
++ * again. */
++static bool render_bars_first(struct dvbridge_renderer *r, const struct pl_frame *source,
++                              const void *metadata, size_t bytes, double pts, double el_pts,
++                              struct dvbridge_geometry geometry, pl_tex packed, bool flip)
++{
++    if (!r)
++        return false;
++    const int kind = packed != NULL;
++    bool ok = render(r, source, metadata, bytes, pts, el_pts, geometry, packed, flip,
++                     !r->early_off && !r->early_unusable[kind]);
++    if (ok && r->early_mask)
++        r->early_failures[kind] = 0;
++    if (ok || !r->early_mask)
++        return ok;
++    pl_renderer_reset_errors(r->renderer, NULL);
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    ok = render(r, source, metadata, bytes, pts, el_pts, geometry, packed, flip, false);
++    if (ok && ++r->early_failures[kind] >= 2)
++        r->early_unusable[kind] = true;
++    return ok;
++}
++
+ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *source,
+                         const void *metadata, size_t bytes, double pts, double el_pts,
+                         struct dvbridge_geometry geometry)
+ {
++    /* Hades: errors left by earlier, unrelated GL work are not ours, as in
++     * dvbridge_render_packed(): the first GL object that libplacebo makes fails on one. */
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
+     struct saved_gl_state state;
+     save_gl_state(&state);
+-    bool ok = render(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++    bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+     restore_gl_state(&state);
+     return ok;
+ }
+@@ -312,7 +432,7 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+         ;
+     struct saved_gl_state state;
+     save_gl_state(&state);
+-    bool ok = render(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
++    bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
+     ok = glGetError() == GL_NO_ERROR && ok;
+     restore_gl_state(&state);
+     r->ready = ok && glGetError() == GL_NO_ERROR;
+@@ -338,3 +458,18 @@ bool dvbridge_render_residual_omitted(const struct dvbridge_renderer *r)
+ {
+     return r && r->residual_omitted;
+ }
++
++int dvbridge_render_early_mask(const struct dvbridge_renderer *r, bool packed)
++{
++    if (!r || r->early_off)
++        return 0;
++    if (r->early_unusable[packed])
++        return 2;
++    return r->ready && r->packed == packed && r->early_mask;
++}
++
++void dvbridge_render_allow_early_mask(struct dvbridge_renderer *r, bool allow)
++{
++    if (r)
++        r->early_off = !allow;
++}
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 45beaa2..3d63b41 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -24,4 +24,13 @@ const struct dvbridge_candidate *dvbridge_render_candidate(const struct dvbridge
+ bool dvbridge_render_commit(struct dvbridge_renderer *renderer);
+ /* Hades: the last prepared picture is FEL drawn without its residual (no enhancement picture). */
+ bool dvbridge_render_residual_omitted(const struct dvbridge_renderer *renderer);
++/* Hades: what the packed render, or the other one, does with the area outside the active
++ * picture. 0: written with the rest (the last render had none, was scaled or was of the other
++ * kind, or it is turned off). 1: written before the reconstruction in the last render. 2: no
++ * longer written before it by this renderer, because its renders failed with that and not
++ * without it. */
++int dvbridge_render_early_mask(const struct dvbridge_renderer *renderer, bool packed);
++/* Hades: whether the area outside the active picture may be written before the reconstruction
++ * (the default). Turned off to measure on hardware what it saves, and by the host test. */
++void dvbridge_render_allow_early_mask(struct dvbridge_renderer *renderer, bool allow);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 2a4ba2f..d7111f4 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -6,7 +6,10 @@
+ #include <iterator>
+ #include <string_view>
+ #include "DVBridgeShaders.h"
++#include "ServiceBroker.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackInfo.h"
++#include "settings/AdvancedSettings.h"
++#include "settings/SettingsComponent.h"
+ #include "utils/log.h"
+ #include <chrono>
+ #include <string>
+@@ -109,6 +112,15 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+       !pl_opengl_has_ext(m_gl, "GL_OES_texture_float_linear"))
+     return Fail("float-blend-or-float-linear-capability");
+   m_renderer = dvbridge_renderer_create(m_gl->gpu, m_log);
++  // To measure on hardware what it saves, advancedsettings.xml can turn off the writing of the
++  // bars before the reconstruction: <video><dvearlymask>false</dvearlymask></video>
++  if (const auto settings = CServiceBroker::GetSettingsComponent();
++      settings && !settings->GetAdvancedSettings()->m_videoDVEarlyMask)
++  {
++    dvbridge_render_allow_early_mask(m_renderer, false);
++    CLog::Log(LOGINFO, "DVBridge: the area outside the active picture is written after the "
++                       "reconstruction, as advancedsettings.xml asks (dvearlymask)");
++  }
+   pl_opengl_wrap_params output{};
+   output.width = 3840;
+   output.height = 2160;
+@@ -187,6 +199,7 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+   {
+     m_direct = dvbridge_render_packed(m_renderer, &bl.frame, metadata.Data(), metadata.Size(),
+                                      base.pts, elPts, geometry, m_scanout, true);
++    LogEarlyMask(true);
+     if (!m_direct)
+     {
+       packedFailed = true;
+@@ -195,6 +208,8 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+   }
+   m_prepared = m_direct || dvbridge_render_rgb(m_renderer, &bl.frame, metadata.Data(), metadata.Size(),
+                                                base.pts, elPts, geometry);
++  if (!m_direct)
++    LogEarlyMask(false);
+   // Give the packed path up only when it fails on frames that the full-precision path draws: a
+   // frame that neither path accepts (its metadata) says nothing about the packed path.
+   if (packedFailed && m_prepared && ++m_directFailures >= 3)
+@@ -269,6 +284,26 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+   return m_prepared;
+ }
+ 
++void CDVBridgeGLES::LogEarlyMask(bool packed)
++{
++  // Once each, for each kind of render: the bars of a letterboxed picture are written before the
++  // reconstruction, which then skips them; or no longer.
++  const int early = dvbridge_render_early_mask(m_renderer, packed);
++  int& logged = m_earlyMask[packed ? 1 : 0];
++  const char* kind = packed ? "packed" : "float-composition";
++  if (early == 1 && logged == 0)
++    CLog::Log(LOGINFO,
++              "DVBridge: {} render writes the area outside the active picture before the "
++              "reconstruction",
++              kind);
++  else if (early == 2 && logged != 2)
++    CLog::Log(LOGINFO,
++              "DVBridge: {} render no longer writes the area outside the active picture before "
++              "the reconstruction (two frames in a row failed with that and not without it)",
++              kind);
++  logged = std::max(logged, early);
++}
++
+ unsigned int CDVBridgeGLES::GetPQTexture() const
+ {
+   const auto texture = m_prepared ? dvbridge_render_texture(m_renderer) : nullptr;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index b89bbdf..e753448 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -80,6 +80,7 @@ public:
+ 
+ private:
+   bool Fail(const char* stage);
++  void LogEarlyMask(bool packed);
+   DVBRIDGE::DiagnosticFailures m_failures;
+   bool m_reportedFrame{false};
+   // All methods, including destruction, require the owning GL context/thread.
+@@ -92,6 +93,8 @@ private:
+   bool m_direct = false;
+   bool m_directUsable = true;
+   unsigned int m_directFailures = 0; //!< packed-path failures on frames the float path drew
++  //! the highest dvbridge_render_early_mask() seen, without and with packing, for the log
++  int m_earlyMask[2] = {0, 0};
+   bool m_prepared = false;
+   bool m_packed = false;
+   PresentedDetail m_pendingDetail;
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 5430680..0306f3f 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -201,6 +201,7 @@ void CAdvancedSettings::Initialize()
+   m_videoAudioDelayRange = 10;
+   m_videoAudioDelayStep = 0.025f;
+   m_videoUseTimeSeeking = true;
++  m_videoDVEarlyMask = true;
+   m_videoSmoothPercentToTimeSeeking = true;
+   m_videoTimeSeekForward = 30;
+   m_videoTimeSeekBackward = -30;
+@@ -693,6 +694,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetFloat(pElement, "ignorepercentatend", m_videoIgnorePercentAtEnd, 0, 100.0f);
+ 
+     XMLUtils::GetBoolean(pElement, "usetimeseeking", m_videoUseTimeSeeking);
++    XMLUtils::GetBoolean(pElement, "dvearlymask", m_videoDVEarlyMask);
+     XMLUtils::GetBoolean(pElement, "smoothpercenttotimeseeking", m_videoSmoothPercentToTimeSeeking);
+     XMLUtils::GetInt(pElement, "timeseekforward", m_videoTimeSeekForward, 0, 6000);
+     XMLUtils::GetInt(pElement, "timeseekbackward", m_videoTimeSeekBackward, -6000, 0);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 1826dd9..5da5150 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -164,6 +164,9 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     float m_videoAudioDelayRange;
+     float m_videoAudioDelayStep;
+     bool m_videoUseTimeSeeking;
++    //! Hades: the Dolby Vision renderer writes the bars of a letterboxed picture before it
++    //! reconstructs the picture (video/dvearlymask). Off for a measurement of what that saves
++    bool m_videoDVEarlyMask;
+     bool m_videoSmoothPercentToTimeSeeking;
+     int m_videoTimeSeekForward;
+     int m_videoTimeSeekBackward;
+-- 
+2.53.0
+

@@ -1,0 +1,179 @@
+From 0210f00ed53b96741cf5b07bdddd532caba22a54 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 11:58:43 +0000
+Subject: [PATCH] windowing/gbm: prefer HDMI and turn the unused outputs off
+
+With several displays connected (a TV on HDMI and monitors on DisplayPort),
+Kodi took the first connected output in the driver's order and, on its first
+commit, detached the planes of every other output, which then stayed lit but
+black: on OLED monitors a panel left on for nothing.
+
+- With "Default" as the monitor setting, prefer a connected HDMI output,
+  where the TV normally is; otherwise the first connected output, as before.
+  A monitor chosen in the settings is still honoured.
+- Leave the other outputs as they are for 10 seconds, so that the notice
+  printed on their console before Kodi starts stays readable, then turn them
+  off in one commit (ACTIVE 0, their planes and connectors detached) so that
+  the monitors go to standby. This also covers amdgpu, where the planes of
+  other outputs were kept because an active CRTC needs one. If the driver
+  refused that commit, Kodi keeps its previous request and those outputs stay
+  as before.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp | 59 +++++++++++++++++++++++-----
+ xbmc/windowing/gbm/drm/DRMAtomic.h   |  5 +++
+ xbmc/windowing/gbm/drm/DRMUtils.cpp  |  9 ++++-
+ xbmc/windowing/gbm/drm/DRMUtils.h    |  5 +++
+ 4 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index b3a5063..a9b1e17 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -43,6 +43,12 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   // referencing an invalid id and the kernel rejects with EINVAL.
+   CDRMPropertyBlob modeBlob;
+ 
++  if (!strict && m_otherOutputsOff && std::chrono::steady_clock::now() >= *m_otherOutputsOff)
++  {
++    m_otherOutputsOff.reset();
++    DisableOtherOutputs(flags);
++  }
++
+   if (m_old_crtc != nullptr)
+   {
+     if (m_old_crtc->GetId() != m_crtc->GetId())
+@@ -65,17 +71,16 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+         AddProperty(plane.get(), "CRTC_ID", 0);
+         AddProperty(plane.get(), "FB_ID", 0);
+       }
+-
+-      // below disables the planes which are not in our crtcs, in other words
+-      // crts attached to other connectors (ie: 2nd monitor), amdgpu requires at least
+-      // one primary plane to enable crtcs, if we disable rest of the planes in amdgpu
+-      // atomic commit will fail
+-      if (!(HasQuirk(QUIRK_NEEDSPRIMARY)))
+-      {
+-        AddProperty(plane.get(), "CRTC_ID", 0);
+-        AddProperty(plane.get(), "FB_ID", 0);
+-      }
+     }
++
++    // The planes of other outputs (a second monitor) used to be detached here, leaving
++    // those outputs lit but black. Keep them a few seconds, so that the notice on their
++    // console stays readable, then turn the outputs off (DisableOtherOutputs).
++    constexpr auto noticeTime = std::chrono::seconds(10);
++    if (std::ranges::any_of(GetCrtcs(), [this](const auto& crtc)
++                            { return crtc.get() != m_crtc &&
++                                     crtc->GetPropertyValue("ACTIVE").value_or(0) != 0; }))
++      m_otherOutputsOff = std::chrono::steady_clock::now() + noticeTime;
+     m_old_crtc = nullptr;
+   }
+ 
+@@ -175,6 +180,40 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   return true;
+ }
+ 
++void CDRMAtomic::DisableOtherOutputs(int& flags)
++{
++  int disabled = 0;
++  for (const auto& crtc : GetCrtcs())
++  {
++    if (crtc.get() == m_crtc || crtc->GetPropertyValue("ACTIVE").value_or(0) == 0)
++      continue;
++    const uint64_t id = crtc->GetId();
++    for (const auto& plane : m_planes)
++    {
++      if (plane->GetPropertyValue("CRTC_ID").value_or(0) == id)
++      {
++        AddProperty(plane.get(), "CRTC_ID", 0);
++        AddProperty(plane.get(), "FB_ID", 0);
++      }
++    }
++    for (const auto& connector : GetConnectors())
++    {
++      if (connector.get() != m_connector &&
++          connector->GetPropertyValue("CRTC_ID").value_or(0) == id)
++        AddProperty(connector.get(), "CRTC_ID", 0);
++    }
++    AddProperty(crtc.get(), "ACTIVE", 0);
++    AddProperty(crtc.get(), "MODE_ID", 0);
++    disabled++;
++  }
++  if (disabled > 0)
++  {
++    flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
++    flags &= ~DRM_MODE_ATOMIC_NONBLOCK;
++    CLog::LogF(LOGINFO, "turning off {} output(s) not used by Kodi", disabled);
++  }
++}
++
+ void CDRMAtomic::FinishRequest(bool accepted)
+ {
+   if (accepted)
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index bbf1ee0..8aaed20 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -11,10 +11,12 @@
+ #include "DRMUtils.h"
+ #include "utils/log.h"
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <deque>
+ #include <map>
+ #include <memory>
++#include <optional>
+ 
+ namespace KODI
+ {
+@@ -46,10 +48,13 @@ private:
+   bool DrmAtomicCommit(int fb_id, int flags, bool rendered, bool videoLayer,
+                        bool strict = false);
+   void FinishRequest(bool accepted);
++  void DisableOtherOutputs(int& flags);
+ 
+   bool m_need_modeset{true};
+   bool m_active = true;
+   bool m_propertyFailure = false;
++  //! When to turn off the outputs Kodi does not use (a second monitor)
++  std::optional<std::chrono::steady_clock::time_point> m_otherOutputsOff;
+ 
+   class CDRMAtomicRequest
+   {
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index dd64078..f09bdf9 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -715,8 +715,13 @@ bool CDRMUtils::FindConnector()
+ 
+   if (connectorName == "Default")
+   {
+-    connector = std::ranges::find_if(m_connectors, [](auto& conn)
+-                                     { return conn->GetEncoderId() > 0 && conn->IsConnected(); });
++    // With several displays connected, prefer an HDMI output, where the TV normally is,
++    // over DisplayPort monitors; otherwise the first connected output, as before.
++    const auto usable = [](auto& conn) { return conn->GetEncoderId() > 0 && conn->IsConnected(); };
++    connector = std::ranges::find_if(m_connectors, [&usable](auto& conn)
++                                     { return usable(conn) && conn->GetType() == "HDMI-A"; });
++    if (connector == m_connectors.end())
++      connector = std::ranges::find_if(m_connectors, usable);
+   }
+ 
+   if (connector == m_connectors.end())
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 09612b0..357ca86 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -96,6 +96,11 @@ protected:
+   bool OpenDrm(bool needConnector);
+   drm_fb* DrmFbGetFromBo(struct gbm_bo* bo);
+   uint32_t DrmOpaqueFbGetFromBo(struct gbm_bo* bo);
++  const std::vector<std::unique_ptr<CDRMConnector>>& GetConnectors() const
++  {
++    return m_connectors;
++  }
++  const std::vector<std::unique_ptr<CDRMCrtc>>& GetCrtcs() const { return m_crtcs; }
+ 
+   int m_fd{-1};
+   CDRMConnector* m_connector{nullptr};

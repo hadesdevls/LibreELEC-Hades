@@ -1,0 +1,652 @@
+From d0ae2ba4527c3e29783d7f9668d26601135dba88 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:19:38 +0000
+Subject: [PATCH] dvbridge: reconstruct a Dolby Vision picture for output as
+ HDR10
+
+The renderer of the bridge reconstructs a Dolby Vision picture (the
+base layer, the residual of the enhancement layer, the reshaping and
+the colour matrices of the RPU) into BT.2020 PQ, and from there packs
+it into the transport of native output. For a display that takes HDR10
+and not Dolby Vision, the reconstruction itself is the picture: this
+adds a way to have it, with no transport and no tone mapping.
+
+dvbridge_render_hdr10() draws the picture, or a part of it, at its
+place in a floating-point texture of the size of the output. What a
+frame is drawn with is what the composed way of native output draws
+with (the same libplacebo parameters, the same clamp to [0, 1]); the
+target is the picture's own colour space, so that nothing is mapped. A
+renderer made for this (dvbridge_renderer_create_hdr10()) does not have
+the 3840x2160 texture of native output. A frame that is refused before
+anything of it is drawn (its metadata does not hold, its place does not
+fit) leaves the one before it in the texture; when the draw itself
+fails, the texture holds no whole picture until the next one is drawn
+(dvbridge_render_hdr10_last() says which).
+
+dvbridge_gl_copy() copies that texture into a framebuffer of the same
+size, sample for sample: the window. A fixed-point framebuffer gets the
+nearest of its levels, which the shader picks, 1/256 of a step above
+the level; a floating-point one gets the values as they are. It can
+write the limited range of an RGB signal, as Kodi's video does when its
+output is set to that.
+
+The picture is reconstructed in the middle of a frame that the caller
+goes on drawing: Kodi draws its GUI over the video afterwards.
+dvbridge_gl_state_save() and dvbridge_gl_state_restore() keep the GL
+state it does that with around a reconstruction and around the set-up
+of a renderer, which both leave libplacebo's state behind: program,
+vertex array, array buffer, the two framebuffers, viewport, scissor,
+blending, colour mask, unpack alignment, nine capabilities, and the 2D
+texture and the sampler of the first sixteen units (libplacebo binds
+the textures of a pass to the units from 0 on and leaves them unbound:
+seven for a picture with an enhancement layer). dvbridge_gl_copy() does
+so by itself.
+
+dvbridge_hdr10_static() gives what an HDR10 output is told of such a
+picture: the luminance of the mastering display and the light levels of
+level 6 of the RPU when it has one, as they are (the brightest pixel may
+be above the peak of the mastering display, as in any HDR10 stream;
+only what cannot be a light level is left out: more than 10000 cd/m2,
+or a frame average above a brightest pixel that is given), and
+otherwise the range of the source that the RPU states, with no light
+levels. Every value fits the 16 bits it has in the infoframe.
+
+Drawn by a software renderer (zink on lavapipe) from a FEL stream, in
+36 and 12 drawings: the picture is the one of the composed way of
+native output inside the active area, sample for sample (0.0000 codes
+of 1023 apart); copied to a 10-bit framebuffer, every sample is the
+nearest code, whole and in part, with the first row at the top and at
+the bottom, in the full and the limited range (64 copies), nothing is
+written outside the rectangle and the scissor is as it was; copied to
+a half-float framebuffer the values are within 2^-11; a part of the
+picture drawn alone is within one code of the same part of the whole
+(0.50 at most: the chroma samples are filtered from other positions);
+a frame that is refused leaves the picture before it.
+
+And as Kodi uses it: a renderer made for HDR10 alone gives the same
+picture, value for value; copied into the default framebuffer (what a
+window is: 3840x2160, 10 bits) with the first row at the bottom and in
+the limited range, whole and between two bars, every sample is the
+nearest code (16 copies); and of 40 values of GL state that a caller
+had set, other framebuffers, a scissor rectangle, blending and a
+texture on each of four units among them, a reconstruction changed 9
+to 11, all of which were put back. The static metadata of the test
+stream reads 4000 and 0.0050 cd/m2, MaxCLL 3991, MaxFALL 2363, and the
+rules above are checked with its level 6 block and source range
+changed.
+
+Three things of that renderer are why it is written as it is. Its copy
+of one framebuffer to another (glBlitFramebuffer) cut values off
+instead of rounding them; it makes 10 bits of a float by dropping six
+of 16, so that a level written 1/64 of a step above its value came out
+one too high from 1015 on; and a half-float texture as the intermediate
+cut the reconstruction off by up to half a code, which is why the
+intermediate has 32 bits.
+---
+ tools/dvbridge/dvbridge_gl_pack.c | 197 ++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_gl_pack.h |  32 +++++
+ tools/dvbridge/dvbridge_placebo.c |  38 ++++++
+ tools/dvbridge/dvbridge_placebo.h |  13 ++
+ tools/dvbridge/dvbridge_render.c  | 148 +++++++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h  |  26 ++++
+ 6 files changed, 452 insertions(+), 2 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index 34ecddf..23fee63 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -78,6 +78,203 @@ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *p)
+     free(p);
+ }
+ 
++struct dvbridge_gl_copier {
++    GLuint program, vao, sampler;
++    GLint picture, flip_height, levels, limited;
++};
++
++static const char COPY_VERTEX[] =
++    "#version 300 es\n"
++    "void main()\n"
++    "{\n"
++    "    vec2 position = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
++    "    gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);\n"
++    "}\n";
++
++/* levels: the highest code of a fixed-point target of up to 12 bits; 0.0 for a floating-point
++ * one, and for more bits than a float keeps apart, which get the values as they are. The level
++ * is written 1/256 of a step above its value. A framebuffer that rounds what it is given makes
++ * that level of it, and so does one that cuts it off, also the one that makes 10 bits by
++ * dropping six of 16, whose steps are a little narrower (a software renderer does that: written
++ * 1/64 of a step above their value, the levels from 1015 on came out one too high there). */
++static const char COPY_FRAGMENT[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform highp sampler2D picture;\n"
++    "uniform int flip_height;\n"
++    "uniform float levels;\n"
++    "uniform int limited;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    if (flip_height > 0)\n"
++    "        p.y = flip_height - 1 - p.y;\n"
++    "    vec3 c = clamp(texelFetch(picture, p, 0).rgb, 0.0, 1.0);\n"
++    "    if (limited != 0)\n"
++    "        c = (c * 876.0 + 64.0) / 1023.0;\n"
++    "    if (levels > 0.0)\n"
++    "        c = (floor(c * levels + 0.5) + 0.00390625) / levels;\n"
++    "    color = vec4(c, 1.0);\n"
++    "}\n";
++
++struct dvbridge_gl_copier *dvbridge_gl_copier_create(void)
++{
++    GLuint vs = compile(GL_VERTEX_SHADER, COPY_VERTEX);
++    GLuint fs = compile(GL_FRAGMENT_SHADER, COPY_FRAGMENT);
++    struct dvbridge_gl_copier *c = vs && fs ? calloc(1, sizeof(*c)) : NULL;
++    if (!c) {
++        glDeleteShader(vs);
++        glDeleteShader(fs);
++        return NULL;
++    }
++    c->program = glCreateProgram();
++    glAttachShader(c->program, vs);
++    glAttachShader(c->program, fs);
++    glLinkProgram(c->program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint linked;
++    glGetProgramiv(c->program, GL_LINK_STATUS, &linked);
++    c->picture = glGetUniformLocation(c->program, "picture");
++    c->flip_height = glGetUniformLocation(c->program, "flip_height");
++    c->levels = glGetUniformLocation(c->program, "levels");
++    c->limited = glGetUniformLocation(c->program, "limited");
++    if (!linked || c->picture < 0 || c->flip_height < 0 || c->levels < 0 || c->limited < 0) {
++        dvbridge_gl_copier_destroy(c);
++        return NULL;
++    }
++    glGenVertexArrays(1, &c->vao);
++    glGenSamplers(1, &c->sampler);
++    glSamplerParameteri(c->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glSamplerParameteri(c->sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glSamplerParameteri(c->sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glSamplerParameteri(c->sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    return c;
++}
++
++void dvbridge_gl_copier_destroy(struct dvbridge_gl_copier *c)
++{
++    if (!c)
++        return;
++    glDeleteVertexArrays(1, &c->vao);
++    glDeleteSamplers(1, &c->sampler);
++    glDeleteProgram(c->program);
++    free(c);
++}
++
++static const GLenum STATE_CAPS[] = {GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_SCISSOR_TEST,
++    GL_DITHER, GL_CULL_FACE, GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE,
++    GL_SAMPLE_COVERAGE};
++_Static_assert(sizeof(STATE_CAPS) / sizeof(*STATE_CAPS) ==
++                   sizeof(((struct dvbridge_gl_state *)0)->enabled),
++               "one flag for each capability");
++
++void dvbridge_gl_state_save(struct dvbridge_gl_state *s)
++{
++    GLboolean mask[4];
++    glGetIntegerv(GL_CURRENT_PROGRAM, &s->program);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s->vertex_array);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s->array_buffer);
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &s->draw_framebuffer);
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &s->read_framebuffer);
++    glGetIntegerv(GL_VIEWPORT, s->viewport);
++    glGetIntegerv(GL_SCISSOR_BOX, s->scissor);
++    glGetIntegerv(GL_BLEND_SRC_RGB, &s->blend[0]);
++    glGetIntegerv(GL_BLEND_DST_RGB, &s->blend[1]);
++    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s->blend[2]);
++    glGetIntegerv(GL_BLEND_DST_ALPHA, &s->blend[3]);
++    glGetIntegerv(GL_UNPACK_ALIGNMENT, &s->unpack_alignment);
++    glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++    for (int i = 0; i < 4; ++i)
++        s->mask[i] = mask[i];
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &s->active_texture);
++    for (int unit = 0; unit < DVBRIDGE_GL_STATE_UNITS; ++unit) {
++        glActiveTexture(GL_TEXTURE0 + unit);
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &s->texture[unit]);
++        glGetIntegerv(GL_SAMPLER_BINDING, &s->sampler[unit]);
++    }
++    glActiveTexture(s->active_texture);
++    for (unsigned i = 0; i < sizeof(STATE_CAPS) / sizeof(*STATE_CAPS); ++i)
++        s->enabled[i] = glIsEnabled(STATE_CAPS[i]);
++}
++
++void dvbridge_gl_state_restore(const struct dvbridge_gl_state *s)
++{
++    for (unsigned i = 0; i < sizeof(STATE_CAPS) / sizeof(*STATE_CAPS); ++i) {
++        if (s->enabled[i])
++            glEnable(STATE_CAPS[i]);
++        else
++            glDisable(STATE_CAPS[i]);
++    }
++    for (int unit = 0; unit < DVBRIDGE_GL_STATE_UNITS; ++unit) {
++        glActiveTexture(GL_TEXTURE0 + unit);
++        glBindTexture(GL_TEXTURE_2D, s->texture[unit]);
++        glBindSampler(unit, s->sampler[unit]);
++    }
++    glActiveTexture(s->active_texture);
++    glColorMask(s->mask[0], s->mask[1], s->mask[2], s->mask[3]);
++    glBlendFuncSeparate(s->blend[0], s->blend[1], s->blend[2], s->blend[3]);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, s->unpack_alignment);
++    glScissor(s->scissor[0], s->scissor[1], s->scissor[2], s->scissor[3]);
++    glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->draw_framebuffer);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, s->read_framebuffer);
++    glBindVertexArray(s->vertex_array);
++    glBindBuffer(GL_ARRAY_BUFFER, s->array_buffer);
++    glUseProgram(s->program);
++}
++
++bool dvbridge_gl_copy(struct dvbridge_gl_copier *c, unsigned texture, unsigned framebuffer,
++                     int width, int height, int x, int y, int w, int h, bool flip, bool limited)
++{
++    if (!c || !texture || width < 1 || height < 1 || w < 1 || h < 1 || x < 0 || y < 0 ||
++        x > width - w || y > height - h)
++        return false;
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    for (unsigned i = 0; i < sizeof(STATE_CAPS) / sizeof(*STATE_CAPS); ++i)
++        glDisable(STATE_CAPS[i]);
++    glActiveTexture(GL_TEXTURE0);
++    bool ok = false;
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    /* what the framebuffer holds: fixed-point levels, or floating-point values */
++    const GLenum attachment = framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK;
++    GLint red = 0, green = 0, blue = 0, samples = 0, type = 0, encoding = 0;
++    glGetIntegerv(GL_RED_BITS, &red);
++    glGetIntegerv(GL_GREEN_BITS, &green);
++    glGetIntegerv(GL_BLUE_BITS, &blue);
++    glGetIntegerv(GL_SAMPLES, &samples);
++    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
++        GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
++    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
++        GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING, &encoding);
++    const bool floating = type == GL_FLOAT;
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || glGetError() ||
++        (!floating && type != GL_UNSIGNED_NORMALIZED) || red != green || red != blue ||
++        red < 8 || red > 16 || samples > 1 || encoding != GL_LINEAR)
++        goto restore;
++    glViewport(0, 0, width, height);
++    glEnable(GL_SCISSOR_TEST);
++    glScissor(x, flip ? height - y - h : y, w, h);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    glUseProgram(c->program);
++    glBindVertexArray(c->vao);
++    glBindSampler(0, c->sampler);
++    glBindTexture(GL_TEXTURE_2D, texture);
++    glUniform1i(c->picture, 0);
++    glUniform1i(c->flip_height, flip ? height : 0);
++    glUniform1f(c->levels, floating || red > 12 ? 0.0f : (float)((1u << red) - 1));
++    glUniform1i(c->limited, limited);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    ok = glGetError() == GL_NO_ERROR;
++restore:
++    dvbridge_gl_state_restore(&state);
++    return ok && glGetError() == GL_NO_ERROR;
++}
++
+ bool dvbridge_gl_pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned framebuffer,
+                      int width, int height, const uint32_t packets[512], unsigned count, bool flip)
+ {
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index 8e2c015..a3f57c3 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -11,4 +11,36 @@ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *packer);
+ bool dvbridge_gl_pack(struct dvbridge_gl_packer *packer, unsigned pq_texture,
+                      unsigned framebuffer, int width, int height,
+                      const uint32_t packets[512], unsigned count, bool flip_y);
++/* Hades: copies a picture from a float texture (first row at the top) into a framebuffer of the
++ * same size, sample for sample, for output as HDR10. A fixed-point framebuffer gets the nearest
++ * of its levels of every value: the shader picks the level, since a framebuffer may also cut a
++ * value off (a software renderer's copy of one framebuffer to another did). A floating-point one
++ * gets the values as they are. Only the rectangle given (from the top left) is written.
++ * flip_y: the first row of the framebuffer is the bottom one, as in a window. limited: the
++ * values go into the limited range of an RGB signal (64 to 940 of 1023), as those of Kodi's
++ * video do when its output is set to that. The GL state is put back. */
++struct dvbridge_gl_copier;
++struct dvbridge_gl_copier *dvbridge_gl_copier_create(void);
++void dvbridge_gl_copier_destroy(struct dvbridge_gl_copier *copier);
++bool dvbridge_gl_copy(struct dvbridge_gl_copier *copier, unsigned texture, unsigned framebuffer,
++                     int width, int height, int x, int y, int w, int h, bool flip_y,
++                     bool limited);
++/* Hades: the GL state that a caller goes on drawing with when a picture is reconstructed in the
++ * middle of its frame, as it is for output as HDR10: Kodi draws its GUI over the video
++ * afterwards, with client-side vertex arrays and the viewport of the window. libplacebo leaves
++ * its own state (dvbridge_render_hdr10(), and the first use of a pl_opengl). Saved before and
++ * restored after; dvbridge_gl_copy() does the same by itself. The 2D texture and the sampler of
++ * the first texture units are among it: libplacebo binds the textures of a pass to the units
++ * from 0 on and leaves them unbound (seven of them for a picture with an enhancement layer). */
++#define DVBRIDGE_GL_STATE_UNITS 16
++struct dvbridge_gl_state {
++    int program, vertex_array, array_buffer, draw_framebuffer, read_framebuffer;
++    int viewport[4], scissor[4], blend[4];
++    int unpack_alignment, active_texture;
++    int texture[DVBRIDGE_GL_STATE_UNITS], sampler[DVBRIDGE_GL_STATE_UNITS]; /* 2D, by unit */
++    unsigned char mask[4];
++    unsigned char enabled[9];
++};
++void dvbridge_gl_state_save(struct dvbridge_gl_state *state);
++void dvbridge_gl_state_restore(const struct dvbridge_gl_state *state);
+ #endif
+diff --git a/tools/dvbridge/dvbridge_placebo.c b/tools/dvbridge/dvbridge_placebo.c
+index b1d1a9a..ceeebcf 100644
+--- a/tools/dvbridge/dvbridge_placebo.c
++++ b/tools/dvbridge/dvbridge_placebo.c
+@@ -4,6 +4,44 @@
+ #include "dvbridge_metadata.h"
+ #include <libplacebo/utils/libav.h>
+ 
++bool dvbridge_hdr10_static(struct dvbridge_hdr10_static *out, const void *metadata, size_t bytes)
++{
++    if (!out || !metadata || (uintptr_t)metadata % _Alignof(AVDOVIMetadata) ||
++        !dvbridge_dv_bounds(metadata, bytes))
++        return false;
++    *out = (struct dvbridge_hdr10_static){0};
++    const AVDOVIMetadata *m = metadata;
++    const AVDOVIDmData *l6 = av_dovi_find_level(m, 6);
++    if (l6 && l6->l6.max_luminance > 0 && l6->l6.max_luminance <= 10000 &&
++        l6->l6.min_luminance < l6->l6.max_luminance * 10000u) {
++        out->level6 = true;
++        out->max_luminance = l6->l6.max_luminance;
++        out->min_luminance = l6->l6.min_luminance; /* 16 bits in the block */
++        /* The light levels as the block has them, like those of an HDR10 stream: the content may
++         * be brighter than the mastering display says. Only what cannot be a light level is left
++         * out: more than the signal can carry, or a frame average above the brightest pixel.
++         * Either may be 0, not known, with the other one given. */
++        if (l6->l6.max_cll <= 10000) {
++            out->max_cll = l6->l6.max_cll;
++            if (l6->l6.max_fall <= (l6->l6.max_cll ? l6->l6.max_cll : 10000))
++                out->max_fall = l6->l6.max_fall;
++        }
++        return true;
++    }
++    const AVDOVIColorMetadata *color = av_dovi_get_color(m);
++    if (color->source_max_pq == 0 || color->source_max_pq > 4095 ||
++        color->source_min_pq >= color->source_max_pq)
++        return false;
++    const float max = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, color->source_max_pq / 4095.0f);
++    const float min = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, color->source_min_pq / 4095.0f);
++    if (!(max >= 1) || max > 10000 || !(min >= 0) || min >= max)
++        return false;
++    out->max_luminance = (unsigned)(max + 0.5f);
++    /* a black level above what the field holds (6.5535 cd/m2) is not one a mastering display has */
++    out->min_luminance = min * 10000 + 0.5f < 65535 ? (unsigned)(min * 10000 + 0.5f) : 65535;
++    return true;
++}
++
+ bool dvbridge_map_color(struct dvbridge_color *out, const void *metadata,
+                        size_t bytes, bool enhancement_layer_paired, bool *residual_omitted)
+ {
+diff --git a/tools/dvbridge/dvbridge_placebo.h b/tools/dvbridge/dvbridge_placebo.h
+index 1abcb4f..74e41a1 100644
+--- a/tools/dvbridge/dvbridge_placebo.h
++++ b/tools/dvbridge/dvbridge_placebo.h
+@@ -11,6 +11,19 @@ struct dvbridge_color {
+     struct pl_dovi_metadata dovi;
+ };
+ 
++/* Hades: what an HDR10 output says of a picture reconstructed with this metadata, which is the
++ * picture as it was mastered. From the level 6 block when the metadata has one. Without it, the
++ * luminance range of the source as the metadata gives it, and the light levels not known.
++ * Every value fits the 16 bits it has in the HDMI infoframe. */
++struct dvbridge_hdr10_static {
++    bool level6;            /* taken from a level 6 block */
++    unsigned max_luminance; /* of the mastering display, cd/m2: 1 to 10000 */
++    unsigned min_luminance; /* ... in 0.0001 cd/m2: at most 65535 */
++    unsigned max_cll;       /* cd/m2, at most 10000; 0: not known */
++    unsigned max_fall;      /* cd/m2, at most max_cll when that is known; 0: not known */
++};
++bool dvbridge_hdr10_static(struct dvbridge_hdr10_static *out, const void *metadata, size_t bytes);
++
+ /* Output owns its mapping; do not copy it without rebinding repr.dovi.
+  * A FEL picture (NLQ active) without its paired enhancement layer is refused, unless
+  * residual_omitted is given (Hades): it is then mapped with the base-layer reshaping alone and
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index a9f1cb3..fa6c4c1 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -12,6 +12,10 @@ struct dvbridge_renderer {
+     pl_gpu gpu;
+     pl_renderer renderer;
+     pl_tex rgb;
++    /* Hades: the picture for output as HDR10 (dvbridge_render_hdr10()); whether the last call
++     * drew it, and whether the texture holds a whole picture (that one or an earlier one) */
++    pl_tex hdr10;
++    bool hdr10_ready, hdr10_whole;
+     struct dvbridge_context *context;
+     struct dvbridge_candidate *pending;
+     bool ready;
+@@ -165,7 +169,19 @@ static struct pl_hook_res mask_active_area(void *priv, const struct pl_hook_para
+     return (struct pl_hook_res){.failed = mask->failed, .output = PL_HOOK_SIG_NONE};
+ }
+ 
++static struct dvbridge_renderer *create_renderer(pl_gpu gpu, pl_log log, bool transport);
++
+ struct dvbridge_renderer *dvbridge_renderer_create(pl_gpu gpu, pl_log log)
++{
++    return create_renderer(gpu, log, true);
++}
++
++struct dvbridge_renderer *dvbridge_renderer_create_hdr10(pl_gpu gpu, pl_log log)
++{
++    return create_renderer(gpu, log, false);
++}
++
++static struct dvbridge_renderer *create_renderer(pl_gpu gpu, pl_log log, bool transport)
+ {
+     if (!gpu)
+         return NULL;
+@@ -188,10 +204,10 @@ struct dvbridge_renderer *dvbridge_renderer_create(pl_gpu gpu, pl_log log)
+     r->context = dvbridge_create();
+     pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32,
+                              PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+-    if (fmt)
++    if (fmt && transport)
+         r->rgb = pl_tex_create(gpu, pl_tex_params(.w = 3840, .h = 2160, .format = fmt,
+             .sampleable = true, .renderable = true, .blit_dst = true));
+-    if (!r->renderer || !r->context || !r->rgb) {
++    if (!r->renderer || !r->context || (transport ? !r->rgb : !fmt)) {
+         dvbridge_renderer_destroy(r);
+         return NULL;
+     }
+@@ -206,6 +222,7 @@ void dvbridge_renderer_reset(struct dvbridge_renderer *r)
+     r->pending = NULL;
+     r->ready = false;
+     r->packed = false;
++    r->hdr10_ready = false;
+     dvbridge_reset(r->context);
+     if (r->renderer) {
+         pl_renderer_flush_cache(r->renderer);
+@@ -219,6 +236,7 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+         return;
+     dvbridge_candidate_destroy(r->pending);
+     dvbridge_destroy(r->context);
++    pl_tex_destroy(r->gpu, &r->hdr10);
+     pl_tex_destroy(r->gpu, &r->rgb);
+     pl_renderer_destroy(&r->renderer);
+     free(r);
+@@ -439,6 +457,132 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+     return r->ready;
+ }
+ 
++/* Hades: the picture stays within [0, 1]: a floating-point target does not clamp what is
++ * written to it. */
++static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params *p)
++{
++    bool *called = priv;
++    static const struct pl_custom_shader shader = {
++        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++        .body = "color = clamp(color, 0.0, 1.0);",
++        .description = "DV picture within the range of an HDR10 output"};
++    *called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    return (struct pl_hook_res){.failed = !*called, .output = PL_HOOK_SIG_NONE};
++}
++
++static bool view_fits(struct dvbridge_view view, const struct pl_frame *source, int width,
++                      int height)
++{
++    return view.dst_width > 0 && view.dst_height > 0 && view.dst_x >= 0 && view.dst_y >= 0 &&
++           view.dst_x <= width - view.dst_width && view.dst_y <= height - view.dst_height &&
++           isfinite(view.src_x0) && isfinite(view.src_y0) && isfinite(view.src_x1) &&
++           isfinite(view.src_y1) && view.src_x1 - view.src_x0 >= 1 &&
++           view.src_y1 - view.src_y0 >= 1 && view.src_x0 >= source->crop.x0 &&
++           view.src_y0 >= source->crop.y0 && view.src_x1 <= source->crop.x1 &&
++           view.src_y1 <= source->crop.y1;
++}
++
++static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *source,
++                         const void *metadata, size_t bytes, double pts, double el_pts,
++                         struct dvbridge_view view, int width, int height)
++{
++    if (!source || !isfinite(pts) || width < 1 || height < 1 || width > 16384 || height > 16384 ||
++        source->num_planes < 1 || source->num_planes > 4 || source->rotation ||
++        !view_fits(view, source, width, height))
++        return false;
++    for (int p = 0; p < source->num_planes; ++p)
++        if (!source->planes[p].texture)
++            return false;
++    const struct pl_frame *el = source->enhancement_layer;
++    if (el) {
++        if (el->num_planes < 1 || el->num_planes > 4 || el->rotation || el->enhancement_layer)
++            return false;
++        for (int p = 0; p < el->num_planes; ++p)
++            if (!el->planes[p].texture)
++                return false;
++    }
++    bool paired = el && isfinite(el_pts) && fabs(pts - el_pts) < 0.00001;
++    struct dvbridge_color mapped;
++    if (!dvbridge_map_color(&mapped, metadata, bytes, paired, &r->residual_omitted))
++        return false;
++    /* The format of the picture that the transport is packed from. A half-float one would be half
++     * the memory, and it is not as good: stored in one by a software renderer, the picture came
++     * out up to half a code of 1023 below this one (the values were cut off, not rounded). */
++    if (!r->hdr10 || r->hdr10->params.w != width || r->hdr10->params.h != height) {
++        r->hdr10_whole = false;
++        pl_fmt fmt = pl_find_fmt(r->gpu, PL_FMT_FLOAT, 4, 32, 32,
++                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
++        if (!fmt || !pl_tex_recreate(r->gpu, &r->hdr10, pl_tex_params(.w = width, .h = height,
++                .format = fmt, .sampleable = true, .renderable = true)))
++            return false;
++    }
++    struct pl_frame image = *source;
++    mapped.repr.bits = source->repr.bits;
++    mapped.repr.alpha = source->repr.alpha;
++    image.repr = mapped.repr;
++    image.color = mapped.color;
++    image.profile = (struct pl_icc_profile){0};
++    image.icc = NULL;
++    image.lut = NULL;
++    image.crop = (pl_rect2df){view.src_x0, view.src_y0, view.src_x1, view.src_y1};
++    /* The same colour space on both sides: the picture is reconstructed and not mapped. */
++    struct pl_frame target = {
++        .num_planes = 1,
++        .planes = {{.texture = r->hdr10, .components = 4, .component_mapping = {0, 1, 2, 3}}},
++        .repr = pl_color_repr_rgb,
++        .color = mapped.color,
++        .crop = {view.dst_x, view.dst_y, view.dst_x + view.dst_width, view.dst_y + view.dst_height},
++    };
++    struct pl_render_params params = pl_render_default_params;
++    params.min_fbo_precision = 32;
++    params.peak_detect_params = NULL;
++    params.dither_params = NULL;
++    params.frame_mixer = NULL;
++    params.skip_caching_single_frame = true;
++    params.border = PL_CLEAR_SKIP;
++    bool clamped = false;
++    const struct pl_hook hook = {
++        .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &clamped,
++        .hook = clamp_picture, .signature = 0x4456424844523130ULL};
++    const struct pl_hook *hooks[] = {&hook};
++    params.hooks = hooks;
++    params.num_hooks = 1;
++    /* from here on the texture may hold a part of this picture over the one before it */
++    r->hdr10_whole = false;
++    bool ok = pl_render_image(r->renderer, &image, &target, &params) && clamped;
++    struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
++    r->hdr10_whole = ok && !errors.errors && !errors.num_disabled_hooks;
++    return r->hdr10_whole;
++}
++
++bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *source,
++                          const void *metadata, size_t bytes, double pts, double el_pts,
++                          struct dvbridge_view view, int width, int height)
++{
++    if (!r)
++        return false;
++    r->hdr10_ready = false;
++    r->residual_omitted = false;
++    /* errors left by earlier, unrelated GL work are not ours, as in dvbridge_render_rgb() */
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    struct saved_gl_state state;
++    save_gl_state(&state);
++    r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height);
++    restore_gl_state(&state);
++    return r->hdr10_ready;
++}
++
++pl_tex dvbridge_render_hdr10_texture(const struct dvbridge_renderer *r)
++{
++    return r && r->hdr10_ready ? r->hdr10 : NULL;
++}
++
++pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *r)
++{
++    return r && r->hdr10_whole ? r->hdr10 : NULL;
++}
++
+ pl_tex dvbridge_render_texture(const struct dvbridge_renderer *r)
+ {
+     return r && r->ready && !r->packed ? r->rgb : NULL;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 3d63b41..5460c07 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -14,6 +14,32 @@ void dvbridge_renderer_reset(struct dvbridge_renderer *renderer);
+ bool dvbridge_render_rgb(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+                         const void *metadata, size_t bytes, double pts, double el_pts,
+                         struct dvbridge_geometry geometry);
++/* Hades: where a picture is drawn for output as HDR10: the part of the source that is shown, in
++ * its samples, and its place in the target, in pixels from the top left. */
++struct dvbridge_view {
++    float src_x0, src_y0, src_x1, src_y1;
++    int dst_x, dst_y, dst_width, dst_height;
++};
++/* Hades: the reconstruction alone, for output as HDR10: the picture as its metadata describes
++ * it, in BT.2020 with the PQ transfer and full range, within [0, 1]. Nothing of the Dolby Vision
++ * transport is prepared, so the metadata does not have to be what the transport carries, and the
++ * target is not the 3840x2160 raster: a float texture of the given size that the renderer keeps
++ * (first row at the top), in which only the place of the picture is written. pts and el_pts as
++ * for dvbridge_render_rgb(): the enhancement layer counts when they are the same. */
++#define DVBRIDGE_RENDER_HDR10 1
++bool dvbridge_render_hdr10(struct dvbridge_renderer *renderer, const struct pl_frame *source,
++                          const void *metadata, size_t bytes, double pts, double el_pts,
++                          struct dvbridge_view view, int width, int height);
++/* The texture of the last dvbridge_render_hdr10() when it succeeded, or NULL. It goes to the
++ * output with dvbridge_gl_copy(). */
++pl_tex dvbridge_render_hdr10_texture(const struct dvbridge_renderer *renderer);
++/* ... or the picture before it: the texture still holds a whole picture, the last one that was
++ * drawn, also after a dvbridge_render_hdr10() that failed before it drew anything. NULL when it
++ * holds none. For a frame that could not be reconstructed, in place of nothing. */
++pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *renderer);
++/* Hades: a renderer for dvbridge_render_hdr10() alone, without the 3840x2160 picture that the
++ * transport is packed from (132 MB that such a renderer never uses). */
++struct dvbridge_renderer *dvbridge_renderer_create_hdr10(pl_gpu gpu, pl_log log);
+ /* Optional full-raster, overlay-free fast path. The caller owns an exact RGBA8
+  * linear target; all other layouts keep the separate full-precision path. */
+ bool dvbridge_render_packed(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+-- 
+2.53.0
+

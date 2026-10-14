@@ -1,0 +1,336 @@
+From 9e528c46cc41af4d8e183b102df97e708d2f9705 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:23:35 +0000
+Subject: [PATCH] DVDVideoCodecFFmpeg: the decoder of both views is opened with
+ the parameter sets of the second view
+
+A Matroska file made of a 3D Blu-ray has the parameter sets of the
+second view (the subset sequence parameter set and its picture parameter
+sets) in a box 'mvcC' behind the record of the base view, and may have
+them among the NAL units of the stream as well. The decoder reads the
+record of the base view and nothing behind it, so it learnt of the
+second view from the stream, or not at all:
+
+- a file that has those sets in the box only never showed its second
+  view: two seconds of the base view in both halves, and then 2D;
+- a file that sends them with the second view itself, in a layout that
+  keeps the second view of an access unit in the packet of the base view
+  of the next one, started without it. Measured on a host with a
+  1920x1080 stream laid out that way, against the reference decoder: the
+  first picture came out with its base view alone, and the second view
+  of the pictures after it was wrong (16 to 19.5 dB) until that view
+  started anew, at every start and every resume. Nothing in Kodi can see
+  that.
+
+The decoder of both views is now opened with a record in which those
+sets stand where it reads them: the subset sequence parameter sets of
+the box behind the sequence parameter sets of the base view, its picture
+parameter sets behind those of the base view; everything else, the box
+included, as it was (KODI::MULTIVIEW::WithSecondViewSets(), with nothing
+of FFmpeg or of Kodi in it). A set that the record has already is not
+added again. Where a picture parameter set of the box has the number of
+one of the base view and is another set, where a number cannot be read
+or the record has no room, nothing is added and the private data is used
+as it is: the base view is never given a set that is not its own.
+
+Only for the decoder of both views. Every other decoder, and that one
+when it is given up for a stream, gets the private data as the file has
+it.
+
+Host test: multiview_test (the record that comes out, set by set; every
+cut and every changed byte of the private data, under the sanitizers).
+---
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  25 +-
+ xbmc/cores/VideoPlayer/MultiviewChoice.h      | 213 ++++++++++++++++++
+ 2 files changed, 237 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 1ad5393..4b6754c 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -491,7 +491,30 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+   m_pCodecContext->bits_per_coded_sample = hints.bitsperpixel;
+   m_pCodecContext->bits_per_raw_sample = hints.bitdepth;
+ 
+-  if (hints.extradata)
++  // Hades: the decoder of both views is opened with the parameter sets of the second view
++  // among those of the base view, where the private data has them in a box of their own
++  // (KODI::MULTIVIEW::WithSecondViewSets() says why). Any other decoder, and this one where
++  // there is nothing to add, gets the private data as it is.
++  std::vector<uint8_t> secondViewSets;
++  if (multiview && hints.extradata)
++    secondViewSets = KODI::MULTIVIEW::WithSecondViewSets(hints.extradata.GetData(),
++                                                         hints.extradata.GetSize());
++  if (!secondViewSets.empty())
++  {
++    m_pCodecContext->extradata =
++        (uint8_t*)av_mallocz(secondViewSets.size() + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (m_pCodecContext->extradata)
++    {
++      m_pCodecContext->extradata_size = static_cast<int>(secondViewSets.size());
++      memcpy(m_pCodecContext->extradata, secondViewSets.data(), secondViewSets.size());
++      CLog::Log(LOGINFO,
++                "CDVDVideoCodecFFmpeg::Open() the parameter sets of the second view are given to "
++                "the decoder with those of the base view ({} bytes of private data, {} as the "
++                "file has it)",
++                secondViewSets.size(), hints.extradata.GetSize());
++    }
++  }
++  else if (hints.extradata)
+   {
+     m_pCodecContext->extradata =
+         (uint8_t*)av_mallocz(hints.extradata.GetSize() + AV_INPUT_BUFFER_PADDING_SIZE);
+diff --git a/xbmc/cores/VideoPlayer/MultiviewChoice.h b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+index 1086365..7ab4151 100644
+--- a/xbmc/cores/VideoPlayer/MultiviewChoice.h
++++ b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+@@ -8,12 +8,15 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+ #include <limits>
+ #include <numeric>
+ #include <optional>
++#include <span>
+ #include <string_view>
++#include <vector>
+ 
+ namespace KODI
+ {
+@@ -58,6 +61,7 @@ inline constexpr const char* BASE_ONLY_STEREO_MODE = "mono";
+ 
+ namespace DETAIL
+ {
++inline constexpr int NAL_PPS = 8;
+ inline constexpr int NAL_SUBSET_SPS = 15;
+ inline constexpr int PROFILE_MULTIVIEW_HIGH = 118;
+ inline constexpr int PROFILE_STEREO_HIGH = 128;
+@@ -109,6 +113,95 @@ inline bool DeclaresSecondView(const uint8_t* record, size_t size)
+   }
+   return found;
+ }
++//! A parameter set as a record has it: two bytes of length, and the NAL unit
++using Set = std::span<const uint8_t>;
++
++/*!
++ * \brief The parameter sets of a second view, from a record of the form of the 'mvcC' box
++ * \param[out] sps its subset sequence parameter sets (what else is in that list is left out)
++ * \param[out] pps its picture parameter sets
++ * \return false when the record ends before what it announces
++ */
++inline bool SecondViewSets(const uint8_t* record,
++                           size_t size,
++                           std::vector<Set>& sps,
++                           std::vector<Set>& pps)
++{
++  if (size < 7 || record[0] != 1)
++    return false;
++
++  // (the count as DeclaresSecondView() reads it)
++  unsigned int count = (record[5] & 0xe0) == 0xe0 ? record[5] & 0x1f : record[5] & 0x7f;
++  size_t pos = 6;
++  for (int list = 0; list < 2; ++list)
++  {
++    if (list == 1)
++    {
++      if (size - pos < 1)
++        return false;
++      count = record[pos++];
++    }
++    for (unsigned int i = 0; i < count; ++i)
++    {
++      if (size - pos < 2)
++        return false;
++      const size_t length = Be16(record + pos);
++      if (size - pos - 2 < length)
++        return false;
++      const int type = length ? record[pos + 2] & 0x1f : 0;
++      if (list == 0 && type == NAL_SUBSET_SPS)
++        sps.emplace_back(record + pos, 2 + length);
++      else if (list == 1 && type == NAL_PPS)
++        pps.emplace_back(record + pos, 2 + length);
++      pos += 2 + length;
++    }
++  }
++  return true;
++}
++
++/*!
++ * \brief The number that a picture parameter set goes by (pic_parameter_set_id)
++ * \param set the set behind its length
++ * \return the number, or -1 when it cannot be read
++ *
++ * The first field of the set, an Exp-Golomb code right behind the byte of the NAL unit header.
++ * The numbers go up to 255, at most 17 bits: no byte that the stream inserts against start
++ * codes can stand among them.
++ */
++inline int PpsId(Set set)
++{
++  size_t bit = 8 * 3; // behind the length and the header
++  const auto next = [&set, &bit]() -> int
++  {
++    if (bit / 8 >= set.size())
++      return -1;
++    const int value = (set[bit / 8] >> (7 - bit % 8)) & 1;
++    ++bit;
++    return value;
++  };
++
++  int zeros = 0;
++  for (;;)
++  {
++    const int value = next();
++    if (value < 0)
++      return -1;
++    if (value)
++      break;
++    if (++zeros > 8)
++      return -1;
++  }
++  int rest = 0;
++  for (int i = 0; i < zeros; ++i)
++  {
++    const int value = next();
++    if (value < 0)
++      return -1;
++    rest = rest << 1 | value;
++  }
++  const int id = (1 << zeros) - 1 + rest;
++  return id <= 255 ? id : -1;
++}
+ } // namespace DETAIL
+ 
+ /*!
+@@ -169,6 +262,126 @@ inline bool HasMvcConfiguration(const uint8_t* data, size_t size)
+   return false;
+ }
+ 
++/*!
++ * \brief The private data of such a track with the parameter sets of its second view put among
++ *        those of the base view
++ *
++ * A decoder reads the record of the base view ('avcC') and nothing behind it. It then learns of
++ * the second view from the stream, where the file has the subset sequence parameter set among
++ * its NAL units. A decoder that learns of it with the first slices of the second view has
++ * started without it: the first picture comes out with its base view alone, and what is
++ * predicted from the second view of that picture is wrong until that view starts anew. A file
++ * that has those parameter sets in the box only never shows its second view at all.
++ *
++ * So the decoder of both views is opened with a record in which they stand where it reads
++ * them: the subset sequence parameter sets of the box behind the sequence parameter sets of
++ * the base view, its picture parameter sets behind those of the base view. Everything else,
++ * the box included, stays as it is.
++ *
++ * A set that the record has already is not added again. A picture parameter set of the box
++ * that has the number of one of the base view and is another set is a doubt: it would take the
++ * place of the one that the base view is decoded with. Nothing is added then, nor where a
++ * number cannot be read or the record has no room for more sets.
++ *
++ * \return the private data to open the decoder of both views with; empty where there is
++ *         nothing to add (the private data is then used as it is)
++ */
++inline std::vector<uint8_t> WithSecondViewSets(const uint8_t* data, size_t size)
++{
++  if (!HasMvcConfiguration(data, size))
++    return {};
++
++  // The sets of the base view. HasMvcConfiguration() has walked them: they lie within the data.
++  std::vector<DETAIL::Set> baseSps;
++  std::vector<DETAIL::Set> basePps;
++  size_t pos = 6;
++  for (unsigned int i = data[5] & 0x1f; i; --i)
++  {
++    const size_t length = 2 + DETAIL::Be16(data + pos);
++    baseSps.emplace_back(data + pos, length);
++    pos += length;
++  }
++  const size_t spsEnd = pos;
++  for (unsigned int i = data[pos++]; i; --i)
++  {
++    const size_t length = 2 + DETAIL::Be16(data + pos);
++    basePps.emplace_back(data + pos, length);
++    pos += length;
++  }
++  const size_t ppsEnd = pos;
++
++  // the box, as HasMvcConfiguration() finds it
++  std::vector<DETAIL::Set> sps;
++  std::vector<DETAIL::Set> pps;
++  bool found = false;
++  for (; !found && size - pos >= 8; ++pos)
++  {
++    if (data[pos + 4] != 'm' || data[pos + 5] != 'v' || data[pos + 6] != 'c' ||
++        data[pos + 7] != 'C')
++      continue;
++    const uint64_t box = DETAIL::Be32(data + pos);
++    if (box < 8 || box > size - pos)
++      continue;
++    const uint8_t* record = data + pos + 8;
++    const size_t recordSize = static_cast<size_t>(box) - 8;
++    if (!DETAIL::DeclaresSecondView(record, recordSize))
++      continue;
++    if (!DETAIL::SecondViewSets(record, recordSize, sps, pps))
++      return {};
++    found = true;
++  }
++  if (!found)
++    return {};
++
++  // what the record does not have yet
++  const auto has = [](const std::vector<DETAIL::Set>& sets, DETAIL::Set set)
++  {
++    return std::ranges::any_of(sets, [set](DETAIL::Set other)
++                               { return std::ranges::equal(other, set); });
++  };
++  std::vector<DETAIL::Set> moreSps;
++  std::vector<DETAIL::Set> morePps;
++  for (const DETAIL::Set set : sps)
++  {
++    if (!has(baseSps, set) && !has(moreSps, set))
++      moreSps.push_back(set);
++  }
++  for (const DETAIL::Set set : pps)
++  {
++    if (has(basePps, set) || has(morePps, set))
++      continue;
++    // (the number of another set of the base view: see above)
++    const int id = DETAIL::PpsId(set);
++    if (id < 0)
++      return {};
++    for (const DETAIL::Set base : basePps)
++    {
++      if (DETAIL::PpsId(base) == id)
++        return {};
++    }
++    morePps.push_back(set);
++  }
++  if (moreSps.empty() && morePps.empty())
++    return {};
++  // (the record counts its sequence parameter sets in five bits, the others in eight)
++  if (baseSps.size() + moreSps.size() > 31 || basePps.size() + morePps.size() > 255)
++    return {};
++
++  std::vector<uint8_t> out;
++  out.reserve(size + 4096);
++  out.insert(out.end(), data, data + 5);
++  out.push_back(static_cast<uint8_t>((data[5] & 0xe0) | (baseSps.size() + moreSps.size())));
++  out.insert(out.end(), data + 6, data + spsEnd);
++  for (const DETAIL::Set set : moreSps)
++    out.insert(out.end(), set.begin(), set.end());
++  out.push_back(static_cast<uint8_t>(basePps.size() + morePps.size()));
++  out.insert(out.end(), data + spsEnd + 1, data + ppsEnd);
++  for (const DETAIL::Set set : morePps)
++    out.insert(out.end(), set.begin(), set.end());
++  out.insert(out.end(), data + ppsEnd, data + size);
++  return out;
++}
++
+ //! Which eye the base view of a stream is
+ enum class BaseEye
+ {
+-- 
+2.53.0
+

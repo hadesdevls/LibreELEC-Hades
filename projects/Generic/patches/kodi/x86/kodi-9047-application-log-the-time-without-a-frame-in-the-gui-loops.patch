@@ -1,0 +1,241 @@
+From 143536ddc33efb50ed2842f85f7807387c90251f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 05:48:52 +0000
+Subject: [PATCH] application: log the time without a frame in the GUI loops
+
+A slow GUI is reported as "the menus freeze when opening a section" or
+"adding a source feels slow", and the log has nothing to tell where the
+time goes. Log every pass (Process, FrameMove, Render) that takes 300 ms
+or more, with the time of each part and the active window (and the
+dialog on top of it), at most once a second unless the wait was a second
+or more, and with the number of reports left out since the last one.
+
+A modal dialog, a busy wait and the close animation of a window run a
+nested loop (CGUIWindowManager::ProcessRenderLoop()) inside a pass of
+the loop that opened them. Their passes are measured in the same way.
+The pass that holds a nested loop lasts for as long as that loop, so it
+is not reported as a whole: what is measured is the time it spends
+without a frame before, between and after the passes of the nested loop
+(the load of a dialog, the load of the next window after a close
+animation, the filling of a list after a busy wait).
+
+Diagnostics only: nothing else changes.
+---
+ xbmc/application/Application.cpp | 108 ++++++++++++++++++++++++++++++-
+ xbmc/application/Application.h   |  28 ++++++++
+ xbmc/guilib/GUIWindowManager.cpp |   5 ++
+ 3 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index c293f9b..af0776d 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -1653,6 +1653,109 @@ void CApplication::ResetCurrentItem()
+     m_pGUI->GetInfoManager().ResetCurrentItem();
+ }
+ 
++namespace
++{
++// Time without a frame that is felt as a frozen GUI. It is logged at most once a second, so that a
++// test on real hardware shows where the GUI waits (a blocking directory listing, the load of a
++// window, a change of the display mode, the audio engine, the storage).
++// (300 ms: Kodi itself waits 100 to 220 ms for a job before it shows the busy dialog)
++constexpr auto SLOW_PASS = std::chrono::milliseconds(300);
++
++long long PassMs(std::chrono::steady_clock::duration d)
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
++}
++
++// the active window and, when there is one, the modal dialog on top of it
++std::string PassWindows()
++{
++  const auto gui = CServiceBroker::GetGUI();
++  if (!gui)
++    return "none";
++
++  const int window = gui->GetWindowManager().GetActiveWindow();
++  const int top = gui->GetWindowManager().GetActiveWindowOrDialog();
++  if (top == window)
++    return std::to_string(window);
++
++  return std::to_string(window) + " under dialog " + std::to_string(top);
++}
++} // unnamed namespace
++
++bool CApplication::SlowPassReportDue(std::chrono::steady_clock::time_point now,
++                                     std::chrono::steady_clock::duration waited)
++{
++  // at most one line a second, except for a wait of a second or more
++  if (waited < std::chrono::seconds(1) && now - m_passLogged < std::chrono::seconds(1))
++  {
++    m_passesUnreported++;
++    return false;
++  }
++  m_passLogged = now;
++  return true;
++}
++
++void CApplication::ReportFrameGap(std::chrono::steady_clock::time_point now,
++                                  std::chrono::steady_clock::duration gap,
++                                  const char* where)
++{
++  if (gap < SLOW_PASS || !SlowPassReportDue(now, gap))
++    return;
++
++  CLog::Log(LOGINFO, "GUI: {} ms without a frame {}; window {}; {} more since the last report",
++            PassMs(gap), where, PassWindows(), m_passesUnreported);
++  m_passesUnreported = 0;
++}
++
++std::chrono::steady_clock::time_point CApplication::BeginPass(bool nested, bool render)
++{
++  const auto now = std::chrono::steady_clock::now();
++  // A nested loop runs inside a pass of the loop that holds it. What that pass did since the last
++  // frame (the load of a dialog before its first frame, blocking work between two ticks of a
++  // progress dialog) is not part of any pass of the nested loop: it is measured here.
++  // (only inside a pass: a nested loop that runs before the main loop has no frame before it)
++  if (nested && render && m_passDepth > 0)
++    ReportFrameGap(now, now - m_passMark, "before a pass of a nested loop");
++  m_passDepth++;
++  m_passMark = now;
++  return now;
++}
++
++void CApplication::EndPass(std::chrono::steady_clock::time_point start,
++                           std::chrono::steady_clock::time_point processed,
++                           std::chrono::steady_clock::time_point moved,
++                           bool nested,
++                           bool render)
++{
++  const auto now = std::chrono::steady_clock::now();
++  const auto mark = m_passMark;
++  m_passMark = now;
++  if (m_passDepth > 0)
++    m_passDepth--;
++
++  if (!render)
++    return;
++
++  // A nested loop ran inside this pass, which lasted for as long as that one (a dialog was open):
++  // only what it did after the last frame of the nested loop counts (the load of the next window
++  // after a close animation, the filling of a list after a busy wait).
++  if (mark != start)
++  {
++    ReportFrameGap(now, now - mark, "after a nested loop");
++    return;
++  }
++
++  if (now - start < SLOW_PASS || !SlowPassReportDue(now, now - start))
++    return;
++
++  CLog::Log(LOGINFO,
++            "GUI: a pass of the {} loop took {} ms (process {}, frame move {}, render {}); window "
++            "{}; {} more since the last report",
++            nested ? "nested" : "main", PassMs(now - start), PassMs(processed - start),
++            PassMs(moved - processed), PassMs(now - moved), PassWindows(), m_passesUnreported);
++  m_passesUnreported = 0;
++}
++
+ int CApplication::Run()
+ {
+   CLog::Log(LOGINFO, "Running the application...");
+@@ -1674,14 +1777,16 @@ int CApplication::Run()
+   {
+     // Animate and render a frame
+ 
+-    lastFrameTime = std::chrono::steady_clock::now();
++    lastFrameTime = BeginPass(false, true);
+     Process();
++    const auto processed = std::chrono::steady_clock::now();
+ 
+     bool renderGUI = GetComponent<CApplicationPowerHandling>()->GetRenderGUI();
+     if (!m_bStop)
+     {
+       FrameMove(true, renderGUI);
+     }
++    const auto moved = std::chrono::steady_clock::now();
+ 
+     if (renderGUI && !m_bStop)
+     {
+@@ -1694,6 +1799,7 @@ int CApplication::Run()
+       if (frameTime.count() < noRenderFrameTime)
+         KODI::TIME::Sleep(std::chrono::milliseconds(noRenderFrameTime - frameTime.count()));
+     }
++    EndPass(lastFrameTime, processed, moved, false, renderGUI && !m_bStop);
+   }
+ 
+   Cleanup();
+diff --git a/xbmc/application/Application.h b/xbmc/application/Application.h
+index 03516d6..f40ce07 100644
+--- a/xbmc/application/Application.h
++++ b/xbmc/application/Application.h
+@@ -105,6 +105,23 @@ public:
+   void FrameMove(bool processEvents, bool processGUI = true) override;
+   void Render() override;
+ 
++  /*!
++   * \brief Hades diagnostics: the start and the end of a pass (process, frame move, render) of
++   * the main loop, or of a nested loop (CGUIWindowManager::ProcessRenderLoop(): a modal dialog,
++   * a busy wait, the close animation of a window). Time without a frame is logged when it is
++   * long: a whole pass with its parts, or what the loop that holds a nested one did before,
++   * between and after the passes of that one.
++   * \param nested a pass of a nested loop
++   * \param render whether the pass renders (not while the display saves power)
++   * \return the start of the pass, for EndPass()
++   */
++  std::chrono::steady_clock::time_point BeginPass(bool nested, bool render);
++  void EndPass(std::chrono::steady_clock::time_point start,
++               std::chrono::steady_clock::time_point processed,
++               std::chrono::steady_clock::time_point moved,
++               bool nested,
++               bool render);
++
+   bool IsInitialized() const { return !m_bInitializing; }
+   void DoneInitializing() { m_bInitializing = false; }
+   bool IsStopping() const { return m_bStop; }
+@@ -227,6 +244,17 @@ protected:
+   std::chrono::time_point<std::chrono::steady_clock> m_lastRenderTime;
+   bool m_skipGuiRender = false;
+ 
++  // see BeginPass(); used by the thread of the main loop only
++  bool SlowPassReportDue(std::chrono::steady_clock::time_point now,
++                         std::chrono::steady_clock::duration waited);
++  void ReportFrameGap(std::chrono::steady_clock::time_point now,
++                      std::chrono::steady_clock::duration gap,
++                      const char* where);
++  std::chrono::steady_clock::time_point m_passMark; //!< the last start or end of a pass
++  unsigned int m_passDepth = 0; //!< passes that are open (a nested loop runs inside one)
++  std::chrono::steady_clock::time_point m_passLogged;
++  unsigned int m_passesUnreported = 0;
++
+   std::unique_ptr<MUSIC_INFO::CMusicInfoScanner> m_musicInfoScanner;
+ 
+   std::unique_ptr<CInertialScrollingHandler> m_pInertialScrollingHandler;
+diff --git a/xbmc/guilib/GUIWindowManager.cpp b/xbmc/guilib/GUIWindowManager.cpp
+index 0ca0a39..bddea99 100644
+--- a/xbmc/guilib/GUIWindowManager.cpp
++++ b/xbmc/guilib/GUIWindowManager.cpp
+@@ -1561,14 +1561,19 @@ bool CGUIWindowManager::ProcessRenderLoop(bool renderOnly)
+   {
+     renderGui = m_pCallback->GetRenderGUI();
+     m_iNested++;
++    // Hades diagnostics, as in CApplication::Run()
++    const auto start = g_application.BeginPass(true, renderGui);
+     if (!renderOnly)
+       m_pCallback->Process();
++    const auto processed = std::chrono::steady_clock::now();
+     {
+       CSingleExit leaveIt(CServiceBroker::GetWinSystem()->GetGfxContext());
+       m_pCallback->FrameMove(!renderOnly);
+     }
++    const auto moved = std::chrono::steady_clock::now();
+     m_pCallback->Render();
+     m_iNested--;
++    g_application.EndPass(start, processed, moved, true, renderGui);
+   }
+   if (g_application.m_bStop || !renderGui)
+     return false;
+-- 
+2.53.0
+

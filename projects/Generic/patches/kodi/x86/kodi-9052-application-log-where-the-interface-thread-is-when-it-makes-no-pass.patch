@@ -1,0 +1,900 @@
+From 5a8e2fab827dc83f38cc32445b618a3d65bff0cd Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:19:37 +0000
+Subject: [PATCH] application: log where the interface thread is when it makes
+ no pass
+
+"log the time without a frame in the GUI loops" says how long the
+interface went without a frame, once it has one again. It does not say
+what its thread was doing. The first opening of an add-on froze the
+interface for 30.9 s (2026-10-03, "GUI: 30890 ms without a frame after
+a nested loop; window 10025") and the log has no trace of the cause.
+
+CGUIStallWatch is a thread that watches the time of the last pass of
+the main loop and of the nested loops. After five seconds without a
+pass, and once more after fifteen, it writes to the log:
+
+- what the thread of the interface waits in: the system call, from
+  /proc/self/task/<tid>/syscall, and for the calls that take one the
+  file, device or socket;
+- the return addresses on its stack, innermost first, as file+address
+  (what addr2line takes), and by name for the functions that their
+  file exports.
+
+The watched thread is only looked at. It gets no signal: a signal ends
+a poll(), a select() or a sleep with EINTR even with SA_RESTART, and
+code that takes that for an error (the wait of libnfs, for one) would
+fail where it only was slow. Its stack is read through the kernel
+(process_vm_readv()), which cannot fault, and nothing unwinds through
+code of others. Nothing is asked of the dynamic loader either, whose
+records another thread can free at any moment by unloading a library,
+and whose lock a thread that hangs while loading one holds: what is
+mapped where comes from /proc/self/maps, and the names from the dynamic
+symbol tables of the files on disk, read after the list of addresses
+is in the log.
+
+The price is exactness. The return addresses are found by their look
+(a word of the stack that points into code, right behind a call
+instruction), so calls that already returned can be among them. A
+thread that is running, not waiting, shows no stack: the report then
+says so, with the processor time it used. And a function that its file
+does not export has no name; Kodi itself is linked stripped, so of it
+only the exported functions have one, and the libraries of the build
+resolve the rest of theirs.
+
+Nothing happens while the loop runs or while Kodi stops (which takes
+seconds by design; a report that was looking at the thread when Kodi
+began to stop is not written, it would describe the thread waiting for
+the watch itself), and there are at most twelve reports in an hour.
+The 72 system calls it names were compared with the table of the
+kernel of the image. Linux on x86-64 with the GNU C library 2.35 or
+later; elsewhere the watch does nothing.
+---
+ xbmc/application/Application.cpp   |  13 +
+ xbmc/application/Application.h     |   3 +
+ xbmc/application/CMakeLists.txt    |   6 +-
+ xbmc/application/GUIStallWatch.cpp | 654 +++++++++++++++++++++++++++++
+ xbmc/application/GUIStallWatch.h   |  67 +++
+ 5 files changed, 741 insertions(+), 2 deletions(-)
+ create mode 100644 xbmc/application/GUIStallWatch.cpp
+ create mode 100644 xbmc/application/GUIStallWatch.h
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index af0776d..114d179 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -39,6 +39,7 @@
+ #include "addons/gui/GUIDialogAddonSettings.h"
+ #include "application/AppInboundProtocol.h"
+ #include "application/AppParams.h"
++#include "application/GUIStallWatch.h"
+ #include "application/ApplicationActionListeners.h"
+ #include "application/ApplicationMessageHandling.h"
+ #include "application/ApplicationPlay.h"
+@@ -1718,6 +1719,8 @@ std::chrono::steady_clock::time_point CApplication::BeginPass(bool nested, bool
+     ReportFrameGap(now, now - m_passMark, "before a pass of a nested loop");
+   m_passDepth++;
+   m_passMark = now;
++  if (m_stallWatch)
++    m_stallWatch->Mark();
+   return now;
+ }
+ 
+@@ -1730,6 +1733,8 @@ void CApplication::EndPass(std::chrono::steady_clock::time_point start,
+   const auto now = std::chrono::steady_clock::now();
+   const auto mark = m_passMark;
+   m_passMark = now;
++  if (m_stallWatch)
++    m_stallWatch->Mark();
+   if (m_passDepth > 0)
+     m_passDepth--;
+ 
+@@ -1772,6 +1777,9 @@ int CApplication::Run()
+     CServiceBroker::GetAppMessenger()->PostMsg(TMSG_PLAYLISTPLAYER_PLAY, -1);
+   }
+ 
++  m_stallWatch = std::make_unique<CGUIStallWatch>();
++  m_stallWatch->Start();
++
+   // Run the app
+   while (!m_bStop)
+   {
+@@ -1802,6 +1810,7 @@ int CApplication::Run()
+     EndPass(lastFrameTime, processed, moved, false, renderGUI && !m_bStop);
+   }
+ 
++  m_stallWatch->Stop();
+   Cleanup();
+ 
+   CLog::Log(LOGINFO, "Exiting the application...");
+@@ -1932,6 +1941,10 @@ bool CApplication::Cleanup()
+ 
+ bool CApplication::Stop(int exitCode)
+ {
++  // stopping takes seconds by design (the add-ons are waited for) and makes no pass
++  if (m_stallWatch)
++    m_stallWatch->Stop();
++
+ #if defined(TARGET_ANDROID)
+   // Note: On Android, the app must be stopped asynchronously, once Android has
+   // signalled that the app shall be destroyed. See android_main() implementation.
+diff --git a/xbmc/application/Application.h b/xbmc/application/Application.h
+index f40ce07..e90bb8d 100644
+--- a/xbmc/application/Application.h
++++ b/xbmc/application/Application.h
+@@ -27,6 +27,8 @@
+ #include <string>
+ #include <vector>
+ 
++class CGUIStallWatch;
++
+ class CAction;
+ class CApplicationMessageHandling;
+ class CBookmark;
+@@ -254,6 +256,7 @@ protected:
+   unsigned int m_passDepth = 0; //!< passes that are open (a nested loop runs inside one)
+   std::chrono::steady_clock::time_point m_passLogged;
+   unsigned int m_passesUnreported = 0;
++  std::unique_ptr<CGUIStallWatch> m_stallWatch; //!< says where this thread is when it makes no pass
+ 
+   std::unique_ptr<MUSIC_INFO::CMusicInfoScanner> m_musicInfoScanner;
+ 
+diff --git a/xbmc/application/CMakeLists.txt b/xbmc/application/CMakeLists.txt
+index bfad6f7..81c06dd 100644
+--- a/xbmc/application/CMakeLists.txt
++++ b/xbmc/application/CMakeLists.txt
+@@ -12,7 +12,8 @@ set(SOURCES AppEnvironment.cpp
+             ApplicationStackHelper.cpp
+             ApplicationVolumeHandling.cpp
+             AppParamParser.cpp
+-            AppParams.cpp)
++            AppParams.cpp
++            GUIStallWatch.cpp)
+ 
+ set(HEADERS AppEnvironment.h
+             AppInboundProtocol.h
+@@ -29,6 +30,7 @@ set(HEADERS AppEnvironment.h
+             ApplicationStackHelper.h
+             ApplicationVolumeHandling.h
+             AppParamParser.h
+-            AppParams.h)
++            AppParams.h
++            GUIStallWatch.h)
+ 
+ core_add_library(application)
+diff --git a/xbmc/application/GUIStallWatch.cpp b/xbmc/application/GUIStallWatch.cpp
+new file mode 100644
+index 0000000..490f05a
+--- /dev/null
++++ b/xbmc/application/GUIStallWatch.cpp
+@@ -0,0 +1,654 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "GUIStallWatch.h"
++
++#include "utils/log.h"
++
++#include <string>
++
++// What Report() reads is there on Linux with the GNU C library on x86-64: the place where a thread
++// waits, _dl_find_object() (2.35), and the look of a call instruction.
++#if defined(TARGET_LINUX) && !defined(TARGET_ANDROID) && defined(__GLIBC__) && defined(__x86_64__)
++#include <features.h>
++#if __GLIBC_PREREQ(2, 35)
++#define HAS_STALL_TRACE 1
++#endif
++#endif
++
++#ifdef HAS_STALL_TRACE
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <map>
++#include <vector>
++
++#include <cxxabi.h>
++#include <dlfcn.h>
++#include <elf.h>
++#include <fcntl.h>
++#include <link.h>
++#include <pthread.h>
++#include <sys/uio.h>
++#include <unistd.h>
++#endif
++
++using namespace std::chrono_literals;
++
++namespace
++{
++constexpr int64_t FIRST_MS = 5000; //!< a stall is reported after this long without a pass ...
++constexpr int64_t SECOND_MS = 15000; //!< ... and once more when it is still the same one
++constexpr unsigned int MAX_REPORTS = 12; //!< within HOUR_MS
++constexpr int64_t HOUR_MS = 3600 * 1000;
++
++#ifdef HAS_STALL_TRACE
++constexpr size_t SHOWN_FRAMES = 64; //!< return addresses of a report
++constexpr uintptr_t SCAN_BYTES = 256 * 1024; //!< of the stack, from where the thread is
++constexpr int LOOKS = 40; //!< at a thread that is running, to find it waiting ...
++constexpr auto BETWEEN_LOOKS = 5ms; //!< ... this far apart
++constexpr uint64_t TABLE_BYTES = 64 * 1024 * 1024; //!< the largest table of names read from a file
++
++// the watched thread
++int s_tid = 0;
++pthread_t s_thread;
++uintptr_t s_stackStart = 0;
++uintptr_t s_stackEnd = 0;
++// the file this code is in (the program), and what to take from an address in it to get the
++// address in the file: 0 for a program that is not position independent
++std::string s_ownPath;
++uintptr_t s_ownBias = 0;
++
++struct ThreadState
++{
++  enum class Kind
++  {
++    UNKNOWN, //!< the kernel did not say
++    RUNNING, //!< it runs, or is ready to
++    WAITING, //!< it waits, in a system call or outside of one
++  };
++  Kind kind = Kind::UNKNOWN;
++  long call = -1; //!< number of the system call, -1 when it waits outside of one
++  unsigned long long argument = 0; //!< its first argument
++  uintptr_t sp = 0;
++  uintptr_t pc = 0;
++};
++
++// "running", or "-1 sp pc", or "number six-arguments sp pc" (all but the number in hex)
++ThreadState ReadState()
++{
++  ThreadState state;
++  char path[64];
++  std::snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", s_tid);
++  const int fd = open(path, O_RDONLY | O_CLOEXEC);
++  if (fd < 0)
++    return state;
++
++  char text[256] = {};
++  const ssize_t size = read(fd, text, sizeof(text) - 1);
++  close(fd);
++  if (size <= 0)
++    return state;
++
++  if (std::strncmp(text, "running", 7) == 0)
++  {
++    state.kind = ThreadState::Kind::RUNNING;
++    return state;
++  }
++
++  long call = 0;
++  unsigned long long v[8] = {};
++  const int fields = std::sscanf(text, "%ld %llx %llx %llx %llx %llx %llx %llx %llx", &call, &v[0],
++                                 &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
++  if (call < 0 && fields >= 3)
++  {
++    state.sp = static_cast<uintptr_t>(v[0]);
++    state.pc = static_cast<uintptr_t>(v[1]);
++  }
++  else if (call >= 0 && fields == 9)
++  {
++    state.call = call;
++    state.argument = v[0];
++    state.sp = static_cast<uintptr_t>(v[6]);
++    state.pc = static_cast<uintptr_t>(v[7]);
++  }
++  else
++    return state;
++
++  state.kind = ThreadState::Kind::WAITING;
++  return state;
++}
++
++struct Call
++{
++  long number;
++  const char* name;
++  bool file; //!< the first argument is a file descriptor (or a directory one)
++};
++
++// the system calls of x86-64 that a thread is found waiting in
++constexpr Call CALLS[] = {
++    {0, "read", true},           {1, "write", true},         {2, "open", false},
++    {3, "close", true},          {4, "stat", false},         {5, "fstat", true},
++    {6, "lstat", false},         {7, "poll", false},         {8, "lseek", true},
++    {9, "mmap", false},          {11, "munmap", false},      {16, "ioctl", true},
++    {17, "pread64", true},       {18, "pwrite64", true},     {19, "readv", true},
++    {20, "writev", true},        {21, "access", false},      {23, "select", false},
++    {26, "msync", false},        {28, "madvise", false},     {35, "nanosleep", false},
++    {40, "sendfile", true},      {42, "connect", true},      {43, "accept", true},
++    {44, "sendto", true},        {45, "recvfrom", true},     {46, "sendmsg", true},
++    {47, "recvmsg", true},       {61, "wait4", false},       {72, "fcntl", true},
++    {73, "flock", true},         {74, "fsync", true},        {75, "fdatasync", true},
++    {76, "truncate", false},     {77, "ftruncate", true},    {78, "getdents", true},
++    {82, "rename", false},       {83, "mkdir", false},       {84, "rmdir", false},
++    {87, "unlink", false},       {89, "readlink", false},    {137, "statfs", false},
++    {138, "fstatfs", true},      {162, "sync", false},       {202, "futex", false},
++    {217, "getdents64", true},
++    {219, "restart_syscall (a call that was interrupted and goes on)", false},
++    {230, "clock_nanosleep", false},
++    {232, "epoll_wait", true},   {247, "waitid", false},     {257, "openat", true},
++    {258, "mkdirat", true},      {262, "newfstatat", true},  {263, "unlinkat", true},
++    {264, "renameat", true},     {267, "readlinkat", true},  {269, "faccessat", true},
++    {270, "pselect6", false},    {271, "ppoll", false},      {277, "sync_file_range", true},
++    {281, "epoll_pwait", true},  {285, "fallocate", true},   {288, "accept4", true},
++    {299, "recvmmsg", true},     {306, "syncfs", true},      {307, "sendmmsg", true},
++    {316, "renameat2", true},    {326, "copy_file_range", true},
++    {332, "statx", true},        {426, "io_uring_enter", true},
++    {441, "epoll_pwait2", true}, {449, "futex_waitv", false},
++};
++
++// "read on /storage/x", "futex", "system call 999"
++std::string DescribeCall(const ThreadState& state)
++{
++  for (const Call& call : CALLS)
++  {
++    if (call.number != state.call)
++      continue;
++
++    std::string text = call.name;
++    // not for the "current directory" of the calls that take a directory
++    if (call.file && state.argument < 0x7fffffffULL)
++    {
++      char path[64];
++      char target[256];
++      std::snprintf(path, sizeof(path), "/proc/self/fd/%llu", state.argument);
++      const ssize_t size = readlink(path, target, sizeof(target) - 1);
++      if (size > 0)
++        text += " on " + std::string(target, static_cast<size_t>(size));
++    }
++    return text;
++  }
++  return "system call " + std::to_string(state.call);
++}
++
++std::string Hex(uintptr_t value)
++{
++  char text[2 + 2 * sizeof(value) + 1];
++  std::snprintf(text, sizeof(text), "%#lx", static_cast<unsigned long>(value));
++  return text;
++}
++
++struct Mapping
++{
++  uintptr_t start;
++  uintptr_t end;
++  bool code; //!< can be read and executed
++  std::string path; //!< of a file, else empty
++};
++
++// What is mapped where, read once for a report. Nothing here asks the dynamic loader, whose
++// records another thread may free at any moment by unloading a library.
++class CMaps
++{
++public:
++  CMaps()
++  {
++    FILE* maps = std::fopen("/proc/self/maps", "re");
++    if (!maps)
++      return;
++
++    char* line = nullptr;
++    size_t capacity = 0;
++    while (getline(&line, &capacity, maps) > 0)
++    {
++      unsigned long start = 0;
++      unsigned long end = 0;
++      char perms[5] = {};
++      int name = 0;
++      if (std::sscanf(line, "%lx-%lx %4s %*s %*s %*s %n", &start, &end, perms, &name) < 3 ||
++          start >= end)
++        continue;
++
++      Mapping mapping{start, end, perms[0] == 'r' && perms[2] == 'x', {}};
++      if (name > 0 && line[name] == '/')
++      {
++        mapping.path = line + name;
++        while (!mapping.path.empty() && mapping.path.back() == '\n')
++          mapping.path.pop_back();
++      }
++      m_mappings.push_back(std::move(mapping));
++    }
++    std::free(line);
++    std::fclose(maps);
++  }
++
++  const Mapping* Find(uintptr_t address) const
++  {
++    const auto mapping = std::upper_bound(m_mappings.begin(), m_mappings.end(), address,
++                                          [](uintptr_t a, const Mapping& m) { return a < m.end; });
++    return mapping != m_mappings.end() && address >= mapping->start ? &*mapping : nullptr;
++  }
++
++  // Whether the address is in code that can be read, with at least before bytes of it in front
++  bool InCode(uintptr_t address, uintptr_t before) const
++  {
++    const Mapping* mapping = Find(address);
++    return mapping && mapping->code && address - mapping->start >= before;
++  }
++
++  // The address in its file, as addr2line takes it, and the file. For a shared object that is the
++  // distance from the lowest mapping of the file; for the program, see s_ownBias.
++  bool InFile(uintptr_t address, std::string& path, uintptr_t& offset) const
++  {
++    const Mapping* mapping = Find(address);
++    if (!mapping || mapping->path.empty())
++      return false;
++
++    path = mapping->path;
++    if (path == s_ownPath)
++    {
++      offset = address - s_ownBias;
++      return true;
++    }
++    uintptr_t base = mapping->start;
++    for (const Mapping& other : m_mappings)
++    {
++      if (other.path == path)
++      {
++        base = other.start; // the mappings are in the order of their addresses
++        break;
++      }
++    }
++    offset = address - base;
++    return true;
++  }
++
++private:
++  std::vector<Mapping> m_mappings;
++};
++
++// "libc.so.6+0x10e9af"
++std::string Module(const CMaps& maps, uintptr_t address)
++{
++  std::string path;
++  uintptr_t offset = 0;
++  if (!maps.InFile(address, path, offset))
++    return Hex(address);
++
++  if (const size_t slash = path.rfind('/'); slash != std::string::npos)
++    path.erase(0, slash + 1);
++  return path + "+" + Hex(offset);
++}
++
++// The functions that a file exports, read from the file on disk (its dynamic symbol table).
++class CNames
++{
++public:
++  explicit CNames(const std::string& path)
++  {
++    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++      return;
++    Load(fd);
++    close(fd);
++    std::sort(m_functions.begin(), m_functions.end(),
++              [](const Function& a, const Function& b) { return a.address < b.address; });
++  }
++
++  // "CGUIWindowManager::Process()+0x52", or nothing
++  std::string Find(uintptr_t offset) const
++  {
++    auto next = std::upper_bound(m_functions.begin(), m_functions.end(), offset,
++                                 [](uintptr_t o, const Function& f) { return o < f.address; });
++    if (next == m_functions.begin())
++      return {};
++
++    const Function& function = *--next;
++    if (offset - function.address >= std::max<uint64_t>(function.size, 1) ||
++        function.name >= m_text.size())
++      return {};
++
++    const char* mangled = m_text.c_str() + function.name;
++    int status = -1;
++    char* name = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
++    std::string text = status == 0 && name ? name : mangled;
++    std::free(name);
++    return text + "+" + Hex(offset - function.address);
++  }
++
++private:
++  struct Function
++  {
++    uint64_t address;
++    uint64_t size;
++    uint32_t name;
++  };
++
++  static bool ReadAt(int fd, uint64_t at, void* buffer, uint64_t size)
++  {
++    return size <= TABLE_BYTES &&
++           pread(fd, buffer, size, static_cast<off_t>(at)) == static_cast<ssize_t>(size);
++  }
++
++  void Load(int fd)
++  {
++    Elf64_Ehdr header;
++    if (!ReadAt(fd, 0, &header, sizeof(header)) ||
++        std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
++        header.e_ident[EI_CLASS] != ELFCLASS64 || header.e_ident[EI_DATA] != ELFDATA2LSB ||
++        header.e_shentsize != sizeof(Elf64_Shdr) || header.e_shnum == 0)
++      return;
++
++    std::vector<Elf64_Shdr> sections(header.e_shnum);
++    if (!ReadAt(fd, header.e_shoff, sections.data(), sections.size() * sizeof(Elf64_Shdr)))
++      return;
++
++    for (const Elf64_Shdr& section : sections)
++    {
++      if (section.sh_type != SHT_DYNSYM || section.sh_entsize != sizeof(Elf64_Sym) ||
++          section.sh_link >= sections.size() || section.sh_size > TABLE_BYTES ||
++          sections[section.sh_link].sh_size > TABLE_BYTES)
++        continue;
++
++      std::vector<Elf64_Sym> symbols(section.sh_size / sizeof(Elf64_Sym));
++      std::string text(sections[section.sh_link].sh_size, '\0');
++      if (symbols.empty() || text.empty() ||
++          !ReadAt(fd, section.sh_offset, symbols.data(), symbols.size() * sizeof(Elf64_Sym)) ||
++          !ReadAt(fd, sections[section.sh_link].sh_offset, text.data(), text.size()))
++        return;
++
++      for (const Elf64_Sym& symbol : symbols)
++      {
++        const unsigned int type = ELF64_ST_TYPE(symbol.st_info);
++        if ((type == STT_FUNC || type == STT_GNU_IFUNC) && symbol.st_shndx != SHN_UNDEF &&
++            symbol.st_value != 0)
++          m_functions.push_back({symbol.st_value, symbol.st_size, symbol.st_name});
++      }
++      m_text = std::move(text);
++      return;
++    }
++  }
++
++  std::vector<Function> m_functions;
++  std::string m_text; //!< the names, each ended by a zero; c_str() ends the last one
++};
++
++// "poll+0x4f" for an address in a function that its file exports. Reads the file the first time.
++std::string Symbol(const CMaps& maps, uintptr_t address)
++{
++  static std::map<std::string, CNames> files; // only the watching thread comes here
++
++  std::string path;
++  uintptr_t offset = 0;
++  if (!maps.InFile(address, path, offset))
++    return {};
++
++  auto names = files.find(path);
++  if (names == files.end())
++    names = files.emplace(path, CNames(path)).first;
++  return names->second.Find(offset);
++}
++
++// Memory of this process, read through the kernel: what is not mapped (a library that another
++// thread unloads just now, a stack pointer that is none) ends the reading instead of faulting.
++// The bytes read, from the start.
++size_t ReadMemory(uintptr_t address, void* buffer, size_t size)
++{
++  constexpr size_t STEP = 64 * 1024;
++  size_t done = 0;
++  while (done < size)
++  {
++    const size_t step = std::min(STEP, size - done);
++    iovec local{static_cast<uint8_t*>(buffer) + done, step};
++    iovec remote{reinterpret_cast<void*>(address + done), step};
++    if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != static_cast<ssize_t>(step))
++      break;
++    done += step;
++  }
++  return done;
++}
++
++// Whether a word of the stack is a return address: it points into code, behind a call instruction
++// (e8 with a 32 bit offset, or ff /2 in its lengths of two to seven bytes).
++bool BehindCall(uintptr_t value, const CMaps& maps)
++{
++  uint8_t code[7]; // the bytes before the address: code[7 - n] is n bytes before it
++  if (value < sizeof(code) || !maps.InCode(value - 1, sizeof(code) - 1) ||
++      ReadMemory(value - sizeof(code), code, sizeof(code)) != sizeof(code))
++    return false;
++
++  const auto indirect = [&code](int n)
++  { return code[7 - n] == 0xff && (code[8 - n] & 0x38) == 0x10; };
++  return code[7 - 5] == 0xe8 || indirect(2) || indirect(3) || indirect(4) || indirect(6) ||
++         indirect(7);
++}
++
++// The stack of the watched thread, from where the thread is towards its start. While the thread
++// waits, nothing changes it; when it goes on in the middle of the reading, what is read is no
++// longer one stack, and addresses of calls that never were together can be among the result.
++std::vector<uintptr_t> ReturnAddresses(uintptr_t sp, const CMaps& maps)
++{
++  std::vector<uintptr_t> found;
++  const uintptr_t first = (sp + 7) & ~uintptr_t{7};
++  if (sp < s_stackStart || first >= s_stackEnd)
++    return found;
++
++  std::vector<uintptr_t> words(std::min(s_stackEnd - first, SCAN_BYTES) / sizeof(uintptr_t));
++  const size_t read =
++      ReadMemory(first, words.data(), words.size() * sizeof(uintptr_t)) / sizeof(uintptr_t);
++  for (size_t i = 0; i < read && found.size() < SHOWN_FRAMES; ++i)
++  {
++    if (BehindCall(words[i], maps))
++      found.push_back(words[i]);
++  }
++  return found;
++}
++
++int64_t ProcessorTimeMs()
++{
++  clockid_t clock;
++  timespec time;
++  if (pthread_getcpuclockid(s_thread, &clock) != 0 || clock_gettime(clock, &time) != 0)
++    return -1;
++  return static_cast<int64_t>(time.tv_sec) * 1000 + time.tv_nsec / 1000000;
++}
++#endif
++} // unnamed namespace
++
++CGUIStallWatch::CGUIStallWatch() : CThread("GUIStallWatch")
++{
++}
++
++CGUIStallWatch::~CGUIStallWatch()
++{
++  Stop();
++}
++
++void CGUIStallWatch::Start()
++{
++  if (m_started)
++    return;
++
++#ifdef HAS_STALL_TRACE
++  pthread_attr_t attributes;
++  void* stack = nullptr;
++  size_t size = 0;
++  if (pthread_getattr_np(pthread_self(), &attributes) != 0)
++    return;
++  const bool known = pthread_attr_getstack(&attributes, &stack, &size) == 0 && stack && size;
++  pthread_attr_destroy(&attributes);
++  if (!known)
++    return;
++
++  s_stackStart = reinterpret_cast<uintptr_t>(stack);
++  s_stackEnd = s_stackStart + size;
++  s_thread = pthread_self();
++  s_tid = gettid();
++
++  // The file this code is in is never unloaded while it runs, so the loader can be asked about
++  // it, once and here.
++  const uintptr_t here = reinterpret_cast<uintptr_t>(&ProcessorTimeMs);
++  struct dl_find_object object;
++  if (_dl_find_object(reinterpret_cast<void*>(here), &object) == 0 && object.dlfo_link_map)
++  {
++    const CMaps maps;
++    if (const Mapping* mapping = maps.Find(here))
++    {
++      s_ownPath = mapping->path;
++      s_ownBias = object.dlfo_link_map->l_addr;
++    }
++  }
++
++  Mark();
++  m_started = true;
++  Create();
++#endif
++}
++
++void CGUIStallWatch::Stop()
++{
++  if (!m_started)
++    return;
++
++  m_started = false;
++  StopThread();
++}
++
++void CGUIStallWatch::Process()
++{
++  int64_t watched = 0;
++  unsigned int stage = 0;
++  // The log is not to be filled by a Kodi that stalls again and again: so many reports an hour.
++  unsigned int reports = 0;
++  int64_t hourStart = Now();
++  while (!m_bStop)
++  {
++    CThread::Sleep(250ms);
++
++    const int64_t mark = m_mark.load(std::memory_order_relaxed);
++    if (mark != watched)
++    {
++      watched = mark;
++      stage = 0;
++    }
++
++    const int64_t now = Now();
++    const int64_t stalled = now - mark;
++    if (!((stage == 0 && stalled >= FIRST_MS) || (stage == 1 && stalled >= SECOND_MS)))
++      continue;
++
++    stage++;
++    if (now - hourStart >= HOUR_MS)
++    {
++      hourStart = now;
++      reports = 0;
++    }
++    if (reports == MAX_REPORTS)
++      continue;
++
++    reports++;
++    Report(stalled);
++    if (reports == MAX_REPORTS)
++      CLog::Log(LOGINFO,
++                "GUI: that was report {} of a stalled interface loop within an hour; the next "
++                "one comes when the hour has passed",
++                reports);
++  }
++}
++
++void CGUIStallWatch::Report(int64_t stalledMs)
++{
++#ifdef HAS_STALL_TRACE
++  // A thread that runs has no place where it waits: look again for a moment.
++  const int64_t usedBefore = ProcessorTimeMs();
++  const int64_t lookedAt = Now();
++  ThreadState state = ReadState();
++  int looks = 1;
++  while (state.kind == ThreadState::Kind::RUNNING && looks < LOOKS && !m_bStop)
++  {
++    CThread::Sleep(BETWEEN_LOOKS);
++    state = ReadState();
++    ++looks;
++  }
++
++  // Kodi is stopping: its interface thread now waits for this one to end, which is no stall.
++  if (m_bStop)
++    return;
++
++  if (state.kind == ThreadState::Kind::UNKNOWN)
++  {
++    CLog::Log(LOGINFO,
++              "GUI: no pass of the interface loop for {} ms; the kernel does not say where its "
++              "thread is",
++              stalledMs);
++    return;
++  }
++
++  if (state.kind == ThreadState::Kind::RUNNING)
++  {
++    const int64_t usedAfter = ProcessorTimeMs();
++    CLog::Log(LOGINFO,
++              "GUI: no pass of the interface loop for {} ms; its thread is not waiting, it runs "
++              "(at each of {} looks; {} ms of processor time in the last {} ms). A stack is only "
++              "read from a thread that waits",
++              stalledMs, looks, usedBefore >= 0 && usedAfter >= 0 ? usedAfter - usedBefore : -1,
++              Now() - lookedAt);
++    return;
++  }
++
++  if (state.call >= 0)
++    CLog::Log(LOGINFO, "GUI: no pass of the interface loop for {} ms; its thread waits in {}",
++              stalledMs, DescribeCall(state));
++  else
++    CLog::Log(LOGINFO,
++              "GUI: no pass of the interface loop for {} ms; its thread is held outside of a "
++              "system call (memory that is being read in, for example)",
++              stalledMs);
++
++  const CMaps maps;
++  const std::vector<uintptr_t> addresses = ReturnAddresses(state.sp, maps);
++  if (addresses.empty())
++  {
++    CLog::Log(LOGINFO, "GUI:   no return address was found on its stack (it is at {})",
++              Module(maps, state.pc));
++    return;
++  }
++
++  // First the whole list as file+address, which reads no file: the names come from the files on
++  // disk, and the disk may be what the interface waits for.
++  std::string list;
++  for (const uintptr_t address : addresses)
++    list += " " + Module(maps, address - 1);
++  CLog::Log(LOGINFO,
++            "GUI:   it is at {}; return addresses on its stack, innermost first (calls that "
++            "already returned can be among them):{}",
++            Module(maps, state.pc), list);
++
++  for (size_t i = 0; i < addresses.size() && !m_bStop; ++i)
++  {
++    // the address of the call, not of what follows it: that may be the next function
++    const std::string symbol = Symbol(maps, addresses[i] - 1);
++    if (!symbol.empty())
++      CLog::Log(LOGINFO, "GUI:   #{} {} ({})", i, symbol, Module(maps, addresses[i] - 1));
++  }
++#else
++  (void)stalledMs;
++#endif
++}
+diff --git a/xbmc/application/GUIStallWatch.h b/xbmc/application/GUIStallWatch.h
+new file mode 100644
+index 0000000..bc183b1
+--- /dev/null
++++ b/xbmc/application/GUIStallWatch.h
+@@ -0,0 +1,67 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "threads/Thread.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++/*!
++ * \brief Hades diagnostics: where the thread of the interface is while it makes no pass
++ *
++ * CApplication logs how long the interface went without a frame, once it has one again. That says
++ * how long, not what the thread was doing: a first opening of an add-on that froze the interface
++ * for 30.9 s (2026-10-03) left one line and no cause.
++ *
++ * This thread watches the time of the last pass. After five seconds without one, and once more
++ * after fifteen, it writes to the log what the thread of the interface waits in (the system call
++ * and, where it has one, the file or socket) and the return addresses on its stack, as
++ * file+address, with the names of the functions that the files export.
++ *
++ * The watched thread is only looked at, and nothing is asked of the dynamic loader while it is:
++ * - the kernel says where the thread waits (/proc/self/task/<tid>/syscall);
++ * - its stack is read as memory, through the kernel (process_vm_readv(), which cannot fault);
++ * - what is mapped where comes from /proc/self/maps, and the names from the files on disk.
++ * It gets no signal, so no call of it is interrupted (a signal would end a poll() or a sleep with
++ * EINTR even when the call is to be restarted, and libraries that take that for an error would
++ * fail where they only were slow).
++ *
++ * The price: the addresses are found by their look (a word that points behind a call
++ * instruction), so calls that already returned can be among them; a thread that is running
++ * instead of waiting shows no stack; and a function that its file does not export has no name
++ * (of the program, which is linked stripped, only the exported functions have one).
++ * Nothing happens while the loop runs.
++ */
++class CGUIStallWatch : private CThread
++{
++public:
++  CGUIStallWatch();
++  ~CGUIStallWatch() override;
++
++  //! \brief Start watching the calling thread, which is the one that makes the passes
++  void Start();
++  void Stop();
++  //! \brief A pass of the interface loop starts or ends
++  void Mark() { m_mark.store(Now(), std::memory_order_relaxed); }
++
++private:
++  void Process() override;
++  void Report(int64_t stalledMs);
++  static int64_t Now()
++  {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++  }
++
++  std::atomic<int64_t> m_mark{0};
++  bool m_started = false;
++};
+-- 
+2.53.0
+

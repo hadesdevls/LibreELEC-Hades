@@ -1,0 +1,167 @@
+From 9011818a006072a824798183369bede7028b6d83 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sun, 26 Jul 2026 17:16:31 +0100
+Subject: [PATCH] gbm/drm: add HDMI frame-packed 3D modes and fix half 3D mode
+ pixel ratio
+
+The GBM/DRM backend sets DRM_CLIENT_CAP_STEREO_3D and so enumerates the sink's
+stereoscopic modes, but only mapped the half side-by-side and top-and-bottom
+layouts, and mapped them incompletely. Non-3D modes are unaffected: they still
+produce exactly the same RESOLUTION_INFO as before.
+
+GetResolutionInfo():
+
+- Record INTERLACED / PROGRESSIVE for every mode. 3D modes previously carried
+  neither, so an interlaced side-by-side mode compared equal to a progressive
+  one under D3DPRESENTFLAG_MODEMASK (which includes INTERLACED).
+
+- Match the whole DRM_MODE_FLAG_3D_MASK field instead of testing single bits.
+  The layout is a masked enum, not a bitfield: TOP_AND_BOTTOM is 7<<14 and
+  shares bit 14 with FRAME_PACKING (1<<14) and bit 16 with SIDE_BY_SIDE_FULL
+  (4<<14), so "flags & DRM_MODE_FLAG_3D_TOP_AND_BOTTOM" aliases them.
+
+- Set fPixelRatio for the half layouts: 2.0 for side-by-side, 0.5 for
+  top-and-bottom. A half mode transmits each eye at half width (SBS) or half
+  height (TB) and the sink stretches it back, so its pixels are twice as wide
+  or twice as tall. CGraphicContext::GetResInfo() only applies its own
+  pixel-ratio adjustment when it is itself turning a 2D mode into a stereo one;
+  for a mode that already carries a 3D flag it trusts the stored fPixelRatio,
+  which was left at 1.0. A half-SBS movie therefore came out squashed to half
+  height, as CalcDestRect derives height from width / aspect.
+
+- Support frame packing. It sends two full-height eye images separated by a
+  vblank-sized active-space gap, so the scanout is (vdisplay + vtotal) lines
+  tall (1080p24 -> 1920x2205, gap 45; 720p60 -> 1280x1470, gap 30), and the
+  kernel doubles the CRTC timing (drm_mode_set_crtcinfo / CRTC_STEREO_DOUBLE)
+  when the mode is set. Report that packed height and present the mode as
+  top-and-bottom with iBlanking set to the gap: CGraphicContext already places
+  the right eye at iHeight + iBlanking, and the GBM surface is sized from
+  iWidth/iHeight so the framebuffer comes out at the packed size. This
+  generalises the hardcoded 1920x2205 / 1280x1470 cases in
+  CDisplaySettings::AddResolutionInfo() to any frame-packing mode the sink
+  offers.
+
+GetModes(): skip interlaced frame-packing modes. Kodi cannot render interlaced
+fields into a packed scanout, and leaving them enumerated made a 29.97fps
+top-and-bottom clip switch to 1080i frame packing at 59.94Hz, which the display
+showed as a raw stacked frame. strId stays bound to the connector mode index
+that SetMode() looks the mode up by, so the filter skips rather than renumbers.
+
+CDRMAtomic: size the output plane's CRTC to the doubled scanout height for a
+frame-packing mode, matching the kernel's doubled CRTC timing (the mode blob
+already carries the 3D flag). The legacy path scans out the whole framebuffer
+via drmModeSetCrtc and needs no change.
+
+(cherry picked from commit 8117bd5f601aca2f85cae897745106eeff7b33da)
+
+Hades: taken as it is from cinema-ONE/LibreELEC.tv (8f7810a9d203, pm3d-0013 of its Kodi
+patches); nothing was adapted. The commits after it keep the 3D modes out of the list of modes
+that Kodi chooses from, and use them only for what is drawn stereoscopically.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp |  8 ++++-
+ xbmc/windowing/gbm/drm/DRMUtils.cpp  | 51 ++++++++++++++++++++++------
+ 2 files changed, 48 insertions(+), 11 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index cb2d201..3dd7bc9 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -151,10 +151,16 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     AddProperty(outputPlane, "SRC_Y", 0);
+     AddProperty(outputPlane, "SRC_W", m_width << 16);
+     AddProperty(outputPlane, "SRC_H", m_height << 16);
++    // Frame packing scans out (vdisplay + vtotal) lines - the kernel doubles the
++    // CRTC timing - and the framebuffer is sized to match, so cover all of it.
++    uint32_t crtcHeight = m_mode->vdisplay;
++    if ((m_mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
++      crtcHeight += m_mode->vtotal;
++
+     AddProperty(outputPlane, "CRTC_X", 0);
+     AddProperty(outputPlane, "CRTC_Y", 0);
+     AddProperty(outputPlane, "CRTC_W", m_mode->hdisplay);
+-    AddProperty(outputPlane, "CRTC_H", m_mode->vdisplay);
++    AddProperty(outputPlane, "CRTC_H", crtcHeight);
+ 
+     if (m_inFenceFd != -1)
+     {
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 653832d..7baafcc 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -1213,6 +1213,12 @@ RESOLUTION_INFO CDRMUtils::GetResolutionInfo(drmModeModeInfoPtr mode)
+   RESOLUTION_INFO res;
+   res.iScreenWidth = mode->hdisplay;
+   res.iScreenHeight = mode->vdisplay;
++
++  // Frame packing scans out both eyes plus an active-space gap, i.e.
++  // (vdisplay + vtotal) lines. The kernel doubles the CRTC timing to match.
++  if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
++    res.iScreenHeight = mode->vdisplay + mode->vtotal;
++
+   res.iWidth = res.iScreenWidth;
+   res.iHeight = res.iScreenHeight;
+ 
+@@ -1267,17 +1273,33 @@ RESOLUTION_INFO CDRMUtils::GetResolutionInfo(drmModeModeInfoPtr mode)
+   res.fPixelRatio = 1.0f;
+   res.bFullScreen = true;
+ 
+-  if (mode->flags & DRM_MODE_FLAG_3D_MASK)
++  res.dwFlags = mode->flags & DRM_MODE_FLAG_INTERLACE ? D3DPRESENTFLAG_INTERLACED
++                                                      : D3DPRESENTFLAG_PROGRESSIVE;
++
++  // The 3D layout is a masked enum, not independent bits (TOP_AND_BOTTOM is
++  // 7<<14 and shares bit 14 with FRAME_PACKING 1<<14), so match the whole field.
++  switch (mode->flags & DRM_MODE_FLAG_3D_MASK)
+   {
+-    if (mode->flags & DRM_MODE_FLAG_3D_TOP_AND_BOTTOM)
+-      res.dwFlags = D3DPRESENTFLAG_MODE3DTB;
+-    else if (mode->flags & DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF)
+-      res.dwFlags = D3DPRESENTFLAG_MODE3DSBS;
++    case DRM_MODE_FLAG_3D_TOP_AND_BOTTOM:
++      // Half layout: each eye is sent at half height and displayed full height,
++      // so its pixels are twice as tall. CGraphicContext trusts the stored ratio
++      // for a natively flagged 3D mode, so it has to be set here.
++      res.dwFlags |= D3DPRESENTFLAG_MODE3DTB;
++      res.fPixelRatio = 0.5f;
++      break;
++    case DRM_MODE_FLAG_3D_SIDE_BY_SIDE_HALF:
++      res.dwFlags |= D3DPRESENTFLAG_MODE3DSBS;
++      res.fPixelRatio = 2.0f;
++      break;
++    case DRM_MODE_FLAG_3D_FRAME_PACKING:
++      // Two full-size eyes stacked with an active-space gap: a top-and-bottom
++      // layout whose right eye sits at iHeight + iBlanking (StereoCorrection).
++      res.dwFlags |= D3DPRESENTFLAG_MODE3DTB;
++      res.iBlanking = mode->vtotal - mode->vdisplay;
++      break;
++    default:
++      break;
+   }
+-  else if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+-    res.dwFlags = D3DPRESENTFLAG_INTERLACED;
+-  else
+-    res.dwFlags = D3DPRESENTFLAG_PROGRESSIVE;
+ 
+   res.strMode =
+       StringUtils::Format("{}x{}{} @ {:.6f} Hz", res.iScreenWidth, res.iScreenHeight,
+@@ -1297,7 +1319,16 @@ std::vector<RESOLUTION_INFO> CDRMUtils::GetModes()
+ 
+   for (auto i = 0; i < m_connector->GetModesCount(); i++)
+   {
+-    RESOLUTION_INFO res = GetResolutionInfo(m_connector->GetModeForIndex(i));
++    drmModeModeInfoPtr mode = m_connector->GetModeForIndex(i);
++
++    // Interlaced frame packing cannot be driven from a progressive framebuffer;
++    // hide it so it is never picked for 3D playback. strId stays the connector
++    // mode index (SetMode() looks the mode up by it), so skip without renumbering.
++    if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING &&
++        (mode->flags & DRM_MODE_FLAG_INTERLACE))
++      continue;
++
++    RESOLUTION_INFO res = GetResolutionInfo(mode);
+     res.strId = std::to_string(i);
+     resolutions.push_back(res);
+   }
+-- 
+2.53.0
+

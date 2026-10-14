@@ -1,0 +1,319 @@
+From ea83e877dd28425a3fbbbba0e135a7409b3edb3f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 02:44:06 +0000
+Subject: [PATCH] DVDInputStreamBluray: the second view by its sub-path and the
+ angle that plays, under a lock
+
+GetStereoscopicClip() answered with the first clip of any sub play item of the extension
+data. Now:
+
+- Only the sub play items of the sub-path of the stereoscopic video count, for the sync id
+  and for the position that it falls back to.
+- Of a sub play item with a clip for each angle, the clip of the angle that plays is the
+  second view (bd_get_current_angle(), taken when the disc reports an angle, a playlist or a
+  play item). A play item without that angle shows its first one, as libbluray does; a sub
+  play item without a clip for the angle that is shown has no second view.
+- It also says which play item it answered for, why there is no second view where there is
+  none, and which eye the base view is by the same playlist (Kodi's parser reads the flag
+  from the byte that libbluray reads it from; the log has both).
+
+What is known of the playlist is asked for by the thread that demuxes, for every picture,
+while the events of the disc are processed by that thread or, for what the user does in a
+menu, by the thread of the application. The playlist is now read into a local and exchanged
+under a lock that the askers take; the play item and the angle are atomic.
+
+In UpdatePlaylistInformation() the test for "a disc whose second view is read" comes before
+everything else: any other disc takes no lock and writes nothing there. A playlist that
+cannot be read because there is no path for Kodi's parser is said in the log.
+
+The demuxer passes the new parameters; what it does with them comes next.
+---
+ .../DVDDemuxers/DVDDemuxBluray3D.cpp          |  10 +-
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 131 ++++++++++++++----
+ .../DVDInputStreams/DVDInputStreamBluray.h    |  25 +++-
+ 3 files changed, 134 insertions(+), 32 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+index 7ac0e7b..97aeb52 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+@@ -163,7 +163,10 @@ bool CDVDDemuxBluray3D::OpenDependentView()
+   unsigned int clip{0};
+   std::string codec;
+   std::chrono::milliseconds inTime{0};
+-  if (!m_bluray->GetStereoscopicClip(clip, codec, inTime))
++  unsigned int playItem{0};
++  bool baseViewIsRightEye{false};
++  const char* why{nullptr};
++  if (!m_bluray->GetStereoscopicClip(clip, codec, inTime, playItem, baseViewIsRightEye, why))
+     return false;
+ 
+   // A clip that will not open is not going to open on the next access unit either, and
+@@ -515,7 +518,10 @@ void CDVDDemuxBluray3D::CheckDependentView()
+   unsigned int clip{0};
+   std::string codec;
+   std::chrono::milliseconds inTime{0};
+-  if (!m_bluray->GetStereoscopicClip(clip, codec, inTime))
++  unsigned int playItem{0};
++  bool baseViewIsRightEye{false};
++  const char* why{nullptr};
++  if (!m_bluray->GetStereoscopicClip(clip, codec, inTime, playItem, baseViewIsRightEye, why))
+   {
+     // The play item now being read has no second eye of its own.
+     if (m_dependent)
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index e95cdd5..55f0dfa 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -600,6 +600,9 @@ void CDVDInputStreamBluray::ProcessEvent() {
+   case BD_EVENT_ANGLE:
+     CLog::Log(LOGDEBUG, "CDVDInputStreamBluray - BD_EVENT_ANGLE {}", m_event.param);
+     m_angle = m_event.param;
++    // Hades: (for the clip of the second view of that angle)
++    if (KODI::MULTIVIEW::DiscSecondView(m_secondViewWanted, m_stereoscopicDisc, false))
++      m_playingAngle = bd_get_current_angle(m_bd);
+ 
+     if (m_playlist <= MAX_PLAYLIST_ID)
+     {
+@@ -649,6 +652,8 @@ void CDVDInputStreamBluray::ProcessEvent() {
+   case BD_EVENT_PLAYITEM:
+     CLog::Log(LOGDEBUG, "CDVDInputStreamBluray - BD_EVENT_PLAYITEM {}", m_event.param);
+     m_playItem = m_event.param;
++    if (KODI::MULTIVIEW::DiscSecondView(m_secondViewWanted, m_stereoscopicDisc, false))
++      m_playingAngle = bd_get_current_angle(m_bd);
+     if (m_titleInfo && m_event.param < m_titleInfo->clip_count)
+     {
+       m_clip = &m_titleInfo->clips[m_event.param];
+@@ -1256,16 +1261,31 @@ bool CDVDInputStreamBluray::IsDefaultStream(int pid) const
+ 
+ void CDVDInputStreamBluray::UpdatePlaylistInformation()
+ {
+-  m_playlistInfoValid = false;
+-  m_playlistInfo = {};
+-
+-  // Hades: only for a disc whose second view is to be read. Any other disc is not asked for
+-  // anything that it was not asked for before.
++  // Hades: only for a disc whose second view is to be read. For any other disc nothing is
++  // read here, nothing is written and no lock is taken.
+   if (!KODI::MULTIVIEW::DiscSecondView(m_secondViewWanted, m_stereoscopicDisc, false))
+     return;
+ 
++  // Hades: what is known of the playlist is asked for by the thread that demuxes while the
++  // events of the disc are processed here, by that thread or by the one of the application.
++  // The playlist is read into a local and exchanged under the lock that the askers take.
++  {
++    std::unique_lock lock(m_playlistInfoLock);
++    m_playlistInfoValid = false;
++    m_playlistInfo = {};
++  }
++  m_playingAngle = bd_get_current_angle(m_bd);
++
+   if (m_vfsRoot.empty() || m_playlist > MAX_PLAYLIST_ID)
++  {
++    CLog::Log(LOGINFO,
++              "CDVDInputStreamBluray - playlist {} is not read for 3D information ({}): its "
++              "base view plays alone",
++              m_playlist,
++              m_vfsRoot.empty() ? "there is no path by which Kodi's own parser could read it"
++                                : "it has no number of a playlist");
+     return;
++  }
+ 
+   // The stereoscopic sub-path lives in the playlist extension data. libbluray parses it
+   // but keeps it private, so read the playlist ourselves. Playlists are never scrambled,
+@@ -1275,7 +1295,8 @@ void CDVDInputStreamBluray::UpdatePlaylistInformation()
+   url.SetHostName(m_vfsRoot);
+ 
+   // Only the extension sub-paths are needed, so there is no reason to read the clips' .clpi.
+-  if (!XFILE::CMPLSParser::ReadMPLS(url, m_playlist, m_playlistInfo, m_clipCache,
++  XFILE::BlurayPlaylistInformation playlistInfo;
++  if (!XFILE::CMPLSParser::ReadMPLS(url, m_playlist, playlistInfo, m_clipCache,
+                                     XFILE::StreamDetails::DEFER))
+   {
+     CLog::Log(LOGINFO, "CDVDInputStreamBluray - could not read playlist {} for 3D information: "
+@@ -1284,24 +1305,43 @@ void CDVDInputStreamBluray::UpdatePlaylistInformation()
+     return;
+   }
+ 
+-  m_playlistInfoValid = true;
++  // Hades: only the sub-path of the stereoscopic video names the second view
++  const size_t all{playlistInfo.extensionSubPlayItems.size()};
++  const size_t secondView{static_cast<size_t>(
++      std::ranges::count_if(playlistInfo.extensionSubPlayItems,
++                            [](const XFILE::SubPlayItemInformation& item)
++                            { return KODI::MULTIVIEW::IsSecondViewSubPath(item.subPathType); }))};
++  const bool baseViewIsRightEye{playlistInfo.baseViewIsRightEye};
++
++  {
++    std::unique_lock lock(m_playlistInfoLock);
++    m_playlistInfo = std::move(playlistInfo);
++    m_playlistInfoValid = true;
++  }
+ 
+   // Hades: one line for each playlist of such a disc, with the eye of the base view as Kodi
+   // reads it from the playlist and as libbluray does
+-  if (!m_playlistInfo.extensionSubPlayItems.empty())
++  if (secondView)
+     CLog::Log(LOGINFO,
+-              "CDVDInputStreamBluray - playlist {} has {} stereoscopic sub play item(s); "
+-              "MVC_Base_view_R_flag {} (libbluray: {})",
+-              m_playlist, m_playlistInfo.extensionSubPlayItems.size(),
+-              m_playlistInfo.baseViewIsRightEye ? 1 : 0,
++              "CDVDInputStreamBluray - playlist {} has {} stereoscopic sub play item(s) (and {} "
++              "of other sub-paths of its extension data); MVC_Base_view_R_flag {} (libbluray: "
++              "{})",
++              m_playlist, secondView, all - secondView, baseViewIsRightEye ? 1 : 0,
+               m_titleInfo ? (m_titleInfo->mvc_base_view_r_flag ? "1" : "0") : "no title");
+   else
+-    CLog::Log(LOGINFO, "CDVDInputStreamBluray - playlist {} names no second view", m_playlist);
++    CLog::Log(LOGINFO,
++              "CDVDInputStreamBluray - playlist {} names no second view ({} sub play item(s) of "
++              "other sub-paths of its extension data)",
++              m_playlist, all);
+ }
+ 
+ bool CDVDInputStreamBluray::IsStereoscopic() const
+ {
+-  return m_playlistInfoValid && !m_playlistInfo.extensionSubPlayItems.empty();
++  std::unique_lock lock(m_playlistInfoLock);
++  return m_playlistInfoValid &&
++         std::ranges::any_of(m_playlistInfo.extensionSubPlayItems,
++                             [](const XFILE::SubPlayItemInformation& item)
++                             { return KODI::MULTIVIEW::IsSecondViewSubPath(item.subPathType); });
+ }
+ 
+ bool CDVDInputStreamBluray::IsStereoscopicDisc() const
+@@ -1311,29 +1351,64 @@ bool CDVDInputStreamBluray::IsStereoscopicDisc() const
+ 
+ bool CDVDInputStreamBluray::GetStereoscopicClip(unsigned int& clip,
+                                                 std::string& codec,
+-                                                std::chrono::milliseconds& inTime) const
++                                                std::chrono::milliseconds& inTime,
++                                                unsigned int& playItem,
++                                                bool& baseViewIsRightEye,
++                                                const char*& why) const
+ {
+-  if (!IsStereoscopic())
++  playItem = m_playItem;
++  const unsigned int angle{m_playingAngle};
++
++  std::unique_lock lock(m_playlistInfoLock);
++
++  if (!m_playlistInfoValid)
++  {
++    why = "its playlist was not read";
+     return false;
++  }
+ 
+   // There is one stereoscopic sub play item in sync with each play item of the main path.
+-  const auto& items{m_playlistInfo.extensionSubPlayItems};
+-  auto it{std::ranges::find_if(items, [this](const XFILE::SubPlayItemInformation& item)
+-                               { return item.syncPlayItemId == m_playItem; })};
+-  if (it == items.end())
++  // Not all discs fill in the sync id, so fall back to matching by position.
++  // Hades: among the sub play items of the stereoscopic video, which are not the only ones
++  // that the extension data can hold.
++  const XFILE::SubPlayItemInformation* subPlayItem{nullptr};
++  const XFILE::SubPlayItemInformation* byPosition{nullptr};
++  unsigned int position{0};
++  for (const XFILE::SubPlayItemInformation& item : m_playlistInfo.extensionSubPlayItems)
+   {
+-    // Not all discs fill in the sync id, so fall back to matching by position.
+-    if (m_playItem >= items.size())
+-      return false;
+-    it = items.begin() + m_playItem;
++    if (!KODI::MULTIVIEW::IsSecondViewSubPath(item.subPathType))
++      continue;
++    if (!subPlayItem && item.syncPlayItemId == playItem)
++      subPlayItem = &item;
++    if (position++ == playItem)
++      byPosition = &item;
++  }
++  if (!subPlayItem)
++    subPlayItem = byPosition;
++  if (!subPlayItem)
++  {
++    why = position ? "its playlist names no second view for it"
++                   : "its playlist names no second view";
++    return false;
+   }
+ 
+-  if (it->clips.empty())
++  // Hades: the clip of the angle that plays
++  const size_t angles{playItem < m_playlistInfo.playItems.size()
++                          ? m_playlistInfo.playItems[playItem].angleClips.size()
++                          : 1};
++  const auto index{
++      KODI::MULTIVIEW::SecondViewClipOfAngle(angle, angles, subPlayItem->clips.size())};
++  if (!index)
++  {
++    why = "its playlist names no second view for the angle that plays";
+     return false;
++  }
+ 
+-  clip = it->clips.front().clip;
+-  codec = it->clips.front().codec;
+-  inTime = it->inTime;
++  clip = subPlayItem->clips[*index].clip;
++  codec = subPlayItem->clips[*index].codec;
++  inTime = subPlayItem->inTime;
++  baseViewIsRightEye = m_playlistInfo.baseViewIsRightEye;
++  why = nullptr;
+ 
+   return true;
+ }
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index dac0d20..7e052ca 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -16,6 +16,7 @@
+ #include "filesystem/UDFContext.h"
+ #endif
+ 
++#include <atomic>
+ #include <chrono>
+ #include <list>
+ #include <map>
+@@ -183,9 +184,21 @@ public:
+    * \param inTime filled with where in the clip the play item starts
+    * \return true if a dependent view clip was found
+    */
++  /*
++   * Hades: of the sub play items of the extension data only those of the sub-path of the
++   * stereoscopic video count, and of a sub play item with a clip for each angle, the clip of the
++   * angle that plays. Asked by the thread that demuxes for every picture, while the events of
++   * the disc may be processed by another: what is known of the playlist is read under a lock.
++   * \param playItem filled with the play item that plays, also where it has no second view
++   * \param baseViewIsRightEye filled with the eye of the base view, by the same playlist
++   * \param why where there is none: the reason, for the log
++   */
+   bool GetStereoscopicClip(unsigned int& clip,
+                            std::string& codec,
+-                           std::chrono::milliseconds& inTime) const;
++                           std::chrono::milliseconds& inTime,
++                           unsigned int& playItem,
++                           bool& baseViewIsRightEye,
++                           const char*& why) const;
+ 
+   /*!
+    * \brief Whether the base view is the right eye rather than the left.
+@@ -328,7 +341,15 @@ protected:
+ 
+     /*! Index of the current play item, tracked so the matching stereoscopic sub-play item
+         can be found. */
+-    uint32_t m_playItem{0};
++    std::atomic<uint32_t> m_playItem{0};
++
++    /*! Hades: the angle that plays, counted from 0, for a disc whose second view is read. */
++    std::atomic<uint32_t> m_playingAngle{0};
++
++    /*! Hades: guards m_playlistInfo and m_playlistInfoValid. The events of the disc are
++        processed by the thread that demuxes and, for what the user does in a menu, by the one
++        of the application; GetStereoscopicClip() is asked by the one that demuxes. */
++    mutable CCriticalSection m_playlistInfoLock;
+ 
+     /*! Bluray state serializer handler */
+     CBlurayStateSerializer m_blurayStateSerializer;
+-- 
+2.53.0
+

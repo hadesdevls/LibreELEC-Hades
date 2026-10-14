@@ -1,0 +1,315 @@
+From b37e7730ac707f683cf880d6db5cc89b96cfb91a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 11:56:13 +0000
+Subject: [PATCH] dvbridge: native Dolby Vision output on NVIDIA (nvidia-drm)
+
+The dvbridge output path spoke only to the i915/xe kernel patches
+(DVBRIDGE_DV_STANDARD_LAB). nvidia-drm 615.71.09 exposes NV_HDMI_VSIF_METADATA,
+a blob that nvkms sends as the HDMI vendor InfoFrame (type 0x81, version 1)
+instead of its own, and "dithering mode"; with the Hades patch it also has
+"max bpc". Together they carry the Dolby Vision "Standard" tunnel:
+
+- CDVBridgeState tells the backends apart by connector properties. For Dolby
+  Vision output on NVIDIA it sets the Dolby VSIF (OUI 00-D0-46 with only the
+  signal bit, the bytes the Intel kernel packs), max bpc 8, dithering off,
+  Colorspace Default, no HDR_OUTPUT_METADATA, and every nvidia-drm colour
+  property neutral (no CTM, LUT or tone mapping, transfer functions Default,
+  multiplier and divisor 1.0, no colour passthrough). As on Intel, the
+  previous state is saved and restored, and the transactional TEST_ONLY
+  commit keeps the ordinary output if anything is refused.
+- nvidia-drm has no "Broadcast RGB": full-range RGB is its default, and the
+  AVI InfoFrame only says so when the sink can select the RGB range, so the
+  NVIDIA backend requires the VCDB QS bit.
+- Native output now requires a VSVDB v2 block advertising the Standard
+  interface, the only form both backends implement (the i915/xe patches
+  already reject V0/V1). V0/V1 and LLDV-only sinks keep ordinary playback.
+- The verdict (available with which backend, or why not) is logged once per
+  change.
+---
+ xbmc/utils/DisplayInfo.cpp               | 12 +++-
+ xbmc/utils/DisplayInfo.h                 |  3 +
+ xbmc/windowing/gbm/WinSystemGbm.cpp      | 44 ++++++++++---
+ xbmc/windowing/gbm/WinSystemGbm.h        |  6 ++
+ xbmc/windowing/gbm/drm/DVBridgeState.cpp | 82 +++++++++++++++++++++---
+ xbmc/windowing/gbm/drm/DVBridgeState.h   | 16 +++++
+ 6 files changed, 144 insertions(+), 19 deletions(-)
+
+diff --git a/xbmc/utils/DisplayInfo.cpp b/xbmc/utils/DisplayInfo.cpp
+index 377ab2a..f18b4bb 100644
+--- a/xbmc/utils/DisplayInfo.cpp
++++ b/xbmc/utils/DisplayInfo.cpp
+@@ -108,9 +108,17 @@ void CDisplayInfo::Parse()
+               // Report the connected display's capability, not the current output mode.
+               const auto* dv = di_cta_data_block_get_dolby_video(block);
+               m_dolbyVision |= dv != nullptr;
+-              // V0/V1 advertise Standard DV; V2 can advertise LLDV only.
++              // Native output is implemented for V2 blocks advertising the Standard
++              // interface only, the one both output backends accept (the i915/xe kernel
++              // patches reject V0/V1). V0/V1 and LLDV-only sinks keep ordinary playback.
+               if (dv)
+-                m_standardDolbyVision |= dv->v0 || dv->v1 || (dv->v2 && dv->v2->mode_standard);
++                m_standardDolbyVision |= dv->v2 && dv->v2->mode_standard;
++              break;
++            }
++            case DI_CTA_DATA_BLOCK_VIDEO_CAP:
++            {
++              const auto* cap = di_cta_data_block_get_video_cap(block);
++              m_rgbQuantizationSelectable |= cap && cap->selectable_rgb_quantization_range;
+               break;
+             }
+             case DI_CTA_DATA_BLOCK_COLORIMETRY:
+diff --git a/xbmc/utils/DisplayInfo.h b/xbmc/utils/DisplayInfo.h
+index eb3d7f4..58a45d3 100644
+--- a/xbmc/utils/DisplayInfo.h
++++ b/xbmc/utils/DisplayInfo.h
+@@ -67,6 +67,8 @@ public:
+ 
+   bool SupportsDolbyVision() const { return m_dolbyVision; }
+   bool SupportsStandardDolbyVision() const { return m_standardDolbyVision; }
++  //! The sink lets the source select the RGB quantization range (VCDB QS bit)
++  bool SupportsRGBQuantizationSelection() const { return m_rgbQuantizationSelectable; }
+ 
+   bool SupportsColorimetry(Colorimetry colorimetry) const;
+ 
+@@ -91,6 +93,7 @@ private:
+   const di_cta_hdr_static_metadata_block* m_hdr_static_metadata = nullptr;
+   bool m_dolbyVision = false;
+   bool m_standardDolbyVision = false;
++  bool m_rgbQuantizationSelectable = false;
+ };
+ 
+ } // namespace UTILS
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index a0254e2..46b6dfa 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -309,15 +309,41 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+ #ifdef HAVE_DVBRIDGE
+ bool CWinSystemGbm::SupportsNativeDVOutput() const
+ {
+-  if (!m_info || !m_info->SupportsStandardDolbyVision() ||
+-      !std::dynamic_pointer_cast<CDRMAtomic>(m_DRM))
+-    return false;
+-  const auto* mode = m_DRM->GetSelectedMode();
+-  auto* connector = m_DRM->GetConnector();
+-  return connector && connector->IsConnected() &&
+-         connector->SupportsProperty("DVBRIDGE_DV_STANDARD_LAB") && mode &&
+-         mode->hdisplay == 3840 && mode->vdisplay == 2160 &&
+-         !(mode->flags & DRM_MODE_FLAG_INTERLACE);
++  const char* reason = nullptr;
++  auto* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
++  const auto* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
++  auto backend = CDVBridgeState::Backend::NONE;
++  if (!m_info || !m_info->SupportsStandardDolbyVision())
++    reason = "the display does not advertise Dolby Vision Standard (VSVDB v2)";
++  else if (!std::dynamic_pointer_cast<CDRMAtomic>(m_DRM))
++    reason = "atomic modesetting is not in use";
++  else if (!connector || !connector->IsConnected())
++    reason = "no connected output";
++  else if ((backend = CDVBridgeState::GetBackend(*connector)) ==
++           CDVBridgeState::Backend::NONE)
++    reason = "the output driver has no Dolby Vision backend";
++  else if (backend == CDVBridgeState::Backend::NVIDIA &&
++           !m_info->SupportsRGBQuantizationSelection())
++    reason = "the display cannot select the RGB range (VCDB QS), needed with NVIDIA";
++  else if (!mode || mode->hdisplay != 3840 || mode->vdisplay != 2160 ||
++           (mode->flags & DRM_MODE_FLAG_INTERLACE))
++    reason = "the output mode is not 3840x2160 progressive";
++
++  // Log the verdict once per change, for diagnosing why Dolby Vision is (not) used.
++  const std::string status =
++      reason ? std::string("unavailable: ") + reason
++             : std::string("available with the ") +
++                   (backend == CDVBridgeState::Backend::NVIDIA ? "NVIDIA" : "Intel") +
++                   " backend";
++  {
++    std::unique_lock lock(m_dvOutputStatusLock);
++    if (status != m_dvOutputStatus)
++    {
++      m_dvOutputStatus = status;
++      CLog::Log(LOGINFO, "DVBridge: native Dolby Vision output {}", status);
++    }
++  }
++  return reason == nullptr;
+ }
+ 
+ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 335b3e6..024f19d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -18,6 +18,8 @@
+ 
+ #include "platform/linux/input/LibInputHandler.h"
+ 
++#include <mutex>
++#include <string>
+ #include <utility>
+ 
+ #include <gbm.h>
+@@ -100,6 +102,10 @@ protected:
+   std::vector<IDispResource*> m_resources;
+ 
+   bool m_dispReset = false;
++#ifdef HAVE_DVBRIDGE
++  mutable std::mutex m_dvOutputStatusLock;
++  mutable std::string m_dvOutputStatus;
++#endif
+   XbmcThreads::EndTime<> m_dispResetTimer;
+   std::unique_ptr<CLibInputHandler> m_libinput;
+ 
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.cpp b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+index 500efaf..06d2631 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.cpp
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+@@ -1,9 +1,34 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ #include "DVBridgeState.h"
+ #include "DRMAtomic.h"
++#include "DRMConnector.h"
++
++#include <cstdint>
+ 
+ using namespace KODI::WINDOWING::GBM;
+ 
++namespace
++{
++// Dolby VSIF payload: IEEE OUI 00-D0-46 followed by 24 content bytes with only the Dolby
++// Vision signal bit set (no low latency, backlight, auxiliary or L11 data). These are the
++// bytes the Intel backend's kernel packs (hdmi_dolby_vendor_infoframe_pack); nvidia-drm adds
++// the InfoFrame header (type 0x81, version 1, length 27) and the checksum.
++constexpr uint8_t DOLBY_VSIF_PAYLOAD[27] = {0x46, 0xD0, 0x00, 0x02};
++
++// 1.0 in the S31.32 fixed point of NV_PLANE_DEGAMMA_MULTIPLIER and NV_CRTC_REGAMMA_DIVISOR.
++constexpr uint64_t NV_S31_32_ONE = uint64_t{1} << 32;
++} // namespace
++
++CDVBridgeState::Backend CDVBridgeState::GetBackend(CDRMConnector& connector)
++{
++  if (connector.SupportsProperty("DVBRIDGE_DV_STANDARD_LAB"))
++    return Backend::INTEL;
++  if (connector.GetType() == "HDMI-A" && connector.SupportsProperty("NV_HDMI_VSIF_METADATA") &&
++      connector.SupportsProperty("max bpc") && connector.SupportsProperty("dithering mode"))
++    return Backend::NVIDIA;
++  return Backend::NONE;
++}
++
+ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+ {
+   if (Captured())
+@@ -13,7 +38,13 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+   auto* plane = drm.GetGuiPlane() ? drm.GetGuiPlane() : drm.GetVideoPlane();
+   if (!connector || !crtc || !plane || (drm.GetGuiPlane() && drm.GetVideoPlane()))
+     return false;
+-  if (connector->GetPropertyValue("DVBRIDGE_DV_STANDARD_LAB") != 0)
++  const Backend backend = GetBackend(*connector);
++  if (backend == Backend::NONE)
++    return false;
++  if (backend == Backend::INTEL && connector->GetPropertyValue("DVBRIDGE_DV_STANDARD_LAB") != 0)
++    return false;
++  // Nothing else may already be sending its own HDMI vendor InfoFrame through the property.
++  if (backend == Backend::NVIDIA && connector->GetPropertyValue("NV_HDMI_VSIF_METADATA") != 0)
+     return false;
+ 
+   std::vector<Property> saved;
+@@ -29,7 +60,7 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+         return false;
+       transport = *selected;
+     }
+-    Property property{object, name, *value, transport, {}};
++    Property property{object, name, *value, transport, {}, {}};
+     if (blob && *value)
+     {
+       auto* original = drmModeGetPropertyBlob(drm.GetFileDescriptor(), *value);
+@@ -45,12 +76,47 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+     return true;
+   };
+ 
+-  if (!save(connector, "DVBRIDGE_DV_STANDARD_LAB", 1, true, false) ||
+-      !save(connector, "HDR_OUTPUT_METADATA", 0, true, true) ||
+-      !save(connector, "max bpc", 8, true, false) ||
+-      !save(connector, "Broadcast RGB", 0, true, false, "Full") ||
+-      !save(connector, "Colorspace", 0, true, false, "Default") ||
+-      !save(crtc, "CTM", 0, false, true) ||
++  if (backend == Backend::INTEL)
++  {
++    if (!save(connector, "DVBRIDGE_DV_STANDARD_LAB", 1, true, false) ||
++        !save(connector, "HDR_OUTPUT_METADATA", 0, true, true) ||
++        !save(connector, "max bpc", 8, true, false) ||
++        !save(connector, "Broadcast RGB", 0, true, false, "Full") ||
++        !save(connector, "Colorspace", 0, true, false, "Default"))
++      return false;
++  }
++  else
++  {
++    CDRMPropertyBlob vsif(drm.GetFileDescriptor(), DOLBY_VSIF_PAYLOAD, sizeof(DOLBY_VSIF_PAYLOAD));
++    if (!vsif.IsValid() || !save(connector, "NV_HDMI_VSIF_METADATA", vsif.Get(), true, true))
++      return false;
++    saved.back().transportBlob = std::move(vsif);
++
++    // No "Broadcast RGB" on nvidia-drm: RGB output is full range by default, and the AVI
++    // InfoFrame says so when the sink can select the RGB range (checked from the EDID).
++    if (!save(connector, "HDR_OUTPUT_METADATA", 0, true, true) ||
++        !save(connector, "max bpc", 8, true, false) ||
++        !save(connector, "dithering mode", 0, true, false, "off") ||
++        !save(connector, "Colorspace", 0, true, false, "Default") ||
++        !save(crtc, "NV_CRTC_REGAMMA_TF", 0, false, false, "Default") ||
++        !save(crtc, "NV_CRTC_REGAMMA_LUT", 0, false, true) ||
++        !save(crtc, "NV_CRTC_REGAMMA_DIVISOR", NV_S31_32_ONE, false, false) ||
++        !save(crtc, "NV_CRTC_COLOR_PASSTHROUGH", 0, false, false) ||
++        !save(plane, "NV_INPUT_COLORSPACE", 0, false, false, "None") ||
++        !save(plane, "NV_HDR_STATIC_METADATA", 0, false, true) ||
++        !save(plane, "NV_PLANE_LMS_CTM", 0, false, true) ||
++        !save(plane, "NV_PLANE_LMS_TO_ITP_CTM", 0, false, true) ||
++        !save(plane, "NV_PLANE_ITP_TO_LMS_CTM", 0, false, true) ||
++        !save(plane, "NV_PLANE_BLEND_CTM", 0, false, true) ||
++        !save(plane, "NV_PLANE_DEGAMMA_TF", 0, false, false, "Default") ||
++        !save(plane, "NV_PLANE_DEGAMMA_LUT", 0, false, true) ||
++        !save(plane, "NV_PLANE_DEGAMMA_MULTIPLIER", NV_S31_32_ONE, false, false) ||
++        !save(plane, "NV_PLANE_TMO_LUT", 0, false, true) ||
++        !save(plane, "NV_PLANE_COLOR_PASSTHROUGH", 0, false, false))
++      return false;
++  }
++
++  if (!save(crtc, "CTM", 0, false, true) ||
+       !save(crtc, "GAMMA_LUT", 0, false, true) ||
+       !save(crtc, "DEGAMMA_LUT", 0, false, true) ||
+       !save(crtc, "VRR_ENABLED", 0, false, false) ||
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.h b/xbmc/windowing/gbm/drm/DVBridgeState.h
+index 221d6dd..79201ea 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.h
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.h
+@@ -8,10 +8,25 @@
+ namespace KODI::WINDOWING::GBM
+ {
+ class CDRMAtomic;
++class CDRMConnector;
+ 
+ class CDVBridgeState
+ {
+ public:
++  //! Dolby Vision output backends, told apart by the connector's DRM properties.
++  enum class Backend
++  {
++    NONE,
++    //! i915/xe with the dvbridge kernel patches: DVBRIDGE_DV_STANDARD_LAB. The kernel builds
++    //! the Dolby VSIF and rejects any scanout that is not bit exact.
++    INTEL,
++    //! nvidia-drm 615.71.09 or later with the "max bpc" property, on HDMI: user space supplies
++    //! the Dolby VSIF through NV_HDMI_VSIF_METADATA, and the scanout is kept bit exact by
++    //! neutral colour settings, 8 bpc and no dithering.
++    NVIDIA,
++  };
++  static Backend GetBackend(CDRMConnector& connector);
++
+   bool Capture(CDRMAtomic& drm);
+   bool Stage(CDRMAtomic& drm, bool restore);
+   void Restored() { m_saved.clear(); m_owner = nullptr; }
+@@ -25,6 +40,7 @@ private:
+     uint64_t original;
+     uint64_t transport;
+     CDRMPropertyBlob blob;
++    CDRMPropertyBlob transportBlob;
+   };
+   std::vector<Property> m_saved;
+   CDRMAtomic* m_owner = nullptr;

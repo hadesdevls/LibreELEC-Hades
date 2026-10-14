@@ -1,0 +1,392 @@
+From 4bb6d7c6b0a0dbea2b691beebcdf9628307b5b6f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 21:56:59 +0000
+Subject: [PATCH] windowing/gbm: on NVIDIA the half 3D layouts are told by the
+ vendor InfoFrame
+
+nvidia-drm lists no mode for top-and-bottom or side-by-side (half): with
+it a 3D display got the two halves in a 2D mode and was switched by
+hand. The driver sends the HDMI vendor InfoFrame that its user gives it
+(NV_HDMI_VSIF_METADATA, which native Dolby Vision output uses), and that
+InfoFrame is all that tells a display of a half layout: the timing is
+the one of the 2D mode.
+
+Where the connector has that property, and the driver has no mode for
+the layout, a 2D mode is offered with it for the timings that the EDID
+of the display says it takes in that layout (the 3D fields of its HDMI
+vendor block, read by STEREO::Parse(); only the 720p and 1080 formats of
+HDMI 1.4). It comes after frame packing and after a mode of the layout
+in the choice. The bytes are those the kernel packs for a mode of that
+layout (STEREO::HalfLayoutInfoFrame()).
+
+The InfoFrame is given to the driver with the commit of the mode, and
+taken away with the commit of the next mode that does not have it:
+- only with a mode that has no 3D layout. Of a frame-packed mode the
+  driver tells the display itself, and what it is given would go out in
+  place of that: such a mode is always committed with the property
+  cleared, when it was set from here;
+- only while the eyes are drawn split, so that it goes when the video
+  ends or the 3D mode is left;
+- never while native Dolby Vision output has the output. That one does
+  not start while the property is set (CDVBridgeState::Capture(), as it
+  was), so the two never hold it together.
+
+After the commit, what Kodi keeps of the properties of the commits that
+the driver accepted is looked at. An InfoFrame that it did not take is
+not offered again while the eyes are drawn split, with one line at info
+level, and the resolution is set once more; one that is still there
+after it was taken away is taken away again, up to three times.
+
+No InfoFrame that says "2D" is sent when 3D is left: the property is
+cleared, and the driver sends what it sends for the mode (kept set, it
+would replace the vendor InfoFrame of the 2160p modes of HDMI 1.4, and
+keep Dolby Vision out).
+
+For a mode that is set while the eyes are not drawn split and nothing
+was given to the driver, PrepareStereoInfoFrame() and
+CheckStereoInfoFrame() return after their first test.
+
+Read and compiled (syntax check of WinSystemGbm.cpp and
+WinSystemGbmGLESContext.cpp with the commands of the last build). What
+the EDID says and the bytes have their host test (drmstereo_test.cpp).
+Not run on a GPU; no display has been seen to take it.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp | 194 ++++++++++++++++++++++++++--
+ xbmc/windowing/gbm/WinSystemGbm.h   |  26 +++-
+ 2 files changed, 206 insertions(+), 14 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 443e318..d9bcc44 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -368,6 +368,10 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+     return false;
+   }
+ 
++  // Hades: where the driver is told of a half 3D layout by the HDMI vendor InfoFrame
++  // (nvidia-drm), it is given, or taken away, with the commit of this mode
++  PrepareStereoInfoFrame(res);
++
+   struct gbm_bo* bo = nullptr;
+ 
+   if (!std::dynamic_pointer_cast<CDRMAtomic>(m_DRM))
+@@ -389,6 +393,7 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+     FlipPage(true, false, false);
+ 
+   // Hades: where a 3D mode was asked for, or the output was in one, what it is in now
++  CheckStereoInfoFrame();
+   CheckStereoOutput();
+ 
+   auto delay =
+@@ -443,11 +448,35 @@ bool CWinSystemGbm::GetStereoOffers(std::vector<STEREO::Offer>& offers,
+     return false;
+   }
+ 
+-  offers = STEREO::Offers(m_DRM->GetStereoModes());
++  const std::vector<STEREO::Mode> modes = m_DRM->GetStereoModes();
++  offers = STEREO::Offers(modes);
+   allowed.framePacking = !m_stereoRefusedFramePacking;
+   allowed.halfModes = !m_stereoRefusedHalfModes;
+-  allowed.infoFrame = false;
++  allowed.infoFrame = !m_stereoRefusedInfoFrame;
+   allowed.otherSize = !CResolutionUtils::HasWhitelist();
++
++  // A driver that takes the HDMI vendor InfoFrame from its user (nvidia-drm) can tell the
++  // display of a half layout in the 2D mode, for the timings that the display's EDID says it
++  // takes in that layout, where the driver lists no mode for it. (Not looked up for the
++  // question of another thread, which is about frame packing.)
++  CDRMConnector* connector = m_DRM->GetConnector();
++  if (drawing && allowed.infoFrame && connector->GetType() == "HDMI-A" &&
++      connector->SupportsProperty("NV_HDMI_VSIF_METADATA"))
++  {
++    const std::vector<uint8_t> raw = connector->GetEDID();
++    const STEREO::Edid3D edid = STEREO::Parse(raw);
++    if (edid.read)
++    {
++      for (STEREO::Offer& offer : offers)
++      {
++        const uint8_t vic = STEREO::VicOf(modes[offer.base]);
++        offer.infoFrameTopAndBottom =
++            offer.topAndBottom < 0 && STEREO::Supports(edid, vic, STEREO::Layout::TOP_AND_BOTTOM);
++        offer.infoFrameSideBySide =
++            offer.sideBySide < 0 && STEREO::Supports(edid, vic, STEREO::Layout::SIDE_BY_SIDE_HALF);
++      }
++    }
++  }
+   return true;
+ }
+ 
+@@ -473,18 +502,23 @@ bool CWinSystemGbm::GetStereoOutputMode(RESOLUTION res,
+   {
+     choice = STEREO::Choose(offers, base, ArrangementOf(mode), allowed);
+     if (choice.layout == STEREO::Layout::NONE)
+-      reason = allowed.framePacking && allowed.halfModes
++      reason = allowed.framePacking && allowed.halfModes && allowed.infoFrame
+                    ? "the display has no 3D mode for it at this refresh rate"
+-                   : "the driver did not take the 3D modes that the display has for it";
++                   : "the driver did not take what the display has for it";
+     else
+       reason = "its modes cannot be read";
+   }
+ 
++  // Told by the vendor InfoFrame in the mode of the resolution itself: the resolution is set
++  // as it is, and the InfoFrame goes with it (PrepareStereoInfoFrame()).
++  if (choice.infoFrame && choice.mode == base)
++    return false;
++
+   // what Kodi is told of the mode to set, and of the 2D mode whose timing that one has
+   RESOLUTION_INFO chosen;
+   RESOLUTION_INFO timing;
+-  if (choice.layout == STEREO::Layout::NONE || choice.infoFrame ||
+-      !m_DRM->GetModeInfo(choice.mode, chosen) || !m_DRM->GetModeInfo(choice.base, timing))
++  if (choice.layout == STEREO::Layout::NONE || !m_DRM->GetModeInfo(choice.mode, chosen) ||
++      !m_DRM->GetModeInfo(choice.base, timing))
+   {
+     TellStereoOutput(StringUtils::Format(
+         "none for {}: {}. The two halves go out as they are, and the display is switched to 3D "
+@@ -530,6 +564,8 @@ bool CWinSystemGbm::GetStereoOutputMode(RESOLUTION res,
+   }
+   else
+   {
++    // A mode of another size: the 3D mode of a half layout or, where the display is told by
++    // the vendor InfoFrame, the 2D mode that it is told in.
+     info = chosen;
+     info.strOutput = entry.strOutput;
+     gfx.ResetOverscan(info);
+@@ -567,17 +603,17 @@ void CWinSystemGbm::TellStereoOutput(const std::string& status)
+   CLog::Log(LOGINFO, "3D output: {}", status);
+ }
+ 
+-void CWinSystemGbm::RefuseStereoOutput(STEREO::Layout layout, const std::string& why)
++void CWinSystemGbm::RefuseStereoOutput(std::atomic<bool>& refused,
++                                       const char* what,
++                                       const std::string& why)
+ {
+-  auto& refused = layout == STEREO::Layout::FRAME_PACKING ? m_stereoRefusedFramePacking
+-                                                          : m_stereoRefusedHalfModes;
+   if (refused.exchange(true))
+     return;
+ 
+   CLog::Log(LOGINFO,
+             "3D output: {} is not used: {}. What comes next in the choice is taken; it is tried "
+             "again when the eyes are next drawn split",
+-            STEREO::LayoutName(layout), why);
++            what, why);
+   // The resolution is set once more, for what is chosen without it
+   CServiceBroker::GetAppMessenger()->PostMsg(
+       TMSG_SETVIDEORESOLUTION, static_cast<int>(GetGfxContext().GetVideoResolution()), 1);
+@@ -591,11 +627,139 @@ bool CWinSystemGbm::StereoWindowFailed(const RESOLUTION_INFO& res,
+   if (layout == STEREO::Layout::NONE)
+     return false;
+ 
+-  RefuseStereoOutput(layout, why);
++  RefuseStereoOutput(layout == STEREO::Layout::FRAME_PACKING ? m_stereoRefusedFramePacking
++                                                             : m_stereoRefusedHalfModes,
++                     STEREO::LayoutName(layout), why);
+   plain = CDisplaySettings::GetInstance().GetResolutionInfo(GetGfxContext().GetVideoResolution());
+   return true;
+ }
+ 
++void CWinSystemGbm::PrepareStereoInfoFrame(const RESOLUTION_INFO& res)
++{
++  m_stereoInfoFrameQueued = false;
++  const RenderStereoMode drawn = GetGfxContext().GetStereoMode();
++
++  // Nothing here is for a mode that is set while the eyes are not drawn split and the driver
++  // has no InfoFrame from here: every mode that is set without a 3D display.
++  if (!IsSplitStereoMode(drawn) && !m_stereoInfoFrame.IsValid())
++    return;
++
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  CDRMConnector* connector = m_DRM->GetConnector();
++  if (!drm || !connector)
++    return;
++
++  // Never with a mode that has a 3D layout: the driver tells the display of that mode itself,
++  // and what it is given here would be sent in place of what it tells.
++  STEREO::Layout wanted = STEREO::Layout::NONE;
++  const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
++  if (IsSplitStereoMode(drawn) && mode && STEREO::LayoutOf(mode->flags) == STEREO::Layout::NONE &&
++      !res.strId.empty())
++  {
++    std::vector<STEREO::Offer> offers;
++    STEREO::Allowed allowed;
++    const char* reason = nullptr;
++    if (GetStereoOffers(offers, allowed, reason, true))
++    {
++      const int base = std::atoi(res.strId.c_str());
++      const STEREO::Choice choice = STEREO::Choose(offers, base, ArrangementOf(drawn), allowed);
++      if (choice.infoFrame && choice.mode == base)
++        wanted = choice.layout;
++    }
++  }
++
++  // (the driver has it already, or has none and none is wanted)
++  if (wanted == m_stereoInfoFrameLayout)
++    return;
++
++  if (wanted != STEREO::Layout::NONE)
++  {
++    const STEREO::InfoFramePayload payload = STEREO::HalfLayoutInfoFrame(wanted);
++    CDRMPropertyBlob blob(drm->GetFileDescriptor(), payload.bytes.data(), payload.size);
++    if (payload.size != 0 && blob.IsValid() &&
++        drm->AddProperty(connector, "NV_HDMI_VSIF_METADATA", blob.Get()))
++    {
++      m_stereoInfoFramePending = std::move(blob);
++      m_stereoInfoFrameAsked = wanted;
++      m_stereoInfoFrameQueued = true;
++      return;
++    }
++
++    RefuseStereoOutput(m_stereoRefusedInfoFrame, "the HDMI vendor InfoFrame of a half layout",
++                       "it could not be made for the driver");
++    if (!m_stereoInfoFrame.IsValid())
++      return;
++  }
++
++  // None is wanted, and the driver has one from here: it is taken away with this commit
++  if (drm->AddProperty(connector, "NV_HDMI_VSIF_METADATA", 0))
++  {
++    m_stereoInfoFrameAsked = STEREO::Layout::NONE;
++    m_stereoInfoFrameQueued = true;
++  }
++}
++
++void CWinSystemGbm::CheckStereoInfoFrame()
++{
++  if (!m_stereoInfoFrameQueued)
++    return;
++  m_stereoInfoFrameQueued = false;
++
++  // What the driver took: the properties of a commit are kept when it is accepted
++  // (CDRMAtomic::FinishRequest()), and those of the commit before it when it is not.
++  CDRMConnector* connector = m_DRM->GetConnector();
++  const uint64_t has =
++      connector ? connector->GetPropertyValue("NV_HDMI_VSIF_METADATA").value_or(0) : 0;
++
++  if (m_stereoInfoFrameAsked != STEREO::Layout::NONE)
++  {
++    if (m_stereoInfoFramePending.IsValid() && has == m_stereoInfoFramePending.Get())
++    {
++      // (the one that the driver had before, if any, goes with this)
++      m_stereoInfoFrame = std::move(m_stereoInfoFramePending);
++      m_stereoInfoFrameLayout = m_stereoInfoFrameAsked;
++      m_stereoInfoFrameTries = 0;
++      const RESOLUTION_INFO mode = m_DRM->GetCurrentMode();
++      TellStereoOutput(StringUtils::Format(
++          "{} with {}, told by the HDMI vendor InfoFrame in that 2D mode",
++          STEREO::LayoutName(m_stereoInfoFrameLayout), mode.strMode));
++    }
++    else
++    {
++      m_stereoInfoFramePending = CDRMPropertyBlob();
++      RefuseStereoOutput(m_stereoRefusedInfoFrame, "the HDMI vendor InfoFrame of a half layout",
++                         "the driver did not take the commit with it");
++    }
++    return;
++  }
++
++  if (has == 0)
++  {
++    m_stereoInfoFrame = CDRMPropertyBlob();
++    m_stereoInfoFrameLayout = STEREO::Layout::NONE;
++    m_stereoInfoFrameTries = 0;
++    const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
++    if (!mode || STEREO::LayoutOf(mode->flags) == STEREO::Layout::NONE)
++      TellStereoOutput("off: the display is no longer told of a 3D layout");
++    return;
++  }
++
++  // It was to be taken away and the driver still has it: the display would show a 2D picture
++  // as two eyes. The mode is set again, a few times.
++  constexpr int TRIES = 3;
++  if (m_stereoInfoFrameTries < TRIES)
++  {
++    ++m_stereoInfoFrameTries;
++    CLog::Log(LOGWARNING,
++              "3D output: the driver still sends the vendor InfoFrame of a half layout (it did "
++              "not take the commit that takes it away): the mode is set again ({} of {})",
++              m_stereoInfoFrameTries, TRIES);
++    m_DRM->AllowModeset();
++    CServiceBroker::GetAppMessenger()->PostMsg(
++        TMSG_SETVIDEORESOLUTION, static_cast<int>(GetGfxContext().GetVideoResolution()), 1);
++  }
++}
++
+ void CWinSystemGbm::CheckStereoOutput()
+ {
+   const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
+@@ -605,7 +769,7 @@ void CWinSystemGbm::CheckStereoOutput()
+   // Nothing here is for a 2D mode that is set while the output is in no 3D mode, the eyes are
+   // not drawn split and nothing was refused: every mode that is set without a 3D display.
+   if (asked == STEREO::Layout::NONE && m_stereoLayout == STEREO::Layout::NONE && !split &&
+-      !m_stereoRefusedFramePacking && !m_stereoRefusedHalfModes)
++      !m_stereoRefusedFramePacking && !m_stereoRefusedHalfModes && !m_stereoRefusedInfoFrame)
+     return;
+ 
+   // The eyes are drawn another way: what was refused may be tried when they are next split
+@@ -613,6 +777,7 @@ void CWinSystemGbm::CheckStereoOutput()
+   {
+     m_stereoRefusedFramePacking = false;
+     m_stereoRefusedHalfModes = false;
++    m_stereoRefusedInfoFrame = false;
+   }
+ 
+   if (asked == STEREO::Layout::NONE && m_stereoLayout == STEREO::Layout::NONE)
+@@ -627,7 +792,10 @@ void CWinSystemGbm::CheckStereoOutput()
+ 
+   if (asked != STEREO::Layout::NONE && shown != asked)
+   {
+-    RefuseStereoOutput(asked, "the driver did not take its mode (the kernel log may say why)");
++    RefuseStereoOutput(asked == STEREO::Layout::FRAME_PACKING ? m_stereoRefusedFramePacking
++                                                              : m_stereoRefusedHalfModes,
++                       STEREO::LayoutName(asked),
++                       "the driver did not take its mode (the kernel log may say why)");
+     return;
+   }
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 86e920c..06ecd53 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -248,12 +248,36 @@ private:
+   void CheckStereoOutput();
+   //! A kind of 3D output cannot be used: it is not chosen again while the eyes are drawn
+   //! split. The first time, it is told and the resolution is set once more.
+-  void RefuseStereoOutput(STEREO::Layout layout, const std::string& why);
++  //! \param refused the flag of that kind
++  //! \param what its name, for the log
++  void RefuseStereoOutput(std::atomic<bool>& refused, const char* what, const std::string& why);
++  /*!
++   * \brief Before the commit of a mode: the HDMI vendor InfoFrame of a half layout is given to
++   *        the driver with that commit, or taken from it
++   *
++   * nvidia-drm lists no mode for the half layouts and sends the vendor InfoFrame that it is
++   * given (NV_HDMI_VSIF_METADATA) in place of its own. Given only with a mode that has no 3D
++   * layout (of a frame-packed mode the driver tells the display itself, and what it is given
++   * here would go out instead), only while the eyes are drawn split, and never while native
++   * Dolby Vision output, which uses the same property, has the output.
++   */
++  void PrepareStereoInfoFrame(const RESOLUTION_INFO& res);
++  //! After that commit: whether the driver took it
++  void CheckStereoInfoFrame();
+   //! Tells the log what the 3D output is, when that is something else than it was told last
+   void TellStereoOutput(const std::string& status);
+   //! (read by other threads: GetStereoOutputArrangement())
+   std::atomic<bool> m_stereoRefusedFramePacking{false};
+   std::atomic<bool> m_stereoRefusedHalfModes{false};
++  std::atomic<bool> m_stereoRefusedInfoFrame{false};
++  //! The vendor InfoFrame that the driver has from here, while it has one, and its layout
++  CDRMPropertyBlob m_stereoInfoFrame;
++  STEREO::Layout m_stereoInfoFrameLayout{STEREO::Layout::NONE};
++  //! What the commit that is being made gives the driver (none: it takes ours from it)
++  CDRMPropertyBlob m_stereoInfoFramePending;
++  STEREO::Layout m_stereoInfoFrameAsked{STEREO::Layout::NONE};
++  bool m_stereoInfoFrameQueued{false}; //!< the commit that is being made changes the property
++  int m_stereoInfoFrameTries{0}; //!< times in a row that ours stayed when it was taken away
+   STEREO::Layout m_stereoLayout{STEREO::Layout::NONE}; //!< of the mode the output was last seen in
+   int m_stereoLeaveTries{0}; //!< times in a row that a 3D mode stayed when a 2D one was set
+   std::string m_stereoStatus; //!< see TellStereoOutput()
+-- 
+2.53.0
+

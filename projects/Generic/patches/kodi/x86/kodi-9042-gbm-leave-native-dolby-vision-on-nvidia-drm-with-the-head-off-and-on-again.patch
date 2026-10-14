@@ -1,0 +1,163 @@
+From 1c27ecede748743d50a3438bb528d27e26ccb3df Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 07:36:33 +0000
+Subject: [PATCH] gbm: leave native Dolby Vision on nvidia-drm with the head
+ off and on again
+
+Leaving the transport on nvidia-drm commits the original properties on
+the same mode: the depth goes from 8 bpc back to the driver's choice
+("max bpc" from 8 to 12), which NVKMS applies to the running head, and
+at 2160p24 to 30 the HDMI link moves from an unscrambled to a scrambled
+TMDS rate. Once, on an RTX 4080 with an LG C5, the TV showed black for
+a moment right after that and then lost the signal for good, while Kodi
+went on normally (the same exit had worked for the previous film).
+There is no kernel log of that session, so the cause is not proven.
+
+Make the exit the path NVKMS takes when a display is switched on:
+commit the original properties with the CRTC inactive, then activate
+it again, both as strict blocking commits, so that the head and the
+link are brought up from scratch. If turning the head off is refused,
+the output is restored in place as before. If turning it on again is
+refused, the head stays off with the original properties and the
+existing retry of the restore (once a second) repeats the sequence;
+the refusal is logged as a warning once per capture. Not while DPMS
+keeps the display off: the in-place restore keeps it off, as before,
+and switching it on later is a full modeset anyway. The kernel
+backends (i915 with the fork's patches, amdgpu with linux-9910) are
+left as they are: changing their tunnel property already forces a full
+modeset.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp      | 53 ++++++++++++++++++++----
+ xbmc/windowing/gbm/drm/DRMAtomic.h       |  2 +
+ xbmc/windowing/gbm/drm/DVBridgeState.cpp |  1 +
+ xbmc/windowing/gbm/drm/DVBridgeState.h   | 10 +++++
+ 4 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 230d15e..5909ada 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -665,13 +665,52 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
+             (format == DRM_FORMAT_XRGB8888 || format == DRM_FORMAT_ARGB8888) && mode &&
+             IsDVTransportMode(*mode);
+   }
+-  if (valid)
+-    valid = state.Stage(*drm, restore);
+-  // Entering and leaving the transport change the output (depth, dither, InfoFrames) and need a
+-  // modeset; the transport frames in between change only the framebuffer. A modeset still
+-  // pending in Kodi (m_need_modeset) is allowed by FlipPageTransactional() itself.
+-  const bool modeset = restore || !state.TransportLive();
+-  const bool accepted = drm->FlipPageTransactional(valid ? bo : nullptr, modeset);
++  bool accepted = false;
++  bool inPlace = true;
++  // nvidia-drm: leaving the transport raises the depth from 8 bpc to the driver's choice on the
++  // same mode, which NVKMS applies to the running head, and moves the HDMI link from an
++  // unscrambled to a scrambled TMDS rate at 2160p24 to 30. Once (RTX 4080, LG C5) the TV lost
++  // the signal right after that and never got it back, while Kodi went on normally. Commit the
++  // original properties with the head off, then turn it on again: NVKMS brings the head and
++  // the link up from scratch, as when the display is switched on. Not while the display is
++  // meant to be off (DPMS): the in-place restore keeps it off, and turning it on later is a full
++  // modeset anyway. The kernel backends already get a full modeset when their tunnel property
++  // changes.
++  if (valid && restore && drm->IsActive() &&
++      state.CapturedBackend() == CDVBridgeState::Backend::NVIDIA)
++  {
++    drm->SetActive(false);
++    const bool off = drm->FlipPageTransactional(state.Stage(*drm, true) ? bo : nullptr, true);
++    drm->SetActive(true);
++    if (off)
++    {
++      // If turning it on is refused, the head stays off with the original properties until the
++      // retry of EndDVBridge() (once a second) repeats this: the in-place restore would be the
++      // same commit.
++      inPlace = false;
++      accepted = drm->FlipPageTransactional(state.Stage(*drm, true) ? bo : nullptr, true);
++      if (accepted)
++        CLog::Log(LOGINFO, "DVBridge: output turned off and on again to leave native Dolby "
++                           "Vision");
++      else
++        CLog::Log(state.TakeRestartNotice() ? LOGWARNING : LOGDEBUG,
++                  "DVBridge: turning the output on again after native Dolby Vision was refused");
++    }
++    else
++      CLog::Log(state.TakeRestartNotice() ? LOGWARNING : LOGDEBUG,
++                "DVBridge: turning the output off to leave native Dolby Vision was refused; "
++                "restoring the output in place");
++  }
++  if (!accepted && inPlace)
++  {
++    if (valid)
++      valid = state.Stage(*drm, restore);
++    // Entering and leaving the transport change the output (depth, dither, InfoFrames) and need a
++    // modeset; the transport frames in between change only the framebuffer. A modeset still
++    // pending in Kodi (m_need_modeset) is allowed by FlipPageTransactional() itself.
++    const bool modeset = restore || !state.TransportLive();
++    accepted = drm->FlipPageTransactional(valid ? bo : nullptr, modeset);
++  }
+   surface.CompleteTransactionalBuffer(accepted);
+   if (accepted && restore)
+   {
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index b7ee26b..723be1f 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -34,6 +34,8 @@ public:
+   void FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, bool async) override;
+   bool SetVideoMode(const RESOLUTION_INFO& res, struct gbm_bo* bo) override;
+   bool SetActive(bool active) override;
++  //! The CRTC is meant to be on (false while DPMS keeps the display off).
++  bool IsActive() const { return m_active; }
+   bool InitDrm() override;
+   void DestroyDrm() override;
+   bool SupportsFencing() override { return true; }
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.cpp b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+index 65df84f..a875dea 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.cpp
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+@@ -184,6 +184,7 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+     return false;
+   m_saved = std::move(saved);
+   m_owner = &drm;
++  m_backend = backend;
+   for (const auto& property : m_saved)
+     CLog::Log(LOGDEBUG, "DVBridge: capture object={} property={} original={} transport={}",
+               property.object->GetId(), property.name, property.original, property.transport);
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.h b/xbmc/windowing/gbm/drm/DVBridgeState.h
+index 93f8aa5..4d8df20 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.h
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.h
+@@ -3,6 +3,7 @@
+ 
+ #include "DRMObject.h"
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace KODI::WINDOWING::GBM
+@@ -38,8 +39,15 @@ public:
+     m_saved.clear();
+     m_owner = nullptr;
+     m_transportLive = false;
++    m_backend = Backend::NONE;
++    m_restartNotice = true;
+   }
+   bool Captured() const { return !m_saved.empty(); }
++  //! The backend of the captured output (NONE when nothing is captured).
++  Backend CapturedBackend() const { return m_backend; }
++  //! True once per capture, so that a refused restart of the output, retried once a second while
++  //! the display refuses it, is logged as a warning only once.
++  bool TakeRestartNotice() { return std::exchange(m_restartNotice, false); }
+   //! The transport has been committed once since the capture: the output already has the
+   //! transport properties, so the next transport frames change only the framebuffer.
+   bool TransportLive() const { return m_transportLive; }
+@@ -58,5 +66,7 @@ private:
+   std::vector<Property> m_saved;
+   CDRMAtomic* m_owner = nullptr;
+   bool m_transportLive = false;
++  Backend m_backend = Backend::NONE;
++  bool m_restartNotice = true;
+ };
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,218 @@
+From 80dcf1952ada1ceed29127165b6c7e0fbc0cb9da Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:33:43 +0000
+Subject: [PATCH] dvbridge: keep Kodi's GL state and ignore earlier GL errors
+
+Kodi's GLES GUI relies on the scissor test being enabled: only
+ResetRenderSystem() and ApplyStateBlock() enable it, and every clipped
+control only sets the scissor rectangle. Two Dolby Vision paths left it
+disabled:
+- libplacebo's raster passes set their own viewport and scissor
+  rectangle (for the output pass, the picture area), leave them, and
+  disable the scissor test and blending. The full-precision composition
+  (dvbridge_render_rgb, used for letterboxed films and whenever the GUI
+  or subtitles are on screen) restored nothing, so the OSD composited
+  next was drawn without clipping. Restoring only the scissor test would
+  clip it to the picture area instead: the OSD over the black bars of a
+  letterboxed film would vanish.
+- EndDVBridge() disabled it to clear the restored output and never
+  enabled it again, so after a Dolby Vision film the GUI was drawn
+  without clipping until the next mode switch.
+Both render paths (full precision and packed) now save the viewport,
+the scissor rectangle, the write mask and the capabilities, render
+without blending, dithering or tests, and restore them all. The GUI
+composite into the Dolby Vision picture covers the whole frame,
+whatever scissor rectangle is set. EndDVBridge() enables the scissor
+test again, and also clears the next back buffer after the restore,
+which may still hold a packed transport frame, so the ordinary output
+never starts from tunnel pixels.
+
+The packed render, the transport pack and the enhancement-layer import
+refused to work when an earlier, unrelated GL call had left an error
+flag set, and the packed path then stayed disabled for the session.
+They now clear such flags (bounded) and check only what they raise.
+---
+ tools/dvbridge/dvbridge_dmabuf.c              |  4 +
+ tools/dvbridge/dvbridge_gl_pack.c             |  6 +-
+ tools/dvbridge/dvbridge_render.c              | 73 +++++++++++++------
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 12 +++
+ 4 files changed, 72 insertions(+), 23 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_dmabuf.c b/tools/dvbridge/dvbridge_dmabuf.c
+index 1c8ad27..73ad2ac 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.c
++++ b/tools/dvbridge/dvbridge_dmabuf.c
+@@ -157,6 +157,10 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+             snprintf(last_error, sizeof(last_error), "egl-image plane=%d egl_error=0x%x", i, (unsigned)eglGetError());
+             goto fail;
+         }
++        /* Errors left by earlier, unrelated GL work are not ours: clear them (bounded), so that
++         * the check below sees only what this import raised. */
++        for (int e = 0; e < 16 && glGetError() != GL_NO_ERROR; ++e)
++            ;
+         GLint previous;
+         glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+         glGenTextures(1, &candidate.planes[i].texture);
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index 29dd931..34ecddf 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -86,8 +86,10 @@ bool dvbridge_gl_pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned f
+     for (unsigned i = 0; i < count * 128; ++i)
+         if (packets[i] > 255)
+             return false;
+-    if (glGetError() != GL_NO_ERROR)
+-        return false;
++    /* Errors left by earlier, unrelated GL work are not ours: clear them (bounded), so that the
++     * checks below see only what the pack raised. */
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
+     GLint program, vao, draw, read, viewport[4], active, binding, sampler;
+     GLboolean mask[4];
+     glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 917e2c0..20f21d8 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -142,6 +142,45 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     free(r);
+ }
+ 
++/* GL state around a render. libplacebo's raster passes set their own viewport and scissor
++ * rectangle (for the output pass, the picture area) and leave them, and turn the scissor test and
++ * blending off. Kodi's GUI, drawn and composited after the video, relies on its own viewport,
++ * scissor rectangle and scissor test: without them the GUI is not clipped, or is clipped to the
++ * picture area of a letterboxed film. The render itself starts without blending, dithering, tests
++ * or write masks, and the caller's state is restored after it. */
++static const GLenum saved_caps[] = {GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_SCISSOR_TEST,
++    GL_DITHER, GL_CULL_FACE, GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE,
++    GL_SAMPLE_COVERAGE};
++#define SAVED_CAPS (sizeof(saved_caps) / sizeof(*saved_caps))
++
++struct saved_gl_state {
++    GLint viewport[4], scissor[4];
++    GLboolean enabled[SAVED_CAPS], mask[4];
++};
++
++static void save_gl_state(struct saved_gl_state *s)
++{
++    glGetIntegerv(GL_VIEWPORT, s->viewport);
++    glGetIntegerv(GL_SCISSOR_BOX, s->scissor);
++    glGetBooleanv(GL_COLOR_WRITEMASK, s->mask);
++    for (unsigned i = 0; i < SAVED_CAPS; ++i) {
++        s->enabled[i] = glIsEnabled(saved_caps[i]);
++        glDisable(saved_caps[i]);
++    }
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++}
++
++static void restore_gl_state(const struct saved_gl_state *s)
++{
++    glViewport(s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
++    glScissor(s->scissor[0], s->scissor[1], s->scissor[2], s->scissor[3]);
++    glColorMask(s->mask[0], s->mask[1], s->mask[2], s->mask[3]);
++    for (unsigned i = 0; i < SAVED_CAPS; ++i) {
++        if (s->enabled[i]) glEnable(saved_caps[i]);
++        else glDisable(saved_caps[i]);
++    }
++}
++
+ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                         const void *metadata, size_t bytes, double pts, double el_pts,
+                         struct dvbridge_geometry geometry, pl_tex packed, bool flip)
+@@ -233,7 +272,11 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+                         const void *metadata, size_t bytes, double pts, double el_pts,
+                         struct dvbridge_geometry geometry)
+ {
+-    return render(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++    struct saved_gl_state state;
++    save_gl_state(&state);
++    bool ok = render(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++    restore_gl_state(&state);
++    return ok;
+ }
+ 
+ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *source,
+@@ -252,28 +295,16 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+     for (int c = 0; c < 4; ++c)
+         if (target->params.format->component_depth[c] != 8)
+             return false;
+-    // Transport bytes must not inherit GUI blending, dithering or write masks.
+-    // libplacebo owns viewport/scissor while rendering; preserve the caller's
+-    // enable state, just as the separate transport packer does.
+-    if (glGetError() != GL_NO_ERROR)
+-        return false;
+-    const GLenum caps[] = {GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_SCISSOR_TEST,
+-        GL_DITHER, GL_CULL_FACE, GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE,
+-        GL_SAMPLE_COVERAGE};
+-    GLboolean enabled[sizeof(caps)/sizeof(*caps)], mask[4];
+-    glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+-    for (unsigned i=0; i<sizeof(caps)/sizeof(*caps); ++i) {
+-        enabled[i] = glIsEnabled(caps[i]);
+-        glDisable(caps[i]);
+-    }
+-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    // Transport bytes must not inherit GUI blending, dithering or write masks (saved_gl_state).
++    // Errors left by earlier, unrelated GL work are not ours: clear them, so that the check
++    // after rendering sees only what this pass raised (bounded: one flag per error kind).
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    struct saved_gl_state state;
++    save_gl_state(&state);
+     bool ok = render(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
+     ok = glGetError() == GL_NO_ERROR && ok;
+-    glColorMask(mask[0], mask[1], mask[2], mask[3]);
+-    for (unsigned i=0; i<sizeof(caps)/sizeof(*caps); ++i) {
+-        if (enabled[i]) glEnable(caps[i]);
+-        else glDisable(caps[i]);
+-    }
++    restore_gl_state(&state);
+     r->ready = ok && glGetError() == GL_NO_ERROR;
+     return r->ready;
+ }
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index de68421..bab204b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -478,6 +478,7 @@ void CWinSystemGbmGLESContext::CompositeGui()
+ #ifdef HAVE_DVBRIDGE
+   GLint previousFramebuffer = 0;
+   GLint previousViewport[4]{};
++  GLboolean previousScissor = GL_FALSE;
+   const bool dvComposite = m_dvState.Captured();
+   if (dvComposite)
+   {
+@@ -491,6 +492,9 @@ void CWinSystemGbmGLESContext::CompositeGui()
+     }
+     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+     glGetIntegerv(GL_VIEWPORT, previousViewport);
++    // The GUI covers the whole picture, black bars included, whatever scissor rectangle is set.
++    previousScissor = glIsEnabled(GL_SCISSOR_TEST);
++    glDisable(GL_SCISSOR_TEST);
+     glBindFramebuffer(GL_FRAMEBUFFER, target);
+     glViewport(0, 0, 3840, 2160);
+   }
+@@ -555,6 +559,8 @@ void CWinSystemGbmGLESContext::CompositeGui()
+   {
+     glBindFramebuffer(GL_FRAMEBUFFER, previousFramebuffer);
+     glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
++    if (previousScissor)
++      glEnable(GL_SCISSOR_TEST);
+   }
+ #endif
+ }
+@@ -739,8 +745,14 @@ bool CWinSystemGbmGLESContext::EndDVBridge()
+     if (!m_eglContext.TrySwapBuffers() || !FlipDVBridgePage(m_dvState, true))
+     {
+       CLog::Log(LOGERROR, "DVBridge: output restoration failed; retaining scanout state");
++      glEnable(GL_SCISSOR_TEST);
+       return false;
+     }
++    // The next back buffer can still hold a packed transport frame: the ordinary output starts
++    // from black, never from tunnel pixels. Kodi's GUI relies on the scissor test staying on
++    // (only ResetRenderSystem() and ApplyStateBlock() turn it on again).
++    glClear(GL_COLOR_BUFFER_BIT);
++    glEnable(GL_SCISSOR_TEST);
+   }
+   DVGpuTimerReset();
+   if (m_dvSignalling)

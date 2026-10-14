@@ -1,0 +1,181 @@
+From 67f525f3109051ab905974794f369205c1f6d635 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 07:22:44 +0000
+Subject: [PATCH] windowing/gbm: turn off the displays of the graphics devices
+ that are not used
+
+The outputs of Kodi's own device that it does not use are turned off ten
+seconds after it comes up, so that a monitor next to the TV goes to
+standby instead of staying lit for nothing. A display on another
+graphics device was left as it was: the panel of a laptop whose TV is
+on the other card stayed on, with the console, for the whole film. And
+since the devices are looked at before one is chosen, every display of
+every device is on when Kodi starts (the kernel turns them on when a
+device is closed).
+
+At the time the unused outputs of its own device are turned off, Kodi
+now opens each other device that drives a display and disables its
+CRTCs. Nothing else has such a device open, so Kodi is its master. The
+device is then kept open: when the last one to have a device open
+closes it, the kernel puts its console back on it and the display comes
+on again, which is what happens when Kodi ends, however it ends.
+
+A device whose driver refuses is left as it is, and closed. This is
+done on the atomic path only, where the outputs of Kodi's own device
+are turned off too.
+
+Nothing of this can be run without displays: validated in hardware
+only.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp |  5 ++-
+ xbmc/windowing/gbm/drm/DRMUtils.cpp  | 67 ++++++++++++++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMUtils.h    |  9 ++++
+ 3 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 82db260..cb2d201 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -79,6 +79,8 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   if (!strict && m_otherOutputsOff && std::chrono::steady_clock::now() >= *m_otherOutputsOff)
+   {
+     m_otherOutputsOff.reset();
++    // (the outputs of the graphics devices that Kodi does not use: not part of this commit)
++    DisableOtherDevices();
+     if (DisableOtherOutputs(flags))
+       tells = false;
+   }
+@@ -111,7 +113,8 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     // those outputs lit but black. Keep them a few seconds, so that the notice on their
+     // console stays readable, then turn the outputs off (DisableOtherOutputs).
+     constexpr auto noticeTime = std::chrono::seconds(10);
+-    if (std::ranges::any_of(GetCrtcs(), [this](const auto& crtc)
++    if (HasOtherDevices() ||
++        std::ranges::any_of(GetCrtcs(), [this](const auto& crtc)
+                             { return crtc.get() != m_crtc &&
+                                      crtc->GetPropertyValue("ACTIVE").value_or(0) != 0; }))
+       m_otherOutputsOff = std::chrono::steady_clock::now() + noticeTime;
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index b4397a3..5e3009d 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -704,6 +704,7 @@ bool CDRMUtils::OpenDrm(bool needConnector, bool atomic)
+   drmDevicePtr chosen = nullptr;
+   m_deviceName.clear();
+   m_otherOutputs.clear();
++  m_otherDeviceNodes.clear();
+   if (needConnector)
+   {
+     std::string asked = "Default";
+@@ -727,6 +728,12 @@ bool CDRMUtils::OpenDrm(bool needConnector, bool atomic)
+         {
+           if (static_cast<int>(i) != best && !outputs[i].empty())
+             m_otherOutputs.emplace_back(outputs[i]);
++
++          // A device that is not used and drives a display, whether Kodi could use it or not:
++          // that display is turned off once Kodi is up (DisableOtherDevices()).
++          if (static_cast<int>(i) != best &&
++              std::ranges::any_of(found[i].outputs, [](const DRMOutput& o) { return o.usable; }))
++            m_otherDeviceNodes.emplace_back(found[i].device->nodes[DRM_NODE_PRIMARY]);
+         }
+       }
+     }
+@@ -1024,8 +1031,68 @@ bool CDRMUtils::RestoreOriginalMode()
+   return true;
+ }
+ 
++void CDRMUtils::DisableOtherDevices()
++{
++  for (const std::string& node : m_otherDeviceNodes)
++  {
++    // Nothing else has that device open (Kodi runs without a display server), so this is its
++    // master, which turning its outputs off takes.
++    const int fd = open(node.c_str(), O_RDWR | O_CLOEXEC);
++    if (fd < 0)
++    {
++      CLog::LogF(LOGWARNING, "{}: {}", node, strerror(errno));
++      continue;
++    }
++
++    int off = 0;
++    int kept = 0;
++    if (drmModeResPtr resources = drmModeGetResources(fd))
++    {
++      for (int i = 0; i < resources->count_crtcs; i++)
++      {
++        drmModeCrtcPtr crtc = drmModeGetCrtc(fd, resources->crtcs[i]);
++        const bool on = crtc && crtc->mode_valid;
++        drmModeFreeCrtc(crtc);
++        if (!on)
++          continue;
++
++        // (a CRTC with no framebuffer and no mode drives nothing: its display goes to standby)
++        if (drmModeSetCrtc(fd, resources->crtcs[i], 0, 0, 0, nullptr, 0, nullptr) == 0)
++          ++off;
++        else
++          ++kept;
++      }
++      drmModeFreeResources(resources);
++    }
++
++    if (off > 0)
++    {
++      // Held open: when the last one to have a device open closes it, the kernel puts its
++      // console back on it, and the display with it. That is what happens when Kodi ends.
++      CLog::LogF(LOGINFO, "{}: turned off {} output(s) that Kodi does not use{}", node, off,
++                 kept > 0 ? "; another stays on, the driver refused" : "");
++      m_otherDeviceFds.emplace_back(fd);
++    }
++    else
++    {
++      if (kept > 0)
++        CLog::LogF(LOGWARNING, "{}: its outputs stay on, the driver refused: {}", node,
++                   strerror(errno));
++      close(fd);
++    }
++  }
++
++  m_otherDeviceNodes.clear();
++}
++
+ void CDRMUtils::DestroyDrm()
+ {
++  // (their displays come on again with the console: see DisableOtherDevices())
++  for (const int fd : m_otherDeviceFds)
++    close(fd);
++  m_otherDeviceFds.clear();
++  m_otherDeviceNodes.clear();
++
+   RestoreOriginalMode();
+ 
+   if (drmAuthMagic(m_fd, 0) == EINVAL)
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 8f3cbf7..b7ff784 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -120,6 +120,11 @@ protected:
+     return m_connectors;
+   }
+   const std::vector<std::unique_ptr<CDRMCrtc>>& GetCrtcs() const { return m_crtcs; }
++  //! Whether a graphics device that Kodi does not use drives a display
++  bool HasOtherDevices() const { return !m_otherDeviceNodes.empty(); }
++  //! Turns the outputs of those devices off. The devices are then kept open until
++  //! DestroyDrm(): the kernel turns the displays of a device on again when it is closed.
++  void DisableOtherDevices();
+ 
+   int m_fd{-1};
+   CDRMConnector* m_connector{nullptr};
+@@ -158,6 +163,10 @@ private:
+   //! The outputs of the other graphics devices that Kodi could use, as they were when this one
+   //! was chosen: the settings offer the connected ones after those of this device.
+   std::vector<std::vector<DRMOutput>> m_otherOutputs;
++  //! The primary nodes of the graphics devices that Kodi does not use and that drive a display
++  std::vector<std::string> m_otherDeviceNodes;
++  //! Those devices, held open once their outputs were turned off
++  std::vector<int> m_otherDeviceFds;
+   std::vector<std::unique_ptr<CDRMConnector>> m_connectors;
+   std::vector<std::unique_ptr<CDRMEncoder>> m_encoders;
+   std::vector<std::unique_ptr<CDRMCrtc>> m_crtcs;
+-- 
+2.53.0
+

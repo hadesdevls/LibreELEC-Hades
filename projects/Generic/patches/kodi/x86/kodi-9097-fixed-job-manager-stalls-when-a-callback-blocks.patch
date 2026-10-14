@@ -1,0 +1,362 @@
+From 83ec9497879d2e5e560e76f2059fafb2244a9d17 Mon Sep 17 00:00:00 2001
+From: Malard <malard@gmail.com>
+Date: Fri, 4 Sep 2026 21:20:57 +0100
+Subject: [PATCH] fixed: job manager stalls when a callback blocks
+
+CJobManager::CanStart() and CJobManager::StartWorkers() use m_processing as their
+measure of how many workers are busy. OnJobComplete() removes the work item from
+m_processing before invoking the callbacks, so a worker that blocks inside a
+callback is counted as free.
+
+Once every live worker is inside a callback, StartWorkers() counts all of them as
+free, so it sets m_jobEvent for threads that will never return to GetNextJob()
+instead of creating a worker. No replacement worker is created, and no job submitted anywhere in the application runs again for
+the remaining life of the process. Anything that waits on a job then hangs; in the
+reported case CVideoPlayer's destructor, which spins on its job queue draining and
+runs on the application thread.
+
+v21 erased from m_processing after the callback returned, so it spawned a
+replacement. The early erase arrived in 10e6892920, which is an ancestor of
+22.0b1, so this ships broken in Beta 1 and Beta 2.
+
+m_completing counts, by priority, the jobs whose callbacks are still running.
+CanStart() adds it to m_processing, so callback execution counts against its
+priority's allowance again, and StartWorkers() no longer counts a worker that is
+still in a callback as free.
+
+Separately, CancelJobs() called IJobCallback::OnJobAbort() while holding m_section.
+A callback that takes a lock of its own therefore inverted the order against every
+path that takes that lock before entering the job manager - CJobQueue::AddJob()
+holds CJobQueue::m_section across CJobManager::AddJob() - and a callback that simply
+blocks stalled every other thread's use of the job manager for as long as it did so.
+
+The pending work items are now moved out of the queues under the lock, and their
+callbacks run and their jobs are freed after it is released. This also removes the
+recursive re-entry of m_section that a callback calling back into AddJob() produces,
+with no change in outcome, since m_running is already false by then.
+
+Jobs still in m_processing keep their current behaviour, so the inversion remains
+reachable for a job that has already started. They are owned by a running worker that
+may complete and free them at any moment, and holding m_section is what guarantees the
+CJob* handed to OnJobAbort() stays alive for the call. Giving those callbacks the same
+treatment needs an ownership change rather than a wider lock scope, which is a separate
+piece of work. The test pauses the queue so the job never enters m_processing, and it
+covers only the path this commit changes.
+
+Fixes #28894
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+(cherry picked from commit e8001117fc7f828302f2a744a64d31d984893478)
+---
+ xbmc/jobs/JobManager.cpp           |  51 +++++++----
+ xbmc/jobs/JobManager.h             |   7 ++
+ xbmc/utils/test/TestJobManager.cpp | 140 +++++++++++++++++++++++++++++
+ 3 files changed, 182 insertions(+), 16 deletions(-)
+
+diff --git a/xbmc/jobs/JobManager.cpp b/xbmc/jobs/JobManager.cpp
+index b2b838a..4d90101 100644
+--- a/xbmc/jobs/JobManager.cpp
++++ b/xbmc/jobs/JobManager.cpp
+@@ -16,6 +16,7 @@
+ #include <cassert>
+ #include <chrono>
+ #include <mutex>
++#include <numeric>
+ #include <optional>
+ #include <stdexcept>
+ #include <thread>
+@@ -103,33 +104,40 @@ void CJobManager::Restart()
+ 
+ void CJobManager::CancelJobs()
+ {
+-  std::unique_lock lock(m_section);
+-  m_running = false;
++  Processing pending;
+ 
+-  // clear any pending jobs
+-  for (unsigned int priority = CJob::PRIORITY_LOW_PAUSABLE; priority <= CJob::PRIORITY_DEDICATED;
+-       ++priority)
+   {
+-    std::ranges::for_each(m_jobQueue[priority],
++    std::unique_lock lock(m_section);
++    m_running = false;
++
++    for (auto& queue : m_jobQueue)
++    {
++      for (auto& wi : queue)
++        pending.emplace_back(std::move(wi));
++      queue.clear();
++    }
++
++    // These stay under the lock: the job is owned by its worker, which may complete and
++    // free it the moment the lock is released.
++    std::ranges::for_each(m_processing,
+                           [](CWorkItem& wi)
+                           {
+                             for (auto* callback : wi.GetCallbacks())
+                               callback->OnJobAbort(wi.GetId(), wi.GetJob());
+-                            wi.FreeJob();
++                            wi.Cancel();
+                           });
+-    m_jobQueue[priority].clear();
+   }
+ 
+-  // cancel any callbacks on jobs still processing
+-  std::ranges::for_each(m_processing,
++  std::ranges::for_each(pending,
+                         [](CWorkItem& wi)
+                         {
+                           for (auto* callback : wi.GetCallbacks())
+                             callback->OnJobAbort(wi.GetId(), wi.GetJob());
+-                          wi.Cancel();
++                          wi.FreeJob();
+                         });
+ 
+   // tell our workers to finish
++  std::unique_lock lock(m_section);
+   while (!m_workers.empty())
+   {
+     lock.unlock();
+@@ -218,9 +226,10 @@ void CJobManager::StartWorkers(CJob::PRIORITY priority)
+   if (!CanStart(priority))
+     return;
+ 
+-  // Workers not running a job (ie waiting for one, or between jobs and about to ask for the next)
+-  const size_t free{m_workers.size() > m_processing.size() ? m_workers.size() - m_processing.size()
+-                                                           : 0};
++  // Workers neither running a job nor in its callbacks (ie waiting for one, or between jobs and
++  // about to ask for the next)
++  const size_t busy{GetBusyCount()};
++  const size_t free{m_workers.size() > busy ? m_workers.size() - busy : 0};
+ 
+   // Each job already waiting has a claim on those ahead of this one
+   const size_t wanted{std::min<size_t>(CountQueuedJobs(), GetMaxWorkers(priority))};
+@@ -374,6 +383,7 @@ void CJobManager::OnJobComplete(bool success, CJob* job)
+       // when another thread modifies m_processing during callback execution
+       item.emplace(std::move(*i));
+       m_processing.erase(i);
++      ++m_completing[item->GetPriority()];
+     }
+     return item;
+   }();
+@@ -416,6 +426,9 @@ void CJobManager::OnJobComplete(bool success, CJob* job)
+     }
+ 
+     item->FreeJob();
++
++    std::unique_lock lock(m_section);
++    --m_completing[item->GetPriority()];
+   }
+ }
+ 
+@@ -461,12 +474,18 @@ bool CJobManager::CanStart(CJob::PRIORITY priority) const
+ {
+   // PRIORITY_LOW_PAUSABLE is background work that spends its time waiting on a source rather than
+   // on a core. Currently only used for texture cache.
+-  const auto pausable{static_cast<size_t>(
++  const auto running{static_cast<size_t>(
+       std::ranges::count_if(m_processing, [](const CWorkItem& item)
+                             { return item.GetPriority() == CJob::PRIORITY_LOW_PAUSABLE; }))};
++  const size_t pausable{running + m_completing[CJob::PRIORITY_LOW_PAUSABLE]};
+ 
+   if (priority == CJob::PRIORITY_LOW_PAUSABLE)
+     return pausable < GetMaxWorkers(priority);
+ 
+-  return m_processing.size() - pausable < GetMaxWorkers(priority);
++  return GetBusyCount() - pausable < GetMaxWorkers(priority);
++}
++
++size_t CJobManager::GetBusyCount() const
++{
++  return std::accumulate(m_completing.begin(), m_completing.end(), m_processing.size());
+ }
+diff --git a/xbmc/jobs/JobManager.h b/xbmc/jobs/JobManager.h
+index 0c59d7e..1488a68 100644
+--- a/xbmc/jobs/JobManager.h
++++ b/xbmc/jobs/JobManager.h
+@@ -238,6 +238,11 @@ private:
+    */
+   CJob* PopJob();
+ 
++  /*! \brief Workers that are unavailable: running a job, or still in its callbacks.
++   Must be called with m_section held.
++   */
++  size_t GetBusyCount() const;
++
+   void StartWorkers(CJob::PRIORITY priority);
+   void RemoveWorker(const CJobWorker* worker);
+ 
+@@ -268,6 +273,8 @@ private:
+   std::array<JobQueue, CJob::PRIORITY_DEDICATED + 1> m_jobQueue;
+   bool m_pauseJobs{false};
+   Processing m_processing;
++  // Jobs out of m_processing whose callbacks are still running, by priority
++  std::array<size_t, CJob::PRIORITY_DEDICATED + 1> m_completing{};
+   Workers m_workers;
+ 
+   mutable CCriticalSection m_section;
+diff --git a/xbmc/utils/test/TestJobManager.cpp b/xbmc/utils/test/TestJobManager.cpp
+index eaa4bda..98f8599 100644
+--- a/xbmc/utils/test/TestJobManager.cpp
++++ b/xbmc/utils/test/TestJobManager.cpp
+@@ -7,13 +7,18 @@
+  */
+ 
+ #include "ServiceBroker.h"
++#include "jobs/IJobCallback.h"
+ #include "jobs/Job.h"
+ #include "jobs/JobManager.h"
+ #include "test/MtTestUtils.h"
+ #include "utils/XTimeUtils.h"
+ 
+ #include <atomic>
++#include <chrono>
++#include <memory>
+ #include <mutex>
++#include <thread>
++#include <vector>
+ 
+ #include <gtest/gtest.h>
+ 
+@@ -342,3 +347,138 @@ TEST_F(TestJobManager, PausableJobsDoNotConsumeTheBudgetOfOtherPriorities)
+   ASSERT_TRUE(poll([&pausable, pausableLimit]()
+                    { return pausable.finished == static_cast<int>(pausableLimit); }));
+ }
++
++namespace
++{
++class BlockingCallback : public IJobCallback
++{
++public:
++  ~BlockingCallback() override { Release(); }
++
++  void OnJobComplete(unsigned int jobID, bool success, CJob* job) override { Block(); }
++
++  void OnJobAbort(unsigned int jobID, CJob* job) override { Block(); }
++
++  bool HasEntered() const { return m_entered; }
++
++  void Release()
++  {
++    m_blocked = false;
++    while (m_entered && !m_exited)
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++  }
++
++private:
++  void Block()
++  {
++    m_entered = true;
++    while (m_blocked)
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    m_exited = true;
++  }
++
++  std::atomic<bool> m_blocked{true};
++  std::atomic<bool> m_entered{false};
++  std::atomic<bool> m_exited{false};
++};
++
++unsigned int AddDumbJob(Flags& flags, IJobCallback* callback, CJob::PRIORITY priority)
++{
++  return CServiceBroker::GetJobManager()->AddJob(new ReallyDumbJob(&flags), callback, priority);
++}
++} // namespace
++
++TEST_F(TestJobManager, BlockedCallbackDoesNotStallOtherJobs)
++{
++  BlockingCallback callback;
++  Flags blockedFlags;
++  AddDumbJob(blockedFlags, &callback, CJob::PRIORITY_NORMAL);
++  ASSERT_TRUE(poll([&callback]() { return callback.HasEntered(); }));
++
++  Flags flags;
++  AddDumbJob(flags, nullptr, CJob::PRIORITY_NORMAL);
++  EXPECT_TRUE(poll([&flags]() { return flags.finished.load(); }));
++
++  callback.Release();
++}
++
++TEST_F(TestJobManager, BlockedCallbackDoesNotStallDedicatedJobs)
++{
++  BlockingCallback callback;
++  Flags blockedFlags;
++  AddDumbJob(blockedFlags, &callback, CJob::PRIORITY_NORMAL);
++  ASSERT_TRUE(poll([&callback]() { return callback.HasEntered(); }));
++
++  Flags flags;
++  AddDumbJob(flags, nullptr, CJob::PRIORITY_DEDICATED);
++  EXPECT_TRUE(poll([&flags]() { return flags.finished.load(); }));
++
++  callback.Release();
++}
++
++TEST_F(TestJobManager, CallbacksCountTowardsTheConcurrencyLimit)
++{
++  const auto limit{CJobManager::GetMaxPausableWorkers()};
++
++  std::vector<std::unique_ptr<Flags>> blockedFlags;
++  std::vector<std::unique_ptr<BlockingCallback>> callbacks;
++  for (unsigned int i = 0; i < limit; ++i)
++  {
++    auto& flags{*blockedFlags.emplace_back(std::make_unique<Flags>())};
++    auto& callback{*callbacks.emplace_back(std::make_unique<BlockingCallback>())};
++    AddDumbJob(flags, &callback, CJob::PRIORITY_LOW_PAUSABLE);
++    ASSERT_TRUE(poll([&callback]() { return callback.HasEntered(); }));
++  }
++
++  Flags flags;
++  AddDumbJob(flags, nullptr, CJob::PRIORITY_LOW_PAUSABLE);
++  EXPECT_FALSE(poll(1000, [&flags]() { return flags.finished.load(); }));
++
++  for (auto& callback : callbacks)
++    callback->Release();
++
++  EXPECT_TRUE(poll([&flags]() { return flags.finished.load(); }));
++}
++
++TEST_F(TestJobManager, CancelJobsDoesNotRunQueuedCallbacksUnderTheLock)
++{
++  CServiceBroker::GetJobManager()->PauseJobs();
++
++  BlockingCallback callback;
++  Flags flags;
++  AddDumbJob(flags, &callback, CJob::PRIORITY_LOW_PAUSABLE);
++
++  std::thread canceller([]() { CServiceBroker::GetJobManager()->CancelJobs(); });
++  std::thread observer;
++  // Declared before the Joiner so it outlives the thread that writes it: on a failed
++  // assertion the Joiner still joins that thread.
++  std::atomic<bool> queried{false};
++
++  // A joinable std::thread destructor calls std::terminate, which would kill the run instead
++  // of reporting the failed assertion.
++  struct Joiner
++  {
++    ~Joiner()
++    {
++      callback.Release();
++      if (canceller.joinable())
++        canceller.join();
++      if (observer.joinable())
++        observer.join();
++    }
++    BlockingCallback& callback;
++    std::thread& canceller;
++    std::thread& observer;
++  } joiner{callback, canceller, observer};
++
++  ASSERT_TRUE(poll([&callback]() { return callback.HasEntered(); }));
++
++  observer = std::thread(
++      [&queried]()
++      {
++        CServiceBroker::GetJobManager()->IsProcessing(CJob::PRIORITY_NORMAL);
++        queried = true;
++      });
++
++  EXPECT_TRUE(poll(2000, [&queried]() { return queried.load(); }));
++}
+-- 
+2.53.0
+

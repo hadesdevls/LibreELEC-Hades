@@ -1,0 +1,1172 @@
+From 1a1f57faab69096a0f20f6cdfdf093f2aeb1c27f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 02:42:29 +0000
+Subject: [PATCH] VideoPlayer: play progressive 25p and 30p video at its own
+ refresh rate
+
+Without a whitelist, Kodi leaves the half refresh rates (25, 29.97 and 30 Hz) out
+of the modes it may choose, so 25 fps plays at 50 Hz and 29.97 fps at 59.94 Hz:
+interlaced video is not always known as such when playback starts, and a stream
+started at 25 Hz would switch the display again once the decoder marks a picture
+as interlaced (VideoPlayerVideo then asks for twice the rate).
+
+A stream whose decoder can never mark a picture as interlaced cannot switch again
+that way. PROGRESSIVE_VIDEO::Check() decides it from the codec and its parameter
+sets, read as FFmpeg 9 reads them, before the first picture:
+- H.264: frame_mbs_only_flag set (no field or MBAFF pictures) and no
+  pic_struct_present_flag (no picture timing that could signal fields);
+- HEVC: neither field_seq_flag nor frame_field_info_present_flag in the VUI of
+  every SPS, and no SPS of another layer;
+- AV1, VP8, VP9: always, they have no interlaced coding;
+- anything else, parameter sets that cannot be read, or an H.264 SPS FFmpeg's
+  strict parse would reject (it then retries with other bits): not progressive.
+Container flags are not trusted to say progressive.
+
+For such a stream the default whitelist also admits the half refresh rates, so it
+gets its exact frame rate: 25p at 25 Hz, 29.97p at 29.97 Hz, 30p at 30 Hz. With a
+user whitelist nothing changes: the whitelist decides, as before, so the old
+behaviour stays available by whitelisting only the 50/60 Hz modes.
+
+The verdict travels with the stream (CDVDStreamInfo::progressive) to the render
+manager through Configure(), as the frame rate does. Within a file it only goes
+from progressive to not progressive: a picture marked as interlaced by any
+decoder ends it for the rest of the file, and a stream reopened in the middle
+(extradata that arrived late, a decoder reopened) cannot make it progressive
+again; the next file of a playlist starts over (CRenderManager::NewFile()). Once
+a file has its display mode, a mode at twice a corrected frame rate is kept, as
+Kodi's default choice did for 25/50 and 29.97/59.94 fps. Native Dolby Vision
+keeps the refresh rate chosen here.
+---
+ xbmc/cores/VideoPlayer/DVDStreamInfo.cpp      |  18 +
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h        |   7 +
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |  12 +-
+ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp   |   6 +-
+ .../VideoRenderers/RenderManager.cpp          |  65 +-
+ .../VideoRenderers/RenderManager.h            |  24 +-
+ xbmc/utils/CMakeLists.txt                     |   2 +
+ xbmc/utils/ProgressiveVideo.cpp               | 627 ++++++++++++++++++
+ xbmc/utils/ProgressiveVideo.h                 |  41 ++
+ xbmc/windowing/Resolution.cpp                 |  20 +-
+ xbmc/windowing/Resolution.h                   |   8 +-
+ 11 files changed, 809 insertions(+), 21 deletions(-)
+ create mode 100644 xbmc/utils/ProgressiveVideo.cpp
+ create mode 100644 xbmc/utils/ProgressiveVideo.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+index 149666e..1216cf6 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "DVDDemuxers/DVDDemux.h"
+ #include "cores/VideoPlayer/Interface/DemuxCrypto.h"
++#include "utils/ProgressiveVideo.h"
+ 
+ #include <cstring>
+ 
+@@ -50,6 +51,8 @@ void CDVDStreamInfo::Clear()
+   fpsscale = 0;
+   fpsrate  = 0;
+   interlaced = false;
++  progressive = false;
++  progressiveReason = {};
+   height   = 0;
+   width    = 0;
+   aspect   = 0.0;
+@@ -222,6 +225,8 @@ void CDVDStreamInfo::Assign(const CDVDStreamInfo& right, bool withextradata)
+   fpsscale = right.fpsscale;
+   fpsrate  = right.fpsrate;
+   interlaced = right.interlaced;
++  progressive = right.progressive;
++  progressiveReason = right.progressiveReason;
+   height   = right.height;
+   width    = right.width;
+   aspect   = right.aspect;
+@@ -297,6 +302,19 @@ void CDVDStreamInfo::Assign(const CDemuxStream& right, bool withextradata)
+     fpsscale  = stream->iFpsScale;
+     fpsrate   = stream->iFpsRate;
+     interlaced = stream->interlaced;
++    // from the demuxer's extradata even when it is not copied: the value describes the stream
++    if (interlaced)
++    {
++      progressive = false;
++      progressiveReason = "the container marks it as interlaced";
++    }
++    else
++    {
++      const PROGRESSIVE_VIDEO::Result scan = PROGRESSIVE_VIDEO::Check(
++          right.codec, right.extraData.GetData(), right.extraData.GetSize());
++      progressive = scan.progressive;
++      progressiveReason = scan.reason;
++    }
+     height    = stream->iHeight;
+     width     = stream->iWidth;
+     aspect    = stream->fAspect;
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index ca706b9..26d1b64 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -10,6 +10,8 @@
+ 
+ #include "DVDDemuxers/DVDDemux.h"
+ 
++#include <string_view>
++
+ extern "C"
+ {
+ #include <libavcodec/avcodec.h>
+@@ -59,6 +61,11 @@ public:
+   int fpsscale; // scale of 1001 and a rate of 60000 will result in 59.94 fps
+   int fpsrate;
+   bool interlaced;
++  //! FFmpeg's decoder never marks a picture of the stream as interlaced (PROGRESSIVE_VIDEO::Check()):
++  //! a mode at its own frame rate may be chosen for it, 25 Hz for 25 fps. Not compared: it follows
++  //! from codec, extradata and interlaced.
++  bool progressive;
++  std::string_view progressiveReason; //!< for the log
+   int height; // height of the stream reported by the demuxer
+   int width; // width of the stream reported by the demuxer
+   double aspect; // display aspect as reported by demuxer
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 680435d..f4d94ab 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -1423,6 +1423,8 @@ void CVideoPlayer::CheckBetterStream(CCurrentStream& current, CDemuxStream* stre
+ 
+ void CVideoPlayer::Prepare()
+ {
++  // a new file: whether its video is progressive, and its display mode, are chosen again
++  m_renderManager.NewFile();
+ #ifdef HAVE_DVBRIDGE
+   // a new video, before its input and streams open: the display is looked at again and, when it
+   // changed, native Dolby Vision output disabled by a failure is tried with it (never during a
+@@ -4458,6 +4460,10 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+   if (hint.flags & AV_DISPOSITION_ATTACHED_PIC)
+     return false;
+ 
++  CLog::Log(LOGINFO, "CVideoPlayer::OpenVideoStream - {}: {}",
++            hint.progressive ? "progressive" : "not known to be progressive",
++            hint.progressiveReason);
++
+   bool nativeDV = false;
+ #ifdef HAVE_DVBRIDGE
+   if (m_CurrentVideo.id < 0 || m_dvNewFile)
+@@ -4483,10 +4489,12 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+                                                    (double)DVD_TIME_BASE * hint.fpsscale /
+                                                    (hint.fpsrate * (hint.interlaced ? 2 : 1)));
+ 
+-      RESOLUTION res = CResolutionUtils::ChooseBestResolution(static_cast<float>(framerate), hint.width, hint.height, !hint.stereo_mode.empty(), nativeDV);
++      RESOLUTION res = CResolutionUtils::ChooseBestResolution(
++          static_cast<float>(framerate), hint.width, hint.height, !hint.stereo_mode.empty(),
++          nativeDV, hint.progressive);
+       CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
+       m_renderManager.TriggerUpdateResolution(framerate, hint.width, hint.height, hint.stereo_mode,
+-                                              nativeDV);
++                                              nativeDV, hint.progressive);
+     }
+ #ifdef HAVE_DVBRIDGE
+     else if (adjustRefreshRate == ADJUST_REFRESHRATE_OFF)
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+index 94e97dd..0758c55 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -882,10 +882,14 @@ CVideoPlayerVideo::EOutputState CVideoPlayerVideo::OutputPicture(const VideoPict
+   int orientation = sorient != 0 ? (sorient + m_hints.orientation) % 360
+                                  : m_hints.orientation;
+ 
++  // A picture marked as interlaced, by any decoder, makes the stream not progressive: the render
++  // manager keeps that for the rest of the file
+   if (!m_renderManager.Configure(*pPicture,
+                                 static_cast<float>(config_framerate),
+                                 orientation,
+-                                m_pVideoCodec->GetAllowedReferences()))
++                                m_pVideoCodec->GetAllowedReferences(),
++                                m_hints.progressive && !m_processInfo.GetVideoInterlaced() &&
++                                    !(pPicture->iFlags & DVP_FLAG_INTERLACED)))
+   {
+     CLog::Log(LOGERROR, "{} - failed to configure renderer", __FUNCTION__);
+     return OUTPUT_ABORT;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 0e13fad..fc1b125 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -23,6 +23,7 @@
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "threads/SingleLock.h"
++#include "utils/MathUtils.h"
+ #include "utils/StringUtils.h"
+ #include "utils/log.h"
+ #include "windowing/GraphicContext.h"
+@@ -90,7 +91,11 @@ void CRenderManager::SetVideoSettings(const CVideoSettings& settings)
+   }
+ }
+ 
+-bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned int orientation, int buffers)
++bool CRenderManager::Configure(const VideoPicture& picture,
++                               float fps,
++                               unsigned int orientation,
++                               int buffers,
++                               bool progressive)
+ {
+ 
+   // check if something has changed
+@@ -103,18 +108,21 @@ bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned
+     if (m_pRenderer != nullptr && m_picture.IsSameParams(picture) && m_orientation == orientation &&
+         m_NumberBuffers == buffers && !m_pRenderer->ConfigChanged(picture))
+     {
+-      if (m_fps != fps)
++      const bool fpsChanged = m_fps != fps;
++      if (fpsChanged)
+       {
+         CLog::Log(LOGDEBUG, "CRenderManager::Configure - framerate changed from {:4.2f} to {:4.2f}",
+                   m_fps, fps);
+         m_fps = fps;
+         m_pRenderer->SetFps(fps);
+-        m_bTriggerUpdateResolution = true;
+         // Clear stale vsync/late-frame state from the old framerate; CheckEnableClockSync() will recalibrate on the next FrameMove on the main thread.
+         m_clockSync.Reset();
+         m_dvdClock.SetVsyncAdjust(0);
+         m_lateframes = -1;
+       }
++      // the trigger last, once everything the new choice reads is set
++      if (UpdateProgressive(progressive) || fpsChanged)
++        m_bTriggerUpdateResolution = true;
+       return true;
+     }
+   }
+@@ -154,6 +162,7 @@ bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned
+       m_nativeDVRate = true;
+ #endif
+     m_fps = fps;
++    UpdateProgressive(progressive);
+     m_orientation = orientation;
+     m_NumberBuffers  = buffers;
+     m_renderState = STATE_CONFIGURING;
+@@ -428,6 +437,9 @@ void CRenderManager::UnInit()
+   m_renderState = STATE_UNCONFIGURED;
+   m_picture.Reset();
+   m_nativeDVRate = false;
++  m_progressive = false;
++  m_progressiveSet = false;
++  m_fileModeChosen = false;
+   m_bRenderGUI = false;
+ 
+   m_initEvent.Set();
+@@ -619,7 +631,8 @@ RESOLUTION CRenderManager::GetResolution()
+   if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF)
+   {
+     res = CResolutionUtils::ChooseBestResolution(m_fps, m_picture.iWidth, m_picture.iHeight,
+-                                                 !m_picture.stereoMode.empty(), m_nativeDVRate);
++                                                 !m_picture.stereoMode.empty(), m_nativeDVRate,
++                                                 m_progressive);
+   }
+ 
+   return res;
+@@ -842,8 +855,28 @@ void CRenderManager::UpdateResolution()
+       if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) != ADJUST_REFRESHRATE_OFF && m_fps > 0.0f)
+       {
+         RESOLUTION res = CResolutionUtils::ChooseBestResolution(
+-            m_fps, m_picture.iWidth, m_picture.iHeight, !m_picture.stereoMode.empty(), m_nativeDVRate);
+-        CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
++            m_fps, m_picture.iWidth, m_picture.iHeight, !m_picture.stereoMode.empty(), m_nativeDVRate,
++            m_progressive);
++        // Once a file has its mode, a mode at twice the frame rate stays: Kodi's default choice puts
++        // 25 and 50 fps, 29.97 and 59.94 fps, 30 and 60 fps in the same mode, so a frame rate
++        // corrected during playback (a container rate of 50 for 25p video) switches nothing.
++        auto& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
++        const RESOLUTION current = gfx.GetVideoResolution();
++        if (m_fileModeChosen && res != current)
++        {
++          const RESOLUTION_INFO& now = gfx.GetResInfo(current);
++          const RESOLUTION_INFO& next = gfx.GetResInfo(res);
++          if (now.iScreenWidth == next.iScreenWidth && now.iScreenHeight == next.iScreenHeight &&
++              (now.dwFlags & D3DPRESENTFLAG_MODEMASK) == (next.dwFlags & D3DPRESENTFLAG_MODEMASK) &&
++              MathUtils::FloatEquals(now.fRefreshRate, m_fps * 2, 0.01f))
++          {
++            CLog::Log(LOGDEBUG, "CRenderManager::UpdateResolution - {} kept for {:.3f} fps", now.strMode,
++                      m_fps);
++            res = current;
++          }
++        }
++        gfx.SetVideoResolution(res, false);
++        m_fileModeChosen = true;
+         UpdateLatencyTweak();
+         if (m_pRenderer)
+           m_pRenderer->Update();
+@@ -855,12 +888,13 @@ void CRenderManager::UpdateResolution()
+ }
+ 
+ void CRenderManager::TriggerUpdateResolution(float fps, int width, int height, std::string &stereomode,
+-                                             bool nativeDV)
++                                             bool nativeDV, bool progressive)
+ {
+   if (width)
+   {
+     // The stream's intent (native Dolby Vision), as SetNativeDVStream() sets it.
+     m_nativeDVRate = nativeDV;
++    UpdateProgressive(progressive);
+     m_fps = fps;
+     m_picture.iWidth = width;
+     m_picture.iHeight = height;
+@@ -869,6 +903,23 @@ void CRenderManager::TriggerUpdateResolution(float fps, int width, int height, s
+   m_bTriggerUpdateResolution = true;
+ }
+ 
++void CRenderManager::NewFile()
++{
++  m_progressiveSet = false;
++  m_fileModeChosen = false;
++}
++
++bool CRenderManager::UpdateProgressive(bool progressive)
++{
++  const bool next = m_progressiveSet ? (m_progressive && progressive) : progressive;
++  m_progressiveSet = true;
++  if (next == m_progressive)
++    return false;
++  CLog::Log(LOGDEBUG, "CRenderManager - the stream is {} progressive", next ? "now" : "no longer");
++  m_progressive = next;
++  return true;
++}
++
+ void CRenderManager::ToggleDebug()
+ {
+   bool isEnabled = !m_renderDebug;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index 5c83c0a..2c3cfd0 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -79,10 +79,14 @@ public:
+   RESOLUTION GetResolution();
+   void UpdateResolution();
+   void TriggerUpdateResolution(float fps, int width, int height, std::string &stereomode,
+-                               bool nativeDV = false);
++                               bool nativeDV = false, bool progressive = false);
+   //! A new stream is for native Dolby Vision output: its display mode is a transport mode for
+   //! the whole stream (see Configure()).
+   void SetNativeDVStream(bool nativeDV) { m_nativeDVRate = nativeDV; }
++  //! A new file starts (VideoPlayer, before its streams open; the next file of a playlist reuses the
++  //! video stream): its first stream or picture sets whether it is progressive again, and its first
++  //! choice of display mode is free again (see UpdateProgressive() and UpdateResolution()).
++  void NewFile();
+   void SetViewMode(int iViewMode);
+   void PreInit();
+   void UnInit();
+@@ -105,7 +109,13 @@ public:
+ 
+   int GetSkippedFrames()  { return m_QueueSkip; }
+ 
+-  bool Configure(const VideoPicture& picture, float fps, unsigned int orientation, int buffers = 0);
++  //! progressive: the stream is progressive (CDVDStreamInfo::progressive) and no picture of it
++  //! was marked as interlaced; a change re-chooses the display mode, as a change of fps does
++  bool Configure(const VideoPicture& picture,
++                 float fps,
++                 unsigned int orientation,
++                 int buffers = 0,
++                 bool progressive = false);
+   bool AddVideoPicture(const VideoPicture& picture, volatile std::atomic_bool& bStop, EINTERLACEMETHOD deintMethod, bool wait);
+   void AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts);
+   void ShowVideo(bool enable);
+@@ -175,6 +185,16 @@ protected:
+   CCriticalSection m_datalock;
+   bool m_bTriggerUpdateResolution = false;
+   std::atomic_bool m_nativeDVRate{false};
++  //! the stream may get a half refresh rate (see CResolutionUtils::ChooseBestResolution())
++  std::atomic_bool m_progressive{false};
++  //! m_progressive was set for the current file
++  std::atomic_bool m_progressiveSet{false};
++  //! a display mode was chosen for the current file
++  std::atomic_bool m_fileModeChosen{false};
++  //! Within a file the verdict only goes from progressive to not progressive, never back: a stream
++  //! reopened in the middle of the file (whose extradata arrived late, or whose decoder forgot a
++  //! picture marked interlaced) must not switch the display mode again. Returns whether it changed.
++  bool UpdateProgressive(bool progressive);
+   bool m_bRenderGUI = true;
+   bool m_renderedDebugOverlay = false;
+   bool m_renderDebug = false;
+diff --git a/xbmc/utils/CMakeLists.txt b/xbmc/utils/CMakeLists.txt
+index 4657c4c..f157572 100644
+--- a/xbmc/utils/CMakeLists.txt
++++ b/xbmc/utils/CMakeLists.txt
+@@ -52,6 +52,7 @@ set(SOURCES ActorProtocol.cpp
+             Observer.cpp
+             POUtils.cpp
+             PlayerUtils.cpp
++            ProgressiveVideo.cpp
+             RecentlyAddedJob.cpp
+             RegExp.cpp
+             RingBuffer.cpp
+@@ -157,6 +158,7 @@ set(HEADERS ActorProtocol.h
+             params_check_macros.h
+             POUtils.h
+             PlayerUtils.h
++            ProgressiveVideo.h
+             ProgressJob.h
+             RecentlyAddedJob.h
+             RegExp.h
+diff --git a/xbmc/utils/ProgressiveVideo.cpp b/xbmc/utils/ProgressiveVideo.cpp
+new file mode 100644
+index 0000000..7007691
+--- /dev/null
++++ b/xbmc/utils/ProgressiveVideo.cpp
+@@ -0,0 +1,627 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include "ProgressiveVideo.h"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <climits>
++#include <span>
++#include <vector>
++
++// The parameter sets are read as FFmpeg 9 reads them (libavcodec/h264_ps.c, hevc/ps.c,
++// h2645_vui.c, h2645_parse.c, h264_parse.c and hevc/parse.c), up to the flag that decides whether
++// its decoder can mark a picture as interlaced. A parameter set that ends before that flag, that
++// breaks a limit FFmpeg checks, or that FFmpeg's strict parse would reject (H.264 then retries in
++// other ways), is not progressive.
++
++namespace
++{
++using PROGRESSIVE_VIDEO::Result;
++
++constexpr unsigned int H264_NAL_SPS = 7;
++constexpr unsigned int HEVC_NAL_SPS = 33;
++
++// Bits of an RBSP up to its rbsp_stop_one_bit, as FFmpeg counts them (get_bit_length()). A read past
++// them fails the reader and returns zeros.
++class CRbspReader
++{
++public:
++  explicit CRbspReader(std::span<const uint8_t> rbsp) : m_rbsp(rbsp)
++  {
++    size_t size = rbsp.size();
++    while (size > 0 && rbsp[size - 1] == 0)
++      size--;
++    m_bits = size * 8;
++    if (size > 0)
++      m_bits -= static_cast<size_t>(std::countr_zero(rbsp[size - 1])) + 1;
++  }
++
++  bool Failed() const { return m_failed; }
++  size_t BitsLeft() const { return m_bits - m_pos; }
++
++  uint32_t Bit()
++  {
++    if (m_pos >= m_bits)
++    {
++      m_failed = true;
++      return 0;
++    }
++    const uint32_t bit = (m_rbsp[m_pos / 8] >> (7 - m_pos % 8)) & 1;
++    m_pos++;
++    return bit;
++  }
++
++  uint32_t PeekBit() const
++  {
++    return m_pos < m_bits ? (m_rbsp[m_pos / 8] >> (7 - m_pos % 8)) & 1 : 0;
++  }
++
++  // count <= 32
++  uint32_t Bits(unsigned int count)
++  {
++    uint32_t value = 0;
++    for (unsigned int i = 0; i < count; i++)
++      value = (value << 1) | Bit();
++    return value;
++  }
++
++  void Skip(size_t count)
++  {
++    if (count > m_bits - m_pos)
++    {
++      m_failed = true;
++      m_pos = m_bits;
++      return;
++    }
++    m_pos += count;
++  }
++
++  // ue(v) with up to 31 leading zero bits, as get_ue_golomb_long()
++  uint32_t UE()
++  {
++    unsigned int zeros = 0;
++    while (Bit() == 0)
++    {
++      if (m_failed || ++zeros > 31)
++      {
++        m_failed = true;
++        return 0;
++      }
++    }
++    return (1u << zeros) - 1 + Bits(zeros);
++  }
++
++  // se(v)
++  int64_t SE()
++  {
++    const uint32_t code = UE();
++    return (code & 1) ? static_cast<int64_t>(code / 2) + 1 : -static_cast<int64_t>(code / 2);
++  }
++
++private:
++  std::span<const uint8_t> m_rbsp;
++  size_t m_bits{0};
++  size_t m_pos{0};
++  bool m_failed{false};
++};
++
++// The payload of a NAL unit without its emulation prevention bytes (00 00 03 -> 00 00)
++std::vector<uint8_t> Rbsp(std::span<const uint8_t> payload)
++{
++  std::vector<uint8_t> rbsp;
++  rbsp.reserve(payload.size());
++  unsigned int zeros = 0;
++  for (const uint8_t byte : payload)
++  {
++    if (zeros >= 2 && byte == 3)
++    {
++      zeros = 0;
++      continue;
++    }
++    rbsp.push_back(byte);
++    zeros = byte == 0 ? zeros + 1 : 0;
++  }
++  return rbsp;
++}
++
++// The NAL units of an Annex B byte stream (start codes 00 00 01 and 00 00 00 01)
++std::vector<std::span<const uint8_t>> AnnexBNals(std::span<const uint8_t> data)
++{
++  const auto findStartCode = [&data](size_t from)
++  {
++    for (size_t i = from; i + 2 < data.size(); i++)
++      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
++        return i;
++    return data.size();
++  };
++
++  std::vector<std::span<const uint8_t>> nals;
++  size_t start = findStartCode(0);
++  while (start < data.size())
++  {
++    const size_t begin = start + 3;
++    const size_t next = findStartCode(begin);
++    size_t end = next;
++    // trailing zero bytes, and the leading zero of a four-byte start code
++    while (end > begin && data[end - 1] == 0)
++      end--;
++    if (end > begin)
++      nals.push_back(data.subspan(begin, end - begin));
++    start = next;
++  }
++  return nals;
++}
++
++// The part of the VUI common to H.264 and HEVC (ff_h2645_decode_common_vui_params). The chroma
++// sample locations go up to 5; FFmpeg reads them with get_ue_golomb_31(), which takes a longer code
++// with other bits, so a larger value fails here.
++bool SkipCommonVui(CRbspReader& br)
++{
++  if (br.Bit() && br.Bits(8) == 255) // aspect_ratio_info_present_flag, aspect_ratio_idc
++    br.Skip(32); // sar_width, sar_height
++  if (br.Bit()) // overscan_info_present_flag
++    br.Skip(1); // overscan_appropriate_flag
++  if (br.Bit()) // video_signal_type_present_flag
++  {
++    br.Skip(4); // video_format, video_full_range_flag
++    if (br.Bit()) // colour_description_present_flag
++      br.Skip(24); // colour_primaries, transfer_characteristics, matrix_coeffs
++  }
++  if (br.Bit()) // chroma_loc_info_present_flag
++  {
++    if (br.UE() > 5 || br.UE() > 5) // chroma_sample_loc_type_top_field, _bottom_field
++      return false;
++  }
++  return !br.Failed();
++}
++
++// H.264 scaling_list(): its length depends on the values read
++bool SkipH264ScalingList(CRbspReader& br, unsigned int size)
++{
++  int64_t last = 8;
++  int64_t next = 8;
++  for (unsigned int i = 0; i < size && next != 0; i++)
++  {
++    const int64_t delta = br.SE(); // delta_scale
++    if (delta < -128 || delta > 127)
++      return false;
++    next = (last + delta) & 0xff;
++    if (next != 0)
++      last = next;
++  }
++  return !br.Failed();
++}
++
++// H.264 hrd_parameters()
++bool SkipH264Hrd(CRbspReader& br)
++{
++  const uint64_t cpbCount = static_cast<uint64_t>(br.UE()) + 1; // cpb_cnt_minus1
++  if (cpbCount > 32)
++    return false;
++  br.Skip(8); // bit_rate_scale, cpb_size_scale
++  for (uint64_t i = 0; i < cpbCount; i++)
++  {
++    br.UE(); // bit_rate_value_minus1
++    br.UE(); // cpb_size_value_minus1
++    br.Skip(1); // cbr_flag
++  }
++  // initial_cpb_removal_delay_length_minus1, cpb_removal_delay_length_minus1,
++  // dpb_output_delay_length_minus1, time_offset_length
++  br.Skip(20);
++  return !br.Failed();
++}
++
++Result H264Sps(std::span<const uint8_t> nal)
++{
++  const std::vector<uint8_t> rbsp = Rbsp(nal.subspan(1));
++  CRbspReader br(rbsp);
++  const Result rejected{false, "H.264: a sequence parameter set FFmpeg does not accept as it is"};
++
++  const uint32_t profileIdc = br.Bits(8);
++  br.Skip(16); // constraint_set0..5_flag, reserved_zero_2bits, level_idc
++  if (br.UE() >= 32) // seq_parameter_set_id (MAX_SPS_COUNT)
++    return rejected;
++
++  // the profiles FFmpeg reads these fields for (h264_ps.c)
++  constexpr std::array<uint32_t, 11> highProfiles{100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 144};
++  uint32_t chromaFormatIdc = 1;
++  if (std::ranges::find(highProfiles, profileIdc) != highProfiles.end())
++  {
++    chromaFormatIdc = br.UE();
++    if (chromaFormatIdc > 3)
++      return rejected;
++    if (chromaFormatIdc == 3 && br.Bit()) // separate_colour_plane_flag: not supported by FFmpeg
++      return rejected;
++    const uint32_t lumaDepthMinus8 = br.UE(); // bit_depth_luma_minus8
++    const uint32_t chromaDepthMinus8 = br.UE(); // bit_depth_chroma_minus8
++    if (lumaDepthMinus8 != chromaDepthMinus8 || lumaDepthMinus8 > 6)
++      return rejected;
++    br.Skip(1); // qpprime_y_zero_transform_bypass_flag
++    if (br.Bit()) // seq_scaling_matrix_present_flag
++    {
++      const unsigned int lists = chromaFormatIdc != 3 ? 8 : 12;
++      for (unsigned int i = 0; i < lists; i++)
++        if (br.Bit() && !SkipH264ScalingList(br, i < 6 ? 16 : 64)) // seq_scaling_list_present_flag
++          return rejected;
++    }
++  }
++
++  if (br.UE() > 12) // log2_max_frame_num_minus4
++    return rejected;
++  const uint32_t pocType = br.UE();
++  if (pocType == 0)
++  {
++    if (br.UE() > 12) // log2_max_pic_order_cnt_lsb_minus4
++      return rejected;
++  }
++  else if (pocType == 1)
++  {
++    br.Skip(1); // delta_pic_order_always_zero_flag
++    br.UE(); // offset_for_non_ref_pic
++    br.UE(); // offset_for_top_to_bottom_field
++    const uint32_t cycle = br.UE(); // num_ref_frames_in_pic_order_cnt_cycle
++    if (cycle > 255)
++      return rejected;
++    for (uint32_t i = 0; i < cycle; i++)
++      br.UE(); // offset_for_ref_frame
++  }
++  else if (pocType != 2)
++    return rejected;
++
++  if (br.UE() > 16) // max_num_ref_frames (H264_MAX_DPB_FRAMES)
++    return rejected;
++  br.Skip(1); // gaps_in_frame_num_value_allowed_flag
++  const uint64_t mbWidth = static_cast<uint64_t>(br.UE()) + 1; // pic_width_in_mbs_minus1
++  const uint64_t mbHeight = static_cast<uint64_t>(br.UE()) + 1; // pic_height_in_map_units_minus1
++  const bool frameMbsOnly = br.Bit() != 0;
++  if (br.Failed())
++    return rejected;
++  if (!frameMbsOnly)
++    return {false, "H.264: frame_mbs_only_flag is 0, field or MBAFF pictures"};
++
++  // FFmpeg's size checks (mb_width/height overflow, av_image_check_size())
++  const uint64_t width = 16 * mbWidth;
++  const uint64_t height = 16 * mbHeight;
++  if (mbWidth >= INT_MAX / 16 || mbHeight >= INT_MAX / 16 ||
++      8 * (width + 128) * (height + 128) >= static_cast<uint64_t>(INT_MAX))
++    return rejected;
++
++  br.Skip(1); // direct_8x8_inference_flag
++  if (br.Bit()) // frame_cropping_flag
++  {
++    const uint64_t left = br.UE();
++    const uint64_t right = br.UE();
++    const uint64_t top = br.UE();
++    const uint64_t bottom = br.UE();
++    const uint64_t stepX = (chromaFormatIdc == 1 || chromaFormatIdc == 2) ? 2 : 1;
++    const uint64_t stepY = chromaFormatIdc == 1 ? 2 : 1; // frames only
++    const uint64_t limitX = INT_MAX / 4 / stepX;
++    const uint64_t limitY = INT_MAX / 4 / stepY;
++    if (left > limitX || right > limitX || top > limitY || bottom > limitY ||
++        (left + right) * stepX >= width || (top + bottom) * stepY >= height)
++      return rejected;
++  }
++
++  bool picStruct = false;
++  if (br.Bit()) // vui_parameters_present_flag
++  {
++    if (!SkipCommonVui(br))
++      return rejected;
++    // FFmpeg stops a VUI cut before its timing information and keeps the SPS (no pic_struct)
++    if (br.PeekBit() && br.BitsLeft() < 10)
++      return {true, "H.264: frame_mbs_only_flag is 1 and there is no pic_struct"};
++    if (br.Bit()) // timing_info_present_flag
++      br.Skip(65); // num_units_in_tick, time_scale, fixed_frame_rate_flag
++    const bool nalHrd = br.Bit() != 0;
++    if (nalHrd && !SkipH264Hrd(br))
++      return rejected;
++    const bool vclHrd = br.Bit() != 0;
++    if (vclHrd && !SkipH264Hrd(br))
++      return rejected;
++    if (nalHrd || vclHrd)
++      br.Skip(1); // low_delay_hrd_flag
++    picStruct = br.Bit() != 0;
++    if (!br.Failed() && br.BitsLeft() > 0 && br.Bit()) // bitstream_restriction_flag
++    {
++      br.Skip(1); // motion_vectors_over_pic_boundaries_flag
++      for (int i = 0; i < 4; i++)
++        br.UE(); // max_bytes_per_pic_denom .. log2_max_mv_length_vertical
++      const uint32_t reorder = br.UE(); // max_num_reorder_frames
++      br.UE(); // max_dec_frame_buffering
++      if (!br.Failed() && reorder > 16)
++        return rejected;
++    }
++  }
++  // FFmpeg's strict parse fails when it reads past the parameter set
++  if (br.Failed())
++    return rejected;
++  if (picStruct)
++    return {false, "H.264: pic_struct_present_flag is 1, picture timing may signal fields"};
++  return {true, "H.264: frame_mbs_only_flag is 1 and there is no pic_struct"};
++}
++
++// HEVC scaling_list_data()
++void SkipHevcScalingListData(CRbspReader& br)
++{
++  for (unsigned int sizeId = 0; sizeId < 4; sizeId++)
++  {
++    for (unsigned int matrixId = 0; matrixId < 6; matrixId += sizeId == 3 ? 3 : 1)
++    {
++      if (!br.Bit()) // scaling_list_pred_mode_flag
++      {
++        br.UE(); // scaling_list_pred_matrix_id_delta
++        continue;
++      }
++      const unsigned int coefficients = std::min(64u, 1u << (4 + (sizeId << 1)));
++      if (sizeId > 1)
++        br.SE(); // scaling_list_dc_coef_minus8
++      for (unsigned int i = 0; i < coefficients; i++)
++        br.SE(); // scaling_list_delta_coef
++    }
++  }
++}
++
++// HEVC st_ref_pic_set(index) of an SPS. numDeltaPocs counts, as FFmpeg does, the entries of each
++// set read so far; an inter-predicted set reads one more entry than the set before it has.
++bool SkipHevcShortTermRefPicSet(CRbspReader& br,
++                                unsigned int index,
++                                std::array<uint32_t, 64>& numDeltaPocs)
++{
++  if (index != 0 && br.Bit()) // inter_ref_pic_set_prediction_flag
++  {
++    br.Skip(1); // delta_rps_sign
++    if (br.UE() > 32767) // abs_delta_rps_minus1
++      return false;
++    uint32_t count = 0;
++    for (uint32_t j = 0; j <= numDeltaPocs[index - 1] && !br.Failed(); j++)
++    {
++      const bool used = br.Bit() != 0; // used_by_curr_pic_flag
++      if (used || br.Bit()) // use_delta_flag
++        count++;
++    }
++    if (count >= 32)
++      return false;
++    numDeltaPocs[index] = count;
++  }
++  else
++  {
++    const uint32_t negative = br.UE(); // num_negative_pics
++    const uint32_t positive = br.UE(); // num_positive_pics
++    if (negative >= 16 || positive >= 16)
++      return false;
++    for (uint32_t i = 0; i < negative + positive && !br.Failed(); i++)
++    {
++      if (br.UE() > 32767) // delta_poc_s0_minus1 or delta_poc_s1_minus1
++        return false;
++      br.Skip(1); // used_by_curr_pic_s0_flag or used_by_curr_pic_s1_flag
++    }
++    numDeltaPocs[index] = negative + positive;
++  }
++  return !br.Failed();
++}
++
++// HEVC profile_tier_level(1, maxSubLayersMinus1)
++void SkipHevcProfileTierLevel(CRbspReader& br, unsigned int maxSubLayersMinus1)
++{
++  // general_profile_space .. general_inbld_flag or reserved bit (88 bits), general_level_idc
++  br.Skip(88 + 8);
++  std::array<bool, 7> subLayerProfile{};
++  std::array<bool, 7> subLayerLevel{};
++  for (unsigned int i = 0; i < maxSubLayersMinus1; i++)
++  {
++    subLayerProfile[i] = br.Bit() != 0;
++    subLayerLevel[i] = br.Bit() != 0;
++  }
++  if (maxSubLayersMinus1 > 0)
++    br.Skip(2 * (8 - maxSubLayersMinus1)); // reserved_zero_2bits
++  for (unsigned int i = 0; i < maxSubLayersMinus1; i++)
++  {
++    if (subLayerProfile[i])
++      br.Skip(88);
++    if (subLayerLevel[i])
++      br.Skip(8);
++  }
++}
++
++Result HevcSps(std::span<const uint8_t> nal)
++{
++  const std::vector<uint8_t> rbsp = Rbsp(nal.subspan(2));
++  CRbspReader br(rbsp);
++  const Result truncated{false, "HEVC: sequence parameter set ends early or is invalid"};
++
++  br.Skip(4); // sps_video_parameter_set_id
++  const uint32_t maxSubLayersMinus1 = br.Bits(3);
++  if (maxSubLayersMinus1 > 6)
++    return truncated;
++  br.Skip(1); // sps_temporal_id_nesting_flag
++  SkipHevcProfileTierLevel(br, maxSubLayersMinus1);
++  br.UE(); // sps_seq_parameter_set_id
++  const uint32_t chromaFormatIdc = br.UE();
++  if (chromaFormatIdc > 3)
++    return truncated;
++  if (chromaFormatIdc == 3)
++    br.Skip(1); // separate_colour_plane_flag
++  br.UE(); // pic_width_in_luma_samples
++  br.UE(); // pic_height_in_luma_samples
++  if (br.Bit()) // conformance_window_flag
++  {
++    for (int i = 0; i < 4; i++)
++      br.UE(); // conf_win_{left,right,top,bottom}_offset
++  }
++  br.UE(); // bit_depth_luma_minus8
++  br.UE(); // bit_depth_chroma_minus8
++  const uint32_t log2MaxPocLsb = br.UE() + 4; // log2_max_pic_order_cnt_lsb_minus4
++  if (log2MaxPocLsb > 16)
++    return truncated;
++  const bool subLayerOrderingInfo = br.Bit() != 0;
++  for (uint32_t i = subLayerOrderingInfo ? 0 : maxSubLayersMinus1; i <= maxSubLayersMinus1; i++)
++  {
++    br.UE(); // sps_max_dec_pic_buffering_minus1
++    br.UE(); // sps_max_num_reorder_pics
++    br.UE(); // sps_max_latency_increase_plus1
++  }
++  // log2_min_luma_coding_block_size_minus3, log2_diff_max_min_luma_coding_block_size,
++  // log2_min_luma_transform_block_size_minus2, log2_diff_max_min_luma_transform_block_size,
++  // max_transform_hierarchy_depth_inter, max_transform_hierarchy_depth_intra
++  for (int i = 0; i < 6; i++)
++    br.UE();
++  if (br.Bit() && br.Bit()) // scaling_list_enabled_flag, sps_scaling_list_data_present_flag
++    SkipHevcScalingListData(br);
++  br.Skip(2); // amp_enabled_flag, sample_adaptive_offset_enabled_flag
++  if (br.Bit()) // pcm_enabled_flag
++  {
++    br.Skip(8); // pcm_sample_bit_depth_luma_minus1, pcm_sample_bit_depth_chroma_minus1
++    br.UE(); // log2_min_pcm_luma_coding_block_size_minus3
++    br.UE(); // log2_diff_max_min_pcm_luma_coding_block_size
++    br.Skip(1); // pcm_loop_filter_disabled_flag
++  }
++  const uint32_t shortTermRefPicSets = br.UE(); // num_short_term_ref_pic_sets
++  if (shortTermRefPicSets > 64)
++    return truncated;
++  std::array<uint32_t, 64> numDeltaPocs{};
++  for (uint32_t i = 0; i < shortTermRefPicSets; i++)
++  {
++    if (!SkipHevcShortTermRefPicSet(br, i, numDeltaPocs))
++      return truncated;
++  }
++  if (br.Bit()) // long_term_ref_pics_present_flag
++  {
++    const uint32_t longTermRefPics = br.UE(); // num_long_term_ref_pics_sps
++    if (longTermRefPics > 32)
++      return truncated;
++    // lt_ref_pic_poc_lsb_sps: u(v) of log2_max_pic_order_cnt_lsb bits, used_by_curr_pic_lt_sps_flag
++    br.Skip(static_cast<size_t>(longTermRefPics) * (log2MaxPocLsb + 1));
++  }
++  br.Skip(2); // sps_temporal_mvp_enabled_flag, strong_intra_smoothing_enabled_flag
++
++  bool fieldSeq = false;
++  bool frameFieldInfo = false;
++  if (br.Bit()) // vui_parameters_present_flag
++  {
++    if (!SkipCommonVui(br))
++      return truncated;
++    br.Skip(1); // neutral_chroma_indication_flag
++    fieldSeq = br.Bit() != 0;
++    frameFieldInfo = br.Bit() != 0;
++  }
++  if (br.Failed())
++    return truncated;
++  if (fieldSeq)
++    return {false, "HEVC: field_seq_flag is 1, the pictures are fields"};
++  if (frameFieldInfo)
++    return {false, "HEVC: frame_field_info_present_flag is 1, picture timing may signal fields"};
++  return {true, "HEVC: no field_seq_flag and no frame_field_info_present_flag"};
++}
++
++Result CheckH264(std::span<const uint8_t> data)
++{
++  std::vector<std::span<const uint8_t>> nals;
++  if (!data.empty() && data[0] == 1) // avcC (ff_h264_decode_extradata)
++  {
++    if (data.size() < 7)
++      return {false, "H.264: avcC too short"};
++    // the SPS array, then the PPS array: FFmpeg decodes every NAL unit of both by its own type
++    size_t pos = 5;
++    for (int array = 0; array < 2; array++)
++    {
++      if (pos >= data.size())
++        break;
++      const unsigned int count = array == 0 ? data[pos] & 0x1f : data[pos];
++      pos++;
++      for (unsigned int i = 0; i < count; i++)
++      {
++        if (data.size() - pos < 2)
++          return {false, "H.264: avcC ends early"};
++        const size_t length = (static_cast<size_t>(data[pos]) << 8) | data[pos + 1];
++        pos += 2;
++        if (length > data.size() - pos)
++          return {false, "H.264: avcC ends early"};
++        nals.push_back(data.subspan(pos, length));
++        pos += length;
++      }
++    }
++  }
++  else
++    nals = AnnexBNals(data);
++
++  Result result{false, "H.264: no sequence parameter set in the extradata"};
++  for (const auto& nal : nals)
++  {
++    if (nal.size() < 2 || (nal[0] & 0x1f) != H264_NAL_SPS)
++      continue;
++    result = H264Sps(nal);
++    if (!result.progressive)
++      return result;
++  }
++  return result;
++}
++
++Result CheckHevc(std::span<const uint8_t> data)
++{
++  std::vector<std::span<const uint8_t>> nals;
++  // hvcC, also the configurationVersion 0 that predates the standard (hevc/parse.c)
++  if (data.size() >= 23 && (data[0] == 1 || (data[0] == 0 && (data[1] != 0 || data[2] > 1))))
++  {
++    const unsigned int arrays = data[22]; // numOfArrays
++    size_t pos = 23;
++    for (unsigned int i = 0; i < arrays; i++)
++    {
++      if (data.size() - pos < 3)
++        return {false, "HEVC: hvcC ends early"};
++      const unsigned int count = (static_cast<unsigned int>(data[pos + 1]) << 8) | data[pos + 2];
++      pos += 3;
++      for (unsigned int j = 0; j < count; j++)
++      {
++        if (data.size() - pos < 2)
++          return {false, "HEVC: hvcC ends early"};
++        const size_t length = (static_cast<size_t>(data[pos]) << 8) | data[pos + 1];
++        pos += 2;
++        if (length > data.size() - pos)
++          return {false, "HEVC: hvcC ends early"};
++        nals.push_back(data.subspan(pos, length));
++        pos += length;
++      }
++    }
++  }
++  else
++    nals = AnnexBNals(data);
++
++  Result result{false, "HEVC: no sequence parameter set in the extradata"};
++  for (const auto& nal : nals)
++  {
++    if (nal.size() < 3 || ((nal[0] >> 1) & 0x3f) != HEVC_NAL_SPS)
++      continue;
++    // FFmpeg parses the SPS of every layer, and a picture timing SEI of any layer can set the
++    // picture structure: another layer (MV-HEVC, SHVC) is not looked into
++    if ((((nal[0] & 1) << 5) | (nal[1] >> 3)) != 0) // nuh_layer_id
++      return {false, "HEVC: a sequence parameter set of another layer"};
++    result = HevcSps(nal);
++    if (!result.progressive)
++      return result;
++  }
++  return result;
++}
++} // namespace
++
++namespace PROGRESSIVE_VIDEO
++{
++Result Check(AVCodecID codec, const uint8_t* extradata, size_t size)
++{
++  const std::span<const uint8_t> data =
++      extradata ? std::span<const uint8_t>(extradata, size) : std::span<const uint8_t>();
++  switch (codec)
++  {
++    case AV_CODEC_ID_AV1:
++    case AV_CODEC_ID_VP8:
++    case AV_CODEC_ID_VP9:
++      return {true, "codec without interlaced coding"};
++    case AV_CODEC_ID_H264:
++      return CheckH264(data);
++    case AV_CODEC_ID_HEVC:
++      return CheckHevc(data);
++    default:
++      return {false, "codec with interlaced coding, not inspected"};
++  }
++}
++} // namespace PROGRESSIVE_VIDEO
+diff --git a/xbmc/utils/ProgressiveVideo.h b/xbmc/utils/ProgressiveVideo.h
+new file mode 100644
+index 0000000..2c4af6c
+--- /dev/null
++++ b/xbmc/utils/ProgressiveVideo.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <string_view>
++
++extern "C"
++{
++#include <libavcodec/codec_id.h>
++}
++
++namespace PROGRESSIVE_VIDEO
++{
++struct Result
++{
++  //! FFmpeg's decoder never marks a picture of the stream as interlaced
++  bool progressive{false};
++  //! why, for the log
++  std::string_view reason;
++};
++
++/*!
++ * \brief Whether a video stream is progressive for Kodi, decided before its first picture.
++ *
++ * Kodi deinterlaces, and doubles the frame rate it asks of the display (25 to 50 Hz, 29.97 to
++ * 59.94 Hz), once the decoder marks a picture as interlaced (AV_FRAME_FLAG_INTERLACED). That
++ * happens only:
++ * - H.264: for field and MBAFF pictures, impossible with frame_mbs_only_flag, or through the
++ *   pic_struct of a picture timing SEI, parsed only with the VUI's pic_struct_present_flag;
++ * - HEVC: through the pic_struct of a picture timing SEI (fields), parsed only with the VUI's
++ *   frame_field_info_present_flag;
++ * - never for AV1, VP8 and VP9, which have no interlaced coding.
++ * Container flags are not used: a container can call interlaced video progressive.
++ *
++ * \param extradata the codec's parameter sets (avcC, hvcC or Annex B), as FFmpeg reads them
++ * \return progressive only when every sequence parameter set in it rules out interlaced pictures;
++ * a stream without them, an unparsable one or any other codec is not progressive
++ */
++Result Check(AVCodecID codec, const uint8_t* extradata, size_t size);
++} // namespace PROGRESSIVE_VIDEO
+diff --git a/xbmc/windowing/Resolution.cpp b/xbmc/windowing/Resolution.cpp
+index 103933b..65683e1 100644
+--- a/xbmc/windowing/Resolution.cpp
++++ b/xbmc/windowing/Resolution.cpp
+@@ -58,7 +58,7 @@ float RESOLUTION_INFO::DisplayRatio() const
+ }
+ 
+ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int height, bool is3D,
+-                                                 bool nativeDV)
++                                                 bool nativeDV, bool progressive)
+ {
+   RESOLUTION res = CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution();
+   float weight = 0.0f;
+@@ -67,7 +67,8 @@ RESOLUTION CResolutionUtils::ChooseBestResolution(float fps, int width, int heig
+   {
+     if (!FindResolutionFromOverride(fps, width, is3D, res, weight, true)) //if that fails find it from a fallback
+     {
+-      FindResolutionFromWhitelist(fps, width, height, is3D, res); //find a refreshrate from whitelist
++      FindResolutionFromWhitelist(fps, width, height, is3D, progressive,
++                                  res); //find a refreshrate from whitelist
+     }
+   }
+ 
+@@ -169,12 +170,14 @@ RESOLUTION CResolutionUtils::ChooseDVResolutionWithoutAdjustment(bool nativeDV)
+ }
+ #endif
+ 
+-void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int height, bool is3D, RESOLUTION &resolution)
++void CResolutionUtils::FindResolutionFromWhitelist(
++    float fps, int width, int height, bool is3D, bool progressive, RESOLUTION& resolution)
+ {
+   RESOLUTION_INFO curr = CServiceBroker::GetWinSystem()->GetGfxContext().GetResInfo(resolution);
+   CLog::Log(LOGINFO,
+-            "[WHITELIST] Searching the whitelist for: width: {}, height: {}, fps: {:0.3f}, 3D: {}",
+-            width, height, fps, is3D ? "true" : "false");
++            "[WHITELIST] Searching the whitelist for: width: {}, height: {}, fps: {:0.3f}, 3D: {}, "
++            "progressive: {}",
++            width, height, fps, is3D ? "true" : "false", progressive ? "true" : "false");
+ 
+   std::vector<CVariant> indexList = CServiceBroker::GetSettingsComponent()->GetSettings()->GetList(CSettings::SETTING_VIDEOSCREEN_WHITELIST);
+ 
+@@ -196,8 +199,11 @@ void CResolutionUtils::FindResolutionFromWhitelist(float fps, int width, int hei
+         // do not add half refreshrates (25, 29.97 by default) as kodi cannot cope with
+         // them on playback start. Especially interlaced content is not properly detected
+         // and this causes ugly double switching.
+-        // This won't allow 25p / 30p playback on native refreshrate by default
+-        if ((info.fRefreshRate > 30) || (MathUtils::FloatEquals(info.fRefreshRate, 24.0f, 0.1f)))
++        // A progressive stream cannot switch again that way: its decoder never marks a picture
++        // as interlaced (CDVDStreamInfo::progressive), so it gets its own frame rate, 25p at
++        // 25 Hz and 30p at 30 Hz rather than twice that.
++        if (progressive || (info.fRefreshRate > 30) ||
++            (MathUtils::FloatEquals(info.fRefreshRate, 24.0f, 0.1f)))
+           indexList.push_back(CDisplaySettings::GetInstance().GetStringFromRes(c));
+       }
+     }
+diff --git a/xbmc/windowing/Resolution.h b/xbmc/windowing/Resolution.h
+index 5c81aaa..06a4bd5 100644
+--- a/xbmc/windowing/Resolution.h
++++ b/xbmc/windowing/Resolution.h
+@@ -121,8 +121,11 @@ public:
+   //! nativeDV: the stream is for native Dolby Vision output, which needs a transport mode
+   //! (3840x2160 at 23.976 to 60 Hz): Kodi's choice keeps its refresh rate and becomes the
+   //! transport mode with that refresh rate, if there is one.
++  //! progressive: the decoder never marks a picture of the stream as interlaced
++  //! (CDVDStreamInfo::progressive): without a whitelist, the half refresh rates (25, 29.97 and
++  //! 30 Hz) are allowed for it, so that it plays at its own frame rate.
+   static RESOLUTION ChooseBestResolution(float fps, int width, int height, bool is3D,
+-                                        bool nativeDV = false);
++                                        bool nativeDV = false, bool progressive = false);
+ #ifdef HAVE_DVBRIDGE
+   //! A Dolby Vision transport mode: 3840x2160 progressive at 23.976 to 60 Hz, not 3D.
+   static bool IsDVTransportResolution(RESOLUTION resolution);
+@@ -146,7 +149,8 @@ public:
+   static void GetMaxAllowedScreenResolution(unsigned int& width, unsigned int& height);
+ 
+ protected:
+-  static void FindResolutionFromWhitelist(float fps, int width, int height, bool is3D, RESOLUTION &resolution);
++  static void FindResolutionFromWhitelist(float fps, int width, int height, bool is3D,
++                                          bool progressive, RESOLUTION& resolution);
+   static bool FindResolutionFromOverride(float fps, int width, bool is3D, RESOLUTION &resolution, float& weight, bool fallback);
+   static float RefreshWeight(float refresh, float fps);
+ };
+-- 
+2.53.0
+

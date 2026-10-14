@@ -1,0 +1,239 @@
+From 502d9eff62b5c632b0ce3b0c63563a8897176cb7 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 02:07:21 +0000
+Subject: [PATCH] dvbridge: GPU time and late presentations in the Dolby Vision
+ statistics
+
+On real hardware, frames with subtitles or GUI on screen (the 32-bit
+float composition path) sometimes took two refresh periods to present
+(83 ms at 23.976 Hz, one repeated frame), while prepare stayed under
+1 ms of CPU time: the wait is inside the presentation, which includes
+glFinish(). To tell GPU work from other causes, measure the GPU time of
+each frame's Dolby Vision work with GL timestamps
+(GL_EXT_disjoint_timer_query): one before PrepareHardware(), one after
+the pack, read back on a later frame without waiting, in a ring of
+four, ignoring results across a disjoint period. The queries exist only
+while native output is captured; without the extension, the log says so
+once and nothing else changes.
+
+Also count the presentations that took more than 1.5 refresh periods
+of the current mode, which are the repeated frames seen as stutter.
+---
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 113 +++++++++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  27 +++++
+ 2 files changed, 138 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 5c8fc39..d4f4ab4 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -172,6 +172,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     // metadata is indexed from the top-left of the HDMI raster.
+     if (m_dvFrame && m_dvBridge && m_dvBridge->Pack(0, m_nWidth, m_nHeight, true))
+     {
++      DVGpuTimerMark(false);
+       glFinish();
+       if (m_eglContext.TrySwapBuffers())
+       {
+@@ -199,6 +200,14 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+           std::chrono::duration<double, std::milli>(now - presentStart).count();
+       m_dvStats.presentSumMs += presentMs;
+       m_dvStats.presentMaxMs = std::max(m_dvStats.presentMaxMs, presentMs);
++      if (const auto* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr; mode && mode->clock)
++      {
++        // one refresh period in ms: pixels per frame / pixel clock in kHz
++        const double periodMs =
++            static_cast<double>(mode->htotal) * mode->vtotal / static_cast<double>(mode->clock);
++        if (presentMs > 1.5 * periodMs)
++          m_dvStats.late++;
++      }
+       if (presented)
+       {
+         if (m_dvStats.hasLastShown)
+@@ -634,6 +643,8 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   if (!BeginDVBridge())
+     return false;
+   const bool overlayFree = m_guiWillRender && GetGUIElementCount() == 0 && !m_dvOverlays;
++  DVGpuTimerCollect();
++  DVGpuTimerMark(true);
+   const auto prepareStart = std::chrono::steady_clock::now();
+   m_dvFrame = m_dvBridge->PrepareHardware(layer, enhancement, metadata, geometry, overlayFree);
+   const double prepareMs = std::chrono::duration<double, std::milli>(
+@@ -709,6 +720,7 @@ bool CWinSystemGbmGLESContext::EndDVBridge()
+       return false;
+     }
+   }
++  DVGpuTimerReset();
+   if (m_dvSignalling)
+   {
+     LogDVStats("until the end");
+@@ -799,18 +811,115 @@ void CWinSystemGbmGLESContext::PublishDVInfo(bool force)
+   }
+ }
+ 
++void CWinSystemGbmGLESContext::DVGpuTimerMark(bool begin)
++{
++  if (!m_dvGpuTimerChecked)
++  {
++    m_dvGpuTimerChecked = true;
++    if (IsExtSupported("GL_EXT_disjoint_timer_query"))
++    {
++      m_glGenQueriesEXT = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(eglGetProcAddress("glGenQueriesEXT"));
++      m_glDeleteQueriesEXT =
++          reinterpret_cast<PFNGLDELETEQUERIESEXTPROC>(eglGetProcAddress("glDeleteQueriesEXT"));
++      m_glQueryCounterEXT =
++          reinterpret_cast<PFNGLQUERYCOUNTEREXTPROC>(eglGetProcAddress("glQueryCounterEXT"));
++      m_glGetQueryObjectuivEXT = reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(
++          eglGetProcAddress("glGetQueryObjectuivEXT"));
++      m_glGetQueryObjectui64vEXT = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
++          eglGetProcAddress("glGetQueryObjectui64vEXT"));
++    }
++    const bool available = m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
++                           m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT;
++    if (available)
++      for (auto& timer : m_dvGpuTimers)
++      {
++        m_glGenQueriesEXT(1, &timer.begin);
++        m_glGenQueriesEXT(1, &timer.end);
++      }
++    if (!m_dvGpuTimerLogged)
++    {
++      m_dvGpuTimerLogged = true;
++      CLog::Log(LOGINFO, "DVBridge: GPU timing of Dolby Vision frames {}",
++                available ? "available" : "unavailable (no GL_EXT_disjoint_timer_query)");
++    }
++  }
++  auto& timer = m_dvGpuTimers[m_dvGpuTimerIndex];
++  if (!timer.begin || !timer.end)
++    return;
++  if (begin)
++  {
++    if (timer.pending)
++      return; // its previous result is not back yet: skip this frame
++    m_glQueryCounterEXT(timer.begin, GL_TIMESTAMP_EXT);
++    timer.begun = true;
++  }
++  else if (timer.begun)
++  {
++    m_glQueryCounterEXT(timer.end, GL_TIMESTAMP_EXT);
++    timer.begun = false;
++    timer.pending = true;
++    m_dvGpuTimerIndex = (m_dvGpuTimerIndex + 1) % m_dvGpuTimers.size();
++  }
++}
++
++void CWinSystemGbmGLESContext::DVGpuTimerCollect()
++{
++  if (!m_glGetQueryObjectuivEXT || !m_dvGpuTimers[0].begin)
++    return;
++  // reading the disjoint state also clears it; a disjoint period invalidates pending results
++  GLint disjoint = 0;
++  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++  for (auto& timer : m_dvGpuTimers)
++  {
++    if (!timer.pending)
++      continue;
++    GLuint available = 0;
++    m_glGetQueryObjectuivEXT(timer.end, GL_QUERY_RESULT_AVAILABLE_EXT, &available);
++    if (!available)
++      continue;
++    timer.pending = false;
++    GLuint64 start = 0;
++    GLuint64 finish = 0;
++    m_glGetQueryObjectui64vEXT(timer.begin, GL_QUERY_RESULT_EXT, &start);
++    m_glGetQueryObjectui64vEXT(timer.end, GL_QUERY_RESULT_EXT, &finish);
++    if (disjoint || finish <= start)
++      continue;
++    const double ms = static_cast<double>(finish - start) / 1e6;
++    m_dvStats.gpuFrames++;
++    m_dvStats.gpuSumMs += ms;
++    m_dvStats.gpuMaxMs = std::max(m_dvStats.gpuMaxMs, ms);
++  }
++}
++
++void CWinSystemGbmGLESContext::DVGpuTimerReset()
++{
++  if (m_glDeleteQueriesEXT)
++    for (auto& timer : m_dvGpuTimers)
++      if (timer.begin)
++      {
++        m_glDeleteQueriesEXT(1, &timer.begin);
++        m_glDeleteQueriesEXT(1, &timer.end);
++      }
++  m_dvGpuTimers = {};
++  m_dvGpuTimerIndex = 0;
++  m_dvGpuTimerChecked = false; // queries are created again at the next DV frame
++}
++
+ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+ {
+   const unsigned int attempts = m_dvStats.shown + m_dvStats.notShown;
+   CLog::Log(LOGINFO,
+             "DVBridge: {}: {} frames shown, {} not shown, {} composed with GUI elements; "
+             "prepare avg {:.1f} ms max {:.1f} ms; present avg {:.1f} ms max {:.1f} ms; "
+-            "longest gap between shown frames {:.1f} ms; {} renderer flushes, {} buffer discards "
++            "longest gap between shown frames {:.1f} ms; {} presentations over 1.5 refresh periods; "
++            "GPU avg {:.1f} ms max {:.1f} ms over {} frames; {} renderer flushes, {} buffer discards "
+             "(seeks, stream changes, decoder resets)",
+             period, m_dvStats.shown, m_dvStats.notShown, m_dvStats.withGui,
+             m_dvStats.prepared ? m_dvStats.prepareSumMs / m_dvStats.prepared : 0.0,
+             m_dvStats.prepareMaxMs, attempts ? m_dvStats.presentSumMs / attempts : 0.0,
+-            m_dvStats.presentMaxMs, m_dvStats.gapMaxMs, m_dvStats.flushes,
++            m_dvStats.presentMaxMs, m_dvStats.gapMaxMs, m_dvStats.late,
++            m_dvStats.gpuFrames ? m_dvStats.gpuSumMs / m_dvStats.gpuFrames : 0.0, m_dvStats.gpuMaxMs,
++            m_dvStats.gpuFrames, m_dvStats.flushes,
+             m_dvDiscards.exchange(0, std::memory_order_relaxed));
+   m_dvLastWindow.valid = true;
+   m_dvLastWindow.shown = m_dvStats.shown;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 6acfbc2..a1a6a93 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -14,6 +14,7 @@
+ #include "utils/EGLUtils.h"
+ 
+ #include <chrono>
++#include <array>
+ #include <atomic>
+ #include <map>
+ #include <memory>
+@@ -125,6 +126,10 @@ private:
+     unsigned int withGui = 0;
+     unsigned int prepared = 0;
+     unsigned int flushes = 0;
++    unsigned int late = 0; //!< presentations that took more than 1.5 refresh periods
++    unsigned int gpuFrames = 0;
++    double gpuSumMs = 0;
++    double gpuMaxMs = 0;
+     double prepareSumMs = 0;
+     double prepareMaxMs = 0;
+     double presentSumMs = 0;
+@@ -136,6 +141,28 @@ private:
+   } m_dvStats;
+   void LogDVStats(const char* period);
+   std::atomic<unsigned int> m_dvDiscards{0};
++  //! GPU time of the Dolby Vision work of a frame, from before PrepareHardware() to after the
++  //! pack: GL timestamps (GL_EXT_disjoint_timer_query) read back on a later frame, never waited
++  //! for. The queries exist while native output is captured.
++  struct DVGpuTimer
++  {
++    GLuint begin = 0;
++    GLuint end = 0;
++    bool begun = false;
++    bool pending = false;
++  };
++  std::array<DVGpuTimer, 4> m_dvGpuTimers{};
++  unsigned int m_dvGpuTimerIndex = 0;
++  bool m_dvGpuTimerChecked = false;
++  bool m_dvGpuTimerLogged = false;
++  PFNGLGENQUERIESEXTPROC m_glGenQueriesEXT = nullptr;
++  PFNGLDELETEQUERIESEXTPROC m_glDeleteQueriesEXT = nullptr;
++  PFNGLQUERYCOUNTEREXTPROC m_glQueryCounterEXT = nullptr;
++  PFNGLGETQUERYOBJECTUIVEXTPROC m_glGetQueryObjectuivEXT = nullptr;
++  PFNGLGETQUERYOBJECTUI64VEXTPROC m_glGetQueryObjectui64vEXT = nullptr;
++  void DVGpuTimerMark(bool begin);
++  void DVGpuTimerCollect();
++  void DVGpuTimerReset();
+   //! The last complete 10-s window of DVStats, for the player information.
+   struct DVWindow
+   {

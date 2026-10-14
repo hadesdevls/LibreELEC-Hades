@@ -5,10 +5,10 @@
 PKG_NAME="kodi"
 PKG_VERSION="63063c8e67b1f162761763c0cbdb1a5dcfc3a47e"
 PKG_SHA256="5fcb34a6541199426522c72bcc211b6e0a78d59e23ca1b4b6b04cd618ee4712d"
-PKG_LICENSE="GPL-2.0-or-later"
+PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="http://www.kodi.tv"
 PKG_URL="https://github.com/xbmc/xbmc/archive/${PKG_VERSION}.tar.gz"
-PKG_DEPENDS_TARGET="toolchain JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
+PKG_DEPENDS_TARGET="toolchain libplacebo JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
 PKG_DEPENDS_UNPACK="commons-lang3 commons-text groovy"
 PKG_DEPENDS_HOST="toolchain"
 PKG_LONGDESC="A free and open source cross-platform media player."
@@ -250,7 +250,7 @@ configure_package() {
                -DLIBDVDREAD_URL=${SOURCES}/libdvdread/libdvdread-$(get_pkg_version libdvdread).tar.xz \
                -DLIBDVDREAD_HASH=SHA256=$(get_pkg_variable libdvdread PKG_SHA256)"
 
-  PKG_CMAKE_OPTS_TARGET="-DNATIVEPREFIX=${TOOLCHAIN} \
+  PKG_CMAKE_OPTS_TARGET="-DENABLE_DVBRIDGE=ON -DNATIVEPREFIX=${TOOLCHAIN} \
                          -DWITH_TEXTUREPACKER=${TOOLCHAIN}/bin/TexturePacker \
                          -DWITH_JSONSCHEMABUILDER=${TOOLCHAIN}/bin/JsonSchemaBuilder \
                          -DSWIG_EXECUTABLE=${TOOLCHAIN}/bin/swig \
@@ -326,7 +326,17 @@ makeinstall_host() {
       -i ${SYSROOT_PREFIX}/usr/lib/kodi/cmake/KodiConfig.cmake
 }
 
+post_patch() {
+  # Hades: texture of the player information button in the Estuary OSD (kodi-9005); a binary file,
+  # which GNU patch cannot add, packed into Textures.xbt with the rest of the skin media.
+  cp ${PKG_DIR}/hades/processinfo.png \
+     ${PKG_BUILD}/addons/skin.estuary/media/osd/fullscreen/buttons/processinfo.png
+}
+
 pre_configure_target() {
+  # Keep source-location diagnostics useful without embedding build-host paths.
+  export CFLAGS+=" -ffile-prefix-map=${ROOT}=/usr/src/libreelec"
+  export CXXFLAGS+=" -ffile-prefix-map=${ROOT}=/usr/src/libreelec"
   export LIBS="${LIBS} -lncurses"
   if [ "${TARGET_ARCH}" = "arm" ]; then
     LDFLAGS+=" -Wl,--allow-shlib-undefined"
@@ -349,8 +359,28 @@ post_makeinstall_target() {
   rm -rf ${INSTALL}/usr/share/pixmaps
   rm -rf ${INSTALL}/usr/share/xsessions
 
+  # Hades: the build shows itself under its own name and images, not as Kodi (brand/README.md).
+  # What Kodi installs in its media folder, but for its fonts, has to be the list that brand/ was
+  # made for: a file more, a file less or a file in another place stops the build, so that a logo
+  # that a later Kodi adds, moves or renames is seen, not shipped.
+  (cd ${INSTALL}/usr/share/kodi/media && find . -type f ! -path './Fonts/*' | LC_ALL=C sort) > ${PKG_BUILD}/.hades-kodi-media
+  if ! cmp -s ${PKG_BUILD}/.hades-kodi-media ${PKG_DIR}/brand/kodi-media.txt; then
+    diff ${PKG_DIR}/brand/kodi-media.txt ${PKG_BUILD}/.hades-kodi-media || true
+    die "kodi: what Kodi installs in its media folder is not what ${PKG_DIR}/brand was made for"
+  fi
+  # (every file of the list has its counterpart, but for the picture of a site for games, which is
+  # not Kodi's and stays, and the two of the page of Kodi's donations, which go)
+  for f in $(grep -v '^\./qr/' ${PKG_DIR}/brand/kodi-media.txt); do
+    [ -f ${PKG_DIR}/brand/${f} ] || die "kodi: media/${f} has no counterpart in ${PKG_DIR}/brand"
+    cp ${PKG_DIR}/brand/${f} ${INSTALL}/usr/share/kodi/media/${f}
+  done
+  rm -rf ${INSTALL}/usr/share/kodi/media/qr/kodilove
+  mkdir -p ${INSTALL}/usr/share/kodi/media/about
+  cp ${PKG_DIR}/brand/about/hades.png ${INSTALL}/usr/share/kodi/media/about
+
   mkdir -p ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-config ${INSTALL}/usr/lib/kodi
+  cp ${PKG_DIR}/scripts/kodi-display-notice ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-safe-mode ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi.sh ${INSTALL}/usr/lib/kodi
 

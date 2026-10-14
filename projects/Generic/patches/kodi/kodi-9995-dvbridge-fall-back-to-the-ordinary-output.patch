@@ -1,0 +1,309 @@
+From 513ed061b6243bbed4d1e61bfa8d9a15c977588e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:13:05 +0000
+Subject: [PATCH] dvbridge: fall back to the ordinary output when Dolby Vision
+ cannot be shown
+
+While native Dolby Vision output owns the display, only frames that went
+through the whole bridge (prepare, pack, transactional commit) are
+presented. When that failed on every frame, nothing was presented at
+all: on real NVIDIA hardware the picture froze on the add-on's loading
+screen while the audio went on and the player still took pause, and the
+only way out was a hard power-off. Setting up the output could also fail
+and leave the renderer unconfigured, with the same result.
+
+Fail closed instead:
+- when Dolby Vision frames could not be shown 24 times in a row over at
+  least two seconds, native output is disabled for the Kodi session, the
+  ordinary output is restored at once, and the renderers report a
+  changed configuration so that the next picture reconfigures them for
+  the ordinary (HDR10) path; a short hiccup never triggers it;
+- when the 8-bit output or BeginDVBridge is rejected while configuring,
+  native output is disabled and the same Configure continues on the
+  ordinary path instead of returning an unconfigured renderer;
+- the verdict logged by SupportsNativeDVOutput says it was disabled, and
+  new playbacks use the ordinary decoder and output until Kodi restarts.
+
+A single failed frame is still never drawn through the ordinary shader.
+m_dvRequested becomes atomic because the player thread now reads it
+through ConfigChanged while the render thread writes it.
+---
+ .../HwDecRender/RendererVAAPIGLES.cpp         |  5 +++
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 40 ++++++++++++++-----
+ .../VideoRenderers/LinuxRendererGLES.h        |  3 +-
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 13 +++++-
+ xbmc/windowing/gbm/WinSystemGbm.h             |  5 +++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 30 ++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  5 +++
+ 7 files changed, 89 insertions(+), 12 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index 8481a35..8f1faad 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -122,6 +122,11 @@ bool CRendererVAAPIGLES::Configure(const VideoPicture& picture, float fps, unsig
+ 
+ bool CRendererVAAPIGLES::ConfigChanged(const VideoPicture& picture)
+ {
++#ifdef HAVE_DVBRIDGE
++  // Native Dolby Vision was given up during playback: reconfigure for the ordinary output.
++  if (m_dvRequested && !KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture))
++    return true;
++#endif
+   CVaapiRenderPicture *pic = dynamic_cast<CVaapiRenderPicture*>(picture.videoBuffer);
+   if ((pic->procPic.videoSurface != VA_INVALID_ID && !m_isVAAPIBuffer) ||
+       (pic->procPic.videoSurface == VA_INVALID_ID && m_isVAAPIBuffer))
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 0990864..535d311 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -214,10 +214,14 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   {
+     CLog::Log(LOGWARNING, "LinuxRendererGLES::Configure: SetVideoOutput failed");
+ #ifdef HAVE_DVBRIDGE
+-    if (KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture))
++    // Fail closed: keep the video on the ordinary output rather than unconfigured.
++    auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++        CServiceBroker::GetWinSystem());
++    if (window && KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture))
+     {
+-      m_bConfigured = false;
+-      return false;
++      window->DisableNativeDVOutput("the Dolby Vision output mode could not be set");
++      if (!CServiceBroker::GetWinSystem()->SetVideoOutput(&picture))
++        CLog::Log(LOGWARNING, "LinuxRendererGLES::Configure: SetVideoOutput failed");
+     }
+ #endif
+   }
+@@ -232,13 +236,18 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+         CServiceBroker::GetWinSystem());
+     m_passthroughHDR = false;
+     m_hdrFboActive = window && window->BeginDVBridge();
+-    if (!m_hdrFboActive)
+-    {
+-      m_bConfigured = false;
+-      CLog::Log(LOGERROR, "DVBridge: native output initialization rejected");
+-      return false;
+-    }
+-    return true;
++    if (m_hdrFboActive)
++      return true;
++    // Fail closed: play through the ordinary output rather than leaving the renderer
++    // unconfigured, which froze the picture while the audio went on.
++    CLog::Log(LOGERROR, "DVBridge: native output initialization rejected; using the ordinary output");
++    if (window)
++      window->DisableNativeDVOutput("native output initialization was rejected");
++    m_dvRequested = false;
++    m_hdrFboActive = false;
++    // Replace the 8-bit transport configuration with the ordinary one.
++    if (!CServiceBroker::GetWinSystem()->SetVideoOutput(&picture))
++      CLog::Log(LOGWARNING, "LinuxRendererGLES::Configure: SetVideoOutput failed");
+   }
+ #endif
+ 
+@@ -257,6 +266,11 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+ 
+ bool CLinuxRendererGLES::ConfigChanged(const VideoPicture &picture)
+ {
++#ifdef HAVE_DVBRIDGE
++  // Native Dolby Vision was given up during playback: reconfigure for the ordinary output.
++  if (m_dvRequested && !KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture))
++    return true;
++#endif
+   if (picture.videoBuffer->GetFormat() != m_format)
+   {
+     return true;
+@@ -1230,6 +1244,12 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+   if (m_dvRequested)
+   {
+     const bool rendered = m_currentField == FIELD_FULL && RenderDVBridge(index);
++    // A frame the bridge could not prepare counts towards the fallback; a prepared one is
++    // counted when it is presented.
++    if (!rendered)
++      if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++              CServiceBroker::GetWinSystem()))
++        window->DVBridgeFrameShown(false);
+     AfterRenderHook(index);
+     return rendered;
+   }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 5637f23..9c593b5 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <vector>
+ 
+ #include "system_gl.h"
+@@ -135,7 +136,7 @@ protected:
+ #ifdef HAVE_DVBRIDGE
+   // Failure is terminal for this frame: never silently use the ordinary shader.
+   virtual bool RenderDVBridge(int idx) { return false; }
+-  bool m_dvRequested{false};
++  std::atomic<bool> m_dvRequested{false};
+ #endif
+   virtual void AfterRenderHook(int idx) {}
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 46b6dfa..1342f99 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -313,7 +313,9 @@ bool CWinSystemGbm::SupportsNativeDVOutput() const
+   auto* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
+   const auto* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
+   auto backend = CDVBridgeState::Backend::NONE;
+-  if (!m_info || !m_info->SupportsStandardDolbyVision())
++  if (m_dvDisabled)
++    reason = "disabled until Kodi restarts, after it failed (see the DVBridge errors above)";
++  else if (!m_info || !m_info->SupportsStandardDolbyVision())
+     reason = "the display does not advertise Dolby Vision Standard (VSVDB v2)";
+   else if (!std::dynamic_pointer_cast<CDRMAtomic>(m_DRM))
+     reason = "atomic modesetting is not in use";
+@@ -346,6 +348,15 @@ bool CWinSystemGbm::SupportsNativeDVOutput() const
+   return reason == nullptr;
+ }
+ 
++void CWinSystemGbm::DisableNativeDVOutput(const char* reason)
++{
++  if (!m_dvDisabled.exchange(true))
++    CLog::Log(LOGERROR,
++              "DVBridge: native Dolby Vision output disabled until Kodi restarts: {}; "
++              "the video continues on the ordinary output",
++              reason);
++}
++
+ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore)
+ {
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 024f19d..b847fcc 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -18,6 +18,7 @@
+ 
+ #include "platform/linux/input/LibInputHandler.h"
+ 
++#include <atomic>
+ #include <mutex>
+ #include <string>
+ #include <utility>
+@@ -56,6 +57,9 @@ public:
+ #ifdef HAVE_DVBRIDGE
+   bool FlipDVBridgePage(CDVBridgeState& state, bool restore);
+   bool SupportsNativeDVOutput() const;
++  //! Stop using native Dolby Vision output for the rest of this Kodi session.
++  void DisableNativeDVOutput(const char* reason);
++  bool NativeDVOutputDisabled() const { return m_dvDisabled.load(); }
+ #endif
+ 
+   bool CanDoWindowed() override { return false; }
+@@ -105,6 +109,7 @@ protected:
+ #ifdef HAVE_DVBRIDGE
+   mutable std::mutex m_dvOutputStatusLock;
+   mutable std::string m_dvOutputStatus;
++  std::atomic<bool> m_dvDisabled{false};
+ #endif
+   XbmcThreads::EndTime<> m_dispResetTimer;
+   std::unique_ptr<CLibInputHandler> m_libinput;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index c16c5e4..f5e34ce 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -156,6 +156,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ #ifdef HAVE_DVBRIDGE
+   if (m_dvState.Captured())
+   {
++    const bool attempted = m_dvFrame && m_dvBridge;
+     bool presented = false;
+     // EGL's window framebuffer has a bottom-left GL origin, while transport
+     // metadata is indexed from the top-left of the HDMI raster.
+@@ -175,6 +176,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     if (m_dvBridge)
+       m_dvBridge->Presented(presented);
+     m_dvFrame = false;
++    if (attempted)
++      DVBridgeFrameShown(presented);
+     return;
+   }
+ #endif
+@@ -547,6 +550,8 @@ bool CWinSystemGbmGLESContext::DVBridgeBeginRejected(const char* stage)
+ 
+ bool CWinSystemGbmGLESContext::BeginDVBridge()
+ {
++  if (NativeDVOutputDisabled())
++    return DVBridgeBeginRejected("disabled-until-kodi-restarts");
+   if (m_nWidth != 3840 || m_nHeight != 2160 || GetOutputBitDepth() != 8 ||
+       m_renderableType != EGL_OPENGL_ES3_BIT)
+     return DVBridgeBeginRejected("output-mode-depth-or-gles3");
+@@ -600,6 +605,7 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+ bool CWinSystemGbmGLESContext::EndDVBridge()
+ {
+   m_dvFrame = false;
++  m_dvFailedFrames = 0;
+   // Never reset Kodi's ordinary HDR GUI compositor unless we owned DV output.
+   if (!m_dvState.Captured())
+     return true;
+@@ -630,6 +636,30 @@ bool CWinSystemGbmGLESContext::EndDVBridge()
+   return true;
+ }
+ 
++void CWinSystemGbmGLESContext::DVBridgeFrameShown(bool shown)
++{
++  // Give up only on a sustained failure: 24 frames in a row that could not be shown, over at
++  // least two seconds, so that a short hiccup (start, seek) never disables native output.
++  constexpr unsigned int minFailedFrames = 24;
++  constexpr auto minFailureTime = std::chrono::seconds(2);
++  if (shown)
++  {
++    m_dvFailedFrames = 0;
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  if (m_dvFailedFrames++ == 0)
++    m_dvFirstFailedFrame = now;
++  if (NativeDVOutputDisabled() || m_dvFailedFrames < minFailedFrames ||
++      now - m_dvFirstFailedFrame < minFailureTime)
++    return;
++  m_dvFailedFrames = 0;
++  DisableNativeDVOutput("Dolby Vision frames could not be shown for two seconds");
++  // Restore the ordinary output now; the renderer is reconfigured with the next picture.
++  if (m_dvState.Captured())
++    EndDVBridge();
++}
++
+ bool CWinSystemGbmGLESContext::DestroyWindowSystem()
+ {
+   if (!EndDVBridge())
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 6ef5559..3d1bde2 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -13,6 +13,7 @@
+ #include "rendering/gles/RenderSystemGLES.h"
+ #include "utils/EGLUtils.h"
+ 
++#include <chrono>
+ #include <memory>
+ #ifdef HAVE_DVBRIDGE
+ #include "cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h"
+@@ -61,6 +62,8 @@ public:
+                        const CDVMetadataBuffer& metadata,
+                        dvbridge_geometry geometry);
+   bool EndDVBridge();
++  //! Outcome of one Dolby Vision frame; enough failures in a row fall back to the ordinary output.
++  void DVBridgeFrameShown(bool shown);
+   bool SetVideoOutput(const VideoPicture* picture) override;
+   bool DestroyWindowSystem() override;
+ #endif
+@@ -93,6 +96,8 @@ private:
+   bool m_dvSignalling = false;
+   bool DVBridgeBeginRejected(const char* stage);
+   DVBRIDGE::DiagnosticFailures m_dvBeginFailures;
++  unsigned int m_dvFailedFrames = 0;
++  std::chrono::steady_clock::time_point m_dvFirstFailedFrame;
+ #endif
+ };
+ 

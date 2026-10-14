@@ -1,0 +1,367 @@
+From 628270138af03fd452559d959631eb1857cf1649 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:19:37 +0000
+Subject: [PATCH] dvbridge: a picture takes the RPU of its enhancement picture
+
+In a dual-layer Dolby Vision stream the RPU travels in the access unit
+of an enhancement picture and is the metadata of that picture. A stream
+of one track carries the access units of the two layers in pairs, in
+coding order, and FFmpeg's decoder attaches the RPU of a packet to the
+base picture of that packet. When the two layers are coded in the same
+picture order that is the right picture. When they are not, the pair of a
+packet is two different pictures, and the RPU went to the wrong one.
+
+Measured on the test stream of two tracks (2876 access units with an
+RPU; the enhancement picture of an access unit is presented one picture
+before the base picture in 1881 of them and two after it in 940): with
+the RPU on the picture its enhancement access unit presents, the level 1
+metadata takes 15 values, each in one run of pictures; on the base
+picture of the same packet it comes in 20 runs, back and forth around
+each change. The enhancement pictures themselves were already paired by
+picture order.
+
+Now:
+- the enhancement layer is split off with its RPU (dovi_split mode
+  el_rpu), so its decoder attaches the RPU to the enhancement picture;
+- when a base picture is paired with its enhancement picture, and that
+  one brings an RPU of its own that is not the RPU the base picture came
+  with, the base picture takes it. The same RPU changes nothing: a stream
+  whose layers share their picture order plays as before, to the byte.
+  The rule is one function of the module, dvbridge_fel_layer_metadata(),
+  so that the host test runs what Kodi runs;
+- a base picture that goes out without its enhancement picture (the
+  layer resynchronizes, software decoding) keeps the RPU it came with,
+  as before. In a stream of this kind that is the RPU of a neighbouring
+  picture, and those pictures are counted;
+- the coded RPU of a base picture is only kept while an enhancement
+  layer is decoded, which is the only reader of it;
+- the log says once that the stream is of this kind, and at the end how
+  many pictures took another RPU and how many went out without their
+  enhancement picture. It also says once when the base pictures bring
+  RPUs and the enhancement pictures none: FFmpeg's decoder does not take
+  the first unit of a packet as an RPU, and an RPU that comes before the
+  enhancement units is the first unit of what the layer's decoder gets.
+  Such a stream plays as before this change.
+
+Tested on the host with the module's own code and the test stream
+decoded in software, the module's decoder on one thread as in Kodi
+(tests/fel_rpu_test.c): with lengths and with start codes (the framing
+of a stream that comes in two tracks), with a packet that lost its
+enhancement units, and with the base layer on one thread too. 2523 of
+2876 paired pictures take another RPU; the two pictures the enhancement
+layer does not have keep theirs, which adds two runs.
+
+The test does not tie an RPU to the content of its picture: a constant
+shift between the two would pass, and the stream has no cut to tell.
+That the RPU of an enhancement access unit belongs to the picture that
+access unit presents is how the two-track form of the stream times
+them, and how the Intel fork's Blu-ray reader matches them. Not verified
+on hardware. Whether discs code their layers in different picture order
+is not known; the log lines will tell.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 78 ++++++++++++++++++-
+ tools/dvbridge/dvbridge_fel.h                 | 17 +++-
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |  1 +
+ .../DVDCodecs/Video/DVDVideoCodec.h           |  3 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 67 +++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |  6 ++
+ 6 files changed, 167 insertions(+), 5 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index 6e8e60e..2fb8840 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -49,8 +49,72 @@ static bool picture_identity(struct picture_order *order, const AVPacket *packet
+     return true;
+ }
+ 
++/* HEVC unit type of a Dolby Vision RPU */
++#define RPU_UNIT 62
++
++/* As dovi_split frames what it gives: a length of this many bytes before every unit when the
++ * enhancement layer has an hvcC configuration, start codes (0) otherwise. */
++static int unit_length_size(const uint8_t *data, int size)
++{
++    return data && size >= 23 && data[0] == 1 ? (data[21] & 3) + 1 : 0;
++}
++
++/* Whether a split packet holds a unit of the enhancement layer, that is, any unit but an RPU. */
++static bool has_layer_unit(const AVPacket *packet, int length_size)
++{
++    const uint8_t *data = packet->data, *end = data + packet->size;
++    if (length_size) {
++        while (end - data > length_size) {
++            size_t length = 0;
++            for (int i = 0; i < length_size; ++i)
++                length = length << 8 | *data++;
++            if (!length || length > (size_t)(end - data))
++                return true; /* damaged: for the parser to judge, as before */
++            if ((data[0] >> 1 & 0x3f) != RPU_UNIT)
++                return true;
++            data += length;
++        }
++        return false;
++    }
++    /* The filter writes 00 00 00 01 before every unit, and no unit contains that. */
++    for (; end - data >= 5; ++data)
++        if (!data[0] && !data[1] && !data[2] && data[3] == 1 &&
++            (data[4] >> 1 & 0x3f) != RPU_UNIT)
++            return true;
++    return false;
++}
++
++/* An RPU as coded, without the zero bytes that may follow a unit in a byte stream. */
++static size_t rpu_length(const uint8_t *data, size_t size)
++{
++    while (size && !data[size - 1])
++        --size;
++    return size;
++}
++
++bool dvbridge_fel_layer_metadata(const AVFrame *enhancement, const uint8_t *base_rpu,
++                                 size_t base_size, const AVFrameSideData **coded,
++                                 const AVFrameSideData **parsed)
++{
++    *coded = *parsed = NULL;
++    if (!enhancement)
++        return false;
++    const AVFrameSideData *c = av_frame_get_side_data(enhancement, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    const AVFrameSideData *p = av_frame_get_side_data(enhancement, AV_FRAME_DATA_DOVI_METADATA);
++    /* FFmpeg attaches the last parsed RPU again to a picture whose access unit carried none,
++     * without the coded one: that is not an RPU of this picture. */
++    if (!c || !p)
++        return false;
++    *coded = c;
++    *parsed = p;
++    size_t own = base_rpu ? rpu_length(base_rpu, base_size) : 0;
++    size_t layer = rpu_length(c->data, c->size);
++    return own != layer || (own && memcmp(base_rpu, c->data, own) != 0);
++}
++
+ struct dvbridge_fel {
+     AVBSFContext *split;
++    int layer_length_size; /* unit_length_size() of the packets split gives */
+     AVCodecContext *decoder;
+     AVPacket *packets[QUEUE_MAX];
+     AVFrame *frames[QUEUE_MAX];
+@@ -160,12 +224,17 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+     f->synchronizing = true;
+     f->anchor_pts = AV_NOPTS_VALUE;
+     f->time_base = time_base;
+-    if (av_bsf_list_parse_str("dovi_split=mode=el", &f->split) < 0 ||
++    /* Hades: the RPU stays with the enhancement access unit (el_rpu), and the decoder attaches
++     * it to the enhancement picture: it is the metadata of that picture, which is not the base
++     * picture of the same packet when the layers are coded in different picture order. */
++    if (av_bsf_list_parse_str("dovi_split=mode=el_rpu", &f->split) < 0 ||
+         avcodec_parameters_copy(f->split->par_in, p) < 0)
+         goto fail;
+     f->split->time_base_in = time_base;
+     if (av_bsf_init(f->split) < 0)
+         goto fail;
++    f->layer_length_size = unit_length_size(f->split->par_out->extradata,
++                                           f->split->par_out->extradata_size);
+     f->decoder = avcodec_alloc_context3(codec);
+     if (!f->decoder || avcodec_parameters_to_context(f->decoder, f->split->par_out) < 0)
+         goto fail;
+@@ -360,6 +429,13 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+                 return pump(f);
+             goto fail;
+         }
++        /* Hades: an access unit without enhancement units still gives its RPU now. That is
++         * no enhancement picture: as when the filter gave nothing for it, its base picture goes
++         * out without the layer. */
++        if (!has_layer_unit(copy, f->layer_length_size)) {
++            av_packet_free(&copy);
++            continue;
++        }
+         if (f->num_packets == QUEUE_MAX || copy->size <= 0 ||
+             (size_t)copy->size > PACKET_BYTES_MAX - f->packet_bytes ||
+             !picture_identity(&f->enhancement_order, copy, &f->packet_order[f->num_packets])) {
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 89c6e19..b2d17d7 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -14,8 +14,23 @@ void dvbridge_fel_reset(struct dvbridge_fel *fel);
+ bool dvbridge_fel_device(struct dvbridge_fel *fel, AVBufferRef *device, bool picture);
+ bool dvbridge_fel_submit(struct dvbridge_fel *fel, const AVPacket *packet);
+ bool dvbridge_fel_drain(struct dvbridge_fel *fel);
+-/* 1: exact pair, 0: need input, 2: discard preroll, -1: missing pair / failure. */
++/* 1: exact pair, 0: need input, 2: discard preroll, -1: missing pair / failure.
++ * The frame of an exact pair carries, as side data, the Dolby Vision metadata of the access unit
++ * of the enhancement picture, with the RPU as coded when that access unit had one. */
+ int dvbridge_fel_take(struct dvbridge_fel *fel, int64_t pts, AVFrame **frame);
++/* Hades: whether a base picture takes the Dolby Vision metadata that the enhancement picture
++ * it is paired with brings. An RPU travels in the access unit of an enhancement picture and is
++ * the metadata of that picture. FFmpeg's base-layer decoder attaches it to the base picture of
++ * the same packet, which is another picture when the two layers are coded in different picture
++ * order. The base picture takes it when the enhancement picture has an RPU of its own and that
++ * is not the RPU the base picture came with (base_rpu, as coded; NULL when it had none of its
++ * own). The same RPU changes nothing: that is every picture of a stream whose layers share
++ * their picture order.
++ * coded, parsed: the RPU of the enhancement picture as coded and as parsed, or NULL when it has
++ * none of its own. */
++bool dvbridge_fel_layer_metadata(const AVFrame *enhancement, const uint8_t *base_rpu,
++                                 size_t base_size, const AVFrameSideData **coded,
++                                 const AVFrameSideData **parsed);
+ bool dvbridge_fel_failed(const struct dvbridge_fel *fel);
+ /* Decoder reached EOF and no enhancement surface remains to pair. */
+ bool dvbridge_fel_exhausted(const struct dvbridge_fel *fel);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index 18bdaea..55a8f06 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -54,6 +54,7 @@ void VideoPicture::Reset()
+ #ifdef HAVE_DVBRIDGE
+   doviEnhancement.reset();
+   doviRpuRepeated = false;
++  doviRpu.Reset();
+ #endif
+ 
+   hasDisplayMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index 60528a3..e0c5105 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -75,6 +75,9 @@ public:
+   std::shared_ptr<AVFrame> doviEnhancement;
+   //! doviMetadata is the previous RPU, repeated by FFmpeg for an access unit that carried none
+   bool doviRpuRepeated = false;
++  //! the RPU doviMetadata was parsed from, as coded. Empty when doviRpuRepeated, and when no
++  //! enhancement layer is decoded: only its pairing reads it
++  CDVMetadataBuffer doviRpu;
+ #endif
+ 
+   bool hasDisplayMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index ed8ad6a..39870c4 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -547,6 +547,20 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+ void CDVDVideoCodecFFmpeg::Dispose()
+ {
+ #ifdef HAVE_DVBRIDGE
++  // The pictures that went out without their enhancement picture kept the metadata carried with
++  // their base picture, which in such a stream is the one of a neighbouring picture.
++  if (m_dvLayerRpu)
++    CLog::Log(LOGINFO,
++              "DV FEL: {} of {} paired pictures took the Dolby Vision metadata of their "
++              "enhancement picture, another than the one carried with their base picture; {} "
++              "pictures went out without their enhancement picture and kept the one carried "
++              "with their base picture",
++              m_dvLayerRpu, m_dvPaired, m_dvUnpaired);
++  m_dvPaired = 0;
++  m_dvLayerRpu = 0;
++  m_dvLayerOwnRpu = 0;
++  m_dvLayerNoRpu = 0;
++  m_dvUnpaired = 0;
+   m_dvPending.clear();
+   m_dvFel.reset();
+   m_dvFailed = false;
+@@ -772,6 +786,45 @@ void CDVDVideoCodecFFmpeg::ResyncDVEnhancement(const char* reason)
+   m_dvLateInRow = 0;
+ }
+ 
++void CDVDVideoCodecFFmpeg::UseLayerDVMetadata(VideoPicture& base, const AVFrame* enhancement)
++{
++  // An RPU travels in the access unit of an enhancement picture and is the metadata of that
++  // picture. FFmpeg's base-layer decoder attaches it to the base picture of the same packet,
++  // which is another picture when the two layers are coded in different picture order: then the
++  // metadata of this picture is the one its enhancement picture brings. The rule is
++  // dvbridge_fel_layer_metadata(), which a host test runs on a real stream.
++  ++m_dvPaired;
++  const AVFrameSideData* coded = nullptr;
++  const AVFrameSideData* parsed = nullptr;
++  const bool take = dvbridge_fel_layer_metadata(enhancement, base.doviRpu.Data(),
++                                                base.doviRpu.Size(), &coded, &parsed);
++  // Once: the base pictures bring RPUs and, after two seconds of film, no enhancement picture
++  // has brought one. FFmpeg's decoder never takes the first unit of a packet as an RPU, and an
++  // RPU that comes before the enhancement units is the first unit of what the layer gets.
++  constexpr unsigned int WITHOUT_RPU_LOGGED = 48;
++  if (coded)
++    ++m_dvLayerOwnRpu;
++  else if (base.doviRpu.Size() && !m_dvLayerOwnRpu && ++m_dvLayerNoRpu == WITHOUT_RPU_LOGGED)
++    CLog::Log(LOGINFO,
++              "DV FEL: the enhancement pictures of this stream bring no Dolby Vision metadata "
++              "(RPU) of their own (it comes before the enhancement units in their access units, "
++              "or it is not there); each picture keeps the one carried with its base picture");
++  if (!take)
++    return;
++  CDVMetadataBuffer metadata;
++  if (!metadata.Assign(parsed->data, parsed->size))
++    return;
++  base.doviMetadata = metadata;
++  base.doviRpu.Assign(coded->data, coded->size);
++  base.doviRpuRepeated = false;
++  if (!m_dvLayerRpu++)
++    CLog::Log(LOGINFO,
++              "DV FEL: the Dolby Vision metadata (RPU) of this stream is not carried with the "
++              "base pictures it describes (first at {:.3f} s); each picture takes the one of "
++              "its enhancement picture",
++              static_cast<double>(base.doviSourcePts) / AV_TIME_BASE);
++}
++
+ void CDVDVideoCodecFFmpeg::CheckNativeDVPicture(VideoPicture* picture)
+ {
+   if (!m_dvNativeOutput || picture->hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION)
+@@ -896,6 +949,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+         // next random-access point common to both layers): it goes out without the layer
+         // instead of stopping the video. dvbridge draws it without the FEL residual, counted.
+         ++m_dvWithoutLayer;
++        ++m_dvUnpaired;
+         pVideoPicture->CopyRef(*base);
+         m_dvPending.pop_front();
+         return VC_PICTURE;
+@@ -920,6 +974,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+                   "(first at {:.3f} s); frames are paired by picture order count",
+                   static_cast<double>(firstMismatch) / AV_TIME_BASE);
+       }
++      UseLayerDVMetadata(*base, enhancement);
+       base->doviEnhancement = {enhancement, [](AVFrame* f) { av_frame_free(&f); }};
+       pVideoPicture->CopyRef(*base);
+       m_dvPending.pop_front();
+@@ -1515,6 +1570,7 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+                                      ? m_pFrame->pts
+                                      : m_pFrame->best_effort_timestamp;
+   pVideoPicture->doviRpuRepeated = false;
++  pVideoPicture->doviRpu.Reset();
+ #else
+   pVideoPicture->doviSourcePts = m_pFrame->best_effort_timestamp;
+ #endif
+@@ -1527,9 +1583,14 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+         CLog::Log(LOGWARNING, "Unable to retain Dolby Vision picture metadata");
+ #ifdef HAVE_DVBRIDGE
+       // FFmpeg attaches the last parsed RPU again to a picture whose access unit carried none;
+-      // only the raw RPU buffer, attached with a parsed RPU, tells them apart.
+-      pVideoPicture->doviRpuRepeated =
+-          !av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++      // only the raw RPU buffer, attached with a parsed RPU, tells them apart. It is kept while
++      // an enhancement layer is decoded: the enhancement picture paired with this one may bring
++      // another RPU (UseLayerDVMetadata()).
++      const AVFrameSideData* coded =
++          av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++      pVideoPicture->doviRpuRepeated = !coded;
++      if (coded && m_dvFel && !m_dvSoftware)
++        pVideoPicture->doviRpu.Assign(coded->data, coded->size);
+ #endif
+       AVDOVIMetadata* dovi = (AVDOVIMetadata*)sd->data;
+       const AVDOVIRpuDataHeader* hdr = av_dovi_get_header(dovi);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 4eac7ea..545f91e 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -76,6 +76,12 @@ protected:
+   unsigned int m_dvLate{0}; //!< base pictures whose enhancement picture was late or missing
+   unsigned int m_dvLateInRow{0}; //!< the same, in a row
+   bool m_dvSoftware{false}; //!< the base layer is decoded in software: no enhancement layer
++  unsigned int m_dvPaired{0}; //!< base pictures paired with their enhancement picture
++  unsigned int m_dvLayerRpu{0}; //!< of them, those that took the RPU of that picture, another one
++  unsigned int m_dvLayerOwnRpu{0}; //!< of them, those whose enhancement picture had its own RPU
++  unsigned int m_dvLayerNoRpu{0}; //!< ... and those where only the base picture had its own
++  unsigned int m_dvUnpaired{0}; //!< base pictures that went out without their enhancement picture
++  void UseLayerDVMetadata(VideoPicture& base, const AVFrame* enhancement);
+   void ResyncDVEnhancement(const char* reason);
+   CDVDVideoCodec::VCReturn GetPairedPicture(VideoPicture* picture);
+   void CheckNativeDVPicture(VideoPicture* picture);
+-- 
+2.53.0
+

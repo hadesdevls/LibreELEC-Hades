@@ -1,0 +1,357 @@
+From c09ad22d3a557b528eae9ebdcde77cff5f6da755 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:14:02 +0000
+Subject: [PATCH] windowing/gbm: a page flip that never comes no longer stops
+ Kodi on nvidia-drm
+
+Seen once with an RTX 4080 SUPER, after native Dolby Vision output had
+ended: the change back to the mode of the GUI took 6.2 s, nvidia-modeset
+logged "Lost display notification (0:0x00000000); continuing", and no
+flip came after it. Kodi waited for the flip of the frame before with
+EGL_FOREVER_KHR, so it stopped there for good: no picture on the TV, no
+input handled, and no way out but the power switch. After a restart the
+same video ended as it should.
+
+The flip is now waited for 2 s. When it has not come by then:
+- the commit of the frame waits. nvidia-drm takes a commit that does not
+  wait only once the flip before it has come; one that waits is applied
+  at once, and the flips that have not come are completed after 3 s
+  ("Flip event timeout on head"), which signals their fences, the ones
+  the GPU waits for too;
+- when flips still do not come (a second stall within 10 s), the output
+  is turned off and on again, as when the screen is blanked and woken.
+  The output off first: that commit completes the flips, and frees the
+  GPU, before the display resources are told that the display is lost,
+  as for a change of mode (a renderer flushed for it waits for the GPU);
+  if the driver does not take the output off, they are not told. If it
+  refuses to turn the output on, it is asked again with the commit of a
+  frame, after 1 s and then less often, up to once a minute, until it
+  takes it. At most once a minute, and three times while Kodi runs;
+  after that each stall costs about 5 s, and Kodi still handles input.
+The fence of the frame goes to its own commit after all this, and a
+fence that was given up on (or whose wait failed) is destroyed only once
+it has signalled.
+
+An output that is off on purpose has no flip to wait for and is left
+alone. A flip comes within tens of milliseconds: nothing changes while
+flips come. With the drivers that use the kernel's helpers (amdgpu,
+i915), a commit that waits first waits for the GPU to finish the frame,
+which waits for the flip before it: there a flip that never comes still
+stops Kodi, in the commit instead of here.
+---
+ xbmc/utils/EGLFence.cpp                       |  41 +++++
+ xbmc/utils/EGLFence.h                         |  13 ++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 141 +++++++++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  23 +++
+ 4 files changed, 215 insertions(+), 3 deletions(-)
+
+diff --git a/xbmc/utils/EGLFence.cpp b/xbmc/utils/EGLFence.cpp
+index d7bfb78..879b798 100644
+--- a/xbmc/utils/EGLFence.cpp
++++ b/xbmc/utils/EGLFence.cpp
+@@ -142,4 +142,45 @@ void CEGLFence::WaitSyncCPU()
+     m_kmsFence = EGL_NO_SYNC_KHR;
+   }
+ }
++
++bool CEGLFence::WaitSyncCPU(std::chrono::milliseconds timeout)
++{
++  // The ones given up before, once they have signalled (or, past eight, the oldest: EGL deletes a
++  // sync object that a command still waits on only when that wait is over, EGL_KHR_wait_sync)
++  std::erase_if(m_givenUpKmsFences,
++                [this](EGLSyncKHR sync)
++                {
++                  EGLint status = EGL_UNSIGNALED_KHR;
++                  if (m_eglGetSyncAttribKHR(m_display, sync, EGL_SYNC_STATUS_KHR, &status) ==
++                          EGL_TRUE &&
++                      status != EGL_SIGNALED_KHR)
++                    return false;
++                  m_eglDestroySyncKHR(m_display, sync);
++                  return true;
++                });
++  if (m_givenUpKmsFences.size() > 8)
++  {
++    m_eglDestroySyncKHR(m_display, m_givenUpKmsFences.front());
++    m_givenUpKmsFences.erase(m_givenUpKmsFences.begin());
++  }
++
++  if (!m_kmsFence)
++    return true;
++
++  const EGLint result =
++      m_eglClientWaitSyncKHR(m_display, m_kmsFence, 0,
++                             static_cast<EGLTimeKHR>(timeout.count()) * 1000000ULL);
++  if (result == EGL_FALSE || result == EGL_TIMEOUT_EXPIRED_KHR)
++  {
++    // The GPU can still wait for it (WaitSyncGPU()): kept until it has signalled. The next frame
++    // brings the fence of its own commit. (A wait that failed left it to the next frame, which
++    // made a new one over it without destroying it.)
++    m_givenUpKmsFences.push_back(m_kmsFence);
++    m_kmsFence = EGL_NO_SYNC_KHR;
++    return result == EGL_FALSE;
++  }
++  m_eglDestroySyncKHR(m_display, m_kmsFence);
++  m_kmsFence = EGL_NO_SYNC_KHR;
++  return true;
++}
+ #endif
+diff --git a/xbmc/utils/EGLFence.h b/xbmc/utils/EGLFence.h
+index 03c246b..580fc1b 100644
+--- a/xbmc/utils/EGLFence.h
++++ b/xbmc/utils/EGLFence.h
+@@ -10,6 +10,9 @@
+ 
+ #include "system_egl.h"
+ 
++#include <chrono>
++#include <vector>
++
+ #include <EGL/eglext.h>
+ 
+ namespace KODI
+@@ -36,6 +39,14 @@ public:
+   EGLint FlushFence();
+   void WaitSyncGPU();
+   void WaitSyncCPU();
++  /*!
++   * \brief Hades: wait for the KMS fence for a bounded time
++   * \return false when it did not signal in that time: it is given up (the next frame brings
++   *         the fence of its own commit), and destroyed once it has signalled; true when it
++   *         signalled, when there was none, and when the wait failed (it is kept as one given up
++   *         on then)
++   */
++  bool WaitSyncCPU(std::chrono::milliseconds timeout);
+ #endif
+ 
+ private:
+@@ -51,6 +62,8 @@ private:
+ 
+   EGLSyncKHR m_gpuFence{EGL_NO_SYNC_KHR};
+   EGLSyncKHR m_kmsFence{EGL_NO_SYNC_KHR};
++  //! Hades: KMS fences that WaitSyncCPU() gave up on, destroyed once they have signalled
++  std::vector<EGLSyncKHR> m_givenUpKmsFences;
+ 
+   PFNEGLDUPNATIVEFENCEFDANDROIDPROC m_eglDupNativeFenceFDANDROID{nullptr};
+   PFNEGLCLIENTWAITSYNCKHRPROC m_eglClientWaitSyncKHR{nullptr};
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index dc8eec1..3895441 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -21,6 +21,7 @@
+ #include "cores/VideoPlayer/VideoRenderers/HwDecRender/RendererDRMPRIMEGLES.h"
+ #include "cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
++#include "drm/DRMAtomic.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIWindow.h"
+ #include "guilib/GUIWindowManager.h"
+@@ -57,7 +58,6 @@ extern "C"
+ #ifdef HAVE_DVBRIDGE
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+ #include "cores/VideoPlayer/DVDStreamInfo.h"
+-#include "drm/DRMAtomic.h"
+ #include "rendering/capture/CaptureService.h"
+ 
+ #include <linux/sync_file.h>
+@@ -85,6 +85,17 @@ int GuiReferenceWhite()
+   return std::clamp(settings->GetInt(CSettings::SETTING_VIDEOSCREEN_HADESGUIWHITE), 25, 300);
+ }
+ 
++// Hades: how long the flip of the frame before is waited for on the ordinary path. It comes with
++// the next refresh once the GPU has finished that frame, in tens of milliseconds; one that has
++// not come by then does not come (FlipStalled()).
++constexpr std::chrono::milliseconds FLIP_STALL_WAIT{2000};
++// Stalls this close to each other are one failure that goes on
++constexpr auto FLIP_STALL_WINDOW = std::chrono::seconds(10);
++// The output is turned off and on again for it at most once in this time, and at most this many
++// times while Kodi runs
++constexpr auto FLIP_RESET_INTERVAL = std::chrono::seconds(60);
++constexpr unsigned int FLIP_RESETS_MAX = 3;
++
+ #ifdef HAVE_DVBRIDGE
+ // How long the flip of a commit is waited for: it comes with the next refresh once the GPU has
+ // finished the frame, and a commit that waits is made in its place when it does not come.
+@@ -411,13 +422,23 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       if (async)
+       {
+         int fd = m_eglFence->FlushFence();
+-        m_DRM->SetInFenceFd(fd);
+ 
+-        m_eglFence->WaitSyncCPU();
++        // Hades: the flip of the frame before, for a bounded time. One that never comes used to
++        // stop Kodi here for good, with nothing on the screen (FlipStalled()). The fence of this
++        // frame goes to its own commit, after that: a commit that FlipStalled() makes would
++        // take it (and close it).
++        if (m_eglFence->WaitSyncCPU(FLIP_STALL_WAIT))
++          FlipCame();
++        else if (FlipStalled())
++          async = false;
++        m_DRM->SetInFenceFd(fd);
+       }
+ #endif
+     }
+ 
++    // Hades: an output that FlipStalled() turned off and could not turn on again
++    if (m_flipOutputOff)
++      FlipOutputOn();
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
+   }
+   else
+@@ -438,6 +459,120 @@ void CWinSystemGbmGLESContext::SendDisplayReset()
+   }
+ }
+ 
++bool CWinSystemGbmGLESContext::FlipStalled()
++{
++  // A flip that never comes. Seen once with nvidia-drm, after a change of mode in which the
++  // driver lost the notification of the display engine ("Lost display notification ...;
++  // continuing"): no flip came after it, and Kodi waited for one for good, with no picture and
++  // no way to reach it but the power switch. The kernel takes a commit that does not wait only
++  // once the flip before it has come (EBUSY otherwise). One that waits is applied at once, and
++  // nvidia-drm completes the flips that have not come after 3 s ("Flip event timeout on head"),
++  // which signals their fences: Kodi goes on. When flips still do not come after that, the
++  // output is turned off and on again, as when the screen is blanked and woken, which sets the
++  // display engine and the link up again. (With the drivers that use the kernel's helpers, a
++  // commit that waits first waits for the GPU to finish the frame, and the GPU waits for the flip
++  // before it, WaitSyncGPU(): there a flip that never comes still stops Kodi, now in the commit.)
++  // An output that is off on purpose (blanked) has no flip to wait for, and none is made to come.
++  // (Only atomic commits bring a fence of their flip.)
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm || !drm->IsActive())
++    return false;
++  const auto now = std::chrono::steady_clock::now();
++  m_flipStalls =
++      m_flipStalls && now - m_flipStallLast < FLIP_STALL_WINDOW ? m_flipStalls + 1 : 1;
++  m_flipStallLast = now;
++  ++m_flipStallsSeen;
++  const bool reset = m_flipStalls >= 2 && m_flipResets < FLIP_RESETS_MAX &&
++                     (!m_flipResets || now - m_flipResetLast >= FLIP_RESET_INTERVAL);
++  // The first 20, then one in 100: while the display engine does not come back, every frame
++  // stalls
++  if (m_flipStallsSeen <= 20 || m_flipStallsSeen % 100 == 0)
++    CLog::Log(LOGERROR,
++              "The flip of the frame before did not come within {} ms ({} in a row, {} since "
++              "Kodi started): {}",
++              FLIP_STALL_WAIT.count(), m_flipStalls, m_flipStallsSeen,
++              reset ? "the output is turned off and on again, and the commit of this frame waits"
++                    : "the commit of this frame waits (the driver then completes the flips that "
++                      "have not come)");
++  if (reset)
++  {
++    m_flipResetLast = now;
++    ++m_flipResets;
++    // The output off first: that commit waits, and the flips that have not come are completed
++    // with it, and the fences that the GPU waits for (WaitSyncGPU()) with them. Only then are the
++    // display resources told that the display is lost, as for a change of mode: a renderer that
++    // is flushed for it waits for the GPU (glFinish()), which would wait for good before. They are
++    // told that it is back once the configured delay has passed (SendDisplayReset()).
++    // (what the driver accepted is what the properties of the CRTC hold)
++    const auto on = [&drm]
++    { return drm->GetCrtc() && drm->GetCrtc()->GetPropertyValue("ACTIVE").value_or(0) != 0; };
++    Hide();
++    // When the driver did not take the output off, nothing has completed the flips: the display
++    // resources are not told (the commit of this frame, which waits, completes them)
++    if (!on())
++      OnLostDevice();
++    else
++      CLog::Log(LOGERROR, "The output could not be turned off: the commit of this frame waits");
++    Show(true);
++    // The driver can refuse to turn it on (Kodi then commits what it had, the output off, and does
++    // not ask again): it is asked again until it is on (FlipOutputOn())
++    if (!on())
++    {
++      CLog::Log(LOGERROR, "The output could not be turned on again: it is asked to again, after "
++                          "1 s and then less often, up to once a minute");
++      m_flipOutputOff = true;
++      m_flipOutputTry = now;
++      m_flipOutputWait = 1s;
++      drm->AllowModeset();
++    }
++    const auto delay =
++        std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++                                      "videoscreen.delayrefreshchange") *
++                                  100);
++    if (delay > 0ms)
++      m_dispResetTimer.Set(delay);
++  }
++  return true;
++}
++
++void CWinSystemGbmGLESContext::FlipCame()
++{
++  if (!m_flipStalls || std::chrono::steady_clock::now() - m_flipStallLast < FLIP_STALL_WINDOW)
++    return;
++  CLog::Log(LOGINFO,
++            "Flips come again: none has stalled for {} s since the last of {} in a row (the "
++            "output was turned off and on again {} times since Kodi started)",
++            std::chrono::duration_cast<std::chrono::seconds>(FLIP_STALL_WINDOW).count(),
++            m_flipStalls, m_flipResets);
++  m_flipStalls = 0;
++}
++
++void CWinSystemGbmGLESContext::FlipOutputOn()
++{
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  // meant to be off now (blanked): it is not turned on
++  if (!drm || !drm->IsActive())
++  {
++    m_flipOutputOff = false;
++    return;
++  }
++  // (what the driver accepted is what the properties of the CRTC hold)
++  if (drm->GetCrtc() && drm->GetCrtc()->GetPropertyValue("ACTIVE").value_or(0) != 0)
++  {
++    CLog::Log(LOGINFO, "The output is on again");
++    m_flipOutputOff = false;
++    return;
++  }
++  // 1, 2, 4 ... 60 s apart: each refusal is logged by the commit (with what it asked for)
++  const auto now = std::chrono::steady_clock::now();
++  if (now - m_flipOutputTry < m_flipOutputWait)
++    return;
++  m_flipOutputTry = now;
++  m_flipOutputWait = std::min<std::chrono::steady_clock::duration>(2 * m_flipOutputWait, 60s);
++  // the commit of this frame asks for it, with its mode, and waits
++  drm->AllowModeset();
++}
++
+ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+ {
+   m_guiCompositing = (colorTransfer != 0);
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index aa06eee..a428337 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -149,6 +149,29 @@ private:
+   //! Tell the display resources (VideoPlayer, audio engine) that the display is back after a
+   //! mode switch, once the configured delay has passed.
+   void SendDisplayReset();
++  /*!
++   * \brief Hades: the flip of the frame before did not come in time (PresentRender()), and is
++   *        no longer waited for. What the driver is made to do about it.
++   * \return whether the commit of this frame waits
++   */
++  bool FlipStalled();
++  //! Hades: ... it came, as flips do
++  void FlipCame();
++  //! Hades: the output that FlipStalled() turned off and could not turn on again: asked with the
++  //! commit of a frame, after 1 s and then less often (up to once a minute), until the driver
++  //! takes it
++  void FlipOutputOn();
++  bool m_flipOutputOff{false};
++  std::chrono::steady_clock::time_point m_flipOutputTry{};
++  std::chrono::steady_clock::duration m_flipOutputWait{};
++  //! Stalls of the flip, each within FLIP_STALL_WINDOW of the one before; 0 once flips have come
++  //! for that long
++  unsigned int m_flipStalls{0};
++  unsigned int m_flipStallsSeen{0}; //!< since Kodi started, for the log
++  std::chrono::steady_clock::time_point m_flipStallLast{};
++  //! Times that the output was turned off and on again for it, and when the last was
++  unsigned int m_flipResets{0};
++  std::chrono::steady_clock::time_point m_flipResetLast{};
+ 
+   bool m_guiCompositing{false};
+   CFrameBufferObject m_guiFbo;
+-- 
+2.53.0
+

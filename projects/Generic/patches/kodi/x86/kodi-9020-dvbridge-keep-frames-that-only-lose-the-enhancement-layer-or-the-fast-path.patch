@@ -1,0 +1,123 @@
+From 83ab35d67471548a092a5017ff7d715a306be77a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:34:07 +0000
+Subject: [PATCH] dvbridge: keep frames that only lose the enhancement layer or
+ the fast path
+
+- An enhancement-layer import failure (DMA-BUF or GL) dropped the whole
+  frame and counted towards the session-wide fallback. The frame is now
+  drawn without the layer: a FEL residual is then omitted and counted as
+  a presentation without it, exactly as during a resynchronization; MEL
+  is drawn identically.
+- One frame refused by the packed fast path disabled that path until
+  the bridge was destroyed, even when the refusal came from the frame
+  itself (metadata) and the full-precision path refused it too. The
+  packed path is now given up only after it failed on three frames that
+  the full-precision path drew.
+- A frame whose PQ picture has no framebuffer for the GUI was silently
+  not presented and never counted, so a persistent failure froze the
+  picture. It now counts as not shown, which ends in the ordinary output
+  if it persists.
+---
+ .../VideoRenderers/DVBridgeGLES.cpp           | 33 ++++++++++++++-----
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  1 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  3 ++
+ 3 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index c0f38bb..bc4f4c2 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -114,17 +114,22 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+   double elPts = std::numeric_limits<double>::quiet_NaN();
+   if (enhancement)
+   {
+-    if (!dvbridge_gl_frame_import(&el, m_gl->gpu, enhancement->layout,
+-                                 enhancement->width, enhancement->height, enhancement->planes))
++    if (dvbridge_gl_frame_import(&el, m_gl->gpu, enhancement->layout, enhancement->width,
++                                 enhancement->height, enhancement->planes))
+     {
+-      dvbridge_gl_frame_release(&bl);
+-      return Fail("enhancement-layer-import");
++      bl.frame.enhancement_layer = &el.frame;
++      elPts = enhancement->pts;
++    }
++    else
++    {
++      // Drawn without the layer (a FEL residual is then omitted and counted) instead of lost.
++      Fail("enhancement-layer-import");
++      enhancement = nullptr;
+     }
+-    bl.frame.enhancement_layer = &el.frame;
+-    elPts = enhancement->pts;
+   }
+   // The fast path produces the exact transport bytes directly. GUI/subtitle
+   // frames and non-fullscreen geometry retain the original 32F composition.
++  bool packedFailed = false;
+   if (allowPacked && m_directUsable && m_scanout && !geometry.x && !geometry.y &&
+       geometry.width == 3840 && geometry.height == 2160)
+   {
+@@ -132,13 +137,21 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+                                      base.pts, elPts, geometry, m_scanout, true);
+     if (!m_direct)
+     {
+-      CLog::Log(LOGDEBUG, "DVBridge: packed render unavailable; retaining full-precision composition path");
+-      m_directUsable = false;
++      packedFailed = true;
+       dvbridge_renderer_reset(m_renderer);
+     }
+   }
+   m_prepared = m_direct || dvbridge_render_rgb(m_renderer, &bl.frame, metadata.Data(), metadata.Size(),
+                                                base.pts, elPts, geometry);
++  // Give the packed path up only when it fails on frames that the full-precision path draws: a
++  // frame that neither path accepts (its metadata) says nothing about the packed path.
++  if (packedFailed && m_prepared && ++m_directFailures >= 3)
++  {
++    CLog::Log(LOGINFO, "DVBridge: packed render unavailable; retaining full-precision composition path");
++    m_directUsable = false;
++  }
++  else if (m_direct)
++    m_directFailures = 0;
+   m_pendingInfo = 0;
+   if (m_prepared)
+   {
+@@ -219,9 +232,11 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+   dvbridge_dmabuf imported{};
+   if (!dvbridge_dmabuf_import(&imported, enhancement))
+   {
++    // Drawn without the layer (a FEL residual is then omitted and counted) instead of lost.
+     const std::string stage =
+         std::string("enhancement-dmabuf-import ") + dvbridge_dmabuf_last_error();
+-    return Fail(stage.c_str());
++    Fail(stage.c_str());
++    return Prepare(base, nullptr, metadata, geometry, allowPacked);
+   }
+   Layer layer{};
+   layer.layout = imported.layout;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 6391a36..317c917 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -71,6 +71,7 @@ private:
+   pl_tex m_scanout = nullptr;
+   bool m_direct = false;
+   bool m_directUsable = true;
++  unsigned int m_directFailures = 0; //!< packed-path failures on frames the float path drew
+   bool m_prepared = false;
+   bool m_packed = false;
+   PresentedDetail m_pendingDetail;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index bab204b..83c78ee 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -487,7 +487,10 @@ void CWinSystemGbmGLESContext::CompositeGui()
+     const auto target = m_dvBridge->GetPQFramebuffer();
+     if (!target)
+     {
++      // The frame cannot carry the GUI: it is not presented, and it counts as not shown so that
++      // a persistent failure ends in the ordinary output instead of a frozen picture.
+       m_dvFrame = false;
++      DVBridgeFrameShown(false, m_dvFramePts);
+       return;
+     }
+     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);

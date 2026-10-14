@@ -1,0 +1,272 @@
+From 455dbd7809bb7698031c306ea04ddca328febdaa Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 19:43:24 +0000
+Subject: [PATCH] ActiveAE: keep the output that follows the display while no
+ output has one
+
+Since "the audio output follows the display when the configured one has
+none", the engine uses the only HDMI output with a display in place of a
+configured one without. When no output had a display it went back to the
+configured one, which has none either, and with snd-hda and an NVIDIA GPU
+cannot be opened.
+
+That state is not only a TV that is switched off. For an instant of
+every change of the display mode the TV disappears from the audio data
+(ELD) of all outputs. In a session of 2026-10-03, with the TV on the
+HDMI output of the board and the setting on the output of the NVIDIA
+GPU, the engine was left without a sink two times for 0.65 s, each time
+the output returned from HDR to SDR ("no sink was returned").
+
+The output that a setting was following now stays in use while no
+output has a display, when it is another output of the same driver that
+reports displays. With one display the output that has it is used, with
+several the configured one, as before.
+
+Only an output that was followed to is kept. The engine remembers it
+for each of the two device settings, apart from the device in use,
+which can also be the configured output or what ValidateOutputDevices()
+took for a device that is not there: neither is held against a change
+of the setting while the outputs have no display.
+
+It helps where the kept output can be opened without a display (the
+HDMI outputs of an AMD GPU). One that cannot (NVIDIA) leaves the engine
+without a sink for that instant, as it does when it is the configured
+output.
+
+CActiveAE::SupportsRaw(), which other threads call, no longer works the
+followed output out again from the setting: LoadSettings() publishes
+the passthrough device it took under a lock, and that is the one asked.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp | 36 +++++++---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.h   | 12 +++-
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 69 ++++++++++++++++---
+ .../Engines/ActiveAE/ActiveAESink.h           |  8 ++-
+ 4 files changed, 101 insertions(+), 24 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index 3d0ad86..3860c3f 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -2847,10 +2847,14 @@ void CActiveAE::LoadSettings()
+ 
+   m_settings.device =
+       FollowDisplay(settings->GetString(CSettings::SETTING_AUDIOOUTPUT_AUDIODEVICE),
+-                    m_settings.device, false);
++                    m_followedDevice, false);
+   m_settings.passthroughdevice =
+       FollowDisplay(settings->GetString(CSettings::SETTING_AUDIOOUTPUT_PASSTHROUGHDEVICE),
+-                    m_settings.passthroughdevice, true);
++                    m_followedPassthroughDevice, true);
++  {
++    std::unique_lock lock(m_passthroughInUseLock);
++    m_passthroughInUse = m_settings.passthroughdevice;
++  }
+ 
+   m_settings.config = settings->GetInt(CSettings::SETTING_AUDIOOUTPUT_CONFIG);
+   m_settings.channels = (m_sink.GetDeviceType(m_settings.device) == AE_DEVTYPE_IEC958) ? AE_CH_LAYOUT_2_0 : settings->GetInt(CSettings::SETTING_AUDIOOUTPUT_CHANNELS);
+@@ -2881,15 +2885,20 @@ void CActiveAE::LoadSettings()
+ }
+ 
+ std::string CActiveAE::FollowDisplay(const std::string& device,
+-                                     const std::string& inUse,
++                                     std::string& followedBefore,
+                                      bool passthrough) const
+ {
+-  std::string followed = m_sink.FollowDisplay(device, passthrough);
+-  if (followed != device && followed != inUse)
++  std::string followed = m_sink.FollowDisplay(device, followedBefore, passthrough);
++  if (followed != device && followed != followedBefore)
+     CLog::Log(LOGINFO,
+               "ActiveAE - the configured {} output '{}' has no display attached: using '{}', the "
+               "only output with one (the setting is not changed)",
+               passthrough ? "passthrough" : "audio", device, followed);
++
++  // What a setting follows is kept apart from the device in use, which can also be the configured
++  // output, or what ValidateOutputDevices() took for a device that is not there: neither may be
++  // kept against a change of the setting while no output has a display.
++  followedBefore = followed != device ? followed : std::string();
+   return followed;
+ }
+ 
+@@ -3054,12 +3063,17 @@ bool CActiveAE::SupportsRaw(AEAudioFormat &format)
+   if (format.m_streamInfo.m_type == CAEStreamInfo::STREAM_TYPE_DTSHD_MA && !m_settings.dtshdpassthrough)
+     return false;
+ 
+-  // (of the passthrough device in use, see FollowDisplay())
+-  if (!m_sink.SupportsFormat(
+-          m_sink.FollowDisplay(CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
+-                                   CSettings::SETTING_AUDIOOUTPUT_PASSTHROUGHDEVICE),
+-                               true),
+-          format))
++  // (of the passthrough device that the engine took from the settings, see FollowDisplay();
++  // before it has loaded them, of the configured one)
++  std::string device;
++  {
++    std::unique_lock lock(m_passthroughInUseLock);
++    device = m_passthroughInUse;
++  }
++  if (device.empty())
++    device = CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
++        CSettings::SETTING_AUDIOOUTPUT_PASSTHROUGHDEVICE);
++  if (!m_sink.SupportsFormat(device, format))
+     return false;
+ 
+   return true;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+index 958991b..0213320 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+@@ -320,8 +320,10 @@ protected:
+   void LoadSettings();
+   //! \brief The device to use for a configured one (CActiveAESink::FollowDisplay()), logged when
+   //! it changes.
++  //! \param followedBefore the output that this setting was following, empty when none; set to
++  //!        what it follows now
+   std::string FollowDisplay(const std::string& device,
+-                            const std::string& inUse,
++                            std::string& followedBefore,
+                             bool passthrough) const;
+   void ValidateOutputDevices(bool saveChanges);
+   void HandleDeviceCountChange(const std::string& driver, bool defaultDeviceChanged);
+@@ -359,6 +361,14 @@ protected:
+   CActiveAEDataProtocol m_dataPort;
+   int m_state;
+   std::atomic<bool> m_noSink{false}; //!< m_state for other threads, see HasNoSink()
++  //! The outputs that the two device settings follow (see FollowDisplay()), empty while the
++  //! configured output is the one in use.
++  std::string m_followedDevice;
++  std::string m_followedPassthroughDevice;
++  //! The passthrough device that LoadSettings() took, for SupportsRaw(), which other threads
++  //! call.
++  std::string m_passthroughInUse;
++  mutable CCriticalSection m_passthroughInUseLock;
+   bool m_bStateMachineSelfTrigger;
+   std::chrono::milliseconds m_extTimeout;
+   bool m_extError;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index c797ec7..626aa53 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -763,6 +763,25 @@ bool IsUsableFor(const CAEDeviceInfo& d, bool passthrough)
+   return passthrough || !d.m_onlyPassthrough;
+ }
+ 
++// The outputs of a driver that have a display and can be used for this kind of output: how many,
++// and the first of them.
++unsigned int DisplayOutputs(const AE::AESinkInfo& sink,
++                            bool passthrough,
++                            const CAEDeviceInfo*& first)
++{
++  unsigned int count = 0;
++  first = nullptr;
++  for (const auto& other : sink.m_deviceInfoList)
++  {
++    if (other.m_display != CAEDeviceInfo::Display::PRESENT || !IsUsableFor(other, passthrough))
++      continue;
++
++    if (count++ == 0)
++      first = &other;
++  }
++  return count;
++}
++
+ // An HDMI or DisplayPort output without a display plays to nothing, and with some drivers cannot
+ // even be opened, which leaves the engine without a sink. When the driver says that the output
+ // has no display, and exactly one other output of the same driver has one, that one is used in
+@@ -777,17 +796,29 @@ const CAEDeviceInfo* DisplayOutputInstead(const AE::AESinkInfo& sink,
+     return nullptr;
+ 
+   const CAEDeviceInfo* found = nullptr;
+-  for (const auto& other : sink.m_deviceInfoList)
+-  {
+-    if (other.m_display != CAEDeviceInfo::Display::PRESENT || !IsUsableFor(other, passthrough))
+-      continue;
++  // several displays: the choice stays with the user
++  return DisplayOutputs(sink, passthrough, found) == 1 ? found : nullptr;
++}
+ 
+-    if (found)
+-      return nullptr; // several displays: the choice stays with the user
++// The output that was followed to, when it is another output of the same driver that reports
++// displays and, like every other one, has none right now.
++const CAEDeviceInfo* FollowedOutput(const AE::AESinkInfo& sink,
++                                    const CAEDeviceInfo& configured,
++                                    const std::string& followed,
++                                    bool passthrough)
++{
++  const AESinkDevice dev = CAESinkFactory::ParseDevice(followed);
++  if (dev.driver != sink.m_sinkName || dev.name.empty() || dev.name == configured.m_deviceName)
++    return nullptr;
+ 
+-    found = &other;
++  for (const auto& other : sink.m_deviceInfoList)
++  {
++    if (other.m_deviceName == dev.name)
++      return other.m_display == CAEDeviceInfo::Display::ABSENT && IsUsableFor(other, passthrough)
++                 ? &other
++                 : nullptr;
+   }
+-  return found;
++  return nullptr;
+ }
+ } // unnamed namespace
+ 
+@@ -795,7 +826,16 @@ const CAEDeviceInfo* DisplayOutputInstead(const AE::AESinkInfo& sink,
+ // formats it may pass through, the sink it opens) is about the output in use. The setting itself
+ // is not touched: when the configured output has a display again, it is the one in use again
+ // (a change of the display's audio data is a device change, which reloads the settings).
+-std::string CActiveAESink::FollowDisplay(const std::string& device, bool passthrough) const
++//
++// While no output has a display, the output that was followed to stays in use. That is the state
++// of a TV that is switched off, and for an instant of every change of the display mode: going
++// back to the configured output, which has no display either, made the engine fail to open its
++// sink (two times of 0.65 s in a session of 2026-10-03, when the output returned from HDR to
++// SDR). Only an output that was followed to is kept: the configured output is never left for one
++// without a display.
++std::string CActiveAESink::FollowDisplay(const std::string& device,
++                                         const std::string& followed,
++                                         bool passthrough) const
+ {
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
+   if (dev.driver.empty() || dev.name.empty())
+@@ -811,7 +851,16 @@ std::string CActiveAESink::FollowDisplay(const std::string& device, bool passthr
+       if (d.m_deviceName != dev.name)
+         continue;
+ 
+-      const CAEDeviceInfo* other = DisplayOutputInstead(sink, d, passthrough);
++      if (d.m_display != CAEDeviceInfo::Display::ABSENT)
++        return device;
++
++      const CAEDeviceInfo* other = nullptr;
++      const unsigned int displays = DisplayOutputs(sink, passthrough, other);
++      if (displays == 0)
++        other = FollowedOutput(sink, d, followed, passthrough);
++      else if (displays > 1)
++        other = nullptr; // several displays: the choice stays with the user
++
+       return other ? other->ToDeviceString(sink.m_sinkName) : device;
+     }
+   }
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+index 796398e..78cfde2 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+@@ -102,9 +102,13 @@ public:
+   std::string ValidateOuputDevice(const std::string& device, bool passthrough) const;
+   /*!
+    * \brief The device to use for a configured one: itself, or the only HDMI output with a display
+-   * when it is an HDMI output without one (see the definition).
++   * when it is an HDMI output without one, or the one that was followed to while no output has a
++   * display (see the definition).
++   * \param followed the output that this setting was following before, empty when none
+    */
+-  std::string FollowDisplay(const std::string& device, bool passthrough) const;
++  std::string FollowDisplay(const std::string& device,
++                            const std::string& followed,
++                            bool passthrough) const;
+   void Start();
+   void Dispose();
+   AEDeviceType GetDeviceType(const std::string &device);
+-- 
+2.53.0
+

@@ -1,0 +1,474 @@
+From 1453b3e8d2d5e0056b65dcaebb35c83fecbc44ad Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 23:22:54 +0000
+Subject: [PATCH] windowing/gbm: on NVIDIA the display is told when a half 3D
+ layout ends, and only of a layout that stays
+
+Two changes to the HDMI vendor InfoFrame that nvidia-drm is given for
+the half layouts (side-by-side and top-and-bottom).
+
+When the layout ended, the InfoFrame was taken away: the display got no
+vendor InfoFrame any more and had to notice by that. Some displays do
+not, and go on showing a 2D picture as two eyes (HDMI 2.0, appendix F).
+The kernel's own HDMI code, which i915 uses, sends an InfoFrame that
+says "no 3D" (HDMI_Video_Format 0) in every 2D mode for that reason, and
+amdgpu, with the patches of this tree, sends one when a 3D layout ends.
+The driver is now given that one (03 0C 00 00) with the
+commit that ends the layout, and keeps it in the modes that are set
+later, until a layout is told again or Kodi ends. It is taken away with
+a mode for which the driver sends a vendor InfoFrame of its own, which
+ours would be sent in place of: a frame-packed mode, and a mode with an
+HDMI_VIC (2160p at 24 to 30 Hz). If the driver does not take it, the
+InfoFrame of the layout is taken away as before, from then on.
+
+Native Dolby Vision output uses the same property, and does not start
+while something else has it. The "no 3D" InfoFrame is the one
+exception: CDVBridgeState::Capture() is told its blob, puts the Dolby
+one in its place and leaves the property empty when native output ends.
+Without a 3D display there never is such a blob, and Capture() does what
+it did.
+
+A Kodi that ends while the driver has an InfoFrame of its 3D output
+leaves it on the connector (a later commit takes it away where Kodi
+ends by itself). The next Kodi clears it with its first modeset, as it
+clears what native Dolby Vision output left; its log line now says that
+it may be either.
+
+The InfoFrame of a layout was also given while another way of drawing
+waited for the next frame. Leaving the split mode sets the resolution
+twice: the display was told of a layout by the first commit and of its
+end by the second. It is now given under the condition that the 3D mode
+of a resolution is asked for under.
+
+Host test: drmstereo_test (the bytes, and the modes that have an
+HDMI_VIC). None of this has run on a GPU.
+---
+ xbmc/windowing/GraphicContext.h               |   3 +
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 126 ++++++++++++++----
+ xbmc/windowing/gbm/WinSystemGbm.h             |  24 +++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |   2 +-
+ xbmc/windowing/gbm/drm/DRMStereo.h            |  35 +++++
+ xbmc/windowing/gbm/drm/DVBridgeState.cpp      |  22 ++-
+ xbmc/windowing/gbm/drm/DVBridgeState.h        |   5 +-
+ 7 files changed, 186 insertions(+), 31 deletions(-)
+
+diff --git a/xbmc/windowing/GraphicContext.h b/xbmc/windowing/GraphicContext.h
+index 15ac16d..4176f91 100644
+--- a/xbmc/windowing/GraphicContext.h
++++ b/xbmc/windowing/GraphicContext.h
+@@ -165,6 +165,9 @@ public:
+   RenderStereoView GetStereoView() { return m_stereoView; }
+   void SetStereoMode(RenderStereoMode mode) { m_nextStereoMode = mode; }
+   RenderStereoMode GetStereoMode() { return m_stereoMode; }
++  //! \brief Hades: the stereoscopic mode that is drawn from the next frame on: another than
++  //! GetStereoMode() while a change of it waits for that frame
++  RenderStereoMode GetNextStereoMode() const { return m_nextStereoMode; }
+   void RestoreCameraPosition();
+   void SetStereoFactor(float factor);
+   void RestoreStereoFactor();
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index abf19c9..a96da21 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -697,11 +697,16 @@ bool CWinSystemGbm::StereoWindowFailed(const RESOLUTION_INFO& res,
+ void CWinSystemGbm::PrepareStereoInfoFrame(const RESOLUTION_INFO& res)
+ {
+   m_stereoInfoFrameQueued = false;
+-  const RenderStereoMode drawn = GetGfxContext().GetStereoMode();
++  auto& gfx = GetGfxContext();
++  const RenderStereoMode drawn = gfx.GetStereoMode();
++  // As where the 3D output of a resolution is asked for (CGraphicContext::UpdateStereoOutput()):
++  // not while another way of drawing waits for the next frame, for which the resolution is set
++  // once more. A display that is about to leave 3D is not told of a layout first.
++  const bool split = IsSplitStereoMode(drawn) && gfx.GetNextStereoMode() == drawn;
+ 
+   // Nothing here is for a mode that is set while the eyes are not drawn split and the driver
+   // has no InfoFrame from here: every mode that is set without a 3D display.
+-  if (!IsSplitStereoMode(drawn) && !m_stereoInfoFrame.IsValid())
++  if (!split && !m_stereoInfoFrame.IsValid())
+     return;
+ 
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+@@ -709,12 +714,25 @@ void CWinSystemGbm::PrepareStereoInfoFrame(const RESOLUTION_INFO& res)
+   if (!drm || !connector)
+     return;
+ 
++  // What the driver had from here may be gone: native Dolby Vision output takes the place of
++  // the one that says "no 3D", and leaves the property empty (CDVBridgeState::Capture()).
++  if (m_stereoInfoFrame.IsValid() &&
++      connector->GetPropertyValue("NV_HDMI_VSIF_METADATA").value_or(0) != m_stereoInfoFrame.Get())
++  {
++    m_stereoInfoFrame = CDRMPropertyBlob();
++    m_stereoInfoFrameLayout = STEREO::Layout::NONE;
++    m_stereoInfoFrameEnds = false;
++    if (!split)
++      return;
++  }
++
+   // Never with a mode that has a 3D layout: the driver tells the display of that mode itself,
+   // and what it is given here would be sent in place of what it tells.
++  const STEREO::Mode mode = m_DRM->GetSelectedStereoMode();
++  const bool plain =
++      m_DRM->GetSelectedMode() && STEREO::LayoutOf(mode.flags) == STEREO::Layout::NONE;
+   STEREO::Layout wanted = STEREO::Layout::NONE;
+-  const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
+-  if (IsSplitStereoMode(drawn) && mode && STEREO::LayoutOf(mode->flags) == STEREO::Layout::NONE &&
+-      !res.strId.empty())
++  if (split && plain && !res.strId.empty())
+   {
+     std::vector<STEREO::Offer> offers;
+     STEREO::Allowed allowed;
+@@ -728,12 +746,12 @@ void CWinSystemGbm::PrepareStereoInfoFrame(const RESOLUTION_INFO& res)
+     }
+   }
+ 
+-  // (the driver has it already, or has none and none is wanted)
+-  if (wanted == m_stereoInfoFrameLayout)
+-    return;
+-
+   if (wanted != STEREO::Layout::NONE)
+   {
++    // (the driver has it already)
++    if (wanted == m_stereoInfoFrameLayout)
++      return;
++
+     const STEREO::InfoFramePayload payload = STEREO::HalfLayoutInfoFrame(wanted);
+     CDRMPropertyBlob blob(drm->GetFileDescriptor(), payload.bytes.data(), payload.size);
+     if (payload.size != 0 && blob.IsValid() &&
+@@ -741,20 +759,54 @@ void CWinSystemGbm::PrepareStereoInfoFrame(const RESOLUTION_INFO& res)
+     {
+       m_stereoInfoFramePending = std::move(blob);
+       m_stereoInfoFrameAsked = wanted;
++      m_stereoInfoFrameAskedEnds = false;
+       m_stereoInfoFrameQueued = true;
+       return;
+     }
+ 
+     RefuseStereoOutput(m_stereoRefusedInfoFrame, "the HDMI vendor InfoFrame of a half layout",
+                        "it could not be made for the driver");
+-    if (!m_stereoInfoFrame.IsValid())
++  }
++
++  // None is wanted (or the one that is wanted could not be made)
++  if (!m_stereoInfoFrame.IsValid())
++    return;
++
++  // The driver has one from here.
++  //
++  // If it is the one of a half layout, that layout ends with this commit. The display is told
++  // so, by an InfoFrame that says "no 3D", and not left to notice that the InfoFrame of the
++  // layout stopped coming, which some displays do not (STEREO::NoLayoutInfoFrame()). That one
++  // then stays with the driver in the modes that are set later, until a layout is told again,
++  // native Dolby Vision output takes the property, or Kodi ends.
++  //
++  // But not in a mode for which the driver sends a vendor InfoFrame of its own, which ours
++  // would be sent in place of: a mode with a 3D layout, and one that HDMI has a format number
++  // of its own for (2160p at 24 to 30 Hz). With such a mode ours is taken away, whichever it
++  // is, and the driver's own tells the display.
++  const bool driverTells = !plain || STEREO::HasHdmiVic(mode);
++  if (m_stereoInfoFrameEnds && !driverTells)
++    return;
++
++  if (!m_stereoInfoFrameEnds && !driverTells && !m_stereoInfoFrameNoEnd)
++  {
++    const STEREO::InfoFramePayload payload = STEREO::NoLayoutInfoFrame();
++    CDRMPropertyBlob blob(drm->GetFileDescriptor(), payload.bytes.data(), payload.size);
++    if (blob.IsValid() && drm->AddProperty(connector, "NV_HDMI_VSIF_METADATA", blob.Get()))
++    {
++      m_stereoInfoFramePending = std::move(blob);
++      m_stereoInfoFrameAsked = STEREO::Layout::NONE;
++      m_stereoInfoFrameAskedEnds = true;
++      m_stereoInfoFrameQueued = true;
+       return;
++    }
+   }
+ 
+-  // None is wanted, and the driver has one from here: it is taken away with this commit
+   if (drm->AddProperty(connector, "NV_HDMI_VSIF_METADATA", 0))
+   {
++    m_stereoInfoFramePending = CDRMPropertyBlob();
+     m_stereoInfoFrameAsked = STEREO::Layout::NONE;
++    m_stereoInfoFrameAskedEnds = false;
+     m_stereoInfoFrameQueued = true;
+   }
+ }
+@@ -766,37 +818,60 @@ void CWinSystemGbm::CheckStereoInfoFrame()
+   m_stereoInfoFrameQueued = false;
+ 
+   // What the driver took: the properties of a commit are kept when it is accepted
+-  // (CDRMAtomic::FinishRequest()), and those of the commit before it when it is not.
++  // (CDRMAtomic::FinishRequest()), and those of the commit before it when it is not. So this
++  // is what Kodi knows of the commits that the driver accepted, not something read from it.
+   CDRMConnector* connector = m_DRM->GetConnector();
+   const uint64_t has =
+       connector ? connector->GetPropertyValue("NV_HDMI_VSIF_METADATA").value_or(0) : 0;
+ 
+-  if (m_stereoInfoFrameAsked != STEREO::Layout::NONE)
++  if (m_stereoInfoFramePending.IsValid())
+   {
+-    if (m_stereoInfoFramePending.IsValid() && has == m_stereoInfoFramePending.Get())
++    // One was given: the one of a half layout, or the one that says "no 3D"
++    const bool ends = m_stereoInfoFrameAskedEnds;
++    if (has == m_stereoInfoFramePending.Get())
+     {
+       // (the one that the driver had before, if any, goes with this)
+       m_stereoInfoFrame = std::move(m_stereoInfoFramePending);
+       m_stereoInfoFrameLayout = m_stereoInfoFrameAsked;
++      m_stereoInfoFrameEnds = ends;
+       m_stereoInfoFrameTries = 0;
+-      const RESOLUTION_INFO mode = m_DRM->GetCurrentMode();
+-      TellStereoOutput(StringUtils::Format(
+-          "{} with {}, told by the HDMI vendor InfoFrame in that 2D mode",
+-          STEREO::LayoutName(m_stereoInfoFrameLayout), mode.strMode));
++      if (ends)
++      {
++        TellStereoOutput("off: the display is told that the 3D layout ended (the HDMI vendor "
++                         "InfoFrame says \"no 3D\")");
++      }
++      else
++      {
++        const RESOLUTION_INFO mode = m_DRM->GetCurrentMode();
++        TellStereoOutput(StringUtils::Format(
++            "{} with {}, told by the HDMI vendor InfoFrame in that 2D mode",
++            STEREO::LayoutName(m_stereoInfoFrameLayout), mode.strMode));
++      }
++      return;
+     }
+-    else
++
++    m_stereoInfoFramePending = CDRMPropertyBlob();
++    if (!ends)
+     {
+-      m_stereoInfoFramePending = CDRMPropertyBlob();
+       RefuseStereoOutput(m_stereoRefusedInfoFrame, "the HDMI vendor InfoFrame of a half layout",
+                          "the driver did not take the commit with it");
++      return;
+     }
+-    return;
++
++    // The one that says "no 3D" was not taken. It is not given again: the one of the half
++    // layout, which the driver still has, is taken away instead (below, by setting the mode
++    // again).
++    m_stereoInfoFrameNoEnd = true;
++    CLog::Log(LOGINFO,
++              "3D output: the driver did not take the commit with the HDMI vendor InfoFrame "
++              "that says \"no 3D\": the one of the half layout is taken away instead");
+   }
+ 
+   if (has == 0)
+   {
+     m_stereoInfoFrame = CDRMPropertyBlob();
+     m_stereoInfoFrameLayout = STEREO::Layout::NONE;
++    m_stereoInfoFrameEnds = false;
+     m_stereoInfoFrameTries = 0;
+     const drmModeModeInfo* mode = m_DRM->GetSelectedMode();
+     if (!mode || STEREO::LayoutOf(mode->flags) == STEREO::Layout::NONE)
+@@ -804,8 +879,13 @@ void CWinSystemGbm::CheckStereoInfoFrame()
+     return;
+   }
+ 
+-  // It was to be taken away and the driver still has it: the display would show a 2D picture
+-  // as two eyes. The mode is set again, a few times.
++  // The driver still has what it had. If that is the one that says "no 3D", it tells the
++  // display nothing wrong: it is left until a mode is set again.
++  if (m_stereoInfoFrameEnds)
++    return;
++
++  // It was to be taken away, and the driver still has the InfoFrame of a half layout: the
++  // display would show a 2D picture as two eyes. The mode is set again, a few times.
+   constexpr int TRIES = 3;
+   if (m_stereoInfoFrameTries < TRIES)
+   {
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index e9cb00b..674bec9 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -173,6 +173,14 @@ protected:
+   //! \brief Hades: native Dolby Vision output has the output. Its transport is no picture
+   //! that the display could take as two eyes: no 3D output is chosen meanwhile.
+   virtual bool NativeDVOutputInUse() const { return false; }
++  //! \brief Hades: the HDMI vendor InfoFrame that the driver has from here to tell the display
++  //! that a 3D layout ended (its blob), or 0. Native Dolby Vision output on nvidia-drm, which
++  //! uses the same property and takes it only while nothing else has it, may take it from
++  //! this one (CDVBridgeState::Capture()).
++  uint32_t EndedStereoInfoFrame() const
++  {
++    return m_stereoInfoFrameEnds ? m_stereoInfoFrame.Get() : 0;
++  }
+   //! \brief Hades: the window of what was to be set could not be made
+   //! \param res what was to be set
+   //! \param why for the log
+@@ -261,6 +269,11 @@ private:
+    * layout (of a frame-packed mode the driver tells the display itself, and what it is given
+    * here would go out instead), only while the eyes are drawn split, and never while native
+    * Dolby Vision output, which uses the same property, has the output.
++   *
++   * When the half layout ends, the driver is given the InfoFrame that says "no 3D"
++   * (STEREO::NoLayoutInfoFrame()) in its place, and keeps it in the modes that are set later
++   * too: until a layout is told again, native Dolby Vision output takes the property, a mode
++   * is set for which the driver sends a vendor InfoFrame of its own, or Kodi ends.
+    */
+   void PrepareStereoInfoFrame(const RESOLUTION_INFO& res);
+   //! After that commit: whether the driver took it
+@@ -271,12 +284,19 @@ private:
+   std::atomic<bool> m_stereoRefusedFramePacking{false};
+   std::atomic<bool> m_stereoRefusedHalfModes{false};
+   std::atomic<bool> m_stereoRefusedInfoFrame{false};
+-  //! The vendor InfoFrame that the driver has from here, while it has one, and its layout
++  //! The vendor InfoFrame that the driver has from here, while it has one: the one of a half
++  //! layout (m_stereoInfoFrameLayout) or, after it, the one that says "no 3D"
++  //! (m_stereoInfoFrameEnds; the layout is then none)
+   CDRMPropertyBlob m_stereoInfoFrame;
+   STEREO::Layout m_stereoInfoFrameLayout{STEREO::Layout::NONE};
+-  //! What the commit that is being made gives the driver (none: it takes ours from it)
++  bool m_stereoInfoFrameEnds{false};
++  //! What the commit that is being made gives the driver (no blob: it takes ours from it)
+   CDRMPropertyBlob m_stereoInfoFramePending;
+   STEREO::Layout m_stereoInfoFrameAsked{STEREO::Layout::NONE};
++  bool m_stereoInfoFrameAskedEnds{false};
++  //! The driver did not take the InfoFrame that says "no 3D": the one of the half layout is
++  //! taken away instead, from then on
++  bool m_stereoInfoFrameNoEnd{false};
+   bool m_stereoInfoFrameQueued{false}; //!< the commit that is being made changes the property
+   int m_stereoInfoFrameTries{0}; //!< times in a row that ours stayed when it was taken away
+   STEREO::Layout m_stereoLayout{STEREO::Layout::NONE}; //!< of the mode the output was last seen in
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index caf7f4d..dc8eec1 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -976,7 +976,7 @@ bool CWinSystemGbmGLESContext::BeginDVBridge()
+     m_dvBridge = std::make_unique<CDVBridgeGLES>();
+   if (!m_dvBridge->Initialize())
+     return DVBridgeBeginRejected("bridge-initialize");
+-  if (!m_dvState.Captured() && !m_dvState.Capture(*drm))
++  if (!m_dvState.Captured() && !m_dvState.Capture(*drm, EndedStereoInfoFrame()))
+     return DVBridgeBeginRejected("output-state-capture");
+   m_compositeShader.reset();
+   if (!SetGuiCompositing(AVCOL_TRC_SMPTE2084))
+diff --git a/xbmc/windowing/gbm/drm/DRMStereo.h b/xbmc/windowing/gbm/drm/DRMStereo.h
+index 7697ea0..8352e49 100644
+--- a/xbmc/windowing/gbm/drm/DRMStereo.h
++++ b/xbmc/windowing/gbm/drm/DRMStereo.h
+@@ -498,6 +498,27 @@ inline uint8_t VicOf(const Mode& mode)
+   return 0;
+ }
+ 
++/*!
++ * \brief Whether HDMI has a format number of its own (HDMI_VIC) for a 2D mode
++ *
++ * The 2160p formats of HDMI 1.4: 3840x2160 at 24, 25 and 30 Hz (and at 1000/1001 of them) and
++ * 4096x2160 at 24 Hz. A driver tells the display of such a mode in the HDMI vendor InfoFrame,
++ * the one that also tells of a 3D layout.
++ */
++inline bool HasHdmiVic(const Mode& mode)
++{
++  if ((mode.flags & (FLAG_INTERLACE | FLAG_DBLSCAN)) != 0 || mode.vscan > 1 ||
++      mode.vdisplay != 2160 || (mode.hdisplay != 3840 && mode.hdisplay != 4096))
++    return false;
++
++  const double rate = RefreshRate(mode);
++  const auto is = [rate](double nominal)
++  {
++    return std::fabs(rate - nominal) < 0.02 || std::fabs(rate - nominal * 1000.0 / 1001.0) < 0.02;
++  };
++  return is(24.0) || (mode.hdisplay == 3840 && (is(25.0) || is(30.0)));
++}
++
+ /*!
+  * \brief What the EDID of a display says of 3D (HDMI 1.4, in its HDMI vendor block)
+  */
+@@ -750,6 +771,20 @@ constexpr InfoFramePayload HalfLayoutInfoFrame(Layout layout)
+   }
+ }
+ 
++/*!
++ * \brief The contents of the HDMI vendor InfoFrame that tells a display that there is no 3D
++ *        layout (any more)
++ *
++ * HDMI_Video_Format 0, with nothing after it. A display is told so when a 3D layout ends,
++ * rather than left to notice that the InfoFrame of the layout stopped coming, which some do
++ * not (HDMI 2.0, appendix F; the kernel's HDMI code sends this InfoFrame in every 2D mode to a
++ * display that takes one).
++ */
++constexpr InfoFramePayload NoLayoutInfoFrame()
++{
++  return {4, {0x03, 0x0C, 0x00, 0x00}};
++}
++
+ } // namespace STEREO
+ } // namespace GBM
+ } // namespace WINDOWING
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.cpp b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+index a875dea..6a151d0 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.cpp
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.cpp
+@@ -39,9 +39,13 @@ void CDVBridgeState::ClearLeftover(CDRMAtomic& drm)
+   const bool nvidia = connector->GetPropertyValue("NV_HDMI_VSIF_METADATA").value_or(0) != 0;
+   if (!kernel && !nvidia)
+     return;
++  // (On nvidia-drm it may also be the vendor InfoFrame of Kodi's 3D output, which uses the same
++  // property: a Kodi that ended while a 3D display was told of a layout, or that one had ended.)
+   CLog::Log(LOGWARNING,
+-            "DVBridge: native Dolby Vision output of a previous session is still set on the "
+-            "connector; resetting it with the first modeset");
++            "DVBridge: {} of a previous session is still set on the connector; resetting it "
++            "with the first modeset",
++            kernel ? "native Dolby Vision output"
++                   : "an HDMI vendor InfoFrame (native Dolby Vision output, or 3D output)");
+   if (kernel)
+     drm.AddProperty(connector, "DVBRIDGE_DV_STANDARD_LAB", 0);
+   if (nvidia)
+@@ -66,7 +70,7 @@ void CDVBridgeState::ClearLeftover(CDRMAtomic& drm)
+   }
+ }
+ 
+-bool CDVBridgeState::Capture(CDRMAtomic& drm)
++bool CDVBridgeState::Capture(CDRMAtomic& drm, uint64_t ownVsif)
+ {
+   if (Captured())
+     return false;
+@@ -81,7 +85,11 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+   if (backend == Backend::KERNEL && connector->GetPropertyValue("DVBRIDGE_DV_STANDARD_LAB") != 0)
+     return false;
+   // Nothing else may already be sending its own HDMI vendor InfoFrame through the property.
+-  if (backend == Backend::NVIDIA && connector->GetPropertyValue("NV_HDMI_VSIF_METADATA") != 0)
++  // (But the one that Kodi's 3D output leaves there to tell the display that a 3D layout
++  // ended: it says nothing of the picture, and the Dolby one takes its place for good.)
++  const auto vsifBefore = connector->GetPropertyValue("NV_HDMI_VSIF_METADATA");
++  const bool vsifOwn = ownVsif != 0 && vsifBefore == ownVsif;
++  if (backend == Backend::NVIDIA && vsifBefore != 0 && !vsifOwn)
+     return false;
+ 
+   std::vector<Property> saved;
+@@ -128,6 +136,12 @@ bool CDVBridgeState::Capture(CDRMAtomic& drm)
+     if (!vsif.IsValid() || !save(connector, "NV_HDMI_VSIF_METADATA", vsif.Get(), true, true))
+       return false;
+     saved.back().transportBlob = std::move(vsif);
++    if (vsifOwn)
++    {
++      // (not put back when native output ends: the property is left empty)
++      saved.back().blob = CDRMPropertyBlob();
++      saved.back().original = 0;
++    }
+ 
+     // No "Broadcast RGB" on nvidia-drm: RGB output is full range by default, and the AVI
+     // InfoFrame says so when the sink can select the RGB range (checked from the EDID).
+diff --git a/xbmc/windowing/gbm/drm/DVBridgeState.h b/xbmc/windowing/gbm/drm/DVBridgeState.h
+index 4d8df20..07956dd 100644
+--- a/xbmc/windowing/gbm/drm/DVBridgeState.h
++++ b/xbmc/windowing/gbm/drm/DVBridgeState.h
+@@ -32,7 +32,10 @@ public:
+   //! connector: stage its reset for the first modeset of this session.
+   static void ClearLeftover(CDRMAtomic& drm);
+ 
+-  bool Capture(CDRMAtomic& drm);
++  //! \param ownVsif (nvidia-drm) the blob of an HDMI vendor InfoFrame that Kodi gave the driver
++  //!        itself and that says nothing of the picture (its 3D output: the end of a 3D layout),
++  //!        or 0. The only one that may be on the connector; it is not put back afterwards.
++  bool Capture(CDRMAtomic& drm, uint64_t ownVsif = 0);
+   bool Stage(CDRMAtomic& drm, bool restore);
+   void Restored()
+   {
+-- 
+2.53.0
+

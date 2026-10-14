@@ -1,0 +1,490 @@
+From 1f10cbb5795de1c23d0ad1fe09e9e9049c7effde Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:56:46 +0000
+Subject: [PATCH] dvbridge: the FEL decoder never holds the video
+
+The resynchronization of kodi-9016 could not keep its promise that the
+video never stops, because several paths waited or failed without
+progress:
+- An enhancement picture that never arrived was declared missing only
+  when 32 later enhancement frames were queued, while at most 16 base
+  pictures could wait, each holding one of the 22 base-layer surfaces.
+  The decoder then ran out of surfaces (a frozen picture and a decoder
+  reopen) or returned VC_ERROR at 16 waiting pictures without pulling
+  the base layer, so no new enhancement packet was ever submitted: a
+  freeze until the next seek.
+  Now the oldest base picture goes out without the layer once 6 wait
+  (both layers are decoded side by side, so its enhancement picture is
+  late or missing by then), and three such pictures in a row
+  resynchronize the layer. Each waiting picture holds a base surface
+  and a VAAPI render picture: VAAPI gives dual-layer streams 6 more
+  surfaces (28 for HEVC, within nvidia-vaapi-driver's 32) and 6 more
+  render pictures (13). With the usual 7, next to the renderer's queue,
+  waiting pictures would drain that queue (a repeated frame) or, with
+  one more picture held, stop the decoder until its 2 s timeout and a
+  reopen.
+- A base picture without a timestamp returned VC_ERROR forever; it now
+  goes out without the layer. At the end of the base layer, waiting
+  pictures go out instead of returning VC_ERROR.
+- A failure of the enhancement decoder's device (dvbridge_fel_device)
+  discarded the base picture just decoded, and forever when the base
+  layer's decoder was set up again on another device or the enhancement
+  decoder could not be opened. The base picture is now kept and the
+  layer resynchronized; the enhancement decoder follows a new device and
+  is created afresh (a context whose opening failed cannot be opened
+  again), retried after 240 base pictures (counted in pictures, not in
+  calls) after a failure.
+- nvidia-vaapi-driver gives a decoder context at most 32 surfaces and
+  fails every decode on a 33rd distinct surface for the rest of the
+  context. The enhancement pool asked for 17 + 36; it is capped at 32,
+  so an exhausted pool is a transient failure that resynchronizes.
+- The enhancement layer was submitted only when avcodec_send_packet()
+  returned 0, although the decoder takes a packet it reports an error
+  for and may still output a picture. It is now submitted for every
+  packet the decoder took, and not for one that Kodi sends again.
+- If the enhancement layer could not be set up for a stream, the codec
+  failed to open and the video did not play; the base layer now plays.
+- A base layer decoded in software (no VAAPI) no longer runs the
+  enhancement machinery, which can only work with VAAPI surfaces.
+---
+ tools/dvbridge/dvbridge_fel.c                 |  48 ++++++-
+ tools/dvbridge/dvbridge_fel.h                 |   4 +-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 124 +++++++++++++-----
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   3 +
+ .../VideoPlayer/DVDCodecs/Video/VAAPI.cpp     |  40 +++++-
+ .../cores/VideoPlayer/DVDCodecs/Video/VAAPI.h |   5 +
+ 6 files changed, 182 insertions(+), 42 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index ccc0e88..6e8e60e 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -10,6 +10,11 @@
+ #define QUEUE_MAX 32
+ #define PACKET_BYTES_MAX (64u * 1024u * 1024u)
+ #define MAP_MAX (QUEUE_MAX * 2)
++/* nvidia-vaapi-driver gives a decoder context at most 32 surfaces and fails the decode of any
++ * further surface for the rest of the context; a larger pool is never used safely. */
++#define SURFACES_MAX 32
++/* Base pictures between two attempts to open an enhancement decoder that failed to open. */
++#define OPEN_RETRY_PICTURES 240
+ /* Independently coded layers can have different decode
+  * order and IDR boundaries. Use FFmpeg's HEVC parser rather than assigning
+  * the BL packet timestamp blindly to the encapsulated EL access unit. */
+@@ -62,6 +67,8 @@ struct dvbridge_fel {
+     const char *reason; /* why the enhancement layer failed, for the log */
+     unsigned order_mismatches; /* EL pictures whose order differs from the carrying BL picture */
+     int64_t first_mismatch_pts;
++    AVRational time_base;
++    unsigned open_wait; /* base pictures to wait before opening the decoder again */
+ };
+ 
+ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+@@ -76,6 +83,8 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
+         return AV_PIX_FMT_NONE;
+     AVHWFramesContext *hw = (void *)frames->data;
+     hw->initial_pool_size += QUEUE_MAX + 4;
++    if (hw->initial_pool_size > SURFACES_MAX)
++        hw->initial_pool_size = SURFACES_MAX; /* an exhausted pool fails a decode: resynchronized */
+     if (av_hwframe_ctx_init(frames) < 0) {
+         av_buffer_unref(&frames);
+         return AV_PIX_FMT_NONE;
+@@ -150,6 +159,7 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+         return NULL;
+     f->synchronizing = true;
+     f->anchor_pts = AV_NOPTS_VALUE;
++    f->time_base = time_base;
+     if (av_bsf_list_parse_str("dovi_split=mode=el", &f->split) < 0 ||
+         avcodec_parameters_copy(f->split->par_in, p) < 0)
+         goto fail;
+@@ -266,14 +276,42 @@ fail:
+     return false;
+ }
+ 
+-bool dvbridge_fel_device(struct dvbridge_fel *f, AVBufferRef *device)
++/* A fresh decoder context on the device: a context whose opening failed cannot be opened again. */
++static bool open_decoder(struct dvbridge_fel *f, AVBufferRef *device)
+ {
+-    if (!f || !device || ((AVHWDeviceContext *)device->data)->type != AV_HWDEVICE_TYPE_VAAPI)
++    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
++    avcodec_free_context(&f->decoder);
++    f->decoder = codec ? avcodec_alloc_context3(codec) : NULL;
++    if (!f->decoder || avcodec_parameters_to_context(f->decoder, f->split->par_out) < 0)
+         return false;
+-    if (f->opened)
+-        return f->decoder->hw_device_ctx->data == device->data && pump(f);
++    f->decoder->pkt_timebase = f->time_base;
++    f->decoder->get_format = hardware_format;
++    f->decoder->thread_count = 1;
+     f->decoder->hw_device_ctx = av_buffer_ref(device);
+-    if (!f->decoder->hw_device_ctx || avcodec_open2(f->decoder, f->decoder->codec, NULL) < 0) {
++    return f->decoder->hw_device_ctx && avcodec_open2(f->decoder, codec, NULL) >= 0;
++}
++
++bool dvbridge_fel_device(struct dvbridge_fel *f, AVBufferRef *device, bool picture)
++{
++    if (!f || !device || ((AVHWDeviceContext *)device->data)->type != AV_HWDEVICE_TYPE_VAAPI)
++        return false;
++    if (f->opened && f->decoder->hw_device_ctx && f->decoder->hw_device_ctx->data == device->data)
++        return pump(f);
++    /* First use, or the base layer's decoder was set up again on another device (a new
++     * sequence): the enhancement decoder follows it, from the next common random-access point. */
++    if (f->open_wait) {
++        if (picture)
++            --f->open_wait;
++        f->reason = "the enhancement decoder could not be opened";
++        f->failed = true;
++        return false;
++    }
++    if (f->opened) {
++        dvbridge_fel_reset(f);
++        f->opened = false;
++    }
++    if (!open_decoder(f, device)) {
++        f->open_wait = OPEN_RETRY_PICTURES;
+         f->reason = "the enhancement decoder could not be opened";
+         f->failed = true;
+         return false;
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 1d73857..89c6e19 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -9,7 +9,9 @@ struct dvbridge_fel;
+ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *parameters, AVRational time_base);
+ void dvbridge_fel_destroy(struct dvbridge_fel *fel);
+ void dvbridge_fel_reset(struct dvbridge_fel *fel);
+-bool dvbridge_fel_device(struct dvbridge_fel *fel, AVBufferRef *device);
++/* picture: the base layer produced a picture in this call (after a failed open, the decoder is
++ * opened again after a number of base pictures). */
++bool dvbridge_fel_device(struct dvbridge_fel *fel, AVBufferRef *device, bool picture);
+ bool dvbridge_fel_submit(struct dvbridge_fel *fel, const AVPacket *packet);
+ bool dvbridge_fel_drain(struct dvbridge_fel *fel);
+ /* 1: exact pair, 0: need input, 2: discard preroll, -1: missing pair / failure. */
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index dd2bbf9..f9be664 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -506,8 +506,11 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+     if (result >= 0)
+       m_dvFel = {dvbridge_fel_create(parameters, AVRational{1, AV_TIME_BASE}), dvbridge_fel_destroy};
+     avcodec_parameters_free(&parameters);
++    // The video still plays: its base layer with the RPU, FEL pictures drawn without the residual
++    // and counted.
+     if (!m_dvFel)
+-      return false;
++      CLog::Log(LOGERROR, "DV FEL: the enhancement layer of this stream cannot be decoded (its "
++                          "setup failed); the base layer plays without it");
+   }
+ #endif
+   return true;
+@@ -526,6 +529,9 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvOrdinary = false;
+   m_dvMissingRpu = 0;
+   m_dvPresentRpu = 0;
++  m_dvLate = 0;
++  m_dvLateInRow = 0;
++  m_dvSoftware = false;
+   m_dvNativeOutput = false;
+ #endif
+   av_frame_free(&m_pFrame);
+@@ -670,9 +676,29 @@ bool CDVDVideoCodecFFmpeg::AddData(const DemuxPacket &packet)
+   avpkt->side_data_elems = packet.iSideDataElems;
+ 
+   int ret = avcodec_send_packet(m_pCodecContext, avpkt);
++
++  // Whether Kodi sends this packet again (false below): on EAGAIN, and on a hardware decoder
++  // without free surfaces.
++  bool sendAgain = ret == AVERROR(EAGAIN);
++  // error
++  if (ret && !sendAgain)
++  {
++    // handle VC_NOBUFFER error for hw accel
++    if (m_pHardware)
++    {
++      int result = m_pHardware->Check(m_pCodecContext);
++      if (result == VC_NOBUFFER)
++      {
++        sendAgain = true;
++      }
++    }
++  }
++
+ #ifdef HAVE_DVBRIDGE
+-  // Submit once, only after BL accepted the packet (Kodi retries EAGAIN).
+-  if (ret == 0 && m_dvFel && !dvbridge_fel_submit(m_dvFel.get(), avpkt))
++  // Submit the enhancement layer once for each base packet the decoder took, also when it
++  // reported an error for it (it may still output a picture, which then waits for its
++  // enhancement picture); a packet that Kodi sends again is submitted then.
++  if (!sendAgain && m_dvFel && !m_dvSoftware && !dvbridge_fel_submit(m_dvFel.get(), avpkt))
+     m_dvFailed = true;
+ #endif
+ 
+@@ -683,23 +709,10 @@ bool CDVDVideoCodecFFmpeg::AddData(const DemuxPacket &packet)
+   av_free(avpkt);
+ 
+   // try again
+-  if (ret == AVERROR(EAGAIN))
++  if (sendAgain)
+   {
+     return false;
+   }
+-  // error
+-  else if (ret)
+-  {
+-    // handle VC_NOBUFFER error for hw accel
+-    if (m_pHardware)
+-    {
+-      int result = m_pHardware->Check(m_pCodecContext);
+-      if (result == VC_NOBUFFER)
+-      {
+-        return false;
+-      }
+-    }
+-  }
+ 
+   m_iLastKeyframe++;
+   // put a limit on convergence count to avoid huge mem usage on streams without keyframes
+@@ -721,6 +734,15 @@ constexpr unsigned int DV_MISSING_RPU_MAX = 12;
+ // Consecutive pictures with Dolby Vision metadata after which a stream that left native output
+ // because the metadata was missing returns to it (2 s at 24 fps).
+ constexpr unsigned int DV_RPU_BACK = 48;
++
++// Base pictures waiting for their enhancement pictures. Both layers are decoded side by side, so
++// the enhancement picture of the oldest one normally arrives within a few pictures; with this many
++// waiting it is late or missing. Each waiting picture holds a base-layer decoder surface (VAAPI
++// adds as many surfaces for dual-layer streams).
++constexpr size_t DV_EL_LATE_PENDING = 6;
++
++// Late or missing enhancement pictures in a row after which the layer is resynchronized.
++constexpr unsigned int DV_EL_LATE_RESYNC = 3;
+ } // namespace
+ 
+ void CDVDVideoCodecFFmpeg::ResyncDVEnhancement(const char* reason)
+@@ -735,6 +757,7 @@ void CDVDVideoCodecFFmpeg::ResyncDVEnhancement(const char* reason)
+               reason, m_dvResyncs);
+   dvbridge_fel_reset(m_dvFel.get());
+   m_dvFailed = false;
++  m_dvLateInRow = 0;
+ }
+ 
+ void CDVDVideoCodecFFmpeg::CheckNativeDVPicture(VideoPicture* picture)
+@@ -801,16 +824,37 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+   {
+     if (m_dvFailed || dvbridge_fel_failed(m_dvFel.get()))
+       ResyncDVEnhancement(dvbridge_fel_reason(m_dvFel.get()));
+-    auto emit = [&]() -> VCReturn
++    // baseEnded: the base layer reached its end and the enhancement layer is drained, so nothing
++    // more can pair with a waiting base picture.
++    auto emit = [&](bool baseEnded) -> VCReturn
+     {
+       if (m_dvPending.empty())
+         return VC_NONE;
+       auto& base = m_dvPending.front();
+-      if (base->doviSourcePts == AV_NOPTS_VALUE)
+-        return VC_ERROR;
+       AVFrame* enhancement = nullptr;
+-      int result = dvbridge_fel_take(m_dvFel.get(), base->doviSourcePts,
+-                                     &enhancement);
++      // A base picture without a timestamp cannot be paired, and a base layer decoded in
++      // software has no enhancement layer (it needs VAAPI): the picture goes out without it.
++      int result = m_dvSoftware || base->doviSourcePts == AV_NOPTS_VALUE
++                       ? 2
++                       : dvbridge_fel_take(m_dvFel.get(), base->doviSourcePts, &enhancement);
++      if (result == 0 && baseEnded)
++        result = 2;
++      else if (result == 0 && m_dvPending.size() >= DV_EL_LATE_PENDING)
++      {
++        // The enhancement picture of the oldest base picture is late or missing (a damaged or
++        // absent enhancement access unit, pictures that do not pair). The base picture goes out
++        // without it instead of holding decoder surfaces until the video stops; if that keeps
++        // happening, the layer is resynchronized.
++        ++m_dvLate;
++        if (++m_dvLateInRow >= DV_EL_LATE_RESYNC)
++          ResyncDVEnhancement("enhancement pictures are late or missing");
++        else if (m_dvLate <= 5 || m_dvLate % 100 == 0)
++          CLog::Log(LOGWARNING,
++                    "DV FEL: an enhancement picture is late or missing; its base picture is shown "
++                    "without it ({} so far)",
++                    m_dvLate);
++        result = 2;
++      }
+       if (result < 0 && dvbridge_fel_exhausted(m_dvFel.get()))
+       {
+         // The enhancement layer ended before the base layer: its last pictures go out without it.
+@@ -839,6 +883,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+       }
+       if (!result)
+         return VC_NONE;
++      m_dvLateInRow = 0;
+       if (m_dvWithoutLayer)
+       {
+         CLog::Log(LOGINFO,
+@@ -861,30 +906,38 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+       m_dvPending.pop_front();
+       return VC_PICTURE;
+     };
+-    VCReturn paired = emit();
++    VCReturn paired = emit(false);
+     if (paired != VC_NONE)
+       return paired;
+-    if (m_dvPending.size() >= 16)
+-      return VC_ERROR;
+     auto base = std::make_shared<VideoPicture>();
+     base->Reset();
+     VCReturn result = GetBasePicture(base.get());
+-    if (m_pCodecContext->hw_frames_ctx)
++    if (result == VC_PICTURE)
++    {
++      if (!m_pCodecContext->hw_frames_ctx && !m_dvSoftware)
++      {
++        CLog::Log(LOGWARNING, "DV FEL: the base layer is decoded in software; the enhancement "
++                              "layer needs VAAPI and is not decoded");
++        m_dvSoftware = true;
++      }
++      m_dvPending.push_back(std::move(base));
++    }
++    // The base picture is kept whatever happens to the enhancement decoder: a failure only
++    // resynchronizes the layer.
++    if (m_pCodecContext->hw_frames_ctx && !m_dvSoftware)
+     {
+       auto* frames = reinterpret_cast<AVHWFramesContext*>(m_pCodecContext->hw_frames_ctx->data);
+-      if (!dvbridge_fel_device(m_dvFel.get(), frames->device_ref))
+-        return VC_ERROR;
++      if (!dvbridge_fel_device(m_dvFel.get(), frames->device_ref, result == VC_PICTURE))
++        ResyncDVEnhancement(dvbridge_fel_reason(m_dvFel.get()));
+     }
+-    if (result == VC_PICTURE)
+-      m_dvPending.push_back(std::move(base));
+     if (result == VC_EOF || (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN))
+-      if (!dvbridge_fel_drain(m_dvFel.get()))
+-        return VC_ERROR;
+-    paired = emit();
++      if (!m_dvSoftware && !dvbridge_fel_drain(m_dvFel.get()))
++        ResyncDVEnhancement(dvbridge_fel_reason(m_dvFel.get()));
++    // At the end of the base layer every waiting picture goes out, so VC_EOF only follows once
++    // none is left.
++    paired = emit(result == VC_EOF);
+     if (paired != VC_NONE)
+       return paired;
+-    if (result == VC_EOF && !m_dvPending.empty())
+-      return VC_ERROR;
+     return result == VC_PICTURE ? VC_BUFFER : result;
+   }
+   return GetBasePicture(pVideoPicture);
+@@ -1198,6 +1251,7 @@ void CDVDVideoCodecFFmpeg::Reset()
+   m_dvLayerEnded = false;
+   m_dvMissingRpu = 0;
+   m_dvPresentRpu = 0;
++  m_dvLateInRow = 0;
+ #endif
+   m_started = false;
+   m_startedInput = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index f3200f0..25413e9 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -70,6 +70,9 @@ protected:
+   bool m_dvOrdinary{false}; //!< RPU missing: ordinary output until the metadata is back
+   unsigned int m_dvMissingRpu{0}; //!< consecutive DV pictures without their RPU
+   unsigned int m_dvPresentRpu{0}; //!< consecutive DV pictures with their RPU, while ordinary
++  unsigned int m_dvLate{0}; //!< base pictures whose enhancement picture was late or missing
++  unsigned int m_dvLateInRow{0}; //!< the same, in a row
++  bool m_dvSoftware{false}; //!< the base layer is decoded in software: no enhancement layer
+   void ResyncDVEnhancement(const char* reason);
+   CDVDVideoCodec::VCReturn GetPairedPicture(VideoPicture* picture);
+   void CheckNativeDVPicture(VideoPicture* picture);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+index 5103cc1..22417f6 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+@@ -753,6 +753,21 @@ bool CDecoder::Open(AVCodecContext* avctx, AVCodecContext* mainctx, const enum A
+   // make ffmpeg require more buffers
+   m_vaapiConfig.maxReferences += 6;
+ 
++#ifdef HAVE_DVBRIDGE
++  // A dual-layer Dolby Vision stream keeps up to 6 base pictures (and their surfaces) while their
++  // enhancement pictures are decoded: 16 + 6 + 6 = 28 surfaces for HEVC, within the 32 that
++  // nvidia-vaapi-driver gives a decoder context. Each of them also holds a render picture, next
++  // to those in the renderer's queue: the pool gets as many more, so that waiting base pictures
++  // never drain that queue or stop the decoder (the output thread starts in ConfigVAAPI()).
++  if (const auto* dvStream =
++          dynamic_cast<CDVDVideoCodecFFmpeg*>(static_cast<ICallbackHWAccel*>(avctx->opaque));
++      dvStream && dvStream->NeedsDVEnhancement())
++  {
++    m_vaapiConfig.maxReferences += 6;
++    m_vaapiOutput.ReserveRenderPictures(NUM_RENDER_PICS + 6);
++  }
++#endif
++
+   if (!ConfigVAAPI())
+   {
+     return false;
+@@ -1424,6 +1439,10 @@ public:
+   CVaapiRenderPicture* ProcessSyncPicture();
+   void Init();
+   void DeleteTextures(bool precleanup);
++#ifdef HAVE_DVBRIDGE
++  //! Render pictures up to count (only before the output thread uses the pool).
++  void Grow(unsigned int count);
++#endif
+ 
+   std::deque<CVaapiProcessedPicture> processedPics;
+   std::deque<CVaapiProcessedPicture> processedPicsAway;
+@@ -1454,7 +1473,7 @@ CVaapiBufferPool::CVaapiBufferPool(CDecoder &decoder)
+ CVaapiBufferPool::~CVaapiBufferPool()
+ {
+   CVaapiRenderPicture *pic;
+-  for (unsigned int i = 0; i < NUM_RENDER_PICS; i++)
++  for (unsigned int i = 0; i < allRenderPics.size(); i++)
+   {
+     pic = allRenderPics[i];
+     delete pic;
+@@ -1462,6 +1481,17 @@ CVaapiBufferPool::~CVaapiBufferPool()
+   allRenderPics.clear();
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++void CVaapiBufferPool::Grow(unsigned int count)
++{
++  for (unsigned int i = static_cast<unsigned int>(allRenderPics.size()); i < count; i++)
++  {
++    allRenderPics.push_back(new CVaapiRenderPicture(static_cast<int>(i)));
++    freeRenderPics.push_back(static_cast<int>(i));
++  }
++}
++#endif
++
+ CVideoBuffer* CVaapiBufferPool::Get()
+ {
+   if (freeRenderPics.empty())
+@@ -1608,6 +1638,14 @@ void COutput::Start()
+   Create();
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++void COutput::ReserveRenderPictures(unsigned int count)
++{
++  if (!IsRunning())
++    m_bufferPool->Grow(count);
++}
++#endif
++
+ COutput::~COutput()
+ {
+   Dispose();
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
+index daf553e..cbd8194 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
+@@ -342,6 +342,11 @@ public:
+   ~COutput() override;
+   void Start();
+   void Dispose();
++#ifdef HAVE_DVBRIDGE
++  //! More render pictures, before Start(): a dual-layer Dolby Vision stream holds base pictures
++  //! while their enhancement pictures are decoded.
++  void ReserveRenderPictures(unsigned int count);
++#endif
+   COutputControlProtocol m_controlPort;
+   COutputDataProtocol m_dataPort;
+ protected:

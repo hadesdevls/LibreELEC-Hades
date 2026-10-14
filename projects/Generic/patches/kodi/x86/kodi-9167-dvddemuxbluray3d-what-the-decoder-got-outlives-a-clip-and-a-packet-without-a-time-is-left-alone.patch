@@ -1,0 +1,196 @@
+From 94d88016e33d940e934b16c7a563cca9fbdf0812 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 03:43:09 +0000
+Subject: [PATCH] DVDDemuxBluray3D: what the decoder got outlives a clip, and a
+ packet without a time is left alone
+
+- The state of the wait for an anchor picture (KODI::MULTIVIEW::Rejoin) is no longer started
+  anew when a clip of the second view is closed: only by a seek or a flush, which start the
+  decoder anew. Another clip, another angle, or the moment in which the other thread reads the
+  playlist again and no second view is known, no longer make the next access unit count as
+  the first of a clip.
+- A picture of the base view that passes while no clip of a second view is open counts as
+  one that went on alone: the decoder did not get its second view either.
+- A packet of the base view without a presentation time is handed on as it was before the
+  wait existed, and nothing is concluded from it (KODI::MULTIVIEW::IsPictureAlone()).
+- The line for a second view that came back without an anchor says how many access units were
+  at hand and were not anchors, which is what the wait is bounded by.
+- The line for a clip of the second view that gives nothing more no longer says whether it
+  ended or a read failed: the stream that reads the clip reports its end for any read that
+  returns nothing, so the two cannot be told apart.
+---
+ .../DVDDemuxers/DVDDemuxBluray3D.cpp          | 64 ++++++++++++-------
+ .../DVDDemuxers/DVDDemuxBluray3D.h            |  8 +--
+ 2 files changed, 44 insertions(+), 28 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+index a5898a8..26af0e0 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+@@ -272,11 +272,11 @@ void CDVDDemuxBluray3D::CloseDependentView()
+   m_pairedInClip = 0;
+   m_aloneInClip = 0;
+   m_loggedReads = false;
+-  m_rejoin = {};
+   m_placedWithoutPair = 0;
+   m_placingGivenUp = false;
+-  m_dependentEndedAtEnd = false;
+   m_loggedEnded = false;
++  // (Hades: m_rejoin stays. It is about what the decoder got, which another clip, another
++  // angle or a playlist that is read again do not change: see Read().)
+ 
+   if (m_pendingDependent)
+   {
+@@ -397,8 +397,6 @@ DemuxPacket* CDVDDemuxBluray3D::ReadDependent()
+     if (!packet)
+     {
+       m_dependentEnded = true;
+-      // Hades: (for the log) whether that is the end of the clip or a read that failed
+-      m_dependentEndedAtEnd = m_dependentInput && m_dependentInput->IsEOF();
+       return nullptr;
+     }
+ 
+@@ -440,9 +438,10 @@ DemuxPacket* CDVDDemuxBluray3D::MergeViews(DemuxPacket* base, DemuxPacket* depen
+ 
+ DemuxPacket* CDVDDemuxBluray3D::WentAlone(DemuxPacket* base)
+ {
+-  // Hades: once a picture has gone on with its second view, one that goes on alone leaves the
+-  // decoder without what the second view of the next ones is predicted from. Nothing is
+-  // appended from here on until an anchor picture (KODI::MULTIVIEW::Rejoin, in Append()).
++  // Hades: a picture that goes on alone leaves the decoder without what the second view of
++  // the next ones is predicted from. Nothing is appended from here on until an anchor picture
++  // (KODI::MULTIVIEW::Rejoin, in Append()), whether or not a picture went on with its second
++  // view before this one.
+   KODI::MULTIVIEW::WentAlone(m_rejoin);
+   ++m_aloneInClip;
+   return base;
+@@ -461,6 +460,8 @@ DemuxPacket* CDVDDemuxBluray3D::Append(DemuxPacket* base, DemuxPacket* dependent
+                     "the base view is no longer a stream that can be marked as two views");
+     CloseDependentView();
+     m_unopenableClip = clip;
++    // (this picture went on alone)
++    KODI::MULTIVIEW::WentAlone(m_rejoin);
+     return base;
+   }
+ 
+@@ -469,6 +470,7 @@ DemuxPacket* CDVDDemuxBluray3D::Append(DemuxPacket* base, DemuxPacket* dependent
+   const bool anchor{KODI::MULTIVIEW::IsAnchorOfSecondView(
+       dependent->pData, static_cast<size_t>(dependent->iSize))};
+   const unsigned int alone{m_rejoin.alone};
++  const unsigned int dropped{m_rejoin.dropped};
+   switch (KODI::MULTIVIEW::Offer(m_rejoin, anchor, static_cast<int64_t>(base->pts)))
+   {
+     case KODI::MULTIVIEW::Join::ALONE:
+@@ -484,10 +486,12 @@ DemuxPacket* CDVDDemuxBluray3D::Append(DemuxPacket* base, DemuxPacket* dependent
+       break;
+     case KODI::MULTIVIEW::Join::APPEND_UNANCHORED:
+       CLog::Log(LOGINFO,
+-                "CDVDDemuxBluray3D - clip {:05}: the second view is back at {} ms after {} "
+-                "pictures of the base view alone, without an anchor picture: none came in that "
+-                "time, so it is appended as it comes",
+-                m_dependentClip, static_cast<int64_t>(DVD_TIME_TO_MSEC(base->pts)), alone);
++                "CDVDDemuxBluray3D - clip {:05}: the second view is back at {} ms without an "
++                "anchor picture: {} access units of it were at hand since a picture went on "
++                "alone and none of them was an anchor, so it is appended as it comes ({} "
++                "pictures of the base view went on alone)",
++                m_dependentClip, static_cast<int64_t>(DVD_TIME_TO_MSEC(base->pts)), dropped,
++                alone);
+       break;
+     case KODI::MULTIVIEW::Join::APPEND:
+       break;
+@@ -536,13 +540,25 @@ DemuxPacket* CDVDDemuxBluray3D::Read()
+ 
+   CheckDependentView();
+ 
++  // Hades: a packet without a time is handed on as it is, as it always was, and nothing is
++  // concluded from it (KODI::MULTIVIEW::IsPictureAlone() says why: the second field of a
++  // picture, whose second view came with the first. Not verified: that takes a disc whose 3D
++  // video is coded in fields.)
++  if (!KODI::MULTIVIEW::IsPictureAlone(packet->pts != DVD_NOPTS_VALUE))
++    return packet;
++
++  // Hades: from here on, every way out without the second view is a picture that the decoder
++  // got alone (KODI::MULTIVIEW::Rejoin): one that passes while no clip of a second view is
++  // open (the play item names none, its clip does not open, or the playlist is being read
++  // again by the other thread), one of a clip that was given up, and one that the second view
++  // did not meet.
+   if (!m_dependent)
++  {
++    KODI::MULTIVIEW::WentAlone(m_rejoin);
+     return packet;
++  }
+ 
+-  // Hades: with a second view open, every way out without it is a picture that went on alone
+-  // (WentAlone()): one without a time, which cannot be paired; one of a clip that was given
+-  // up; and one that the second view did not meet.
+-  if (packet->pts == DVD_NOPTS_VALUE || m_placingGivenUp)
++  if (m_placingGivenUp)
+     return WentAlone(packet);
+ 
+   // Hades: (see ReadDependent())
+@@ -580,18 +596,17 @@ DemuxPacket* CDVDDemuxBluray3D::Read()
+     return Append(packet, dependent);
+   }
+ 
+-  // Hades: one line when the second view ends before the base view does
++  // Hades: one line when the clip of the second view gives nothing more before the base view
++  // does. (Its end and a read that failed cannot be told apart from here: the stream that
++  // reads the clip reports its end for any read that returns nothing.)
+   if (m_dependentEnded && !m_loggedEnded && !m_aborted)
+   {
+     m_loggedEnded = true;
+     CLog::Log(LOGINFO,
+-              "CDVDDemuxBluray3D - clip {:05}: {}; the pictures of the base view that still "
++              "CDVDDemuxBluray3D - clip {:05}: the clip of the second view gives nothing more "
++              "(it has ended, or a read of it failed); the pictures of the base view that still "
+               "come go on alone",
+-              m_dependentClip,
+-              m_dependentEndedAtEnd
+-                  ? "the second view has ended (the end of its clip was reached)"
+-                  : "the second view cannot be read any further (a read failed before the end "
+-                    "of its clip)");
++              m_dependentClip);
+   }
+ 
+   // The dependent view is ahead and the base view has yet to catch up, which never lasts
+@@ -689,8 +704,9 @@ void CDVDDemuxBluray3D::FlushDependent()
+   m_lastRealignPts = DVD_NOPTS_VALUE;
+   m_unopenableClip = -1;
+ 
+-  // Hades: after a seek or a flush the second view is appended as at the start of a clip
+-  // (KODI::MULTIVIEW::Rejoin), and a clip that was left alone gets another chance
++  // Hades: a seek or a flush starts the decoder anew, and with it what is remembered of what
++  // the decoder got (KODI::MULTIVIEW::Rejoin: this is the only place where it starts anew);
++  // and a clip that was left alone gets another chance
+   m_rejoin = {};
+   m_placedWithoutPair = 0;
+   m_placingGivenUp = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
+index 6c055f1..1f19f99 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
+@@ -205,7 +205,9 @@ private:
+   unsigned int m_readsLeft{0};
+   bool m_loggedReads{false};
+ 
+-  //! Hades: whether the second view is appended, or waits for an anchor picture
++  //! Hades: whether every picture of the base view has gone on with its second view since the
++  //! decoder was started or flushed, or the second view waits for an anchor picture. It is
++  //! about the decoder, and so outlives a clip: only a seek or a flush starts it anew.
+   KODI::MULTIVIEW::Rejoin m_rejoin;
+ 
+   //! Hades: times that the clip was placed again at the base view without the two meeting in
+@@ -213,9 +215,7 @@ private:
+   unsigned int m_placedWithoutPair{0};
+   bool m_placingGivenUp{false};
+ 
+-  //! Hades: whether the clip of the second view ended at its end (and not on a read that
+-  //! failed), and whether its ending was reported
+-  bool m_dependentEndedAtEnd{false};
++  //! Hades: whether it was reported that the clip of the second view gives nothing more
+   bool m_loggedEnded{false};
+ 
+   //! Hades: the play item that the second view was last asked for, the eye of its base view by
+-- 
+2.53.0
+

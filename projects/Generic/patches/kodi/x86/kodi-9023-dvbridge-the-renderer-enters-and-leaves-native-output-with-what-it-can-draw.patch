@@ -1,0 +1,359 @@
+From 9132178aa347353b8b45cdcb887ede5c4cb66ea0 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:49:48 +0000
+Subject: [PATCH] dvbridge: the renderer enters and leaves native output with
+ what it can draw
+
+The renderer decided native output once, from the picture it was
+configured with, and only left it when native output was disabled for
+the session. That gave two wrong outcomes:
+- A renderer configured for the ordinary output never entered native
+  output: the first picture came without its RPU (an unreadable RPU,
+  a cut file), or the output switched to a transport mode after the
+  renderer was configured (a refresh-rate switch after the first
+  picture, a GUI resolution change). The whole playback stayed on the
+  ordinary output.
+- Conditions that only make native output impossible for the moment
+  went through the frame-failure counter, which after two seconds
+  disabled native output until Kodi restarted: a mode that cannot carry
+  the transport (leaving fullscreen with "adjust refresh rate: always"
+  and a 1080p GUI), zoom or stretch, a picture pillarboxed at an odd
+  column (x = 127 for a 3586-pixel wide picture), and pictures in system
+  memory (the base renderer claimed native output but cannot draw it).
+
+Native output now follows what the pictures ask for and what the
+renderer can draw now, checked for every picture in ConfigChanged():
+- It starts with a picture that asks for it and that the renderer can
+  draw: a VAAPI surface in NV12/P010/P012/P016, no rotation, and a
+  geometry that shows the whole picture at its own aspect ratio inside
+  the 3840x2160 raster.
+- It ends, without disabling it for the session, when the verdict
+  (mode, display, disabled) or the geometry no longer allows it, and
+  starts again when they do. A picture without metadata still does not
+  end it (it is only not drawn).
+- Both change only with the mode, the view settings or a failure (which
+  disables native output for the session), so the renderer cannot
+  alternate from picture to picture. The geometry is computed on the
+  render thread after each ManageRenderArea() and published atomically
+  to the player thread, which never reads a rectangle being updated.
+- The horizontal position and width of the picture are moved inwards to
+  even columns (at most one pixel each side), as the 4:2:2 transport
+  needs, instead of refusing every frame; full-screen and letterboxed
+  geometry is unchanged.
+- The 8-bit transport format is chosen only when the renderer draws the
+  picture natively; otherwise the output keeps its ordinary depth.
+---
+ .../HwDecRender/RendererVAAPIGLES.cpp         | 87 +++++++++++++++----
+ .../HwDecRender/RendererVAAPIGLES.h           | 11 +++
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 56 +++++++++---
+ .../VideoRenderers/LinuxRendererGLES.h        |  7 ++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  6 +-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  4 +
+ 6 files changed, 142 insertions(+), 29 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index bdb5123..8992ae1 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -19,6 +19,7 @@
+ #ifdef HAVE_DVBRIDGE
+ #include "ServiceBroker.h"
+ #include "windowing/gbm/WinSystemGbmGLESContext.h"
++#include <algorithm>
+ #include <chrono>
+ #include <cmath>
+ #endif
+@@ -123,14 +124,8 @@ bool CRendererVAAPIGLES::Configure(const VideoPicture& picture, float fps, unsig
+ bool CRendererVAAPIGLES::ConfigChanged(const VideoPicture& picture)
+ {
+ #ifdef HAVE_DVBRIDGE
+-  // Native Dolby Vision was disabled during playback: reconfigure for the ordinary output.
+-  // A single picture without Dolby Vision metadata is only not drawn; the decoder moves a
+-  // stream whose metadata stays missing to the ordinary output by changing its hdrType.
+-  if (m_dvRequested)
+-    if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+-            CServiceBroker::GetWinSystem());
+-        window && window->NativeDVOutputDisabled())
+-      return true;
++  if (DVBridgeConfigChanged(picture))
++    return true;
+ #endif
+   CVaapiRenderPicture *pic = dynamic_cast<CVaapiRenderPicture*>(picture.videoBuffer);
+   if ((pic->procPic.videoSurface != VA_INVALID_ID && !m_isVAAPIBuffer) ||
+@@ -204,6 +199,72 @@ bool CRendererVAAPIGLES::DVFrameRejected(const char* stage)
+   return false;
+ }
+ 
++bool CRendererVAAPIGLES::DVGeometry(dvbridge_geometry& geometry) const
++{
++  // Native output draws the whole picture, at its own aspect ratio, inside the 3840x2160
++  // raster. Zoom (a cropped source), stretching or a shift out of the raster keep the ordinary
++  // output.
++  if (m_sourceWidth == 0 || m_sourceHeight == 0 || m_sourceWidth > 3840 || m_sourceHeight > 2160 ||
++      m_sourceRect.x1 != 0 || m_sourceRect.y1 != 0 ||
++      m_sourceRect.Width() != m_sourceWidth || m_sourceRect.Height() != m_sourceHeight)
++    return false;
++  if (m_destRect.x1 < -0.5f || m_destRect.y1 < -0.5f || m_destRect.x2 > 3840.5f ||
++      m_destRect.y2 > 2160.5f)
++    return false;
++  const double aspect = static_cast<double>(m_sourceHeight) / m_sourceWidth;
++  if (std::abs(static_cast<double>(m_destRect.Width()) * aspect -
++               static_cast<double>(m_destRect.Height())) > 1.5)
++    return false;
++  // The 4:2:2 transport needs an even horizontal position and width (for example a 3586-pixel
++  // wide picture pillarboxed at x = 127): move each side inwards to an even column, at most one
++  // pixel, and take the height from that width, centred where Kodi placed the picture.
++  const int left = std::clamp(2 * static_cast<int>(std::ceil(m_destRect.x1 / 2.0f - 0.01f)), 0, 3840);
++  const int right =
++      std::clamp(2 * static_cast<int>(std::floor(m_destRect.x2 / 2.0f + 0.01f)), 0, 3840);
++  const int width = right - left;
++  if (width <= 0)
++    return false;
++  const int height = std::min(2160, static_cast<int>(std::lround(width * aspect)));
++  if (height <= 0)
++    return false;
++  const int top = std::clamp(
++      static_cast<int>(std::lround(static_cast<double>(m_destRect.y1 + m_destRect.y2) / 2.0 -
++                                   height / 2.0)),
++      0, 2160 - height);
++  geometry = {static_cast<int>(m_sourceWidth), static_cast<int>(m_sourceHeight), left, top, width,
++              height};
++  return true;
++}
++
++bool CRendererVAAPIGLES::CanRenderDVBridge(const VideoPicture& picture) const
++{
++  // Native decoder textures only. Postprocessed or rotated images need their own explicit
++  // metadata/geometry mapping.
++  const auto* pic = dynamic_cast<const CVaapiRenderPicture*>(picture.videoBuffer);
++  if (!pic || pic->procPic.videoSurface == VA_INVALID_ID || m_textureTarget != GL_TEXTURE_2D ||
++      m_renderOrientation != 0)
++    return false;
++  switch (pic->procPic.fourcc)
++  {
++    case VA_FOURCC_NV12:
++    case VA_FOURCC_P010:
++    case VA_FOURCC_P012:
++    case VA_FOURCC_P016:
++      break;
++    default:
++      return false;
++  }
++  // Called on the player thread: the geometry itself is computed by the render thread.
++  return m_dvGeometryUsable;
++}
++
++void CRendererVAAPIGLES::ManageRenderArea()
++{
++  CLinuxRendererGLES::ManageRenderArea();
++  dvbridge_geometry geometry{};
++  m_dvGeometryUsable = DVGeometry(geometry);
++}
++
+ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
+ {
+   // Native decoder textures only. Postprocessed/cropped/rotated images need
+@@ -233,13 +294,9 @@ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
+     layer.planes[p] = {plane.id, static_cast<int>(plane.texwidth),
+                       static_cast<int>(plane.texheight)};
+   }
+-  if (m_sourceRect.x1 != 0 || m_sourceRect.y1 != 0 ||
+-      m_sourceRect.Width() != m_sourceWidth || m_sourceRect.Height() != m_sourceHeight)
+-    return DVFrameRejected("cropped-source");
+-  dvbridge_geometry geometry{layer.width, layer.height,
+-      static_cast<int>(std::lround(m_destRect.x1)), static_cast<int>(std::lround(m_destRect.y1)),
+-      static_cast<int>(std::lround(m_destRect.Width())),
+-      static_cast<int>(std::lround(m_destRect.Height()))};
++  dvbridge_geometry geometry{};
++  if (!DVGeometry(geometry))
++    return DVFrameRejected("geometry");
+   const bool prepared =
+       window->RenderDVBridge(layer, buffer.doviEnhancement.get(), buffer.doviMetadata, geometry);
+   if (prepared && m_dvRejected.Count())
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+index 5d1091a..dc7c171 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+@@ -33,6 +33,10 @@ namespace VAAPI
+ class IVaapiWinSystem;
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++struct dvbridge_geometry;
++#endif
++
+ class CRendererVAAPIGLES : public CLinuxRendererGLES
+ {
+ public:
+@@ -54,6 +58,13 @@ protected:
+   bool RenderHook(int idx) override;
+ #ifdef HAVE_DVBRIDGE
+   bool RenderDVBridge(int idx) override;
++  bool CanRenderDVBridge(const VideoPicture& picture) const override;
++  //! Where the picture goes in the 3840x2160 transport raster; false when it cannot be drawn
++  //! natively (zoom, stretch, a shift out of the raster). Render thread.
++  bool DVGeometry(dvbridge_geometry& geometry) const;
++  //! Also publishes whether the geometry allows native output, for the player thread.
++  void ManageRenderArea() override;
++  std::atomic<bool> m_dvGeometryUsable{false};
+ #endif
+   void AfterRenderHook(int idx) override;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 0cc2b0a..9a981e3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -210,16 +210,23 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   // frame is loaded after every call to Configure().
+   m_bValidated = false;
+ 
++#ifdef HAVE_DVBRIDGE
++  // Decided before the output transition: SetVideoOutput() chooses the 8-bit transport format
++  // only for a picture that this renderer draws natively.
++  auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++      CServiceBroker::GetWinSystem());
++  if (dvWindow)
++    dvWindow->SetDVBridgeRendererNative(WantsDVBridge(picture));
++#endif
++
+   if (!CServiceBroker::GetWinSystem()->SetVideoOutput(&picture))
+   {
+     CLog::Log(LOGWARNING, "LinuxRendererGLES::Configure: SetVideoOutput failed");
+ #ifdef HAVE_DVBRIDGE
+     // Fail closed: keep the video on the ordinary output rather than unconfigured.
+-    auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+-        CServiceBroker::GetWinSystem());
+-    if (window && KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture))
++    if (dvWindow && WantsDVBridge(picture))
+     {
+-      window->DisableNativeDVOutput("the Dolby Vision output mode could not be set");
++      dvWindow->DisableNativeDVOutput("the Dolby Vision output mode could not be set");
+       if (!CServiceBroker::GetWinSystem()->SetVideoOutput(&picture))
+         CLog::Log(LOGWARNING, "LinuxRendererGLES::Configure: SetVideoOutput failed");
+     }
+@@ -229,7 +236,7 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   CServiceBroker::GetWinSystem()->SetColorimetry(&picture);
+ 
+ #ifdef HAVE_DVBRIDGE
+-  m_dvRequested = KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture);
++  m_dvRequested = WantsDVBridge(picture);
+   if (m_dvRequested)
+   {
+     auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+@@ -267,14 +274,8 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+ bool CLinuxRendererGLES::ConfigChanged(const VideoPicture &picture)
+ {
+ #ifdef HAVE_DVBRIDGE
+-  // Native Dolby Vision was disabled during playback: reconfigure for the ordinary output.
+-  // A single picture without Dolby Vision metadata is only not drawn; the decoder moves a
+-  // stream whose metadata stays missing to the ordinary output by changing its hdrType.
+-  if (m_dvRequested)
+-    if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+-            CServiceBroker::GetWinSystem());
+-        window && window->NativeDVOutputDisabled())
+-      return true;
++  if (DVBridgeConfigChanged(picture))
++    return true;
+ #endif
+   if (picture.videoBuffer->GetFormat() != m_format)
+   {
+@@ -284,6 +285,32 @@ bool CLinuxRendererGLES::ConfigChanged(const VideoPicture &picture)
+   return false;
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++bool CLinuxRendererGLES::WantsDVBridge(const VideoPicture& picture) const
++{
++  return KODI::WINDOWING::GBM::CWinSystemGbmGLESContext::DVBridgeRequested(&picture) &&
++         CanRenderDVBridge(picture);
++}
++
++bool CLinuxRendererGLES::DVBridgeConfigChanged(const VideoPicture& picture) const
++{
++  // Native output follows what the pictures ask for and what this renderer can draw now. It
++  // starts with a picture that asks for it: the first pictures may come without their RPU, or
++  // the output may switch to a transport mode after the renderer was configured. It ends when
++  // the output mode, the geometry (zoom, stretch, shift) or a session-wide disable no longer
++  // allows it; that is not a failure, and native output starts again when they allow it. A
++  // picture without Dolby Vision metadata is only not drawn and does not end it: the decoder
++  // moves a stream whose metadata stays missing to the ordinary output by changing its hdrType.
++  // The conditions change only with the mode, the view settings or a failure (which disables
++  // native output for the session), so this cannot alternate from picture to picture.
++  if (!m_dvRequested)
++    return WantsDVBridge(picture);
++  const auto* window =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  return !window || !window->SupportsNativeDVOutput() || !CanRenderDVBridge(picture);
++}
++#endif
++
+ int CLinuxRendererGLES::NextYUVTexture()
+ {
+   return (m_iYUVRenderBuffer + 1) % m_NumYUVBuffers;
+@@ -1137,6 +1164,9 @@ void CLinuxRendererGLES::UnInit()
+     }
+     m_dvRequested = false;
+   }
++  if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++          CServiceBroker::GetWinSystem()))
++    window->SetDVBridgeRendererNative(false);
+ #endif
+ 
+   // YUV textures
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 9c593b5..fa1a1fd 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -136,6 +136,13 @@ protected:
+ #ifdef HAVE_DVBRIDGE
+   // Failure is terminal for this frame: never silently use the ordinary shader.
+   virtual bool RenderDVBridge(int idx) { return false; }
++  //! Whether this renderer can draw the picture natively now: its surface, orientation and
++  //! geometry. The base renderer (pictures in system memory) cannot.
++  virtual bool CanRenderDVBridge(const VideoPicture& picture) const { return false; }
++  //! The picture asks for native output and this renderer can draw it natively.
++  bool WantsDVBridge(const VideoPicture& picture) const;
++  //! Native output starts or ends with this picture: the renderer is configured again.
++  bool DVBridgeConfigChanged(const VideoPicture& picture) const;
+   std::atomic<bool> m_dvRequested{false};
+ #endif
+   virtual void AfterRenderHook(int idx) {}
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 1af7ce5..6f541bc 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -629,7 +629,11 @@ bool CWinSystemGbmGLESContext::DVBridgeRequested(const VideoPicture* picture)
+ 
+ int CWinSystemGbmGLESContext::VideoOutputBitDepth(const VideoPicture* picture) const
+ {
+-  return DVBridgeRequested(picture) ? 8 : CWinSystemGbmEGLContext::VideoOutputBitDepth(picture);
++  // A picture that the renderer does not draw natively (system-memory frames, zoom, a mode that
++  // cannot carry the transport) keeps the ordinary output depth.
++  return m_dvRendererNative && DVBridgeRequested(picture)
++             ? 8
++             : CWinSystemGbmEGLContext::VideoOutputBitDepth(picture);
+ }
+ 
+ bool CWinSystemGbmGLESContext::DVBridgeBeginRejected(const char* stage)
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 71235e4..f25518d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -60,6 +60,9 @@ public:
+   bool IsHdrComposite() const override { return m_guiCompositing; }
+ #ifdef HAVE_DVBRIDGE
+   static bool DVBridgeRequested(const VideoPicture* picture);
++  //! Whether the configured video renderer draws its pictures natively; set before its output
++  //! transition. Only then does the output use the 8-bit transport format.
++  void SetDVBridgeRendererNative(bool native) { m_dvRendererNative = native; }
+   bool BeginDVBridge();
+   void SetDVBridgeOverlays(bool visible) { m_dvOverlays = visible; }
+   bool DVBridgeCaptured() const { return m_dvState.Captured(); }
+@@ -113,6 +116,7 @@ private:
+ #ifdef HAVE_DVBRIDGE
+   std::unique_ptr<CDVBridgeGLES> m_dvBridge;
+   CDVBridgeState m_dvState;
++  std::atomic<bool> m_dvRendererNative{false};
+   bool m_dvFrame = false;
+   double m_dvFramePts = DVD_NOPTS_VALUE; //!< picture prepared by RenderDVBridge()
+   bool m_dvOverlays = true;

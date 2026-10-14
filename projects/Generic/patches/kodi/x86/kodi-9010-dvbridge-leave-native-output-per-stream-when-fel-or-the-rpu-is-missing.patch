@@ -1,0 +1,432 @@
+From 28d941c4373b3db95f0c75d0e9e418dee37e1d4d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 02:45:01 +0000
+Subject: [PATCH] dvbridge: leave native output per stream when FEL or the RPU
+ is missing
+
+Follow-up to the picture-order pairing taken from the Intel fork.
+
+Once the enhancement layer failed (unparsable picture order, a full
+queue, a decoder error, a missing enhancement picture or no common
+random-access point), GetPicture() returned VC_ERROR on every call.
+VideoPlayer does not reset the decoder on VC_ERROR, so the base layer
+was never read again and the picture froze until the next seek. Give
+the enhancement layer up for the stream instead, log why, and let the
+base layer continue; a base picture is still never paired with a
+neighbouring enhancement surface.
+
+dvbridge refuses a picture whose NLQ is active (libplacebo nlq_active)
+without its enhancement layer, and pictures it cannot draw end, after 24
+of them, in DisableNativeDVOutput(), which turns native output off until
+Kodi restarts. Decide per stream in the decoder instead:
+- a MEL picture (trivial NLQ, empty residual) is exact without the
+  enhancement layer and stays in Dolby Vision;
+- the first picture that needs a missing enhancement layer, or 12
+  consecutive pictures without Dolby Vision metadata (RPU), send the
+  stream to the ordinary output until it is reopened: its pictures lose
+  the Dolby Vision metadata and get the hdrType of the base layer (HDR10,
+  HLG or none, from the transfer function), which makes RenderManager
+  reconfigure the renderer for the ordinary output. Native output stays
+  available for the next playback, and stop and resume tries again.
+
+The preroll after a reset is bounded by 120 enhancement packets (about
+5 s at 24 fps) instead of 1024 (about 42 s of discarded pictures); the
+enhancement layer of Blu-ray profile 7 streams shares the GOP structure
+of the base layer, whose random-access points are about one second
+apart. The log also says how many base pictures a resynchronisation
+discarded and whether the two layers are coded in a different picture
+order.
+---
+ tools/dvbridge/dvbridge_fel.c                 |  58 ++++++-
+ tools/dvbridge/dvbridge_fel.h                 |   7 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 144 +++++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   7 +
+ 4 files changed, 209 insertions(+), 7 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index 134ef19..c5c0e58 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -10,6 +10,9 @@
+ #define QUEUE_MAX 32
+ #define PACKET_BYTES_MAX (64u * 1024u * 1024u)
+ #define MAP_MAX (QUEUE_MAX * 2)
++/* Hades: enhancement packets discarded while waiting for a common random-access point after a
++ * reset (about 5 s at 24 fps); beyond it the enhancement layer is given up for the stream. */
++#define PREROLL_PACKETS_MAX 120
+ 
+ /* Independently coded layers can have different decode
+  * order and IDR boundaries. Use FFmpeg's HEVC parser rather than assigning
+@@ -60,6 +63,9 @@ struct dvbridge_fel {
+     bool synchronizing;
+     int64_t anchor_pts;
+     unsigned preroll_packets;
++    const char *reason; /* why the enhancement layer failed, for the log */
++    unsigned order_mismatches; /* EL pictures whose order differs from the carrying BL picture */
++    int64_t first_mismatch_pts;
+ };
+ 
+ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+@@ -93,6 +99,7 @@ static void clear_queues(struct dvbridge_fel *f)
+     f->packet_bytes = 0;
+     f->failed = f->draining = f->sent_eof = f->eof = false;
+     f->num_times = 0;
++    f->reason = NULL;
+ }
+ 
+ void dvbridge_fel_reset(struct dvbridge_fel *f)
+@@ -221,8 +228,10 @@ static bool pump(struct dvbridge_fel *f)
+         while (match < f->num_times && f->times[match].order != f->packet_order[0])
+             ++match;
+         if (match == f->num_times) {
+-            if (f->draining)
++            if (f->draining) {
++                f->reason = "an enhancement picture has no base picture at the end of the stream";
+                 goto fail;
++            }
+             break; /* A reference EL picture can precede its corresponding BL. */
+         }
+         packet->pts = f->times[match].pts;
+@@ -255,6 +264,8 @@ static bool pump(struct dvbridge_fel *f)
+     }
+     return true;
+ fail:
++    if (!f->reason)
++        f->reason = "enhancement decoder error";
+     f->failed = true;
+     return false;
+ }
+@@ -267,6 +278,7 @@ bool dvbridge_fel_device(struct dvbridge_fel *f, AVBufferRef *device)
+         return f->decoder->hw_device_ctx->data == device->data && pump(f);
+     f->decoder->hw_device_ctx = av_buffer_ref(device);
+     if (!f->decoder->hw_device_ctx || avcodec_open2(f->decoder, f->decoder->codec, NULL) < 0) {
++        f->reason = "the enhancement decoder could not be opened";
+         f->failed = true;
+         return false;
+     }
+@@ -281,11 +293,19 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+         packet->pts == AV_NOPTS_VALUE)
+         return false;
+     int64_t base_identity;
+-    if (f->num_times == MAP_MAX || !picture_identity(&f->base_order, packet, &base_identity))
++    if (f->num_times == MAP_MAX) {
++        f->reason = "too many base pictures wait for their enhancement pictures";
++        goto fail;
++    }
++    if (!picture_identity(&f->base_order, packet, &base_identity)) {
++        f->reason = "the base-layer picture order could not be parsed";
+         goto fail;
++    }
+     for (unsigned i = 0; i < f->num_times; ++i)
+-        if (f->times[i].order == base_identity)
++        if (f->times[i].order == base_identity) {
++            f->reason = "two base pictures have the same picture order";
+             goto fail;
++        }
+     f->times[f->num_times].order = base_identity;
+     f->times[f->num_times++].pts = packet->pts;
+     AVPacket *copy = av_packet_clone(packet);
+@@ -310,6 +330,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             (size_t)copy->size > PACKET_BYTES_MAX - f->packet_bytes ||
+             !picture_identity(&f->enhancement_order, copy, &f->packet_order[f->num_packets])) {
+             av_packet_free(&copy);
++            f->reason = "the enhancement queue is full or its picture order could not be parsed";
+             goto fail;
+         }
+         if (f->synchronizing) {
+@@ -324,8 +345,10 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             if (!common_key && !el_idr) {
+                 av_packet_free(&copy);
+                 f->num_times = 0;
+-                if (++f->preroll_packets > 1024)
++                if (++f->preroll_packets > PREROLL_PACKETS_MAX) {
++                    f->reason = "no common random-access point within the preroll bound";
+                     goto fail;
++                }
+                 continue;
+             }
+             f->enhancement_order.offset = base_identity - ep->output_picture_number;
+@@ -334,10 +357,17 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             f->anchor_pts = packet->pts;
+             f->synchronizing = false;
+         }
++        else if (f->packet_order[f->num_packets] != base_identity) {
++            /* evidence for the log: the layers are not coded in the same picture order */
++            if (!f->order_mismatches++)
++                f->first_mismatch_pts = packet->pts;
++        }
+         f->packet_bytes += copy->size;
+         f->packets[f->num_packets++] = copy;
+     }
+ fail:
++    if (!f->reason)
++        f->reason = "the enhancement layer could not be split";
+     f->failed = true;
+     return false;
+ }
+@@ -347,6 +377,7 @@ bool dvbridge_fel_drain(struct dvbridge_fel *f)
+     if (!f)
+         return false;
+     if (f->synchronizing) {
++        f->reason = "the stream ended before a common random-access point";
+         f->failed = true;
+         return false; /* EOF cannot supply the missing random-access picture. */
+     }
+@@ -389,3 +420,22 @@ bool dvbridge_fel_exhausted(const struct dvbridge_fel *f)
+ {
+     return f && !f->failed && f->eof && !f->num_frames && !f->num_packets;
+ }
++
++const char *dvbridge_fel_reason(const struct dvbridge_fel *f)
++{
++    return f && f->reason ? f->reason : "unknown";
++}
++
++unsigned dvbridge_fel_preroll_packets(const struct dvbridge_fel *f)
++{
++    return f ? f->preroll_packets : 0;
++}
++
++unsigned dvbridge_fel_order_mismatches(const struct dvbridge_fel *f, int64_t *first_pts)
++{
++    if (!f)
++        return 0;
++    if (first_pts)
++        *first_pts = f->first_mismatch_pts;
++    return f->order_mismatches;
++}
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 1ff8693..1d73857 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -17,4 +17,11 @@ int dvbridge_fel_take(struct dvbridge_fel *fel, int64_t pts, AVFrame **frame);
+ bool dvbridge_fel_failed(const struct dvbridge_fel *fel);
+ /* Decoder reached EOF and no enhancement surface remains to pair. */
+ bool dvbridge_fel_exhausted(const struct dvbridge_fel *fel);
++/* Why the enhancement layer failed (static string), for the log. */
++const char *dvbridge_fel_reason(const struct dvbridge_fel *fel);
++/* Enhancement packets discarded while waiting for a random-access point since the last reset. */
++unsigned dvbridge_fel_preroll_packets(const struct dvbridge_fel *fel);
++/* Enhancement pictures whose picture order differed from the base picture carrying them, and
++ * the time of the first one (stream time base of the codec). */
++unsigned dvbridge_fel_order_mismatches(const struct dvbridge_fel *fel, int64_t *first_pts);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 95dfd95..6e3a9b9 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -517,6 +517,10 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvPending.clear();
+   m_dvFel.reset();
+   m_dvFailed = false;
++  m_dvPrerollDropped = 0;
++  m_dvOrderLogged = false;
++  m_dvOrdinary = false;
++  m_dvMissingRpu = 0;
+   m_dvNativeOutput = false;
+ #endif
+   av_frame_free(&m_pFrame);
+@@ -702,13 +706,124 @@ bool CDVDVideoCodecFFmpeg::AddData(const DemuxPacket &packet)
+   return true;
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++namespace
++{
++// Consecutive Dolby Vision pictures without their RPU after which the stream leaves native output
++// (a single one is not drawn; many would end in DisableNativeDVOutput() for the whole session).
++constexpr unsigned int DV_MISSING_RPU_MAX = 12;
++
++// Whether dvbridge needs the enhancement layer for this picture: the same test as nlq_active in
++// libplacebo's pl_map_avdovi_metadata(). dvbridge refuses such a picture without its layer; a
++// MEL picture (trivial NLQ, empty residual) is exact without it.
++bool DVNeedsEnhancementLayer(const VideoPicture& picture)
++{
++  const size_t size = picture.doviMetadata.Size();
++  if (size < sizeof(AVDOVIMetadata))
++    return false;
++  const auto* dovi = reinterpret_cast<const AVDOVIMetadata*>(picture.doviMetadata.Data());
++  if (dovi->header_offset + sizeof(AVDOVIRpuDataHeader) > size ||
++      dovi->mapping_offset + sizeof(AVDOVIDataMapping) > size)
++    return false;
++  const AVDOVIRpuDataHeader* header = av_dovi_get_header(dovi);
++  const AVDOVIDataMapping* mapping = av_dovi_get_mapping(dovi);
++  if (header->disable_residual_flag || mapping->nlq_method_idc != AV_DOVI_NLQ_LINEAR_DZ)
++    return false;
++  for (const AVDOVINLQParams& nlq : mapping->nlq)
++    if (nlq.nlq_offset != 0 || nlq.vdr_in_max != (1ULL << header->coef_log2_denom) ||
++        nlq.linear_deadzone_slope != 0 || nlq.linear_deadzone_threshold != 0)
++      return true;
++  return false;
++}
++} // namespace
++
++void CDVDVideoCodecFFmpeg::AbandonDVEnhancement(const char* reason)
++{
++  // Never pair a base picture with a wrong enhancement surface and never stop the video: the
++  // base layer continues. CheckNativeDVPicture() sends the stream to the ordinary output at its
++  // first picture that needs the enhancement layer (FEL); MEL pictures stay in Dolby Vision.
++  CLog::Log(LOGWARNING,
++            "DV FEL: giving up the enhancement layer for this stream ({}); the base layer "
++            "continues, {} queued pictures",
++            reason, m_dvPending.size());
++  m_dvFel.reset();
++  m_dvFailed = false;
++  m_dvPrerollDropped = 0;
++}
++
++void CDVDVideoCodecFFmpeg::CheckNativeDVPicture(VideoPicture* picture)
++{
++  if (picture->hdrType != StreamHdrType::HDR_TYPE_DOLBYVISION)
++    return;
++  // A FEL picture without its enhancement layer can never be shown natively, even when native
++  // output was not selected when the stream opened (the display mode can change afterwards);
++  // missing metadata only matters to native output.
++  const char* reason = nullptr;
++  if (m_dvOrdinary)
++    ;
++  else if (!picture->doviMetadata.Data())
++  {
++    if (m_dvNativeOutput && ++m_dvMissingRpu == DV_MISSING_RPU_MAX)
++      reason = "12 consecutive pictures came without Dolby Vision metadata (RPU)";
++  }
++  else
++  {
++    m_dvMissingRpu = 0;
++    if (!picture->doviEnhancement && DVNeedsEnhancementLayer(*picture))
++      reason = "a full enhancement layer (FEL) picture has no enhancement layer";
++  }
++  if (reason)
++  {
++    // Only this stream: native output stays available for the next playback.
++    CLog::Log(m_dvNativeOutput ? LOGWARNING : LOGINFO,
++              "DV: this stream continues on the ordinary output until playback restarts: {}",
++              reason);
++    m_dvOrdinary = true;
++  }
++  if (!m_dvOrdinary)
++    return;
++  // The Dolby Vision metadata goes, and the changed hdrType makes RenderManager reconfigure the
++  // renderer, which then selects the ordinary output of the base layer.
++  picture->doviMetadata.Reset();
++  picture->doviEnhancement.reset();
++  if (picture->color_transfer == AVCOL_TRC_SMPTE2084)
++    picture->hdrType = StreamHdrType::HDR_TYPE_HDR10;
++  else if (picture->color_transfer == AVCOL_TRC_ARIB_STD_B67)
++    picture->hdrType = StreamHdrType::HDR_TYPE_HLG;
++  else
++    picture->hdrType = StreamHdrType::HDR_TYPE_NONE;
++}
++#endif
++
+ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPicture)
+ {
+ #ifdef HAVE_DVBRIDGE
++  VCReturn result = GetPairedPicture(pVideoPicture);
++  if (result == VC_PICTURE)
++    CheckNativeDVPicture(pVideoPicture);
++  return result;
++#else
++  return GetBasePicture(pVideoPicture);
++#endif
++}
++
++#ifdef HAVE_DVBRIDGE
++CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pVideoPicture)
++{
++  // Base pictures queued before the enhancement layer was given up go out without it.
++  if (!m_dvFel && !m_dvPending.empty())
++  {
++    pVideoPicture->CopyRef(*m_dvPending.front());
++    m_dvPending.pop_front();
++    return VC_PICTURE;
++  }
+   if (m_dvFel)
+   {
+     if (m_dvFailed || dvbridge_fel_failed(m_dvFel.get()))
+-      return VC_ERROR;
++    {
++      AbandonDVEnhancement(dvbridge_fel_reason(m_dvFel.get()));
++      return GetPairedPicture(pVideoPicture);
++    }
+     auto emit = [&]() -> VCReturn
+     {
+       if (m_dvPending.empty())
+@@ -721,6 +836,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+                                      &enhancement);
+       if (result == 2)
+       {
++        ++m_dvPrerollDropped;
+         m_dvPending.pop_front();
+         return VC_BUFFER;
+       }
+@@ -734,10 +850,31 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+           m_dvPending.clear();
+           return VC_EOF;
+         }
+-        return VC_ERROR;
++        // A missing pair would otherwise return VC_ERROR on every call: give the layer up.
++        AbandonDVEnhancement(dvbridge_fel_failed(m_dvFel.get())
++                                 ? dvbridge_fel_reason(m_dvFel.get())
++                                 : "an enhancement picture is missing");
++        return GetPairedPicture(pVideoPicture);
+       }
+       if (!result)
+         return VC_NONE;
++      if (m_dvPrerollDropped)
++      {
++        CLog::Log(LOGINFO,
++                  "DV FEL: paired with the enhancement layer after discarding {} base pictures "
++                  "before a common random-access point ({} enhancement packets)",
++                  m_dvPrerollDropped, dvbridge_fel_preroll_packets(m_dvFel.get()));
++        m_dvPrerollDropped = 0;
++      }
++      int64_t firstMismatch = 0;
++      if (!m_dvOrderLogged && dvbridge_fel_order_mismatches(m_dvFel.get(), &firstMismatch))
++      {
++        m_dvOrderLogged = true;
++        CLog::Log(LOGINFO,
++                  "DV FEL: the base and enhancement layers are coded in different picture order "
++                  "(first at {:.3f} s); frames are paired by picture order count",
++                  static_cast<double>(firstMismatch) / AV_TIME_BASE);
++      }
+       base->doviEnhancement = {enhancement, [](AVFrame* f) { av_frame_free(&f); }};
+       pVideoPicture->CopyRef(*base);
+       m_dvPending.pop_front();
+@@ -769,9 +906,9 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+       return VC_ERROR;
+     return result == VC_PICTURE ? VC_BUFFER : result;
+   }
+-#endif
+   return GetBasePicture(pVideoPicture);
+ }
++#endif
+ 
+ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetBasePicture(VideoPicture* pVideoPicture)
+ {
+@@ -1076,6 +1213,7 @@ void CDVDVideoCodecFFmpeg::Reset()
+   m_dvPending.clear();
+   dvbridge_fel_reset(m_dvFel.get());
+   m_dvFailed = false;
++  m_dvMissingRpu = 0;
+ #endif
+   m_started = false;
+   m_startedInput = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 3c6375c..c965b90 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -63,6 +63,13 @@ protected:
+   std::shared_ptr<dvbridge_fel> m_dvFel;
+   std::deque<std::shared_ptr<VideoPicture>> m_dvPending;
+   bool m_dvFailed{false};
++  unsigned int m_dvPrerollDropped{0}; //!< base pictures dropped before a FEL random-access point
++  bool m_dvOrderLogged{false};
++  bool m_dvOrdinary{false}; //!< this stream left native DV output: ordinary output until reopened
++  unsigned int m_dvMissingRpu{0}; //!< consecutive DV pictures without their RPU
++  void AbandonDVEnhancement(const char* reason);
++  CDVDVideoCodec::VCReturn GetPairedPicture(VideoPicture* picture);
++  void CheckNativeDVPicture(VideoPicture* picture);
+   bool m_dvNativeOutput{false};
+ #endif
+   void Dispose();

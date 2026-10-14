@@ -1,0 +1,216 @@
+From 324ceb050c2a7ffa2a04aa4a38bd68870521c1e6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 23:02:43 +0000
+Subject: [PATCH] dvbridge: accept the P010 chroma layout of
+ nvidia-vaapi-driver for FEL
+
+Profile 7 FEL failed on NVIDIA at "enhancement-dmabuf-import": the
+enhancement layer, decoded by a second VAAPI decoder, was refused before
+any import because dvbridge_dmabuf_validate_p010 only accepted the
+interleaved CbCr plane as DRM_FORMAT_GR1616, which is what Intel's driver
+exports. nvidia-vaapi-driver 0.0.18 exports it as DRM_FORMAT_RG1616
+(vabackend.c, NV_FORMAT_P010).
+
+Accept both. The import already passes the declared layer format to EGL
+unchanged, exactly as Kodi's own VAAPI importer does for the base layer
+(CVaapi2Texture::Import), which dvbridge samples as Cb in .r and Cr in
+.g; the enhancement layer is therefore sampled with the same component
+order as the base layer on each driver.
+
+Also keep the reason of a failed import (frame, surface format, DRM PRIME
+mapping, plane layout with formats and modifier, modifier support, EGL or
+GL error), and report it with the enhancement-dmabuf-import stage.
+---
+ tools/dvbridge/dvbridge_dmabuf.c              | 82 ++++++++++++++++---
+ tools/dvbridge/dvbridge_dmabuf.h              |  2 +
+ .../VideoRenderers/DVBridgeGLES.cpp           |  7 +-
+ 3 files changed, 80 insertions(+), 11 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_dmabuf.c b/tools/dvbridge/dvbridge_dmabuf.c
+index 48cc208..1c8ad27 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.c
++++ b/tools/dvbridge/dvbridge_dmabuf.c
+@@ -7,9 +7,41 @@
+ #include <libavutil/hwcontext.h>
+ #include <libavutil/hwcontext_drm.h>
+ #include <libdrm/drm_fourcc.h>
++#include <libavutil/pixdesc.h>
+ #include <limits.h>
++#include <stdio.h>
+ #include <string.h>
+ 
++/* Reason of the last failed import, for diagnostics only. */
++static char last_error[192];
++
++const char *dvbridge_dmabuf_last_error(void)
++{
++    return last_error;
++}
++
++static void fourcc_name(char out[5], uint32_t fourcc)
++{
++    for (int i = 0; i < 4; ++i) {
++        char c = (char)((fourcc >> (8 * i)) & 0xff);
++        out[i] = c >= 32 && c < 127 ? c : '?';
++    }
++    out[4] = 0;
++}
++
++static void describe_layout(const AVDRMFrameDescriptor *desc)
++{
++    char format0[5] = "none", format1[5] = "none";
++    if (desc && desc->nb_layers > 0)
++        fourcc_name(format0, desc->layers[0].format);
++    if (desc && desc->nb_layers > 1)
++        fourcc_name(format1, desc->layers[1].format);
++    snprintf(last_error, sizeof(last_error),
++             "p010-layout layers=%d objects=%d format0=%s format1=%s modifier=0x%llx",
++             desc ? desc->nb_layers : -1, desc ? desc->nb_objects : -1, format0, format1,
++             desc && desc->nb_objects > 0 ? (unsigned long long)desc->objects[0].format_modifier : 0ULL);
++}
++
+ bool dvbridge_dmabuf_validate_p010(const AVDRMFrameDescriptor *desc, int width, int height)
+ {
+     if (!desc || width < 1 || width > 4096 || height < 1 || height > 2304 ||
+@@ -18,7 +50,13 @@ bool dvbridge_dmabuf_validate_p010(const AVDRMFrameDescriptor *desc, int width,
+     for (int i = 0; i < 2; ++i) {
+         const AVDRMLayerDescriptor *layer = &desc->layers[i];
+         const AVDRMPlaneDescriptor *plane = &layer->planes[0];
+-        if (layer->nb_planes != 1 || layer->format != (i ? DRM_FORMAT_GR1616 : DRM_FORMAT_R16) ||
++        /* The interleaved CbCr plane is GR1616 from Intel's driver and RG1616 from
++         * nvidia-vaapi-driver. The import passes the declared format to EGL unchanged, as
++         * Kodi's own VAAPI importer does for the base layer, so both layers are sampled
++         * with the same component order on each driver. */
++        const bool format = i ? layer->format == DRM_FORMAT_GR1616 || layer->format == DRM_FORMAT_RG1616
++                              : layer->format == DRM_FORMAT_R16;
++        if (layer->nb_planes != 1 || !format ||
+             plane->object_index < 0 || plane->object_index >= desc->nb_objects)
+             return false;
+         const AVDRMObjectDescriptor *object = &desc->objects[plane->object_index];
+@@ -54,26 +92,41 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+ {
+     if (!out || out->mapping || !source || source->format != AV_PIX_FMT_VAAPI ||
+         !source->hw_frames_ctx || source->width < 1 || source->height < 1 ||
+-        source->width > 3840 || source->height > 2160)
++        source->width > 3840 || source->height > 2160) {
++        snprintf(last_error, sizeof(last_error), "frame format=%d size=%dx%d", source ? source->format : -1,
++                 source ? source->width : 0, source ? source->height : 0);
+         return false;
++    }
+     PFNEGLCREATEIMAGEKHRPROC create = (void *)eglGetProcAddress("eglCreateImageKHR");
+     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+     EGLDisplay display = eglGetCurrentDisplay();
+-    if (!create || !bind || display == EGL_NO_DISPLAY)
++    if (!create || !bind || display == EGL_NO_DISPLAY) {
++        snprintf(last_error, sizeof(last_error), "egl-entry-points-or-display");
+         return false;
++    }
+     AVHWFramesContext *hw = (void *)source->hw_frames_ctx->data;
+-    if (hw->sw_format != AV_PIX_FMT_P010 || hw->width < source->width || hw->height < source->height)
++    if (hw->sw_format != AV_PIX_FMT_P010 || hw->width < source->width || hw->height < source->height) {
++        const char *name = av_get_pix_fmt_name(hw->sw_format);
++        snprintf(last_error, sizeof(last_error), "surface sw_format=%s pool=%dx%d frame=%dx%d",
++                 name ? name : "unknown", hw->width, hw->height, source->width, source->height);
+         return false;
++    }
+     struct dvbridge_dmabuf candidate = {.display = display, .layout = DVBRIDGE_P010};
+     candidate.mapping = av_frame_alloc();
+-    if (!candidate.mapping)
++    if (!candidate.mapping) {
++        snprintf(last_error, sizeof(last_error), "allocation");
+         return false;
++    }
+     candidate.mapping->format = AV_PIX_FMT_DRM_PRIME;
+-    if (av_hwframe_map(candidate.mapping, source, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) < 0)
++    if (av_hwframe_map(candidate.mapping, source, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) < 0) {
++        snprintf(last_error, sizeof(last_error), "drm-prime-map");
+         goto fail;
++    }
+     const AVDRMFrameDescriptor *desc = (void *)candidate.mapping->data[0];
+-    if (!dvbridge_dmabuf_validate_p010(desc, hw->width, hw->height))
++    if (!dvbridge_dmabuf_validate_p010(desc, hw->width, hw->height)) {
++        describe_layout(desc);
+         goto fail;
++    }
+     const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+     bool modifiers = extensions && strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
+     for (int i = 0; i < 2; ++i) {
+@@ -83,8 +136,11 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+         int width = i ? (hw->width + 1) / 2 : hw->width;
+         int height = i ? (hw->height + 1) / 2 : hw->height;
+         if (object->format_modifier != DRM_FORMAT_MOD_INVALID &&
+-            object->format_modifier != DRM_FORMAT_MOD_LINEAR && !modifiers)
++            object->format_modifier != DRM_FORMAT_MOD_LINEAR && !modifiers) {
++            snprintf(last_error, sizeof(last_error), "modifier=0x%llx without EGL_EXT_image_dma_buf_import_modifiers",
++                     (unsigned long long)object->format_modifier);
+             goto fail;
++        }
+         EGLint attrs[24] = {
+             EGL_WIDTH, width, EGL_HEIGHT, height, EGL_LINUX_DRM_FOURCC_EXT, (EGLint)layer->format,
+             EGL_DMA_BUF_PLANE0_FD_EXT, object->fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)plane->offset,
+@@ -97,8 +153,10 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+             attrs[16] = EGL_NONE;
+         }
+         candidate.images[i] = create(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+-        if (!candidate.images[i])
++        if (!candidate.images[i]) {
++            snprintf(last_error, sizeof(last_error), "egl-image plane=%d egl_error=0x%x", i, (unsigned)eglGetError());
+             goto fail;
++        }
+         GLint previous;
+         glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+         glGenTextures(1, &candidate.planes[i].texture);
+@@ -109,12 +167,16 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+         glBindTexture(GL_TEXTURE_2D, previous);
+-        if (glGetError() != GL_NO_ERROR)
++        const GLenum error = glGetError();
++        if (error != GL_NO_ERROR) {
++            snprintf(last_error, sizeof(last_error), "gl-texture plane=%d gl_error=0x%x", i, (unsigned)error);
+             goto fail;
++        }
+         candidate.planes[i].width = width;
+         candidate.planes[i].height = height;
+     }
+     *out = candidate;
++    last_error[0] = 0;
+     return true;
+ fail:
+     dvbridge_dmabuf_release(&candidate);
+diff --git a/tools/dvbridge/dvbridge_dmabuf.h b/tools/dvbridge/dvbridge_dmabuf.h
+index 3a85409..642fa43 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.h
++++ b/tools/dvbridge/dvbridge_dmabuf.h
+@@ -17,4 +17,6 @@ bool dvbridge_dmabuf_validate_p010(const AVDRMFrameDescriptor *desc, int width,
+ /* Current EGL/GLES context required. Does not transfer pixels through the CPU. */
+ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *frame);
+ void dvbridge_dmabuf_release(struct dvbridge_dmabuf *frame);
++/* Why the last dvbridge_dmabuf_import() failed, for diagnostics; empty after a success. */
++const char *dvbridge_dmabuf_last_error(void);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index b25b8dc..b7b9e6d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -4,6 +4,7 @@
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackInfo.h"
+ #include "utils/log.h"
+ #include <chrono>
++#include <string>
+ extern "C"
+ {
+ #include <libavutil/dovi_meta.h>
+@@ -183,7 +184,11 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+     return Prepare(base, nullptr, metadata, geometry, allowPacked);
+   dvbridge_dmabuf imported{};
+   if (!dvbridge_dmabuf_import(&imported, enhancement))
+-    return Fail("enhancement-dmabuf-import");
++  {
++    const std::string stage =
++        std::string("enhancement-dmabuf-import ") + dvbridge_dmabuf_last_error();
++    return Fail(stage.c_str());
++  }
+   Layer layer{};
+   layer.layout = imported.layout;
+   layer.width = enhancement->width;
