@@ -2,13 +2,13 @@
 
 [English](README.md) | **Español**
 
-LibreELEC Hades es una compilación personal y no oficial de [LibreELEC](https://libreelec.tv) para PC corrientes de 64 bits (la imagen "Generic x86_64"). Es LibreELEC con un añadido principal: su centro multimedia, que es Kodi® con cambios, puede enviar vídeo Dolby Vision a una tele Dolby Vision por HDMI desde la gráfica del PC, sea una tarjeta gráfica o la integrada en el procesador, en vez de quedarse en HDR10. Todo lo demás que hace LibreELEC se conserva. Nació del fork de LibreELEC con Dolby Vision para gráficas Intel de CroqueMr; mira "Créditos".
+LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.tv) para PC corrientes de 64 bits (la imagen "Generic x86_64"). Es LibreELEC con un añadido principal: su centro multimedia, que es Kodi® con cambios, puede enviar vídeo Dolby Vision a una tele Dolby Vision por HDMI desde la gráfica del PC, sea una tarjeta gráfica o la integrada en el procesador, en vez de quedarse en HDR10. Todo lo demás que hace LibreELEC se conserva. Nació del fork de LibreELEC con Dolby Vision para gráficas Intel de CroqueMr; mira "Créditos".
 
 > **Esto no es LibreELEC y no es oficial.** LibreELEC Hades no lo hacen, mantienen, avalan ni certifican Team LibreELEC, Team Kodi o la XBMC Foundation, Dolby Laboratories, ni NVIDIA, AMD o Intel, y no tiene relación con ninguno de ellos. Por favor, no pidas ayuda sobre Hades a esos proyectos ni a esas empresas. Kodi es una marca registrada de la XBMC Foundation. Las demás marcas son de sus dueños; consulta [NOTICE.es.md](NOTICE.es.md).
 
 **Por qué la pantalla dice "LibreELEC Hades" y no "Kodi".** El centro multimedia de esta compilación es un Kodi modificado que la XBMC Foundation no ha aprobado, y la política de marca de Kodi pide a una compilación así que no use como suyos el nombre y los logos de Kodi. Por eso la pantalla de arranque, el logo, los iconos y los textos que nombraban el programa dicen LibreELEC Hades, y una página de la información del sistema, "Acerca de esta compilación", dice qué es y dónde apoyar a Kodi y a LibreELEC. Por debajo es Kodi: complementos, interfaces y aplicaciones de mando a distancia funcionan como con Kodi, su registro sigue siendo `kodi.log`, y lo que leen otros programas (el agente de usuario, JSON-RPC, los nombres de DLNA y AirPlay) sigue diciendo Kodi. En este documento, "Kodi" es ese programa.
 
-**Estado: versión 1.0, candidata 1 (octubre de 2026). Experimental.** Lo hace una sola persona y se ha probado en muy poco hardware. Lee "Qué se ha probado" antes de esperar que funcione en el tuyo.
+**Versión 1.0, candidata 1 (octubre de 2026).** El Dolby Vision nativo, con el perfil 7 y su capa de mejora completa, ya se ha visto en gráficas NVIDIA, AMD e Intel, con el Dolby Atmos en paso directo. Como versión candidata, está lista para más hardware: pruébala en el tuyo y cuenta lo que veas en los issues. "Qué se ha probado" dice lo que se ha visto hasta ahora.
 
 ## Qué añade a LibreELEC
 
