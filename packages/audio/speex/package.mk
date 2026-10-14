@@ -11,3 +11,7 @@ PKG_URL="https://gitlab.xiph.org/xiph/speex/-/archive/Speex-${PKG_VERSION}/speex
 PKG_DEPENDS_TARGET="toolchain"
 PKG_LONGDESC="An Open Source Software patent-free audio compression format designed for speech."
 PKG_TOOLCHAIN="autotools"
+
+# speexenc and speexdec are built only when configure finds libogg, which this package does not
+# depend on: whether they were in the image depended on which of the two packages was built first.
+PKG_CONFIGURE_OPTS_TARGET="--disable-binaries"

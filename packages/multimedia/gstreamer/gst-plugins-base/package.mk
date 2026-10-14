@@ -63,6 +63,16 @@ pre_configure_target() {
 }
 
 post_makeinstall_target() {
+  # Keep the libraries needed at run time: libgstcodecparsers (gst-plugins-bad), which
+  # nvidia-vaapi-driver loads, links against libgstvideo-1.0, which links against
+  # libgstallocators-1.0.
+  mkdir -p ${PKG_BUILD}/.runtime-libs
+  cp -P ${INSTALL}/usr/lib/libgstvideo-1.0.so.0* ${PKG_BUILD}/.runtime-libs
+  cp -P ${INSTALL}/usr/lib/libgstallocators-1.0.so.0* ${PKG_BUILD}/.runtime-libs
+
   # clean up
   safe_remove ${INSTALL}
+
+  mkdir -p ${INSTALL}/usr/lib
+    cp -P ${PKG_BUILD}/.runtime-libs/* ${INSTALL}/usr/lib
 }

@@ -47,6 +47,20 @@ make_target() {
        RANLIB=${RANLIB} \
        CFLAGS="-I${SYSROOT_PREFIX}/usr/include -fomit-frame-pointer -D_FILE_OFFSET_BITS=64" \
        LDFLAGS="-L${SYSROOT_PREFIX}/usr/lib"
+
+  # Hades: GRUB for 64-bit UEFI, built from source out of tree with the same configure line
+  # and only --target=x86_64-pc-linux; it replaces the prebuilt syslinux EFI loader as
+  # bootx64.efi
+  mkdir -p ${PKG_BUILD}/.x86_64-efi
+  (
+    cd ${PKG_BUILD}/.x86_64-efi
+    ${PKG_BUILD}/configure ${TARGET_CONFIGURE_OPTS} --target=x86_64-pc-linux --disable-nls --with-platform=efi
+    make CC=${CC} \
+         AR=${AR} \
+         RANLIB=${RANLIB} \
+         CFLAGS="-I${SYSROOT_PREFIX}/usr/include -fomit-frame-pointer -D_FILE_OFFSET_BITS=64" \
+         LDFLAGS="-L${SYSROOT_PREFIX}/usr/lib"
+  )
 }
 
 makeinstall_target() {
@@ -54,9 +68,13 @@ makeinstall_target() {
     boot chain configfile ext2 fat linux search efi_gop \
     part_gpt gzio gettext loadenv loadbios memrw
 
+  ${PKG_BUILD}/.${HOST_NAME}/grub-mkimage -d ${PKG_BUILD}/.x86_64-efi/grub-core -o bootx64.efi -O x86_64-efi -p /EFI/BOOT \
+    boot chain configfile ext2 fat linux search efi_gop \
+    part_gpt gzio gettext loadenv loadbios memrw
+
   mkdir -p ${INSTALL}/usr/share/grub
-     cp -P bootia32.efi ${INSTALL}/usr/share/grub
+     cp -P bootia32.efi bootx64.efi ${INSTALL}/usr/share/grub
 
   mkdir -p ${TOOLCHAIN}/share/grub
-     cp -P bootia32.efi ${TOOLCHAIN}/share/grub
+     cp -P bootia32.efi bootx64.efi ${TOOLCHAIN}/share/grub
 }

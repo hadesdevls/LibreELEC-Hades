@@ -7,7 +7,7 @@ PKG_SHA256="731b5681e4bb18be313231579b8efd0296c5b015fa36dc533874b639ba838016"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE="https://www.qemu.org"
 PKG_URL="https://download.qemu.org/qemu-${PKG_VERSION}.tar.xz"
-PKG_DEPENDS_HOST="toolchain:host distlib:host glib:host pixman:host Python3:host zlib:host"
+PKG_DEPENDS_HOST="toolchain:host distlib:host glib:host pixman:host Python3:host wheel:host zlib:host"
 PKG_LONGDESC="QEMU is a generic and open source machine emulator and virtualizer."
 PKG_TOOLCHAIN="configure"
 
@@ -32,6 +32,7 @@ pre_configure_host() {
     --disable-debug-mutex \
     --disable-debug-tcg \
     --disable-docs \
+    --disable-download \
     --disable-gcrypt \
     --disable-gnutls \
     --disable-system \
