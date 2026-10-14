@@ -1,0 +1,264 @@
+From 3242fedad1bad5abad4a48a0767b9bbed58f6f24 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 31 Jul 2026 19:32:39 +0100
+Subject: [PATCH 07/18] avcodec/h264dec: add a per-view context
+
+An MVC access unit is strictly ordered -- all base view slices, then all slices
+of each dependent view -- so only one view is ever being decoded at a time. Take
+advantage of that: keep the state of the view being decoded in the H264Context
+fields it already lives in, and swap it in and out of a per-view context at view
+boundaries.
+
+The alternative, addressing every view's state explicitly as MV-HEVC does with
+HEVCLayerContext, would mean touching around 250 sites across twelve files,
+including six hwaccels, for cur_pic_ptr, short_ref, long_ref and poc alone. With
+a swap the macroblock layer, the reference list code and every hwaccel keep
+addressing h->cur_pic_ptr, h->short_ref and h->poc as before and need no
+knowledge of views at all.
+
+The DPB stays a single shared pool. It is already a flat pool served by
+find_unused_picture(), the per-view reference lists keep the two views'
+reference management separate, and H264_MAX_PICTURE_COUNT is comfortable for two
+views of the reference counts real streams use.
+
+idr() is made to reset every view rather than whichever one happens to be
+swapped in. It acts on the live H264Context fields, so once a dependent view can
+be current at an IDR access unit it would otherwise empty that view's reference
+lists and leave the base view's stale, to be restored at the next view switch.
+
+Only one view exists so far and ff_h264_view_switch() is therefore never called,
+so decoder behaviour is unchanged by this commit.
+
+Signed-off-by: Dom Cobley <popcornmix@gmail.com>
+---
+ libavcodec/h264_refs.c  | 51 +++++++++++++++++++++++++++++++++++++++++
+ libavcodec/h264_slice.c | 17 ++++++++++++++
+ libavcodec/h264dec.c    | 39 +++++++++++++++++++++++++------
+ libavcodec/h264dec.h    | 50 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 150 insertions(+), 7 deletions(-)
+
+diff --git a/libavcodec/h264_refs.c b/libavcodec/h264_refs.c
+index b743858cdc3..4e1fecc0a48 100644
+--- a/libavcodec/h264_refs.c
++++ b/libavcodec/h264_refs.c
+@@ -585,6 +585,57 @@ void ff_h264_remove_all_refs(H264Context *h)
+     memset(h->default_ref, 0, sizeof(h->default_ref));
+ }
+ 
++void ff_h264_view_sync(H264Context *h)
++{
++    H264ViewContext *v = &h->views[h->cur_view];
++
++    v->poc             = h->poc;
++    v->short_ref_count = h->short_ref_count;
++    v->long_ref_count  = h->long_ref_count;
++    memcpy(v->short_ref, h->short_ref, sizeof(v->short_ref));
++    memcpy(v->long_ref,  h->long_ref,  sizeof(v->long_ref));
++}
++
++void ff_h264_view_switch(H264Context *h, unsigned view)
++{
++    H264ViewContext *v;
++
++    av_assert1(view < FF_ARRAY_ELEMS(h->views));
++
++    if (view == h->cur_view)
++        return;
++
++    /* save the outgoing view */
++    ff_h264_view_sync(h);
++
++    /* restore the incoming one */
++    v = &h->views[view];
++    h->poc             = v->poc;
++    h->short_ref_count = v->short_ref_count;
++    h->long_ref_count  = v->long_ref_count;
++    memcpy(h->short_ref, v->short_ref, sizeof(h->short_ref));
++    memcpy(h->long_ref,  v->long_ref,  sizeof(h->long_ref));
++
++    h->cur_view = view;
++}
++
++void ff_h264_view_reset(H264Context *h)
++{
++    for (int i = 0; i < FF_ARRAY_ELEMS(h->views); i++) {
++        H264ViewContext *v = &h->views[i];
++
++        /* The pictures themselves are owned by the DPB, which is torn down
++         * separately; only the per-view bookkeeping is dropped here. */
++        memset(v->short_ref, 0, sizeof(v->short_ref));
++        memset(v->long_ref,  0, sizeof(v->long_ref));
++        v->short_ref_count = 0;
++        v->long_ref_count  = 0;
++        v->cur_pic_ptr     = NULL;
++        memset(&v->poc, 0, sizeof(v->poc));
++    }
++    h->cur_view = 0;
++}
++
+ static void generate_sliding_window_mmcos(H264Context *h)
+ {
+     MMCO *mmco = h->mmco;
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 7bdf8b1fe4d..73c5dfc7ad5 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -467,6 +467,23 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
+     copy_picture_range(h->delayed_pic, h1->delayed_pic,
+                        FF_ARRAY_ELEMS(h->delayed_pic), h, h1);
+ 
++    /* The saved state of the views that are not current holds DPB pointers too,
++     * so it needs the same rebasing. */
++    h->cur_view = h1->cur_view;
++    for (int i = 0; i < FF_ARRAY_ELEMS(h->views); i++) {
++        H264ViewContext       *v  = &h->views[i];
++        const H264ViewContext *v1 = &h1->views[i];
++
++        v->poc             = v1->poc;
++        v->short_ref_count = v1->short_ref_count;
++        v->long_ref_count  = v1->long_ref_count;
++        copy_picture_range(v->short_ref, v1->short_ref,
++                           FF_ARRAY_ELEMS(v->short_ref), h, h1);
++        copy_picture_range(v->long_ref, v1->long_ref,
++                           FF_ARRAY_ELEMS(v->long_ref), h, h1);
++        v->cur_pic_ptr = REBASE_PICTURE(v1->cur_pic_ptr, h, h1);
++    }
++
+     h->frame_recovered       = h1->frame_recovered;
+ 
+     ret = ff_h2645_sei_ctx_replace(&h->sei.common, &h1->sei.common);
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index 6910db5b877..fb41c5ab6a8 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -443,13 +443,36 @@ static av_cold int h264_decode_init(AVCodecContext *avctx)
+  */
+ static void idr(H264Context *h)
+ {
+-    int i;
+-    ff_h264_remove_all_refs(h);
+-    h->poc.prev_frame_num        =
+-    h->poc.prev_frame_num_offset = 0;
+-    h->poc.prev_poc_msb          = 1<<16;
+-    h->poc.prev_poc_lsb          = -1;
+-    for (i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
++    const unsigned prev_view = h->cur_view;
++
++    /* An IDR access unit starts a new coded video sequence in every view, so all
++     * of them are emptied -- not just the one that happens to be swapped in.
++     * Otherwise a dependent view left mid-sequence restores its stale references
++     * and prev_frame_num at the next view switch, which shows up as spurious
++     * frame_num gap concealment and reference list overflow right after the IDR. */
++    for (unsigned view = 0; view < FF_ARRAY_ELEMS(h->views); view++) {
++        ff_h264_view_switch(h, view);
++
++        ff_h264_remove_all_refs(h);
++        /* frame_num is cleared along with prev_frame_num because a view whose
++         * picture is still waiting to be finished runs ff_h264_field_end()
++         * after this point, and that assigns prev_frame_num = frame_num. Left
++         * at its pre-IDR value it would undo the reset a moment after it was
++         * made, and the view would then conceal a frame_num gap up to the IDR. */
++        h->poc.frame_num             =
++        h->poc.prev_frame_num        =
++        h->poc.prev_frame_num_offset = 0;
++        h->poc.prev_poc_msb          = 1<<16;
++        h->poc.prev_poc_lsb          = -1;
++    }
++    ff_h264_view_switch(h, prev_view);
++
++    /* The loop above leaves the last view swapped in, so for that view the
++     * switch back is a no-op and never writes the emptied state into its slot,
++     * which would keep the pre-IDR snapshot and restore it at the next switch. */
++    ff_h264_view_sync(h);
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(h->last_pocs); i++)
+         h->last_pocs[i] = INT_MIN;
+ }
+ 
+@@ -472,6 +495,8 @@ void ff_h264_flush_change(H264Context *h)
+     }
+     ff_h264_unref_picture(&h->last_pic_for_ec);
+ 
++    ff_h264_view_reset(h);
++
+     h->first_field = 0;
+     h->recovery_frame = -1;
+     h->frame_recovered = 0;
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index 6ed168e9a4f..edf80a2eb44 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -332,6 +332,33 @@ typedef struct H264SliceContext {
+     int max_pic_num;
+ } H264SliceContext;
+ 
++/**
++ * Per-view decoding state for MVC (H.264 Annex H).
++ *
++ * An MVC access unit is strictly ordered -- all base view slices, then all slices
++ * of each dependent view -- so only one view is ever being decoded at a time.
++ * Rather than addressing every view's state explicitly, the state of the view
++ * currently being decoded stays in the H264Context fields it has always lived in,
++ * and ff_h264_view_switch() swaps it in and out of here at view boundaries. That
++ * way the macroblock layer, the reference list code and all the hwaccels keep
++ * addressing h->cur_pic_ptr, h->short_ref and h->poc directly and need no
++ * knowledge of views whatsoever.
++ */
++typedef struct H264ViewContext {
++    H264POCContext  poc;
++    H264Picture    *short_ref[32];
++    H264Picture    *long_ref[32];
++    int             short_ref_count;
++    int             long_ref_count;
++
++    /**
++     * The picture this view holds for the access unit being decoded, used to pair
++     * the views up at output time. Unlike the fields above this is not swapped;
++     * it stays valid across a view switch.
++     */
++    H264Picture    *cur_pic_ptr;
++} H264ViewContext;
++
+ /**
+  * H264Context
+  */
+@@ -556,6 +583,8 @@ typedef struct H264Context {
+      * @name MVC (H.264 Annex H) multiview state
+      * @{
+      */
++    /** Per-view decoding state, indexed by view order index (VOIdx). */
++    H264ViewContext views[H264_MAX_MVC_VIEWS];
+     /**
+      * Number of views in the active subset SPS, or 0 if the stream is not
+      * multiview (or its MVC extension is unsupported).
+@@ -622,6 +651,27 @@ int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx);
+ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl);
+ void ff_h264_remove_all_refs(H264Context *h);
+ 
++/**
++ * Make @p view the view being decoded, saving the state of the previously
++ * current view and restoring that of @p view.
++ *
++ * Must be called at every view boundary within an access unit, and to return to
++ * the base view before starting the next one. Calling it for the view that is
++ * already current is a no-op.
++ */
++void ff_h264_view_switch(H264Context *h, unsigned view);
++
++/**
++ * Write the live per view state back into the slot of the view that is
++ * currently swapped in, without switching away from it.
++ */
++void ff_h264_view_sync(H264Context *h);
++
++/**
++ * Reset all per-view state, as at an IDR or a flush.
++ */
++void ff_h264_view_reset(H264Context *h);
++
+ /**
+  * Execute the reference picture marking (memory management control operations).
+  */
+-- 
+2.53.0
+

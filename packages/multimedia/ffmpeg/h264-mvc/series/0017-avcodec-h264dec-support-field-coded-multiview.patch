@@ -1,0 +1,357 @@
+From 854812ddb74b266de82b6e849b706362334331ae Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Tue, 4 Aug 2026 03:13:36 +0100
+Subject: [PATCH 17/18] avcodec/h264dec: support field coded multiview
+
+A field coded multiview access unit carries one field of each view, so a
+view can be left half way through a complementary field pair while
+another view is decoded, and picked up again when its second field
+arrives. Several pieces of decoder state describe that position and were
+context wide, shared by every view:
+
+- ::first_field, ::picture_structure, ::droppable and ::missing_fields,
+  along with the picture the pair is being decoded into, are saved with
+  the view being left and restored with the one being entered.
+
+- ::cur_pic, the reference to the picture being decoded into, is set up
+  by h264_frame_start(), which the second field of a pair does not go
+  through. It has to be rebound on a view switch, or that field would be
+  decoded into whichever view most recently started a picture -- the
+  dependent view, leaving the base view's second field entirely wrong.
+
+- A view stopped between the fields of a pair still owns its first field
+  while another view is decoded, and ::cur_pic_ptr does not point at it.
+  Keep release_unused_pictures() off it.
+
+Reference picture marking for a first field now also runs before the
+other view does, so that the second field finds the frame at the head of
+short_ref instead of adding a second short term entry for it.
+
+Two pictures also have to be reported complete that were not before, or a frame
+thread waits on them forever:
+
+- The picture of the view being left. ff_h264_view_switch_fields() replaces
+  ::cur_pic_ptr with the picture the view being entered left behind, so the
+  block that used to report it no longer sees it. Progress is kept per field,
+  so a first field is reported here too: that field is finished, even though
+  its frame is not, and the second field reports itself once its view is
+  returned to.
+
+- A lower view's pending first field, once a field of the opposite parity
+  starts. An access unit carries its views in view order index order and a
+  field coded one carries the same field of every view before moving on to the
+  other field, so a view already passed that is still mid pair has lost its
+  second field, and only that view would ever have completed the picture.
+
+Neither shows on undamaged input, where every slice decodes and reports its own
+rows. Corrupt input deadlocked the decoder without them: a dependent view field
+awaiting a base view field whose slices had failed, and a dependent view field
+awaiting the base view field of an access unit that never arrived.
+
+With this, MVC_ez0027.mp4 decodes both views with no errors, the base
+view bit exact with the same file decoded as plain H.264, under frame
+threading, slice threading and no threading alike.
+
+Signed-off-by: Dom Cobley <popcornmix@gmail.com>
+---
+ libavcodec/h264_refs.c  |  61 +++++++++++++++++++++---
+ libavcodec/h264_slice.c | 102 ++++++++++++++++++++++++++++++++++++----
+ libavcodec/h264dec.c    |  23 +++++++--
+ libavcodec/h264dec.h    |  13 +++++
+ 4 files changed, 177 insertions(+), 22 deletions(-)
+
+diff --git a/libavcodec/h264_refs.c b/libavcodec/h264_refs.c
+index 8e1ba651b0c..2c567c24eb7 100644
+--- a/libavcodec/h264_refs.c
++++ b/libavcodec/h264_refs.c
+@@ -805,6 +805,51 @@ int ff_h264_view_idx(const H264Context *h, int view_id)
+     return AVERROR_INVALIDDATA;
+ }
+ 
++/* The field pair state has to follow the view too, but only when the switch is
++ * part of decoding a slice: idr() and the frame thread hand-over walk the views
++ * for their own reasons and must not disturb the picture being decoded. */
++int ff_h264_view_switch_fields(H264Context *h, unsigned view)
++{
++    H264ViewContext *out, *in;
++    int ret;
++
++    if (view == h->cur_view)
++        return 0;
++
++    out = &h->views[h->cur_view];
++    out->first_field       = h->first_field;
++    out->picture_structure = h->picture_structure;
++    out->droppable         = h->droppable;
++    out->missing_fields    = h->missing_fields;
++    out->pending_field_pic = h->first_field ? h->cur_pic_ptr : NULL;
++
++    in  = &h->views[view];
++    ff_h264_view_switch(h, view);
++
++    h->first_field       = in->first_field;
++    h->picture_structure = in->picture_structure;
++    h->droppable         = in->droppable;
++    h->missing_fields    = in->missing_fields;
++    h->cur_pic_ptr       = in->pending_field_pic;
++
++    /* h->cur_pic is a reference to the picture being decoded into, refreshed by
++     * h264_frame_start() -- which the second field of a complementary pair does
++     * not go through. Rebind it to the view being switched to, or that field
++     * would be decoded into whichever view started a picture most recently. */
++    ff_h264_unref_picture(&h->cur_pic);
++    if (h->cur_pic_ptr) {
++        ret = ff_h264_ref_picture(&h->cur_pic, h->cur_pic_ptr);
++        if (ret < 0)
++            return ret;
++        for (int i = 0; i < h->nb_slice_ctx; i++) {
++            h->slice_ctx[i].linesize   = h->cur_pic_ptr->f->linesize[0];
++            h->slice_ctx[i].uvlinesize = h->cur_pic_ptr->f->linesize[1];
++        }
++    }
++
++    return 0;
++}
++
+ void ff_h264_view_switch(H264Context *h, unsigned view)
+ {
+     H264ViewContext *v;
+@@ -834,13 +879,15 @@ void ff_h264_view_reset(H264Context *h)
+         H264ViewContext *v = &h->views[i];
+ 
+         /* The pictures themselves are owned by the DPB, which is torn down
+-         * separately; only the per-view bookkeeping is dropped here. */
+-        memset(v->short_ref, 0, sizeof(v->short_ref));
+-        memset(v->long_ref,  0, sizeof(v->long_ref));
+-        v->short_ref_count = 0;
+-        v->long_ref_count  = 0;
+-        v->cur_pic_ptr     = NULL;
+-        memset(&v->poc, 0, sizeof(v->poc));
++         * separately; only the per-view bookkeeping is dropped here. Clearing the
++         * whole struct rather than naming fields keeps the half decoded field
++         * pair state from surviving a flush: pending_field_pic would otherwise be
++         * restored at the next view switch, pointing into a DPB that has since
++         * been emptied. */
++        memset(v, 0, sizeof(*v));
++        v->poc.prev_poc_msb   = 1 << 16;
++        v->poc.prev_poc_lsb   = -1;
++        v->poc.prev_frame_num = -1;
+     }
+     h->cur_view = 0;
+ }
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index dcae98b434e..b3175c758f8 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -121,7 +121,16 @@ static void release_unused_pictures(H264Context *h, int remove_current)
+ 
+     /* release non reference frames */
+     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+-        if (h->DPB[i].f->buf[0] && !h->DPB[i].reference &&
++        int pending = 0;
++
++        /* a view left half way through a complementary field pair still owns its
++         * first field, and h->cur_pic_ptr does not point at it while the other
++         * view is being decoded */
++        for (int v = 0; v < FF_ARRAY_ELEMS(h->views); v++)
++            if (h->views[v].pending_field_pic == &h->DPB[i])
++                pending = 1;
++
++        if (h->DPB[i].f->buf[0] && !h->DPB[i].reference && !pending &&
+             &h->DPB[i] != h->next_output_pic &&
+             &h->DPB[i] != h->next_output_pic_dep &&
+             /* A base view picture that has left the reorder buffer is still needed
+@@ -558,6 +567,13 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
+         copy_picture_range(v->long_ref, v1->long_ref,
+                            FF_ARRAY_ELEMS(v->long_ref), h, h1);
+         v->cur_pic_ptr = REBASE_PICTURE(v1->cur_pic_ptr, h, h1);
++
++        /* a view may be half way through a complementary field pair */
++        v->pending_field_pic  = REBASE_PICTURE(v1->pending_field_pic, h, h1);
++        v->first_field        = v1->first_field;
++        v->picture_structure  = v1->picture_structure;
++        v->droppable          = v1->droppable;
++        v->missing_fields     = v1->missing_fields;
+     }
+ 
+     h->frame_recovered       = h1->frame_recovered;
+@@ -2059,6 +2075,28 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
+         }
+     }
+ 
++    /* An access unit carries its views in view order index order, and a field
++     * coded one carries the same field of every view before moving on to the
++     * other field. A view below this one still holding a pending first field of
++     * the opposite parity has therefore lost its second field, and only that view
++     * would ever have completed the picture. Complete it here, or a thread
++     * awaiting the missing field -- as an inter-view reference of this very
++     * access unit, or as a temporal one later -- waits forever. A view above this
++     * one is simply not there yet, and one of the same parity is mid pair, as it
++     * should be. */
++    for (unsigned v = 0; h->nb_views > 1 && v < h->cur_view; v++) {
++        H264ViewContext *vc = &h->views[v];
++
++        if (!vc->pending_field_pic || !vc->pending_field_pic->f->buf[0] ||
++            vc->picture_structure == h->picture_structure)
++            continue;
++
++        ff_thread_report_progress(&vc->pending_field_pic->tf, INT_MAX, 0);
++        ff_thread_report_progress(&vc->pending_field_pic->tf, INT_MAX, 1);
++        vc->pending_field_pic = NULL;
++        vc->first_field       = 0;
++    }
++
+     h->views[h->cur_view].cur_pic_ptr = h->cur_pic_ptr;
+ 
+     /* Pair a dependent view picture with the base view picture of the same access
+@@ -2579,19 +2617,43 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
+ 
+             if (view != h->cur_view) {
+                 /* A new view of the same access unit: finish off the picture of
+-                 * the view we were decoding and start a fresh one. cur_pic_ptr is
+-                 * deliberately left set, so that the block below reports the
+-                 * picture as complete -- ff_h264_field_end() does not do so when
+-                 * called with in_setup, and a frame thread waiting on it as a
+-                 * reference would wait forever. */
++                 * the view we were decoding and start a fresh one. */
+                 if (h->cur_pic_ptr) {
++                    /* Also for a first field: its reference picture marking has
++                     * to happen before the other view runs, or the second field
++                     * will not find it at the head of short_ref and will enter a
++                     * second short term entry for the same frame. */
+                     ret = ff_h264_field_end(h, h->slice_ctx, 1);
+                     if (ret < 0)
+                         return ret;
++
++                    /* Report the field just decoded complete while cur_pic_ptr
++                     * still refers to it: ff_h264_view_switch_fields() below
++                     * replaces it with whatever the view being entered left
++                     * behind, so the block further down no longer can. The view
++                     * being entered may reference this picture, and nothing else
++                     * would ever report it -- ff_h264_field_end() does not, when
++                     * called with in_setup, and a decode error stops the per-slice
++                     * reporting short -- so a thread waiting on it as a reference
++                     * would wait forever. Progress is per field, so this holds for
++                     * a first field too: that field is finished even though its
++                     * frame is not, and the second field reports itself once this
++                     * view is returned to. */
++                    if (!h->droppable || h->views_active_decode != 1)
++                        ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX,
++                                                  h->picture_structure == PICT_BOTTOM_FIELD);
+                 }
+                 h->current_slice = 0;
+-                h->first_field   = 0;
+-                ff_h264_view_switch(h, view);
++                /* A field coded access unit carries one field of each view, so
++                 * the view being left may be half way through a complementary
++                 * pair. Keep its first_field set: ff_h264_view_switch() stashes
++                 * the pending picture with it and hands both back when that
++                 * view's second field arrives. */
++                if (!(FIELD_PICTURE(h) && h->first_field))
++                    h->first_field = 0;
++                ret = ff_h264_view_switch_fields(h, view);
++                if (ret < 0)
++                    return ret;
+             } else if (h->cur_pic_ptr && FIELD_PICTURE(h) && h->first_field) {
+                 ret = ff_h264_field_end(h, h->slice_ctx, 1);
+                 if (ret < 0)
+@@ -2626,8 +2688,28 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
+ 
+     /* Returning to the base view for a new access unit, or starting a view whose
+      * predecessor produced no picture. */
+-    if (!h->current_slice)
+-        ff_h264_view_switch(h, view);
++    if (!h->current_slice) {
++        /* As at the view switch above, and for the same reason: the picture of
++         * the view being left is about to stop being cur_pic_ptr, and if its
++         * slice failed before it could raise ::current_slice nothing else would
++         * ever report it.
++         *
++         * Only for a field this thread started itself, and only with the slice
++         * queue empty. Under frame threading ::cur_pic_ptr may instead be a
++         * picture inherited from the previous packet, which the thread that owns
++         * it is still decoding into -- it declared setup finished so that this
++         * thread could start, and reporting its field here releases a waiter
++         * onto rows that have not been written yet. */
++        if (view != h->cur_view && h->cur_pic_ptr && !h->nb_slice_ctx_queued &&
++            h->cur_pic_ptr->tf.owner[h->picture_structure == PICT_BOTTOM_FIELD] == h->avctx &&
++            (!h->droppable || h->views_active_decode != 1))
++            ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX,
++                                      h->picture_structure == PICT_BOTTOM_FIELD);
++
++        ret = ff_h264_view_switch_fields(h, view);
++        if (ret < 0)
++            return ret;
++    }
+ 
+     if (h->current_slice == 0 && !h->first_field) {
+         if (
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index 84539a73f93..f8ffc1014d9 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -926,12 +926,25 @@ end:
+      * ever completes that picture, so a frame thread awaiting it, as the frame
+      * num gap concealment does, waits forever. Complete them here as well. */
+     for (unsigned v = 0; h->nb_views > 1 && v < FF_ARRAY_ELEMS(h->views); v++) {
+-        H264Picture *pic = h->views[v].cur_pic_ptr;
++        const H264ViewContext *vc = &h->views[v];
++        H264Picture *pic = vc->cur_pic_ptr;
+ 
+-        if (pic && pic != h->cur_pic_ptr && pic->f->buf[0]) {
+-            ff_thread_report_progress(&pic->tf, INT_MAX, 0);
+-            ff_thread_report_progress(&pic->tf, INT_MAX, 1);
+-        }
++        if (!pic || pic == h->cur_pic_ptr || !pic->f->buf[0])
++            continue;
++        /* Only pictures this packet started. Under frame threading the view
++         * that was not decoded from this packet holds the picture of the thread
++         * before, which that thread is still decoding into; completing it here
++         * would release a waiter onto rows that have not been written yet. */
++        if (pic->tf.owner[0] != h->avctx)
++            continue;
++        /* Nor one that is a first field whose second one is still to come in a
++         * later packet -- that picture is not complete, and saying it is would
++         * hand a waiting thread an undecoded field. */
++        if (vc->first_field && vc->pending_field_pic == pic)
++            continue;
++
++        ff_thread_report_progress(&pic->tf, INT_MAX, 0);
++        ff_thread_report_progress(&pic->tf, INT_MAX, 1);
+     }
+ 
+     return (ret < 0) ? ret : buf_size;
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index c8906622f9a..3a70f35aa9d 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -381,6 +381,18 @@ typedef struct H264ViewContext {
+      * it stays valid across a view switch.
+      */
+     H264Picture    *cur_pic_ptr;
++
++    /**
++     * Field pair state, swapped like the fields above. A field coded access unit
++     * carries one field of each view, so a view is left half way through a
++     * complementary pair whenever the next view starts, and each view has to
++     * remember its own pending field.
++     */
++    H264Picture    *pending_field_pic;
++    int             first_field;
++    int             picture_structure;
++    int             droppable;
++    int             missing_fields;
+ } H264ViewContext;
+ 
+ /**
+@@ -756,6 +768,7 @@ int ff_h264_resolve_view_pair(H264Context *h, H264Picture *base, int output,
+  * already current is a no-op.
+  */
+ void ff_h264_view_switch(H264Context *h, unsigned view);
++int ff_h264_view_switch_fields(H264Context *h, unsigned view);
+ 
+ /**
+  * Write the live per view state back into the slot of the view that is
+-- 
+2.53.0
+

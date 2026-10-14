@@ -1,0 +1,692 @@
+From d1e00b45ece3ce1a37276a7f6645b04aa1ac7eff Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 18:38:22 +0000
+Subject: [PATCH] drm/amd/display: Dolby Vision Standard tunnel on HDMI
+
+Dolby Vision Standard (TV-led) output sends RGB 8 bpc pixels that carry
+YCbCr 4:2:2 12-bit with the display management metadata in the chroma
+LSBs, next to a Dolby vendor InfoFrame; the sink accepts them only if
+they arrive bit exact. The Intel Dolby Vision LibreELEC fork does this on
+i915 with a connector property, DVBRIDGE_DV_STANDARD_LAB. Offer the same
+property, with the same meaning, on amdgpu HDMI connectors, so that the
+same user space (Kodi dvbridge) drives both:
+
+- the property is a boolean on native HDMI connectors of DCN 3.x GPUs,
+  the pipeline this was reviewed for (module parameter amdgpu.dvbridge,
+  default on). Setting it requires max bpc 8, the default colorspace, no
+  HDR metadata, no limited range, no underscan borders or scaling mode, a
+  progressive CTA 1080p/2160p mode at 24-60 Hz, a single connector on the
+  CRTC, and a sink whose EDID (of the sink the new stream is built for,
+  which the stream holds a reference to) has exactly one Dolby VSVDB
+  that advertises Standard DV with the Dolby VSIF: version 2 with
+  interface 2 or 3, or version 1 in its 12-byte form with the
+  low-latency field 1 and display management 4 or later, the version
+  of the metadata user space sends (the other version 1 blocks and
+  version 0 mean the HDMI 1.4b VSIF, which is not sent); with a
+  version 1 block, 2160p50 and 2160p60 only if it advertises 2160p60.
+  An HDMI Forum EEODB may extend the EDID. Kodi applies the same rule.
+  Changing it always forces a full modeset. A CRTC that is off (the
+  display was switched off) sends nothing and is neither checked nor
+  tunnelled, so that turning it off never fails; turning it on again is
+  a modeset, checked then. A stream without a real sink (the fake sink
+  of a connector without a display, as when resuming with the display
+  off) gets no tunnel instead of failing;
+- the stream gets an AVI InfoFrame built with the DRM helpers as i915
+  does (RGB, no colorimetry, full range, CTA VIC, content type from the
+  connector), the Dolby VSIF (only the Dolby Vision signal bit, packed
+  by hdmi_dolby_vendor_infoframe_pack() of the fork) in the vendor slot
+  instead of the HDMI 1.4 VSIF, and DITHER_OPTION_TRUN8: the default for
+  8 bpc is spatial dither, which changes the tunnelled bytes. No FreeSync
+  InfoFrame is sent and the refresh rate never varies;
+- when a commit turns the tunnel on or off, or changes the content type
+  of a tunnelled stream, the new AVI and vendor InfoFrames and the dither
+  option also go with the stream update of the commit: on an unchanged
+  timing (2160p50/60) DC keeps the stream encoder of the old stream
+  (pipe_need_reprogram() compares no InfoFrames) and would not send
+  them, which leaves the sink with tunnel pixels without the Dolby VSIF,
+  or with the Dolby VSIF over ordinary pixels;
+- CRC capture (debugfs), which sets its own dither, leaves a tunnelled
+  stream as it is;
+- every commit of a CRTC with the tunnel is refused unless the scanout is
+  byte exact: RGB 8 bpc full range over TMDS, no DSC, no border, the
+  whole raster unscaled, no CRTC CTM, degamma or gamma LUT and the
+  default regamma TF (which put the output gamma in bypass at commit), no
+  VRR, the primary plane alone (no overlay or cursor), XRGB8888, full
+  screen, unscaled, unrotated, opaque, without plane colour pipeline or
+  AMD plane colour properties, and DC programming bypass for the plane
+  degamma, shaper, 3D LUT, blend, gamut remap and input CSC with an HDR
+  multiplier of 1.
+
+Truncation takes the eight most significant bits, so the formatter's
+dynamic expansion (bits below them) does not change the result and is
+left as it is. With the property at 0 nothing changes.
+
+Not tested on hardware yet.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_display.c   |   7 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h      |   2 +
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 347 +++++++++++++++++-
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   2 +
+ .../drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c |  10 +-
+ .../display/amdgpu_dm/amdgpu_dm_dvbridge.h    | 104 ++++++
+ 6 files changed, 468 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+index f5cd685..830fc91 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_display.c
+@@ -1467,6 +1467,13 @@ int amdgpu_display_modeset_create_props(struct amdgpu_device *adev)
+ 					 "dither",
+ 					 amdgpu_dither_enum_list, sz);
+ 
++	/* Same name and meaning as the i915 property of the Dolby Vision tunnel */
++	adev->mode_info.dvbridge_dv_standard_property =
++		drm_property_create_bool(adev_to_drm(adev), DRM_MODE_PROP_ATOMIC,
++					 "DVBRIDGE_DV_STANDARD_LAB");
++	if (!adev->mode_info.dvbridge_dv_standard_property)
++		return -ENOMEM;
++
+ 	return amdgpu_display_setup_abm_prop(adev);
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index 8069fc4..d01b67d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -328,6 +328,8 @@ struct amdgpu_mode_info {
+ 	struct drm_property *dither_property;
+ 	/* Adaptive Backlight Modulation (power feature) */
+ 	struct drm_property *abm_level_property;
++	/* Dolby Vision Standard tunnel over HDMI, requested by user space */
++	struct drm_property *dvbridge_dv_standard_property;
+ 	/* hardcoded DFP edid from BIOS */
+ 	const struct drm_edid *bios_hardcoded_edid;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 5ba196d..5c205d8 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -83,6 +83,7 @@
+ #include <drm/drm_privacy_screen_consumer.h>
+ #include <drm/display/drm_dp_mst_helper.h>
+ #include <drm/display/drm_hdmi_helper.h>
++#include "amdgpu_dm_dvbridge.h"
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -7620,6 +7621,281 @@ static void apply_dsc_policy_for_stream(struct amdgpu_dm_connector *aconnector,
+ }
+ #endif
+ 
++/*
++ * DOC: Dolby Vision Standard tunnel
++ *
++ * With DVBRIDGE_DV_STANDARD_LAB set on an HDMI connector, user space scans out RGB 8 bpc
++ * pixels that carry YCbCr 4:2:2 12-bit with the Dolby Vision display management metadata in
++ * the chroma LSBs (Dolby Vision Standard, TV-led); the sink rejects them unless they arrive
++ * bit exact next to a Dolby vendor InfoFrame. The property carries the i915 meaning: the
++ * kernel sends the InfoFrames (AVI with the CTA VIC and full range RGB, Dolby VSIF in the
++ * vendor slot) and refuses any configuration whose output is not byte exact: dither,
++ * colour processing, scaling, other planes, VRR, DSC, limited range or deep colour.
++ */
++static bool amdgpu_dm_dvbridge = true;
++module_param_named(dvbridge, amdgpu_dm_dvbridge, bool, 0444);
++MODULE_PARM_DESC(dvbridge,
++		 "Offer DVBRIDGE_DV_STANDARD_LAB, the byte exact RGB 8 bpc Dolby Vision Standard tunnel, on HDMI connectors (default: true)");
++
++/* HDMI InfoFrame to DC: header in hb0-hb2, checksum in sb[0], payload after it. */
++static int amdgpu_dm_dvbridge_infopacket(const u8 *buf, ssize_t len,
++					 struct dc_info_packet *out)
++{
++	if (len < HDMI_INFOFRAME_HEADER_SIZE ||
++	    len - 3 > (ssize_t)sizeof(out->sb))
++		return -EINVAL;
++	memset(out, 0, sizeof(*out));
++	out->hb0 = buf[0];
++	out->hb1 = buf[1];
++	out->hb2 = buf[2];
++	memcpy(out->sb, &buf[3], len - 3);
++	out->valid = true;
++	return 0;
++}
++
++/* The Dolby VSIF this driver builds occupies the vendor slot of the stream. */
++bool amdgpu_dm_dvbridge_stream_active(const struct dc_stream_state *stream)
++{
++	return stream && stream->vsp_infopacket.valid &&
++	       stream->vsp_infopacket.hb0 == HDMI_INFOFRAME_TYPE_VENDOR &&
++	       stream->vsp_infopacket.hb2 == HDMI_DOLBY_VENDOR_INFOFRAME_SIZE &&
++	       stream->vsp_infopacket.sb[1] == 0x46 &&
++	       stream->vsp_infopacket.sb[2] == 0xd0 &&
++	       stream->vsp_infopacket.sb[3] == 0x00;
++}
++
++static int amdgpu_dm_dvbridge_fill_stream(struct drm_connector *connector,
++					  const struct drm_display_mode *mode,
++					  const struct drm_connector_state *con_state,
++					  struct dc_stream_state *stream)
++{
++	u8 buf[HDMI_INFOFRAME_SIZE(DOLBY_VENDOR)];
++	u8 vic = amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode));
++	struct hdmi_dolby_vendor_infoframe dv;
++	struct hdmi_avi_infoframe avi;
++	ssize_t len;
++	bool p60;
++	int ret;
++
++	/*
++	 * The sink this stream is built for, which the stream holds a reference to, must
++	 * advertise Dolby Vision Standard: the connector's EDID can be replaced by a hotplug
++	 * meanwhile, and it is not protected by the locks of an atomic check.
++	 */
++	if (stream->signal == SIGNAL_TYPE_VIRTUAL)
++		return 0; /* no display (a fake sink): nothing receives it, no tunnel is built */
++	if (!stream->sink ||
++	    !amdgpu_dm_dvbridge_edid_standard(stream->sink->dc_edid.raw_edid,
++					      stream->sink->dc_edid.length, &p60))
++		return -EOPNOTSUPP;
++	if (!vic || (mode->flags & DRM_MODE_FLAG_3D_MASK))
++		return -EINVAL;
++	/* 2160p50 and 2160p60 need a sink that advertises Dolby Vision at 2160p60. */
++	if (!p60 && (vic == 96 || vic == 97))
++		return -EINVAL;
++
++	/* RGB is a byte tunnel here, not an RGB colour-managed picture. */
++	ret = drm_hdmi_avi_infoframe_from_display_mode(&avi, connector, mode);
++	if (ret)
++		return ret;
++	drm_hdmi_avi_infoframe_content_type(&avi, con_state);
++	avi.video_code = vic;
++	avi.colorspace = HDMI_COLORSPACE_RGB;
++	avi.colorimetry = HDMI_COLORIMETRY_NONE;
++	avi.extended_colorimetry = 0;
++	avi.quantization_range = HDMI_QUANTIZATION_RANGE_FULL;
++	len = hdmi_avi_infoframe_pack(&avi, buf, sizeof(buf));
++	if (len < 0)
++		return len;
++	ret = amdgpu_dm_dvbridge_infopacket(buf, len, &stream->avi_infopacket);
++	if (ret)
++		return ret;
++
++	/*
++	 * AVI carries the CTA timing, so the vendor slot holds the Dolby VSIF and no
++	 * HDMI 1.4 vendor packet competes with it.
++	 */
++	hdmi_dolby_vendor_infoframe_init(&dv);
++	dv.signal = true;
++	len = hdmi_dolby_vendor_infoframe_pack(&dv, buf, sizeof(buf));
++	if (len < 0)
++		return len;
++	ret = amdgpu_dm_dvbridge_infopacket(buf, len, &stream->vsp_infopacket);
++	if (ret)
++		return ret;
++
++	stream->timing.vic = vic;
++	stream->timing.hdmi_vic = 0;
++	/* Truncate to 8 bits: the default spatial dither would change the tunnelled bytes. */
++	stream->dither_option = DITHER_OPTION_TRUN8;
++	return 0;
++}
++
++static int amdgpu_dm_dvbridge_check_connector(struct amdgpu_dm_connector *aconn,
++					      const struct drm_connector_state *con_state,
++					      struct drm_atomic_commit *state)
++{
++	const struct dm_connector_state *dm_state = to_dm_connector_state(con_state);
++	const struct drm_display_mode *mode;
++	struct drm_crtc_state *crtc_state;
++
++	crtc_state = drm_atomic_get_crtc_state(state, con_state->crtc);
++	if (IS_ERR(crtc_state))
++		return PTR_ERR(crtc_state);
++	if (!crtc_state->active)
++		return 0; /* nothing is sent; enabling the CRTC again is a modeset */
++
++	/* Native TMDS HDMI (the sink's Dolby Vision support is checked on the stream). */
++	if (aconn->base.connector_type != DRM_MODE_CONNECTOR_HDMIA || !aconn->dc_link ||
++	    aconn->dc_link->connector_signal != SIGNAL_TYPE_HDMI_TYPE_A ||
++	    !aconn->base.display_info.has_hdmi_infoframe)
++		return -EOPNOTSUPP;
++	if (con_state->max_requested_bpc != 8 ||
++	    con_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT ||
++	    con_state->hdr_output_metadata ||
++	    con_state->hdmi.broadcast_rgb == DRM_HDMI_BROADCAST_RGB_LIMITED)
++		return -EINVAL;
++	/* Underscan borders and the scaling modes change the scanout or the timing. */
++	if (dm_state->scaling != RMX_OFF ||
++	    (dm_state->underscan_enable &&
++	     (dm_state->underscan_hborder || dm_state->underscan_vborder)))
++		return -EINVAL;
++	mode = &crtc_state->mode;
++	if (!amdgpu_dm_dvbridge_avi_vic(drm_match_cea_mode(mode)) ||
++	    (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN |
++			    DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_3D_MASK)))
++		return -EINVAL;
++	/* A clone would receive the same tunnel. */
++	if (crtc_state->connector_mask != drm_connector_mask(&aconn->base))
++		return -EINVAL;
++	return 0;
++}
++
++/* Refuse colour processing and compositing: never bypass a user setting silently. */
++static int amdgpu_dm_dvbridge_check_scanout(struct drm_atomic_commit *state,
++					    struct drm_crtc *crtc,
++					    struct drm_crtc_state *crtc_state)
++{
++	const struct dm_crtc_state *dm_crtc_state = to_dm_crtc_state(crtc_state);
++	const struct dc_stream_state *stream = dm_crtc_state->stream;
++	const struct drm_plane_state *plane_state;
++	const struct dm_plane_state *dm_plane_state;
++	const struct dc_plane_state *dc_plane;
++	struct drm_plane *primary = crtc->primary;
++	unsigned int w, h;
++
++	if (!crtc_state->active || !amdgpu_dm_dvbridge_stream_active(stream))
++		return 0;
++	w = stream->timing.h_addressable;
++	h = stream->timing.v_addressable;
++
++	/* RGB 8 bpc full range over TMDS, truncated, without output colour processing. */
++	if (stream->signal != SIGNAL_TYPE_HDMI_TYPE_A ||
++	    stream->timing.pixel_encoding != PIXEL_ENCODING_RGB ||
++	    stream->timing.display_color_depth != COLOR_DEPTH_888 ||
++	    stream->timing.flags.INTERLACE || stream->timing.flags.DSC ||
++	    stream->timing.timing_3d_format != TIMING_3D_FORMAT_NONE ||
++	    stream->timing.h_border_left || stream->timing.h_border_right ||
++	    stream->timing.v_border_top || stream->timing.v_border_bottom ||
++	    stream->output_color_space != COLOR_SPACE_SRGB ||
++	    stream->dither_option != DITHER_OPTION_TRUN8 ||
++	    stream->gamut_remap_matrix.enable_remap ||
++	    stream->csc_color_matrix.enable_adjustment ||
++	    stream->hdr_static_metadata.valid || !stream->avi_infopacket.valid)
++		return -EINVAL;
++	/* The whole raster, unscaled (underscan would shrink the destination). */
++	if (stream->src.x || stream->src.y || stream->src.width != w || stream->src.height != h ||
++	    stream->dst.x || stream->dst.y || stream->dst.width != w || stream->dst.height != h)
++		return -EINVAL;
++	/*
++	 * No gamma LUT and the default regamma TF put the output gamma in bypass at commit
++	 * (amdgpu_dm_set_atomic_regamma()).
++	 */
++	if (crtc_state->ctm || crtc_state->degamma_lut || crtc_state->gamma_lut ||
++	    dm_crtc_state->regamma_tf != AMDGPU_TRANSFER_FUNCTION_DEFAULT ||
++	    crtc_state->vrr_enabled ||
++	    dm_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_VARIABLE ||
++	    dm_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_FIXED)
++		return -EINVAL;
++
++	/* The primary plane alone (no overlay, no cursor), full screen, unscaled. */
++	if (crtc_state->plane_mask != drm_plane_mask(primary))
++		return -EINVAL;
++	plane_state = drm_atomic_get_new_plane_state(state, primary);
++	if (!plane_state)
++		plane_state = primary->state; /* unchanged, serialized by this CRTC's lock */
++	if (!plane_state || !plane_state->fb || plane_state->crtc != crtc ||
++	    !plane_state->visible ||
++	    plane_state->fb->format->format != DRM_FORMAT_XRGB8888 ||
++	    plane_state->src_x || plane_state->src_y ||
++	    plane_state->src_w != (w << 16) || plane_state->src_h != (h << 16) ||
++	    plane_state->crtc_x || plane_state->crtc_y ||
++	    plane_state->crtc_w != w || plane_state->crtc_h != h ||
++	    plane_state->rotation != DRM_MODE_ROTATE_0 ||
++	    plane_state->alpha != DRM_BLEND_ALPHA_OPAQUE || plane_state->color_pipeline)
++		return -EINVAL;
++	dm_plane_state = to_dm_plane_state(plane_state);
++	if (dm_plane_state->degamma_lut || dm_plane_state->ctm || dm_plane_state->shaper_lut ||
++	    dm_plane_state->lut3d || dm_plane_state->blend_lut ||
++	    dm_plane_state->degamma_tf != AMDGPU_TRANSFER_FUNCTION_DEFAULT ||
++	    dm_plane_state->shaper_tf != AMDGPU_TRANSFER_FUNCTION_DEFAULT ||
++	    dm_plane_state->blend_tf != AMDGPU_TRANSFER_FUNCTION_DEFAULT ||
++	    dm_plane_state->hdr_mult != AMDGPU_HDR_MULT_DEFAULT)
++		return -EINVAL;
++
++	/* What DC will program for the plane. */
++	dc_plane = dm_plane_state->dc_state;
++	if (!dc_plane || dc_plane->format != SURFACE_PIXEL_FORMAT_GRPH_ARGB8888 ||
++	    dc_plane->in_transfer_func.type != TF_TYPE_BYPASS ||
++	    dc_plane->in_shaper_func.type != TF_TYPE_BYPASS ||
++	    dc_plane->blend_tf.type != TF_TYPE_BYPASS ||
++	    dc_plane->lut3d_func.state.bits.initialized ||
++	    dc_plane->gamut_remap_matrix.enable_remap ||
++	    dc_plane->input_csc_color_matrix.enable_adjustment ||
++	    dc_plane->hdr_mult.value != dc_fixpt_one.value ||
++	    dc_plane->per_pixel_alpha || dc_plane->global_alpha ||
++	    dc_plane->rotation != ROTATION_ANGLE_0 || dc_plane->horizontal_mirror ||
++	    dc_plane->src_rect.x || dc_plane->src_rect.y ||
++	    dc_plane->src_rect.width != w || dc_plane->src_rect.height != h ||
++	    dc_plane->dst_rect.x || dc_plane->dst_rect.y ||
++	    dc_plane->dst_rect.width != w || dc_plane->dst_rect.height != h)
++		return -EINVAL;
++	return 0;
++}
++
++/*
++ * The commit changes the InfoFrames of the tunnel for the connector driven by this CRTC: it
++ * turns the tunnel on or off, or changes the content type of a tunnelled stream.
++ */
++static bool amdgpu_dm_dvbridge_toggled(struct drm_atomic_commit *state, struct drm_crtc *crtc)
++{
++	struct drm_connector_state *old_con_state, *new_con_state;
++	struct drm_connector *connector;
++	int i;
++
++	for_each_oldnew_connector_in_state(state, connector, old_con_state, new_con_state, i) {
++		if (new_con_state->crtc != crtc && old_con_state->crtc != crtc)
++			continue;
++		if (to_dm_connector_state(old_con_state)->dvbridge_dv_standard !=
++		    to_dm_connector_state(new_con_state)->dvbridge_dv_standard)
++			return true;
++		if (to_dm_connector_state(new_con_state)->dvbridge_dv_standard &&
++		    old_con_state->content_type != new_con_state->content_type)
++			return true;
++	}
++	return false;
++}
++
++/*
++ * The byte exact path was reviewed for the DCN 3.x pipeline (DPP3, MPC3, OPP); DCE and DCN
++ * 1/2 have other blocks, and DCN 4 adds scaler sharpening (SPL, ISHARP).
++ */
++static bool amdgpu_dm_dvbridge_dcn_reviewed(const struct amdgpu_device *adev)
++{
++	return adev->dm.dc && adev->dm.dc->ctx->dce_version >= DCN_VERSION_3_0 &&
++	       adev->dm.dc->ctx->dce_version < DCN_VERSION_4_01;
++}
++
+ static struct dc_stream_state *
+ create_stream_for_sink(struct drm_connector *connector,
+ 		       const struct drm_display_mode *drm_mode,
+@@ -8002,6 +8278,13 @@ int amdgpu_dm_connector_atomic_set_property(struct drm_connector *connector,
+ 	} else if (property == adev->mode_info.underscan_property) {
+ 		dm_new_state->underscan_enable = val;
+ 		ret = 0;
++	} else if (property == adev->mode_info.dvbridge_dv_standard_property) {
++		if (val > 1 || connector->connector_type != DRM_MODE_CONNECTOR_HDMIA)
++			return -EINVAL;
++		if (val && !amdgpu_dm_dvbridge)
++			return -EOPNOTSUPP;
++		dm_new_state->dvbridge_dv_standard = val;
++		ret = 0;
+ 	} else if (property == adev->mode_info.abm_level_property) {
+ 		switch (val) {
+ 		case ABM_SYSFS_CONTROL:
+@@ -8058,6 +8341,9 @@ int amdgpu_dm_connector_atomic_get_property(struct drm_connector *connector,
+ 	} else if (property == adev->mode_info.underscan_property) {
+ 		*val = dm_state->underscan_enable;
+ 		ret = 0;
++	} else if (property == adev->mode_info.dvbridge_dv_standard_property) {
++		*val = dm_state->dvbridge_dv_standard;
++		ret = 0;
+ 	} else if (property == adev->mode_info.abm_level_property) {
+ 		if (!dm_state->abm_sysfs_forbidden)
+ 			*val = ABM_SYSFS_CONTROL;
+@@ -8714,10 +9000,13 @@ amdgpu_dm_connector_atomic_check(struct drm_connector *conn,
+ 	struct drm_crtc *crtc = new_con_state->crtc;
+ 	struct drm_crtc_state *new_crtc_state;
+ 	struct amdgpu_dm_connector *aconn = to_amdgpu_dm_connector(conn);
++	struct dm_connector_state *dm_old_con_state, *dm_new_con_state;
+ 	int ret;
+ 
+ 	if (WARN_ON(unlikely(!old_con_state || !new_con_state)))
+ 		return -EINVAL;
++	dm_old_con_state = to_dm_connector_state(old_con_state);
++	dm_new_con_state = to_dm_connector_state(new_con_state);
+ 
+ 	trace_amdgpu_dm_connector_atomic_check(new_con_state);
+ 
+@@ -8727,8 +9016,26 @@ amdgpu_dm_connector_atomic_check(struct drm_connector *conn,
+ 			return ret;
+ 	}
+ 
+-	if (!crtc)
++	if (!crtc) {
++		/* A disabled connector drops the Dolby Vision tunnel request. */
++		dm_new_con_state->dvbridge_dv_standard = false;
+ 		return 0;
++	}
++
++	if (dm_new_con_state->dvbridge_dv_standard != dm_old_con_state->dvbridge_dv_standard) {
++		new_crtc_state = drm_atomic_get_crtc_state(state, crtc);
++		if (IS_ERR(new_crtc_state))
++			return PTR_ERR(new_crtc_state);
++
++		/* The InfoFrames, dither and colour path change only with a full modeset. */
++		new_crtc_state->mode_changed = true;
++	}
++
++	if (dm_new_con_state->dvbridge_dv_standard) {
++		ret = amdgpu_dm_dvbridge_check_connector(aconn, new_con_state, state);
++		if (ret)
++			return ret;
++	}
+ 
+ 	if (new_con_state->privacy_screen_sw_state != old_con_state->privacy_screen_sw_state) {
+ 		new_crtc_state = drm_atomic_get_crtc_state(state, crtc);
+@@ -9509,6 +9816,12 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ 		drm_connector_attach_content_type_property(&aconnector->base);
+ 	}
+ 
++	if (connector_type == DRM_MODE_CONNECTOR_HDMIA && amdgpu_dm_dvbridge &&
++	    adev->mode_info.dvbridge_dv_standard_property &&
++	    amdgpu_dm_dvbridge_dcn_reviewed(adev))
++		drm_object_attach_property(&aconnector->base.base,
++					   adev->mode_info.dvbridge_dv_standard_property, 0);
++
+ 	if (connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+ 		if (!drm_mode_create_hdmi_colorspace_property(&aconnector->base, supported_colorspaces))
+ 			drm_connector_attach_colorspace_property(&aconnector->base);
+@@ -10703,6 +11016,18 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_commit *state,
+ 			bundle->stream_update.dst = acrtc_state->stream->dst;
+ 		}
+ 
++		/*
++		 * The Dolby Vision tunnel changes the AVI and vendor InfoFrames of the new stream.
++		 * On an unchanged timing (2160p50/60) DC keeps the stream encoder of the old one
++		 * (pipe_need_reprogram() compares no InfoFrames): send them with the update.
++		 */
++		if (amdgpu_dm_dvbridge_toggled(state, pcrtc)) {
++			bundle->stream_update.avi_infopacket = &acrtc_state->stream->avi_infopacket;
++			bundle->stream_update.vsp_infopacket = &acrtc_state->stream->vsp_infopacket;
++			/* explicit, not a side effect of the planes being enabled again */
++			bundle->stream_update.dither_option = &acrtc_state->stream->dither_option;
++		}
++
+ 		if (new_pcrtc_state->color_mgmt_changed) {
+ 			/*
+ 			 * TODO: This isn't fully correct since we've actually
+@@ -12042,7 +12367,9 @@ static void get_freesync_config_for_crtc(
+ 
+ 	aconnector = to_amdgpu_dm_connector(new_con_state->base.connector);
+ 
+-	new_crtc_state->vrr_supported = new_con_state->freesync_capable &&
++	/* The Dolby Vision tunnel sends no FreeSync InfoFrame and never varies the refresh rate. */
++	new_crtc_state->vrr_supported = !new_con_state->dvbridge_dv_standard &&
++					new_con_state->freesync_capable &&
+ 					vrefresh >= aconnector->min_vfreq &&
+ 					vrefresh <= aconnector->max_vfreq;
+ 
+@@ -12210,6 +12537,13 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 		if (ret)
+ 			goto fail;
+ 
++		if (dm_new_conn_state->dvbridge_dv_standard && new_crtc_state->active) {
++			ret = amdgpu_dm_dvbridge_fill_stream(connector, &new_crtc_state->mode,
++							     drm_new_conn_state, new_stream);
++			if (ret)
++				goto fail;
++		}
++
+ 		/*
+ 		 * If we already removed the old stream from the context
+ 		 * (and set the new stream to NULL) then we can't reuse
+@@ -13492,6 +13826,15 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 		goto fail;
+ 	}
+ 
++	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
++		ret = amdgpu_dm_dvbridge_check_scanout(state, crtc, new_crtc_state);
++		if (ret) {
++			drm_dbg_atomic(dev, "[CRTC:%d:%s] Dolby Vision tunnel refused: scanout not byte exact\n",
++				       crtc->base.id, crtc->name);
++			goto fail;
++		}
++	}
++
+ 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+ 		if (dm_new_crtc_state->mpo_requested)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index 797f944..9e36821 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -1063,6 +1063,8 @@ struct dm_connector_state {
+ 	uint8_t abm_level;
+ 	int vcpi_slots;
+ 	uint64_t pbn;
++	/* DVBRIDGE_DV_STANDARD_LAB: Dolby Vision Standard tunnel requested */
++	bool dvbridge_dv_standard;
+ };
+ 
+ #define to_dm_connector_state(x)\
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+index 88f7cfe..50fc834 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c
+@@ -34,6 +34,7 @@
+ #include "amdgpu_dm_psr.h"
+ #include "amdgpu_dm_replay.h"
+ #include "amdgpu_dm_kunit_helpers.h"
++#include "amdgpu_dm_dvbridge.h"
+ 
+ static const char *const pipe_crc_sources[] = {
+ 	"none",
+@@ -550,8 +551,13 @@ int amdgpu_dm_crtc_configure_crc_source(struct drm_crtc *crtc,
+ 		}
+ 	}
+ 
+-	/* Configure dithering */
+-	if (!dm_need_crc_dither(source)) {
++	/*
++	 * Configure dithering, never on a Dolby Vision tunnel: its bytes must stay exact (it keeps
++	 * its truncation to 8 bits).
++	 */
++	if (amdgpu_dm_dvbridge_stream_active(stream_state)) {
++		/* leave the tunnel as it is */
++	} else if (!dm_need_crc_dither(source)) {
+ 		dc_stream_set_dither_option(stream_state, DITHER_OPTION_TRUN8);
+ 		dc_stream_set_dyn_expansion(stream_state->ctx->dc, stream_state,
+ 					    DYN_EXPANSION_DISABLE);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
+new file mode 100644
+index 0000000..da3ff6e
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_dvbridge.h
+@@ -0,0 +1,104 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Dolby Vision Standard (TV-led) RGB 8 bpc tunnel over HDMI: sink and mode policy.
++ * No hardware accesses here. Passing this policy is not a Dolby Vision colour or
++ * fidelity validation: user space packs the pixels and the per-frame metadata.
++ *
++ * Adapted for amdgpu from intel_dv_lab_policy.h of the Intel Dolby Vision LibreELEC fork
++ * (github.com/CroqueMr/intel-dv-libreelec, MIT).
++ */
++#ifndef __AMDGPU_DM_DVBRIDGE_H__
++#define __AMDGPU_DM_DVBRIDGE_H__
++
++#include <linux/types.h>
++
++struct dc_stream_state;
++
++/* The stream carries the Dolby Vision tunnel (its vendor slot holds the Dolby VSIF). */
++bool amdgpu_dm_dvbridge_stream_active(const struct dc_stream_state *stream);
++
++/*
++ * An EDID with exactly one Dolby VSVDB that advertises Standard (TV-led) DV with the Dolby VSIF:
++ * version 2 with interface 2 or 3, or version 1 in its 12-byte form with the low-latency field 1
++ * (Standard and low latency) and display management 4 or later, the version of the metadata user
++ * space sends. The field 0, the 15-byte version 1 form and version 0 mean the HDMI 1.4b vendor
++ * InfoFrame, which this tunnel does not send. *p60: the sink takes it at 2160p50 and 2160p60,
++ * always with version 2. Kodi reads the EDID with the same rule.
++ */
++static inline bool amdgpu_dm_dvbridge_edid_standard(const u8 *edid, size_t size, bool *p60)
++{
++	static const u8 magic[8] = {0, 255, 255, 255, 255, 255, 255, 0};
++	unsigned int block, i, found = 0;
++	bool standard = false;
++
++	*p60 = false;
++	/* An HDMI Forum EEODB makes the EDID longer than its base block's extension count. */
++	if (!edid || size < 128 || size % 128 || size < ((size_t)edid[126] + 1) * 128)
++		return false;
++	for (i = 0; i < 8; i++)
++		if (edid[i] != magic[i])
++			return false;
++	for (block = 0; block < size / 128; block++) {
++		const u8 *b = edid + block * 128;
++		unsigned int end, pos;
++		u8 sum = 0;
++
++		for (i = 0; i < 128; i++)
++			sum += b[i];
++		if (sum)
++			return false;
++		if (!block || b[0] != 0x02 || b[1] < 3)
++			continue;
++		end = b[2];
++		if (!end)
++			continue;
++		if (end < 4 || end > 127)
++			return false;
++		for (pos = 4; pos < end;) {
++			unsigned int len = b[pos] & 31;
++			const u8 *data = b + pos + 1;
++
++			if (pos + len + 1 > end)
++				return false;
++			/* Extended vendor-specific video block, little-endian Dolby OUI */
++			if ((b[pos] >> 5) == 7 && len >= 4 && data[0] == 1 &&
++			    data[1] == 0x46 && data[2] == 0xd0 && data[3] == 0) {
++				if (++found != 1 || len < 11)
++					return false;
++				switch (data[4] >> 5) {
++				case 2:
++					/* VSVDB v2 interface 2 or 3 advertises Standard DV */
++					standard = (data[6] & 3) >= 2;
++					*p60 = true;
++					break;
++				case 1:
++					standard = len == 11 && (data[7] & 3) == 1 &&
++						   ((data[4] >> 2) & 7) >= 2;
++					*p60 = data[4] & 2;
++					break;
++				default:
++					return false;
++				}
++			}
++			pos += len + 1;
++		}
++	}
++	return found == 1 && standard;
++}
++
++/*
++ * CTA 1080p and 2160p at 24, 25, 30, 50 and 60 Hz (fractional clocks included): the AVI
++ * InfoFrame carries the timing because the vendor slot carries the Dolby VSIF.
++ */
++static inline u8 amdgpu_dm_dvbridge_avi_vic(u8 cea_vic)
++{
++	switch (cea_vic) {
++	case 16: case 31: case 32: case 33: case 34:
++	case 93: case 94: case 95: case 96: case 97:
++		return cea_vic;
++	default:
++		return 0;
++	}
++}
++
++#endif
+-- 
+2.53.0
+

@@ -119,6 +119,15 @@ else
   PKG_FFMPEG_AV1="--disable-libdav1d"
 fi
 
+post_patch() {
+  # Hades: a separate decoder for H.264 MVC (stereoscopic 3D, as on Blu-ray 3D), named h264_mvc: copies of
+  # the sources of the stock decoder with the multiview series applied to them. The stock decoder is not
+  # touched (h264-mvc/twin.sh says how). The build files learn about it from a patch of the project.
+  if [ "${PROJECT}" = "Generic" ]; then
+    bash ${PKG_DIR}/h264-mvc/twin.sh ${PKG_BUILD} ${PKG_DIR}/h264-mvc
+  fi
+}
+
 pre_configure_target() {
   cd ${PKG_BUILD}
   rm -rf .${TARGET_NAME}

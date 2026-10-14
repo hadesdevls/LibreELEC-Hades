@@ -1,0 +1,311 @@
+From df5c6f8304d8ace557291860387215d856f7cd46 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Fri, 31 Jul 2026 21:32:19 +0100
+Subject: [PATCH 11/18] avcodec/h264dec: output both views of an access unit
+ together
+
+Both views of an access unit share a POC, so running the reordering logic for
+each of them separately would be meaningless. Drive reordering from the base
+view alone and hold a dependent view picture until the base view picture it is
+paired with leaves the reorder buffer, then emit it immediately after.
+
+A dependent picture is released when its base partner *leaves* the reorder
+buffer rather than when it is output, because the base also leaves when it is
+discarded as out of order or unrecovered, and dependents left behind then
+accumulate until the DPB runs dry.
+
+A view the caller did not ask for is decoded -- a dependent view needs the views
+below it -- but must not be output, and that has to be checked for the base view
+as well, or asking for a dependent view alone yields both. finalize_frame() is
+the one place that covers both views and the frames released at end of stream.
+
+Signed-off-by: Dom Cobley <popcornmix@gmail.com>
+---
+ libavcodec/h264_picture.c |  2 ++
+ libavcodec/h264_slice.c   | 58 +++++++++++++++++++++++++++++++-
+ libavcodec/h264dec.c      | 70 +++++++++++++++++++++++++++++++++++++++
+ libavcodec/h264dec.h      | 21 ++++++++++++
+ 4 files changed, 150 insertions(+), 1 deletion(-)
+
+diff --git a/libavcodec/h264_picture.c b/libavcodec/h264_picture.c
+index a37fb1b2ed4..539b9d3fade 100644
+--- a/libavcodec/h264_picture.c
++++ b/libavcodec/h264_picture.c
+@@ -99,6 +99,8 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
+     dst->gray          = src->gray;
+     dst->invalid_gap   = src->invalid_gap;
+     dst->sei_recovery_frame_cnt = src->sei_recovery_frame_cnt;
++    dst->view_id       = src->view_id;
++    dst->base_view_pic = src->base_view_pic;
+     dst->mb_width      = src->mb_width;
+     dst->mb_height     = src->mb_height;
+     dst->mb_stride     = src->mb_stride;
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index adb3c5c43ae..4d7b137a595 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -199,6 +199,18 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
+             return ret;
+     }
+ 
++    /* Add the view ID side data before the buffer is allocated, so that it is
++     * visible to get_buffer(). Only nontrivial multiview streams are tagged. */
++    if (h->nb_views > 1) {
++        AVFrameSideData *sd = av_frame_side_data_new(&pic->f->side_data,
++                                                     &pic->f->nb_side_data,
++                                                     AV_FRAME_DATA_VIEW_ID,
++                                                     sizeof(int), 0);
++        if (!sd)
++            return AVERROR(ENOMEM);
++        *(int*)sd->data = pic->view_id;
++    }
++
+     pic->tf.f = pic->f;
+     ret = ff_thread_get_ext_buffer(h->avctx, &pic->tf,
+                                    pic->reference ? AV_GET_BUFFER_FLAG_REF : 0);
+@@ -546,6 +558,9 @@ static int h264_frame_start(H264Context *h)
+     pic->reference              = h->droppable ? 0 : h->picture_structure;
+     pic->field_picture          = h->picture_structure != PICT_FRAME;
+     pic->frame_num               = h->poc.frame_num;
++    pic->view_id                = (h->cur_view < h->nb_view_ids_available) ?
++                                  h->view_ids_available[h->cur_view] : 0;
++    pic->base_view_pic          = -1;
+     /*
+      * Zero key_frame here; IDR markings per slice in frame or fields are ORed
+      * in later.
+@@ -612,7 +627,11 @@ static int h264_frame_start(H264Context *h)
+ 
+     h->cur_pic_ptr->field_poc[0] = h->cur_pic_ptr->field_poc[1] = INT_MAX;
+ 
+-    h->next_output_pic = NULL;
++    /* Output selection is driven by the base view, whose picture starts first in
++     * an access unit; a dependent view starting afterwards must not discard the
++     * selection made for it. */
++    if (!h->cur_view)
++        h->next_output_pic = NULL;
+ 
+     h->postpone_filter = 0;
+ 
+@@ -1339,6 +1358,27 @@ static int h264_init_ps(H264Context *h, const H264SliceContext *sl, int first_sl
+     }
+     h->avctx->chroma_sample_location = sps->vui.chroma_location;
+ 
++    /* The subset SPS that declares the views need not be available when the first
++     * slice arrives -- in mp4 and Matroska it is carried in band rather than in
++     * extradata -- so pick it up whenever it appears. This deliberately does not
++     * force a context reinit: doing so would flush the DPB and change base view
++     * output. The consequence is that a caller which selects views from its
++     * get_format() callback only sees views that were already known by then;
++     * setting view_ids up front always works. */
++    if (!h->cur_view && first_slice) {
++        const SPS *mvc_sps = find_mvc_sps(h->avctx, &h->ps);
++
++        if (mvc_sps != h->mvc_sps) {
++            h->mvc_sps = mvc_sps;
++            ret = export_multiview(h, mvc_sps);
++            if (ret < 0)
++                return ret;
++            ret = setup_multiview(h, mvc_sps);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
+     if (!h->context_initialized || must_reinit || needs_reinit) {
+         int flush_changes = h->context_initialized;
+         const SPS *mvc_sps = find_mvc_sps(h->avctx, &h->ps);
+@@ -1520,6 +1560,16 @@ static int h264_select_output_frame(H264Context *h)
+     cur->mmco_reset = h->mmco_reset;
+     h->mmco_reset = 0;
+ 
++    /* Both views of an access unit share a POC, so running the reordering logic
++     * for each of them would be meaningless. Reordering is driven by the base
++     * view alone; a dependent view picture is held until the base view picture it
++     * is paired with is output, and then emitted alongside it. */
++    if (h->cur_view) {
++        if (cur->reference == 0)
++            cur->reference = DELAYED_PIC_REF;
++        return 0;
++    }
++
+     if (sps->bitstream_restriction_flag ||
+         h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT) {
+         h->avctx->has_b_frames = FFMAX(h->avctx->has_b_frames, sps->num_reorder_frames);
+@@ -1577,6 +1627,7 @@ static int h264_select_output_frame(H264Context *h)
+ 
+     if (out_of_order || pics > h->avctx->has_b_frames) {
+         out->reference &= ~DELAYED_PIC_REF;
++        h->pending_pair_pic = out;
+         for (i = out_idx; h->delayed_pic[i]; i++)
+             h->delayed_pic[i] = h->delayed_pic[i + 1];
+     }
+@@ -1894,6 +1945,11 @@ static int h264_field_start(H264Context *h, const H264SliceContext *sl,
+ 
+     h->views[h->cur_view].cur_pic_ptr = h->cur_pic_ptr;
+ 
++    /* Pair a dependent view picture with the base view picture of the same access
++     * unit, so that the two can be output together. */
++    h->cur_pic_ptr->base_view_pic = (h->cur_view && h->views[0].cur_pic_ptr) ?
++                                    h->views[0].cur_pic_ptr - h->DPB : -1;
++
+     h->cur_pic_ptr->f->flags |= AV_FRAME_FLAG_KEY * !!(ff_h264_nal_is_idr(nal));
+ 
+     if (ff_h264_nal_is_idr(nal)) {
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+index 30a7331b834..71e3ff75ddd 100644
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -1005,6 +1005,17 @@ static int finalize_frame(H264Context *h, H264Picture *out)
+     AVFrame *dst = h->output_frame;
+     int ret;
+ 
++    /* A view the caller did not ask for is decoded -- a dependent view needs the
++     * views below it -- but not output. This has to be checked for the base view
++     * too, which is otherwise emitted even when only a dependent view was
++     * requested. */
++    if (h->nb_views > 1) {
++        int voidx = ff_h264_view_idx(h, out->view_id);
++
++        if (voidx < 0 || !(h->views_active_output & (1 << voidx)))
++            return 0;
++    }
++
+     if (((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
+          (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
+          out->recovered)) {
+@@ -1062,6 +1073,52 @@ static int finalize_frame(H264Context *h, H264Picture *out)
+     return 0;
+ }
+ 
++/**
++ * Resolve the dependent view pictures paired with a base view picture that has
++ * left the reorder buffer.
++ *
++ * The hold keeping them alive is dropped either way; they are additionally output
++ * if the base view picture they belong to is itself being output. Both views of an
++ * access unit share a POC and are presented together, so a dependent view picture
++ * follows its base view partner immediately.
++ */
++static int resolve_view_pair(H264Context *h, H264Picture *base, int output)
++{
++    if (!base || h->nb_views < 2)
++        return 0;
++
++    for (int i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
++        H264Picture *dep = &h->DPB[i];
++
++        if (!dep->f->buf[0] || dep->base_view_pic < 0 ||
++            &h->DPB[dep->base_view_pic] != base)
++            continue;
++
++        dep->base_view_pic = -1;
++        dep->reference    &= ~DELAYED_PIC_REF;
++
++        if (output) {
++            int ret;
++
++            dep->recovered |= base->recovered;
++            /* Both views of an access unit are presented together, so the
++             * dependent view picture is timed by its base view partner. It
++             * cannot time itself: in a stream whose packets do not start on an
++             * access unit boundary it is decoded from the packet after the one
++             * its access unit began in, and would take that packet's
++             * timestamps. */
++            dep->f->pts      = base->f->pts;
++            dep->f->pkt_dts  = base->f->pkt_dts;
++            dep->f->duration = base->f->duration;
++            ret = finalize_frame(h, dep);
++            if (ret < 0)
++                return ret;
++        }
++    }
++
++    return 0;
++}
++
+ /**
+  * Push every picture still held for reordering onto the output fifo.
+  */
+@@ -1097,9 +1154,14 @@ static int send_delayed_frames(H264Context *h)
+             ret = finalize_frame(h, out);
+             if (ret < 0)
+                 return ret;
++            ret = resolve_view_pair(h, out, 1);
++            if (ret < 0)
++                return ret;
+         }
+     }
+ 
++    h->pending_pair_pic = NULL;
++
+     return 0;
+ }
+ 
+@@ -1166,10 +1228,18 @@ static int h264_decode_packet(AVCodecContext *avctx, AVPacket *avpkt)
+                 return ret;
+         }
+ 
++        /* A base view picture that left the reorder buffer without being output
++         * still has to let go of its dependent views, or they accumulate in the
++         * DPB until it runs dry. */
++        ret = resolve_view_pair(h, h->pending_pair_pic,
++                                h->pending_pair_pic == h->next_output_pic);
++        h->pending_pair_pic = NULL;
+         /* Handed over; the hold release_unused_pictures() keeps on it must end
+          * here, or the next packet's frame_start() sees a stale pointer and
+          * leaves the picture occupying a DPB slot for another access unit. */
+         h->next_output_pic = NULL;
++        if (ret < 0)
++            return ret;
+     }
+ 
+     ff_h264_unref_picture(&h->last_pic_for_ec);
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+index 5cf976acdfe..48eabb401f2 100644
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -155,6 +155,14 @@ typedef struct H264Picture {
+ 
+     const PPS   *pps;
+ 
++    /** MVC view_id of this picture; 0 for a stream that is not multiview */
++    int view_id;
++    /**
++     * For a dependent view picture, the DPB index of the base view picture of the
++     * same access unit, else -1. Used to pair the views up at output time.
++     */
++    int base_view_pic;
++
+     int mb_width, mb_height;
+     int mb_stride;
+ 
+@@ -597,6 +605,13 @@ typedef struct H264Context {
+      * @name MVC (H.264 Annex H) multiview state
+      * @{
+      */
++    /**
++     * The subset SPS whose MVC extension declared the current view list, used
++     * only to notice when it appears or changes. Borrowed, never dereferenced
++     * after the fact.
++     */
++    const SPS *mvc_sps;
++
+     /** Per-view decoding state, indexed by view order index (VOIdx). */
+     H264ViewContext views[H264_MAX_MVC_VIEWS];
+ 
+@@ -613,6 +628,12 @@ typedef struct H264Context {
+      * layer only fills AVFrame.pkt_dts in for the decode() callback.
+      */
+     int64_t pkt_dts;
++    /**
++     * The base view picture that most recently left the reorder buffer, and whose
++     * paired dependent view pictures therefore need resolving: output alongside it
++     * if it is being output, dropped with it otherwise.
++     */
++    H264Picture *pending_pair_pic;
+     /**
+      * Number of views in the active subset SPS, or 0 if the stream is not
+      * multiview (or its MVC extension is unsupported).
+-- 
+2.53.0
+

@@ -1,0 +1,125 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:55:07 +0000
+Subject: [PATCH] avcodec/h264: wait for the dependent view of the packet that
+ turns it on
+
+With frame threads, decoding of the next packet may start once the
+last NAL unit that it depends on has been reached. get_last_needed_nal()
+looks for that unit before the packet is decoded, and passes over the
+slices of a dependent view while views_active_decode says that only the
+base view is decoded.
+
+views_active_decode is what the packets before this one left. Where a
+stream brings its second view after the decoder has decoded packets
+without one, the packet that brings it holds the subset SPS and the
+first slices of the dependent view: h264_init_ps() decides the views
+again at the first slice of the base view, in the middle of that packet
+(it exports them, lets the caller choose in get_format() and sets them
+up). Setup had been declared finished at that slice, the first slice of
+the dependent view could not start its picture ("Too many views"), and
+the second view of that access unit was not decoded. The pictures
+predicted from it were then decoded from a reference that is missing,
+and came out wrong without a word, until the next picture of that view
+that refers to nothing before it.
+
+A stream whose first packet has both views is not touched by this (the
+context starts with no view decided, and the slices are counted). A 3D
+disc can do it: its second view is read from a clip of its own, and the
+first pictures of a title can reach the decoder without it.
+
+The slices of a dependent view are now counted when this packet is one
+in which the views are decided again: only the base view is decoded, and
+the subset SPS that declares the views is not the one that they were
+last decided with, which is the condition of h264_init_ps(). That subset
+SPS is found as find_mvc_sps() finds it: the one that the PPS of the
+first slice of the base view of the packet resolves to, when it declares
+views, else the first one in the list that does. What the caller
+chooses there cannot be known beforehand; where it chooses the base view
+alone, setup is declared finished when the packet has been decoded, once
+for each thread, and nothing else changes.
+
+With one thread or slice threads nothing changes: the unit is not looked
+for.
+
+Measured with the series as of 2026-10-14, carried to FFmpeg 9.0.2, and
+a stream of 75 access units made of three copies of a stream of two
+views, the second view of the first 25 taken out with its subset SPS.
+Without this change, with eight frame threads, the decoder says "Too
+many views" once and "Missing reference picture" for four slices, gives
+no second view for unit 25 and ten wrong ones after it. With it, from
+unit 25 on, it gives the pictures of the decode of the whole stream, as
+it does with one thread and with slice threads.
+---
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -545,6 +545,56 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
+         FF_HW_SIMPLE_CALL(avctx, flush);
+ }
+ 
++/**
++ * Whether the views are decided again while this packet is decoded, and a
++ * dependent view can be turned on by it. h264_init_ps() does that at the first
++ * slice of the base view when the subset SPS that declares the views is not
++ * the one that they were last decided with (the parameter sets of this packet
++ * were parsed before this is asked): it exports the views, lets the caller
++ * choose among them in get_format(), and sets them up. What the caller will
++ * choose cannot be known here.
++ *
++ * The subset SPS is found as find_mvc_sps() in h264_slice.c finds it: the one
++ * that the PPS of that slice resolves to, when it declares views, else the
++ * first one in the list that does.
++ */
++static int dependent_view_may_start(const H264Context *h)
++{
++    const SPS *sps = NULL;
++
++    if (h->views_active_decode != 1 || h->avctx->hwaccel)
++        return 0;
++
++    for (int i = 0; i < h->pkt.nb_nals; i++) {
++        const H2645NAL *nal = &h->pkt.nals[i];
++        GetBitContext gb;
++        unsigned pps_id;
++
++        if (nal->type != H264_NAL_SLICE && nal->type != H264_NAL_IDR_SLICE)
++            continue;
++        if (init_get_bits8(&gb, nal->data + 1, nal->size - 1) < 0)
++            break;
++        get_ue_golomb_long(&gb);    // first_mb_in_slice
++        get_ue_golomb_31(&gb);      // slice_type
++        pps_id = get_ue_golomb(&gb);
++        if (pps_id < MAX_PPS_COUNT)
++            sps = ff_h264_pps_sps_mvc(&h->ps, h->ps.pps_list[pps_id]);
++        break;
++    }
++    if (!sps || sps->mvc.num_views < 2) {
++        sps = NULL;
++        for (int i = 0; i < MAX_SPS_COUNT; i++) {
++            const SPS *s = h->ps.subset_sps_list[i];
++
++            if (s && s->mvc.num_views > 1) {
++                sps = s;
++                break;
++            }
++        }
++    }
++    return sps && sps != h->mvc_sps;
++}
++
+ static int get_last_needed_nal(H264Context *h)
+ {
+     int nals_needed = 0;
+@@ -567,7 +617,11 @@ static int get_last_needed_nal(H264Context *h)
+             nals_needed = i;
+             break;
+         case H264_NAL_EXTEN_SLICE:
+-            if (h->views_active_decode == 1)
++            /* A dependent view that is not decoded is not waited for, unless
++             * this is the packet that may turn it on: views_active_decode is
++             * what the packets before this one left, and the first slice of
++             * the base view of this one can change it. */
++            if (h->views_active_decode == 1 && !dependent_view_may_start(h))
+                 break;
+             /* the MVC NAL unit header has already been consumed by the NAL parser,
+              * so the slice header starts three bytes further in */
