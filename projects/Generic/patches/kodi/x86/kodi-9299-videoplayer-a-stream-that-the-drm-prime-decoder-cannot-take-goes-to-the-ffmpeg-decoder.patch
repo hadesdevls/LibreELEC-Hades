@@ -1,0 +1,440 @@
+From fd5230959d4233c489c4f82d0a03ce04425e4066 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:10:18 +0000
+Subject: [PATCH] VideoPlayer: a stream that the DRM PRIME decoder cannot take
+ goes to the FFmpeg decoder
+
+Where no decoder of the build decodes to DRM PRIME in hardware (the
+Generic x86 image), CDVDVideoCodecDRMPRIME decodes in software into
+8-bit pictures only. For a stream of more bits its get_format() finds no
+format, FFmpeg refuses every packet (EPERM), AddData() says "send it
+again", and VideoPlayer sent the same packet for ever, with no picture.
+Open() declined such a stream from its hints, but the hints can be
+wrong: a transport stream that is joined live is opened without
+avformat_find_stream_info(), and a 10-bit HEVC channel then has a hint
+of 8 bits and no profile (the hint that the VAAPI bit-depth fix no
+longer trusts). With "Allow using DRM PRIME decoder" on, such a channel
+never showed a picture.
+
+The format that the decoder offers now decides, whatever the hints said
+(CDRMPRIMEHandBack):
+- get_format() refuses: AddData() leaves every packet with VideoPlayer,
+  and GetPicture() answers the new VC_HANDBACK;
+- VideoPlayer then opens the stream again with CODEC_HANDED_BACK, which
+  the factory reads as "no platform decoder": CDVDVideoCodecFFmpeg takes
+  it, with VAAPI where it is on, as with DRM PRIME off. Only a platform
+  decoder hands a stream back and none is tried for one handed back, so
+  it happens once per opening and cannot loop (as VC_REOPEN gives a
+  failed hardware decoder's stream to the software one);
+- so that the next decoder starts where this one started, VideoPlayer
+  keeps the packets that the DRM PRIME decoder took until it has taken a
+  format (its converge count, which was 0: up to 300, as
+  CDVDVideoCodecFFmpeg keeps them since a key frame), sends them again
+  ahead of the one it put back, and drops them once the decoder keeps
+  none. That last line changes nothing for the other decoders:
+  CDVDVideoCodecFFmpeg's count is never 0 after a packet, and the
+  others' always is, with nothing kept.
+Open() still declines what its hints say is of more bits, and now also
+a hint of 8 bits with a profile of more (HEVC Main 10, H.264 High 10,
+VP9 profile 2 or 3), which it took before.
+
+A format refused after one was taken (a stream that changes to more
+bits on the way) has no packets kept: the FFmpeg decoder gives pictures
+from the next key frame on.
+
+Host test (handback_test.cpp: FFmpeg 9.0.2's own decoders under a model
+of VideoPlayer's video thread and of the decoder's AddData() and
+GetPicture(), with the gate and the rule of the tree): the 10-bit HEVC
+transport stream opened without stream info (hint 8 bits, no profile)
+is taken by Open(), refused by get_format(), handed back once, and gives
+the 96 pictures of a decoder fed from the start, the same and in order,
+with 32 threads (one packet kept and sent again) and with one; the tree
+before sends one packet more than 1000 times with no picture. The same
+stream in Matroska is declined by Open(). An 8-bit H.264 stream stays
+with the DRM PRIME decoder, with every picture and nothing kept.
+engine_test checks the rule and the gate (456 checks); 11 mutations of
+them make it fail, and 3 of the gate make the hand-back test fail.
+---
+ .../VideoPlayer/DVDCodecs/DVDFactoryCodec.cpp |  4 +-
+ .../DVDCodecs/Video/DRMPRIMEHandBack.h        | 64 +++++++++++++++++++
+ .../DVDCodecs/Video/DVDVideoCodec.h           |  4 +-
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp | 42 ++++++++++--
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |  5 ++
+ .../DVDCodecs/Video/DVPlaybackPolicy.h        | 14 ++--
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h        |  2 +
+ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp   | 37 +++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayerVideo.h     |  1 +
+ 9 files changed, 160 insertions(+), 13 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.cpp
+index 71373a9..8e7d09c 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.cpp
+@@ -98,8 +98,8 @@ std::unique_ptr<CDVDVideoCodec> CDVDFactoryCodec::CreateVideoCodec(CDVDStreamInf
+     pCodec = std::make_unique<CDVDVideoCodecFFmpeg>(processInfo);
+     return pCodec->Open(hint, options) ? std::move(pCodec) : nullptr;
+   }
+-  // platform specific video decoders
+-  if (!(hint.codecOptions & CODEC_FORCE_SOFTWARE))
++  // platform specific video decoders (Hades: not for a stream that one of them handed back)
++  if (!(hint.codecOptions & (CODEC_FORCE_SOFTWARE | CODEC_HANDED_BACK)))
+   {
+     for (auto &codec : m_hwVideoCodecs)
+     {
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h
+new file mode 100644
+index 0000000..8e8ed0a
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h
+@@ -0,0 +1,64 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <atomic>
++
++/*!
++ * \brief Hades: when CDVDVideoCodecDRMPRIME gives its stream back to a decoder of VideoPlayer's own
++ *
++ * Its FFmpeg decoder asks it for a picture format (get_format()). One that it does not take (in
++ * software, any of more than 8 bits) leaves FFmpeg without a format: every packet is then refused
++ * (EPERM), and VideoPlayer, told to send it again, sent the same packet for ever, with no picture.
++ * Open() declines a stream whose hints say more than 8 bits, but the hints can be wrong: a
++ * transport stream that is joined live is opened without avformat_find_stream_info(), and the hint
++ * of a 10-bit HEVC channel says 8 bits. So the format that the decoder offers decides, whatever the
++ * hints said:
++ *  - a format refused: AddData() leaves every packet with VideoPlayer (false), and GetPicture()
++ *    answers VC_HANDBACK, on which VideoPlayer gives the stream to a decoder that is not one of the
++ *    platform's (CODEC_HANDED_BACK), with the packets it kept for this one;
++ *  - until a format is taken, VideoPlayer keeps the packets that this decoder took (its converge
++ *    count: as many, and at most 300, as CDVDVideoCodecFFmpeg keeps since a key frame), so that the
++ *    next decoder starts where this one started; once one is taken, none.
++ * A format refused after one was taken (a stream that changes to more bits) has no packets kept:
++ * the next decoder starts at the packet that VideoPlayer still has, and gives pictures from the
++ * next key frame on.
++ */
++class CDRMPRIMEHandBack
++{
++public:
++  static constexpr unsigned MAX_KEPT = 300;
++
++  //! A decoder is opened for the stream
++  void Open()
++  {
++    m_refused = false;
++    m_taken = false;
++    m_took = 0;
++  }
++  //! get_format() took a format, or found none to take (on any of the decoder's threads)
++  void Format(bool taken) { (taken ? m_taken : m_refused).store(true); }
++  //! The decoder cannot decode the stream: it goes to the next one
++  bool HandBack() const { return m_refused; }
++  //! AddData() gave a packet to the decoder
++  void Took()
++  {
++    if (m_took < MAX_KEPT)
++      ++m_took;
++  }
++  //! The decoder was flushed (VideoPlayer drops what it kept)
++  void Flushed() { m_took = 0; }
++  //! How many of the packets that it took VideoPlayer is to keep (GetConvergeCount())
++  unsigned Kept() const { return m_taken ? 0 : m_took; }
++
++private:
++  std::atomic<bool> m_refused{false};
++  std::atomic<bool> m_taken{false};
++  unsigned m_took = 0;
++};
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index fdcc55e..81cc0b8 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -153,7 +153,9 @@ public:
+     VC_FLUSHED,         //< the decoder lost it's state, we need to restart decoding again
+     VC_NOBUFFER,        //< last FFmpeg GetBuffer failed
+     VC_REOPEN,          //< decoder request to re-open
+-    VC_EOF              //< EOF
++    VC_EOF,             //< EOF
++    VC_HANDBACK         //< Hades: the decoder cannot decode the stream: VideoPlayer gives it, with
++                        //< the packets it kept for it, to one that is not the platform's
+   };
+ 
+   explicit CDVDVideoCodec(CProcessInfo &processInfo) : m_processInfo(processInfo) {}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 80af159..7a5bd7a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -245,11 +245,15 @@ enum AVPixelFormat CDVDVideoCodecDRMPRIME::GetFormat(struct AVCodecContext* avct
+     if (IsSupportedHwFormat(fmt[n]) || IsSupportedSwFormat(fmt[n]))
+     {
+       CDVDVideoCodecDRMPRIME* ctx = static_cast<CDVDVideoCodecDRMPRIME*>(avctx->opaque);
++      ctx->m_handBack.Format(true);
+       ctx->UpdateProcessInfo(avctx, fmt[n]);
+       return fmt[n];
+     }
+   }
+ 
++  // Hades: the stream goes to the next decoder (see CDRMPRIMEHandBack)
++  static_cast<CDVDVideoCodecDRMPRIME*>(avctx->opaque)->m_handBack.Format(false);
++
+   std::vector<std::string> formats;
+   for (int n = 0; fmt[n] != AV_PIX_FMT_NONE; n++)
+   {
+@@ -325,6 +329,9 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+   if (hints.multiview)
+     return false;
+ 
++  m_handBack.Open();
++  m_handBackTold = false;
++
+   const AVCodec* pCodec = FindDecoder(hints);
+   if (!pCodec)
+   {
+@@ -335,9 +342,10 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+ 
+ #ifdef HAVE_DVBRIDGE
+   // Hades: decoded in software (no decoder decodes this stream to DRM PRIME in hardware), only
+-  // 8-bit pictures can be had: a stream of more bits would never give one (see
+-  // DVBRIDGE::PrimeSoftwareTakes()). It is left to the next decoder, which decodes it as with this
+-  // one off.
++  // 8-bit pictures can be had: a stream whose hints say more bits, or a profile of more, would
++  // never give one (see DVBRIDGE::PrimeSoftwareTakes()). It is left to the next decoder, which
++  // decodes it as with this one off. Hints that say 8 bits wrongly are caught by the format that
++  // the decoder offers (m_handBack).
+   const bool deepProfile =
+       (hints.codec == AV_CODEC_ID_HEVC && hints.profile == AV_PROFILE_HEVC_MAIN_10) ||
+       (hints.codec == AV_CODEC_ID_H264 && (hints.profile == AV_PROFILE_H264_HIGH_10 ||
+@@ -479,6 +487,10 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+   if (!packet.pData)
+     return true;
+ 
++  // Hades: a stream handed back leaves every packet with VideoPlayer, for the next decoder
++  if (m_handBack.HandBack())
++    return false;
++
+   AVPacket* avpkt = av_packet_alloc();
+   if (!avpkt)
+   {
+@@ -506,6 +518,10 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+   av_buffer_unref(&avpkt->buf);
+   av_free(avpkt);
+ 
++  // (refused for that, or taken by a decoder that is going away: the next one has it)
++  if (m_handBack.HandBack())
++    return false;
++
+   if (ret == AVERROR(EAGAIN))
+     return false;
+   else if (ret)
+@@ -518,6 +534,7 @@ bool CDVDVideoCodecDRMPRIME::AddData(const DemuxPacket& packet)
+       return false;
+   }
+ 
++  m_handBack.Took();
+   return true;
+ }
+ 
+@@ -547,6 +564,7 @@ void CDVDVideoCodecDRMPRIME::Reset()
+ 
+   CLog::Log(LOGDEBUG, "CDVDVideoCodecDRMPRIME::{} - flush buffers", __FUNCTION__);
+   avcodec_flush_buffers(m_pCodecContext);
++  m_handBack.Flushed();
+ }
+ 
+ void CDVDVideoCodecDRMPRIME::Drain()
+@@ -688,8 +706,24 @@ void CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+   pVideoPicture->dts = DVD_NOPTS_VALUE;
+ }
+ 
++CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::HandBack()
++{
++  if (!m_handBackTold)
++  {
++    m_handBackTold = true;
++    CLog::Log(LOGINFO,
++              "CDVDVideoCodecDRMPRIME::{} - the decoder offers no picture format that this decoder "
++              "takes: the stream goes to the next decoder",
++              __FUNCTION__);
++  }
++  return VC_HANDBACK;
++}
++
+ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideoPicture)
+ {
++  if (m_handBack.HandBack())
++    return HandBack();
++
+   if (m_codecControlFlags & DVD_CODEC_CTRL_DRAIN)
+     Drain();
+ 
+@@ -712,7 +746,7 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecDRMPRIME::GetPicture(VideoPicture* pVideo
+     av_strerror(ret, err, AV_ERROR_MAX_STRING_SIZE);
+     CLog::Log(LOGERROR, "CDVDVideoCodecDRMPRIME::{} - receive frame failed: {} ({})", __FUNCTION__,
+               err, ret);
+-    return VC_ERROR;
++    return m_handBack.HandBack() ? HandBack() : VC_ERROR;
+   }
+ 
+   // ffmpeg's v4l2m2m resizes without re-invoking our GetFormat callback; republish from the frames
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index 4c78c58..c2e6b0c 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "cores/VideoPlayer/Buffers/VideoBuffer.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "cores/VideoPlayer/DVDStreamInfo.h"
+ 
+@@ -32,6 +33,7 @@ public:
+   CDVDVideoCodec::VCReturn GetPicture(VideoPicture* pVideoPicture) override;
+   const char* GetName() override { return m_name.c_str(); }
+   unsigned GetAllowedReferences() override { return 5; }
++  unsigned GetConvergeCount() override { return m_handBack.Kept(); }
+   void SetCodecControl(int flags) override;
+ 
+ protected:
+@@ -40,6 +42,7 @@ protected:
+   void UpdateProcessInfo(struct AVCodecContext* avctx, const enum AVPixelFormat fmt);
+   static enum AVPixelFormat GetFormat(struct AVCodecContext* avctx, const enum AVPixelFormat* fmt);
+   static int GetBuffer(struct AVCodecContext* avctx, AVFrame* frame, int flags);
++  CDVDVideoCodec::VCReturn HandBack();
+ 
+   std::string m_name;
+   int m_codecControlFlags = 0;
+@@ -49,4 +52,6 @@ protected:
+   AVFrame* m_pFrame = nullptr;
+   std::shared_ptr<CVideoBufferPoolDRMPRIMEFFmpeg> m_hwVideoBufferPool;
+   std::shared_ptr<CVideoBufferPoolDMA> m_swVideoBufferPool;
++  CDRMPRIMEHandBack m_handBack;
++  bool m_handBackTold = false;
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+index b738dce..a06cdf0 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+@@ -368,17 +368,19 @@ DecoderShortfall DecoderShortfallNow();
+  *
+  * It decodes such a stream in software into pictures of the formats that its renderer takes:
+  * 8-bit ones only (IsSupportedSwFormat() of CDVDVideoCodecDRMPRIME). A stream of more bits finds no
+- * format to take: FFmpeg then refuses every packet with EPERM (measured with the HEVC Main 10 of
+- * a Dolby Vision stream, with the decoder's software path on the host), which VideoPlayer sends to
+- * the decoder again and again, and no picture ever comes. Such a stream goes to the next decoder.
++ * format to take, and FFmpeg then refuses every packet with EPERM (measured with the HEVC Main 10
++ * of a Dolby Vision stream, with the decoder's software path on the host). Open() leaves a stream
++ * to the next decoder when its hints say more bits or a profile of more bits, whichever says it.
++ * They can say 8 bits wrongly (a transport stream joined live, opened without stream info): what
++ * the decoder then offers decides, and the stream is handed back (CDRMPRIMEHandBack).
+  * \param bitDepth of the stream (CDVDStreamInfo::bitdepth, from the format the demuxer found; 0
+- *        when not known)
++ *        when not known, and 8 when it found none)
+  * \param deepProfile its profile is one of more than 8 bits (HEVC Main 10, H.264 High 10, VP9
+- *        profile 2 or 3): what decides when the bit depth is not known
++ *        profile 2 or 3)
+  */
+ constexpr bool PrimeSoftwareTakes(int bitDepth, bool deepProfile)
+ {
+-  return bitDepth > 8 ? false : bitDepth > 0 ? true : !deepProfile;
++  return bitDepth <= 8 && !deepProfile;
+ }
+ 
+ //! Whether any decoder of this build decodes to DRM PRIME in hardware (with the hardware
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index 5168a57..75c9e06 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -20,6 +20,8 @@ extern "C"
+ 
+ #define CODEC_FORCE_SOFTWARE 0x01
+ #define CODEC_ALLOW_FALLBACK 0x02
++// Hades: a platform decoder handed the stream back (CDVDVideoCodec::VC_HANDBACK): none is tried
++#define CODEC_HANDED_BACK 0x04
+ 
+ class CDemuxStream;
+ struct DemuxCryptoSession;
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+index 316e543..1a9f6c0 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -595,6 +595,10 @@ void CVideoPlayerVideo::Process()
+               m_packets.size() * frametime > DVD_SEC_TO_TIME(10))
+             m_packets.pop_front();
+         }
++        // Hades: a decoder that has nothing kept for it any more (CDVDVideoCodecDRMPRIME, once it
++        // has taken a picture format) leaves nothing to keep
++        else if (!m_packets.empty())
++          m_packets.clear();
+ 
+         m_videoStats.AddSampleBytes(pPacket->iSize);
+         UpdatePlayerInfo();
+@@ -613,6 +617,33 @@ void CVideoPlayerVideo::Process()
+   }
+ }
+ 
++// Hades: the decoder cannot decode the stream (CDVDVideoCodecDRMPRIME, offered no picture format
++// that it takes): the packets kept for it go again, ahead of the one it left (put back), to a
++// decoder that is not one of the platform's. Once: only those hand a stream back.
++void CVideoPlayerVideo::HandBack()
++{
++  CLog::Log(LOGINFO,
++            "CVideoPlayerVideo - the video decoder {} cannot decode this stream: it goes, with "
++            "the {} packet(s) kept for it, to a decoder that is not the platform's",
++            m_pVideoCodec->GetName(), m_packets.size());
++  while (!m_packets.empty())
++  {
++    auto msg = std::static_pointer_cast<CDVDMsgDemuxerPacket>(m_packets.front().message);
++    m_packets.pop_front();
++    SendMessage(msg, 10);
++  }
++
++  CDVDStreamInfo hint(m_hints);
++  hint.codecOptions |= CODEC_HANDED_BACK;
++  m_pVideoCodec.reset();
++  OpenStream(hint, nullptr);
++  if (m_picture.videoBuffer)
++  {
++    m_picture.videoBuffer->Release();
++    m_picture.videoBuffer = nullptr;
++  }
++}
++
+ void CVideoPlayerVideo::UpdatePlayerInfo()
+ {
+   m_processInfo.SetVideoLiveBitRate(GetVideoBitrate());
+@@ -663,6 +694,12 @@ bool CVideoPlayerVideo::ProcessDecoderOutput(double &frametime, double &pts)
+     return false;
+   }
+ 
++  if (decoderState == CDVDVideoCodec::VC_HANDBACK)
++  {
++    HandBack();
++    return false;
++  }
++
+   // if decoder had an error, tell it to reset to avoid more problems
+   if (decoderState == CDVDVideoCodec::VC_ERROR)
+   {
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.h b/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
+index bb3efe3..45e62ee 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.h
+@@ -93,6 +93,7 @@ protected:
+   void Process() override;
+ 
+   bool ProcessDecoderOutput(double &frametime, double &pts);
++  void HandBack();
+   void UpdatePlayerInfo();
+   void SendMessageBack(const std::shared_ptr<CDVDMsg>& pMsg, int priority = 0);
+   MsgQueueReturnCode GetMessage(std::shared_ptr<CDVDMsg>& pMsg,
+-- 
+2.53.0
+

@@ -1,0 +1,353 @@
+From 7a15af7523584025acd999e90c84b42b2cde2ecc Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 00:00:49 +0000
+Subject: [PATCH] windowing/gbm: tell of a held mode change with the commit
+ that makes it
+
+A change of mode that is held for the output of the video that opens
+(CModeChangeHold, START) told the display resources that the display was
+lost when the mode was chosen, and armed the reset from that moment. The
+commit that applies the mode came later: with the first frame of native
+Dolby Vision, or with the first ordinary commit after the renderer was
+configured or the deadline passed. So OnResetDisplay() could reach
+VideoPlayer and the audio engine before the display had changed at all,
+and the change itself then came unannounced. The audio engine, which
+with no sink waits for the reset while the display is lost, tried its
+sink before the change and met the device changes of the change after
+it.
+
+Now the hold only chooses the mode. CHeldModeAnnouncement decides when
+the change is told: before the first commit that carries it, of any
+kind (the first frame of native output, a commit of the ordinary output
+after the configure or the deadline, Hide() or Show()), with the reset
+after it, armed with the delay that the user set, as SetFullScreen()
+does. A frame of native output that tells of the change is not
+presented a frame ahead: the loss flushes the renderer, so the GPU work
+of that frame is finished first. When the driver refuses that frame the
+mode did not change: the announcement is armed again for the next commit
+that is not a frame of native output (the restoration of the ordinary
+output, or a commit of it), never for the frames attempted every
+refresh. A hold that a change of mode ends (SetFullScreen()) is not
+told: that change tells of itself. A hold that cancels or expires is
+told with whichever commit then makes the mode.
+
+OnLostDevice() is told once until the display is back
+(SendDisplayReset()): the resources hear of a loss and of its end in
+pairs, never of a loss twice in a row (a change of mode before the reset
+of the one before, or a held change told while a stalled flip turns the
+output off and on). The reset timer is set again by each change, so the
+reset still comes after the last one.
+
+Every display resource that Kodi registers with this window system hears
+of a change only through OnLostDevice() and OnResetDisplay()
+(VideoPlayer, the audio engine, the video clock; VDPAU is X11 only), so
+these two bracket the commit that reaches the display in every case.
+
+Host model of the announcements per transition, with the old behaviour
+as the counterexample: HDR10 start "lost, commit, reset"; native DV
+start "lost, commit, reset, frames"; refused first frame "lost, refused
+frame, reset, refused frame, lost, restoration, reset"; a hold that
+expires "lost, commit, reset"; a hold dropped by a change of mode, told
+only by that change. Five mutations of the decision (told every frame,
+not armed again after a refusal, never told, kept after a drop, told
+state never cleared) all make it fail.
+---
+ xbmc/windowing/gbm/ModeChangeHold.h           | 57 +++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 80 ++++++++++++++-----
+ xbmc/windowing/gbm/WinSystemGbm.h             | 14 +++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 13 +++
+ 4 files changed, 142 insertions(+), 22 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/ModeChangeHold.h b/xbmc/windowing/gbm/ModeChangeHold.h
+index a6d64ed..cba3e15 100644
+--- a/xbmc/windowing/gbm/ModeChangeHold.h
++++ b/xbmc/windowing/gbm/ModeChangeHold.h
+@@ -206,6 +206,63 @@ private:
+   End m_ended = End::NONE;
+ };
+ 
++/*!
++ * \brief When the other subsystems are told of a change of mode that was held (CModeChangeHold,
++ *        START): around the commit that makes it, not when it was chosen
++ *
++ * A change of mode tells the display resources (VideoPlayer, the audio engine, the video clock,
++ * the decoders) that the display is lost before its commit, and that it is back once that commit
++ * is made (OnLostDevice(), then OnResetDisplay() after the delay that the user set). A change that
++ * is held is chosen at once and committed later: told when it was chosen, the display was back for
++ * them before it changed at all, and the change itself came unannounced (the audio engine, waiting
++ * for the display in its error state, tried its sink before the change and again with the device
++ * changes of the change). Told now before the first commit that carries it, of any kind (the first
++ * frame of native output, or a commit of the ordinary output after the deadline): the display is
++ * back after it. When that commit is a frame of native output that the driver refused, the mode
++ * did not change: the commit that does change it later is not another frame of native output (a
++ * frame is attempted every refresh, and is not told again) but the restoration of the ordinary
++ * output, or a commit of it, which is told then.
++ *
++ * Only decides; the window system tells, and arms the reset, when Before() says so.
++ */
++class CHeldModeAnnouncement
++{
++public:
++  enum class Step
++  {
++    NONE, //!< nothing to tell
++    BEFORE_NEXT, //!< before the next commit, of any kind
++    BEFORE_ORDINARY, //!< before the next commit that is not a frame of native output
++    TOLD, //!< told for the commit that is being made
++  };
++
++  //! A change of mode was held: it is told with its commit
++  void Held() { m_step = Step::BEFORE_NEXT; }
++  //! Another change of mode is made, which tells of itself: this one is not told
++  void Dropped() { m_step = Step::NONE; }
++  //! A commit is about to be made (transport: a frame of native Dolby Vision output); true when
++  //! the other subsystems are to be told now that the display is lost (and back after it)
++  bool Before(bool transport)
++  {
++    if (m_step == Step::BEFORE_NEXT || (m_step == Step::BEFORE_ORDINARY && !transport))
++    {
++      m_step = Step::TOLD;
++      return true;
++    }
++    return false;
++  }
++  //! ... it was made: accepted, or refused by the driver (only a frame of native output can be)
++  void After(bool accepted, bool transport)
++  {
++    if (m_step == Step::TOLD)
++      m_step = !accepted && transport ? Step::BEFORE_ORDINARY : Step::NONE;
++  }
++  Step Pending() const { return m_step; }
++
++private:
++  Step m_step = Step::NONE;
++};
++
+ } // namespace GBM
+ } // namespace WINDOWING
+ } // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index e54e05a..324f28f 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -1497,6 +1497,11 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   if (!drm || !m_GBM || !state.Captured())
+     return false;
++  // Hades: a change of mode that was held, and that the frame of native output that should have
++  // made it did not (the driver refused it), goes out with the restoration: told with it
++  // (CHeldModeAnnouncement; the frames are told by the caller)
++  if (restore)
++    AnnounceHeldModeChange(false);
+   auto& surface = m_GBM->GetDevice().GetSurface();
+   auto* bo = surface.LockTransactionalBuffer();
+   // The output state of the transport, or of before it; for a restoration that ends a wait after a
+@@ -1595,6 +1600,8 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip
+   }
+   else if (accepted)
+     state.SetTransportLive();
++  if (restore)
++    HeldModeChangeCommitted(accepted, false);
+   return accepted;
+ }
+ 
+@@ -1680,40 +1687,57 @@ bool CWinSystemGbm::DVEndWaitsForMode(const CDVBridgeState& state) const
+ 
+ bool CWinSystemGbm::HoldModeChange(RESOLUTION_INFO& res)
+ {
+-  // As SetFullScreen() does, but the commit: the mode is chosen, and the next commit carries it
++  // As SetFullScreen() does, but the commit: the mode is chosen, and the next commit carries it.
++  // (Not where the other subsystems were told of this change already: K57's path, whose commit
++  // made it.)
++  if (m_displayLostSent)
++    return false;
+   VideoSeen();
+   const drmModeModeInfo* before = m_DRM->GetSelectedMode();
+   if (!m_DRM->SetMode(res))
+     return false;
+-  // The other subsystems are told now, as for any change of mode: VideoPlayer, which goes on
+-  // when it is told that the display is back (SendDisplayReset()), decodes the picture whose
+-  // output then goes out with the mode.
+-  if (!std::exchange(m_displayLostSent, false))
+-    OnLostDevice();
++  // The other subsystems are told of the change with the commit that makes it, not now
++  // (CHeldModeAnnouncement): VideoPlayer goes on meanwhile, and decodes the picture whose output
++  // then goes out with the mode.
+   m_DRM->SetVideoMode(res, nullptr);
+   m_modeHeldFrom = before;
+-  const auto delay =
+-      std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
+-                                    "videoscreen.delayrefreshchange") *
+-                                100);
+-  if (delay > 0ms)
+-    m_dispResetTimer.Set(delay);
+-  // (VideoPlayer waits the delay after a change of mode that the user set before it goes on: the
+-  // output of the video comes that much later)
++  m_modeAnnounce.Held();
+   m_modeHold.Start(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+-                       .count() +
+-                   std::max<int64_t>(delay.count(), 0));
++                       .count());
+   CLog::Log(LOGINFO,
+             "The change of mode to {}x{} @ {:.3f} Hz waits for the output of the video that opens "
+             "(at most {} ms), to go out in one commit with it",
+-            res.iScreenWidth, res.iScreenHeight, res.fRefreshRate,
+-            CModeChangeHold::START_MS + std::max<int64_t>(delay.count(), 0));
++            res.iScreenWidth, res.iScreenHeight, res.fRefreshRate, CModeChangeHold::START_MS);
+   return true;
+ }
+ 
++void CWinSystemGbm::AnnounceHeldModeChange(bool transport)
++{
++  if (!m_modeAnnounce.Before(transport))
++    return;
++  // As SetFullScreen() tells of the change that it commits: lost now, back once the delay that the
++  // user set has passed after this commit (SendDisplayReset(), after it)
++  CLog::Log(LOGDEBUG, "The other subsystems are told of the change of mode that was held, with "
++                      "the commit that makes it");
++  OnLostDevice();
++  const auto delay =
++      std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++                                    "videoscreen.delayrefreshchange") *
++                                100);
++  if (delay > 0ms)
++    m_dispResetTimer.Set(delay);
++}
++
++void CWinSystemGbm::HeldModeChangeCommitted(bool accepted, bool transport)
++{
++  m_modeAnnounce.After(accepted, transport);
++}
++
+ bool CWinSystemGbm::EndModeHoldForModeChange()
+ {
++  // (a change of mode that was held and not told yet is not told: this one tells of itself)
++  m_modeAnnounce.Dropped();
+   const CModeChangeHold::Kind kind = m_modeHold.Holding();
+   if (!m_modeHold.ModeChange())
+     return false;
+@@ -1816,12 +1840,17 @@ bool CWinSystemGbm::Hide()
+ {
+ #ifdef HAVE_DVBRIDGE
+   WaitDVBridgeFlip();
+-  // Hades: this commit carries what a hold of the output kept back (CModeChangeHold)
++  // Hades: this commit carries what a hold of the output kept back (CModeChangeHold), and a change
++  // of mode that was held is told with it
+   if (m_modeHold.Cancel())
+     TellModeHoldEnd();
++  AnnounceHeldModeChange(false);
+ #endif
+   bool ret = m_DRM->SetActive(false);
+   FlipPage(false, false, false);
++#ifdef HAVE_DVBRIDGE
++  HeldModeChangeCommitted(true, false);
++#endif
+   return ret;
+ }
+ 
+@@ -1831,9 +1860,13 @@ bool CWinSystemGbm::Show(bool raise)
+   WaitDVBridgeFlip();
+   if (m_modeHold.Cancel())
+     TellModeHoldEnd();
++  AnnounceHeldModeChange(false);
+ #endif
+   bool ret = m_DRM->SetActive(true);
+   FlipPage(false, false, false);
++#ifdef HAVE_DVBRIDGE
++  HeldModeChangeCommitted(true, false);
++#endif
+   return ret;
+ }
+ 
+@@ -1855,6 +1888,15 @@ void CWinSystemGbm::Unregister(IDispResource* resource)
+ 
+ void CWinSystemGbm::OnLostDevice()
+ {
++  // Hades: once until the display is back (SendDisplayReset()): the resources are told of a loss
++  // and of its end in pairs, never of a loss twice in a row (a change of mode that comes before the
++  // reset of the one before, or one that is told with its commit while a stalled flip turns the
++  // output off and on)
++  if (m_dispReset)
++  {
++    CLog::Log(LOGDEBUG, "{} - the display is lost already: not told again", __FUNCTION__);
++    return;
++  }
+   CLog::Log(LOGDEBUG, "{} - notify display change event", __FUNCTION__);
+   m_dispReset = true;
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 823cee4..836187d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -267,10 +267,18 @@ protected:
+   const drmModeModeInfo* m_modeHeldFrom = nullptr;
+   //! ... the change to res as this window system sees it
+   CModeChangeHold::Change ModeChangeOf(const RESOLUTION_INFO& res) const;
+-  //! ... START: res is chosen, and the other subsystems told, as SetFullScreen() does, but nothing
+-  //! is committed: the mode goes out with the next commit. False, with nothing done, where res
+-  //! cannot be chosen (the change is then made as always).
++  //! ... START: res is chosen as SetFullScreen() does, but nothing is committed: the mode goes out
++  //! with the next commit, and the other subsystems are told of it then (m_modeAnnounce). False,
++  //! with nothing done, where res cannot be chosen (the change is then made as always).
+   bool HoldModeChange(RESOLUTION_INFO& res);
++  //! Hades: when the other subsystems are told of a change of mode that was held
++  CHeldModeAnnouncement m_modeAnnounce;
++  //! ... a commit is about to be made (transport: a frame of native Dolby Vision output): where it
++  //! is the one that makes such a change, they are told now that the display is lost, and that it
++  //! is back after it (OnLostDevice(), and the delay that the user set, as SetFullScreen())
++  void AnnounceHeldModeChange(bool transport);
++  //! ... and it was made, or refused by the driver
++  void HeldModeChangeCommitted(bool accepted, bool transport);
+   //! ... a change of mode is being made: a hold ends with it (a START one gives the mode on the
+   //! screen back to the selection, for what follows to compare with). True when it was a STOP
+   //! hold: what it held goes out with the commit of this change, which no START hold may then
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index e125a71..a5b7066 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -371,6 +371,10 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       // ahead (see CDVAhead): the kernel waits for the GPU, by the fence of the frame, and
+       // the commit returns at once.
+       bool ahead = DVAheadWanted();
++      // Hades: a frame that makes a change of mode that was held is told before its commit
++      // (CHeldModeAnnouncement), which flushes the renderer: its GPU work is finished first
++      if (m_modeAnnounce.Pending() == CHeldModeAnnouncement::Step::BEFORE_NEXT)
++        ahead = false;
+       if (!ahead)
+         glFinish();
+       const bool swapped = m_eglContext.TrySwapBuffers();
+@@ -430,7 +434,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         flip.ahead = ahead;
+         const auto atomic = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+         plainFrame = m_dvState.TransportLive() && atomic && !atomic->HasPendingRequest();
++        AnnounceHeldModeChange(true);
+         presented = FlipDVBridgePage(m_dvState, false, &flip);
++        HeldModeChangeCommitted(presented, true);
+         DVAheadEnd(presented, flip);
+         if (presented && !m_dvSignalling)
+         {
+@@ -577,6 +583,12 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ 
+   if (rendered || videoLayer)
+   {
++#ifdef HAVE_DVBRIDGE
++    // Hades: the commit of this frame makes a change of mode that was held (the deadline of the
++    // hold passed, or the output of the video is set up): the other subsystems are told of it now,
++    // before it, and that the display is back after it (CHeldModeAnnouncement)
++    AnnounceHeldModeChange(false);
++#endif
+     bool async = !videoLayer && m_eglFence;
+     if (rendered)
+     {
+@@ -623,6 +635,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       FlipOutputOn();
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
+ #ifdef HAVE_DVBRIDGE
++    HeldModeChangeCommitted(true, false);
+     // Hades: the depth and the format at which HDR leaves (and a Dolby Vision picture rebuilt
+     // as HDR10 with it), once its signalling has gone out (the commit above carried it, or one
+     // before it did); asked again when the signalling changes. Not during native Dolby Vision:
+-- 
+2.53.0
+

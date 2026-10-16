@@ -1,0 +1,263 @@
+From e84aa69403b2cfa1d4236b766babf214fe57acb9 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:04:11 +0000
+Subject: [PATCH] tools/dvbridge: pack a composed picture with one fetch a
+ pixel where fragment shaders have quad operations
+
+The shader that packs the transport of a composed picture fetched two
+texels of the RGBA32F picture for every pixel: its own, and the even
+pixel of its pair, whose chroma the pair carries. The even pixel fetched
+that texel already, and it sits next to the odd one in its 2x2 quad: with
+GL_KHR_shader_subgroup_quad the odd pixel takes the value from it
+(subgroupQuadSwapHorizontal(), as the direct way does). Each invocation
+passes its place along with the value, and an odd pixel whose neighbour
+in the quad is not the even pixel of the same row (a quad laid out
+otherwise) fetches it after all: the value is the same bits either way.
+
+The packer makes that form (DVBRIDGE_PACK_QUAD) where fragment shaders
+have the basic and quad subgroup operations, asked as the renderer asks
+for the direct way. It is compiled as ESSL 3.10, both stages: Mesa only
+takes the subgroup extensions from 3.10 on, and shaders of two ES
+versions do not link. Where it does not compile or link, the shaders are
+made as they are written, with two fetches. dvbridge_gl_packer_quad()
+says which, and Kodi logs it.
+
+Measured on a software OpenGL ES (Mesa zink on lavapipe), where the
+form with quad operations is the one made: in every composed drawing of
+eight pictures of a profile 7 FEL stream (48, with edited margins), and
+of 2 more scaled ones (12), its bytes are those of the packing with two
+fetches compiled as before (ESSL 3.00), and those of a copy whose fetch
+of the even pixel gives a wrong value: every odd pixel took the value
+from its quad. How much time it saves on a GPU is not measured: the
+second fetch reads a texel next to the first one.
+
+On top of "dvbridge: keep the caller's GL state and samplers, check GL
+objects and bit depths": whichever of the two programs is made, the
+packer is made with the vertex array and the sampler that make_objects()
+makes and checks, or not at all. And on top of "dvbridge: send the Dolby
+Vision metadata as CCM 001 and dovi_tool describe it": the metadata bits
+are read from packet words of four bytes each in both forms, as before
+this change.
+---
+ tools/dvbridge/dvbridge_gl_pack.c             | 95 +++++++++++++++----
+ tools/dvbridge/dvbridge_gl_pack.h             |  4 +
+ tools/dvbridge/pack_gles300.frag              | 13 +++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  6 ++
+ 4 files changed, 102 insertions(+), 16 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index f3bdce9..6c85e03 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -1,28 +1,41 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ /* Pack transport bytes with isolated GL state; never apply ordinary RGB color processing. */
+ #include "dvbridge_gl_pack.h"
+-#include <GLES3/gl3.h>
++#include <GLES3/gl31.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ struct dvbridge_gl_packer {
+     GLuint program, vao, sampler;
+     GLint input, words, count, flip;
++    bool quad;
+ };
+ 
+-static GLuint compile(GLenum type, const char *source)
++/* first: lines in place of the first line of the source, its #version. quiet: a shader that does
++ * not compile is not reported (one that is tried and has a fallback). */
++static GLuint compile(GLenum type, const char *source, const char *first, bool quiet)
+ {
+     if (!source)
+         return 0;
++    const char *line = strchr(source, '\n');
++    if (first && (!line || strncmp(source, "#version", 8)))
++        return 0;
+     GLuint shader = glCreateShader(type);
+-    glShaderSource(shader, 1, &source, NULL);
++    if (first) {
++        const char *parts[2] = {first, line + 1};
++        glShaderSource(shader, 2, parts, NULL);
++    } else {
++        glShaderSource(shader, 1, &source, NULL);
++    }
+     glCompileShader(shader);
+     GLint ok;
+     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+     if (!ok) {
+         char log[4096];
+         glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+-        fprintf(stderr, "DV transport shader: %s\n", log);
++        if (!quiet)
++            fprintf(stderr, "DV transport shader: %s\n", log);
+         glDeleteShader(shader);
+         return 0;
+     }
+@@ -51,19 +64,46 @@ static bool make_objects(GLuint *vao, GLuint *sampler)
+     return made;
+ }
+ 
+-struct dvbridge_gl_packer *dvbridge_gl_packer_create(const char *vertex, const char *fragment)
++/* Hades: whether fragment shaders have the quad operations of GL_KHR_shader_subgroup, asked as
++ * dvbridge_render.c asks it for the direct way. */
++static bool fragment_quad(void)
+ {
+-    GLuint vs = compile(GL_VERTEX_SHADER, vertex), fs = compile(GL_FRAGMENT_SHADER, fragment);
+-    if (!vs || !fs) {
+-        glDeleteShader(vs);
+-        glDeleteShader(fs);
+-        return NULL;
++    GLint extensions = 0;
++    bool listed = false;
++    glGetIntegerv(GL_NUM_EXTENSIONS, &extensions);
++    for (GLint i = 0; i < extensions && !listed; ++i) {
++        const char *name = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
++        listed = name && !strcmp(name, "GL_KHR_shader_subgroup");
+     }
+-    struct dvbridge_gl_packer *p = calloc(1, sizeof(*p));
+-    if (!p) {
++    GLint size = 0, stages = 0, features = 0;
++    if (listed) {
++        glGetIntegerv(0x9532 /* GL_SUBGROUP_SIZE_KHR */, &size);
++        glGetIntegerv(0x9533 /* GL_SUBGROUP_SUPPORTED_STAGES_KHR */, &stages);
++        glGetIntegerv(0x9534 /* GL_SUBGROUP_SUPPORTED_FEATURES_KHR */, &features);
++    }
++    /* (errors of these queries are not left for libplacebo, which takes any it finds as its own) */
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    return size >= 4 && size <= 128 && !(size & (size - 1)) && (stages & GL_FRAGMENT_SHADER_BIT) &&
++           (features & 0x81) == 0x81; /* basic and quad */
++}
++
++/* quad: both stages as ESSL 3.10 (the version that the subgroup extensions need in Mesa; shaders
++ * of two ES versions do not link), and the fragment shader with DVBRIDGE_PACK_QUAD */
++static bool build_program(struct dvbridge_gl_packer *p, const char *vertex, const char *fragment,
++                          bool quad)
++{
++    static const char version[] = "#version 310 es\n";
++    static const char prelude[] = "#version 310 es\n"
++                                  "#extension GL_KHR_shader_subgroup_basic : require\n"
++                                  "#extension GL_KHR_shader_subgroup_quad : require\n"
++                                  "#define DVBRIDGE_PACK_QUAD 1\n";
++    GLuint vs = compile(GL_VERTEX_SHADER, vertex, quad ? version : NULL, quad);
++    GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, quad ? prelude : NULL, quad);
++    if (!vs || !fs) {
+         glDeleteShader(vs);
+         glDeleteShader(fs);
+-        return NULL;
++        return false;
+     }
+     p->program = glCreateProgram();
+     glAttachShader(p->program, vs);
+@@ -77,7 +117,25 @@ struct dvbridge_gl_packer *dvbridge_gl_packer_create(const char *vertex, const c
+     p->words = glGetUniformLocation(p->program, "metadata_words");
+     p->count = glGetUniformLocation(p->program, "packet_count");
+     p->flip = glGetUniformLocation(p->program, "flip_y");
+-    if (!linked || p->input < 0 || p->words < 0 || p->count < 0 || p->flip < 0 ||
++    if (!linked || p->input < 0 || p->words < 0 || p->count < 0 || p->flip < 0) {
++        glDeleteProgram(p->program);
++        p->program = 0;
++        return false;
++    }
++    return true;
++}
++
++struct dvbridge_gl_packer *dvbridge_gl_packer_create(const char *vertex, const char *fragment)
++{
++    struct dvbridge_gl_packer *p = calloc(1, sizeof(*p));
++    if (!p)
++        return NULL;
++    /* Hades: the fragment shader takes the even pixel of a pair from the invocation next to it
++     * where it can (DVBRIDGE_PACK_QUAD), and fetches it otherwise: the same bytes. Where that
++     * does not compile or link, the shaders are made as they are written. Either program, and
++     * the vertex array and sampler it draws with (make_objects()), or no packer. */
++    p->quad = fragment_quad() && build_program(p, vertex, fragment, true);
++    if ((!p->quad && !build_program(p, vertex, fragment, false)) ||
+         !make_objects(&p->vao, &p->sampler)) {
+         dvbridge_gl_packer_destroy(p);
+         return NULL;
+@@ -95,6 +153,11 @@ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *p)
+     free(p);
+ }
+ 
++bool dvbridge_gl_packer_quad(const struct dvbridge_gl_packer *p)
++{
++    return p && p->quad;
++}
++
+ struct dvbridge_gl_copier {
+     GLuint program, vao, sampler;
+     GLint picture, flip_height, levels, limited;
+@@ -137,8 +200,8 @@ static const char COPY_FRAGMENT[] =
+ 
+ struct dvbridge_gl_copier *dvbridge_gl_copier_create(void)
+ {
+-    GLuint vs = compile(GL_VERTEX_SHADER, COPY_VERTEX);
+-    GLuint fs = compile(GL_FRAGMENT_SHADER, COPY_FRAGMENT);
++    GLuint vs = compile(GL_VERTEX_SHADER, COPY_VERTEX, NULL, false);
++    GLuint fs = compile(GL_FRAGMENT_SHADER, COPY_FRAGMENT, NULL, false);
+     struct dvbridge_gl_copier *c = vs && fs ? calloc(1, sizeof(*c)) : NULL;
+     if (!c) {
+         glDeleteShader(vs);
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index 0726066..6f3b9c6 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -6,6 +6,10 @@
+ struct dvbridge_gl_packer;
+ struct dvbridge_gl_packer *dvbridge_gl_packer_create(const char *vertex, const char *fragment);
+ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *packer);
++/* Hades: the packer was made with DVBRIDGE_PACK_QUAD defined in its fragment shader (the two
++ * shaders as ESSL 3.10, the fragment one with the extensions it needs, in place of their #version
++ * line): fragment shaders have quad operations here. */
++bool dvbridge_gl_packer_quad(const struct dvbridge_gl_packer *packer);
+ /* Current GLES3 context; PQ texture and destination must both be 3840x2160.
+  * Destination must be linear RGB8/RGBA8, without multisampling.
+  * packets: as dvbridge_packets() gives them, count of them (1 to 16). */
+diff --git a/tools/dvbridge/pack_gles300.frag b/tools/dvbridge/pack_gles300.frag
+index ff32219..7a6aa25 100644
+--- a/tools/dvbridge/pack_gles300.frag
++++ b/tools/dvbridge/pack_gles300.frag
+@@ -33,7 +33,20 @@ void main()
+     // where the receiver puts it, and blurred. (A filter centred on the even pixel would reach
+     // past the pair, which the direct way, dvbridge_render.c, cannot.)
+     vec3 s = clamp(texelFetch(pq_input, p, 0).rgb, 0.0, 1.0);
++#ifdef DVBRIDGE_PACK_QUAD
++    // Hades: where fragment shaders have quad operations (dvbridge_gl_packer_create()), the odd
++    // pixel takes the value of the even one from the invocation next to it in its 2x2 quad, which
++    // fetched it, instead of fetching it again: the same bits. Each invocation passes its place
++    // along, and a value that does not come from the even pixel of the same row (a quad that is
++    // not laid out as two pairs of a row) is fetched after all.
++    vec4 peer = subgroupQuadSwapHorizontal(vec4(s, float(p.y * 4096 + p.x)));
++    vec3 a = s;
++    if ((p.x & 1) != 0)
++        a = peer.w == float(p.y * 4096 + (p.x & ~1)) ? peer.rgb
++            : clamp(texelFetch(pq_input, ivec2(p.x & ~1, p.y), 0).rgb, 0.0, 1.0);
++#else
+     vec3 a = clamp(texelFetch(pq_input, ivec2(p.x & ~1, p.y), 0).rgb, 0.0, 1.0);
++#endif
+     float ys = dot(s, vec3(.2627, .6780, .0593));
+     float ya = dot(a, vec3(.2627, .6780, .0593));
+     uint y = uint(floor(256.0 + 3504.0 * ys + .5));
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 347f44e..4f55ab6 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -475,6 +475,12 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+             "rgb_bits={}/{}/{} samples={} linear_encoding={} software_allowed={}",
+             m_renderer != nullptr, m_packer != nullptr, m_scanout != nullptr,
+             red, green, blue, samples, encoding == GL_LINEAR, allowSoftware);
++  // Hades: which form of the packing of a composed picture this GPU runs (the same bytes)
++  if (m_packer)
++    CLog::Log(LOGINFO, "DVBridge: the transport of a composed picture is packed with {}",
++              dvbridge_gl_packer_quad(m_packer)
++                  ? "one fetch a pixel (the even pixel of a pair taken from its quad)"
++                  : "two fetches a pixel (the form with quad operations is not made here)");
+   if (!m_renderer || !m_packer)
+     return Fail("renderer-or-packer-initialization");
+   return m_renderer && m_packer;
+-- 
+2.53.0
+

@@ -1,0 +1,559 @@
+From 60589fdae143927496903d620f054766871f6dee Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 22:56:12 +0000
+Subject: [PATCH] windowing/gbm: make the GPU programs of a native Dolby Vision
+ session ready before its first frame
+
+libplacebo makes the GPU program of a way of drawing when a frame first needs it, and the bridge
+draws the frames of a stream more than one way: directly when nothing is over the picture,
+composed when the GUI, a subtitle or a capture is (and while the two ways are compared), at
+another fidelity step-down level when the GPU falls behind, and without the residual of the
+enhancement layer while that resynchronizes after a seek. Each first such frame waited for the
+compile of its programs. Measured on the software bridge (zink on lavapipe, its own shader cache
+off), with the composer of ETSI GS CCM 001: the first frame with the GUI over a picture drawn
+directly took 201 ms instead of 45, the first at level 1 95 instead of 65, the first without the
+layer 270 instead of 21, the first at level 2 336 instead of 45 (one or two programs each). On a
+GPU with little time to spare that is a late frame, and it comes when the GUI appears, or when the
+GPU is already behind.
+
+dvbridge_render_warm() draws the first frame of a native output, before it is prepared, every way
+the session can draw it, into the renderer's own targets: composed and, where the GPU can, directly;
+at every step-down level that the frames can be drawn at (the one that advancedsettings.xml forces;
+else, where the setting lets Kodi step down, every level that changes anything for the stream;
+else level 0), the level in use first, then the nearest; with the residual of the layer and
+without it (without one, every level above 1 draws what level 1 draws, which is made once). Each
+render is waited for; renders are made while less than 1000 ms have passed, the others left for
+the frame that first needs them. With the program cache of earlier sessions (2ecefa4) the programs
+come from it, and what the warm-up costs is the GPU time of its renders.
+
+Nothing that is presented changes. The renders go to the renderer's picture and to the window's
+back buffer, which the frame then writes whole, and the renderer's state is given back: its
+candidate, transport state, notes, level and what it has found of the bars written first;
+libplacebo's errors are reset, and its picture is taken as not clean (it is cleared once more where
+the next picture does not fill it). Measured on the software bridge with five frames as a session
+draws them (directly, composed with the GUI, composed at level 1, directly without the layer,
+composed at level 2): the same transport bytes, frame by frame, with and without the warm-up; no
+program compiled at any of the five after it (without it: 6, 1, 1, 2 and 2; with libplacebo's
+reshaping, dvccmcomposer off, 4, 1, 1, 1 and 1, and none either after it). The warm-up made 12
+renders and compiled 14 programs, in 2.1 s on the software renderer (more than the 1000 ms that
+Kodi gives it: there the rest would be left for the frames); a later session that started with
+the cache filled by it compiled none (14 taken from it), in 0.56 s.
+
+The first frame of a native output is not told to the fidelity step-down as a presentation (the
+warm-up delays it; its GPU time is its own, the warm-up comes before the timer begins), and its
+preparation time leaves the warm-up out. Logged once in each native output: how many ways were made
+ready, in how long, how many programs were compiled. <video><dvwarmup>false</dvwarmup></video> in
+advancedsettings.xml turns it off.
+
+Not warmed: the reconstruction for output as HDR10. The GUI goes over it in Kodi's own HDR path and
+it has no step-down levels, so its programs do not change with them; the only other one that a
+video can need is that of a frame without the residual of its layer (after a seek), made by the
+frame that first needs it.
+
+The idea of compiling the variants of the overlay path before playback is that of the YBLOD fork
+(dv_source_renderer_prepare_overlays()); here the bridge's own frames are drawn, with libplacebo's
+programs.
+
+With the expert settings of native output (CDVEngineSettings): a level
+set in videoscreen.hadesdvstepmode is the one the frames are drawn at,
+as one that advancedsettings.xml forces, and "never" leaves level 0
+alone; with videoscreen.hadesdvpathmode set to always composed no frame
+is drawn directly, and the direct way is not made ready. The composer is
+the one that the settings gave the bridge when the output began.
+---
+ tools/dvbridge/dvbridge_render.c              | 160 ++++++++++++++++++
+ tools/dvbridge/dvbridge_render.h              |  29 ++++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  67 ++++++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  20 +++
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   4 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  48 +++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  10 ++
+ 8 files changed, 334 insertions(+), 6 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 28a6eaf..b8d8d13 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -9,6 +9,7 @@
+ #include <GLES3/gl31.h>
+ #include <math.h>
+ #include <stdlib.h>
++#include <time.h>
+ 
+ /* Hades: what dvbridge_render_take_notes() reports, once each in a stream */
+ enum {
+@@ -990,3 +991,162 @@ void dvbridge_render_use_ccm_composer(struct dvbridge_renderer *r, bool use)
+     if (r)
+         r->legacy_composer = !use;
+ }
++
++/* Hades: what dvbridge_render_warm() keeps of the renderer while it draws */
++struct kept_state {
++    struct dvbridge_candidate *pending;
++    bool ready, packed, early_mask, residual_omitted, residual_drawn, early_unusable[2];
++    unsigned char early_failures[2];
++    int step;
++    unsigned noted, fresh;
++    struct dvbridge_render_notes notes;
++};
++
++static void keep_state(struct dvbridge_renderer *r, struct kept_state *k)
++{
++    k->pending = r->pending;
++    r->pending = NULL;
++    k->ready = r->ready;
++    k->packed = r->packed;
++    k->early_mask = r->early_mask;
++    k->residual_omitted = r->residual_omitted;
++    k->residual_drawn = r->residual_drawn;
++    for (int i = 0; i < 2; ++i) {
++        k->early_unusable[i] = r->early_unusable[i];
++        k->early_failures[i] = r->early_failures[i];
++    }
++    k->step = r->step;
++    k->noted = r->noted;
++    k->fresh = r->fresh;
++    k->notes = r->notes;
++}
++
++static void give_back_state(struct dvbridge_renderer *r, const struct kept_state *k)
++{
++    dvbridge_candidate_destroy(r->pending);
++    r->pending = k->pending;
++    r->ready = k->ready;
++    r->packed = k->packed;
++    r->early_mask = k->early_mask;
++    r->residual_omitted = k->residual_omitted;
++    r->residual_drawn = k->residual_drawn;
++    for (int i = 0; i < 2; ++i) {
++        r->early_unusable[i] = k->early_unusable[i];
++        r->early_failures[i] = k->early_failures[i];
++    }
++    r->step = k->step;
++    r->noted = k->noted;
++    r->fresh = k->fresh;
++    r->notes = k->notes;
++    /* the picture was drawn into: what is outside the place of the next one is not known to be
++     * black (it is cleared then, which writes the same bytes) */
++    r->rgb_clean = false;
++    /* a render of these that failed leaves nothing turned off for the frames */
++    pl_renderer_reset_errors(r->renderer, NULL);
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++}
++
++static double now_ms(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
++}
++
++int dvbridge_render_warm(struct dvbridge_renderer *r, const struct pl_frame *source,
++                         const void *metadata, size_t bytes, double pts, double el_pts,
++                         struct dvbridge_geometry geometry, unsigned levels, pl_tex scanout,
++                         struct dvbridge_gl_packer *packer, unsigned framebuffer, double budget_ms,
++                         struct dvbridge_warm_report *report)
++{
++    struct dvbridge_warm_report done = {0};
++    if (!r || !r->rgb || !source || !metadata) {
++        if (report)
++            *report = done;
++        return 0;
++    }
++    const double start = now_ms();
++    struct kept_state kept;
++    keep_state(r, &kept);
++    /* The frame as it comes, and, when it has the residual of an enhancement layer, without it:
++     * as it is drawn while the decoder resynchronizes the layer after a seek */
++    struct pl_frame bare = *source;
++    bare.enhancement_layer = NULL;
++    const bool paired = source->enhancement_layer && isfinite(el_pts) && fabs(pts - el_pts) < 0.00001;
++    struct dvbridge_color mapped;
++    bool omitted = false;
++    const bool residual = paired && dvbridge_map_color(&mapped, metadata, bytes, true, &omitted) &&
++                          mapped.dovi.nlq_active;
++    /* the level that the frames are drawn at first, then the others that they can be drawn at,
++     * the nearest first */
++    levels = (levels | 1u << kept.step) & ((1u << DVBRIDGE_STEP_LEVELS) - 1);
++    int order[DVBRIDGE_STEP_LEVELS], n = 0;
++    order[n++] = kept.step;
++    for (int d = 1; d < DVBRIDGE_STEP_LEVELS; ++d) {
++        if (kept.step + d < DVBRIDGE_STEP_LEVELS)
++            order[n++] = kept.step + d;
++        if (kept.step - d >= 0)
++            order[n++] = kept.step - d;
++    }
++    /* Without a residual, every level above 1 draws what level 1 draws (no plane of a layer is
++     * scaled up: dvbridge_render_step_levels()): one of them is made, the first of the order */
++    const unsigned changes = dvbridge_render_step_levels(r, false);
++    unsigned bare_done = 0;
++    bool packed_once = false;
++    for (int i = 0; i < n; ++i) {
++        const int level = order[i];
++        if (!(levels & (1u << level)))
++            continue;
++        for (int form = 0; form < (residual ? 2 : 1); ++form) {
++            /* form 1: the frame without its layer */
++            const bool bare_form = form == 1;
++            if (!residual || bare_form) {
++                int same = level;
++                while (same > 0 && !(changes & (1u << same)))
++                    --same;
++                if (bare_done & (1u << same))
++                    continue;
++                bare_done |= 1u << same;
++            }
++            for (int way = 0; way < 2; ++way) {
++                if (way == 1 && !(scanout && r->fragment_quad))
++                    continue;
++                ++done.asked;
++                if (now_ms() - start >= budget_ms) {
++                    ++done.left;
++                    continue;
++                }
++                r->step = level;
++                const struct pl_frame *frame = bare_form ? &bare : source;
++                const double frame_el = bare_form ? (double)NAN : el_pts;
++                bool ok;
++                if (way == 0) {
++                    ok = dvbridge_render_rgb(r, frame, metadata, bytes, pts, frame_el, geometry);
++                    if (ok && packer && !packed_once) {
++                        /* and the packing of a composed picture, once: into the target of the
++                         * frames, which the first one writes whole */
++                        unsigned count = 0;
++                        const uint32_t *words = dvbridge_packets(r->pending, &count);
++                        packed_once = dvbridge_gl_pack(packer,
++                            pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, NULL), framebuffer,
++                            3840, 2160, words, count, true);
++                    }
++                } else {
++                    ok = dvbridge_render_packed(r, frame, metadata, bytes, pts, frame_el, geometry,
++                                                scanout, true);
++                }
++                /* each one waited for, so that the time is the time it took */
++                glFinish();
++                done.made += ok;
++                done.failed += !ok;
++                pl_renderer_reset_errors(r->renderer, NULL);
++            }
++        }
++    }
++    give_back_state(r, &kept);
++    done.ms = now_ms() - start;
++    if (report)
++        *report = done;
++    return done.made;
++}
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 8402b4a..a82843c 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -155,4 +155,33 @@ bool dvbridge_render_ccm_composer(const struct dvbridge_renderer *renderer);
+  * reshaping, as before, to compare on hardware. A picture outside the clause's scope is composed
+  * by libplacebo's reshaping either way (libplacebo logs why). */
+ void dvbridge_render_use_ccm_composer(struct dvbridge_renderer *renderer, bool use);
++
++/* Hades: the GPU programs of the ways a session can draw the frames of a stream, made ready before
++ * the first one is presented, with that frame (dvbridge_render_warm()). Each program is made when a
++ * frame first needs it: the first frame with GUI elements or subtitles over a picture drawn directly
++ * (it is composed), the first frame at another fidelity step-down level, the first frame of an
++ * enhancement layer that is resynchronizing after a seek (drawn without its residual). On a GPU that
++ * has little time to spare, that frame is late. What is drawn here: the frame composed and, where
++ * scanout is given and the GPU can, drawn directly; at every level of the mask levels (the level
++ * the renderer is set to always, first, then the nearest), and when it has the residual of its
++ * enhancement layer, also without that layer. Composed into the renderer's picture, directly into
++ * scanout, and one composed picture packed with packer into framebuffer (the target of the frames,
++ * which the next frame writes whole); each render waited for. Nothing is presented, and nothing of
++ * the renderer's state changes: not its candidate, transport state, notes, level or what it has
++ * found of the bars written first; libplacebo's errors are reset. Renders are made while the time
++ * since the start is under budget_ms. Returns how many renders were made. */
++#define DVBRIDGE_RENDER_WARM 1
++struct dvbridge_gl_packer;
++struct dvbridge_warm_report {
++    unsigned asked;  /* renders of the list */
++    unsigned made;   /* ... made */
++    unsigned failed; /* ... that failed (libplacebo or the metadata refused them) */
++    unsigned left;   /* ... not made: the time was up */
++    double ms;       /* the time it took */
++};
++int dvbridge_render_warm(struct dvbridge_renderer *renderer, const struct pl_frame *source,
++                         const void *metadata, size_t bytes, double pts, double el_pts,
++                         struct dvbridge_geometry geometry, unsigned levels, pl_tex scanout,
++                         struct dvbridge_gl_packer *packer, unsigned framebuffer, double budget_ms,
++                         struct dvbridge_warm_report *report);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 1c133dc..7c230ce 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -276,7 +276,10 @@ CDVBridgeGLES::~CDVBridgeGLES()
+ void CDVBridgeGLES::UseShaderCache()
+ {
+   if (const pl_cache cache = OpenShaderCache())
++  {
+     pl_gpu_set_cache(m_gl->gpu, cache);
++    m_shaderCache = cache;
++  }
+ }
+ 
+ void CDVBridgeGLES::SaveShaderCache()
+@@ -724,6 +727,70 @@ void CDVBridgeGLES::PQTextureDrawn()
+     dvbridge_render_texture_drawn(m_renderer);
+ }
+ 
++void CDVBridgeGLES::Warm(const Layer& base,
++                         const AVFrame* enhancement,
++                         const CDVMetadataBuffer& metadata,
++                         dvbridge_geometry geometry,
++                         unsigned int levels,
++                         bool allowPacked,
++                         double budgetMs)
++{
++  if (!m_renderer || !metadata.Data())
++    return;
++  TakeStaleGLErrors("the ways of drawing are made ready");
++  dvbridge_gl_frame bl{}, el{};
++  if (!dvbridge_gl_frame_import(&bl, m_gl->gpu, base.layout, base.width, base.height, base.planes,
++                                base.chroma))
++    return;
++  // the layer as the frame will import it (with the images kept of its surface)
++  if (enhancement && !m_layerCache)
++    m_layerCache = dvbridge_dmabuf_cache_create();
++  dvbridge_dmabuf imported{};
++  bool mapped = false;
++  bool layered = false;
++  double elPts = std::numeric_limits<double>::quiet_NaN();
++  if (enhancement)
++  {
++    mapped = dvbridge_dmabuf_import_cached(m_layerCache, &imported, enhancement);
++    layered = mapped && dvbridge_gl_frame_import(&el, m_gl->gpu, imported.layout, enhancement->width,
++                                                 enhancement->height, imported.planes,
++                                                 enhancement->chroma_location);
++    if (layered)
++    {
++      bl.frame.enhancement_layer = &el.frame;
++      elPts = static_cast<double>(enhancement->pts);
++    }
++  }
++  const bool whole = !geometry.x && !geometry.y && geometry.width == 3840 && geometry.height == 2160;
++  const int programs = m_shaderCache ? pl_cache_objects(m_shaderCache) : -1;
++  dvbridge_warm_report report{};
++  dvbridge_render_warm(m_renderer, &bl.frame, metadata.Data(), metadata.Size(), base.pts, elPts,
++                       geometry, levels, allowPacked && m_directUsable && whole ? m_scanout : nullptr,
++                       m_packer, 0, budgetMs, &report);
++  if (layered)
++    dvbridge_gl_frame_release(&el);
++  if (mapped)
++    dvbridge_dmabuf_release(&imported);
++  dvbridge_gl_frame_release(&bl);
++  TakeStaleGLErrors("the ways of drawing were made ready");
++  const std::string compiled =
++      programs >= 0
++          ? StringUtils::Format(", {} GPU programs compiled (the others were taken from the cache of "
++                                "earlier sessions, or made before)",
++                                pl_cache_objects(m_shaderCache) - programs)
++          : std::string();
++  CLog::Log(LOGINFO,
++            "DVBridge: {} of {} ways of drawing the frames of this stream made ready before its "
++            "first frame, in {:.0f} ms{}{}{}",
++            report.made, report.asked, report.ms, compiled,
++            report.left ? StringUtils::Format("; {} left for the frame that first needs them (the "
++                                              "{:.0f} ms were up)",
++                                              report.left, budgetMs)
++                        : std::string(),
++            report.failed ? StringUtils::Format("; {} could not be drawn", report.failed)
++                          : std::string());
++}
++
+ unsigned int CDVBridgeGLES::GetPQTexture() const
+ {
+   const auto texture = m_prepared ? dvbridge_render_texture(m_renderer) : nullptr;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 9967ff3..6390872 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -136,6 +136,24 @@ public:
+   //! otherwise (dvbridge_render_texture_drawn()).
+   void PQTextureDrawn();
+ 
++  /*!
++   * \brief Hades: the GPU programs of the ways the frames of this stream can be drawn, made ready
++   *        with its first frame before that is prepared (dvbridge_render_warm()), so that the frame
++   *        that first needs one (GUI elements or subtitles over a picture drawn directly, another
++   *        fidelity step-down level, the enhancement layer resynchronizing after a seek) is not
++   *        late for it on a GPU with little time to spare. Nothing that is presented changes.
++   * \param levels the step-down levels that the frames can be drawn at (bit n: level n)
++   * \param allowPacked frames without GUI elements may be drawn directly
++   * \param budgetMs renders are made while less time than this has passed
++   */
++  void Warm(const Layer& base,
++            const AVFrame* enhancement,
++            const CDVMetadataBuffer& metadata,
++            dvbridge_geometry geometry,
++            unsigned int levels,
++            bool allowPacked,
++            double budgetMs);
++
+   // Hades: a Dolby Vision picture reconstructed for output as HDR10. A bridge is set up for
+   // this or for native output, not for both.
+   bool InitializeConversion(bool allowSoftware = false);
+@@ -197,6 +215,8 @@ private:
+   //! m_gl; and what was made since, written for the next ones
+   void UseShaderCache();
+   static void SaveShaderCache();
++  //! Hades: the cache that UseShaderCache() gave m_gl (nullptr: none)
++  pl_cache m_shaderCache = nullptr;
+   //! Hades: the enhancement surfaces imported so far, kept (see dvbridge_dmabuf.h); and how
+   //! many imports reused one and made one, when that was last logged
+   dvbridge_dmabuf_cache* m_layerCache = nullptr;
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index a0fa812..3b65c9e 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -206,6 +206,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVAheadAlways = false;
+   m_videoDVStepDown = -1;
+   m_videoDVKeepRepeats = true;
++  m_videoDVWarmup = true;
+   m_videoSmoothPercentToTimeSeeking = true;
+   m_videoTimeSeekForward = 30;
+   m_videoTimeSeekBackward = -30;
+@@ -704,6 +705,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+     XMLUtils::GetInt(pElement, "dvstepdown", m_videoDVStepDown, 0, 3);
+     XMLUtils::GetBoolean(pElement, "dvkeeprepeats", m_videoDVKeepRepeats);
++    XMLUtils::GetBoolean(pElement, "dvwarmup", m_videoDVWarmup);
+     XMLUtils::GetBoolean(pElement, "smoothpercenttotimeseeking", m_videoSmoothPercentToTimeSeeking);
+     XMLUtils::GetInt(pElement, "timeseekforward", m_videoTimeSeekForward, 0, 6000);
+     XMLUtils::GetInt(pElement, "timeseekbackward", m_videoTimeSeekBackward, -6000, 0);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index d32446d..3c65030 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -182,6 +182,10 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! same way (paused, or a film at a higher refresh rate) is kept there instead
+     //! (video/dvkeeprepeats). Off to have every refresh drawn, as before
+     bool m_videoDVKeepRepeats;
++    //! Hades: the GPU programs of the ways a native Dolby Vision session can draw its frames are
++    //! made ready before its first frame (video/dvwarmup; dvbridge_render_warm()). Off to have each
++    //! made when a frame first needs it, as before
++    bool m_videoDVWarmup;
+     bool m_videoSmoothPercentToTimeSeeking;
+     int m_videoTimeSeekForward;
+     int m_videoTimeSeekBackward;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index d0050b2..2cf950c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1607,6 +1607,9 @@ bool CWinSystemGbmGLESContext::BeginDVBridge()
+   DVEngineRead();
+   // Hades: whether its frames reach the display is found for this native output
+   m_dvPresentStall.Reset();
++  // Hades: the warm-up, for this native output (its first frame)
++  m_dvWarmed = false;
++  m_dvExtraWork = false;
+   return true;
+ }
+ 
+@@ -1771,7 +1774,37 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   frame.clean = overlayFree;
+   frame.allowPacked = overlayFree && direct;
+   frame.step = m_dvStepLevel;
++  // Hades: an enhancement picture whose residual the metadata does not reconstruct (MEL, or NLQ
++  // that changes nothing) is not imported. libplacebo leaves such a layer out before it draws
++  // anything (pass_init()), so the frame is the same without it, to the bit.
++  const bool layerWithoutResidual = layered && foresaw && !residual;
+   const auto prepareStart = std::chrono::steady_clock::now();
++  // Hades: what is not the preparation of the frame itself (the warm-up), left out of its time
++  double extraMs = 0;
++  // Hades: the GPU programs of the ways this native output can draw its frames, made ready with
++  // its first frame (video/dvwarmup): the levels that the frames can be drawn at are the one that
++  // is set (videoscreen.hadesdvstepmode, or advancedsettings.xml), else those that Kodi can step
++  // down to where the setting lets it; and the direct way only where the way of drawing is not
++  // set to always composed (videoscreen.hadesdvpathmode).
++  if (!m_dvWarmed)
++  {
++    m_dvWarmed = true;
++    const auto component = CServiceBroker::GetSettingsComponent();
++    const auto advanced = component ? component->GetAdvancedSettings() : nullptr;
++    if (!advanced || advanced->m_videoDVWarmup)
++    {
++      unsigned int levels = 1u << m_dvStepLevel;
++      if (m_dvStepForced < 0 && m_dvStepAuto)
++        levels |= m_dvBridge->StepLevels(CDVFrameLoad::WithResidual(foreseen));
++      m_dvBridge->Warm(layer, layerWithoutResidual ? nullptr : enhancement, metadata, geometry,
++                       levels, m_dvEngine.path != CDVEngineSettings::Path::COMPOSED,
++                       DV_WARM_BUDGET_MS);
++      extraMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                           prepareStart)
++                     .count();
++      m_dvExtraWork = true;
++    }
++  }
+   if (DVKeepsPicture(frame))
+   {
+     m_dvRepeat = true;
+@@ -1781,10 +1814,6 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     return true;
+   }
+   DVGpuTimerMark(true);
+-  // Hades: an enhancement picture whose residual the metadata does not reconstruct (MEL, or NLQ
+-  // that changes nothing) is not imported. libplacebo leaves such a layer out before it draws
+-  // anything (pass_init()), so the frame is the same without it, to the bit.
+-  const bool layerWithoutResidual = layered && foresaw && !residual;
+   m_dvFrame = m_dvBridge->PrepareHardware(layer, layerWithoutResidual ? nullptr : enhancement,
+                                           metadata, geometry, overlayFree && direct,
+                                           layerWithoutResidual);
+@@ -1823,10 +1852,14 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     m_dvStepFrame.layered = layered;
+     m_dvStepFrame.format = load;
+     m_dvStepFrame.level = m_dvStepLevel;
+-    m_dvStepFrame.measured = measured;
++    // Hades: (not when work that is not the frame's own went to the GPU before it: when it is
++    // presented says nothing of whether the frames keep up)
++    m_dvStepFrame.measured = measured && !m_dvExtraWork;
+   }
++  m_dvExtraWork = false;
+   const double prepareMs = std::chrono::duration<double, std::milli>(
+-                              std::chrono::steady_clock::now() - prepareStart).count();
++                              std::chrono::steady_clock::now() - prepareStart).count() -
++                           extraMs;
+   m_dvStats.prepared++;
+   m_dvStats.prepareSumMs += prepareMs;
+   m_dvStats.prepareMaxMs = std::max(m_dvStats.prepareMaxMs, prepareMs);
+@@ -2079,6 +2112,9 @@ bool CWinSystemGbmGLESContext::EndDVBridge()
+     CLog::Log(LOGINFO, "DVBridge: native Dolby Vision output ended, normal output restored");
+   }
+   PublishDVInfo(true);
++  // Hades: the warm-up is made again with the first frame of the next native output
++  m_dvWarmed = false;
++  m_dvExtraWork = false;
+   if (m_dvBridge)
+     m_dvBridge->Reset();
+   SetGuiCompositing(0);
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 2a286aa..7eddabd 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -505,6 +505,16 @@ private:
+   //! composed (0), none yet (-1). For the player information, which is a GUI element itself:
+   //! the frames with GUI elements are always composed
+   int m_dvPlainDirect = -1;
++
++  //! Hades: the GPU programs of the ways this native output can draw its frames are made ready
++  //! with its first frame (video/dvwarmup; CDVBridgeGLES::Warm()): done, or not to be done
++  bool m_dvWarmed = false;
++  //! ... within this much time
++  static constexpr double DV_WARM_BUDGET_MS = 1000.0;
++  //! Work that is not the frame's own went to the GPU before the next frame that is drawn (the
++  //! warm-up): when that frame is presented says nothing of whether the frames keep up
++  //! (CDVStepDown is not told). Its GPU time is its own: that work comes before the timer begins.
++  bool m_dvExtraWork = false;
+   void DVGpuTimerTag(bool measured,
+                      bool asked,
+                      bool direct,
+-- 
+2.53.0
+

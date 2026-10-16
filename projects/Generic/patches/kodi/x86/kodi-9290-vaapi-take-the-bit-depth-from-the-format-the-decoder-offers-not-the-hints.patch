@@ -1,0 +1,139 @@
+From 93199a6ce1d6546ad53ba58a931636aa03e60d82 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 22:28:19 +0000
+Subject: [PATCH] VAAPI: take the bit depth from the format the decoder offers,
+ not the hints
+
+CDecoder::Open() runs inside get_format(). It took the bit depth from
+bits_per_raw_sample, which VideoPlayer sets from the stream's hints and
+which only the H.264 decoder overwrites (from its SPS), and fell back to
+pix_fmt only when that was 0. The demuxer makes the hint from the pixel
+format of the stream's parameters and says 8 bits when it never saw
+them: a transport stream that is joined live is opened without
+avformat_find_stream_info(). A 10-bit HEVC channel then got Main 10 as
+its profile (avctx->profile is right) but NV12 surfaces from
+ConfigVAAPI(), and no picture. (The YBLOD fork names it Kodi issue
+23699; the issue was not read here.)
+
+ff_get_format() sets sw_pix_fmt to the software format of the list it
+offers right before it calls get_format(): what the bitstream decodes
+to. DXVA and VDPAU already read it. VAAPI::StreamBitDepth()
+(VAAPIStreamFormat.h) takes its depth, and what Open() took before when
+there is no software format in hand (sw_pix_fmt unset, or a hardware
+format). A line in the log says when the hints were wrong.
+
+Where the hints come from avformat_find_stream_info() (files, so every
+Dolby Vision file whose P010 surfaces the bridge imports), the probe
+decoder's format is the one get_format() offers, and nothing changes.
+The chroma subsampling still comes from pix_fmt: for HEVC that is the
+same format at that point, and the VP9 decoder sets pix_fmt only after
+get_format(), so taking the chroma from sw_pix_fmt as well would let VP9
+profiles 1 and 3 reach a VAAPI path that has never run - a change of
+its own, to make with a 4:4:4 VP9 stream and the hardware in hand.
+
+Host test (vaapi_depth_test.cpp, FFmpeg 9.0.2's own decoders opened as
+VideoPlayer opens them): a 10-bit HEVC transport stream opened without
+stream info has a hint of 8 bits and offers yuv420p10 at get_format(),
+8 bits before and 10 now; the same stream in Matroska with stream info,
+and an 8-bit H.264 stream, give what they gave. Three mutations of the
+header make it fail.
+
+Idea from the YBLOD fork, 6e1fb8a631; rewritten.
+---
+ .../VideoPlayer/DVDCodecs/Video/VAAPI.cpp     | 20 ++++-----
+ .../DVDCodecs/Video/VAAPIStreamFormat.h       | 45 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 11 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPIStreamFormat.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+index 1d03fdd..cb82e8b 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "DVDVideoCodec.h"
+ #include "ServiceBroker.h"
++#include "VAAPIStreamFormat.h"
+ #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "cores/VideoPlayer/Process/ProcessInfo.h"
+@@ -578,17 +579,14 @@ bool CDecoder::Open(AVCodecContext* avctx, AVCodecContext* mainctx, const enum A
+   m_vaapiConfig.surfaceWidth = avctx->coded_width;
+   m_vaapiConfig.surfaceHeight = avctx->coded_height;
+   m_vaapiConfig.aspect = avctx->sample_aspect_ratio;
+-  m_vaapiConfig.bitDepth = avctx->bits_per_raw_sample;
+-  // ffmpeg's HEVC, VP9, and AV1 decoders do not set bits_per_raw_sample,
+-  // but they do set pix_fmt correctly (e.g. yuv420p10le for 10-bit).
+-  // Derive bit depth from the pixel format when bits_per_raw_sample is 0,
+-  // otherwise ConfigVAAPI creates NV12 surfaces for 10-bit content.
+-  if (m_vaapiConfig.bitDepth == 0)
+-  {
+-    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+-    if (desc)
+-      m_vaapiConfig.bitDepth = desc->comp[0].depth;
+-  }
++  // Hades: the depth of the format that get_format() offers, not that of the stream's hints, which
++  // say 8 bits for a stream whose parameters the demuxer never saw (a live transport stream): a
++  // Main 10 stream then got NV12 surfaces from ConfigVAAPI() and no picture (see
++  // VAAPIStreamFormat.h).
++  m_vaapiConfig.bitDepth = VAAPI::StreamBitDepth(*avctx);
++  if (avctx->bits_per_raw_sample != 0 && avctx->bits_per_raw_sample != m_vaapiConfig.bitDepth)
++    CLog::Log(LOGINFO, "VAAPI - the stream decodes to {} bits, its hints said {}",
++              m_vaapiConfig.bitDepth, avctx->bits_per_raw_sample);
+   m_DisplayState = VAAPI_OPEN;
+   m_vaapiConfigured = false;
+   m_presentPicture = nullptr;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPIStreamFormat.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPIStreamFormat.h
+new file mode 100644
+index 0000000..1dafcf0
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPIStreamFormat.h
+@@ -0,0 +1,45 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++#include <libavutil/pixdesc.h>
++}
++
++namespace VAAPI
++{
++/*!
++ * \brief Hades: the bit depth of what the bitstream decodes to, for a hardware decoder that the
++ *        get_format() callback opens
++ *
++ * libavcodec's ff_get_format() sets sw_pix_fmt to the software format of the list it offers, which
++ * the decoder derived from the parameter sets it is about to decode with, right before it calls
++ * get_format(). bits_per_raw_sample is not that: VideoPlayer sets it from the stream's hints, and
++ * only the H.264 decoder overwrites it from its SPS (the HEVC, VP9 and AV1 decoders never write
++ * it). The hints of a stream whose parameters the demuxer never saw say 8 bits (a transport stream
++ * that is joined live is opened without avformat_find_stream_info()), and a 10-bit stream then got
++ * 8-bit surfaces.
++ *
++ * Without a software format in hand (sw_pix_fmt unset, or a hardware format), the answer is what it
++ * was before: bits_per_raw_sample, else the depth of pix_fmt.
++ */
++inline int StreamBitDepth(const AVCodecContext& avctx)
++{
++  const AVPixFmtDescriptor* stream = av_pix_fmt_desc_get(avctx.sw_pix_fmt);
++  if (stream && !(stream->flags & AV_PIX_FMT_FLAG_HWACCEL) && stream->comp[0].depth > 0)
++    return stream->comp[0].depth;
++
++  if (avctx.bits_per_raw_sample != 0)
++    return avctx.bits_per_raw_sample;
++  const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(avctx.pix_fmt);
++  return desc ? desc->comp[0].depth : 0;
++}
++} // namespace VAAPI
+-- 
+2.53.0
+

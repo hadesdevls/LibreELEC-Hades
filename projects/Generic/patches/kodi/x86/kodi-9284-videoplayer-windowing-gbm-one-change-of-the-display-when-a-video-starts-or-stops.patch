@@ -1,0 +1,860 @@
+From a43419e12616b3c79331d2c1e0ef7c08ed01694d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 22:29:27 +0000
+Subject: [PATCH] VideoPlayer, windowing/gbm: one change of the display when a
+ video starts or stops
+
+Every commit that changes the mode, the HDR signalling or the depth of the HDMI link makes the TV
+set itself up again. With the refresh rate adjusted to the video, Kodi set the mode of the video
+first (VideoPlayer, before the decoder is open), and the output of the video came with its first
+picture: the HDR signalling of an HDR10 or HLG video (a modeset on amdgpu and i915), or the
+transport of native Dolby Vision (a modeset with every backend). Two changes of the display, a
+second or less apart. When the video stopped, the output lost its HDR signalling or the transport
+first, and Kodi set the mode of the GUI after it; only native Dolby Vision on nvidia-drm left in
+one commit.
+
+CModeChangeHold:
+- START: the change of mode that VideoPlayer makes for a video whose output will be HDR or native
+  Dolby Vision (DVBRIDGE::ModeChangeForVideo()) is chosen, and the other subsystems told, but not
+  committed. It goes out with the first commit after the renderer of the video is configured
+  (CRenderManager::Configure() calls VideoOutputConfigured()), which carries the HDR signalling,
+  or with the first frame of native output, which carries the transport. Meanwhile nothing is
+  committed, and the display keeps the picture it has. An SDR video is not held: its mode is its
+  only change.
+- STOP: the commit that takes the HDR signalling of a video away waits for the change to the mode
+  of the GUI that follows, and goes out with it.
+- The end of native Dolby Vision joins the next mode with every backend (DVModeChangeJoins(), no
+  longer for nvidia-drm only): amdgpu and i915 made a full modeset for the end of the tunnel in the
+  mode of the video, and another one for the mode of the GUI.
+
+Only with atomic modesetting, the output on, a mode of the same window size, no 3D output, and a
+mode that is not the one on the screen. Each hold has a deadline: 3 s for the output of a video
+(plus the delay after a change of mode that the user set), 2 s for the change of mode after a
+video. After it, what was held goes out alone, as before. A change of mode that comes meanwhile
+ends a hold (one for a video that never set up its output gives the mode on the screen back to
+the selection), as do blanking the output and a window that goes. Native output that starts over
+a STOP hold puts back, when it ends, what Kodi has asked for since (the properties that it keeps
+are those on the screen), and no START hold follows a STOP one in the same change for the same
+reason.
+
+A host model of the commits of each transition, driven by this class, counts the changes of the
+display in 360 transitions (nvidia-drm, amdgpu, i915; SDR, HDR10, HLG, native Dolby Vision; the
+GUI at 60, 100, 119.88, 120 and 144 Hz; videos at 23.976 to 59.94 Hz): 210 go from two to one,
+none the other way, and a renderer configured after the deadline, or no change of mode after a
+stop, gives what it gave before. Twelve mutations of the decisions make the test fail.
+---
+ .../DVDCodecs/Video/DVPlaybackPolicy.h        |  20 ++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |  14 ++
+ .../VideoRenderers/RenderManager.cpp          |   7 +
+ xbmc/windowing/gbm/ModeChangeHold.h           | 211 ++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 156 +++++++++++--
+ xbmc/windowing/gbm/WinSystemGbm.h             |  36 ++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 141 +++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  21 +-
+ 8 files changed, 577 insertions(+), 29 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/ModeChangeHold.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+index cc2f049..b738dce 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+@@ -79,6 +79,26 @@ bool WantsNativeOutput(const VideoPicture* picture);
+ //! up for it (dual-layer decoding, mode selection) before the output switches to that mode.
+ bool WantsNativeOutputMode(const CDVDStreamInfo& stream);
+ bool WantsNativeOutputMode(const VideoPicture* picture);
++//! Hades: what the output of a video that opens will be (CModeChangeHold::Video)
++enum class OpenedOutput
++{
++  ORDINARY = 1, //!< without HDR signalling
++  HDR = 2, //!< with HDR signalling (HDR10, HLG, Dolby Vision that is not sent natively)
++  NATIVE_DV = 3, //!< native Dolby Vision, where a transport mode can carry it
++};
++//! ... told by VideoPlayer from before the change of mode that it makes for that video to after
++//! it, with the resolution it sets (the window system may hold that change for the commit that
++//! sets up the output of the video, so that the display changes once: CModeChangeHold)
++void ModeChangeForVideo(OpenedOutput output, int resolution);
++void ModeChangeForVideoDone();
++//! ... and what it is, by what the stream says before its decoder is open
++constexpr OpenedOutput OutputOfStream(bool nativeDV, bool hdrType, bool pqOrHlg)
++{
++  return nativeDV ? OpenedOutput::NATIVE_DV
++         : hdrType || pqOrHlg ? OpenedOutput::HDR
++                              : OpenedOutput::ORDINARY;
++}
++
+ //! A new video starts (VideoPlayer, once per file, before its input and streams open): the display
+ //! is looked at again and, when it changed, native output disabled by a failure is tried with it.
+ void NewVideo();
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 9e29cdc..1bb3e92 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -4599,7 +4599,21 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+       RESOLUTION res = CResolutionUtils::ChooseBestResolution(
+           static_cast<float>(framerate), hint.width, hint.height, !hint.stereo_mode.empty(),
+           nativeDV, hint.progressive);
++#ifdef HAVE_DVBRIDGE
++      // Hades: the window system may hold this change of mode for the commit that sets up the
++      // output of the video (its HDR signalling, or native Dolby Vision): one change of the
++      // display instead of two
++      DVBRIDGE::ModeChangeForVideo(
++          DVBRIDGE::OutputOfStream(
++              nativeDV, hint.hdrType != StreamHdrType::HDR_TYPE_NONE,
++              hint.colorTransferCharacteristic == AVCOL_TRC_SMPTE2084 ||
++                  hint.colorTransferCharacteristic == AVCOL_TRC_ARIB_STD_B67),
++          static_cast<int>(res));
++#endif
+       CServiceBroker::GetWinSystem()->GetGfxContext().SetVideoResolution(res, false);
++#ifdef HAVE_DVBRIDGE
++      DVBRIDGE::ModeChangeForVideoDone();
++#endif
+       m_renderManager.TriggerUpdateResolution(framerate, hint.width, hint.height, hint.stereo_mode,
+                                               nativeDV, hint.progressive);
+     }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 79f0d47..2e4fb2d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -221,6 +221,13 @@ bool CRenderManager::Configure()
+ 
+   m_pRenderer->SetVideoSettings(m_playerPort->GetVideoSettings());
+   bool result = m_pRenderer->Configure(*m_pConfigPicture, m_fps, m_orientation);
++#ifdef HAVE_DVBRIDGE
++  // Hades: the output of the video is set up, or could not be: a change of mode that waited for
++  // it goes out with the next commit (CModeChangeHold)
++  if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++          CServiceBroker::GetWinSystem()))
++    dvWindow->VideoOutputConfigured();
++#endif
+   if (result)
+   {
+     CRenderInfo info = m_pRenderer->GetRenderInfo();
+diff --git a/xbmc/windowing/gbm/ModeChangeHold.h b/xbmc/windowing/gbm/ModeChangeHold.h
+new file mode 100644
+index 0000000..a6d64ed
+--- /dev/null
++++ b/xbmc/windowing/gbm/ModeChangeHold.h
+@@ -0,0 +1,211 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <utility>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Whether a change of the output waits for the next one, so that the display changes once
++ *
++ * Every commit that changes the mode, the HDR signalling or the depth of the HDMI link makes the
++ * TV set itself up again: some seconds without a picture, and on some TVs a click of the sound.
++ * When a video starts with the refresh rate adjusted to it, Kodi sets the mode of the video
++ * first (VideoPlayer, before the decoder is open), and the output of the video comes after it
++ * with its first picture: the HDR signalling of an HDR10 or HLG video (SetHDR()), or the
++ * transport of native Dolby Vision, which change the link again. When such a video stops, the
++ * output loses its HDR signalling first, and Kodi sets the mode of the GUI after it. That is two
++ * changes of the display each time, a second or less apart.
++ *
++ * START: the change of mode for a video that opens is held for the commit that sets up its
++ * output: the mode is chosen, and goes out with the first commit after the renderer of the video
++ * is configured, or with the first frame of native Dolby Vision. STOP: the commit that takes the
++ * HDR signalling away is held for the change to the mode of the GUI that follows. (Native Dolby
++ * Vision that ends waits for that change of mode on its own, the same way:
++ * CWinSystemGbmGLESContext::EndDVBridgeAfterVideo().) Meanwhile nothing is committed: the display
++ * keeps the picture it has. Each hold has a deadline, after which what was held goes out alone,
++ * as it did before: never a frozen output.
++ *
++ * Only where it can be done: an atomic output that is on, a mode of the same window size (a new
++ * window makes a new surface), no 3D output, and a mode that is not the one on the screen. A
++ * video that sets nothing up after its mode (an SDR video) is not held: its mode is the only
++ * change.
++ *
++ * This class only decides.
++ */
++class CModeChangeHold
++{
++public:
++  //! What the output of a video that opens will be, as its stream says
++  enum class Video
++  {
++    NONE, //!< no video opens: nothing to wait for
++    ORDINARY, //!< without HDR signalling (SDR)
++    HDR, //!< with HDR signalling: HDR10, HLG, or Dolby Vision that is not sent natively
++    NATIVE_DV, //!< native Dolby Vision, where a transport mode can carry it
++  };
++
++  enum class Kind
++  {
++    NONE,
++    START, //!< the mode of a video that opens waits for the output of that video
++    STOP, //!< the end of the HDR signalling of a video waits for the mode of the GUI
++  };
++
++  //! What ended a hold
++  enum class End
++  {
++    NONE,
++    CONFIGURED, //!< (START) the output of the video was set up: the next commit carries all
++    MODE, //!< (STOP) the change of mode came: its commit carries all
++    DEADLINE, //!< nothing came in time: what was held goes out alone
++    CANCELLED, //!< something else changed the output first
++  };
++
++  //! The change that is about to be made, as the window system sees it
++  struct Change
++  {
++    bool atomic = false; //!< atomic modesetting: only its commits carry a mode and properties
++    bool active = false; //!< the output is meant to be on (not blanked)
++    bool sameWindow = false; //!< the window keeps its size (a new one makes a new surface)
++    bool mode3D = false; //!< the mode is a 3D output
++    //! the 3D output has anything to do with this change: the eyes are drawn split, the output
++    //! is in a 3D layout or was refused one, or the driver has a vendor InfoFrame from Kodi
++    bool stereoBusy = false;
++    bool captured = false; //!< native Dolby Vision is captured: it waits its own way
++    bool timingChanges = false; //!< the mode is another one than the mode on the screen
++  };
++
++  static bool Possible(const Change& c)
++  {
++    return c.atomic && c.active && c.sameWindow && !c.mode3D && !c.stereoBusy && !c.captured &&
++           c.timingChanges;
++  }
++
++  /*!
++   * \brief Native Dolby Vision that ended is restored in the commit of the mode that Kodi sets
++   *        next, instead of in a commit of its own before it (CWinSystemGbm::DVModeChangeJoins())
++   *
++   * With every backend: nvidia-drm, and the kernel backends of amdgpu and i915, which make a full
++   * modeset for the end of the transport anyway. The window keeps its size and the mode is no 3D
++   * output (3D is never shown while native output has the output).
++   */
++  static bool DVRestoreJoins(const Change& c)
++  {
++    return c.atomic && c.active && c.captured && c.sameWindow && !c.mode3D && c.timingChanges;
++  }
++
++  //! START: a change of mode made for a video that opens is held for its output
++  static bool StartHolds(Video video, const Change& c)
++  {
++    return (video == Video::HDR || video == Video::NATIVE_DV) && Possible(c);
++  }
++
++  //! STOP: the output of a video that ended, while the screen has HDR signalling and a change of
++  //! mode back to the GUI mode follows (the change described is that one), is held for it
++  static bool StopHolds(bool hdrOnScreen, bool modeChangeFollows, const Change& c)
++  {
++    return hdrOnScreen && modeChangeFollows && Possible(c);
++  }
++
++  void Start(int64_t nowMs) { Begin(Kind::START, nowMs + START_MS); }
++  void Stop(int64_t nowMs) { Begin(Kind::STOP, nowMs + STOP_MS); }
++
++  Kind Holding() const { return m_kind; }
++
++  //! A commit of the ordinary output would be made now: false while a hold lasts. At its deadline
++  //! the hold ends (End::DEADLINE) and the commit goes.
++  bool Commits(int64_t nowMs)
++  {
++    if (m_kind == Kind::NONE)
++      return true;
++    if (nowMs < m_until)
++      return false;
++    Finish(End::DEADLINE);
++    return true;
++  }
++
++  //! The renderer of a video was configured (its output is set up): a START hold ends, and the
++  //! next commit carries the mode with that output; a STOP hold too (a renderer made again
++  //! within a video passes through the end of the one before: no change of mode follows)
++  bool Configured()
++  {
++    if (m_kind == Kind::NONE)
++      return false;
++    Finish(m_kind == Kind::START ? End::CONFIGURED : End::CANCELLED);
++    return true;
++  }
++
++  //! A change of mode is being made: a STOP hold ends with it (its commit carries what was held);
++  //! a START hold is dropped, and the new change is decided on its own
++  bool ModeChange()
++  {
++    if (m_kind == Kind::NONE)
++      return false;
++    Finish(m_kind == Kind::STOP ? End::MODE : End::CANCELLED);
++    return true;
++  }
++
++  //! Something else commits the output (it is blanked, the window goes, native output is
++  //! captured): the hold ends
++  bool Cancel()
++  {
++    if (m_kind == Kind::NONE)
++      return false;
++    Finish(End::CANCELLED);
++    return true;
++  }
++
++  //! How the last hold ended, and what it was, once
++  std::pair<Kind, End> Take()
++  {
++    const auto ended = std::make_pair(m_endedKind, m_ended);
++    m_endedKind = Kind::NONE;
++    m_ended = End::NONE;
++    return ended;
++  }
++
++  //! The time a START hold waits for the output of the video: its first picture, decoded and
++  //! configured (well under a second, also for a 2160p stream)
++  static constexpr int64_t START_MS = 3000;
++  //! ... and a STOP hold for the change of mode (Kodi makes it within a second of the end of the
++  //! video: 0.8 s in the tests of 2026-10-14), as native Dolby Vision that ends waits for it
++  static constexpr int64_t STOP_MS = 2000;
++
++private:
++  void Begin(Kind kind, int64_t until)
++  {
++    if (m_kind != Kind::NONE)
++      Finish(End::CANCELLED);
++    m_kind = kind;
++    m_until = until;
++  }
++  void Finish(End end)
++  {
++    m_endedKind = m_kind;
++    m_ended = end;
++    m_kind = Kind::NONE;
++  }
++
++  Kind m_kind = Kind::NONE;
++  int64_t m_until = 0;
++  Kind m_endedKind = Kind::NONE;
++  End m_ended = End::NONE;
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 989d2dc..999863b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -1570,23 +1570,14 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip
+   return accepted;
+ }
+ 
+-bool CWinSystemGbm::DVModeChangeJoins(const CDVBridgeState& state, const RESOLUTION_INFO& res) const
++bool CWinSystemGbm::OtherTiming(const RESOLUTION_INFO& res) const
+ {
+-  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+-  if (!drm || !drm->IsActive() || !state.Captured() ||
+-      state.CapturedBackend() != CDVBridgeState::Backend::NVIDIA)
+-    return false;
+-  // The window and its buffer stay as they are: a mode of their size, and not a 3D output.
+-  if (res.iWidth != m_nWidth || res.iHeight != m_nHeight ||
+-      (res.dwFlags & (D3DPRESENTFLAG_MODE3DSBS | D3DPRESENTFLAG_MODE3DTB)) != 0)
+-    return false;
+-  const CDRMConnector* connector = drm->GetConnector();
+-  const drmModeModeInfo* now = drm->GetSelectedMode();
++  const CDRMConnector* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
++  const drmModeModeInfo* now = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
+   const int index = std::atoi(res.strId.c_str());
+-  if (!connector || !now || index < 0 || index >= connector->GetModesCount())
++  if (!connector || !now || res.strId.empty() || index < 0 || index >= connector->GetModesCount())
+     return false;
+-  // Another mode: with the same one there is no change of mode to wait for, and the output is
+-  // restored as one whose mode stays.
++  // Another mode: with the same one there is no change of mode to wait for
+   const drmModeModeInfo& next = *connector->GetModeForIndex(index);
+   return next.clock != now->clock || next.hdisplay != now->hdisplay ||
+          next.hsync_start != now->hsync_start || next.hsync_end != now->hsync_end ||
+@@ -1596,7 +1587,48 @@ bool CWinSystemGbm::DVModeChangeJoins(const CDVBridgeState& state, const RESOLUT
+          next.vscan != now->vscan || next.flags != now->flags;
+ }
+ 
+-bool CWinSystemGbm::DVEndWaitsForMode(const CDVBridgeState& state) const
++CModeChangeHold::Change CWinSystemGbm::ModeChangeOf(const RESOLUTION_INFO& res) const
++{
++  CModeChangeHold::Change change;
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  change.atomic = drm != nullptr;
++  change.active = drm && drm->IsActive();
++  // The window and its buffer stay as they are: a mode of their size
++  change.sameWindow = res.iWidth == m_nWidth && res.iHeight == m_nHeight;
++  const CDRMConnector* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
++  const int index = res.strId.empty() ? -1 : std::atoi(res.strId.c_str());
++  const drmModeModeInfo* mode = connector && index >= 0 && index < connector->GetModesCount()
++                                    ? connector->GetModeForIndex(index)
++                                    : nullptr;
++  change.mode3D = (res.dwFlags & (D3DPRESENTFLAG_MODE3DSBS | D3DPRESENTFLAG_MODE3DTB)) != 0 ||
++                  (mode && STEREO::LayoutOf(mode->flags) != STEREO::Layout::NONE);
++  // (what PrepareStereoInfoFrame(), CheckStereoInfoFrame() and CheckStereoOutput() have nothing
++  // to do for, which come with the commit of a mode)
++  change.stereoBusy = IsSplitStereoMode(GetGfxContext().GetStereoMode()) ||
++                      m_stereoInfoFrame.IsValid() || m_stereoLayout != STEREO::Layout::NONE ||
++                      m_stereoRefusedFramePacking || m_stereoRefusedHalfModes ||
++                      m_stereoRefusedInfoFrame;
++  change.captured = NativeDVOutputInUse();
++  change.timingChanges = OtherTiming(res);
++  return change;
++}
++
++bool CWinSystemGbm::DVModeChangeJoins(const CDVBridgeState& state, const RESOLUTION_INFO& res) const
++{
++  // Hades: with every backend. nvidia-drm turns the output off and on otherwise, in the mode of
++  // the video, before the mode that Kodi sets next (two changes of the HDMI link in a row, which
++  // lost a notification of its display engine in the tests of 2026-10-14); amdgpu and i915 make a
++  // full modeset to end the transport, in the mode of the video, and another one for the next mode
++  // (two changes of the display). In the commit of that mode, the display changes once.
++  if (!state.Captured())
++    return false;
++  CModeChangeHold::Change change = ModeChangeOf(res);
++  // (the state of the bridge that the caller has, which is the one captured)
++  change.captured = true;
++  return CModeChangeHold::DVRestoreJoins(change);
++}
++
++bool CWinSystemGbm::ModeAfterVideo(RESOLUTION_INFO& res) const
+ {
+   // As CGraphicContext::SetFullScreenVideo(): when a video stops, Kodi goes back to the resolution
+   // of the GUI, unless the refresh rate is adjusted when a video starts only.
+@@ -1608,7 +1640,94 @@ bool CWinSystemGbm::DVEndWaitsForMode(const CDVBridgeState& state) const
+   RESOLUTION target = RES_DESKTOP;
+   if (CDisplaySettings::GetInstance().GetCurrentResolution() > RES_DESKTOP)
+     target = CDisplaySettings::GetInstance().GetCurrentResolution();
+-  return DVModeChangeJoins(state, CDisplaySettings::GetInstance().GetResolutionInfo(target));
++  res = CDisplaySettings::GetInstance().GetResolutionInfo(target);
++  return true;
++}
++
++bool CWinSystemGbm::DVEndWaitsForMode(const CDVBridgeState& state) const
++{
++  RESOLUTION_INFO target;
++  return ModeAfterVideo(target) && DVModeChangeJoins(state, target);
++}
++
++bool CWinSystemGbm::HoldModeChange(RESOLUTION_INFO& res)
++{
++  // As SetFullScreen() does, but the commit: the mode is chosen, and the next commit carries it
++  VideoSeen();
++  const drmModeModeInfo* before = m_DRM->GetSelectedMode();
++  if (!m_DRM->SetMode(res))
++    return false;
++  // The other subsystems are told now, as for any change of mode: VideoPlayer, which goes on
++  // when it is told that the display is back (SendDisplayReset()), decodes the picture whose
++  // output then goes out with the mode.
++  if (!std::exchange(m_displayLostSent, false))
++    OnLostDevice();
++  m_DRM->SetVideoMode(res, nullptr);
++  m_modeHeldFrom = before;
++  const auto delay =
++      std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++                                    "videoscreen.delayrefreshchange") *
++                                100);
++  if (delay > 0ms)
++    m_dispResetTimer.Set(delay);
++  // (VideoPlayer waits the delay after a change of mode that the user set before it goes on: the
++  // output of the video comes that much later)
++  m_modeHold.Start(std::chrono::duration_cast<std::chrono::milliseconds>(
++                       std::chrono::steady_clock::now().time_since_epoch())
++                       .count() +
++                   std::max<int64_t>(delay.count(), 0));
++  CLog::Log(LOGINFO,
++            "The change of mode to {}x{} @ {:.3f} Hz waits for the output of the video that opens "
++            "(at most {} ms), to go out in one commit with it",
++            res.iScreenWidth, res.iScreenHeight, res.fRefreshRate,
++            CModeChangeHold::START_MS + std::max<int64_t>(delay.count(), 0));
++  return true;
++}
++
++bool CWinSystemGbm::EndModeHoldForModeChange()
++{
++  const CModeChangeHold::Kind kind = m_modeHold.Holding();
++  if (!m_modeHold.ModeChange())
++    return false;
++  // The mode of a video that never set up its output is not the one on the screen
++  if (kind == CModeChangeHold::Kind::START && m_modeHeldFrom)
++    m_DRM->ReselectMode(m_modeHeldFrom);
++  m_modeHeldFrom = nullptr;
++  TellModeHoldEnd();
++  return kind == CModeChangeHold::Kind::STOP;
++}
++
++void CWinSystemGbm::TellModeHoldEnd()
++{
++  const auto [kind, end] = m_modeHold.Take();
++  if (kind == CModeChangeHold::Kind::NONE)
++    return;
++  using End = CModeChangeHold::End;
++  const bool start = kind == CModeChangeHold::Kind::START;
++  if (start)
++    m_modeHeldFrom = nullptr;
++  switch (end)
++  {
++    case End::CONFIGURED:
++      CLog::Log(LOGINFO, "The change of mode goes out with the output of the video, in one "
++                         "commit");
++      break;
++    case End::MODE:
++      CLog::Log(LOGINFO, "The end of the HDR signalling of the video goes out with the change of "
++                         "mode that follows it, in one commit");
++      break;
++    case End::DEADLINE:
++      CLog::Log(LOGINFO, "{} did not come in time: {} goes out alone",
++                start ? "The output of the video" : "A change of mode",
++                start ? "the change of mode" : "the end of the HDR signalling");
++      break;
++    case End::CANCELLED:
++      CLog::Log(LOGINFO, "{} no longer waits: another change of the output came first",
++                start ? "The change of mode" : "The end of the HDR signalling");
++      break;
++    default:
++      break;
++  }
+ }
+ #endif
+ 
+@@ -1669,6 +1788,9 @@ bool CWinSystemGbm::Hide()
+ {
+ #ifdef HAVE_DVBRIDGE
+   WaitDVBridgeFlip();
++  // Hades: this commit carries what a hold of the output kept back (CModeChangeHold)
++  if (m_modeHold.Cancel())
++    TellModeHoldEnd();
+ #endif
+   bool ret = m_DRM->SetActive(false);
+   FlipPage(false, false, false);
+@@ -1679,6 +1801,8 @@ bool CWinSystemGbm::Show(bool raise)
+ {
+ #ifdef HAVE_DVBRIDGE
+   WaitDVBridgeFlip();
++  if (m_modeHold.Cancel())
++    TellModeHoldEnd();
+ #endif
+   bool ret = m_DRM->SetActive(true);
+   FlipPage(false, false, false);
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index a92fd0d..2d70122 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -9,6 +9,9 @@
+ #pragma once
+ 
+ #include "VideoLayerBridge.h"
++#ifdef HAVE_DVBRIDGE
++#include "ModeChangeHold.h"
++#endif
+ #include "drm/DRMObject.h"
+ #include "drm/DRMUtils.h"
+ #include "threads/CriticalSection.h"
+@@ -76,9 +79,10 @@ public:
+     bool refused = false;
+   };
+   bool FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip* flip = nullptr);
+-  //! Hades: nvidia-drm can leave native Dolby Vision with res, the mode that Kodi sets next, in
+-  //! one commit (see FlipDVBridgePage()): the output is captured for native output by that driver
+-  //! and on, and res is another mode of the size of the window, not a 3D output
++  //! Hades: native Dolby Vision can be left with res, the mode that Kodi sets next, in one commit
++  //! (see FlipDVBridgePage()), with every backend (CModeChangeHold::DVRestoreJoins()): the output
++  //! is captured for native output and on, and res is another mode of the size of the window, not
++  //! a 3D output
+   bool DVModeChangeJoins(const CDVBridgeState& state, const RESOLUTION_INFO& res) const;
+   //! Hades: ... and the resolution that Kodi goes back to when a video stops
+   //! (CGraphicContext::SetFullScreenVideo()) is such a mode
+@@ -249,6 +253,32 @@ protected:
+     std::unique_lock lock(m_dvOutputStatusLock);
+     return m_dvFailedCode.empty() ? "failed" : m_dvFailedCode;
+   }
++  //! Hades: a change of the output that waits for the next one, so that the display changes once
++  //! (CModeChangeHold). Only the commits of the ordinary output wait (the GLES context's
++  //! PresentRender()); those of native Dolby Vision carry what waits.
++  CModeChangeHold m_modeHold;
++  //! ... the mode that was on the screen when a START hold began (selected again when another
++  //! change of mode drops it)
++  const drmModeModeInfo* m_modeHeldFrom = nullptr;
++  //! ... the change to res as this window system sees it
++  CModeChangeHold::Change ModeChangeOf(const RESOLUTION_INFO& res) const;
++  //! ... START: res is chosen, and the other subsystems told, as SetFullScreen() does, but nothing
++  //! is committed: the mode goes out with the next commit. False, with nothing done, where res
++  //! cannot be chosen (the change is then made as always).
++  bool HoldModeChange(RESOLUTION_INFO& res);
++  //! ... a change of mode is being made: a hold ends with it (a START one gives the mode on the
++  //! screen back to the selection, for what follows to compare with). True when it was a STOP
++  //! hold: what it held goes out with the commit of this change, which no START hold may then
++  //! keep back (the properties that native output captures are those on the screen).
++  bool EndModeHoldForModeChange();
++  //! ... how the last hold ended, to the log (once)
++  void TellModeHoldEnd();
++  //! The resolution that Kodi goes back to when a video stops (the GUI resolution, as
++  //! CGraphicContext::SetFullScreenVideo() has it), where it goes back to one (not with the refresh
++  //! rate adjusted "on start")
++  bool ModeAfterVideo(RESOLUTION_INFO& res) const;
++  //! The mode of res differs from the mode selected (the one on the screen)
++  bool OtherTiming(const RESOLUTION_INFO& res) const;
+   //! A display that offers Dolby Vision was seen in this session (at init, or by a later look): it
+   //! is looked at again with each video even while its EDID offers no Dolby Vision (an input
+   //! setting, a failed read), so that what it offers again is seen.
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index afcb9cb..d0050b2 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -75,6 +75,7 @@ extern "C"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+ #include "cores/VideoPlayer/DVDStreamInfo.h"
+ #include "drm/DVBridgeRefused.h"
++#include "settings/DisplaySettings.h"
+ #include "rendering/capture/CaptureService.h"
+ #include "settings/lib/Setting.h"
+ 
+@@ -228,11 +229,15 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+                                              bool blankOtherDisplays)
+ {
+ #ifdef HAVE_DVBRIDGE
++  // Hades: a hold of the output ends with a change of mode (CModeChangeHold): the end of the HDR
++  // signalling of a video that waited for this change goes out with its commit (STOP), and the
++  // mode of a video that has not set up its output yet is dropped for this one (START)
++  const bool heldEnd = EndModeHoldForModeChange();
+   // Hades: a video whose native Dolby Vision output ended waiting for this change of mode
+   // (EndDVBridgeAfterVideo()): the ordinary output comes back in the new mode, in one commit
+-  // (FlipDVBridgePage()). The other subsystems are told first, as the change of mode below
+-  // does. Where that commit is refused, the restoration after it turns the output off and on,
+-  // in the new mode.
++  // (FlipDVBridgePage()), with every backend. The other subsystems are told first, as the change
++  // of mode below does. Where that commit is refused, the restoration after it is made on its own
++  // (nvidia-drm: the output off and on again), in the new mode.
+   // If no restoration goes through at all, the mode of the video is selected again: Kodi keeps
+   // its resolution when the change of it fails.
+   const drmModeModeInfo* before = nullptr;
+@@ -253,8 +258,8 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+                   res.iScreenWidth, res.iScreenHeight, res.fRefreshRate);
+       else
+         CLog::Log(LOGWARNING, "DVBridge: leaving native Dolby Vision with the change of mode did "
+-                              "not go through; the output is turned off and on again in the new "
+-                              "mode");
++                              "not go through; the ordinary output is restored on its own, in the "
++                              "new mode");
+     }
+   }
+   if (!EndDVBridge())
+@@ -274,6 +279,17 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+   EndDVConversion();
+   // Hades: in another mode the link may carry another depth: asked again
+   m_dvConvertDepth = DVDepth::UNKNOWN;
++  // Hades: the change of mode for a video that opens waits for the output of that video (its HDR
++  // signalling, or native Dolby Vision), and goes out with it in one commit (CModeChangeHold,
++  // START). The window keeps its size: nothing of it is made again. Not with the end of the HDR
++  // signalling of the video before, which waited for this change (heldEnd): that goes out now,
++  // before anything of the next video is set up on it (native Dolby Vision keeps, to put them
++  // back, the properties that are on the screen when it starts).
++  if (!heldEnd && HoldsModeForVideo(res) && HoldModeChange(res))
++  {
++    CRenderSystemGLES::ResetRenderSystem(res.iWidth, res.iHeight);
++    return true;
++  }
+ #endif
+   // Hades: what is set is res. Only when res is a 3D output whose window cannot be made (the
+   // frame of both eyes, in a buffer that the driver takes for it) is it the resolution without
+@@ -523,6 +539,15 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     SendDisplayReset();
+     return;
+   }
++  // Hades: a change of the output that waits for the next one (CModeChangeHold): nothing is
++  // committed meanwhile, and the display keeps the picture it has. VideoPlayer is told that the
++  // display is back all the same: the picture whose output the change waits for comes from it.
++  if (!ModeHoldCommits())
++  {
++    KODI::TIME::Sleep(10ms);
++    SendDisplayReset();
++    return;
++  }
+ #endif
+ 
+   if (rendered || videoLayer)
+@@ -1559,6 +1584,16 @@ bool CWinSystemGbmGLESContext::BeginDVBridge()
+   m_dvBridge->UpdateScanout();
+   if (!m_dvState.Captured() && !m_dvState.Capture(*drm, EndedStereoInfoFrame()))
+     return DVBridgeBeginRejected("output-state-capture");
++  // Hades: the end of the HDR signalling of the video before still waits (CModeChangeHold, STOP):
++  // what the capture kept to put back is what the screen has, not what Kodi has asked for since,
++  // which goes back after it when native output ends. The transport frames carry what the end
++  // waited for.
++  if (m_modeHold.Holding() == CModeChangeHold::Kind::STOP)
++  {
++    m_dvRestoreRequeue = true;
++    if (m_modeHold.Cancel())
++      TellModeHoldEnd();
++  }
+   m_compositeShader.reset();
+   if (!SetGuiCompositing(AVCOL_TRC_SMPTE2084))
+     return DVBridgeBeginRejected("gui-compositing-setup");
+@@ -1641,6 +1676,10 @@ bool CWinSystemGbmGLESContext::SetVideoOutput(const VideoPicture* picture)
+ {
+   CLog::Log(LOGDEBUG, "DVBridge: output transition picture={} dv_requested={} state_captured={}",
+             picture != nullptr, DVBridgeRequested(picture), m_dvState.Captured());
++  // Hades: the output of a video goes (its renderer ends): the end of its HDR signalling may wait
++  // for the change of mode that follows (CModeChangeHold, STOP)
++  if (!picture)
++    HoldEndOfVideo();
+   // Restore with the current surface before EGL replaces its buffers. (Hades: not when a video has
+   // stopped and its restoration waits for the change of mode that follows, while the window keeps
+   // its surface: see EndDVBridgeAfterVideo().)
+@@ -1854,6 +1893,95 @@ bool CWinSystemGbmGLESContext::EndDVBridgeAfterVideo()
+   return EndDVBridge();
+ }
+ 
++namespace
++{
++// Hades: the change of mode that VideoPlayer makes for a video that opens (DVBRIDGE::OpenedOutput,
++// 0 none), and its resolution
++std::atomic<int> g_modeChangeOutput{0};
++std::atomic<int> g_modeChangeResolution{-1};
++
++int64_t NowMs()
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++} // namespace
++
++void DVBRIDGE::ModeChangeForVideo(OpenedOutput output, int resolution)
++{
++  g_modeChangeResolution = resolution;
++  g_modeChangeOutput = static_cast<int>(output);
++}
++
++void DVBRIDGE::ModeChangeForVideoDone()
++{
++  g_modeChangeOutput = 0;
++  g_modeChangeResolution = -1;
++}
++
++bool CWinSystemGbmGLESContext::HoldsModeForVideo(const RESOLUTION_INFO& res)
++{
++  const int output = g_modeChangeOutput;
++  const int told = g_modeChangeResolution;
++  if (output == 0 || told < 0)
++    return false;
++  // The change that VideoPlayer told of, and no other one that came meanwhile
++  const RESOLUTION_INFO& asked =
++      CDisplaySettings::GetInstance().GetResolutionInfo(static_cast<RESOLUTION>(told));
++  if (asked.strId != res.strId || asked.iScreenWidth != res.iScreenWidth ||
++      asked.iScreenHeight != res.iScreenHeight || asked.dwFlags != res.dwFlags)
++    return false;
++  using Video = CModeChangeHold::Video;
++  Video video = output == static_cast<int>(DVBRIDGE::OpenedOutput::NATIVE_DV) ? Video::NATIVE_DV
++                : output == static_cast<int>(DVBRIDGE::OpenedOutput::HDR)     ? Video::HDR
++                                                                               : Video::ORDINARY;
++  // HDR signalling goes out only where Kodi's HDR output sends it (SetHDR()): elsewhere the video
++  // sets up nothing after its mode, which is its only change
++  if (video == Video::HDR && !(IsHDRDisplaySettingEnabled() && IsHDRDisplay()))
++    video = Video::ORDINARY;
++  return CModeChangeHold::StartHolds(video, ModeChangeOf(res));
++}
++
++void CWinSystemGbmGLESContext::HoldEndOfVideo()
++{
++  // (native Dolby Vision that ends waits its own way: EndDVBridgeAfterVideo())
++  if (m_dvState.Captured() || m_modeHold.Holding() != CModeChangeHold::Kind::NONE)
++    return;
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  auto* connector = drm ? drm->GetConnector() : nullptr;
++  // The HDR signalling that the display has: what the driver took with the last commit it
++  // accepted (the values of the properties are kept from those commits)
++  const bool hdrOnScreen =
++      connector && connector->GetPropertyValue("HDR_OUTPUT_METADATA").value_or(0) != 0;
++  RESOLUTION_INFO target;
++  if (!hdrOnScreen || !ModeAfterVideo(target) ||
++      !CModeChangeHold::StopHolds(hdrOnScreen, true, ModeChangeOf(target)))
++    return;
++  m_modeHold.Stop(NowMs());
++  CLog::Log(LOGINFO,
++            "The end of the HDR signalling of the video waits for the change of mode to {}x{} @ "
++            "{:.3f} Hz that follows (at most {} ms), to go out in one commit with it",
++            target.iScreenWidth, target.iScreenHeight, target.fRefreshRate,
++            CModeChangeHold::STOP_MS);
++}
++
++bool CWinSystemGbmGLESContext::ModeHoldCommits()
++{
++  if (m_modeHold.Holding() == CModeChangeHold::Kind::NONE)
++    return true;
++  if (!m_modeHold.Commits(NowMs()))
++    return false;
++  TellModeHoldEnd();
++  return true;
++}
++
++void CWinSystemGbmGLESContext::VideoOutputConfigured()
++{
++  if (m_modeHold.Configured())
++    TellModeHoldEnd();
++}
++
+ bool CWinSystemGbmGLESContext::DestroyWindow()
+ {
+ #ifdef HAVE_DVBRIDGE
+@@ -1862,6 +1990,9 @@ bool CWinSystemGbmGLESContext::DestroyWindow()
+   // change of mode, and its window goes before its window system, whose end restores too late.
+   if (m_dvState.Captured())
+     EndDVBridge();
++  // Hades: nothing waits for a window that goes (the next commit is of another one)
++  if (m_modeHold.Cancel())
++    TellModeHoldEnd();
+ #endif
+   return CWinSystemGbmEGLContext::DestroyWindow();
+ }
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 44a172e..2a286aa 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -94,12 +94,15 @@ public:
+                        dvbridge_geometry geometry,
+                        unsigned int serial = 0);
+   bool EndDVBridge();
+-  //! Hades: the end of native Dolby Vision output when its video stops (renderer teardown). On
+-  //! nvidia-drm, where Kodi then sets another mode of the size of the window
+-  //! (DVEndWaitsForMode()), the ordinary output waits for that change of mode, DV_END_WAIT at
+-  //! most, with the last frame on the display, and comes back with it in one commit
+-  //! (SetFullScreen()); otherwise EndDVBridge().
++  //! Hades: the end of native Dolby Vision output when its video stops (renderer teardown). Where
++  //! Kodi then sets another mode of the size of the window (DVEndWaitsForMode(): with every
++  //! backend), the ordinary output waits for that change of mode, DV_END_WAIT at most, with the
++  //! last frame on the display, and comes back with it in one commit (SetFullScreen());
++  //! otherwise EndDVBridge().
+   bool EndDVBridgeAfterVideo();
++  //! Hades: the renderer of a video was configured (RenderManager, render thread): a change of
++  //! mode that waits for the output of that video goes out with the next commit (CModeChangeHold)
++  void VideoOutputConfigured();
+   //! Hades: a restoration still to be made needs the window: made before it goes
+   bool DestroyWindow() override;
+   //! Hades: a Dolby Vision picture that is not sent natively can be reconstructed and sent as
+@@ -272,6 +275,14 @@ private:
+   //! EndDVBridgeAfterVideo(): the restoration waits for the change of mode, until then
+   std::atomic<bool> m_dvEndDeferred{false};
+   std::chrono::steady_clock::time_point m_dvEndDeferredUntil{};
++  //! Hades: a change of mode for the video that opens (VideoPlayer) is held for the output of that
++  //! video (CModeChangeHold, START): it is the one that VideoPlayer told of, and res is that change
++  bool HoldsModeForVideo(const RESOLUTION_INFO& res);
++  //! Hades: ... STOP: the end of the HDR signalling of a video that stopped waits for the change
++  //! of mode that follows (SetVideoOutput() without a picture)
++  void HoldEndOfVideo();
++  //! Hades: a commit of the ordinary output may be made now (CModeChangeHold::Commits())
++  bool ModeHoldCommits();
+   bool m_dvFrame = false;
+   double m_dvFramePts = DVD_NOPTS_VALUE; //!< picture prepared by RenderDVBridge()
+   bool m_dvOverlays = true;
+-- 
+2.53.0
+

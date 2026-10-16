@@ -1,0 +1,216 @@
+From fb040d38deeaa978d9f4bd88a0355ec0c9da3ba5 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:13:55 +0000
+Subject: [PATCH] dvbridge: keep what the display is sent of each frame's
+ metadata
+
+The player information could say which extension blocks an RPU carries,
+but not which of them reach the display: the serializer leaves L6 (the
+static HDR10 fallback) and L255 (the encoder's own data) out, makes an L5
+from the place of the picture when the RPU has none, and moves the L5 of
+the RPU onto the 3840x2160 raster. Saying "sent" from the rules of the
+serializer would be a second copy of them that can drift; the payload of
+the frame is the truth.
+
+dvbridge_dv_metadata() now notes where the count of the blocks is in the
+payload, and dvbridge_sent_blocks() reads the blocks back from it: their
+levels in the order sent, and the four values of the L5 block. It checks
+that the payload reads back exactly as it is written (every length within
+it, one L5, nothing left over) and says -1 otherwise, so that nothing is
+shown from a payload it does not understand. Nothing that is written or
+sent changes.
+
+CDVBridgeGLES::Prepare() keeps, with the rest of a frame's PresentedDetail
+(committed only when the frame is presented): the levels of the RPU, the
+target displays of its L2 trims, the source display of the RPU (its color
+metadata), and the blocks sent with the L5 sent.
+
+A host test builds RPUs with libavutil, runs the serializer and checks the
+blocks read back against what each case must send, against the active
+area of the candidate, and against the bytes of the transport packets
+themselves; three mutations of the reader make it fail.
+---
+ tools/dvbridge/dvbridge_core.c                | 36 +++++++++++++++++++
+ tools/dvbridge/dvbridge_core.h                |  7 ++++
+ tools/dvbridge/dvbridge_metadata.h            |  4 +++
+ .../VideoRenderers/DVBridgeGLES.cpp           | 22 ++++++++++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h | 17 +++++++++
+ 5 files changed, 86 insertions(+)
+
+diff --git a/tools/dvbridge/dvbridge_core.c b/tools/dvbridge/dvbridge_core.c
+index 9145805..0cc8039 100644
+--- a/tools/dvbridge/dvbridge_core.c
++++ b/tools/dvbridge/dvbridge_core.c
+@@ -106,3 +106,39 @@ bool dvbridge_active_area(const struct dvbridge_candidate *candidate, unsigned m
+     memcpy(margins, candidate->margins, sizeof(candidate->margins));
+     return true;
+ }
++
++int dvbridge_sent_blocks(const struct dvbridge_candidate *candidate, uint8_t *levels,
++                         unsigned max, unsigned l5[4])
++{
++    if (!candidate || !l5)
++        return -1;
++    const struct dvbridge_dv *d = &candidate->state;
++    unsigned pos = d->blocks_at;
++    if (!pos || pos >= d->size || d->size > sizeof(d->payload))
++        return -1;
++    /* As dvbridge_dv_metadata() writes each block: its length (32 bits), its level, its data.
++     * Every payload has one level 5 block, from the metadata or made for the raster. */
++    const unsigned count = d->payload[pos++];
++    bool area = false;
++    for (unsigned i = 0; i < count; ++i) {
++        if (d->size - pos < 5)
++            return -1;
++        const uint32_t length = (uint32_t)d->payload[pos] << 24 | (uint32_t)d->payload[pos + 1] << 16 |
++                                (uint32_t)d->payload[pos + 2] << 8 | (uint32_t)d->payload[pos + 3];
++        const uint8_t level = d->payload[pos + 4];
++        pos += 5;
++        if (length > d->size - pos)
++            return -1;
++        if (level == 5) {
++            if (length != 8 || area)
++                return -1;
++            for (unsigned j = 0; j < 4; ++j)
++                l5[j] = (unsigned)d->payload[pos + 2 * j] << 8 | d->payload[pos + 2 * j + 1];
++            area = true;
++        }
++        if (levels && i < max)
++            levels[i] = level;
++        pos += length;
++    }
++    return pos == d->size && area ? (int)count : -1;
++}
+diff --git a/tools/dvbridge/dvbridge_core.h b/tools/dvbridge/dvbridge_core.h
+index 0344f3e..17d4622 100644
+--- a/tools/dvbridge/dvbridge_core.h
++++ b/tools/dvbridge/dvbridge_core.h
+@@ -30,6 +30,13 @@ bool dvbridge_commit(struct dvbridge_context *context, const struct dvbridge_can
+ const uint32_t *dvbridge_packets(const struct dvbridge_candidate *candidate, unsigned *count);
+ /* Left, right, top, bottom blanking margins in the final 3840x2160 raster. */
+ bool dvbridge_active_area(const struct dvbridge_candidate *candidate, unsigned margins[4]);
++/* Hades: the extension blocks of the display management metadata that the candidate carries,
++ * read back from the payload that the display is sent, for the player information: their levels
++ * in the order in which they are sent (the first max of them), and the four values of its level 5
++ * block, the active area as left, right, top and bottom offsets on the 3840x2160 raster. Returns
++ * how many blocks there are, or -1 when the payload does not read back as it is written. */
++int dvbridge_sent_blocks(const struct dvbridge_candidate *candidate, uint8_t *levels,
++                         unsigned max, unsigned l5[4]);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/tools/dvbridge/dvbridge_metadata.h b/tools/dvbridge/dvbridge_metadata.h
+index 9f5091b..150c652 100644
+--- a/tools/dvbridge/dvbridge_metadata.h
++++ b/tools/dvbridge/dvbridge_metadata.h
+@@ -21,6 +21,9 @@ struct dvbridge_dv {
+     int source_w, source_h, dest_x, dest_y, dest_w, dest_h;
+     bool fel_verified;
+     unsigned compatibility_omissions;
++    /* Hades: where the payload holds the count of its extension blocks, which follow it (0: no
++     * payload yet). Read back by dvbridge_sent_blocks(), for the player information. */
++    unsigned blocks_at;
+ };
+ #define DV_REQUIRE(x) do { if (!(x)) return false; } while (0)
+ /* Presentation times reach the serializer in AV_TIME_BASE units (microseconds), as Kodi passes
+@@ -129,6 +132,7 @@ static inline bool dvbridge_dv_metadata(struct dvbridge_dv *d, const AVDOVIMetad
+     dvbridge_dv_u16(d, 42);
+     unsigned count_pos = d->size++;
+     d->payload[count_pos] = 0;
++    d->blocks_at = count_pos;
+     unsigned l1 = 0, area = 0, targets[AV_DOVI_MAX_EXT_BLOCKS], ntargets = 0;
+     const AVDOVIDmData *ordered[AV_DOVI_MAX_EXT_BLOCKS];
+     unsigned order[AV_DOVI_MAX_EXT_BLOCKS];
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 7d35cd5..5ab5f8e 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -25,6 +25,9 @@ extern "C"
+ #include <GLES3/gl3.h>
+ #include <limits>
+ 
++// (every extension block of an RPU has its place in a PresentedDetail)
++static_assert(AV_DOVI_MAX_EXT_BLOCKS <= CDVBridgeGLES::PresentedDetail::MAX_BLOCKS);
++
+ namespace
+ {
+ // A line of shader source, which libplacebo logs line by line ("[ 12] ...") after a shader that
+@@ -342,6 +345,8 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+     {
+       const auto* ext = av_dovi_get_ext(parsed, i);
+       const auto level = ext->level;
++      if (m_pendingDetail.levelCount < PresentedDetail::MAX_BLOCKS)
++        m_pendingDetail.levels[m_pendingDetail.levelCount++] = level;
+       if (level == 3 || level == 8 || level == 9 || level == 10 || level == 11 || level == 254)
+         m_pendingInfo |= CDVPlaybackInfo::CM4;
+       if (level == 1)
+@@ -351,7 +356,11 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+         m_pendingDetail.l1[2] = ext->l1.max_pq;
+       }
+       else if (level == 2)
++      {
++        if (m_pendingDetail.l2Trims < static_cast<int>(PresentedDetail::MAX_BLOCKS))
++          m_pendingDetail.l2Targets[m_pendingDetail.l2Trims] = ext->l2.target_max_pq;
+         m_pendingDetail.l2Trims++;
++      }
+       else if (level == 5)
+       {
+         m_pendingDetail.l5[0] = ext->l5.left_offset;
+@@ -366,6 +375,19 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+       }
+     }
+     m_pendingDetail.cm4 = (m_pendingInfo & CDVPlaybackInfo::CM4) != 0;
++    // Hades: the source display of the RPU, and what of its metadata the display is sent, read
++    // back from the payload of this frame (the transport carries it; nothing else changes it)
++    const AVDOVIColorMetadata* source = av_dovi_get_color(parsed);
++    m_pendingDetail.source[0] = source->source_min_pq;
++    m_pendingDetail.source[1] = source->source_max_pq;
++    unsigned int area[4];
++    const int sent = dvbridge_sent_blocks(dvbridge_render_candidate(m_renderer),
++                                          m_pendingDetail.sent, PresentedDetail::MAX_BLOCKS, area);
++    if (sent >= 0 && sent <= static_cast<int>(PresentedDetail::MAX_BLOCKS))
++    {
++      m_pendingDetail.sentCount = sent;
++      std::copy(std::begin(area), std::end(area), std::begin(m_pendingDetail.sentL5));
++    }
+     if (!m_reportedFrame)
+     {
+       // Hades: in the log without debugging, to tell a stream whose picture comes out wrong
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 9879cb7..2f2995c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -5,6 +5,7 @@
+ #include "utils/DVBridgeDiagnosticState.h"
+ 
+ #include <atomic>
++#include <cstdint>
+ 
+ extern "C"
+ {
+@@ -77,6 +78,22 @@ public:
+     int l2Trims = 0;
+     int l5[4] = {-1, -1, -1, -1}; //!< L5 left, right, top, bottom offsets
+     int l6[2] = {-1, -1}; //!< L6 MaxCLL, MaxFALL in cd/m2
++    // Hades: for the overview page of the player information
++    static constexpr unsigned int MAX_BLOCKS = 32; //!< AV_DOVI_MAX_EXT_BLOCKS
++    //! the source (mastering) display of the RPU: min, max as 12-bit PQ codes; -1 when absent
++    int source[2] = {-1, -1};
++    //! the levels of the extension blocks of the RPU, in its order
++    uint8_t levels[MAX_BLOCKS] = {};
++    unsigned int levelCount = 0;
++    //! the target displays of its L2 trims (the first l2Trims), as 12-bit PQ codes
++    uint16_t l2Targets[MAX_BLOCKS] = {};
++    //! the levels of the extension blocks of the display management metadata that the display
++    //! is sent, read back from it, in the order sent; sentCount -1 when it could not be read
++    uint8_t sent[MAX_BLOCKS] = {};
++    int sentCount = -1;
++    //! ... and its level 5 block: the active area on the 3840x2160 raster (left, right, top,
++    //! bottom), from the RPU's L5 or, when it has none, made from the picture's place
++    int sentL5[4] = {-1, -1, -1, -1};
+   };
+   const PresentedDetail& GetPresentedDetail() const { return m_presentedDetail; }
+   //! Presented frames whose L1 differed from the previous presented frame, since the last call.
+-- 
+2.53.0
+

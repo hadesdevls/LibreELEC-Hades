@@ -1,0 +1,524 @@
+From 6d298fbd7ffb8b092cd99d7f0e9447dcd8954b18 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:14:08 +0000
+Subject: [PATCH] dvbridge: keep the EGL images of the enhancement-layer
+ surfaces
+
+Every frame with an enhancement layer mapped its VAAPI surface to DRM
+PRIME, made two EGL images and two textures from it, looked up three EGL
+entry points and the EGL extension string, and destroyed all of it after
+the render. The decoder has a fixed pool of surfaces, so the same images
+can serve again, as Kodi's own VAAPI texture pool does for the base layer
+(CVaapiTexturePool).
+
+dvbridge_dmabuf_import_cached() still maps the frame every time (FFmpeg
+waits for the decoder there and exports the surface), and identifies the
+memory by the device and inode of each dma-buf and by the whole layout
+given to EGL; a surface seen before gets its images and textures back.
+Frames of another pool of surfaces, or another EGL display, empty the
+cache; when it is full (32 surfaces) the least recently used one makes
+room. The cache of a bridge is emptied at the end of native output and
+destroyed with the bridge; how many imports found their images and how
+many made them is logged then.
+
+Tested on the host with EGL, OpenGL ES and av_hwframe_map() replaced by
+counting fakes over memfds (a new descriptor of the same file for every
+mapping, as vaExportSurfaceHandle gives): the same surface gives the same
+textures without new images, another dma-buf behind the same surface id,
+another pool or another display do not, the least recently used surface
+makes room, a failed import leaves nothing, every image and texture is
+deleted exactly once, every mapping is released, and without a cache the
+import behaves as before. Not run on a GPU: whether a driver gives the
+same dma-buf for a surface every time (which Kodi's base-layer pool relies
+on as well) is seen in the log line of the cache.
+---
+ tools/dvbridge/dvbridge_dmabuf.c              | 300 ++++++++++++++----
+ tools/dvbridge/dvbridge_dmabuf.h              |  27 ++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  28 +-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   5 +
+ 4 files changed, 300 insertions(+), 60 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_dmabuf.c b/tools/dvbridge/dvbridge_dmabuf.c
+index 73ad2ac..21eabd9 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.c
++++ b/tools/dvbridge/dvbridge_dmabuf.c
+@@ -10,7 +10,9 @@
+ #include <libavutil/pixdesc.h>
+ #include <limits.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ 
+ /* Reason of the last failed import, for diagnostics only. */
+ static char last_error[192];
+@@ -73,22 +75,196 @@ bool dvbridge_dmabuf_validate_p010(const AVDRMFrameDescriptor *desc, int width,
+     return true;
+ }
+ 
++/* The EGL entry points that an import uses, and the display it imports into. */
++struct egl_entry {
++    EGLDisplay display;
++    PFNEGLCREATEIMAGEKHRPROC create;
++    PFNEGLDESTROYIMAGEKHRPROC destroy;
++    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind;
++    bool modifiers;
++};
++
++static void delete_planes(EGLDisplay display, PFNEGLDESTROYIMAGEKHRPROC destroy,
++                          EGLImage images[2], struct dvbridge_gl_plane planes[3])
++{
++    for (int i = 0; i < 2; ++i) {
++        if (planes[i].texture)
++            glDeleteTextures(1, &planes[i].texture);
++        if (images[i] && destroy)
++            destroy(display, images[i]);
++        planes[i] = (struct dvbridge_gl_plane){0};
++        images[i] = NULL;
++    }
++}
++
++/* The two planes of a mapped surface as EGL images and textures. On failure nothing is left. */
++static bool make_planes(const struct egl_entry *egl, const AVDRMFrameDescriptor *desc, int pool_width,
++                        int pool_height, EGLImage images[2], struct dvbridge_gl_plane planes[3])
++{
++    for (int i = 0; i < 2; ++i) {
++        const AVDRMLayerDescriptor *layer = &desc->layers[i];
++        const AVDRMPlaneDescriptor *plane = &layer->planes[0];
++        const AVDRMObjectDescriptor *object = &desc->objects[plane->object_index];
++        int width = i ? (pool_width + 1) / 2 : pool_width;
++        int height = i ? (pool_height + 1) / 2 : pool_height;
++        if (object->format_modifier != DRM_FORMAT_MOD_INVALID &&
++            object->format_modifier != DRM_FORMAT_MOD_LINEAR && !egl->modifiers) {
++            snprintf(last_error, sizeof(last_error), "modifier=0x%llx without EGL_EXT_image_dma_buf_import_modifiers",
++                     (unsigned long long)object->format_modifier);
++            goto fail;
++        }
++        EGLint attrs[24] = {
++            EGL_WIDTH, width, EGL_HEIGHT, height, EGL_LINUX_DRM_FOURCC_EXT, (EGLint)layer->format,
++            EGL_DMA_BUF_PLANE0_FD_EXT, object->fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)plane->offset,
++            EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)plane->pitch, EGL_NONE};
++        if (egl->modifiers && object->format_modifier != DRM_FORMAT_MOD_INVALID) {
++            attrs[12] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
++            attrs[13] = (EGLint)(object->format_modifier & UINT32_MAX);
++            attrs[14] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
++            attrs[15] = (EGLint)(object->format_modifier >> 32);
++            attrs[16] = EGL_NONE;
++        }
++        images[i] = egl->create(egl->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
++        if (!images[i]) {
++            snprintf(last_error, sizeof(last_error), "egl-image plane=%d egl_error=0x%x", i, (unsigned)eglGetError());
++            goto fail;
++        }
++        /* Errors left by earlier, unrelated GL work are not ours: clear them (bounded), so that
++         * the check below sees only what this import raised. */
++        for (int e = 0; e < 16 && glGetError() != GL_NO_ERROR; ++e)
++            ;
++        GLint previous;
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
++        glGenTextures(1, &planes[i].texture);
++        glBindTexture(GL_TEXTURE_2D, planes[i].texture);
++        egl->bind(GL_TEXTURE_2D, images[i]);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glBindTexture(GL_TEXTURE_2D, previous);
++        const GLenum error = glGetError();
++        if (error != GL_NO_ERROR) {
++            snprintf(last_error, sizeof(last_error), "gl-texture plane=%d gl_error=0x%x", i, (unsigned)error);
++            goto fail;
++        }
++        planes[i].width = width;
++        planes[i].height = height;
++    }
++    return true;
++fail:
++    delete_planes(egl->display, egl->destroy, images, planes);
++    return false;
++}
++
+ void dvbridge_dmabuf_release(struct dvbridge_dmabuf *frame)
+ {
+     if (!frame)
+         return;
+-    PFNEGLDESTROYIMAGEKHRPROC destroy = (void *)eglGetProcAddress("eglDestroyImageKHR");
+-    for (int i = 0; i < 2; ++i) {
+-        if (frame->planes[i].texture)
+-            glDeleteTextures(1, &frame->planes[i].texture);
+-        if (frame->images[i] && destroy)
+-            destroy(frame->display, frame->images[i]);
++    if (!frame->cached) {
++        PFNEGLDESTROYIMAGEKHRPROC destroy = (void *)eglGetProcAddress("eglDestroyImageKHR");
++        delete_planes(frame->display, destroy, frame->images, frame->planes);
+     }
+     av_frame_free(&frame->mapping);
+     memset(frame, 0, sizeof(*frame));
+ }
+ 
++/* Hades: what tells one surface from another: its memory (the device and inode of each dma-buf,
++ * which stay the same for as long as that memory exists and are not given to other memory
++ * meanwhile) and everything else that the import passes to EGL. */
++struct surface_identity {
++    int nb_objects;
++    unsigned long long dev[AV_DRM_MAX_PLANES], ino[AV_DRM_MAX_PLANES];
++    unsigned long long size[AV_DRM_MAX_PLANES], modifier[AV_DRM_MAX_PLANES];
++    unsigned long long format[2], object[2], offset[2], pitch[2];
++    int width, height;
++};
++
++#define CACHE_ENTRIES 32
++
++struct cache_entry {
++    bool used;
++    unsigned long long last; /* the import that used it last */
++    struct surface_identity identity;
++    EGLImage images[2];
++    struct dvbridge_gl_plane planes[3];
++};
++
++struct dvbridge_dmabuf_cache {
++    struct egl_entry egl; /* display NULL until the first import */
++    const void *pool;     /* the hardware frames context of the frames last imported */
++    unsigned long long clock;
++    unsigned long reused, made;
++    struct cache_entry entries[CACHE_ENTRIES];
++};
++
++static bool identify(struct surface_identity *id, const AVDRMFrameDescriptor *desc, int width, int height)
++{
++    memset(id, 0, sizeof(*id));
++    id->nb_objects = desc->nb_objects;
++    for (int i = 0; i < desc->nb_objects; ++i) {
++        struct stat st;
++        if (fstat(desc->objects[i].fd, &st) != 0)
++            return false;
++        id->dev[i] = (unsigned long long)st.st_dev;
++        id->ino[i] = (unsigned long long)st.st_ino;
++        id->size[i] = (unsigned long long)desc->objects[i].size;
++        id->modifier[i] = (unsigned long long)desc->objects[i].format_modifier;
++    }
++    for (int i = 0; i < 2; ++i) {
++        id->format[i] = desc->layers[i].format;
++        id->object[i] = (unsigned long long)desc->layers[i].planes[0].object_index;
++        id->offset[i] = (unsigned long long)desc->layers[i].planes[0].offset;
++        id->pitch[i] = (unsigned long long)desc->layers[i].planes[0].pitch;
++    }
++    id->width = width;
++    id->height = height;
++    return true;
++}
++
++static void cache_drop(struct dvbridge_dmabuf_cache *cache, struct cache_entry *entry)
++{
++    if (entry->used)
++        delete_planes(cache->egl.display, cache->egl.destroy, entry->images, entry->planes);
++    memset(entry, 0, sizeof(*entry));
++}
++
++struct dvbridge_dmabuf_cache *dvbridge_dmabuf_cache_create(void)
++{
++    return calloc(1, sizeof(struct dvbridge_dmabuf_cache));
++}
++
++void dvbridge_dmabuf_cache_clear(struct dvbridge_dmabuf_cache *cache)
++{
++    if (!cache)
++        return;
++    for (int i = 0; i < CACHE_ENTRIES; ++i)
++        cache_drop(cache, &cache->entries[i]);
++    cache->pool = NULL;
++}
++
++void dvbridge_dmabuf_cache_destroy(struct dvbridge_dmabuf_cache *cache)
++{
++    dvbridge_dmabuf_cache_clear(cache);
++    free(cache);
++}
++
++void dvbridge_dmabuf_cache_counts(const struct dvbridge_dmabuf_cache *cache, unsigned long *reused,
++                                  unsigned long *made)
++{
++    if (reused)
++        *reused = cache ? cache->reused : 0;
++    if (made)
++        *made = cache ? cache->made : 0;
++}
++
+ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
++{
++    return dvbridge_dmabuf_import_cached(NULL, out, source);
++}
++
++bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct dvbridge_dmabuf *out,
++                                   const AVFrame *source)
+ {
+     if (!out || out->mapping || !source || source->format != AV_PIX_FMT_VAAPI ||
+         !source->hw_frames_ctx || source->width < 1 || source->height < 1 ||
+@@ -97,10 +273,18 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+                  source ? source->width : 0, source ? source->height : 0);
+         return false;
+     }
+-    PFNEGLCREATEIMAGEKHRPROC create = (void *)eglGetProcAddress("eglCreateImageKHR");
+-    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
++    struct egl_entry egl;
+     EGLDisplay display = eglGetCurrentDisplay();
+-    if (!create || !bind || display == EGL_NO_DISPLAY) {
++    if (cache && cache->egl.display && cache->egl.display == display) {
++        egl = cache->egl;
++    } else {
++        egl.create = (void *)eglGetProcAddress("eglCreateImageKHR");
++        egl.destroy = (void *)eglGetProcAddress("eglDestroyImageKHR");
++        egl.bind = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
++        egl.display = display;
++        egl.modifiers = false;
++    }
++    if (!egl.create || !egl.bind || display == EGL_NO_DISPLAY) {
+         snprintf(last_error, sizeof(last_error), "egl-entry-points-or-display");
+         return false;
+     }
+@@ -118,6 +302,8 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+         return false;
+     }
+     candidate.mapping->format = AV_PIX_FMT_DRM_PRIME;
++    /* (vaapi: waits for the decoder to finish the surface, then exports it; done for every frame,
++     * also when the images of the surface are kept) */
+     if (av_hwframe_map(candidate.mapping, source, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) < 0) {
+         snprintf(last_error, sizeof(last_error), "drm-prime-map");
+         goto fail;
+@@ -127,58 +313,56 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *source)
+         describe_layout(desc);
+         goto fail;
+     }
+-    const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
+-    bool modifiers = extensions && strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
+-    for (int i = 0; i < 2; ++i) {
+-        const AVDRMLayerDescriptor *layer = &desc->layers[i];
+-        const AVDRMPlaneDescriptor *plane = &layer->planes[0];
+-        const AVDRMObjectDescriptor *object = &desc->objects[plane->object_index];
+-        int width = i ? (hw->width + 1) / 2 : hw->width;
+-        int height = i ? (hw->height + 1) / 2 : hw->height;
+-        if (object->format_modifier != DRM_FORMAT_MOD_INVALID &&
+-            object->format_modifier != DRM_FORMAT_MOD_LINEAR && !modifiers) {
+-            snprintf(last_error, sizeof(last_error), "modifier=0x%llx without EGL_EXT_image_dma_buf_import_modifiers",
+-                     (unsigned long long)object->format_modifier);
+-            goto fail;
+-        }
+-        EGLint attrs[24] = {
+-            EGL_WIDTH, width, EGL_HEIGHT, height, EGL_LINUX_DRM_FOURCC_EXT, (EGLint)layer->format,
+-            EGL_DMA_BUF_PLANE0_FD_EXT, object->fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)plane->offset,
+-            EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)plane->pitch, EGL_NONE};
+-        if (modifiers && object->format_modifier != DRM_FORMAT_MOD_INVALID) {
+-            attrs[12] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+-            attrs[13] = (EGLint)(object->format_modifier & UINT32_MAX);
+-            attrs[14] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+-            attrs[15] = (EGLint)(object->format_modifier >> 32);
+-            attrs[16] = EGL_NONE;
+-        }
+-        candidate.images[i] = create(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+-        if (!candidate.images[i]) {
+-            snprintf(last_error, sizeof(last_error), "egl-image plane=%d egl_error=0x%x", i, (unsigned)eglGetError());
+-            goto fail;
++    if (!cache || cache->egl.display != display) {
++        const char *extensions = eglQueryString(display, EGL_EXTENSIONS);
++        egl.modifiers = extensions && strstr(extensions, "EGL_EXT_image_dma_buf_import_modifiers");
++    }
++    if (cache) {
++        /* Another display (not seen in Kodi, which keeps one): what was made with the one before
++         * goes with it. Frames of another pool of surfaces: what the cache holds is of surfaces
++         * that are gone or going. */
++        if (cache->egl.display != display) {
++            dvbridge_dmabuf_cache_clear(cache);
++            cache->egl = egl;
++        } else if (cache->pool != (const void *)hw) {
++            dvbridge_dmabuf_cache_clear(cache);
+         }
+-        /* Errors left by earlier, unrelated GL work are not ours: clear them (bounded), so that
+-         * the check below sees only what this import raised. */
+-        for (int e = 0; e < 16 && glGetError() != GL_NO_ERROR; ++e)
+-            ;
+-        GLint previous;
+-        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous);
+-        glGenTextures(1, &candidate.planes[i].texture);
+-        glBindTexture(GL_TEXTURE_2D, candidate.planes[i].texture);
+-        bind(GL_TEXTURE_2D, candidate.images[i]);
+-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+-        glBindTexture(GL_TEXTURE_2D, previous);
+-        const GLenum error = glGetError();
+-        if (error != GL_NO_ERROR) {
+-            snprintf(last_error, sizeof(last_error), "gl-texture plane=%d gl_error=0x%x", i, (unsigned)error);
+-            goto fail;
++        cache->pool = hw;
++        struct surface_identity identity;
++        if (identify(&identity, desc, hw->width, hw->height)) {
++            ++cache->clock;
++            struct cache_entry *found = NULL, *room = NULL;
++            for (int i = 0; i < CACHE_ENTRIES && !found; ++i) {
++                struct cache_entry *entry = &cache->entries[i];
++                if (entry->used && !memcmp(&entry->identity, &identity, sizeof(identity)))
++                    found = entry;
++                else if (!room || (room->used && (!entry->used || entry->last < room->last)))
++                    room = entry;
++            }
++            if (!found) {
++                /* the least recently used surface, if every entry has one */
++                cache_drop(cache, room);
++                if (!make_planes(&egl, desc, hw->width, hw->height, room->images, room->planes))
++                    goto fail;
++                room->identity = identity;
++                room->used = true;
++                found = room;
++                ++cache->made;
++            } else {
++                ++cache->reused;
++            }
++            found->last = cache->clock;
++            memcpy(candidate.planes, found->planes, sizeof(candidate.planes));
++            candidate.cached = true;
++            *out = candidate;
++            last_error[0] = 0;
++            return true;
+         }
+-        candidate.planes[i].width = width;
+-        candidate.planes[i].height = height;
++        /* (fstat() of a dma-buf does not fail: if it did, the surface is imported for this frame
++         * alone, as without a cache) */
+     }
++    if (!make_planes(&egl, desc, hw->width, hw->height, candidate.images, candidate.planes))
++        goto fail;
+     *out = candidate;
+     last_error[0] = 0;
+     return true;
+diff --git a/tools/dvbridge/dvbridge_dmabuf.h b/tools/dvbridge/dvbridge_dmabuf.h
+index 642fa43..294a016 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.h
++++ b/tools/dvbridge/dvbridge_dmabuf.h
+@@ -12,6 +12,9 @@ struct dvbridge_dmabuf {
+     EGLImage images[2];
+     struct dvbridge_gl_plane planes[3];
+     enum dvbridge_gl_layout layout;
++    /* Hades: the images and textures are those of a dvbridge_dmabuf_cache, which keeps them:
++     * dvbridge_dmabuf_release() frees the mapping alone */
++    bool cached;
+ };
+ bool dvbridge_dmabuf_validate_p010(const AVDRMFrameDescriptor *desc, int width, int height);
+ /* Current EGL/GLES context required. Does not transfer pixels through the CPU. */
+@@ -19,4 +22,28 @@ bool dvbridge_dmabuf_import(struct dvbridge_dmabuf *out, const AVFrame *frame);
+ void dvbridge_dmabuf_release(struct dvbridge_dmabuf *frame);
+ /* Why the last dvbridge_dmabuf_import() failed, for diagnostics; empty after a success. */
+ const char *dvbridge_dmabuf_last_error(void);
++
++/* Hades: the EGL images and the textures of the surfaces of a decoder, kept from one frame to
++ * the next. A frame is mapped as dvbridge_dmabuf_import() maps it, every time (the mapping waits
++ * for the decoder to finish the surface, and says which memory it is): when that memory is a
++ * surface that was imported before (the same dma-buf, by its device and inode, with the same
++ * layout), its images and textures are used again, as Kodi's own VAAPI texture pool does for the
++ * base layer; else they are made and kept. A decoder has a fixed pool of surfaces (32 at most),
++ * which fits. Frames of another pool of surfaces empty the cache first; the least recently used
++ * entry makes room when it is full. All calls on the GL context and thread of the importer. */
++#define DVBRIDGE_DMABUF_CACHE 1
++struct dvbridge_dmabuf_cache;
++struct dvbridge_dmabuf_cache *dvbridge_dmabuf_cache_create(void);
++/* Deletes what the cache holds (current GL context required); NULL does nothing. */
++void dvbridge_dmabuf_cache_destroy(struct dvbridge_dmabuf_cache *cache);
++/* Deletes what the cache holds and keeps the cache (current GL context required). */
++void dvbridge_dmabuf_cache_clear(struct dvbridge_dmabuf_cache *cache);
++/* dvbridge_dmabuf_import() with the cache; without a cache (NULL) the same as that. The planes
++ * stay valid until the cache is cleared or destroyed, or the entry is reused for another surface
++ * by a later import: release the frame before the next import. */
++bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct dvbridge_dmabuf *out,
++                                   const AVFrame *frame);
++/* Imports since the cache was made: answered by the cache, and that made images. */
++void dvbridge_dmabuf_cache_counts(const struct dvbridge_dmabuf_cache *cache, unsigned long *reused,
++                                  unsigned long *made);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 7677b4b..9c08611 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -135,6 +135,8 @@ CDVBridgeGLES::~CDVBridgeGLES()
+   CDVPlaybackInfo::presented.store(0);
+   if (m_gl)
+     TakeStaleGLErrors("the bridge is destroyed");
++  LogLayerCache();
++  dvbridge_dmabuf_cache_destroy(m_layerCache);
+   glDeleteFramebuffers(1, &m_framebuffer);
+   dvbridge_gl_packer_destroy(m_packer);
+   dvbridge_gl_copier_destroy(m_copier);
+@@ -145,6 +147,20 @@ CDVBridgeGLES::~CDVBridgeGLES()
+   pl_log_destroy(&m_log);
+ }
+ 
++void CDVBridgeGLES::LogLayerCache()
++{
++  unsigned long reused = 0, made = 0;
++  dvbridge_dmabuf_cache_counts(m_layerCache, &reused, &made);
++  if (reused == m_layerCacheLogged[0] && made == m_layerCacheLogged[1])
++    return;
++  CLog::Log(LOGINFO,
++            "DVBridge: enhancement pictures imported: {} with the images of their surface kept "
++            "from an earlier one, {} with new images",
++            reused - m_layerCacheLogged[0], made - m_layerCacheLogged[1]);
++  m_layerCacheLogged[0] = reused;
++  m_layerCacheLogged[1] = made;
++}
++
+ void CDVBridgeGLES::TakeStaleGLErrors(const char* before)
+ {
+   // libplacebo reads glGetError() after its own calls and takes whatever it finds as its own
+@@ -266,6 +282,9 @@ void CDVBridgeGLES::Reset()
+   if (m_gl)
+     TakeStaleGLErrors("the renderer is reset");
+   dvbridge_renderer_reset(m_renderer);
++  // The end of native output: the surfaces of the enhancement layer of this video are let go.
++  LogLayerCache();
++  dvbridge_dmabuf_cache_clear(m_layerCache);
+ }
+ 
+ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -530,8 +549,11 @@ bool CDVBridgeGLES::PrepareHardware(const Layer& base, const AVFrame* enhancemen
+   }
+   // (the import of the layer clears them too, without a word)
+   TakeStaleGLErrors("a picture is prepared");
++  // Hades: the images of a surface of the layer are made once and kept (see dvbridge_dmabuf.h)
++  if (!m_layerCache)
++    m_layerCache = dvbridge_dmabuf_cache_create();
+   dvbridge_dmabuf imported{};
+-  if (!dvbridge_dmabuf_import(&imported, enhancement))
++  if (!dvbridge_dmabuf_import_cached(m_layerCache, &imported, enhancement))
+   {
+     // Drawn without the layer (a FEL residual is then omitted and counted) instead of lost.
+     const std::string stage =
+@@ -675,7 +697,9 @@ bool CDVBridgeGLES::PrepareConversion(const Layer& base,
+   double elPts = std::numeric_limits<double>::quiet_NaN();
+   if (enhancement)
+   {
+-    mapped = dvbridge_dmabuf_import(&imported, enhancement);
++    if (!m_layerCache)
++      m_layerCache = dvbridge_dmabuf_cache_create();
++    mapped = dvbridge_dmabuf_import_cached(m_layerCache, &imported, enhancement);
+     if (mapped)
+       layered = dvbridge_gl_frame_import(&el, m_gl->gpu, imported.layout, enhancement->width,
+                                          enhancement->height, imported.planes);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 38847b0..94777f3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -166,6 +166,11 @@ private:
+   //! Take the OpenGL errors that earlier drawing left in the context, before libplacebo runs
+   //! \param before what runs next, for the log
+   void TakeStaleGLErrors(const char* before);
++  //! Hades: the enhancement surfaces imported so far, kept (see dvbridge_dmabuf.h); and how
++  //! many imports reused one and made one, when that was last logged
++  dvbridge_dmabuf_cache* m_layerCache = nullptr;
++  unsigned long m_layerCacheLogged[2] = {0, 0};
++  void LogLayerCache();
+   //! Hades: see PrepareHardware()
+   bool m_layerWithoutResidual = false;
+   DVBRIDGE::DiagnosticFailures m_failures;
+-- 
+2.53.0
+

@@ -1,0 +1,548 @@
+From 2ecefa41a88dc4092e3626d0333c32f9a04be467 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:14:15 +0000
+Subject: [PATCH] dvbridge: keep libplacebo's GPU programs from one session to
+ the next
+
+No pl_cache was given to libplacebo: every program of the Dolby Vision
+bridge (one per shader variant: enhancement layer, bars written first,
+composed or direct, HDR10) was compiled and linked from its source when it
+was first drawn, at the start of every Kodi session and in the middle of
+videos when a new variant came.
+
+dvbridge_cache.c keeps a pl_cache in a file, which pl_gpu_set_cache()
+gives to every pl_gpu of the bridge (native and HDR10 output share it).
+With it libplacebo stores the binary of each program it links (keyed by
+the GL vendor, renderer and version and the program's source) and loads it
+with glProgramBinary() the next time; a binary that the driver does not
+take is compiled from its source as before. The file is named by a hash
+of the GL strings, the system's name and version and libplacebo's
+version, under special://temp/dvbridge/; the four most recently written
+files are kept. It is read when a bridge is set up and written when native
+output ends and when a bridge goes, only when something was added: into a
+file of its own, renamed over the old one. Before libplacebo reads a file,
+its header and the size of every entry are checked against the file
+(libplacebo allocates the size an entry declares, and aborts when it
+cannot); a file that does not hold is deleted, and an entry whose
+checksum fails is left out with the ones after it.
+
+Tested on the host: a cache test with files cut, padded, with another magic
+or version, a 1 TiB entry, an entry size that wraps, a key 0, changed
+bytes, keys that xor to 0, a bound smaller than an entry, an unwritable
+folder (31 checks); and the render test of the FEL test stream through
+zink on lavapipe (which gives program binaries only with Mesa's disk cache
+on): cold, 16 programs written; from the file, all 21 programs of the run
+taken from it and none compiled, and the hashes of all 36 drawings the
+same as without any cache. Measured there: 21 programs took 89 ms to
+compile with nothing cached and 7.6 ms with only Mesa's own disk cache
+(which LibreELEC builds and keeps in /storage/.cache); what the binaries
+save on a real driver is not measured.
+---
+ tools/dvbridge/CMakeLists.txt                 |   3 +-
+ tools/dvbridge/dvbridge_cache.c               | 186 ++++++++++++++++++
+ tools/dvbridge/dvbridge_cache.h               |  38 ++++
+ .../VideoRenderers/DVBridgeGLES.cpp           | 167 +++++++++++++++-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   4 +
+ 5 files changed, 396 insertions(+), 2 deletions(-)
+ create mode 100644 tools/dvbridge/dvbridge_cache.c
+ create mode 100644 tools/dvbridge/dvbridge_cache.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index a0bfa3e..91900d3 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -10,7 +10,8 @@ pkg_check_modules(DVGles REQUIRED IMPORTED_TARGET glesv2)
+ pkg_check_modules(DVEgl REQUIRED IMPORTED_TARGET egl)
+ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+-                                dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c)
++                                dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
++                                dvbridge_cache.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_cache.c b/tools/dvbridge/dvbridge_cache.c
+new file mode 100644
+index 0000000..157ce97
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_cache.c
+@@ -0,0 +1,186 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: the GPU programs that libplacebo makes, kept in a file from one session to the next. */
++#include "dvbridge_cache.h"
++#include <errno.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++struct dvbridge_shader_cache {
++    pl_cache cache;
++    char *path;
++    size_t max_bytes;
++    int loaded;
++    /* What the file holds (nothing: 0, 0, 0): pl_cache_signature() (the keys xored), the number of
++     * entries and their bytes. The three, since keys that are xored can come to the same. */
++    struct state {
++        uint64_t signature;
++        int entries;
++        size_t bytes;
++    } on_disk;
++};
++
++static struct state state_of(pl_cache cache)
++{
++    return (struct state){pl_cache_signature(cache), pl_cache_objects(cache), pl_cache_size(cache)};
++}
++
++static bool same_state(struct state a, struct state b)
++{
++    return a.signature == b.signature && a.entries == b.entries && a.bytes == b.bytes;
++}
++
++/* The format of pl_cache_save(), libplacebo's src/cache.c (CACHE_VERSION 1): a header of 16
++ * bytes ("pl_cache", the version, the number of entries), then for each entry its key, size and
++ * checksum (three 64-bit values) and its bytes, padded to 4. Host byte order. */
++#define FILE_MAGIC "pl_cache"
++#define FILE_VERSION 1
++#define HEADER_BYTES 16
++#define ENTRY_BYTES 24
++
++static uint32_t read_u32(const unsigned char *p)
++{
++    uint32_t v;
++    memcpy(&v, p, sizeof(v));
++    return v;
++}
++
++static uint64_t read_u64(const unsigned char *p)
++{
++    uint64_t v;
++    memcpy(&v, p, sizeof(v));
++    return v;
++}
++
++/* Whether the bytes are a whole file of that format, every entry within it and of at most
++ * max_bytes. libplacebo allocates the size an entry says before it reads it: a size that the
++ * file does not hold must not reach it. */
++static bool well_formed(const unsigned char *data, size_t length, size_t max_bytes)
++{
++    if (length < HEADER_BYTES || memcmp(data, FILE_MAGIC, 8) != 0 ||
++        read_u32(data + 8) != FILE_VERSION)
++        return false;
++    const uint32_t entries = read_u32(data + 12);
++    size_t at = HEADER_BYTES;
++    for (uint32_t i = 0; i < entries; ++i) {
++        if (length - at < ENTRY_BYTES)
++            return false;
++        const uint64_t key = read_u64(data + at);
++        const uint64_t size = read_u64(data + at + 8);
++        at += ENTRY_BYTES;
++        if (!key || !size || size > max_bytes || size > length - at)
++            return false;
++        const uint64_t padded = (size + 3) & ~(uint64_t)3;
++        if (padded > length - at)
++            return false;
++        at += (size_t)padded;
++    }
++    return at == length;
++}
++
++struct dvbridge_shader_cache *dvbridge_shader_cache_open(const char *path, size_t max_bytes, pl_log log)
++{
++    struct dvbridge_shader_cache *c = calloc(1, sizeof(*c));
++    if (!c)
++        return NULL;
++    c->path = strdup(path ? path : "");
++    c->max_bytes = max_bytes;
++    c->cache = pl_cache_create(pl_cache_params(.log = log, .max_total_size = max_bytes,
++                                               .max_object_size = max_bytes));
++    if (!c->path || !c->cache) {
++        dvbridge_shader_cache_close(c);
++        return NULL;
++    }
++    if (!c->path[0])
++        return c;
++    FILE *f = fopen(c->path, "rb");
++    if (!f)
++        return c;
++    /* The whole file, of what the cache may hold and its headers at most */
++    const size_t most = max_bytes + max_bytes / 2 + 65536;
++    unsigned char *data = malloc(most + 1);
++    size_t length = data ? fread(data, 1, most + 1, f) : 0;
++    const bool read_whole = data && !ferror(f) && length <= most;
++    fclose(f);
++    if (read_whole && well_formed(data, length, max_bytes)) {
++        const int taken = pl_cache_load(c->cache, data, length);
++        c->loaded = taken > 0 ? taken : 0;
++        /* (what was not taken, with a checksum that does not match, makes the file differ from
++         * the cache: it is written anew without it the next time) */
++        if (c->loaded == (int)read_u32(data + 12))
++            c->on_disk = state_of(c->cache);
++        else
++            c->on_disk = (struct state){0, -1, 0};
++    } else if (data) {
++        /* not a file that this writes, or not whole: it is written anew */
++        remove(c->path);
++    }
++    free(data);
++    return c;
++}
++
++void dvbridge_shader_cache_close(struct dvbridge_shader_cache *c)
++{
++    if (!c)
++        return;
++    pl_cache_destroy(&c->cache);
++    free(c->path);
++    free(c);
++}
++
++pl_cache dvbridge_shader_cache_get(const struct dvbridge_shader_cache *c)
++{
++    return c ? c->cache : NULL;
++}
++
++int dvbridge_shader_cache_loaded(const struct dvbridge_shader_cache *c)
++{
++    return c ? c->loaded : 0;
++}
++
++void dvbridge_shader_cache_size(const struct dvbridge_shader_cache *c, int *entries, size_t *bytes)
++{
++    if (entries)
++        *entries = c ? pl_cache_objects(c->cache) : 0;
++    if (bytes)
++        *bytes = c ? pl_cache_size(c->cache) : 0;
++}
++
++int dvbridge_shader_cache_save(struct dvbridge_shader_cache *c)
++{
++    if (!c || !c->path[0])
++        return -1;
++    const struct state now = state_of(c->cache);
++    if (same_state(now, c->on_disk))
++        return 0;
++    /* What would be written, then written: the cache is not changed meanwhile by this thread,
++     * and a change by another one makes the sizes differ, which is tried again next time */
++    const size_t length = pl_cache_save(c->cache, NULL, 0);
++    unsigned char *data = length ? malloc(length) : NULL;
++    if (!data || pl_cache_save(c->cache, data, length) != length) {
++        free(data);
++        return -1;
++    }
++    const size_t name = strlen(c->path) + 32;
++    char *temporary = malloc(name);
++    if (!temporary) {
++        free(data);
++        return -1;
++    }
++    snprintf(temporary, name, "%s.%ld.tmp", c->path, (long)getpid());
++    FILE *f = fopen(temporary, "wb");
++    bool written = f && fwrite(data, 1, length, f) == length;
++    if (f)
++        written = fclose(f) == 0 && written;
++    free(data);
++    if (written && rename(temporary, c->path) == 0) {
++        free(temporary);
++        c->on_disk = now;
++        return 1;
++    }
++    remove(temporary);
++    free(temporary);
++    return -1;
++}
+diff --git a/tools/dvbridge/dvbridge_cache.h b/tools/dvbridge/dvbridge_cache.h
+new file mode 100644
+index 0000000..cd2e524
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_cache.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: the GPU programs that libplacebo makes, kept in a file from one session to the next. */
++#ifndef DVBRIDGE_CACHE_H
++#define DVBRIDGE_CACHE_H
++#include <stdbool.h>
++#include <stddef.h>
++#include <libplacebo/cache.h>
++
++/* A pl_cache for pl_gpu_set_cache(), with a file behind it. On OpenGL libplacebo keeps the binary
++ * of each program it links there, by a key made of the GL vendor, renderer and version and the
++ * source of the program, and takes it back with glProgramBinary() when the same program is made
++ * again: the driver then has nothing to compile. A binary that the driver does not take (another
++ * driver, a damaged one) is not used, and the program is compiled from its source as without a
++ * cache. The file is meant for one GPU, driver and build: the caller names it by them.
++ *
++ * Not thread safe beyond what pl_cache is; the cache must outlive every pl_gpu that uses it. */
++struct dvbridge_shader_cache;
++
++/* Takes what the file at path holds when it is a whole file of the format that
++ * dvbridge_shader_cache_save() writes: its header and the size of every entry are checked
++ * against the file before anything of it is taken, and libplacebo checks the checksum of each
++ * entry as it takes it (an entry that does not match is left out, with the ones after it). A file
++ * that does not hold is deleted. A missing or bad file is no failure: the cache starts empty.
++ * max_bytes bounds what the cache holds (the oldest entries make room) and what is read.
++ * Returns NULL only when there is no memory. */
++struct dvbridge_shader_cache *dvbridge_shader_cache_open(const char *path, size_t max_bytes, pl_log log);
++/* Without saving it. The pl_cache goes with it. */
++void dvbridge_shader_cache_close(struct dvbridge_shader_cache *cache);
++pl_cache dvbridge_shader_cache_get(const struct dvbridge_shader_cache *cache);
++/* Entries taken from the file when it was opened. */
++int dvbridge_shader_cache_loaded(const struct dvbridge_shader_cache *cache);
++/* Writes the file when what the cache holds is not what the file holds (it has been loaded or
++ * written with other entries): into a file beside it, which then takes its name, so that a file
++ * is whole or not there. 1 written, 0 nothing to write, -1 it could not be written. */
++int dvbridge_shader_cache_save(struct dvbridge_shader_cache *cache);
++/* What the cache holds: entries and bytes. */
++void dvbridge_shader_cache_size(const struct dvbridge_shader_cache *cache, int *entries, size_t *bytes);
++#endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 9c08611..c91e622 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -9,15 +9,23 @@
+ #include "ServiceBroker.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackInfo.h"
++#include "filesystem/SpecialProtocol.h"
+ #include "settings/AdvancedSettings.h"
+ #include "settings/SettingsComponent.h"
+ #include "utils/StringUtils.h"
++#include "utils/SystemInfo.h"
+ #include "utils/log.h"
+ #include <chrono>
++#include <filesystem>
++#include <mutex>
+ #include <string>
++#include <system_error>
++#include <utility>
++#include <vector>
+ extern "C"
+ {
+ #include <libavutil/dovi_meta.h>
++#include "dvbridge_cache.h"
+ #include "dvbridge_placebo.h"
+ }
+ 
+@@ -128,6 +136,123 @@ std::string DescribeMetadata(const void* metadata)
+       static_cast<unsigned int>(color->source_min_pq),
+       static_cast<unsigned int>(color->source_max_pq), levels.empty() ? "none" : levels);
+ }
++
++// Hades: the GPU programs that libplacebo makes, kept from one session to the next (see
++// dvbridge_cache.h). Each program of a video is linked when it is first drawn, and a new one at
++// any frame that needs another (an enhancement layer, the bars written first, a frame with GUI
++// elements, the other way of drawing): at the start of every video, and in the middle of some.
++// A program that the driver gives back as a binary is taken from here the next time, and linked
++// from that. One cache for each GPU, driver and build (the GL strings, which with Mesa carry its
++// version and the kernel's, the name and version of the system, and libplacebo's version): each
++// in a file of its own under Kodi's temporary folder, of which the four written last are kept,
++// for a disk that is started on more than one computer. A cache is never freed: a pl_gpu that
++// was given one may use it until it goes.
++constexpr size_t SHADER_CACHE_BYTES = 32 * 1024 * 1024;
++constexpr size_t SHADER_CACHE_FILES = 4;
++constexpr const char* SHADER_CACHE_FOLDER = "special://temp/dvbridge/";
++constexpr const char* SHADER_CACHE_SUFFIX = ".plcache";
++
++struct ShaderCache
++{
++  std::string path;
++  dvbridge_shader_cache* cache = nullptr;
++  bool failed = false; //!< writing it failed, which was logged
++};
++
++// (made once and never destroyed, so that a bridge that goes after the static objects of the
++// process finds them)
++std::mutex& ShaderCacheLock()
++{
++  static auto* lock = new std::mutex();
++  return *lock;
++}
++
++std::vector<ShaderCache>& ShaderCaches()
++{
++  static auto* caches = new std::vector<ShaderCache>();
++  return *caches;
++}
++
++uint64_t TextKey(const std::string& text)
++{
++  // FNV-1a
++  uint64_t key = UINT64_C(14695981039346656037);
++  for (const char c : text)
++  {
++    key ^= static_cast<unsigned char>(c);
++    key *= UINT64_C(1099511628211);
++  }
++  return key;
++}
++
++std::string GLText(GLenum name)
++{
++  const GLubyte* value = glGetString(name);
++  return value ? reinterpret_cast<const char*>(value) : "";
++}
++
++// The cache for the GPU, driver and build of the current GL context; nullptr when that cannot be
++// told (no GL strings) or there is no memory for it.
++pl_cache OpenShaderCache()
++{
++  const std::string renderer = GLText(GL_RENDERER);
++  if (renderer.empty())
++    return nullptr;
++  const std::string identity = GLText(GL_VENDOR) + '\n' + renderer + '\n' + GLText(GL_VERSION) +
++                               '\n' + CSysInfo::GetOsPrettyNameWithVersion() + '\n' + pl_version();
++  const std::string folder = CSpecialProtocol::TranslatePath(SHADER_CACHE_FOLDER);
++  const std::string path =
++      folder + StringUtils::Format("shaders-{:016x}{}", TextKey(identity), SHADER_CACHE_SUFFIX);
++  std::lock_guard lock(ShaderCacheLock());
++  for (const auto& known : ShaderCaches())
++    if (known.path == path)
++      return dvbridge_shader_cache_get(known.cache);
++  std::error_code error;
++  std::filesystem::create_directories(folder, error);
++  // what a write that did not end left (a write goes to a file of its own, renamed when whole)
++  for (auto entry = std::filesystem::directory_iterator(folder, error);
++       !error && entry != std::filesystem::directory_iterator(); entry.increment(error))
++  {
++    std::error_code ignored;
++    if (entry->path().extension() == ".tmp")
++      std::filesystem::remove(entry->path(), ignored);
++  }
++  dvbridge_shader_cache* cache = dvbridge_shader_cache_open(path.c_str(), SHADER_CACHE_BYTES, nullptr);
++  if (!cache)
++    return nullptr;
++  ShaderCaches().push_back({path, cache, false});
++  int entries = 0;
++  size_t bytes = 0;
++  dvbridge_shader_cache_size(cache, &entries, &bytes);
++  CLog::Log(LOGINFO,
++            "DVBridge: GPU programs of earlier sessions with this GPU, driver and build: {} taken "
++            "from {} ({} KiB)",
++            dvbridge_shader_cache_loaded(cache), path, bytes / 1024);
++  return dvbridge_shader_cache_get(cache);
++}
++
++// The files of the most recently written caches are kept, the others deleted
++void PruneShaderCaches(const std::string& folder)
++{
++  std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
++  std::error_code error;
++  for (auto entry = std::filesystem::directory_iterator(folder, error);
++       !error && entry != std::filesystem::directory_iterator(); entry.increment(error))
++  {
++    std::error_code ignored;
++    if (entry->path().extension() == SHADER_CACHE_SUFFIX)
++      files.emplace_back(entry->last_write_time(ignored), entry->path());
++  }
++  if (files.size() <= SHADER_CACHE_FILES)
++    return;
++  std::sort(files.begin(), files.end(),
++            [](const auto& a, const auto& b) { return a.first > b.first; });
++  for (size_t n = SHADER_CACHE_FILES; n < files.size(); ++n)
++  {
++    std::error_code ignored;
++    std::filesystem::remove(files[n].second, ignored);
++  }
++}
+ } // namespace
+ 
+ CDVBridgeGLES::~CDVBridgeGLES()
+@@ -135,6 +260,7 @@ CDVBridgeGLES::~CDVBridgeGLES()
+   CDVPlaybackInfo::presented.store(0);
+   if (m_gl)
+     TakeStaleGLErrors("the bridge is destroyed");
++  SaveShaderCache();
+   LogLayerCache();
+   dvbridge_dmabuf_cache_destroy(m_layerCache);
+   glDeleteFramebuffers(1, &m_framebuffer);
+@@ -147,6 +273,41 @@ CDVBridgeGLES::~CDVBridgeGLES()
+   pl_log_destroy(&m_log);
+ }
+ 
++void CDVBridgeGLES::UseShaderCache()
++{
++  if (const pl_cache cache = OpenShaderCache())
++    pl_gpu_set_cache(m_gl->gpu, cache);
++}
++
++void CDVBridgeGLES::SaveShaderCache()
++{
++  // At the end of native output, and of a bridge: not while a video plays. Rarely anything:
++  // only what was linked since the file was read or written.
++  std::lock_guard lock(ShaderCacheLock());
++  bool written = false;
++  for (auto& known : ShaderCaches())
++  {
++    const int saved = dvbridge_shader_cache_save(known.cache);
++    if (saved > 0)
++    {
++      int entries = 0;
++      size_t bytes = 0;
++      dvbridge_shader_cache_size(known.cache, &entries, &bytes);
++      CLog::Log(LOGINFO, "DVBridge: {} GPU programs kept for the next sessions in {} ({} KiB)",
++                entries, known.path, bytes / 1024);
++      known.failed = false;
++      written = true;
++    }
++    else if (saved < 0 && !known.failed)
++    {
++      known.failed = true;
++      CLog::Log(LOGWARNING, "DVBridge: the GPU programs could not be kept in {}", known.path);
++    }
++  }
++  if (written)
++    PruneShaderCaches(CSpecialProtocol::TranslatePath(SHADER_CACHE_FOLDER));
++}
++
+ void CDVBridgeGLES::LogLayerCache()
+ {
+   unsigned long reused = 0, made = 0;
+@@ -223,6 +384,7 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+   m_gl = pl_opengl_create(m_log, &params);
+   if (!m_gl)
+     return Fail("libplacebo-opengl");
++  UseShaderCache();
+   // GUI alpha blending takes place in the 32F PQ target, before transport packing.
+   if (!pl_opengl_has_ext(m_gl, "GL_EXT_float_blend") ||
+       !pl_opengl_has_ext(m_gl, "GL_OES_texture_float_linear"))
+@@ -282,9 +444,11 @@ void CDVBridgeGLES::Reset()
+   if (m_gl)
+     TakeStaleGLErrors("the renderer is reset");
+   dvbridge_renderer_reset(m_renderer);
+-  // The end of native output: the surfaces of the enhancement layer of this video are let go.
++  // The end of native output: the surfaces of the enhancement layer of this video are let go, and
++  // the programs that were linked for it kept for the next sessions.
+   LogLayerCache();
+   dvbridge_dmabuf_cache_clear(m_layerCache);
++  SaveShaderCache();
+ }
+ 
+ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+@@ -638,6 +802,7 @@ bool CDVBridgeGLES::InitializeConversion(bool allowSoftware)
+   m_gl = pl_opengl_create(m_log, &params);
+   if (!m_gl)
+     return Fail("libplacebo-opengl");
++  UseShaderCache();
+   m_conversion = true;
+   m_renderer = dvbridge_renderer_create_hdr10(m_gl->gpu, m_log);
+   m_copier = dvbridge_gl_copier_create();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 94777f3..fb184ce 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -166,6 +166,10 @@ private:
+   //! Take the OpenGL errors that earlier drawing left in the context, before libplacebo runs
+   //! \param before what runs next, for the log
+   void TakeStaleGLErrors(const char* before);
++  //! Hades: the GPU programs of earlier sessions for libplacebo (see dvbridge_cache.h), given to
++  //! m_gl; and what was made since, written for the next ones
++  void UseShaderCache();
++  static void SaveShaderCache();
+   //! Hades: the enhancement surfaces imported so far, kept (see dvbridge_dmabuf.h); and how
+   //! many imports reused one and made one, when that was last logged
+   dvbridge_dmabuf_cache* m_layerCache = nullptr;
+-- 
+2.53.0
+

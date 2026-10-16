@@ -1,0 +1,554 @@
+From 5ab7c08c8b699917b4c7178bc5fb76935ba09c6e Mon Sep 17 00:00:00 2001
+From: Martin Ellis <malard@gmail.com>
+Date: Sun, 11 Oct 2026 20:03:47 +0100
+Subject: [PATCH] [settings] Don't hold a setting's lock while its change
+ callbacks run (#29011)
+
+* fixed: don't hold a setting's lock while its change callbacks run
+
+CSetting::SetValue held the setting's exclusive lock (m_critical) across
+OnSettingChanging and OnSettingChanged. A callback that causes the same
+setting to be read from another thread then deadlocks: the reader takes a
+shared lock on m_critical, which blocks on the exclusive lock the writer
+still holds, while the writer blocks waiting for the reader.
+
+That is xbmc/xbmc#20371. Setting videoscreen.blankdisplays over JSON-RPC runs
+on a web-server thread: CSettingBool::SetValue holds the lock and calls
+CDisplaySettings::OnSettingChanging, which calls
+CGraphicContext::SetVideoResolution, which posts a synchronous message to the
+main thread and waits. The main thread then runs SetVideoResolutionInternal,
+which reads the same setting back via GetBool - and blocks on the lock the web
+thread is holding. Kodi freezes. It only happens off the GUI thread (a GUI
+change is already on the main thread, so no cross-thread hop) and where
+SetVideoResolutionInternal reads the setting, i.e. Windows/macOS in fullscreen.
+
+Invoking callbacks while holding a lock they might re-enter is the underlying
+hazard, so the lock is now held only for the value mutation and the revert,
+and released before the callbacks. A value read during a callback sees the
+pending value, which is the correct trade-off for not calling out under a lock.
+
+The sequence is the same for every setting type, so it lives once in
+CSetting::ApplyValue rather than in each SetValue: take the lock, reject an
+unchanged or invalid value, store, run the callbacks unlocked, and revert if
+they refuse. The bool, int, number and string settings are written through it.
+CSettingList keeps its own copy, because it rejects on size and element type as
+well as validity and compares its elements by their string form rather than by
+==.
+
+Releasing the lock opens a window in which another thread's SetValue can be
+accepted before this call's callbacks reject it. The revert therefore restores
+the old value only if the setting still holds the value this call wrote. That
+test cannot distinguish such a value from the same value written again by
+another thread, so the revert is best effort rather than exact - which is still
+strictly better than the unconditional overwrite it replaces.
+
+TestSettingsManager.ValueIsReadableFromAnotherThreadDuringOnSettingChanging
+pins the deadlock: an OnSettingChanging handler reads the setting from another
+thread and waits for that read. TestSettingsManager.
+RejectedChangeDoesNotUndoAConcurrentWrite pins the revert: a handler writes a
+second value from another thread and then rejects the first, and the second
+value must survive. Both waits are bounded, so a regression fails the test
+rather than hanging it.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+
+* [settings] Apply a setting's writes one at a time, and join the threads its tests start
+
+Callbacks still run with the setting's lock released, so another thread can
+read it meanwhile; a new per-setting writer lock is held across the store
+and the callbacks instead. A second write waits for the first rather than
+seeing its tentative value: before, writing the value a pending change had
+stored returned success at once, and the pending change's rejection then
+reverted it. The four functions that call SetValue holding the setting's
+lock take the writer lock first, so the two are always taken in the same
+order.
+
+With writes serialised a rejection restores the old value outright. The
+test that wrote the setting from another thread inside its callback is
+replaced by one whose threads are joined, so a regression fails the test
+instead of reaching a destroyed callback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude <noreply@anthropic.com>
+(cherry picked from commit e48e05ec874cbac6bbdb2de91e6d28d92fc7dcb0)
+---
+ xbmc/settings/lib/Setting.cpp                 | 193 +++++++++---------
+ xbmc/settings/lib/Setting.h                   |  21 ++
+ .../settings/lib/test/TestSettingsManager.cpp | 106 ++++++++++
+ 3 files changed, 220 insertions(+), 100 deletions(-)
+
+diff --git a/xbmc/settings/lib/Setting.cpp b/xbmc/settings/lib/Setting.cpp
+index 3a3aa7b..171435e 100644
+--- a/xbmc/settings/lib/Setting.cpp
++++ b/xbmc/settings/lib/Setting.cpp
+@@ -333,6 +333,39 @@ void CSetting::Copy(const CSetting &setting)
+   m_changed = setting.m_changed;
+ }
+ 
++template<class TSetting, typename TValue, typename TValidate>
++CSetting::ApplyResult CSetting::ApplyValue(TValue& storage, const TValue& value, TValidate validate)
++{
++  TValue oldValue;
++  {
++    std::unique_lock lock(m_critical);
++
++    if (storage == value)
++      return ApplyResult::Unchanged;
++
++    if (!validate())
++      return ApplyResult::Rejected;
++
++    oldValue = storage;
++    storage = value;
++  }
++
++  if (OnSettingChanging(shared_from_base<TSetting>()))
++    return ApplyResult::Applied;
++
++  {
++    std::unique_lock lock(m_critical);
++    storage = oldValue;
++  }
++
++  // the setting couldn't be changed because one of the
++  // callback handlers failed the OnSettingChanging()
++  // callback so we need to let all the callback handlers
++  // know that the setting hasn't changed
++  OnSettingChanging(shared_from_base<TSetting>());
++  return ApplyResult::Rejected;
++}
++
+ Logger CSettingList::s_logger;
+ 
+ CSettingList::CSettingList(std::string_view id,
+@@ -389,6 +422,7 @@ void CSettingList::MergeDetails(const CSetting& other)
+ 
+ bool CSettingList::Deserialize(const TiXmlNode *node, bool update /* = false */)
+ {
++  std::unique_lock writer(m_writeSection);
+   std::unique_lock lock(m_critical);
+ 
+   if (!m_definition)
+@@ -497,6 +531,7 @@ bool CSettingList::CheckValidity(const std::string &value) const
+ 
+ void CSettingList::Reset()
+ {
++  std::unique_lock writer(m_writeSection);
+   std::unique_lock lock(m_critical);
+   SettingList values;
+   for (const auto& it : m_defaults)
+@@ -516,33 +551,40 @@ bool CSettingList::FromString(const std::vector<std::string> &value)
+ 
+ bool CSettingList::SetValue(const SettingList &values)
+ {
+-  std::unique_lock lock(m_critical);
+-
+-  if (static_cast<int>(values.size()) < m_minimumItems ||
+-      (m_maximumItems > 0 && static_cast<int>(values.size()) > m_maximumItems))
+-    return false;
++  std::unique_lock writer(m_writeSection);
+ 
+-  bool equal = values.size() == m_values.size();
+-  for (size_t index = 0; index < values.size(); index++)
++  SettingList oldValues;
+   {
+-    if (values[index]->GetType() != GetElementType())
++    std::unique_lock lock(m_critical);
++
++    if (static_cast<int>(values.size()) < m_minimumItems ||
++        (m_maximumItems > 0 && static_cast<int>(values.size()) > m_maximumItems))
+       return false;
+ 
+-    if (equal &&
+-        !values[index]->Equals(m_values[index]->ToString()))
+-      equal = false;
+-  }
++    bool equal = values.size() == m_values.size();
++    for (size_t index = 0; index < values.size(); index++)
++    {
++      if (values[index]->GetType() != GetElementType())
++        return false;
+ 
+-  if (equal)
+-    return true;
++      if (equal && !values[index]->Equals(m_values[index]->ToString()))
++        equal = false;
++    }
++
++    if (equal)
++      return true;
+ 
+-  SettingList oldValues = m_values;
+-  m_values.clear();
+-  m_values.insert(m_values.begin(), values.begin(), values.end());
++    oldValues = m_values;
++    m_values.clear();
++    m_values.insert(m_values.begin(), values.begin(), values.end());
++  }
+ 
+   if (!OnSettingChanging(shared_from_base<CSettingList>()))
+   {
+-    m_values = oldValues;
++    {
++      std::unique_lock lock(m_critical);
++      m_values = oldValues;
++    }
+ 
+     // the setting couldn't be changed because one of the
+     // callback handlers failed the OnSettingChanging()
+@@ -552,7 +594,10 @@ bool CSettingList::SetValue(const SettingList &values)
+     return false;
+   }
+ 
+-  m_changed = toString(m_values) != toString(m_defaults);
++  {
++    std::unique_lock lock(m_critical);
++    m_changed = toString(m_values) != toString(m_defaults);
++  }
+   OnSettingChanged(shared_from_base<CSettingList>());
+   return true;
+ }
+@@ -745,27 +790,15 @@ bool CSettingBool::CheckValidity(const std::string &value) const
+ 
+ bool CSettingBool::SetValue(bool value)
+ {
+-  std::unique_lock lock(m_critical);
++  std::unique_lock writer(m_writeSection);
++  const ApplyResult result{ApplyValue<CSettingBool>(m_value, value, [] { return true; })};
++  if (result != ApplyResult::Applied)
++    return result == ApplyResult::Unchanged;
+ 
+-  if (value == m_value)
+-    return true;
+-
+-  bool oldValue = m_value;
+-  m_value = value;
+-
+-  if (!OnSettingChanging(shared_from_base<CSettingBool>()))
+   {
+-    m_value = oldValue;
+-
+-    // the setting couldn't be changed because one of the
+-    // callback handlers failed the OnSettingChanging()
+-    // callback so we need to let all the callback handlers
+-    // know that the setting hasn't changed
+-    OnSettingChanging(shared_from_base<CSettingBool>());
+-    return false;
++    std::unique_lock lock(m_critical);
++    m_changed = m_value != m_default;
+   }
+-
+-  m_changed = m_value != m_default;
+   OnSettingChanged(shared_from_base<CSettingBool>());
+   return true;
+ }
+@@ -1024,30 +1057,16 @@ bool CSettingInt::CheckValidity(int value) const
+ 
+ bool CSettingInt::SetValue(int value)
+ {
+-  std::unique_lock lock(m_critical);
+-
+-  if (value == m_value)
+-    return true;
+-
+-  if (!CheckValidity(value))
+-    return false;
++  std::unique_lock writer(m_writeSection);
++  const ApplyResult result{
++      ApplyValue<CSettingInt>(m_value, value, [&] { return CheckValidity(value); })};
++  if (result != ApplyResult::Applied)
++    return result == ApplyResult::Unchanged;
+ 
+-  int oldValue = m_value;
+-  m_value = value;
+-
+-  if (!OnSettingChanging(shared_from_base<CSettingInt>()))
+   {
+-    m_value = oldValue;
+-
+-    // the setting couldn't be changed because one of the
+-    // callback handlers failed the OnSettingChanging()
+-    // callback so we need to let all the callback handlers
+-    // know that the setting hasn't changed
+-    OnSettingChanging(shared_from_base<CSettingInt>());
+-    return false;
++    std::unique_lock lock(m_critical);
++    m_changed = m_value != m_default;
+   }
+-
+-  m_changed = m_value != m_default;
+   OnSettingChanged(shared_from_base<CSettingInt>());
+   return true;
+ }
+@@ -1076,6 +1095,7 @@ SettingOptionsType CSettingInt::GetOptionsType() const
+ 
+ IntegerSettingOptions CSettingInt::UpdateDynamicOptions()
+ {
++  std::unique_lock writer(m_writeSection);
+   std::unique_lock lock(m_critical);
+   IntegerSettingOptions options;
+   if (!m_optionsFiller && (m_optionsFillerName.empty() || !m_settingsManager))
+@@ -1294,30 +1314,16 @@ bool CSettingNumber::CheckValidity(double value) const
+ 
+ bool CSettingNumber::SetValue(double value)
+ {
+-  std::unique_lock lock(m_critical);
+-
+-  if (value == m_value)
+-    return true;
+-
+-  if (!CheckValidity(value))
+-    return false;
++  std::unique_lock writer(m_writeSection);
++  const ApplyResult result{
++      ApplyValue<CSettingNumber>(m_value, value, [&] { return CheckValidity(value); })};
++  if (result != ApplyResult::Applied)
++    return result == ApplyResult::Unchanged;
+ 
+-  double oldValue = m_value;
+-  m_value = value;
+-
+-  if (!OnSettingChanging(shared_from_base<CSettingNumber>()))
+   {
+-    m_value = oldValue;
+-
+-    // the setting couldn't be changed because one of the
+-    // callback handlers failed the OnSettingChanging()
+-    // callback so we need to let all the callback handlers
+-    // know that the setting hasn't changed
+-    OnSettingChanging(shared_from_base<CSettingNumber>());
+-    return false;
++    std::unique_lock lock(m_critical);
++    m_changed = m_value != m_default;
+   }
+-
+-  m_changed = m_value != m_default;
+   OnSettingChanged(shared_from_base<CSettingNumber>());
+   return true;
+ }
+@@ -1517,30 +1523,16 @@ bool CSettingString::CheckValidity(const std::string &value) const
+ 
+ bool CSettingString::SetValue(const std::string &value)
+ {
+-  std::unique_lock lock(m_critical);
++  std::unique_lock writer(m_writeSection);
++  const ApplyResult result{
++      ApplyValue<CSettingString>(m_value, value, [&] { return CheckValidity(value); })};
++  if (result != ApplyResult::Applied)
++    return result == ApplyResult::Unchanged;
+ 
+-  if (value == m_value)
+-    return true;
+-
+-  if (!CheckValidity(value))
+-    return false;
+-
+-  std::string oldValue = m_value;
+-  m_value = value;
+-
+-  if (!OnSettingChanging(shared_from_base<CSettingString>()))
+   {
+-    m_value = oldValue;
+-
+-    // the setting couldn't be changed because one of the
+-    // callback handlers failed the OnSettingChanging()
+-    // callback so we need to let all the callback handlers
+-    // know that the setting hasn't changed
+-    OnSettingChanging(shared_from_base<CSettingString>());
+-    return false;
++    std::unique_lock lock(m_critical);
++    m_changed = m_value != m_default;
+   }
+-
+-  m_changed = m_value != m_default;
+   OnSettingChanged(shared_from_base<CSettingString>());
+   return true;
+ }
+@@ -1569,6 +1561,7 @@ SettingOptionsType CSettingString::GetOptionsType() const
+ 
+ StringSettingOptions CSettingString::UpdateDynamicOptions()
+ {
++  std::unique_lock writer(m_writeSection);
+   std::unique_lock lock(m_critical);
+   StringSettingOptions options;
+   if (!m_optionsFiller && (m_optionsFillerName.empty() || !m_settingsManager))
+diff --git a/xbmc/settings/lib/Setting.h b/xbmc/settings/lib/Setting.h
+index 9fb0bc7..3aa3f2a 100644
+--- a/xbmc/settings/lib/Setting.h
++++ b/xbmc/settings/lib/Setting.h
+@@ -16,6 +16,7 @@
+ #include "SettingLevel.h"
+ #include "SettingType.h"
+ #include "SettingUpdate.h"
++#include "threads/CriticalSection.h"
+ #include "threads/SharedSection.h"
+ #include "utils/logtypes.h"
+ 
+@@ -128,6 +129,23 @@ protected:
+     return std::static_pointer_cast<TSetting>(shared_from_this());
+   }
+ 
++  enum class ApplyResult
++  {
++    Unchanged,
++    Applied,
++    Rejected //!< the value was invalid, or a callback refused it and it has been reverted
++  };
++
++  /*! \brief Store a value and run the change callbacks.
++
++   The callbacks run with m_critical released, unless the caller already holds it, because
++   one of them reading this setting back on another thread would otherwise deadlock against
++   the write. validate is the exception: it is called while the lock is held. The caller holds
++   m_writeSection.
++   */
++  template<class TSetting, typename TValue, typename TValidate>
++  ApplyResult ApplyValue(TValue& storage, const TValue& value, TValidate validate);
++
+   ISettingCallback *m_callback = nullptr;
+   bool m_enabled = true;
+   std::string m_parentSetting;
+@@ -137,6 +155,9 @@ protected:
+   std::set<CSettingUpdate> m_updates;
+   bool m_changed = false;
+   mutable CSharedSection m_critical;
++  //! Held by a writer from before its value is stored until its callbacks finish, so writers apply
++  //! one at a time while readers take only m_critical. Taken before m_critical.
++  mutable CCriticalSection m_writeSection;
+ 
+   std::string m_referencedId;
+ 
+diff --git a/xbmc/settings/lib/test/TestSettingsManager.cpp b/xbmc/settings/lib/test/TestSettingsManager.cpp
+index b05a39d..8e2d7e6 100644
+--- a/xbmc/settings/lib/test/TestSettingsManager.cpp
++++ b/xbmc/settings/lib/test/TestSettingsManager.cpp
+@@ -6,13 +6,20 @@
+  *  See LICENSES/README.md for more information.
+  */
+ 
++#include "settings/lib/ISettingCallback.h"
++#include "settings/lib/Setting.h"
+ #include "settings/lib/SettingsManager.h"
++#include "threads/Event.h"
+ #include "utils/XBMCTinyXML.h"
+ #include "utils/XMLUtils.h"
+ 
++#include <atomic>
++#include <chrono>
++#include <memory>
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <thread>
+ 
+ #include <gtest/gtest.h>
+ 
+@@ -202,3 +209,102 @@ TEST(TestSettingsManager, LocateSettingNull)
+   elem = CSettingsManager::LocateSetting(doc.RootElement(), "");
+   EXPECT_EQ(nullptr, elem);
+ }
++
++namespace
++{
++class CConcurrentReadCallback : public ISettingCallback
++{
++public:
++  std::shared_ptr<CSettingBool> m_setting;
++  std::atomic<bool> m_readCompleted{false};
++
++  bool OnSettingChanging(const std::shared_ptr<const CSetting>& setting) override
++  {
++    const auto s = m_setting;
++    const auto done = std::make_shared<std::atomic<bool>>(false);
++
++    std::thread(
++        [s, done]()
++        {
++          (void)s->GetValue(); // shared_lock on the setting whose value is being changed
++          done->store(true);
++        })
++        .detach();
++
++    // Bounded, so a regression fails the test rather than hanging it
++    for (int i = 0; i < 200 && !done->load(); ++i)
++      std::this_thread::sleep_for(std::chrono::milliseconds(10));
++
++    m_readCompleted.store(done->load());
++    return true;
++  }
++};
++} // namespace
++
++// A setting change must not prevent another thread from reading the same setting while the
++// OnSettingChanging handler runs. Regression test for xbmc/xbmc#20371 (JSON-RPC deadlock when
++// setting videoscreen.blankdisplays).
++TEST(TestSettingsManager, ValueIsReadableFromAnotherThreadDuringOnSettingChanging)
++{
++  const auto setting = std::make_shared<CSettingBool>("test", nullptr);
++  CConcurrentReadCallback callback;
++  callback.m_setting = setting;
++  setting->SetCallback(&callback);
++
++  setting->SetValue(true);
++
++  EXPECT_TRUE(callback.m_readCompleted.load())
++      << "the setting could not be read from another thread while OnSettingChanging ran - "
++         "SetValue held the setting's exclusive lock across the callback (xbmc/xbmc#20371)";
++}
++
++namespace
++{
++// Holds the first change in its callback until released, then rejects it. Later changes,
++// including the call that announces the rejected change's revert, are accepted.
++class CHoldThenRejectCallback : public ISettingCallback
++{
++public:
++  CEvent m_entered;
++  CEvent m_release;
++
++  bool OnSettingChanging(const std::shared_ptr<const CSetting>& setting) override
++  {
++    if (m_calls++ != 0)
++      return true;
++
++    m_entered.Set();
++    m_release.Wait(std::chrono::seconds(5));
++    return false;
++  }
++
++private:
++  std::atomic<int> m_calls{0};
++};
++} // namespace
++
++// A write of the same value made while another change's callbacks run must not be reported as
++// done and then lost when that change is rejected.
++TEST(TestSettingsManager, AWriteDuringARejectedChangeIsNotLost)
++{
++  const auto setting = std::make_shared<CSettingInt>("test", nullptr);
++  CHoldThenRejectCallback callback;
++  setting->SetCallback(&callback);
++
++  std::atomic<bool> firstResult{true};
++  std::atomic<bool> secondResult{false};
++  std::thread first([&]() { firstResult = setting->SetValue(1); });
++  const bool entered{callback.m_entered.Wait(std::chrono::seconds(5))};
++  std::thread second([&]() { secondResult = setting->SetValue(1); });
++
++  // Long enough for the second write to finish if it does not wait for the first
++  std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  callback.m_release.Set();
++  first.join();
++  second.join();
++
++  ASSERT_TRUE(entered);
++  EXPECT_FALSE(firstResult);
++  EXPECT_TRUE(secondResult);
++  EXPECT_EQ(1, setting->GetValue()) << "the second write reported success but did not survive";
++}
+-- 
+2.53.0
+

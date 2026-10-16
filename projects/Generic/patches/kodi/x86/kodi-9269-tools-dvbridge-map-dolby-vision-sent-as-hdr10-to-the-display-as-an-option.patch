@@ -1,0 +1,338 @@
+From ad588ae85e5dc0902d321e33a927cb96a7c797cb Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:15:00 +0000
+Subject: [PATCH] tools/dvbridge: map Dolby Vision sent as HDR10 to the
+ display, as an option
+
+A Dolby Vision picture that is reconstructed and sent as HDR10 goes out as
+it was mastered (up to 4000 or 10000 cd/m2), and the display maps it. HDR10
+projectors and some displays do that poorly: they only see the static
+metadata, while the Dolby Vision stream says scene by scene how bright each
+shot is (level 1: maximum and average PQ of the shot, ETSI GS CCM 001 6.2.2).
+
+dvbridge_render_hdr10_mapping() lets the renderer map the picture to a
+display of a given peak and gamut, with libplacebo's own tone and gamut
+mapping: pl_map_avdovi_metadata() already gives libplacebo the level 1
+values (max_pq_y, avg_pq_y), which it uses as the brightest and the average
+of the scene; the curve is the BT.2390 EETF or libplacebo's spline; the
+gamut mapping is libplacebo's perceptual one, to the display's primaries
+inside the BT.2020 signal, from the gamut of the mastering display where the
+caller knows it. Black is not adapted (the display's black is not known):
+both sides are given PQ black, because with a black level libplacebo maps
+the source's black to the target's and its gamut table lifts anything
+darker than the target's black (measured: 0.00002 to 0.005 cd/m2). An
+output hook holds every channel within the peak: the curve maps the level 1
+maximum to it, and pixels brighter than the metadata says (the test stream
+has some) would otherwise go above it.
+
+dvbridge_hdr10_static_mapped() says what an HDR10 output is told of such a
+picture: the display's peak as mastering maximum and MaxCLL, the source's
+black, MaxFALL not known (the mapping changes each frame's average, which is
+not measured); dvbridge_hdr10_gamut_xy() gives the primaries to send.
+
+Off, which is how a renderer starts, nothing changes: the host render test
+gives the same HDR10 picture to the bit as rc14-wip, also after mapped
+pictures were drawn with the same renderer. The creative trims (levels 2
+and 8) are not applied: CCM 001 defines them by SMPTE ST 2094-10, relative
+to Dolby's own display mapping curve, which is not public.
+---
+ tools/dvbridge/dvbridge_placebo.c | 66 +++++++++++++++++++++
+ tools/dvbridge/dvbridge_placebo.h | 45 ++++++++++++++
+ tools/dvbridge/dvbridge_render.c  | 98 ++++++++++++++++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h  |  8 +++
+ 4 files changed, 215 insertions(+), 2 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_placebo.c b/tools/dvbridge/dvbridge_placebo.c
+index 586b4bc..4598424 100644
+--- a/tools/dvbridge/dvbridge_placebo.c
++++ b/tools/dvbridge/dvbridge_placebo.c
+@@ -42,6 +42,72 @@ bool dvbridge_hdr10_static(struct dvbridge_hdr10_static *out, const void *metada
+     return true;
+ }
+ 
++bool dvbridge_hdr10_gamut_xy(enum dvbridge_hdr10_gamut gamut, float xy[8])
++{
++    enum pl_color_primaries prim;
++    switch (gamut) {
++    case DVBRIDGE_HDR10_GAMUT_BT2020: prim = PL_COLOR_PRIM_BT_2020; break;
++    case DVBRIDGE_HDR10_GAMUT_P3_D65: prim = PL_COLOR_PRIM_DISPLAY_P3; break;
++    case DVBRIDGE_HDR10_GAMUT_BT709:  prim = PL_COLOR_PRIM_BT_709; break;
++    default: return false;
++    }
++    if (!xy)
++        return false;
++    const struct pl_raw_primaries *p = pl_raw_primaries_get(prim);
++    const struct pl_cie_xy points[4] = {p->red, p->green, p->blue, p->white};
++    for (int i = 0; i < 4; ++i) {
++        xy[2 * i] = points[i].x;
++        xy[2 * i + 1] = points[i].y;
++    }
++    return true;
++}
++
++bool dvbridge_hdr10_mapping_valid(const struct dvbridge_hdr10_mapping *m)
++{
++    if (!m)
++        return false;
++    if (!m->enabled)
++        return true;
++    if (!(m->peak >= DVBRIDGE_HDR10_PEAK_MIN && m->peak <= DVBRIDGE_HDR10_PEAK_MAX))
++        return false;
++    float xy[8];
++    if (!dvbridge_hdr10_gamut_xy(m->gamut, xy))
++        return false;
++    if (m->curve != DVBRIDGE_HDR10_CURVE_SPLINE && m->curve != DVBRIDGE_HDR10_CURVE_BT2390)
++        return false;
++    if (m->source_known) {
++        for (int i = 0; i < 8; ++i)
++            if (!(m->source_xy[i] > 0.0f && m->source_xy[i] < 1.0f))
++                return false;
++        const struct pl_raw_primaries p = {
++            .red = {m->source_xy[0], m->source_xy[1]}, .green = {m->source_xy[2], m->source_xy[3]},
++            .blue = {m->source_xy[4], m->source_xy[5]}, .white = {m->source_xy[6], m->source_xy[7]}};
++        if (!pl_primaries_valid(&p))
++            return false;
++    }
++    return true;
++}
++
++bool dvbridge_hdr10_static_mapped(struct dvbridge_hdr10_static *out, const void *metadata,
++                                  size_t bytes, const struct dvbridge_hdr10_mapping *m)
++{
++    if (!out || !m || !m->enabled || !dvbridge_hdr10_mapping_valid(m))
++        return false;
++    struct dvbridge_hdr10_static source;
++    if (!dvbridge_hdr10_static(&source, metadata, bytes))
++        return false;
++    const unsigned peak = (unsigned)(m->peak + 0.5f);
++    *out = (struct dvbridge_hdr10_static){0};
++    out->level6 = source.level6;
++    out->max_luminance = peak;
++    /* the black of the source, below the peak (a mastering display of a black level at or above
++     * the peak of this display is not one whose black can be kept: then not known) */
++    out->min_luminance = source.min_luminance < peak * 10000u ? source.min_luminance : 0;
++    out->max_cll = peak;
++    out->max_fall = 0;
++    return true;
++}
++
+ bool dvbridge_map_color(struct dvbridge_color *out, const void *metadata,
+                        size_t bytes, bool enhancement_layer_paired, bool *residual_omitted)
+ {
+diff --git a/tools/dvbridge/dvbridge_placebo.h b/tools/dvbridge/dvbridge_placebo.h
+index dafe562..5f41518 100644
+--- a/tools/dvbridge/dvbridge_placebo.h
++++ b/tools/dvbridge/dvbridge_placebo.h
+@@ -24,6 +24,51 @@ struct dvbridge_hdr10_static {
+ };
+ bool dvbridge_hdr10_static(struct dvbridge_hdr10_static *out, const void *metadata, size_t bytes);
+ 
++/* Hades: the picture for output as HDR10 mapped to the display it goes to, for displays that map
++ * HDR10 poorly (projectors above all). Off (the default): the picture as it was mastered, which
++ * the display maps; nothing of this is used. On: libplacebo's own tone mapping (the BT.2390 EETF,
++ * or its spline) guided scene by scene by the level 1 metadata of the picture (the maximum and the
++ * average of the shot, in PQ), and its perceptual gamut mapping, to the peak and the gamut of the
++ * display, with nothing above that peak. The black of the source is kept (that of the display is
++ * not known). How the tones below the peak change depends on the curve; and libplacebo lowers a
++ * whole shot a little when its brightest is above the peak (to a virtual target between the two),
++ * more when its average is bright too. The creative trims of the metadata (levels 2 and 8) are not
++ * applied: how Dolby's display management applies them is not public. */
++enum dvbridge_hdr10_gamut {
++    DVBRIDGE_HDR10_GAMUT_BT2020 = 0,
++    DVBRIDGE_HDR10_GAMUT_P3_D65 = 1,
++    DVBRIDGE_HDR10_GAMUT_BT709 = 2,
++};
++enum dvbridge_hdr10_curve {
++    DVBRIDGE_HDR10_CURVE_SPLINE = 0, /* libplacebo's default tone mapping */
++    DVBRIDGE_HDR10_CURVE_BT2390 = 1, /* the EETF of ITU-R BT.2390 */
++};
++#define DVBRIDGE_HDR10_PEAK_MIN 10.0f
++#define DVBRIDGE_HDR10_PEAK_MAX 10000.0f
++struct dvbridge_hdr10_mapping {
++    bool enabled;
++    float peak;                      /* of the display, cd/m2 */
++    enum dvbridge_hdr10_gamut gamut; /* of the display, inside the BT.2020 signal */
++    enum dvbridge_hdr10_curve curve;
++    /* The gamut of the mastering display, when its metadata gives it (the HDR10 metadata of the
++     * stream): where the colours of the picture can be at all. CIE 1931 xy of red, green, blue
++     * and white. Not known: the BT.2020 of the signal. */
++    bool source_known;
++    float source_xy[8];
++};
++/* A mapping that dvbridge_render_hdr10_mapping() takes: off, or on with values it can use. */
++bool dvbridge_hdr10_mapping_valid(const struct dvbridge_hdr10_mapping *m);
++/* The primaries and white (CIE 1931 xy: red, green, blue, white) of a display gamut. */
++bool dvbridge_hdr10_gamut_xy(enum dvbridge_hdr10_gamut gamut, float xy[8]);
++/* What an HDR10 output is told of a picture mapped to the display (m on): the display's peak as
++ * the maximum of the mastering display and as MaxCLL (nothing brighter is sent), the black of the
++ * source as dvbridge_hdr10_static() gives it (black is not mapped), MaxFALL not known (the
++ * mapping changes the average of each frame, which is not measured). The primaries to send are
++ * those of m->gamut (dvbridge_hdr10_gamut_xy()). False where dvbridge_hdr10_static() is, or for a
++ * mapping that is off or not valid. */
++bool dvbridge_hdr10_static_mapped(struct dvbridge_hdr10_static *out, const void *metadata,
++                                  size_t bytes, const struct dvbridge_hdr10_mapping *m);
++
+ /* Output owns its mapping; do not copy it without rebinding repr.dovi.
+  * Hades: metadata without extension blocks (no display management) is mapped too: the picture can
+  * be reconstructed, and only native output needs those blocks (dvbridge_dv_readable()).
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 31e3297..2573ea9 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -26,6 +26,8 @@ struct dvbridge_renderer {
+      * drew it, and whether the texture holds a whole picture (that one or an earlier one) */
+     pl_tex hdr10;
+     bool hdr10_ready, hdr10_whole;
++    /* Hades: its mapping to the display (dvbridge_render_hdr10_mapping()); off when calloc'd */
++    struct dvbridge_hdr10_mapping hdr10_mapping;
+     struct dvbridge_context *context;
+     struct dvbridge_candidate *pending;
+     bool ready;
+@@ -635,6 +637,31 @@ static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params
+     return (struct pl_hook_res){.failed = !*called, .output = PL_HOOK_SIG_NONE};
+ }
+ 
++/* Hades: the same, and no channel above the peak of the display that the picture is mapped to
++ * (dvbridge_render_hdr10_mapping()): what the output is told (dvbridge_hdr10_static_mapped()).
++ * The curve maps the brightest of the scene as its level 1 metadata gives it to that peak; what is
++ * brighter than the metadata says, or a scene that fits and has a few pixels above it, would
++ * otherwise go out above it, and the display would clip it. */
++struct display_clamp {
++    bool called;
++    float peak; /* in PQ */
++};
++
++static struct pl_hook_res clamp_to_display(void *priv, const struct pl_hook_params *p)
++{
++    struct display_clamp *c = priv;
++    struct pl_shader_var var = {.var = pl_var_float("dvbridge_peak"), .data = &c->peak,
++                                .dynamic = true};
++    const struct pl_custom_shader shader = {
++        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++        .body = "color = clamp(color, 0.0, 1.0);\n"
++                "color.rgb = min(color.rgb, vec3(dvbridge_peak));",
++        .variables = &var, .num_variables = 1,
++        .description = "DV picture within the peak of the display it is mapped to"};
++    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
++}
++
+ static bool view_fits(struct dvbridge_view view, const struct pl_frame *source, int width,
+                       int height)
+ {
+@@ -647,6 +674,57 @@ static bool view_fits(struct dvbridge_view view, const struct pl_frame *source,
+            view.src_y1 <= source->crop.y1;
+ }
+ 
++bool dvbridge_render_hdr10_mapping(struct dvbridge_renderer *r,
++                                   const struct dvbridge_hdr10_mapping *mapping)
++{
++    if (!r)
++        return false;
++    const bool valid = !mapping || dvbridge_hdr10_mapping_valid(mapping);
++    if (mapping && valid)
++        r->hdr10_mapping = *mapping;
++    else
++        r->hdr10_mapping = (struct dvbridge_hdr10_mapping){0};
++    return valid;
++}
++
++/* Hades: the colour spaces and the parameters of a picture mapped to the display (a valid mapping
++ * that is on). The source keeps what dvbridge_map_color() gave it, the level 1 metadata among it,
++ * which libplacebo takes as the brightest and the average of the scene (PL_HDR_METADATA_CIE_Y);
++ * where the stream says it, the gamut of its mastering display is added. The target is the same
++ * signal, BT.2020 with PQ, of a display of the given peak and gamut. Black is not adapted: with a
++ * black level on either side, libplacebo would map the black of the source to that of the target,
++ * and its gamut table, which starts at the target's black, lifts anything darker to it (the
++ * pixels below the mastering display's black of the test stream went from 0.00002 to 0.005
++ * cd/m2). The display's black is not known, and the picture's black is to go out as mastered:
++ * both sides are given PQ black (PL_COLOR_HDR_BLACK, "infinite contrast"). The rest is
++ * libplacebo's defaults: no measurement of the picture (the renderer is given none), no inverse
++ * tone mapping, no expansion of the gamut. */
++static void map_to_display(const struct dvbridge_hdr10_mapping *m, struct pl_color_space *source,
++                           struct pl_color_space *target, struct pl_color_map_params *params)
++{
++    if (m->source_known)
++        source->hdr.prim = (struct pl_raw_primaries){
++            .red = {m->source_xy[0], m->source_xy[1]}, .green = {m->source_xy[2], m->source_xy[3]},
++            .blue = {m->source_xy[4], m->source_xy[5]}, .white = {m->source_xy[6], m->source_xy[7]}};
++    source->hdr.min_luma = PL_COLOR_HDR_BLACK;
++    float xy[8];
++    dvbridge_hdr10_gamut_xy(m->gamut, xy);
++    *target = (struct pl_color_space){
++        .primaries = PL_COLOR_PRIM_BT_2020,
++        .transfer = PL_COLOR_TRC_PQ,
++        .hdr = {.min_luma = PL_COLOR_HDR_BLACK, .max_luma = m->peak,
++                .prim = {.red = {xy[0], xy[1]}, .green = {xy[2], xy[3]}, .blue = {xy[4], xy[5]},
++                         .white = {xy[6], xy[7]}}},
++    };
++    *params = pl_color_map_default_params;
++    params->tone_mapping_function =
++        m->curve == DVBRIDGE_HDR10_CURVE_BT2390 ? &pl_tone_map_bt2390 : &pl_tone_map_spline;
++    params->gamut_mapping = &pl_gamut_map_perceptual;
++    params->metadata = PL_HDR_METADATA_ANY;
++    params->inverse_tone_mapping = false;
++    params->gamut_expansion = false;
++}
++
+ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *source,
+                          const void *metadata, size_t bytes, double pts, double el_pts,
+                          struct dvbridge_view view, int width, int height)
+@@ -691,7 +769,8 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     image.icc = NULL;
+     image.lut = NULL;
+     image.crop = (pl_rect2df){view.src_x0, view.src_y0, view.src_x1, view.src_y1};
+-    /* The same colour space on both sides: the picture is reconstructed and not mapped. */
++    /* The same colour space on both sides: the picture is reconstructed and not mapped (unless it
++     * is mapped to the display, below). */
+     struct pl_frame target = {
+         .num_planes = 1,
+         .planes = {{.texture = r->hdr10, .components = 4, .component_mapping = {0, 1, 2, 3}}},
+@@ -714,9 +793,24 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     const struct pl_hook *hooks[] = {&hook};
+     params.hooks = hooks;
+     params.num_hooks = 1;
++    /* Hades: or mapped to the display, where that is asked for (dvbridge_render_hdr10_mapping()),
++     * and then held within its peak */
++    struct pl_color_map_params mapping;
++    struct display_clamp to_display = {0};
++    const struct pl_hook display_hook = {
++        .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &to_display,
++        .hook = clamp_to_display, .signature = 0x4456424844523131ULL};
++    const struct pl_hook *display_hooks[] = {&display_hook};
++    if (r->hdr10_mapping.enabled) {
++        map_to_display(&r->hdr10_mapping, &image.color, &target.color, &mapping);
++        params.color_map_params = &mapping;
++        to_display.peak = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->hdr10_mapping.peak);
++        params.hooks = display_hooks;
++    }
+     /* from here on the texture may hold a part of this picture over the one before it */
+     r->hdr10_whole = false;
+-    bool ok = pl_render_image(r->renderer, &image, &target, &params) && clamped;
++    bool ok = pl_render_image(r->renderer, &image, &target, &params) &&
++              (r->hdr10_mapping.enabled ? to_display.called : clamped);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     r->hdr10_whole = ok && !errors.errors && !errors.num_disabled_hooks;
+     return r->hdr10_whole;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 5d83219..db74b69 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -72,6 +72,14 @@ pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *renderer);
+ /* Hades: a renderer for dvbridge_render_hdr10() alone, without the 3840x2160 picture that the
+  * transport is packed from (132 MB that such a renderer never uses). */
+ struct dvbridge_renderer *dvbridge_renderer_create_hdr10(pl_gpu gpu, pl_log log);
++/* Hades: the mapping of the following dvbridge_render_hdr10() pictures to the display
++ * (struct dvbridge_hdr10_mapping, dvbridge_placebo.h). A renderer starts with it off, which draws
++ * the picture as it always has. NULL turns it off. A mapping that is not valid is not taken: it
++ * turns it off, and the call returns false. */
++#define DVBRIDGE_HDR10_MAPPING 1
++struct dvbridge_hdr10_mapping;
++bool dvbridge_render_hdr10_mapping(struct dvbridge_renderer *renderer,
++                                   const struct dvbridge_hdr10_mapping *mapping);
+ /* Optional full-raster, overlay-free fast path. The caller owns an exact RGBA8
+  * linear target; all other layouts keep the separate full-precision path. */
+ bool dvbridge_render_packed(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+-- 
+2.53.0
+
