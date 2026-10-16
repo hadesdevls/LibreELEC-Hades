@@ -1,0 +1,171 @@
+From 955a0e564d1caf6fcb619c539558ceb24c66f522 Mon Sep 17 00:00:00 2001
+From: Daniel Oberlin <dmo.git@gmail.com>
+Date: Sun, 4 Oct 2026 20:52:45 -0400
+Subject: [PATCH] Skip the rest of a clip once PCR has passed the play item OUT
+ time
+
+A play item may reference only the beginning of a much longer clip.
+m2ts_filter already wipes ES packets with PTS after OUT time, but the
+clip was still delivered up to its last packet (the EP map gives no
+earlier end when the video stream stops before OUT time). PCR packets
+are passed through, so an application pacing playback on PCR waits for
+the whole length of the clip.
+
+Seen on Star Trek: The Original Series (season 1, disc 1): playlist
+00017.mpls plays 5 seconds (IN 27000000, OUT 27225225) of clip 00173,
+whose video ends at 604.9 s but whose audio and PCR run to 719 s. With
+VLC the 5 second warning card stayed on screen for about two minutes.
+
+Track PCR in the filter and report when it crosses OUT time. All
+remaining ES packets then have PTS > OUT, so the reader skips to the end
+of the clip. Only a continuous crossing (previous PCR <= OUT, step below
+one second) is accepted, so STC discontinuities inside a clip keep the
+old behaviour.
+---
+ src/libbluray/bluray.c               | 15 ++++++++
+ src/libbluray/decoders/m2ts_filter.c | 51 ++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 1a7070506849..24539849688f 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -86,6 +86,7 @@ typedef struct {
+ 
+     /* */
+     uint8_t         eof_hit;
++    uint8_t         out_hit;   /* PCR passed play item OUT time: rest of the clip can be skipped */
+     uint8_t         encrypted_block_cnt;
+     uint8_t         seek_flag;  /* used to fine-tune first read after seek */
+ 
+@@ -661,6 +662,7 @@ static int _open_m2ts(BLURAY *bd, BD_STREAM *st)
+     st->clip_pos = (uint64_t)st->clip->start_pkt * 192;
+     st->clip_block_pos = (st->clip_pos / 6144) * 6144;
+     st->eof_hit = 0;
++    st->out_hit = 0;
+     st->encrypted_block_cnt = 0;
+ 
+     if (st->fp) {
+@@ -740,6 +742,7 @@ static int _validate_unit(BLURAY *bd, BD_STREAM *st, uint8_t *buf)
+     }
+ 
+     st->eof_hit = 0;
++    st->out_hit = 0;
+     st->encrypted_block_cnt = 0;
+     return 1;
+ }
+@@ -794,6 +797,8 @@ static int _read_block(BLURAY *bd, BD_STREAM *st, uint8_t *buf)
+                     if (result < 0) {
+                         m2ts_filter_close(&st->m2ts_filter);
+                         BD_DEBUG(DBG_BLURAY | DBG_CRIT, "m2ts filter error\n");
++                    } else if (result > 0) {
++                        st->out_hit = 1;
+                     }
+                 }
+ 
+@@ -2062,6 +2067,16 @@ static int _bd_read(BLURAY *bd, unsigned char *buf, int len)
+                     }
+                 }
+             }
++            if (st->out_hit && st->int_buf_off == 6144 && clip_pkt < st->clip->end_pkt) {
++                /* everything left in this clip is after play item OUT time */
++                uint64_t skip = (uint64_t)(st->clip->end_pkt - clip_pkt) * 192;
++                BD_DEBUG(DBG_BLURAY | DBG_STREAM, "OUT time reached, skipping %u packets at end of clip %s\n",
++                         st->clip->end_pkt - clip_pkt, st->clip->name);
++                st->clip_pos += skip;
++                bd->s_pos    += skip;
++                st->out_hit   = 0;
++                clip_pkt      = st->clip->end_pkt;
++            }
+             if (st->int_buf_off == 6144 || clip_pkt >= st->clip->end_pkt) {
+ 
+                 // Do we need to get the next clip?
+diff --git a/src/libbluray/decoders/m2ts_filter.c b/src/libbluray/decoders/m2ts_filter.c
+index b5f64ca902e5..c67830203219 100644
+--- a/src/libbluray/decoders/m2ts_filter.c
++++ b/src/libbluray/decoders/m2ts_filter.c
+@@ -52,6 +52,9 @@ struct m2ts_filter_s
+     int64_t  out_pts;
+     uint32_t pat_packets; /* how many packets to search for PAT (seeked pat_packets packets before the actual seek point) */
+     uint8_t  pat_seen;
++
++    int64_t  last_pcr;    /* previous PCR base (90kHz), -1 if none seen since open/seek */
++    uint8_t  out_reached; /* PCR has advanced past out_pts: nothing left to present in this clip */
+ };
+ 
+ M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
+@@ -66,6 +69,7 @@ M2TS_FILTER *m2ts_filter_init(int64_t in_pts, int64_t out_pts,
+ 
+         p->in_pts   = in_pts;
+         p->out_pts  = out_pts;
++        p->last_pcr = -1;
+         p->wipe_pid = calloc(num_audio + num_video + num_ig + num_pg + 1, sizeof(uint16_t));
+         p->pass_pid = calloc(num_audio + num_video + num_ig + num_pg + 1, sizeof(uint16_t));
+         if (!p->pass_pid || !p->wipe_pid) {
+@@ -199,6 +203,46 @@ void m2ts_filter_seek(M2TS_FILTER *p, uint32_t pat_packets, int64_t in_pts)
+     p->in_pts   = in_pts;
+     p->pat_seen = 0;
+     p->pat_packets = pat_packets;
++    p->last_pcr = -1;
++    p->out_reached = 0;
++}
++
++/*
++ * Detect the PCR running past the OUT time.
++ *
++ * Some clips are much longer than the play item that references them (ex. a 5 second
++ * warning card backed by a 2 minute clip). ES packets after OUT time are wiped, but the
++ * clip would still be delivered - and paced by the application - up to its last packet.
++ * Once PCR has passed OUT time every remaining ES packet has PTS > OUT, so the rest of
++ * the clip can be skipped.
++ * Only a continuous crossing is accepted, to ignore STC discontinuities inside the clip.
++ */
++static void _check_pcr(M2TS_FILTER *p, const uint8_t *buf)
++{
++    const uint8_t *ts = buf + 4; /* TS packet, after TP_extra_header */
++
++    unsigned af_exists = ts[3] & 0x20;
++    unsigned af_length = ts[4];
++    unsigned pcr_flag  = ts[5] & 0x10;
++
++    if (!af_exists || af_length < 7 || !pcr_flag) {
++        return;
++    }
++
++    /* program_clock_reference_base: 33 bits, 90 kHz. The extension is not needed. */
++    const uint8_t *base = ts + 6;
++    int64_t pcr = ((int64_t)base[0] << 25) |
++                  ((int64_t)base[1] << 17) |
++                  ((int64_t)base[2] <<  9) |
++                  ((int64_t)base[3] <<  1) |
++                  ((int64_t)base[4] >>  7);
++
++    if (p->last_pcr >= 0 && p->last_pcr <= p->out_pts &&
++        pcr > p->out_pts && pcr - p->last_pcr < 90000) {
++        M2TS_TRACE("PCR %" PRId64 " passed OUT timestamp %" PRId64 "\n", pcr, p->out_pts);
++        p->out_reached = 1;
++    }
++    p->last_pcr = pcr;
+ }
+ 
+ static int _filter_es_pts(M2TS_FILTER *p, const uint8_t *buf, uint16_t pid)
+@@ -289,6 +333,9 @@ int m2ts_filter(M2TS_FILTER *p, uint8_t *buf)
+         if (pid < HDMV_PID_VIDEO) {
+             /* pass PMT, PCR, SIT */
+             /*M2TS_TRACE("NOT Wiping pid 0x%04x (< 0x1011)\n", pid);*/
++            if (pid == HDMV_PID_PCR && p->out_pts >= 0) {
++                _check_pcr(p, buf);
++            }
+             continue;
+         }
+ #if 0
+@@ -316,5 +363,9 @@ int m2ts_filter(M2TS_FILTER *p, uint8_t *buf)
+ 
+     /*result = !!(p->after ? p->wipe_pid[0] : p->pass_pid[0]);*/
+ 
++    if (p->out_reached) {
++        result = 1;
++    }
++
+     return result;
+ }
