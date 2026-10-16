@@ -38,8 +38,7 @@ Only when every condition below holds. Otherwise the video plays the ordinary Ko
 | --- | --- |
 | The video is Dolby Vision with valid metadata, progressive and not stereoscopic 3D | Any profile, in HEVC or AV1. Tried: profiles 5, 7 with FEL, and 8.1, in HEVC. AV1 with Dolby Vision has not been tried (no sample) |
 | The display has exactly one Dolby Vision block (VSVDB) in valid EDID blocks: version 2 with the Standard interface, or version 1 in its 12-byte form with display management version 4 or later | A display that advertises only low-latency Dolby Vision (often a TV input set to its game or PC mode) gets HDR10 and a notice. Older blocks describe a signal that Hades does not implement |
-| The graphics driver has a Dolby Vision backend (see "Graphics drivers" below) and modesetting is atomic | |
-| Intel: a 12-byte version 2 block, in an EDID without an HDMI Forum extension override (EEODB) | What the Intel kernel backend reads |
+| The graphics driver has a Dolby Vision backend (see "Graphics drivers" below) and modesetting is atomic | Kodi and the Intel and AMD kernel backends read the Dolby Vision block with the same rule |
 | NVIDIA: the display lets the source select the RGB range (VCDB QS bit) | Full-range RGB has to be signalled |
 | The display mode is 3840x2160, progressive, at 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 Hz, without a 3D layout | Above 30 Hz, the display must also take Dolby Vision at 2160p60 |
 
@@ -59,6 +58,12 @@ Where the graphics chip needs, on average, at least half of a refresh period to 
 
 A commit that the driver refuses this way is repeated at once the ordinary way, so no frame is lost; three refusals in a row turn it off for that output. It can be turned off in the settings ([settings.md](settings.md)).
 
+## A step down in fidelity
+
+For a graphics chip that cannot draw a frame in the time of a refresh, the rebuilt picture can step down from the faithful one: the planes that are scaled up to the size of the picture are scaled up bilinearly, with the sampling of the GPU itself, instead of with Lanczos. Level 1 does it for the chroma of the base layer, level 2 also for the chroma of the enhancement layer, level 3 also for its luma. On three pictures of a profile 7 FEL stream, drawn on a software OpenGL ES, the three levels change up to 22 %, 48 % and 56 % of the pixels, most of them by one code of 4095 and none by more than 7, 10 and 16. From level 1 the luma of the base layer, which is not scaled, is also read the way it was before the exact read of unscaled planes, which needs another plane scaled with Lanczos: with linear filtering at the centres of its texels, which gives the texels themselves where the graphics chip computes the weights of the filter in fixed point (the software renderer differs from them by one code in under 0.02 % of the pixels). Nothing else changes: the metadata, the tunnel, the bars.
+
+The faithful picture is never changed on graphics that keep up. For now the level is 0 unless `advancedsettings.xml` forces one ([settings.md](settings.md)), which is there to measure on a given graphics chip how much GPU time each level saves. When Hades is to step down by itself will be decided with those measurements. The output as HDR10 always uses the faithful picture.
+
 ## Leaving Dolby Vision
 
 When the video ends, the ordinary output comes back: the menus' mode, the colour properties and range of before, the InfoFrame off. On NVIDIA the output is also turned off and on, so that the HDMI link is set up from scratch. When Kodi is about to set another mode of the same size right after the video (it goes back to the menus' refresh rate), that restoration waits for the change of mode, for two seconds at most with the last frame on screen, and goes in the same commit: one change of the HDMI link instead of two. Where no such change comes, the output is restored as before.
@@ -73,6 +78,7 @@ By default this is done only for profile 5, whose base picture is not a usable p
 
 - **Exact refresh rates on NVIDIA.** NVIDIA's driver offered many TV modes only at 23.976, 29.97, 59.94 or 119.88 Hz. A patch to its open kernel modules adds the twin at exactly 24, 30, 60 and 120 Hz of each such mode, with the exact clock, as Linux's own EDID code does.
 - **HDR10 at more than 8 bits on NVIDIA.** NVIDIA's EGL offers no 10-bit window, only 8-bit and 16-bit floating point; 10-bit video goes out through the 16-bit one. If the card refuses it, the 8-bit one comes back.
+- **HDR10 and HLG at 10 bits on Intel and AMD where RGB would be 8.** At 3840x2160 above 30 Hz over HDMI TMDS (HDMI 2.0, and HDMI 2.1 without FRL, which Intel never uses and AMD has off by default), RGB fits at 8 bits only, and the drivers sent HDR at 8 bits. Where the TV takes the mode in YCbCr 4:2:0 too, with deep colour in 4:2:0, HDR now goes out in 4:2:0 at 10 bits or more (12 on older Intel graphics): the video is 4:2:0 already, so none of it is lost, and only the menus and subtitles over it have half the colour resolution. Intel's driver now encodes 4:2:0 with the BT.2020 matrix that the TV is told (it used the BT.709 one for every YCbCr output). SDR and Dolby Vision are not touched. It can be turned off in the settings ([settings.md](settings.md)), and the player information says the depth and the format the driver sends.
 - **Screenshots during Dolby Vision** read the picture, not the tunnel.
 
 ## Graphics drivers

@@ -44,17 +44,19 @@ All tests were made by the author with the test builds that led to this version:
 | What | Status |
 | --- | --- |
 | Dolby Vision profile 7 with the full enhancement layer (FEL) | Works, measured: RTX 4080 SUPER, and the integrated Radeon graphics of the Ryzen 9 7950X3D (240 frames every 10 s, none dropped, the enhancement layer in every one; see "Known limits"). Works: the integrated graphics of the Core i5-12450H |
-| Dolby Vision profile 8.1 | Works, measured: RTX 4080 SUPER. Other graphics: **untested** |
-| Dolby Vision profile 5 | Works, measured: RTX 4080 SUPER. Other graphics: **untested** |
+| Dolby Vision profile 7 with the minimal enhancement layer (MEL) | Works: RTX 4080 SUPER and the integrated Radeon graphics of the Ryzen 9 7950X3D (this version) |
+| Dolby Vision profile 8.1 | Works: RTX 4080 SUPER and the integrated Radeon graphics of the Ryzen 9 7950X3D (this version); measured on the RTX 4080 SUPER with earlier test builds |
+| Dolby Vision profile 5 | Works: RTX 4080 SUPER and the integrated Radeon graphics of the Ryzen 9 7950X3D (this version, sent as certified players send it); measured on the RTX 4080 SUPER with earlier test builds |
 | Dolby Vision in two video tracks (Blu-ray `.m2ts` structure) | Works: RTX 4080 SUPER |
 | Dolby Vision with the refresh rate not adjusted to the video (60 Hz) | Works, measured: RTX 4080 SUPER |
-| Leaving Dolby Vision with the menus at 120 Hz | **Untested** with this version, which fixes a lost picture that the test builds before it had there on NVIDIA |
+| Dolby Vision with the menus at 119.88 Hz or 120 Hz, starting and leaving | Works: RTX 4080 SUPER and the integrated Radeon graphics, with the refresh rate adjusted to the video and not adjusted (this version) |
 | Dolby Vision shown as HDR10 where native output is not possible | Ran on the RTX 4080 SUPER with a profile 5 video; checked by software |
 | AV1 video with Dolby Vision | **Untested** (no sample to try) |
 | HDR10 with more than 8 bits on NVIDIA | Works: RTX 4080 SUPER |
 | A video at exactly 24 fps sent at exactly 24 Hz on NVIDIA (modes that this version adds to what the driver offers) | Works, measured: RTX 4080 SUPER |
 | Dolby TrueHD with Atmos, passed through to the sound bar | Works: RTX 4080 SUPER, and the integrated graphics of the Ryzen 9 7950X3D and of the Core i5-12450H |
 | Dolby Digital Plus with Atmos, passed through to the sound bar | Works: RTX 4080 SUPER |
+| DTS-HD Master Audio, passed through | Works: RTX 4080 SUPER, to a TCL Q85H Pro sound bar (this version) |
 | Sound keeps working when the display and the audio output change (sound follows the screen) | Works, measured: the author's PC, from the NVIDIA card to the processor's graphics and back |
 | A PC or laptop with more than one graphics chip: Kodi starting on the TV, whichever chip it is connected to | Works on the author's PC: TV on the NVIDIA card, with the processor's graphics and its own HDMI port also present. Other combinations untested |
 | Moving to a TV that is connected after Kodi started | **Untested** |
@@ -135,7 +137,7 @@ Things to know:
 - The build downloads the source of every package from the address in its recipe (`package.mk`) and checks it against the SHA-256 written there. No recipe has an empty hash, and prebuilt "reusable" toolchain packages are not used (`USE_REUSABLE="no"`).
 - The NVIDIA driver package is downloaded from NVIDIA and unpacked without being run. Only its user-space libraries and firmware are used, unchanged; the kernel modules are compiled from NVIDIA's open source code. By building you accept NVIDIA's licence for those files.
 - The author's own builds are made without network access, from sources fetched and verified beforehand. A clean build takes between twenty and forty-five minutes on a 32-thread machine; much longer on a small one.
-- **If you change the tree and share your build, give it a name of your own** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one the build calls itself "Hades 1.0 RC1".
+- **If you change the tree and share your build, give it a name of your own** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one the build calls itself "Hades 1.0 RC2".
 
 The Windows installer is a separate small program (C#, in `tools/hades-installer/`); `build.ps1` builds it with the compiler that Windows already has.
 
@@ -150,7 +152,7 @@ The [documentation](docs/README.md) has more: how the Dolby Vision output works,
 - **3D, decoding.** FFmpeg decodes only the base view of H.264 MVC. Hades builds a second H.264 decoder, `h264_mvc`, from a copy of FFmpeg's decoder with Dom Cobley's multiview series applied (FFmpeg pull request 24303, not merged); FFmpeg's own H.264 decoder is left byte for byte as it is, and Kodi asks for the second one by name, only for a stream that has a second view. Checked on a host build against the H.264 reference decoder (JM): the 27 MVC conformance streams of ITU-T H.264.1 (base view identical in all; second view identical in 18 of the 19 the reference decoder gives one for, the exception being a superseded stream), and two stereo streams made for the purpose, identical in both views (1920x1080, and 960x540, which wraps the frame number of its second view, as a disc does all the time and no conformance stream does). The series is taken as it stood on 2026-10-14, carried to FFmpeg 9.0.2, with two fixes of this project.
 - **3D, discs.** On a 3D Blu-ray the second view is in a clip of its own. What reads the two clips together is Dom Cobley's demuxer for Kodi, as he wrote it, with changes of this project around it: the second clip is read only where both views are wanted, the playlist says which clip and which angle, and after a picture that went on without its second view nothing of it is given to the decoder before a picture from which it can be decoded cleanly (an anchor picture).
 - **3D, output.** A display learns the layout of a 3D picture from the HDMI vendor InfoFrame, which drivers send for a mode that has the layout in its flags. Intel's driver has such modes. For AMD the kernel carries the `amdgpu` patches of cinema-ONE's LibreELEC tree with fixes of this project; for NVIDIA, a patch of this project to the open kernel modules for frame packing, and the driver's vendor InfoFrame property for the half-resolution formats. A 3D mode is never one of Kodi's resolutions: it is how the resolution Kodi chose is sent while a 3D picture is drawn, at the same refresh rate.
-- **Versions in 1.0 RC1:** Linux 7.2.10, Kodi 22 (the `Piers` branch after 22.0rc1), FFmpeg 9.0.2, Mesa 26.2.5, libplacebo from its main branch, NVIDIA 615.78.08.
+- **Versions in 1.0 RC2:** Linux 7.2.11, Kodi 22 (the `Piers` branch after 22.0rc1), FFmpeg 9.0.2, Mesa 26.2.5, libplacebo from its main branch, NVIDIA 615.78.08.
 - **Based on** LibreELEC `master` (13.0 development). LibreELEC has not released version 13.
 
 ## Credits
@@ -161,6 +163,7 @@ What this build adds to LibreELEC was written for it, except what is named here,
 - **Dom Cobley (popcornmix)**: the decoding of the second view of 3D Blu-ray video (his series of changes to FFmpeg's H.264 decoder) and how Kodi reads the two clips of a 3D disc, as he wrote them.
 - **cinema-ONE** ([cinema-ONE/LibreELEC.tv](https://github.com/cinema-ONE/LibreELEC.tv)): the changes to AMD's kernel driver that switch a display to 3D over HDMI, on which the 3D output of this build for AMD is built.
 - **quietvoid** ([dovi_tool](https://github.com/quietvoid/dovi_tool)): a reference consulted for the Dolby Vision metadata; no code of it is in this build.
+- **YBLOD** ([dangerouslaser/libreelec-yblod](https://github.com/dangerouslaser/libreelec-yblod)): ideas that this build wrote again in its own way: one display change when Dolby Vision or HDR starts and stops, the active-area metadata describing menus drawn over the bars, a check on the GPU of the bytes sent, the GPU programs prepared before the first frame, HDR10 at 10 bits in YCbCr 4:2:0, and several live TV fixes (10-bit live channels, passthrough on live streams, opening a stream once, the declared frame rate). No code of it is in this build.
 - **Team LibreELEC and Team Kodi**, and the authors of every program in the image. Patches taken from other projects keep their authors in their headers, and the one commit of another author that this build takes as it is (OpenSSL 4, by Rudi Heitbaum, from LibreELEC) keeps its author in this repository's history.
 
 [NOTICE.md](NOTICE.md) lists them with their licences.
