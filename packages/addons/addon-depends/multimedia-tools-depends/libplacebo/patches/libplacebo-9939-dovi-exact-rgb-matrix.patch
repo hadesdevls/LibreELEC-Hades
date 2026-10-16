@@ -1,0 +1,198 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:00:00 +0000
+Subject: [PATCH] shaders/colorspace: decode Dolby Vision with the exact matrix
+ of its primaries
+
+pl_shader_decode_color() decodes a Dolby Vision picture to BT.2020 RGB
+through LMS: R'G'B' = ycc_to_rgb * (YCbCr - offset), the PQ EOTF, the
+RPU's rgb_to_lms, a fixed lms2rgb, and the PQ OETF. That is the decoding
+ETSI GS CCM 001 describes (clause 6.2.2): YCCtoRGB gives the non-linear
+RGB (or LMS) of the HDR output picture, RGBtoLMS takes its linear RGB to
+LMS, a space common to every source, and lms2rgb goes from that LMS to
+BT.2020. RGBtoLMS thus carries the primaries of the picture: its default
+there, [5845 9702 837; 2568 12256 1561; 0 679 15705] / 16384, is that of
+P3-D65 RGB (lms2rgb times it is 1.3e-4 from the exact P3-D65 to BT.2020
+matrix, and 0.13 from that of P3 with the DCI white).
+
+For a picture whose RGB is BT.2020, as on a profile 7 or 8 stream, the
+two matrices should cancel; for P3-D65 their product should be the exact
+P3-D65 to BT.2020 matrix. They are not quite: the RPU rounds its
+coefficients to 1/16384, and lms2rgb is the inverse of coefficients a
+little apart from them (2.8/16384 on one, on the RPUs of a profile 7 FEL
+stream): their product is off by up to 2e-4. Between the EOTF and the
+OETF that moves light from the bright components of a pixel to the dark
+ones, which PQ then shows as hundreds of codes: a component that should
+be black next to a red at 4000 cd/m^2 gets about 0.5 cd/m^2, code 490 of
+4095.
+
+Where lms2rgb times the RPU's rgb_to_lms is within 1e-3 of the exact
+matrix from the linear RGB of BT.2020, P3-D65 or BT.709 to BT.2020
+(computed in double from libplacebo's primaries, for every picture),
+that matrix is taken in place of the product. For BT.2020 it is the
+identity: the round trip is left out and the signal only clamped to
+[0, 1], as the EOTF of libplacebo-9931 has it, so the decoded picture is
+the composed signal itself. The clause does not restrict the primaries
+of the HDR output picture (it refers to the display primaries of SMPTE
+ST 2086), and BT.709 is taken by the same rule. The three matrices are
+0.13 and more apart, and a 14-bit rounding with the error of lms2rgb
+stays within 2e-4 of its own. Any other matrix (the identity of a signal
+whose YCCtoRGB gives LMS already, other primaries or another white such
+as DCI-P3's, or one off by more) goes through LMS as before. A Dolby
+Vision display does the same rounding in its own LMS, and next to the
+bright component it is not seen there; it is not part of the signal,
+which was graded in the RGB the RPU names, and an output of that signal
+has no reason to carry it.
+
+On all 2878 pictures of that stream (17.8 billion pixels of their active
+areas, in 64-bit floats, with libplacebo-9931), the round trip moved 65 %
+of the pixels off the exact one, a third of those by one code of 4095;
+10 % of all the pixels by 37 codes or more, 1 % by 276 or more, up to
+679, with either composer (their percentiles agree within a code). With
+this patch the decoded picture is the exact one.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe), on top of
+libplacebo-9930 and 9931, on pictures 44, 45, 47, 51, 704, 930 and 1509
+of that stream with both composers: the picture is within one code of
+4095 of the exact round trip (two in at most 137 pixels with the
+reshaping). Before, it was off by up to 2 codes on picture 51, 12 on
+44, 558 and 679 on 45 and 47, and on 704, 930 and 1509, where much of
+the picture is bright, by up to 469 to 604 codes in 59 to 64 % of the
+pixels, most of them by 4 codes or more. Made-up RPUs on the planes of
+picture 51: the default rgb_to_lms of the clause and that of P3-D65
+(both rounded to 1/16384) are decoded with the exact P3-D65 matrix, that
+of BT.709 with BT.709's, each within one code of its exact round trip
+(two in at most 72 pixels with the reshaping); the identity (an LMS
+signal), P3 with the DCI white, and the stream's matrix with one
+coefficient 40/16384 off stay on the general path, byte for byte as
+before, with both composers.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the file changed,
+whose notice stays as it is.
+---
+ src/shaders/colorspace.c | 106 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index bf2e350..12f9c65 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -320,6 +320,63 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
+ #endif
+ }
+ 
++#ifdef PL_HAVE_DOVI
++// Hades: for the Dolby Vision decoding, the matrix from the linear RGB of
++// some primaries to that of BT.2020, in double (both of the white of D65)
++static double dovi_det3(const double m[3][3])
++{
++    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
++         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
++         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
++}
++
++// RGB to XYZ: the columns are the primaries, scaled so that RGB = 1 is the white
++static void dovi_rgb2xyz(const struct pl_raw_primaries *p, double m[3][3])
++{
++    const struct pl_cie_xy c[3] = { p->red, p->green, p->blue };
++    const double w[3] = { p->white.x / p->white.y, 1.0,
++                          (1.0 - p->white.x - p->white.y) / p->white.y };
++    double a[3][3];
++    for (int k = 0; k < 3; k++) {
++        a[0][k] = c[k].x / c[k].y;
++        a[1][k] = 1.0;
++        a[2][k] = (1.0 - c[k].x - c[k].y) / c[k].y;
++    }
++    const double det = dovi_det3(a);
++    for (int k = 0; k < 3; k++) {
++        double b[3][3];
++        for (int i = 0; i < 3; i++) {
++            for (int j = 0; j < 3; j++)
++                b[i][j] = j == k ? w[i] : a[i][j];
++        }
++        const double s = dovi_det3(b) / det; // Cramer: (a^-1 w)[k]
++        for (int i = 0; i < 3; i++)
++            m[i][k] = a[i][k] * s;
++    }
++}
++
++static void dovi_to_bt2020(enum pl_color_primaries prim, double out[3][3])
++{
++    double src[3][3], dst[3][3], inv[3][3];
++    dovi_rgb2xyz(pl_raw_primaries_get(prim), src);
++    dovi_rgb2xyz(pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020), dst);
++    const double det = dovi_det3(dst);
++    for (int i = 0; i < 3; i++) {
++        for (int j = 0; j < 3; j++) {
++            const int i1 = (j + 1) % 3, i2 = (j + 2) % 3, j1 = (i + 1) % 3, j2 = (i + 2) % 3;
++            inv[i][j] = (dst[i1][j1] * dst[i2][j2] - dst[i1][j2] * dst[i2][j1]) / det;
++        }
++    }
++    for (int i = 0; i < 3; i++) {
++        for (int j = 0; j < 3; j++) {
++            out[i][j] = 0.0;
++            for (int k = 0; k < 3; k++)
++                out[i][j] += inv[i][k] * src[k][j];
++        }
++    }
++}
++#endif
++
+ void pl_shader_decode_color_ex(pl_shader sh,
+                                const struct pl_color_decode_args *args)
+ {
+@@ -465,7 +522,54 @@ void pl_shader_decode_color_ex(pl_shader sh,
+             { 0.01736321, -0.04725154,  1.03004253},
+         }};
+ 
+-        pl_matrix3x3_mul(&dovi_lms2rgb, &repr->dovi->linear);
++        // The RPU's rgb_to_lms is that of the RGB of the picture, whose
++        // primaries it names: through lms2rgb it is the matrix from that RGB
++        // to BT.2020. Rounded to 1/16384, and lms2rgb the inverse of
++        // coefficients a little apart (up to 2.8/16384 on a profile 7
++        // stream), the product is off by up to 1.8e-4, which moves light from
++        // the bright components of a pixel to the dark ones: hundreds of PQ
++        // codes near black. Where it is within 1e-3 of the exact matrix of
++        // BT.2020, P3-D65 (the primaries of the default rgb_to_lms of ETSI GS
++        // CCM 001) or BT.709, that matrix is taken, from the primaries, in
++        // double; for BT.2020 the round trip through LMS is the identity, and
++        // it is left out: the signal is only clamped, as the EOTF has it.
++        // These three are 0.13 and more apart. Any other matrix (the identity
++        // of a signal whose nonlinear matrix gives LMS already, or one of
++        // other primaries or white) goes through LMS as before.
++        double conv[3][3], exact[3][3];
++        for (int i = 0; i < 3; i++) {
++            for (int j = 0; j < 3; j++) {
++                conv[i][j] = 0.0;
++                for (int k = 0; k < 3; k++)
++                    conv[i][j] += (double) dovi_lms2rgb.m[i][k] * repr->dovi->linear.m[k][j];
++            }
++        }
++        static const enum pl_color_primaries dovi_prims[] = {
++            PL_COLOR_PRIM_BT_2020, PL_COLOR_PRIM_DISPLAY_P3, PL_COLOR_PRIM_BT_709,
++        };
++        int dovi_prim = -1;
++        for (int n = 0; n < PL_ARRAY_SIZE(dovi_prims) && dovi_prim < 0; n++) {
++            dovi_to_bt2020(dovi_prims[n], exact);
++            bool close_to = true;
++            for (int i = 0; i < 3; i++) {
++                for (int j = 0; j < 3; j++)
++                    close_to &= fabs(conv[i][j] - exact[i][j]) < 1e-3;
++            }
++            if (close_to)
++                dovi_prim = n;
++        }
++        if (dovi_prim == 0) {
++            GLSL("color.rgb = clamp(color.rgb, 0.0, 1.0); \n");
++            break;
++        } else if (dovi_prim > 0) {
++            for (int i = 0; i < 3; i++) {
++                for (int j = 0; j < 3; j++)
++                    dovi_lms2rgb.m[i][j] = exact[i][j];
++            }
++        } else {
++            pl_matrix3x3_mul(&dovi_lms2rgb, &repr->dovi->linear);
++        }
++
+         ident_t mat = sh_var(sh, (struct pl_shader_var) {
+             .var = pl_var_mat3("lms2rgb"),
+             .data = PL_TRANSPOSE_3X3(dovi_lms2rgb.m),

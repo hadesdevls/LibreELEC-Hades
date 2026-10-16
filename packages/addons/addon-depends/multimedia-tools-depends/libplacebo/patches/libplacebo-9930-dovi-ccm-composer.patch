@@ -1,0 +1,1466 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:30:00 +0000
+Subject: [PATCH] renderer: compose Dolby Vision as the composer of ETSI GS CCM
+ 001 does
+
+libplacebo reconstructs a Dolby Vision picture per pixel at 4:4:4: the
+chroma of the base layer is scaled up first, and the MMR mapping of the
+chroma is evaluated at every pixel with the luma of that pixel; a code is
+read as s / (2^n - 1); the enhancement layer is scaled up as a continuous
+signal and its inverse quantization applied to the scaled values; the
+output is clamped to the pivots. The composer of ETSI GS CCM 001 V1.1.1,
+clause 5.4, is defined otherwise, in integers:
+- 5.4.2.3.3: "the BL luma (colour component 0) shall be down-sampled, to
+  align with chroma samples, before applying the MMR mapping process":
+  the chroma is mapped per chroma sample (4:2:0), with
+  s*_{i,j} = (((s_{2i-1,2j} + 2 s_{2i,2j} + s_{2i+1,2j} + 2) >> 2)
+  + ((s_{2i-1,2j+1} + 2 s_{2i,2j+1} + s_{2i+1,2j+1} + 2) >> 2) + 1) >> 1;
+- 5.4.2.3.2/3: a code s is read as s << (20 - BL_bit_depth) of 2^20, i.e.
+  s / 2^n, the mapped signal v has 16 bits (v / 2^16), and the inputs,
+  not the output, are clamped to the pivots;
+- 5.4.3.2: the inverse quantization works on the integer codes of the
+  enhancement layer, after a resampling that clause 4 (note 1) leaves out
+  of the normative part and annex B (informative) gives a reference for;
+- 5.4.3.3: h = (v + r + 2^(15 - hdr)) >> (16 - hdr), clamped to hdr bits.
+On a profile 7 FEL stream the picture differs from libplacebo's by 4 to 15
+codes of 4095 in almost every pixel (the normalization), and by up to 742
+at edges of high luma contrast (the chroma composed at 4:4:4).
+
+With the new pl_render_params.dovi_ccm the renderer composes a Dolby Vision
+image as the clause does, in passes of its own before it reads the planes:
+- the polynomial mapping of every code of the base layer, and the inverse
+  quantization (NLQ_LINEAR_DZ) of every code the resampled layer can have,
+  are tables made on the CPU with the clause's arithmetic (dovi_ccm.c);
+- the MMR mapping is evaluated in the shader, exactly: with C' the
+  coefficients scaled to 27 fractional bits, v = floor(sum C' tt / 2^27);
+  the shader has floor(sum floor(C'/2^7) tt + floor(sum (C' mod 2^7) tt /
+  2^7)) modulo 2^32 in 32-bit integers (the second sum exact in floats),
+  hence v modulo 4096, and a float estimate within 2048 of v picks it;
+  the products of the terms tt are shifted down exactly in 32 bits;
+- an enhancement layer half the size of the base layer is resampled with
+  the integer filters of annex B.3 (vertical, then horizontal, edges by
+  replication), the geometry the composer of the clause is built around;
+- the composed luma (per luma sample) and chroma (per chroma sample) hold
+  h / 2^hdr_bit_depth and take the place of the image's planes: the chroma
+  is scaled up by plane_upscaler at the chroma location of the base layer,
+  and the decoding subtracts the ycc_to_rgb offsets as the RPU gives them
+  (the composed signal is in their units, without the 2^n / (2^n - 1)).
+The coefficients are needed as integers: pl_map_dovi_metadata() now also
+fills pl_dovi_metadata.ccm with the composing metadata as the RPU codes it.
+
+Two readings of the text, written where they are used:
+- 5.4.2.2 starts pivot_idx at num_pivots_minus2 + 1, past the last piece,
+  for a sample at or above the last pivot (code 1023 when that pivot is
+  1023), which would then have no mapping: it takes the last piece; its
+  value is clamped to the last pivot by the mapping either way;
+- in s_{i,j} of a "(PicWidth)x(PicHeight)" block, "MxN (M-column by
+  N-row)" (clause 3.1), i is the column: the [1 2 1] filter is horizontal,
+  centred on the even columns, and two rows are averaged. The down-sampled
+  luma is then co-sited with the chroma horizontally and centred between
+  its two rows vertically: chroma sample location type 0 of H.273
+  (chroma_sample_loc_type 0 of HEVC, inferred when a stream does not say),
+  the default siting of 4:2:0, and the geometry of annex B too. The other
+  reading would site it centred horizontally and co-sited vertically,
+  type 3, which streams hardly use. (It changes 2562 Cb and 3662 Cr
+  samples of one picture, by up to 307 codes of 4095. The filter of the
+  clause does not depend on the siting a stream signals: the one profile 7
+  stream at hand signals top-left, type 2.)
+
+The MMR evaluation is exact while S = sum |C'| 2^20 / 2^27 over a piece
+is below 2^28: the float estimate is then off by less than about 785
+(49 * 2^-24 * S, with every float operation off by up to one ulp), well
+inside the 2048 the choice allows. S is computed for every RPU on the CPU.
+
+A picture the clause does not cover (MMR on the luma, a base layer that is
+not 4:2:0, coefficient_log2_denom above 23, a layer of another size,
+floating-point coefficients, film grain, interlacing, an MMR piece with
+S >= 2^28) is composed as before, and each reason is logged once a stream
+(until pl_renderer_flush_cache()), however the pictures alternate. A pass
+that fails on the GPU sets the new PL_RENDER_ERR_DOVI_COMPOSER, the
+picture is composed as before, and so are the following ones until the
+error is reset. With pl_render_params.active_rows the passes leave out
+the rows nothing reads; they still write every texel of their targets
+(0 in the rows left out). Without dovi_ccm nothing changes.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe), on top of
+libplacebo-9913 and 9914 (exact weights, exact 1:1 read) and 9920 of the
+tree, against two transcriptions of the clause written apart (C and numpy,
+64-bit integers, annex B.3 for the layer), which give the same samples on
+every picture:
+- the composed planes are identical to them, every sample, on 8 pictures
+  of a profile 7 FEL stream and on 12 made-up cases (MMR of order 1, 2
+  and 3, a component with MMR and polynomial pieces, polynomials of order
+  2 with the pivots inside the code range, 8-bit layers,
+  coefficient_log2_denom 18, hdr_bit_depth 10, a layer of the base layer's
+  size, NLQ with a threshold and with hdr_in_max clamping, no residual,
+  a random base layer), each with planar and with P010 textures; a 13th
+  case, beyond the exact range, is composed as before;
+- the bound, both ways, with made-up MMR pieces of order 3 whose terms
+  cancel (95 % of the chroma samples in range): with S = 2^28 - 2^-7 the
+  composed planes are identical to the transcriptions; with S = 2^28 the
+  picture is byte for byte the one without dovi_ccm, and alternating the
+  two logs each once, and again after pl_renderer_flush_cache(). On the
+  2878 pictures of the stream S is at most 2^23.6, 21 times below the
+  bound; the float estimate, emulated in float32 in the shader's order on
+  300 random sets at the bound, is off by at most 49;
+- the reconstructed picture differs from the reference's (the stage after
+  the composer in 64-bit floats) by one code of 4095 in 0.01 to 0.68 % of
+  the pixels of the stream's pictures, never by more (libplacebo's
+  reshaping: almost every pixel of the active picture, by up to 742);
+- Kodi's Dolby Vision renderer passes its render test, and its two ways
+  (composed, and drawn and packed in one shader) give the same transport
+  bytes in all 48 drawings of the 8 pictures; with and without
+  active_rows (the test's early hook) the transport and the composed
+  picture are the same in every drawing of 106 runs (5088 drawings), and
+  the composed planes, in the rows composed, are those of a full
+  composition, even after another picture was drawn with the same
+  renderer, with 0 in the rows left out. One earlier run, of a build of
+  this patch that summed the low parts of the MMR coefficients in 32-bit
+  integers (since replaced by the exact float sums), drew transport bytes
+  that differed with and without the early hook (1 to 91 bytes in 20 of
+  48 drawings); in 160 runs since, on this base and on one without 9913
+  and 9914, with the dumps of the test on and off, 10 of them with that
+  build rebuilt, not one byte differed.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the files changed,
+whose notices stay as they are; dovi_ccm.c and dovi_ccm.h carry it too.
+---
+ src/colorspace.c                              |  21 +-
+ src/colorspace.h                              |   6 +
+ src/dovi_ccm.c                                | 242 +++++++
+ src/dovi_ccm.h                                |  76 ++
+ src/include/libplacebo/colorspace.h           |  28 +
+ src/include/libplacebo/renderer.h             |  20 +
+ src/include/libplacebo/shaders/colorspace.h   |   7 +
+ src/include/libplacebo/utils/libav_internal.h |  40 +
+ src/meson.build                               |   1 +
+ src/renderer.c                                | 685 ++++++++++++++++++
+ src/shaders/colorspace.c                      |  14 +-
+ 11 files changed, 1135 insertions(+), 5 deletions(-)
+ create mode 100644 src/dovi_ccm.c
+ create mode 100644 src/dovi_ccm.h
+
+diff --git a/src/colorspace.c b/src/colorspace.c
+index fc8238d..edc65ca 100644
+--- a/src/colorspace.c
++++ b/src/colorspace.c
+@@ -1774,8 +1774,25 @@ static inline void apply_hue_sat(pl_matrix3x3 *m,
+     }
+ }
+ 
++static pl_transform3x3 color_repr_decode(struct pl_color_repr *repr,
++                                         const struct pl_color_adjustment *params,
++                                         bool dovi_composed);
++
+ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
+                                      const struct pl_color_adjustment *params)
++{
++    return color_repr_decode(repr, params, false);
++}
++
++pl_transform3x3 pl_color_repr_decode_dovi_composed(struct pl_color_repr *repr,
++                                                   const struct pl_color_adjustment *params)
++{
++    return color_repr_decode(repr, params, true);
++}
++
++static pl_transform3x3 color_repr_decode(struct pl_color_repr *repr,
++                                         const struct pl_color_adjustment *params,
++                                         bool dovi_composed)
+ {
+     params = PL_DEF(params, &pl_color_adjustment_neutral);
+ 
+@@ -1921,9 +1938,11 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
+     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION) {
+         // The RPU matrix already includes levels normalization, but in this
+         // case we also have to respect the signalled color offsets
++        // Hades: a composed signal (ETSI GS CCM 001 clause 5.4) is normalized
++        // as h / 2^hdr_bit_depth, the units of the offsets: as they are
+         for (int i = 0; i < 3; i++) {
+             mul[i] = 1.0;
+-            black[i] = repr->dovi->nonlinear_offset[i] * scale;
++            black[i] = repr->dovi->nonlinear_offset[i] * (dovi_composed ? 1.0 : scale);
+         }
+     } else
+ #endif
+diff --git a/src/colorspace.h b/src/colorspace.h
+index 7c85bf7..644f1ea 100644
+--- a/src/colorspace.h
++++ b/src/colorspace.h
+@@ -53,3 +53,9 @@ static const float SLOG_A = 0.432699,
+                    SLOG_P = 3.538813,
+                    SLOG_Q = 0.030001,
+                    SLOG_K2 = 155.0 / 219.0;
++
++// Hades: pl_color_repr_decode() for a PL_COLOR_SYSTEM_DOLBYVISION signal that is
++// composed already (ETSI GS CCM 001 clause 5.4), normalized as h / 2^hdr_bit_depth:
++// the ycc_to_rgb offsets are subtracted as the RPU gives them.
++pl_transform3x3 pl_color_repr_decode_dovi_composed(struct pl_color_repr *repr,
++                                                   const struct pl_color_adjustment *params);
+diff --git a/src/dovi_ccm.c b/src/dovi_ccm.c
+new file mode 100644
+index 0000000..62a239e
+--- /dev/null
++++ b/src/dovi_ccm.c
+@@ -0,0 +1,242 @@
++/*
++ * This file is part of libplacebo.
++ *
++ * libplacebo is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * libplacebo is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <math.h>
++#include <stdlib.h>
++
++#include "dovi_ccm.h"
++#include "hash.h"
++
++uint64_t pl_dovi_ccm_signature(const struct pl_dovi_ccm *ccm)
++{
++    uint64_t sig = pl_mem_hash(ccm, sizeof(*ccm));
++    return sig ? sig : 1;
++}
++
++// 5.4.2.2. The pseudo-code starts at num_pivots_minus2 + 1, one past the last
++// piece, for a sample at or above the last pivot (code 1023 when that pivot is
++// 1023), which then has no mapping: such a sample takes the last piece, whose
++// input is clamped to the last pivot by 5.4.2.3.2 and 5.4.2.3.3 in any case.
++static int pivot_index(const struct pl_dovi_ccm_curve *cv, int s)
++{
++    const int num_pivots_minus2 = cv->num_pivots - 2;
++    for (int idx = 0; idx < num_pivots_minus2 + 1; idx++) {
++        if (s < cv->pivots[idx + 1])
++            return idx;
++    }
++    return num_pivots_minus2;
++}
++
++// 5.4.2.3.2, polynomial mapping of the sample s of the BL
++static int map_poly(const struct pl_dovi_ccm *ccm,
++                    const struct pl_dovi_ccm_curve *cv, int pivot_idx, int s)
++{
++    const int last = cv->num_pivots - 1;
++    if (s < cv->pivots[0])
++        s = cv->pivots[0];
++    if (s > cv->pivots[last])
++        s = cv->pivots[last];
++
++    int64_t ss = 1, vv = 0;
++    int shift = 20; // 2 * (maximum BL_bit_depth)
++    for (int i = 0; i <= cv->poly_order[pivot_idx]; i++) {
++        vv += cv->poly_coef[pivot_idx][i] * (ss << shift);
++        ss *= s;
++        shift -= ccm->bl_bit_depth;
++    }
++
++    vv = vv < 0 ? 0 : vv;
++    int64_t v = vv >> (4 + ccm->coef_log2_denom);
++    return v > 0xffff ? 0xffff : (int) v;
++}
++
++// 5.4.3.2, NLQ_LINEAR_DZ, for the code e of the resampled EL
++static int nlq_linear_dz(const struct pl_dovi_ccm *ccm, int cmp, int e)
++{
++    const struct pl_dovi_ccm_nlq *q = &ccm->nlq[cmp];
++    const int eld = ccm->el_bit_depth;
++    const int64_t T = q->threshold, S = q->slope, R = q->hdr_in_max;
++    int64_t rr = (int64_t) e - q->offset;
++    if (rr == 0)
++        return 0;
++
++    const int64_t sign = rr < 0 ? -1 : 1;
++    rr *= 2;
++    rr -= sign;
++    rr *= (int64_t) 1 << (10 - eld);
++    int64_t dq = rr * S;
++    dq += T * ((int64_t) 1 << (10 - eld + 1)) * sign;
++    const int64_t RR = R * ((int64_t) 1 << (10 - eld + 1));
++    if (dq > RR)
++        dq = RR;
++    else if (dq < -RR)
++        dq = -RR;
++
++    // arithmetic shift, as the clause has it: floor
++    const int64_t div = (int64_t) 1 << (ccm->coef_log2_denom - 5 - eld);
++    int64_t r = dq / div;
++    if (dq % div && dq < 0)
++        r -= 1;
++    return (int) r;
++}
++
++#define FAIL(why) do { out->reason = (why); return false; } while (0)
++
++bool pl_dovi_ccm_prepare(struct pl_dovi_ccm_prep *out,
++                         const struct pl_dovi_ccm *ccm)
++{
++    const uint64_t sig = pl_dovi_ccm_signature(ccm);
++    if (out->signature == sig)
++        return !out->reason;
++
++    memset(out, 0, sizeof(*out));
++    out->signature = sig;
++
++    if (!ccm->valid)
++        FAIL("the composing metadata is not fixed-point (or was not mapped)");
++
++    // Clause 5.3.2 and annex A, main profile / ETSI profile 1
++    const int d = ccm->coef_log2_denom;
++    out->bl_depth = ccm->bl_bit_depth;
++    out->el_depth = ccm->el_bit_depth;
++    out->hdr_depth = ccm->hdr_bit_depth;
++    out->residual = !ccm->disable_residual;
++    if (out->bl_depth != 8 && out->bl_depth != 10)
++        FAIL("BL_bit_depth is not 8 or 10");
++    if (out->hdr_depth != 10 && out->hdr_depth != 12)
++        FAIL("hdr_bit_depth is not 10 or 12");
++    if (d < 1 || d > 23)
++        FAIL("coefficient_log2_denom is outside 1..23");
++    if (out->residual) {
++        if (out->el_depth != 8 && out->el_depth != 10)
++            FAIL("EL_bit_depth is not 8 or 10");
++        if (d < out->el_depth + 5)
++            FAIL("coefficient_log2_denom is below EL_bit_depth + 5");
++        if (ccm->nlq_method != 0)
++            FAIL("the inverse quantization is not NLQ_LINEAR_DZ");
++    }
++
++    const int smax = (1 << out->bl_depth) - 1;
++    for (int c = 0; c < 3; c++) {
++        const struct pl_dovi_ccm_curve *cv = &ccm->curve[c];
++        if (cv->num_pivots < 2 || cv->num_pivots > 9)
++            FAIL("a component has fewer than 2 or more than 9 pivots");
++        for (int i = 0; i < cv->num_pivots; i++) {
++            if (cv->pivots[i] > smax || (i && cv->pivots[i] <= cv->pivots[i - 1]))
++                FAIL("the pivots are not increasing codes of the BL");
++        }
++        for (int i = 0; i < cv->num_pivots - 1; i++) {
++            switch (cv->mapping_idc[i]) {
++            case 0:
++                if (cv->poly_order[i] < 1 || cv->poly_order[i] > 2)
++                    FAIL("a polynomial is not of order 1 or 2");
++                for (int k = 0; k <= cv->poly_order[i]; k++) {
++                    if (llabs(cv->poly_coef[i][k]) >= (1LL << 40))
++                        FAIL("a polynomial coefficient is out of range");
++                }
++                break;
++            case 1:
++                if (c == 0)
++                    FAIL("the luma has an MMR piece (mapping_idc[0] shall be 0)");
++                if (cv->mmr_order[i] < 1 || cv->mmr_order[i] > 3)
++                    FAIL("an MMR mapping is not of order 1 to 3");
++                break;
++            default:
++                FAIL("an unknown mapping_idc");
++            }
++        }
++        out->range[c][0] = cv->pivots[0];
++        out->range[c][1] = cv->pivots[cv->num_pivots - 1];
++    }
++
++    // The tables of the polynomial pieces, for every code of the BL
++    for (int c = 0; c < 3; c++) {
++        const struct pl_dovi_ccm_curve *cv = &ccm->curve[c];
++        for (int s = 0; s <= smax; s++) {
++            const int idx = pivot_index(cv, s);
++            if (cv->mapping_idc[idx] == 0)
++                out->lut[c][s] = map_poly(ccm, cv, idx, s);
++        }
++    }
++
++    // The tables of the inverse quantization, for every code the resampled EL
++    // can have: below 2^(EL_bit_depth + 1) (the filters of annex B.3 overshoot
++    // a 10-bit code to at most 1406)
++    if (out->residual) {
++        for (int c = 0; c < 3; c++) {
++            for (int e = 0; e < PL_DOVI_CCM_LUT_W; e++)
++                out->lut[3 + c][e] = nlq_linear_dz(ccm, c, e);
++        }
++    }
++
++    // The MMR pieces of the chroma, split for the exact evaluation in the
++    // shader: with C' = C * 2^(23 - d) and the terms tt[k] < 2^20 (tt[0] = 2^20)
++    // of 5.4.2.3.3, v = floor(sum_k C'_k tt[k] / 2^27). The shader has the low
++    // 32 bits of X = sum_k floor(C'_k / 2^7) tt[k] + floor(sum_k r_k tt[k] / 2^7)
++    // (the r_k part is below 22 * 127 * 2^20 < 2^32, exact: the shader sums it in
++    // floats as sum r_k (tt[k] >> 10) * 2^10 + sum r_k (tt[k] & 1023), whose terms
++    // and partial sums are integers below 2^22), and v = floor(X / 2^20)
++    // modulo 4096 from its bits 20..31. A float estimate of sum_k C'_k tt[k] / 2^27
++    // within 2048 of it tells which of those values it is. For
++    // S = sum_k |C'_k| tt[k] / 2^27 <= sum_k |C'_k| 2^20 / 2^27, its error is at
++    // most about 49 * 2^-24 * S in any order of the 24 products and their sums
++    // with each float operation off by at most one ulp (25 * 2^-24 * S when they
++    // round correctly), and 1 more for the floor. This is checked for every
++    // RPU: S < 2^28 keeps the error below 785, well inside 2048; an RPU that can
++    // reach S >= 2^28 for some sample is not composed here (the caller falls
++    // back to the reshaping of libplacebo for that picture).
++    for (int ci = 0; ci < 2; ci++) {
++        const struct pl_dovi_ccm_curve *cv = &ccm->curve[1 + ci];
++        struct pl_dovi_ccm_chroma *ch = &out->chroma[ci];
++        ch->num_pieces = cv->num_pivots - 1;
++        for (int i = 1; i < cv->num_pivots - 1; i++)
++            ch->pivots[i - 1] = cv->pivots[i];
++
++        int max_order = 0;
++        for (int i = 0; i < ch->num_pieces; i++) {
++            if (cv->mapping_idc[i] != 1)
++                continue;
++            ch->mmr_mask |= 1 << i;
++            max_order = PL_MAX(max_order, cv->mmr_order[i]);
++
++            int64_t coef[PL_DOVI_CCM_TERMS] = { cv->mmr_constant[i] };
++            for (int o = 0; o < cv->mmr_order[i]; o++) {
++                for (int j = 0; j < 7; j++)
++                    coef[1 + 7 * o + j] = cv->mmr_coef[i][o][j];
++            }
++
++            double bound = 0.0;
++            for (int k = 0; k < PL_DOVI_CCM_TERMS; k++) {
++                if (llabs(coef[k]) >= (1LL << 40))
++                    FAIL("an MMR coefficient is out of range");
++                const int64_t cs = coef[k] * ((int64_t) 1 << (23 - d));
++                const int64_t r = ((cs % 128) + 128) % 128;
++                const int64_t q = (cs - r) / 128;
++                ch->q[i][k] = (uint32_t) (uint64_t) q;
++                ch->r[i][k] = (float) r;
++                ch->f[i][k] = (float) ((double) cs / 134217728.0);
++                bound += fabs((double) cs) * 1048576.0 / 134217728.0;
++            }
++            if (bound >= 268435456.0)
++                FAIL("the MMR coefficients exceed what the shader evaluates exactly");
++        }
++        ch->terms = max_order * 8; // 8, 16, 24 terms (7 per order and the constant, padded)
++    }
++
++    out->reason = NULL;
++    return true;
++}
+diff --git a/src/dovi_ccm.h b/src/dovi_ccm.h
+new file mode 100644
+index 0000000..7ed5a12
+--- /dev/null
++++ b/src/dovi_ccm.h
+@@ -0,0 +1,76 @@
++/*
++ * This file is part of libplacebo.
++ *
++ * libplacebo is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * libplacebo is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with libplacebo. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include "common.h"
++
++#include <libplacebo/colorspace.h>
++
++// The composer of ETSI GS CCM 001 V1.1.1, clause 5.4: what its shaders need,
++// made on the CPU from the composing metadata of a picture (pl_dovi_ccm).
++//
++// Everything that depends on one sample of one component is a table, computed
++// here with the integer arithmetic of the clause: the mapping of a polynomial
++// piece (5.4.2.3.2) for every code of the base layer, and the inverse
++// quantization (5.4.3.2) for every code of the resampled enhancement layer.
++// The MMR mapping (5.4.2.3.3) depends on three samples and is evaluated in the
++// shader, exactly: its coefficients are split here for that (see dovi_ccm.c).
++
++#define PL_DOVI_CCM_LUT_W 2048 // entries of a row of the tables
++#define PL_DOVI_CCM_TERMS 24   // the 22 terms of an MMR mapping of order 3, padded to vec4
++
++struct pl_dovi_ccm_prep {
++    uint64_t signature;     // of the pl_dovi_ccm this was made from
++    const char *reason;     // why the picture cannot be composed so, or NULL
++
++    int bl_depth, el_depth, hdr_depth;
++    bool residual;          // the clause adds an inverse-quantized residual
++
++    // rows 0-2: v (5.4.2.3.2) of base layer code s of component c, where the
++    //           piece of s is a polynomial;
++    // rows 3-5: r (5.4.3.2) of resampled enhancement layer code e of
++    //           component c. Exact integers, held as floats.
++    float lut[6][PL_DOVI_CCM_LUT_W];
++
++    // [pivot_value[c][0], pivot_value[c][num_pivots_minus2 + 1]]
++    int range[3][2];
++
++    struct pl_dovi_ccm_chroma {
++        int num_pieces;
++        int pivots[7];      // the interior pivots: piece = #{ i : s >= pivots[i] }
++        int mmr_mask;       // bit i: piece i is an MMR mapping
++        int terms;          // 8, 16 or 24 for the highest MMR order 1, 2 or 3;
++                            // 0 when the component has no MMR piece
++        // The coefficient C of term k (k = 0 the constant, then the 7 of each
++        // order) scaled to 27 fractional bits, C' = C * 2^(23 - denom), as
++        //   q = floor(C' / 2^7) modulo 2^32, r = C' - 2^7 floor(C' / 2^7) (0..127),
++        //   f = C' / 2^27 (rounded to a float)
++        uint32_t q[8][PL_DOVI_CCM_TERMS];
++        float r[8][PL_DOVI_CCM_TERMS];
++        float f[8][PL_DOVI_CCM_TERMS];
++    } chroma[2];
++};
++
++// Makes `out` for `ccm`, unless `out->signature` says it already is. Returns
++// false, with `out->reason` set, when the clause cannot compose this picture
++// (metadata outside its scope or outside what the shaders evaluate exactly).
++bool pl_dovi_ccm_prepare(struct pl_dovi_ccm_prep *out,
++                         const struct pl_dovi_ccm *ccm);
++
++// The signature of a pl_dovi_ccm (never 0).
++uint64_t pl_dovi_ccm_signature(const struct pl_dovi_ccm *ccm);
+diff --git a/src/include/libplacebo/colorspace.h b/src/include/libplacebo/colorspace.h
+index 5a1c24a..a9547bb 100644
+--- a/src/include/libplacebo/colorspace.h
++++ b/src/include/libplacebo/colorspace.h
+@@ -164,6 +164,34 @@ struct pl_dovi_metadata {
+         float deadzone_slope;     // (2^el_bit_depth - 1) * S / 2^coef_log2_denom
+         float deadzone_threshold; // (T - S/2) / 2^coef_log2_denom
+     } nlq[3];
++
++    // The composing metadata as the RPU codes it, in integers, for the
++    // composer of ETSI GS CCM 001 V1.1.1, clause 5.4 (see
++    // `pl_render_params.dovi_ccm`): pivots in codes of the base layer,
++    // coefficients in units of 2^-coef_log2_denom. `ccm.valid` is false when
++    // the metadata does not have it (not mapped from an RPU with fixed-point
++    // coefficients); the renderer then composes from the fields above.
++    struct pl_dovi_ccm {
++        bool valid;
++        uint8_t coef_log2_denom;
++        uint8_t bl_bit_depth, el_bit_depth, hdr_bit_depth;
++        bool disable_residual;
++        uint8_t nlq_method; // 0 = NLQ_LINEAR_DZ
++        struct pl_dovi_ccm_curve {
++            uint8_t num_pivots;
++            uint16_t pivots[9];
++            uint8_t mapping_idc[8]; // 0 = polynomial, 1 = MMR
++            uint8_t poly_order[8];  // 1 or 2
++            int64_t poly_coef[8][3];
++            uint8_t mmr_order[8];   // 1, 2 or 3
++            int64_t mmr_constant[8];
++            int64_t mmr_coef[8][3 /* order */][7];
++        } curve[3];
++        struct pl_dovi_ccm_nlq {
++            uint16_t offset;
++            uint64_t hdr_in_max, slope, threshold;
++        } nlq[3];
++    } ccm;
+ };
+ 
+ // Struct describing the underlying color system and representation. This
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index a39208a..c6e9324 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -53,6 +53,7 @@ enum pl_render_error {
+     PL_RENDER_ERR_HOOKS             = 1 << 10,
+     PL_RENDER_ERR_CONTRAST_RECOVERY = 1 << 11,
+     PL_RENDER_ERR_BLUR              = 1 << 12,
++    PL_RENDER_ERR_DOVI_COMPOSER     = 1 << 13, // see `pl_render_params.dovi_ccm`
+ };
+ 
+ // Struct describing current renderer state, including internal processing errors,
+@@ -385,6 +386,25 @@ struct pl_render_params {
+     // and the render fails instead of leaving out other rows.
+     int active_rows[2];
+ 
++    // Compose a Dolby Vision image (PL_COLOR_SYSTEM_DOLBYVISION, with the
++    // integer composing metadata `pl_dovi_metadata.ccm`) as the composer of
++    // ETSI GS CCM 001 V1.1.1, clause 5.4, does, with its arithmetic: the luma
++    // mapped per luma sample, the chroma per chroma sample (4:2:0) with the
++    // luma down-sampled as in 5.4.2.3.3, a code of the base layer read as
++    // s / 2^BL_bit_depth, the residual of the enhancement layer inverse-
++    // quantized on its integer codes after the resampling of annex B.3
++    // (informative), and the output samples h of 5.4.3.3 (hdr_bit_depth). The
++    // composed chroma is then scaled up by `plane_upscaler` at the chroma
++    // location of the image, and decoded with the RPU's matrices, reading h
++    // as h / 2^hdr_bit_depth.
++    //
++    // A picture that the clause does not cover (MMR on the luma, 4:4:4,
++    // coefficients outside its ranges...) is composed as without this, and
++    // logged. If the composition fails on the GPU, PL_RENDER_ERR_DOVI_COMPOSER
++    // is set and pictures are composed as without this until it is reset.
++    // Hades extension.
++    bool dovi_ccm;
++
+     // This callback is invoked for every pass successfully executed in the
+     // process of rendering a frame. Optional.
+     //
+diff --git a/src/include/libplacebo/shaders/colorspace.h b/src/include/libplacebo/shaders/colorspace.h
+index 9a7b533..6920e6d 100644
+--- a/src/include/libplacebo/shaders/colorspace.h
++++ b/src/include/libplacebo/shaders/colorspace.h
+@@ -54,6 +54,13 @@ struct pl_color_decode_args {
+     // and output of the shader depends on the EL being used, based on repr.
+     // Currently only Dolby Vision EL is supported.
+     pl_shader enhancement_layer;
++
++    // For PL_COLOR_SYSTEM_DOLBYVISION: the color holds the composed signal
++    // already (the samples h of ETSI GS CCM 001 clause 5.4.3.3, normalized as
++    // h / 2^hdr_bit_depth). There is no reshaping and no enhancement layer to
++    // add, and the ycc_to_rgb offsets are subtracted as the RPU gives them.
++    // Hades extension.
++    bool dovi_composed;
+ };
+ 
+ #define pl_color_decode_args(...) (&(struct pl_color_decode_args) { __VA_ARGS__ })
+diff --git a/src/include/libplacebo/utils/libav_internal.h b/src/include/libplacebo/utils/libav_internal.h
+index 4451c2a..284e790 100644
+--- a/src/include/libplacebo/utils/libav_internal.h
++++ b/src/include/libplacebo/utils/libav_internal.h
+@@ -1017,6 +1017,46 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+             dst->deadzone_threshold = coef_scale_d * (T - 0.5 * S);
+         }
+     }
++
++    // The same composing metadata in integers, as the RPU codes it, for the
++    // composer of ETSI GS CCM 001 (clause 5.4). FFmpeg turns floating-point
++    // coefficients (coef_data_type 1) into fixed point of its own choosing,
++    // which is not what the clause composes: those are left out.
++    memset(&out->ccm, 0, sizeof(out->ccm));
++    out->ccm.valid = header->coef_data_type == 0;
++    out->ccm.coef_log2_denom = header->coef_log2_denom;
++    out->ccm.bl_bit_depth = header->bl_bit_depth;
++    out->ccm.el_bit_depth = header->el_bit_depth;
++    out->ccm.hdr_bit_depth = header->vdr_bit_depth;
++    out->ccm.disable_residual = header->disable_residual_flag;
++    out->ccm.nlq_method = mapping->nlq_method_idc;
++    for (int c = 0; c < 3; c++) {
++        const AVDOVIReshapingCurve *csrc = &mapping->curves[c];
++        struct pl_dovi_ccm_curve *cdst = &out->ccm.curve[c];
++        cdst->num_pivots = csrc->num_pivots;
++        for (int i = 0; i < csrc->num_pivots && i < 9; i++)
++            cdst->pivots[i] = csrc->pivots[i];
++        for (int i = 0; i < csrc->num_pivots - 1 && i < 8; i++) {
++            cdst->mapping_idc[i] = csrc->mapping_idc[i];
++            cdst->poly_order[i] = csrc->poly_order[i];
++            cdst->mmr_order[i] = csrc->mmr_order[i];
++            cdst->mmr_constant[i] = csrc->mmr_constant[i];
++            for (int k = 0; k < 3; k++)
++                cdst->poly_coef[i][k] = k <= csrc->poly_order[i] ? csrc->poly_coef[i][k] : 0;
++            for (int j = 0; j < 3; j++) {
++                for (int k = 0; k < 7; k++) {
++                    cdst->mmr_coef[i][j][k] = j < csrc->mmr_order[i] ?
++                                              csrc->mmr_coef[i][j][k] : 0;
++                }
++            }
++        }
++    }
++    for (int c = 0; c < 3; c++) {
++        out->ccm.nlq[c].offset = mapping->nlq[c].nlq_offset;
++        out->ccm.nlq[c].hdr_in_max = mapping->nlq[c].vdr_in_max;
++        out->ccm.nlq[c].slope = mapping->nlq[c].linear_deadzone_slope;
++        out->ccm.nlq[c].threshold = mapping->nlq[c].linear_deadzone_threshold;
++    }
+ }
+ 
+ PL_DEPRECATED_IN(v7.370)
+diff --git a/src/meson.build b/src/meson.build
+index 5978ff4..bcfb256 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -94,6 +94,7 @@ sources = [
+   'common.c',
+   'convert.cc',
+   'dither.c',
++  'dovi_ccm.c',
+   'dispatch.c',
+   'dummy.c',
+   'filters.c',
+diff --git a/src/renderer.c b/src/renderer.c
+index 789bee2..3916256 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -22,6 +22,7 @@
+ #include "hash.h"
+ #include "shaders.h"
+ #include "dispatch.h"
++#include "dovi_ccm.h"
+ 
+ #include <libplacebo/renderer.h>
+ 
+@@ -91,6 +92,20 @@ struct pl_renderer_t {
+ 
+     // For backwards compatibility
+     struct icc_state icc_fallback[2];
++
++    // Hades: the composer of ETSI GS CCM 001 (pl_render_params.dovi_ccm)
++    struct dovi_ccm_state *dovi_ccm;
++};
++
++struct dovi_ccm_state {
++    struct pl_dovi_ccm_prep prep;
++    pl_tex lut;
++    uint64_t lut_signature;
++    // what was logged since the last pl_renderer_flush_cache() (a stream): each
++    // reason not to compose once, and composing once
++    const char *said[32]; // more than there are reasons
++    int num_said;
++    bool said_composed;
+ };
+ 
+ enum {
+@@ -176,6 +191,10 @@ void pl_renderer_destroy(pl_renderer *p_rr)
+     for (int i = 0; i < PL_ARRAY_SIZE(rr->samplers_el); i++)
+         sampler_destroy(rr, &rr->samplers_el[i]);
+ 
++    // Hades: the tables of the composer of ETSI GS CCM 001
++    if (rr->dovi_ccm)
++        pl_tex_destroy(rr->gpu, &rr->dovi_ccm->lut);
++
+     // Free fallback ICC profiles
+     for (int i = 0; i < PL_ARRAY_SIZE(rr->icc_fallback); i++)
+         pl_icc_close(&rr->icc_fallback[i].icc);
+@@ -201,6 +220,12 @@ void pl_renderer_flush_cache(pl_renderer rr)
+     rr->frames.num = 0;
+ 
+     pl_reset_detected_peak(rr->tone_map_state);
++
++    // Hades: a new stream logs again what the composer of ETSI GS CCM 001 does
++    if (rr->dovi_ccm) {
++        rr->dovi_ccm->num_said = 0;
++        rr->dovi_ccm->said_composed = false;
++    }
+ }
+ 
+ const struct pl_render_params pl_render_fast_params = { PL_RENDER_DEFAULTS };
+@@ -1815,6 +1840,658 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+     sh_describe(sh, "enhancement layer");
+     return sh;
+ }
++
++// Hades: the composer of ETSI GS CCM 001 V1.1.1, clause 5.4
++// (pl_render_params.dovi_ccm). It reads the planes of the base layer and of
++// the enhancement layer as the integer codes they hold, and writes the samples
++// h of clause 5.4.3.3 of each plane at its own resolution (4:2:0):
++//
++//  - the luma, per luma sample: the polynomial mapping (5.4.2.3.2) of the
++//    code s, read from a table made on the CPU with the clause's arithmetic,
++//    plus the inverse-quantized residual (5.4.3.2), also from a table;
++//  - the chroma, per chroma sample: the luma down-sampled as 5.4.2.3.3 says
++//    ([1 2 1] across three columns of two rows, integer rounding), then each
++//    component mapped by its MMR piece (evaluated exactly, see dovi_ccm.c) or
++//    its polynomial piece (table), plus its residual;
++//  - the enhancement layer, when it is smaller than the base layer, resampled
++//    first as annex B.3 does (informative; resampling is not normative, clause
++//    4 note 1): a vertical pass, then a horizontal one, integer filters,
++//    edges by replication of the picture's samples.
++//
++// The composed planes then replace those of the image: the luma, and the
++// chroma at the chroma location of the base layer, which the renderer scales
++// up as any chroma plane. The decoding reads h as h / 2^hdr_bit_depth.
++
++static void fix_frame(struct pl_frame *frame);
++
++struct ccm_channel {
++    const struct pl_plane *plane;
++    int comp; // the component of a texel of the plane's texture
++};
++
++struct ccm_ctx {
++    const struct pl_dovi_ccm_prep *prep;
++    struct ccm_channel bl[3], el[3];
++    float kbl, kel;         // normalized texel value to code
++    int el_ratio;           // 0: no residual, 1: EL of the BL's size, 2: half
++    int elw, elh;           // the EL picture, in luma samples
++    pl_fmt fmt1, fmt2;      // r32f, rg32f
++    pl_tex lut;
++    bool rows;              // leave rows out (pl_render_params.active_rows)
++    int luma_rows[2], chroma_rows[2];
++};
++
++static bool ccm_find_channel(const struct pl_frame *frame, int channel,
++                             struct ccm_channel *out)
++{
++    for (int p = 0; p < frame->num_planes; p++) {
++        const struct pl_plane *plane = &frame->planes[p];
++        for (int c = 0; c < plane->components; c++) {
++            if (plane->component_mapping[c] != channel)
++                continue;
++            if (!plane->texture || plane->flipped)
++                return false;
++            out->plane = plane;
++            out->comp = plane->texture->params.format->sample_order[c];
++            return out->comp >= 0 && out->comp < 4;
++        }
++    }
++    return false;
++}
++
++// The factor from a normalized texel of `frame` to its integer code
++static float ccm_code_scale(const struct pl_frame *frame, int depth)
++{
++    struct pl_color_repr repr = frame->repr;
++    return pl_color_repr_normalize(&repr) * ((1 << depth) - 1);
++}
++
++// The textures bound in a shader: a pass may not bind one texture twice (two
++// components of one plane, e.g. the CbCr plane of P010)
++struct ccm_binds {
++    int num;
++    pl_tex tex[8];
++    ident_t id[8];
++};
++
++static ident_t ccm_tex(pl_shader sh, struct ccm_binds *b, pl_tex tex,
++                       const char *name)
++{
++    for (int i = 0; i < b->num; i++) {
++        if (b->tex[i] == tex)
++            return b->id[i];
++    }
++    pl_assert(b->num < PL_ARRAY_SIZE(b->tex));
++    b->tex[b->num] = tex;
++    b->id[b->num] = sh_desc(sh, (struct pl_shader_desc) {
++        .binding.object = tex,
++        .binding.address_mode = PL_TEX_ADDRESS_CLAMP,
++        .binding.sample_mode = PL_TEX_SAMPLE_NEAREST,
++        .desc = { .name = name, .type = PL_DESC_SAMPLED_TEX },
++    });
++    return b->id[b->num++];
++}
++
++// #define name(p): the integer code of the channel at the texel p
++static ident_t ccm_code(pl_shader sh, struct ccm_binds *b,
++                        const struct ccm_channel *ch, float scale, const char *name)
++{
++    ident_t tex = ccm_tex(sh, b, ch->plane->texture, name);
++    ident_t fn = sh_fresh(sh, name);
++    GLSLH("#define "$"(p) int(texelFetch("$", (p), 0)[%d] * "$" + 0.5) \n",
++          fn, tex, ch->comp, SH_FLOAT(scale));
++    return fn;
++}
++
++static pl_shader ccm_begin(struct pass_state *pass, int w, int h,
++                           const char *desc, const int rows[2], bool skip)
++{
++    pl_shader sh = pl_dispatch_begin(pass->rr->dp);
++    if (!sh_require(sh, PL_SHADER_SIG_NONE, w, h)) {
++        pl_dispatch_abort(pass->rr->dp, &sh);
++        return NULL;
++    }
++    sh_describe(sh, desc);
++    GLSL("vec4 color = vec4(0.0, 0.0, 0.0, 1.0); \n"
++         "{                                      \n"
++         "ivec2 p = ivec2(gl_FragCoord.xy);      \n");
++    if (skip) {
++        // rows that nothing reads (pl_render_params.active_rows)
++        GLSL("if (p.y < %d || p.y >= %d) \n"
++             "    return color;           \n", rows[0], rows[1]);
++    }
++    return sh;
++}
++
++static pl_tex ccm_end(struct pass_state *pass, pl_shader sh, pl_fmt fmt,
++                      int w, int h)
++{
++    GLSL("} \n");
++    pl_tex tex = get_fbo(pass, w, h, fmt, fmt->num_components, PL_DEBUG_TAG);
++    if (!tex) {
++        pl_dispatch_abort(pass->rr->dp, &sh);
++        return NULL;
++    }
++    if (!pl_dispatch_finish(pass->rr->dp, pl_dispatch_params(
++            .shader = &sh,
++            .target = tex,
++        )))
++    {
++        return NULL;
++    }
++    return tex;
++}
++
++// Annex B.3, the vertical pass: the EL luma (or both EL chroma components)
++// with twice the rows, as integers. Output w x h: the width of the EL plane's
++// texture, the height of the BL plane's texture (rows past the EL picture
++// replicate its last ones).
++static pl_tex ccm_el_vertical(struct pass_state *pass, const struct ccm_ctx *x,
++                              bool luma, int w, int h)
++{
++    const int *rows = luma ? x->luma_rows : x->chroma_rows;
++    pl_shader sh = ccm_begin(pass, w, h, luma ?
++                             "DV composer: EL luma, vertical (CCM 001 annex B.3)" :
++                             "DV composer: EL chroma, vertical (CCM 001 annex B.3)",
++                             rows, x->rows);
++    if (!sh)
++        return NULL;
++
++    const int last = (luma ? x->elh : (x->elh + 1) / 2) - 1;
++    struct ccm_binds binds = {0};
++    GLSL("int n = p.y >> 1;                \n"
++         "bool odd = (p.y & 1) != 0;       \n"
++         "ivec4 r = clamp(ivec4(n - 2, n - 1, n + 1, n + 2), 0, %d); \n"
++         "int r0 = clamp(n, 0, %d);        \n", last, last);
++    for (int k = 0; k < (luma ? 1 : 2); k++) {
++        ident_t e = ccm_code(sh, &binds, &x->el[luma ? 0 : 1 + k], x->kel, "dv_el");
++        GLSL("{                                                          \n"
++             "int a = "$"(ivec2(p.x, r.x)), b = "$"(ivec2(p.x, r.y));    \n"
++             "int c = "$"(ivec2(p.x, r0)),  d = "$"(ivec2(p.x, r.z));    \n"
++             "int f = "$"(ivec2(p.x, r.w));                              \n",
++             e, e, e, e, e);
++        if (luma) {
++            GLSL("int v = odd ? ((-9*b + 111*c + 29*d - 3*f + 64) >> 7) \n"
++                 "            : ((-3*a + 29*b + 111*c - 9*d + 64) >> 7);\n");
++        } else {
++            GLSL("int v = odd ? ((192*c + 64*d + 128) >> 8)             \n"
++                 "            : ((64*b + 192*c + 128) >> 8);             \n");
++        }
++        GLSL("color[%d] = float(clamp(v, 0, 65535));                    \n"
++             "}                                                          \n", k);
++    }
++
++    return ccm_end(pass, sh, luma ? x->fmt1 : x->fmt2, w, h);
++}
++
++// Annex B.3, the horizontal pass, on the output of the vertical one: an ivec2
++// of the resampled EL codes at the sample p (both chroma components, or the
++// luma in .x). `last`: the last column of the EL picture.
++static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert, int last)
++{
++    ident_t tex = ccm_tex(sh, b, vert, "dv_el_vert");
++    ident_t fn = sh_fresh(sh, "dv_el_h");
++    GLSLH("ivec2 "$"(ivec2 p) {                                              \n"
++          "    int n = p.x >> 1;                                            \n"
++          "#define DV_ELV(k) ivec2(texelFetch("$", ivec2(clamp(n + (k), 0, %d), p.y), 0).xy) \n"
++          "    ivec2 e;                                                     \n"
++          "    if ((p.x & 1) == 0) {                                        \n"
++          "        e = DV_ELV(0);                                           \n"
++          "    } else {                                                     \n"
++          "        e = (22 * DV_ELV(-3) + 94 * DV_ELV(-2) - 524 * DV_ELV(-1) \n"
++          "           + 2456 * DV_ELV(0) + 2456 * DV_ELV(1) - 524 * DV_ELV(2) \n"
++          "           + 94 * DV_ELV(3) + 22 * DV_ELV(4) + 2048) >> 12;      \n"
++          "        e = clamp(e, 0, 65535);                                  \n"
++          "    }                                                            \n"
++          "#undef DV_ELV                                                    \n"
++          "    return e;                                                    \n"
++          "}                                                                \n",
++          fn, tex, last);
++    return fn;
++}
++
++// h of 5.4.3.3 from v + r (`in`, an int or ivec2), into `out` as h / 2^hdr_bit_depth
++// (`type`: float or vec2); the division by a power of two is exact
++static void ccm_output(pl_shader sh, const struct pl_dovi_ccm_prep *pp,
++                       const char *in, const char *out, const char *type)
++{
++    const int d = pp->hdr_depth;
++    GLSL("%s = %s(clamp((%s + %d) >> %d, 0, %d)) / %d.0; \n",
++         out, type, in, 1 << (15 - d), 16 - d, (1 << d) - 1, 1 << d);
++}
++
++static pl_tex ccm_luma(struct pass_state *pass, const struct ccm_ctx *x,
++                       pl_tex elv, int w, int h)
++{
++    const struct pl_dovi_ccm_prep *pp = x->prep;
++    pl_shader sh = ccm_begin(pass, w, h, "DV composer: luma (CCM 001 5.4)",
++                             x->luma_rows, x->rows);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t bly = ccm_code(sh, &binds, &x->bl[0], x->kbl, "dv_bl_y");
++    ident_t lut = ccm_tex(sh, &binds, x->lut, "dv_lut");
++    GLSL("int s = clamp("$"(p), 0, %d);                       \n"
++         "int v = int(texelFetch("$", ivec2(s, 0), 0).x);     \n",
++         bly, (1 << pp->bl_depth) - 1, lut);
++
++    if (x->el_ratio) {
++        if (x->el_ratio == 2) {
++            ident_t hf = ccm_el_horizontal(sh, &binds, elv, x->elw - 1);
++            GLSL("int e = "$"(p).x; \n", hf);
++        } else {
++            ident_t ely = ccm_code(sh, &binds, &x->el[0], x->kel, "dv_el_y");
++            GLSL("int e = "$"(p); \n", ely);
++        }
++        GLSL("v += int(texelFetch("$", ivec2(clamp(e, 0, %d), 3), 0).x); \n",
++             lut, PL_DOVI_CCM_LUT_W - 1);
++    }
++
++    ccm_output(sh, pp, "v", "color.x", "float");
++    return ccm_end(pass, sh, x->fmt1, w, h);
++}
++
++// 5.4.2.3.3 for the chroma component ci (0 = Cb, 1 = Cr), into v[ci]: the
++// piece of the sample s = sc[ci], then its MMR mapping (exact, see dovi_ccm.c)
++// or its polynomial mapping (table)
++static void ccm_mmr(struct pass_state *pass, pl_shader sh,
++                    const struct ccm_ctx *x, int ci, ident_t lut)
++{
++    const struct pl_dovi_ccm_chroma *ch = &x->prep->chroma[ci];
++    GLSL("{                \n"
++         "int s = sc[%d];  \n"
++         "int idx = 0;     \n", ci);
++    if (ch->num_pieces > 1) {
++        // (an array of one would be declared as a scalar: at least two)
++        int *pivots = pl_alloc(pass->tmp, 8 * sizeof(int));
++        for (int i = 0; i < 8; i++)
++            pivots[i] = i < ch->num_pieces - 1 ? ch->pivots[i] : INT32_MAX;
++        ident_t piv = sh_var(sh, (struct pl_shader_var) {
++            .var = {
++                .name = "dv_pivots", .type = PL_VAR_SINT,
++                .dim_v = 1, .dim_m = 1, .dim_a = PL_MAX(ch->num_pieces - 1, 2),
++            },
++            .data = pivots,
++        });
++        GLSL("for (int i = 0; i < %d; i++) \n"
++             "    idx += int(s >= "$"[i]);  \n", ch->num_pieces - 1, piv);
++    }
++
++    if (!ch->terms) {
++        GLSL("v[%d] = int(texelFetch("$", ivec2(s, %d), 0).x); \n"
++             "} \n", ci, lut, 1 + ci);
++        return;
++    }
++
++    const int nq = ch->terms / 4, n = ch->num_pieces * nq;
++    uint32_t *q = pl_alloc(pass->tmp, n * 4 * sizeof(uint32_t));
++    float *r = pl_alloc(pass->tmp, n * 4 * sizeof(float));
++    float *f = pl_alloc(pass->tmp, n * 4 * sizeof(float));
++    for (int i = 0; i < ch->num_pieces; i++) {
++        memcpy(&q[i * nq * 4], ch->q[i], nq * 4 * sizeof(uint32_t));
++        memcpy(&r[i * nq * 4], ch->r[i], nq * 4 * sizeof(float));
++        memcpy(&f[i * nq * 4], ch->f[i], nq * 4 * sizeof(float));
++    }
++
++    ident_t vq = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmr_q", .type = PL_VAR_UINT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = q,
++    });
++    ident_t vr = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmr_r", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = r,
++    });
++    ident_t vf = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmr_f", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = f,
++    });
++
++    bool all_mmr = ch->mmr_mask == (1 << ch->num_pieces) - 1;
++    if (!all_mmr)
++        GLSL("if (((%d >> idx) & 1) != 0) { \n", ch->mmr_mask);
++    // X = sum floor(C'/2^7) tt + floor(sum (C' mod 2^7) tt / 2^7), modulo 2^32;
++    // v = floor(X / 2^20) is known modulo 4096 from its bits 20..31, and the
++    // float estimate (within 2048 of it) picks the one it is. The second sum is
++    // exact in floats: the terms r * (tt >> 10) and r * (tt & 1023), r < 2^7,
++    // and their sums are integers below 2^22.
++    GLSL("{                                                      \n"
++         "int base = idx * %d;                                   \n"
++         "uint X = 0u;                                           \n"
++         "float rh = 0.0, rl = 0.0, est = 0.0;                   \n"
++         "for (int k = 0; k < %d; k++) {                         \n"
++         "    uvec4 a = "$"[base + k] * tt[k];                   \n"
++         "    X += a.x + a.y + a.z + a.w;                        \n"
++         "    rh += dot("$"[base + k], tth[k]);                  \n"
++         "    rl += dot("$"[base + k], ttl[k]);                  \n"
++         "    est += dot("$"[base + k], ttf[k]);                 \n"
++         "}                                                      \n"
++         "X += ((uint(rh) << 10u) + uint(rl)) >> 7u;             \n"
++         "int m = int(X >> 20u);                                 \n"
++         "int vv = m + 4096 * int(floor((est - float(m)) * (1.0/4096.0) + 0.5)); \n"
++         "v[%d] = clamp(vv, 0, 65535);                           \n"
++         "}                                                      \n",
++         nq, nq, vq, vr, vr, vf, ci);
++    if (!all_mmr) {
++        GLSL("} else {                                               \n"
++             "    v[%d] = int(texelFetch("$", ivec2(s, %d), 0).x);   \n"
++             "}                                                      \n",
++             ci, lut, 1 + ci);
++    }
++    GLSL("} \n");
++}
++
++static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
++                         pl_tex elv, int w, int h)
++{
++    const struct pl_dovi_ccm_prep *pp = x->prep;
++    pl_shader sh = ccm_begin(pass, w, h, "DV composer: chroma (CCM 001 5.4)",
++                             x->chroma_rows, x->rows);
++    if (!sh)
++        return NULL;
++
++    const pl_tex ly = x->bl[0].plane->texture;
++    struct ccm_binds binds = {0};
++    ident_t bly = ccm_code(sh, &binds, &x->bl[0], x->kbl, "dv_bl_y");
++    ident_t blb = ccm_code(sh, &binds, &x->bl[1], x->kbl, "dv_bl_cb");
++    ident_t blr = ccm_code(sh, &binds, &x->bl[2], x->kbl, "dv_bl_cr");
++    ident_t lut = ccm_tex(sh, &binds, x->lut, "dv_lut");
++
++    // 5.4.2.3.3: s*_{i,j} = (((s_{2i-1,2j} + 2 s_{2i,2j} + s_{2i+1,2j} + 2) >> 2)
++    //   + ((s_{2i-1,2j+1} + 2 s_{2i,2j+1} + s_{2i+1,2j+1} + 2) >> 2) + 1) >> 1,
++    // i the column (a "(PicWidth)x(PicHeight)" block is PicWidth columns by
++    // PicHeight rows, clause 3.1), edges by replication
++    GLSL("ivec3 lx = clamp(ivec3(2*p.x - 1, 2*p.x, 2*p.x + 1), 0, %d);          \n"
++         "ivec2 ly = clamp(ivec2(2*p.y, 2*p.y + 1), 0, %d);                     \n"
++         "int da = ("$"(ivec2(lx.x, ly.x)) + 2*"$"(ivec2(lx.y, ly.x))           \n"
++         "          + "$"(ivec2(lx.z, ly.x)) + 2) >> 2;                         \n"
++         "int db = ("$"(ivec2(lx.x, ly.y)) + 2*"$"(ivec2(lx.y, ly.y))           \n"
++         "          + "$"(ivec2(lx.z, ly.y)) + 2) >> 2;                         \n"
++         "int s0 = (da + db + 1) >> 1;                                          \n"
++         "ivec2 sc = clamp(ivec2("$"(p), "$"(p)), 0, %d);                       \n"
++         "ivec2 v = ivec2(0);                                                   \n",
++         ly->params.w - 1, ly->params.h - 1, bly, bly, bly, bly, bly, bly,
++         blb, blr, (1 << pp->bl_depth) - 1);
++
++    const int terms = PL_MAX(pp->chroma[0].terms, pp->chroma[1].terms);
++    if (terms) {
++        // The terms tt[] of 5.4.2.3.3, all below 2^20 but tt[0] = 2^20. The
++        // products of two of them are shifted down with
++        //   (a*b) >> 20 = ((a*bh) >> 10) + ((((a*bh) & 1023) << 10) + a*bl) >> 20
++        // for b = bh * 2^10 + bl, exact in 32 bits.
++        ident_t mul = sh_fresh(sh, "dv_mul20");
++        GLSLH("uint "$"(uint a, uint b) {                             \n"
++              "    uint p1 = a * (b >> 10u), p0 = a * (b & 1023u);    \n"
++              "    return (p1 >> 10u) + ((((p1 & 1023u) << 10u) + p0) >> 20u); \n"
++              "}                                                      \n", mul);
++        const int sh1 = 20 - pp->bl_depth, sh2 = 20 - 2 * pp->bl_depth;
++        ident_t lo = sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_ivec3("dv_lo"),
++            .data = &(int[3]) { pp->range[0][0], pp->range[1][0], pp->range[2][0] },
++        });
++        ident_t hi = sh_var(sh, (struct pl_shader_var) {
++            .var = pl_var_ivec3("dv_hi"),
++            .data = &(int[3]) { pp->range[0][1], pp->range[1][1], pp->range[2][1] },
++        });
++        GLSL("uvec3 u = uvec3(clamp(ivec3(s0, sc), "$", "$"));                  \n"
++             "uvec4 tt[%d];                                                     \n"
++             "tt[0] = uvec4(1048576u, u << %du);                                \n"
++             "tt[1] = uvec4(uvec3(u.x*u.y, u.x*u.z, u.y*u.z) << %du, 0u);       \n"
++             "tt[1].w = "$"(tt[1].x, tt[0].w);                                  \n",
++             lo, hi, terms / 4, sh1, sh2, mul);
++        if (terms >= 16) {
++            GLSL("tt[2] = uvec4((u * u) << %du, "$"(tt[1].x, tt[1].x));         \n"
++                 "tt[3] = uvec4("$"(tt[1].y, tt[1].y), "$"(tt[1].z, tt[1].z),   \n"
++                 "              "$"(tt[1].w, tt[1].w), 0u);                     \n",
++                 sh2, mul, mul, mul, mul);
++        }
++        if (terms >= 24) {
++            GLSL("tt[3].w = "$"(tt[0].y, tt[2].x);                              \n"
++                 "tt[4] = uvec4("$"(tt[0].z, tt[2].y), "$"(tt[0].w, tt[2].z),   \n"
++                 "              "$"(tt[1].x, tt[2].w), "$"(tt[1].y, tt[3].x));  \n"
++                 "tt[5] = uvec4("$"(tt[1].z, tt[3].y), "$"(tt[1].w, tt[3].z), 0u, 0u); \n",
++                 mul, mul, mul, mul, mul, mul, mul);
++        }
++        GLSL("vec4 ttf[%d], tth[%d], ttl[%d];     \n"
++             "for (int k = 0; k < %d; k++) {      \n"
++             "    ttf[k] = vec4(tt[k]);           \n"
++             "    tth[k] = vec4(tt[k] >> 10u);    \n"
++             "    ttl[k] = vec4(tt[k] & 1023u);   \n"
++             "}                                   \n",
++             terms / 4, terms / 4, terms / 4, terms / 4);
++    }
++
++    for (int ci = 0; ci < 2; ci++)
++        ccm_mmr(pass, sh, x, ci, lut);
++
++    if (x->el_ratio) {
++        if (x->el_ratio == 2) {
++            ident_t hf = ccm_el_horizontal(sh, &binds, elv, (x->elw + 1) / 2 - 1);
++            GLSL("ivec2 e = "$"(p); \n", hf);
++        } else {
++            ident_t elb = ccm_code(sh, &binds, &x->el[1], x->kel, "dv_el_cb");
++            ident_t elr = ccm_code(sh, &binds, &x->el[2], x->kel, "dv_el_cr");
++            GLSL("ivec2 e = ivec2("$"(p), "$"(p)); \n", elb, elr);
++        }
++        GLSL("e = clamp(e, 0, %d);                                     \n"
++             "v += ivec2(int(texelFetch("$", ivec2(e.x, 4), 0).x),      \n"
++             "           int(texelFetch("$", ivec2(e.y, 5), 0).x));     \n",
++             PL_DOVI_CCM_LUT_W - 1, lut, lut);
++    }
++
++    ccm_output(sh, pp, "v", "color.xy", "vec2");
++    return ccm_end(pass, sh, x->fmt2, w, h);
++}
++
++// Why the image cannot be composed so (NULL: it can); fills `x`
++static const char *ccm_check(struct pass_state *pass, struct ccm_ctx *x)
++{
++    const struct pl_render_params *params = pass->params;
++    const struct pl_frame *image = &pass->image;
++    const struct pl_dovi_ccm_prep *pp = x->prep;
++    const struct pl_dovi_metadata *dovi = image->repr.dovi;
++    pl_gpu gpu = pass->rr->gpu;
++
++    const struct pl_glsl_version glsl = gpu->glsl;
++    if (glsl.gles ? glsl.version < 300 : glsl.version < 130)
++        return "GLSL without integer arithmetic";
++    if (image->num_planes < 2 || image->num_planes > 3)
++        return "not a planar YCbCr image";
++    for (int c = 0; c < 3; c++) {
++        if (!ccm_find_channel(image, c, &x->bl[c]))
++            return "a component of the base layer is missing";
++    }
++    pl_tex y = x->bl[0].plane->texture, cb = x->bl[1].plane->texture,
++           cr = x->bl[2].plane->texture;
++    const int cw = (y->params.w + 1) / 2, chh = (y->params.h + 1) / 2;
++    if (cb->params.w != cw || cb->params.h != chh || cr->params.w != cw || cr->params.h != chh)
++        return "the base layer is not 4:2:0 (clause 5.2.2 b)";
++    if (image->field != PL_FIELD_NONE)
++        return "an interlaced picture";
++    if (image->film_grain.type != PL_FILM_GRAIN_NONE)
++        return "film grain to apply to the base layer";
++    if (image->repr.bits.color_depth != pp->bl_depth ||
++        y->params.format->type != PL_FMT_UNORM ||
++        cb->params.format->type != PL_FMT_UNORM || cr->params.format->type != PL_FMT_UNORM)
++        return "the planes do not hold BL_bit_depth codes";
++    x->kbl = ccm_code_scale(image, pp->bl_depth);
++
++    x->fmt1 = pl_find_fmt(gpu, PL_FMT_FLOAT, 1, 32, 32,
++                          PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    x->fmt2 = pl_find_fmt(gpu, PL_FMT_FLOAT, 2, 32, 32, PL_FMT_CAP_SAMPLEABLE |
++                          PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_LINEAR);
++    if (!x->fmt2) {
++        x->fmt2 = pl_find_fmt(gpu, PL_FMT_FLOAT, 2, 32, 32,
++                              PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    }
++    if (!x->fmt1 || !x->fmt2)
++        return "no 32-bit floating-point render targets";
++
++    // the uniforms of the chroma pass: the MMR coefficients, at most
++    int comps = 64;
++    for (int ci = 0; ci < 2; ci++)
++        comps += pp->chroma[ci].num_pieces * pp->chroma[ci].terms * 3 + 8;
++    if (comps > gpu->limits.max_variable_comps)
++        return "more MMR pieces than the shader has uniforms for";
++
++    x->el_ratio = 0;
++    const struct pl_frame *el = image->enhancement_layer;
++    if (el && dovi->nlq_active && pp->residual) {
++        struct pl_frame elf = *el;
++        fix_frame(&elf);
++        for (int c = 0; c < 3; c++) {
++            if (!ccm_find_channel(el, c, &x->el[c]))
++                return "a component of the enhancement layer is missing";
++        }
++        pl_tex ey = x->el[0].plane->texture, eb = x->el[1].plane->texture,
++               er = x->el[2].plane->texture;
++        if (elf.repr.bits.color_depth != pp->el_depth ||
++            ey->params.format->type != PL_FMT_UNORM ||
++            eb->params.format->type != PL_FMT_UNORM || er->params.format->type != PL_FMT_UNORM)
++            return "the planes of the enhancement layer do not hold EL_bit_depth codes";
++        x->kel = ccm_code_scale(&elf, pp->el_depth);
++        x->elw = pl_rect_w(el->crop) > 0 ? (int) roundf(pl_rect_w(el->crop)) : ey->params.w;
++        x->elh = pl_rect_h(el->crop) > 0 ? (int) roundf(pl_rect_h(el->crop)) : ey->params.h;
++        if (el->crop.x0 || el->crop.y0 || x->elw > ey->params.w || x->elh > ey->params.h)
++            return "the enhancement layer is cropped";
++        const int ecw = (ey->params.w + 1) / 2, ech = (ey->params.h + 1) / 2;
++        if (eb->params.w != ecw || eb->params.h != ech || er->params.w != ecw || er->params.h != ech)
++            return "the enhancement layer is not 4:2:0";
++        if (ey->params.w == y->params.w && ey->params.h == y->params.h) {
++            x->el_ratio = 1;
++        } else if (2 * ey->params.w >= y->params.w && 2 * ey->params.w <= y->params.w + 1 &&
++                   2 * ey->params.h >= y->params.h && 2 * ey->params.h <= y->params.h + 1) {
++            x->el_ratio = 2;
++        } else {
++            return "the enhancement layer is neither the base layer's size nor half of it";
++        }
++    }
++
++    // Rows that nothing reads: only where a picture row is a row of the target
++    const int y0 = params->active_rows[0], y1 = params->active_rows[1];
++    x->rows = y->params.h == 2160 && y0 >= 0 && y1 <= 2160 && y0 < y1 &&
++              (y0 || y1 != 2160) && !pass->rotation &&
++              image->crop.x0 == 0 && image->crop.y0 == 0 &&
++              image->crop.x1 == y->params.w && image->crop.y1 == y->params.h &&
++              pass->dst_rect.y0 == 0 && pass->dst_rect.y1 == 2160 &&
++              pass->dst_rect.x0 == 0 && pass->dst_rect.x1 == y->params.w;
++    if (x->rows) {
++        // the luma: those rows; the chroma: the rows the scaler of the chroma
++        // reads for them (filter radius 3, an offset of up to a chroma row)
++        x->luma_rows[0] = y0;
++        x->luma_rows[1] = y1;
++        x->chroma_rows[0] = PL_MAX(y0 / 2 - 6, 0);
++        x->chroma_rows[1] = PL_MIN((y1 + 1) / 2 + 6, chh);
++    }
++
++    return NULL;
++}
++
++// Logs each reason not to compose (static strings) once a stream, and composing
++// once a stream, however often the pictures of the stream change between them.
++static void ccm_say(pl_renderer rr, struct dovi_ccm_state *st, const char *why)
++{
++    if (!why) {
++        if (!st->said_composed)
++            PL_INFO(rr, "Dolby Vision: composed as ETSI GS CCM 001 clause 5.4 does");
++        st->said_composed = true;
++        return;
++    }
++
++    for (int i = 0; i < st->num_said; i++) {
++        if (st->said[i] == why)
++            return;
++    }
++    PL_WARN(rr, "Dolby Vision: a picture is not composed as ETSI GS CCM 001 does "
++            "(%s); it is composed by the reshaping of libplacebo", why);
++    if (st->num_said < PL_ARRAY_SIZE(st->said))
++        st->said[st->num_said++] = why;
++}
++
++// Composes the image (ETSI GS CCM 001 clause 5.4) and puts the composed planes
++// in place of its planes. False, with the image untouched, when it does not.
++static bool pass_dovi_ccm(struct pass_state *pass)
++{
++    pl_renderer rr = pass->rr;
++    struct pl_frame *image = &pass->image;
++    const struct pl_dovi_metadata *dovi = image->repr.dovi;
++    if (!pass->params->dovi_ccm || image->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION ||
++        !dovi || (rr->errors & PL_RENDER_ERR_DOVI_COMPOSER))
++        return false;
++
++    if (!rr->dovi_ccm)
++        rr->dovi_ccm = pl_zalloc_ptr(rr, rr->dovi_ccm);
++    struct dovi_ccm_state *st = rr->dovi_ccm;
++    struct ccm_ctx x = { .prep = &st->prep };
++    const char *why = NULL;
++    if (!pl_dovi_ccm_prepare(&st->prep, &dovi->ccm))
++        why = st->prep.reason;
++    if (!why)
++        why = ccm_check(pass, &x);
++    ccm_say(rr, st, why);
++    if (why)
++        return false;
++
++    const struct pl_dovi_ccm_prep *pp = &st->prep;
++    pl_tex y = x.bl[0].plane->texture, cb = x.bl[1].plane->texture;
++    pl_tex ly = NULL, lc = NULL, ev[2] = {0};
++
++    // the tables
++    if (!st->lut || st->lut_signature != pp->signature) {
++        st->lut_signature = 0;
++        bool ok = pl_tex_recreate(rr->gpu, &st->lut, pl_tex_params(
++            .w = PL_DOVI_CCM_LUT_W,
++            .h = 6,
++            .format = x.fmt1,
++            .sampleable = true,
++            .host_writable = true,
++            .debug_tag = PL_DEBUG_TAG,
++        ));
++        ok = ok && pl_tex_upload(rr->gpu, pl_tex_transfer_params(
++            .tex = st->lut,
++            .ptr = (void *) pp->lut,
++        ));
++        if (!ok)
++            goto error;
++        st->lut_signature = pp->signature;
++    }
++    x.lut = st->lut;
++
++    if (x.el_ratio == 2) {
++        ev[0] = ccm_el_vertical(pass, &x, true, x.el[0].plane->texture->params.w, y->params.h);
++        ev[1] = ccm_el_vertical(pass, &x, false, x.el[1].plane->texture->params.w, cb->params.h);
++        if (!ev[0] || !ev[1])
++            goto error;
++    }
++    ly = ccm_luma(pass, &x, ev[0], y->params.w, y->params.h);
++    lc = ccm_chroma(pass, &x, ev[1], cb->params.w, cb->params.h);
++    if (!ly || !lc)
++        goto error;
++
++    struct pl_plane luma = *x.bl[0].plane, chroma = *x.bl[1].plane;
++    luma.texture = ly;
++    luma.components = 1;
++    memcpy(luma.component_mapping, (int[4]) { PL_CHANNEL_Y, -1, -1, -1 },
++           sizeof(luma.component_mapping));
++    chroma.texture = lc;
++    chroma.components = 2;
++    memcpy(chroma.component_mapping, (int[4]) { PL_CHANNEL_CB, PL_CHANNEL_CR, -1, -1 },
++           sizeof(chroma.component_mapping));
++    image->planes[0] = luma;
++    image->planes[1] = chroma;
++    image->num_planes = 2;
++    // h / 2^hdr_bit_depth, held as is: a normalization of 1
++    image->repr.bits = (struct pl_bit_encoding) { .sample_depth = 32, .color_depth = 32 };
++    image->enhancement_layer = NULL;
++    pass->src_ref = frame_ref(image);
++    return true;
++
++error:
++    PL_ERR(rr, "Dolby Vision: composing as ETSI GS CCM 001 does failed; composing by "
++           "the reshaping of libplacebo from now on");
++    rr->errors |= PL_RENDER_ERR_DOVI_COMPOSER;
++    return false;
++}
+ #endif // PL_HAVE_DOVI
+ 
+ // The rect that pass_read_image() samples a plane from
+@@ -1849,6 +2526,13 @@ static bool pass_read_image(struct pass_state *pass)
+     struct pl_frame *image = &pass->image;
+     pl_renderer rr = pass->rr;
+ 
++    // Hades: a Dolby Vision image composed as ETSI GS CCM 001 does: its planes
++    // are the composed ones from here on
++    bool dovi_composed = false;
++#ifdef PL_HAVE_DOVI
++    dovi_composed = pass_dovi_ccm(pass);
++#endif
++
+     struct plane_state planes[4];
+     struct plane_state *ref = &planes[pass->src_ref];
+     pl_assert(pass->src_ref >= 0 && pass->src_ref < image->num_planes);
+@@ -2260,6 +2944,7 @@ static bool pass_read_image(struct pass_state *pass)
+             .repr              = &pass->img.repr,
+             .color_adjustment  = params->color_adjustment,
+             .enhancement_layer = el_sh,
++            .dovi_composed     = dovi_composed,
+         ));
+         pl_dispatch_abort(rr->dp, &el_sh);
+     }
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index de3f1bd..46bd4e4 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -333,18 +333,23 @@ void pl_shader_decode_color_ex(pl_shader sh,
+     GLSL("// pl_shader_decode_color \n"
+          "{ \n");
+ 
+-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
++    // Hades: a signal composed already (ETSI GS CCM 001 clause 5.4) is
++    // neither reshaped nor added to again
++    const bool dovi_composed = args->dovi_composed &&
++                               repr->sys == PL_COLOR_SYSTEM_DOLBYVISION;
++
++    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION && !dovi_composed)
+     {
+         ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
+         GLSL("color.rgb *= vec3("$"); \n", scale);
+     }
+ 
+-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
++    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION && !dovi_composed)
+         pl_shader_dovi_reshape(sh, repr->dovi);
+ 
+     // Dolby Vision FEL composition
+     if (args->enhancement_layer && repr->sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+-        repr->dovi && repr->dovi->nlq_active)
++        repr->dovi && repr->dovi->nlq_active && !dovi_composed)
+     {
+         ident_t el = sh_subpass(sh, args->enhancement_layer);
+         if (el)
+@@ -352,7 +357,8 @@ void pl_shader_decode_color_ex(pl_shader sh,
+     }
+ 
+     enum pl_color_system orig_sys = repr->sys;
+-    pl_transform3x3 tr = pl_color_repr_decode(repr, params);
++    pl_transform3x3 tr = dovi_composed ? pl_color_repr_decode_dovi_composed(repr, params)
++                                       : pl_color_repr_decode(repr, params);
+ 
+     if (memcmp(&tr, &pl_transform3x3_identity, sizeof(tr))) {
+         ident_t cmat = sh_var(sh, (struct pl_shader_var) {

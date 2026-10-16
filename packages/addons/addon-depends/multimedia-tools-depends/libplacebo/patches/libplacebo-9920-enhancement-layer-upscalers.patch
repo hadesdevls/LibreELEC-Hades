@@ -1,0 +1,129 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:10:44 +0000
+Subject: [PATCH] renderer: the planes of an enhancement layer can have upscalers
+ of their own
+
+The planes of a Dolby Vision enhancement layer (profile 7) are scaled up
+to the size of the base layer with the filter of the chroma of the base
+layer: plane_upscaler, or upscaler where that is not set. A caller that
+has to draw such a picture in less GPU time, where the GPU cannot keep up
+with the video otherwise, can only change the filter of all three kinds
+of planes at once: the chroma of the base layer, and the luma and the
+chroma of the enhancement layer, which do not cost the same and do not
+change the picture as much.
+
+New pl_render_params.el_luma_upscaler and el_chroma_upscaler: the
+upscaler of the plane of the enhancement layer that carries luma, and of
+those that carry only chroma, told by their component mapping, as the
+sampler of the layer reads them. Where one is set, that plane is sampled
+as before with it in place of plane_upscaler, from a copy of the
+parameters for that call. The planes of the base layer, and the scaling
+down of any plane, are not affected. Both NULL, the default: no copy is
+made and nothing changes, not even the text of a shader.
+
+Measured with Kodi's Dolby Vision renderer (tools/dvbridge in the Kodi of
+LibreELEC Hades) on a software OpenGL ES (zink on lavapipe), three
+pictures of a profile 7 FEL stream, drawn the two ways the renderer has:
+with both NULL, the reconstructed picture and the transport are bit for
+bit those without this patch. With the chroma of the base layer, then
+also the chroma, then also the luma of the enhancement layer scaled up
+bilinearly, the reconstructed picture is the one that a test-only change
+choosing the filter of each kind of plane gave, in every pixel.
+
+Measured again with libplacebo-9913 and 9914 applied first, which this
+patch follows: with both NULL, the same bytes as with those two alone;
+with the filters changed one kind at a time, the same pictures as the
+test-only change, in every pixel, once that change also picks the filter
+where 9914 asks how the other planes are scaled. Once the chroma of the
+base layer is scaled up bilinearly, no plane of the base layer has a
+scaler that fixes the size of its shader, which the texel-exact read of
+a plane that needs no scaling (libplacebo-9914) requires: the luma of
+the base layer is then read as before 9914, with linear filtering at the
+centres of its texels. That gives the texels themselves where the GPU
+computes the weights of the filter in fixed point; on the software
+renderer, which computes them in float, it differs from the exact read
+by one code of 4095 in 1166 to 1389 of the 8294400 pixels of a picture
+(under 0.02 %).
+
+License: LGPL-2.1-or-later, that of libplacebo and of the files changed,
+whose notices stay as they are.
+---
+ src/include/libplacebo/renderer.h | 13 ++++++++++++
+ src/renderer.c                    | 33 +++++++++++++++++++++++++++++++
+
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -151,6 +151,19 @@ struct pl_render_params {
+     const struct pl_filter_config *plane_upscaler;
+     const struct pl_filter_config *plane_downscaler;
+ 
++    // If set, these override `plane_upscaler` (or `upscaler`, where that is
++    // NULL) for the planes of an enhancement layer (`pl_frame.enhancement_layer`):
++    // `el_luma_upscaler` for a plane that carries luma, `el_chroma_upscaler`
++    // for one that carries only chroma. They are used where such a plane is
++    // scaled up to the size of the base layer; the planes of the base layer,
++    // and the scaling down of any plane, are not affected. Note that a value
++    // of NULL simply means "no override".
++    //
++    // For a caller that trades the precision of the enhancement layer for
++    // speed apart from that of the chroma of the base layer.
++    const struct pl_filter_config *el_luma_upscaler;
++    const struct pl_filter_config *el_chroma_upscaler;
++
+     // The anti-ringing strength to apply to filters. See the equivalent option
+     // in `pl_sample_filter_params` for more information.
+     float antiringing_strength;
+diff --git a/src/renderer.c b/src/renderer.c
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1675,6 +1675,27 @@ static bool want_merge(struct pass_state *pass,
+ static int frame_ref(const struct pl_frame *frame);
+ 
+ #ifdef PL_HAVE_DOVI
++// The upscaler that `pl_render_params.el_luma_upscaler` or `el_chroma_upscaler`
++// sets for a plane of an enhancement layer, or NULL. A plane is told by the
++// components it carries, as sample_el() reads them: luma, or only chroma.
++static const struct pl_filter_config *el_plane_upscaler(const struct pl_render_params *params,
++                                                        const struct pl_plane *plane)
++{
++    bool luma = false, chroma = false;
++    for (int c = 0; c < plane->components; c++) {
++        switch (plane->component_mapping[c]) {
++        case PL_CHANNEL_Y: luma = true; continue;
++        case PL_CHANNEL_CB:
++        case PL_CHANNEL_CR: chroma = true; continue;
++        default: continue;
++        }
++    }
++
++    if (luma)
++        return params->el_luma_upscaler;
++    return chroma ? params->el_chroma_upscaler : NULL;
++}
++
+ // Build a sub-shader that samples the enhancement layer planes and returns
+ // the (color-repr-normalized) EL signal.
+ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+@@ -1759,9 +1780,21 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+                  ref_tex->params.w, ref_tex->params.h, sx, sy,
+                  src.rect.x0, src.rect.y0, src.rect.x1, src.rect.y1);
+ 
++        // A plane with an upscaler of its own is sampled like the others,
++        // with that one in place of `plane_upscaler`
++        const struct pl_render_params *params = pass->params;
++        const struct pl_filter_config *upscaler = el_plane_upscaler(params, plane);
++        struct pl_render_params el_params;
++        if (upscaler) {
++            el_params = *params;
++            el_params.plane_upscaler = upscaler;
++            pass->params = &el_params;
++        }
++
+         pl_shader plane_sh = pl_dispatch_begin_ex(rr->dp, true);
+         dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
+                          NULL, &src);
++        pass->params = params;
+ 
+         ident_t sub = sh_subpass(sh, plane_sh);
+         pl_dispatch_abort(rr->dp, &plane_sh);

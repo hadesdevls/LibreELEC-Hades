@@ -1,0 +1,218 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:38:30 +0000
+Subject: [PATCH] renderer: read a plane that needs no scaling texel by
+ texel
+
+A plane of the image that is sampled 1:1 (the luma of a 4:2:0 picture
+drawn at its size) goes through dispatch_sampler(), SAMPLER_NOOP, to
+pl_shader_sample_direct(), which samples with linear filtering at the
+centres of the texels. That gives the texels themselves only on a GPU
+that computes the weights of the filter in fixed point with few
+fractional bits, where the error of the interpolated position rounds
+away. A GPU that computes them in float, as Mesa's llvmpipe and lavapipe
+do, mixes in the neighbouring texel by that error, which grows with the
+size of the texture: about a ten-thousandth of a texel at 3840 columns.
+
+Such a plane is now read with nearest sampling at the same positions,
+which gives each texel on every GPU, when its rect lies on whole texels,
+its size is the size it is drawn at, and its texture is a normal 2D
+float or normalised one.
+
+A shader that reads with nearest sampling must not be drawn at another
+size, where linear sampling would have interpolated: a main scaler that
+samples the shader of the image freely (no FBO, bilinear) does that. So
+the shader of the plane gets its size fixed, and pass_read_image() asks
+for this only when another plane of the image is scaled by a sampler
+that fixes the size of its shader (a separable or polar one), which the
+shader that reads the planes then has anyway. Where no plane is scaled,
+or only by the built-in samplers, nothing changes. To tell the two cases
+apart before the first plane is sampled, the rect of each plane is now
+computed by read_plane_rect(), the code that was inline, unchanged.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe):
+- The 3840x2160 luma plane of three profile 7 FEL pictures, as Kodi's
+  Dolby Vision renderer has libplacebo read it (dispatch_sampler() once
+  more, drawn at its size): before, 0.3 to 1.9 % of the samples differ
+  from their texel, by up to 0.54 codes of 4095; after, every sample is
+  its texel (as this GPU turns a 16-bit value into a float).
+- The reconstructed picture (12-bit PQ RGB): 1218 to 1282 pixels of
+  8294400 change, by one code.
+- The whole renderer on a 4:2:0 picture with pl_render_fast_params
+  (planes scaled by the built-in samplers, a main scaler that samples
+  freely), at the size of the picture and at twice it: the same bytes
+  as before.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the file changed,
+whose notice stays as it is.
+---
+ src/renderer.c | 107 +++++++++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 91 insertions(+), 16 deletions(-)
+
+diff --git a/src/renderer.c b/src/renderer.c
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -380,6 +380,10 @@ struct pass_state {
+     bool *fbos_used;
+     bool need_peak_fbo; // need indirection for peak detection
+ 
++    // A plane of the image that needs no scaling may be read texel by texel:
++    // see dispatch_sampler(), SAMPLER_NOOP
++    bool exact_identity;
++
+     // Map of acquired frames
+     struct {
+         bool target, image, prev, next, enhancement_layer;
+@@ -734,6 +738,23 @@ static bool skip_inactive_rows(struct pass_state *pass, pl_shader sh, int height
+     return true;
+ }
+ 
++// A source that is sampled 1:1 on whole texels
++static bool exact_identity_src(const struct pl_sample_src *src)
++{
++    if (!src->tex || src->tex->sampler_type != PL_SAMPLER_NORMAL)
++        return false;
++    const enum pl_fmt_type type = src->tex->params.format->type;
++    if (type == PL_FMT_UINT || type == PL_FMT_SINT)
++        return false;
++
++    const pl_rect2df rc = src->rect;
++    return src->new_w > 0 && src->new_h > 0 &&
++           rc.x0 == floorf(rc.x0) && rc.x1 == floorf(rc.x1) &&
++           rc.y0 == floorf(rc.y0) && rc.y1 == floorf(rc.y1) &&
++           fabsf(pl_rect_w(rc)) == src->new_w &&
++           fabsf(pl_rect_h(rc)) == src->new_h;
++}
++
+ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+                              struct sampler *sampler, enum sampler_usage usage,
+                              pl_tex target_tex, const struct pl_sample_src *src)
+@@ -751,6 +772,27 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+     pl_shader_obj *lut = NULL;
+     switch (info.dir) {
+     case SAMPLER_NOOP:
++        // The fallback samples with linear filtering at the texel centres,
++        // which gives the texels themselves only where the GPU computes the
++        // weights of the filter in fixed point with few fractional bits. A
++        // GPU that computes them in float, as Mesa's llvmpipe does, mixes in
++        // the neighbouring texel by the error of the interpolated position,
++        // which grows with the size of the texture. Nearest sampling at the
++        // same positions gives each texel on every GPU.
++        //
++        // Linear sampling is also what a shader of no fixed size does when it
++        // is drawn at another size (a main scaler that samples freely), so
++        // the shader of this plane has its size fixed, and the caller asks for
++        // this only where the shader that reads the planes has it anyway.
++        if (pass->exact_identity && usage == SAMPLER_PLANE && !target_tex &&
++            exact_identity_src(src) && !sh->output_w && !sh->output_h)
++        {
++            if (pl_shader_sample_nearest(sh, src)) {
++                sh->output_w = src->new_w;
++                sh->output_h = src->new_h;
++            }
++            return;
++        }
+         goto fallback;
+     case SAMPLER_DOWN:
+         lut = &sampler->downscaler_state;
+@@ -1742,6 +1784,31 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+ }
+ #endif // PL_HAVE_DOVI
+ 
++// The rect that pass_read_image() samples a plane from
++static pl_rect2df read_plane_rect(const struct plane_state *st, pl_rect2df ref_rc,
++                                  float off_x, float off_y,
++                                  float stretch_x, float stretch_y)
++{
++    float scale_x = pl_rect_w(st->img.rect) / pl_rect_w(ref_rc),
++          scale_y = pl_rect_h(st->img.rect) / pl_rect_h(ref_rc),
++          base_x = st->img.rect.x0 - scale_x * off_x,
++          base_y = st->img.rect.y0 - scale_y * off_y;
++
++    pl_rect2df rect = {
++        base_x,
++        base_y,
++        base_x + stretch_x * pl_rect_w(st->img.rect),
++        base_y + stretch_y * pl_rect_h(st->img.rect),
++    };
++
++    if (st->plane.flipped) {
++        rect.y0 = st->plane_h - rect.y0;
++        rect.y1 = st->plane_h - rect.y1;
++    }
++
++    return rect;
++}
++
+ // This scales and merges all of the source images, and initializes pass->img.
+ static bool pass_read_image(struct pass_state *pass)
+ {
+@@ -2007,36 +2074,42 @@ static bool pass_read_image(struct pass_state *pass)
+           stretch_x = pl_rect_w(ref_rounded) / pl_rect_w(ref_rc),
+           stretch_y = pl_rect_h(ref_rounded) / pl_rect_h(ref_rc);
+ 
++    // Whether a plane is scaled by a sampler that fixes the size of its
++    // shader, and so of the shader that reads the planes: only then may a plane
++    // that needs no scaling be read texel by texel (dispatch_sampler())
++    bool fixed_size = false;
++    for (int i = 0; i < image->num_planes; i++) {
++        const struct plane_state *st = &planes[i];
++        if (!st->type)
++            continue;
++
++        const struct pl_sample_src src = {
++            .tex   = st->img.tex,
++            .new_w = pl_rect_w(ref_rounded),
++            .new_h = pl_rect_h(ref_rounded),
++            .rect  = read_plane_rect(st, ref_rc, off_x, off_y, stretch_x, stretch_y),
++        };
++
++        const struct sampler_info info = sample_src_info(pass, &src, SAMPLER_PLANE);
++        fixed_size |= info.dir != SAMPLER_NOOP && info.type == SAMPLER_COMPLEX;
++    }
++
+     for (int i = 0; i < image->num_planes; i++) {
+         struct plane_state *st = &planes[i];
+         const struct pl_plane *plane = &st->plane;
+         if (!st->type)
+             continue;
+ 
+-        float scale_x = pl_rect_w(st->img.rect) / pl_rect_w(ref_rc),
+-              scale_y = pl_rect_h(st->img.rect) / pl_rect_h(ref_rc),
+-              base_x = st->img.rect.x0 - scale_x * off_x,
+-              base_y = st->img.rect.y0 - scale_y * off_y;
+-
+         struct pl_sample_src src = {
+             .components = plane->components,
+             .address_mode = plane->address_mode,
+             .scale      = pl_color_repr_normalize(&st->img.repr),
+             .new_w      = pl_rect_w(ref_rounded),
+             .new_h      = pl_rect_h(ref_rounded),
+-            .rect = {
+-                base_x,
+-                base_y,
+-                base_x + stretch_x * pl_rect_w(st->img.rect),
+-                base_y + stretch_y * pl_rect_h(st->img.rect),
+-            },
++            .rect       = read_plane_rect(st, ref_rc, off_x, off_y,
++                                          stretch_x, stretch_y),
+         };
+ 
+-        if (plane->flipped) {
+-            src.rect.y0 = st->plane_h - src.rect.y0;
+-            src.rect.y1 = st->plane_h - src.rect.y1;
+-        }
+-
+         PL_TRACE(rr, "Aligning plane %d: {%f %f %f %f} -> {%f %f %f %f}%s",
+                  i, st->img.rect.x0, st->img.rect.y0,
+                  st->img.rect.x1, st->img.rect.y1,
+@@ -2054,8 +2127,10 @@ static bool pass_read_image(struct pass_state *pass)
+             src.tex = img_tex(pass, &st->img);
+             st->img.tex = NULL;
+             st->img.sh = pl_dispatch_begin_ex(rr->dp, true);
++            pass->exact_identity = fixed_size;
+             dispatch_sampler(pass, st->img.sh, &rr->samplers_src[i],
+                              SAMPLER_PLANE, NULL, &src);
++            pass->exact_identity = false;
+             st->img.err_enum |= PL_RENDER_ERR_SAMPLING;
+             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
+             st->img.w = st->img.rect.x1 = src.new_w;

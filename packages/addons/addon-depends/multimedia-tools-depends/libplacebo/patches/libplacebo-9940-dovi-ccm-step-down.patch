@@ -1,0 +1,247 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:10:00 +0000
+Subject: [PATCH] renderer: cheaper filters for the composer of ETSI GS CCM
+ 001, as a step-down
+
+A caller that has to draw in less GPU time can scale the planes of an
+image up bilinearly (plane_upscaler, and since libplacebo-9920 the
+upscalers of the planes of an enhancement layer). An image composed by
+pass_dovi_ccm() (pl_render_params.dovi_ccm, libplacebo-9930) takes none
+of those for its enhancement layer, which it resamples with the integer
+filters of annex B.3 of ETSI GS CCM 001, and only plane_upscaler for its
+composed chroma: the costliest rung in fidelity was then the only one.
+
+New, for the images composed so:
+- pl_render_params.dovi_ccm_el_linear, a mask of enum
+  pl_dovi_ccm_el_linear: the filters of annex B.3 replaced by the two
+  nearest samples, in integers: the luma between columns
+  ((a + b + 1) >> 1 in place of 8 taps), the luma between rows
+  ((3a + b + 2) >> 2 in place of 4 taps, the chroma's filter of annex
+  B.3), the chroma between columns;
+- pl_render_params.dovi_ccm_plane_upscaler: the upscaler of the composed
+  planes in place of plane_upscaler (NULL: plane_upscaler), so that a
+  caller can set plane_upscaler for the reshaping and another filter for
+  the composer. The composer falls back to the reshaping for a picture
+  the clause does not cover, which then takes plane_upscaler and the
+  upscalers of 9920 as before.
+With both unset nothing changes: measured, every picture is byte for
+byte the one without this patch (picture 51 of a profile 7 FEL stream
+and two made-up cases, both composers).
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe) against the
+faithful picture, on pictures 3, 27 and 51 of that stream, and in 64-bit
+floats, which agree with the GPU within one code of 4095 for each rung;
+texture fetches counted in the shaders, about 197 million for a
+3840x2160 P010 frame without any of these (the odd columns of the 8-tap
+filters count 8, the even ones 1):
+- the luma between columns: 25 million fewer; picture 51, 11.7 % of the
+  pixels of the active picture change, by 9 codes at most, mean 0.17;
+- the luma between rows: 8 million; 9.8 %, 6 codes, mean 0.14;
+- the chroma between columns: 6 million; 20.7 %, 6 codes, mean 0.27;
+- the three: 39 million; 34.3 %, 12 codes, mean 0.52;
+- the composed chroma bilinear (dovi_ccm_plane_upscaler): 66 million
+  and a pass; 28.5 %, up to 331 codes (4866 pixels by 16 or more, at
+  edges of strong colour), mean 0.36.
+Pictures 3 and 27 have a flat enhancement layer: the filters of the
+layer change nothing there, and the composed chroma bilinear changes
+2.1 % and 11.5 % of the pixels, by 6 and 7 codes at most.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the files changed,
+whose notices stay as they are.
+---
+ src/include/libplacebo/renderer.h | 29 ++++++++++++++++++
+ src/renderer.c                    | 49 +++++++++++++++++++++++--------
+ 2 files changed, 65 insertions(+), 13 deletions(-)
+
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 54b74d0..899dfd3 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -56,6 +56,23 @@ enum pl_render_error {
+     PL_RENDER_ERR_DOVI_COMPOSER     = 1 << 13, // see `pl_render_params.dovi_ccm`
+ };
+ 
++// Hades: the filters of annex B.3 of ETSI GS CCM 001 that
++// `pl_render_params.dovi_ccm_el_linear` replaces with two taps, for a caller
++// that has to draw in less GPU time. Each lowers the fidelity a little: the
++// resampled layer is no longer the one of annex B.3 (informative), which the
++// encoder of the residual may have been built around.
++enum pl_dovi_ccm_el_linear {
++    // the luma between columns: (a + b + 1) >> 1 of the two nearest, in
++    // place of 8 taps
++    PL_DOVI_CCM_EL_LUMA_COLUMNS   = 1 << 0,
++    // the luma between rows: (3a + b + 2) >> 2 of the two nearest, in place
++    // of 4 taps (what annex B.3 does for the chroma)
++    PL_DOVI_CCM_EL_LUMA_ROWS      = 1 << 1,
++    // the chroma between columns, as the luma (between rows, annex B.3
++    // takes two already)
++    PL_DOVI_CCM_EL_CHROMA_COLUMNS = 1 << 2,
++};
++
+ // Struct describing current renderer state, including internal processing errors,
+ // as well as list of signatures of disabled hooks.
+ struct pl_render_errors {
+@@ -427,6 +444,18 @@ struct pl_render_params {
+     // Hades extension.
+     bool dovi_ccm;
+ 
++    // With `dovi_ccm`, for the images composed so: a mask of
++    // `enum pl_dovi_ccm_el_linear`, the filters of annex B.3 to replace with
++    // two taps where an enhancement layer of half the size of the base layer
++    // is resampled; and the upscaler of the composed planes (the chroma, and
++    // the luma where the crop of the image scales it) in place of
++    // `plane_upscaler`, which it is when NULL. An image that is not composed
++    // so takes `plane_upscaler`, `el_luma_upscaler` and `el_chroma_upscaler`
++    // as before; those two do not apply to an image composed so. Hades
++    // extension.
++    int dovi_ccm_el_linear;
++    const struct pl_filter_config *dovi_ccm_plane_upscaler;
++
+     // This callback is invoked for every pass successfully executed in the
+     // process of rendering a frame. Optional.
+     //
+diff --git a/src/renderer.c b/src/renderer.c
+index 7ad90ed..446ac67 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -409,6 +409,11 @@ struct pass_state {
+     // see dispatch_sampler(), SAMPLER_NOOP
+     bool exact_identity;
+ 
++    // Hades: in place of `pl_render_params.plane_upscaler` while the planes
++    // of an image composed by pass_dovi_ccm() are read
++    // (`pl_render_params.dovi_ccm_plane_upscaler`), or NULL
++    const struct pl_filter_config *plane_upscaler;
++
+     // Map of acquired frames
+     struct {
+         bool target, image, prev, next, enhancement_layer;
+@@ -674,7 +679,9 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
+         }
+         break;
+     case SAMPLER_UP:
+-        if (usage == SAMPLER_PLANE && params->plane_upscaler) {
++        if (usage == SAMPLER_PLANE && pass->plane_upscaler) {
++            info.config = pass->plane_upscaler;
++        } else if (usage == SAMPLER_PLANE && params->plane_upscaler) {
+             info.config = params->plane_upscaler;
+         } else {
+             pl_assert(usage != SAMPLER_LOWPASS);
+@@ -1878,6 +1885,7 @@ struct ccm_ctx {
+     pl_fmt fmt1, fmt2;      // r32f, rg32f
+     pl_tex lut;
+     bool rows;              // leave rows out (pl_render_params.active_rows)
++    int el_linear;          // pl_render_params.dovi_ccm_el_linear
+     int luma_rows[2], chroma_rows[2];
+ };
+ 
+@@ -1991,9 +1999,13 @@ static pl_tex ccm_el_vertical(struct pass_state *pass, const struct ccm_ctx *x,
+                               bool luma, int w, int h)
+ {
+     const int *rows = luma ? x->luma_rows : x->chroma_rows;
+-    pl_shader sh = ccm_begin(pass, w, h, luma ?
++    // the luma from two rows (PL_DOVI_CCM_EL_LUMA_ROWS): the filter of annex
++    // B.3 for the chroma
++    const bool four = luma && !(x->el_linear & PL_DOVI_CCM_EL_LUMA_ROWS);
++    pl_shader sh = ccm_begin(pass, w, h, !luma ?
++                             "DV composer: EL chroma, vertical (CCM 001 annex B.3)" : four ?
+                              "DV composer: EL luma, vertical (CCM 001 annex B.3)" :
+-                             "DV composer: EL chroma, vertical (CCM 001 annex B.3)",
++                             "DV composer: EL luma, vertical (two rows)",
+                              rows, x->rows);
+     if (!sh)
+         return NULL;
+@@ -2007,11 +2019,11 @@ static pl_tex ccm_el_vertical(struct pass_state *pass, const struct ccm_ctx *x,
+     for (int k = 0; k < (luma ? 1 : 2); k++) {
+         ident_t e = ccm_code(sh, &binds, &x->el[luma ? 0 : 1 + k], x->kel, "dv_el");
+         GLSL("{                                                          \n"
+-             "int a = "$"(ivec2(p.x, r.x)), b = "$"(ivec2(p.x, r.y));    \n"
+-             "int c = "$"(ivec2(p.x, r0)),  d = "$"(ivec2(p.x, r.z));    \n"
+-             "int f = "$"(ivec2(p.x, r.w));                              \n",
+-             e, e, e, e, e);
+-        if (luma) {
++             "int b = "$"(ivec2(p.x, r.y));                              \n"
++             "int c = "$"(ivec2(p.x, r0)),  d = "$"(ivec2(p.x, r.z));    \n",
++             e, e, e);
++        if (four) {
++            GLSL("int a = "$"(ivec2(p.x, r.x)), f = "$"(ivec2(p.x, r.w)); \n", e, e);
+             GLSL("int v = odd ? ((-9*b + 111*c + 29*d - 3*f + 64) >> 7) \n"
+                  "            : ((-3*a + 29*b + 111*c - 9*d + 64) >> 7);\n");
+         } else {
+@@ -2027,8 +2039,10 @@ static pl_tex ccm_el_vertical(struct pass_state *pass, const struct ccm_ctx *x,
+ 
+ // Annex B.3, the horizontal pass, on the output of the vertical one: an ivec2
+ // of the resampled EL codes at the sample p (both chroma components, or the
+-// luma in .x). `last`: the last column of the EL picture.
+-static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert, int last)
++// luma in .x). `last`: the last column of the EL picture. `linear`: from the two
++// nearest columns (PL_DOVI_CCM_EL_LUMA_COLUMNS, PL_DOVI_CCM_EL_CHROMA_COLUMNS).
++static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert, int last,
++                                 bool linear)
+ {
+     ident_t tex = ccm_tex(sh, b, vert, "dv_el_vert");
+     ident_t fn = sh_fresh(sh, "dv_el_h");
+@@ -2038,6 +2052,8 @@ static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert,
+           "    ivec2 e;                                                     \n"
+           "    if ((p.x & 1) == 0) {                                        \n"
+           "        e = DV_ELV(0);                                           \n"
++          "    } else if (%s) {                                             \n"
++          "        e = (DV_ELV(0) + DV_ELV(1) + 1) >> 1;                    \n"
+           "    } else {                                                     \n"
+           "        e = (22 * DV_ELV(-3) + 94 * DV_ELV(-2) - 524 * DV_ELV(-1) \n"
+           "           + 2456 * DV_ELV(0) + 2456 * DV_ELV(1) - 524 * DV_ELV(2) \n"
+@@ -2047,7 +2063,7 @@ static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert,
+           "#undef DV_ELV                                                    \n"
+           "    return e;                                                    \n"
+           "}                                                                \n",
+-          fn, tex, last);
++          fn, tex, last, linear ? "true" : "false");
+     return fn;
+ }
+ 
+@@ -2079,7 +2095,8 @@ static pl_tex ccm_luma(struct pass_state *pass, const struct ccm_ctx *x,
+ 
+     if (x->el_ratio) {
+         if (x->el_ratio == 2) {
+-            ident_t hf = ccm_el_horizontal(sh, &binds, elv, x->elw - 1);
++            ident_t hf = ccm_el_horizontal(sh, &binds, elv, x->elw - 1,
++                                           x->el_linear & PL_DOVI_CCM_EL_LUMA_COLUMNS);
+             GLSL("int e = "$"(p).x; \n", hf);
+         } else {
+             ident_t ely = ccm_code(sh, &binds, &x->el[0], x->kel, "dv_el_y");
+@@ -2267,7 +2284,8 @@ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+ 
+     if (x->el_ratio) {
+         if (x->el_ratio == 2) {
+-            ident_t hf = ccm_el_horizontal(sh, &binds, elv, (x->elw + 1) / 2 - 1);
++            ident_t hf = ccm_el_horizontal(sh, &binds, elv, (x->elw + 1) / 2 - 1,
++                                           x->el_linear & PL_DOVI_CCM_EL_CHROMA_COLUMNS);
+             GLSL("ivec2 e = "$"(p); \n", hf);
+         } else {
+             ident_t elb = ccm_code(sh, &binds, &x->el[1], x->kel, "dv_el_cb");
+@@ -2382,6 +2400,8 @@ static const char *ccm_check(struct pass_state *pass, struct ccm_ctx *x)
+         }
+     }
+ 
++    x->el_linear = params->dovi_ccm_el_linear;
++
+     // Rows that nothing reads: only where a picture row is a row of the target
+     const int y0 = params->active_rows[0], y1 = params->active_rows[1];
+     x->rows = y->params.h == 2160 && y0 >= 0 && y1 <= 2160 && y0 < y1 &&
+@@ -2550,6 +2570,8 @@ static bool pass_read_image(struct pass_state *pass)
+     bool dovi_composed = false;
+ #ifdef PL_HAVE_DOVI
+     dovi_composed = pass_dovi_ccm(pass);
++    if (dovi_composed)
++        pass->plane_upscaler = params->dovi_ccm_plane_upscaler;
+ #endif
+ 
+     struct plane_state planes[4];
+@@ -2982,6 +3004,7 @@ static bool pass_read_image(struct pass_state *pass)
+     // bleeding colors from transparent regions into non-transparent regions
+     pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_PREMULTIPLIED);
+ 
++    pass->plane_upscaler = NULL;
+     pass_hook(pass, &pass->img, PL_HOOK_RGB);
+     sh = NULL;
+     return true;

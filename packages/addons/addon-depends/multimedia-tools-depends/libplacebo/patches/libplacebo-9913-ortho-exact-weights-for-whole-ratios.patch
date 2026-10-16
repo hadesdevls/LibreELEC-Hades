@@ -1,0 +1,337 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:38:30 +0000
+Subject: [PATCH] shaders/sampling: exact weights for an upscaling by a
+ whole ratio
+
+pl_shader_sample_ortho2() takes the weights of its taps from a LUT of
+256 rows, one per subpixel offset from 0 to 1, interpolated linearly
+between rows by the texture unit, at the offset that the shader computes
+from its interpolated sample position. sh_lut() is not given a format,
+so it takes the first float format with at least 16 bits that can be
+filtered; on an OpenGL ES context, such as Kodi's on GBM, that is
+rgba16f (asked of libplacebo on Mesa's OpenGL ES with the query that
+sh_lut() makes). A half float has 11 significant bits, so each weight is
+off by up to one part in 2048 of itself, and the shader's division by
+the sum of the weights only takes out what the errors have in common.
+At a sharp edge the result is off by up to about one code of 4095.
+
+For the planes of a Dolby Vision picture the ratios are whole numbers:
+the chroma of the base layer and the luma of a 1080p enhancement layer
+are scaled by 2 in each direction, the chroma of that layer by 4. Output
+pixel j of such an axis samples the source at rect.x0 + (j + 0.5) / R,
+so its subpixel offset repeats every R pixels and the convolution needs
+R rows of weights, not a continuum.
+
+When one axis is scaled up by a whole ratio R from 2 to 8 and the other
+one is 1:1 on whole texels, those R rows are now computed in double
+precision from the filter itself, the way compute_row() computes a row
+of the LUT (pl_filter_sample() at the distance of each tap from the
+sample position, normalised to a sum of 1), and given to the shader as a
+uniform array. The shader recovers the index of its output pixel along
+the axis by rounding (sample position - origin) * R, which the error of
+an interpolated position (well under 1/R) cannot move, and from it the
+row and the first tap; each tap is fetched at the centre of its texel
+with nearest sampling. Neither the row nor the taps depend on how
+precisely the GPU interpolated the position or filters a texture, and
+there is no LUT texture to fetch. The origin, the rows and the first
+taps are uniforms: the text of the shader depends only on R, the number
+of taps and the components, so a different crop or chroma siting does
+not compile another program.
+
+Everything else keeps the LUT: other ratios, downscaling, a scaled
+axis whose other axis is not 1:1 on whole texels, a flipped axis, polar
+filters, an external or rectangle sampler, GLSL before 1.30 or ESSL
+before 3.00 (a uniform array indexed by a computed int), and filters
+whose taps would not fit in 16 vec4 for R rows. Anti-ringing works as
+before, on the two middle taps. The main scaler takes the new path as
+well when it upscales by a whole ratio.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe), in codes of
+4095, against a double-precision computation of libplacebo's Lanczos on
+the CPU:
+- Planes of three profile 7 FEL pictures, as Kodi's Dolby Vision
+  renderer has libplacebo scale them (the two passes drawn again into
+  textures of their own and read back): before, up to 0.0025 (base
+  chroma, 2x2), 0.046 (enhancement luma, 2x2) and 0.0089 (enhancement
+  chroma, 4x4); after, up to 0.0009, 0.0010 and 0.0009, the float
+  arithmetic of the two passes. The same pictures at 1080p: before up
+  to 0.031, after up to 0.00095. A half-float LUT computed on the CPU
+  at the exact offsets errs by up to 0.015 on the 2160p planes: the
+  rest of the error before comes from the offset that the shader reads
+  from the interpolated position (inferred, not measured apart).
+- The main scaler of the bridge for a 1080p picture on a 2160p output
+  (Lanczos on the PQ RGB of the reconstruction, no sigmoid, 32-bit
+  intermediates), against the reference from its own input: before,
+  up to 0.67; after, up to 0.0015. On the same input, the new build
+  is nowhere more than 0.0005 further from the reference than before.
+- Synthetic 16-bit planes with full-range edges, ratios 2 to 8, offsets
+  of chroma sitings, of crops and that double cannot hold, one to three
+  components, anti-ringing, one or both axes: before, up to 0.95; after,
+  up to 0.0015 in all 15 cases. A ratio of 1.5, a ratio of 9 and rows
+  half a texel off keep the LUT and give the same results as before.
+- Whole renders of a synthetic 4:2:0 picture through libplacebo's
+  renderer with 32-bit intermediates, against a double-precision
+  computation of the whole chain (decode; at 2x for SDR linearize,
+  sigmoidize, scale, unsigmoidize, delinearize; for HDR/PQ the scaling
+  alone): before, up to 17.4 (SDR, 2x) and 1.03 (PQ, 2x); after, up to
+  0.0105 and 0.0027, and nowhere more than 0.002 further than before.
+  With libplacebo's default half-float intermediates (which this
+  software renderer rounds toward zero) both builds are bound by that
+  rounding; apart from the samples whose result changes when the
+  stored values move by a millionth (those at a half-float step), the
+  new build is again nowhere more than 0.001 further than before.
+- The reconstructed picture of the three 2160p pictures (12-bit PQ
+  RGB): 554 to 18126 pixels of 8294400 change, by one code (334 by
+  two). The speed on a GPU is not measured.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the file changed,
+whose notice stays as it is.
+---
+ src/shaders/sampling.c | 213 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 211 insertions(+), 2 deletions(-)
+
+diff --git a/src/shaders/sampling.c b/src/shaders/sampling.c
+--- a/src/shaders/sampling.c
++++ b/src/shaders/sampling.c
+@@ -17,6 +17,7 @@
+ 
+ #include <math.h>
+ #include "shaders.h"
++#include "filters.h"
+ 
+ #include <libplacebo/colorspace.h>
+ #include <libplacebo/shaders/sampling.h>
+@@ -947,6 +948,202 @@ enum {
+     SEP_PASSES
+ };
+ 
++// Upscaling one axis by a whole ratio R, with the other axis 1:1 on whole
++// texels. Output pixel j of the scaled axis samples the source at
++// `rect.x0 + (j + 0.5) / R`, so its subpixel offset repeats every R pixels:
++// the convolution only ever needs R rows of weights. Those rows are computed
++// here in double precision from the filter itself, as compute_row() computes
++// the rows of the LUT, and given to the shader as uniforms, one row per
++// phase. The shader picks the phase and the first tap from the integer index
++// of its output pixel, which it recovers from the sample position by
++// rounding, so neither depends on how precisely the GPU interpolated that
++// position, and fetches each tap at the centre of its texel with nearest
++// sampling.
++//
++// The LUT path interpolates the weights between 256 rows of a texture of the
++// first float format with at least 16 bits that sh_lut() finds, normally a
++// half-float one, whose 11 significant bits leave each weight off by up to
++// about one part in 2048 (one code of 4095 at a sharp edge). It is kept for
++// every other case.
++#define ORTHO_EXACT_MAX_RATIO 8
++#define ORTHO_EXACT_MAX_VEC4  16
++
++struct ortho_exact {
++    int pass;       // the scaled axis: SEP_HORIZ or SEP_VERT
++    int ratio;      // the whole upscaling ratio along it
++    double origin;  // where output pixel 0 samples it, in texels, minus 0.5
++};
++
++static bool ortho_exact_plan(pl_shader sh, const struct pl_sample_src *src,
++                             const struct pl_filter_config *filter,
++                             struct ortho_exact *out)
++{
++    // A uniform array indexed by a computed int: GLSL 1.30, ESSL 3.00
++    const struct pl_glsl_version glsl = sh_glsl(sh);
++    if (glsl.version < (glsl.gles ? 300 : 130))
++        return false;
++    if (!src->tex || src->tex->sampler_type != PL_SAMPLER_NORMAL)
++        return false;
++    if (filter->polar || !filter->kernel || src->new_w <= 0 || src->new_h <= 0)
++        return false;
++
++    // The source rect as setup_src() takes it
++    const struct pl_tex_params *tp = &src->tex->params;
++    const double x0 = src->rect.x0, y0 = src->rect.y0;
++    double w = pl_rect_w(src->rect), h = pl_rect_h(src->rect);
++    w = w ? w : tp->w;
++    h = h ? h : tp->h;
++
++    const bool same_x = w == src->new_w && x0 == floor(x0);
++    const bool same_y = h == src->new_h && y0 == floor(y0);
++    double start, len;
++    int new_len;
++    if (same_x && !same_y) {
++        out->pass = SEP_VERT;
++        start = y0, len = h, new_len = src->new_h;
++    } else if (same_y && !same_x) {
++        out->pass = SEP_HORIZ;
++        start = x0, len = w, new_len = src->new_w;
++    } else {
++        return false;
++    }
++
++    if (!(len > 0.0))
++        return false;
++    const long ratio = lround(new_len / len);
++    if (ratio < 2 || ratio > ORTHO_EXACT_MAX_RATIO || ratio * len != new_len)
++        return false;
++
++    // The number of taps, bounded as pl_filter_generate() bounds it. An
++    // upscaling filter is not widened.
++    struct pl_filter_config cfg = *filter;
++    cfg.blur = PL_DEF(cfg.blur, 1.0f);
++    const float bound = pl_filter_radius_bound(&cfg);
++    if (!(bound > 0.0f) || bound > 64.0f)
++        return false;
++    const int taps = 2 * (int) ceilf(bound);
++    if (ratio * PL_DIV_UP(taps, 4) > ORTHO_EXACT_MAX_VEC4)
++        return false;
++
++    out->ratio = ratio;
++    out->origin = start + 0.5 / ratio - 0.5;
++    return true;
++}
++
++static bool ortho_exact_sample(pl_shader sh, pl_filter filt,
++                               const struct pl_filter_config *cfg,
++                               const struct ortho_exact *ex, uint8_t comps,
++                               float scale, ident_t src_tex, ident_t pos,
++                               ident_t pt)
++{
++    const int N = filt->row_size, R = ex->ratio, S = PL_DIV_UP(N, 4);
++    if (N < 2 || N % 2 || R * S > ORTHO_EXACT_MAX_VEC4) {
++        SH_FAIL(sh, "Exact separated sampling: %d taps for ratio %d?", N, R);
++        return false;
++    }
++
++    // Row k: output pixels j with j % R == k. The tap n of such a pixel is
++    // texel `floor(at) - (N/2 - 1) + n`, at the distance compute_row() gives
++    // it for the subpixel offset `at - floor(at)`.
++    float weights[ORTHO_EXACT_MAX_VEC4 * 4] = {0};
++    float first[ORTHO_EXACT_MAX_RATIO];
++    for (int k = 0; k < R; k++) {
++        const double at = ex->origin + (double) k / R;
++        double base = floor(at), off = at - base;
++        if (off > 1.0 - 1e-9) {
++            base += 1.0; // `at` is a whole number that double could not hold
++            off = 0.0;
++        } else if (off < 1e-9) {
++            off = 0.0;
++        }
++
++        double w[4 * ORTHO_EXACT_MAX_VEC4], wsum = 0.0;
++        for (int n = 0; n < N; n++) {
++            w[n] = pl_filter_sample(&filt->params.config, n - (N / 2 - 1) - off);
++            wsum += w[n];
++        }
++
++        if (!(wsum > 0.0)) {
++            SH_FAIL(sh, "Exact separated sampling: weights sum to %f", wsum);
++            return false;
++        }
++
++        for (int n = 0; n < N; n++)
++            weights[k * S * 4 + n] = w[n] / wsum;
++        first[k] = base - (N / 2 - 1);
++    }
++
++    ident_t weights_v = sh_var(sh, (struct pl_shader_var) {
++        .var  = {
++            .name  = "phase_weights",
++            .type  = PL_VAR_FLOAT,
++            .dim_v = 4,
++            .dim_m = 1,
++            .dim_a = R * S,
++        },
++        .data = weights,
++    });
++
++    ident_t first_v = sh_var(sh, (struct pl_shader_var) {
++        .var  = {
++            .name  = "phase_first",
++            .type  = PL_VAR_FLOAT,
++            .dim_v = 1,
++            .dim_m = 1,
++            .dim_a = R,
++        },
++        .data = first,
++    });
++
++    ident_t origin_v = sh_var_float(sh, "phase_origin", ex->origin, false);
++
++    const bool horiz = ex->pass == SEP_HORIZ;
++    const char *type = sh_float_type(comps), *swiz = sh_swizzle(comps);
++    const bool use_ar = cfg->antiring > 0 && filt->radius != filt->radius_zero;
++
++    // m: the index of this output pixel along the axis, from the first one
++    GLSL("// pl_shader_sample_ortho (whole ratio, exact weights)          \n"
++         "vec4 color = vec4(0.0, 0.0, 0.0, 1.0);                          \n"
++         "{                                                               \n"
++         "vec2 pos = "$", pt = "$";                                       \n"
++         "vec2 size = vec2(textureSize("$", 0));                          \n"
++         "vec2 dir = vec2(%d.0, %d.0);                                    \n"
++         "float m = floor((dot(pos * size, dir) - 0.5 - "$") * %d.0 + 0.5); \n"
++         "float q = floor(m / %d.0);                                      \n"
++         "int k = clamp(int(m - q * %d.0), 0, %d);                        \n"
++         "float first = q + "$"[k] + 0.5;                                 \n"
++         "vec2 across = pos - dir * pos;                                  \n"
++         "vec4 ws;                                                        \n"
++         "%s c;                                                           \n"
++         "PRECISE %s ca = %s(0.0);                                        \n",
++         pos, pt, src_tex, horiz ? 1 : 0, horiz ? 0 : 1, origin_v, R, R, R,
++         R - 1, first_v, type, type, type);
++
++    if (use_ar) {
++        GLSL("%s hi = %s(0.0); \n"
++             "%s lo = %s(1e9); \n",
++             type, type, type, type);
++    }
++
++    for (int n = 0; n < N; n++) {
++        if (n % 4 == 0)
++            GLSL("ws = "$"[k * %d + %d]; \n", weights_v, S, n / 4);
++        GLSL("c = textureLod("$", across + dir * ((first + %d.0) * pt), 0.0).%s; \n",
++             src_tex, n, swiz);
++        if (use_ar && (n == N / 2 - 1 || n == N / 2))
++            GLSL("lo = min(lo, c); hi = max(hi, c); \n");
++        GLSL("ca += ws[%d] * c; \n", n % 4);
++    }
++
++    if (use_ar)
++        GLSL("ca = mix(ca, clamp(ca, lo, hi), "$"); \n", SH_FLOAT(cfg->antiring));
++
++    GLSL("color.%s = "$" * ca; \n"
++         "}                    \n",
++         swiz, SH_FLOAT(scale));
++    return true;
++}
++
+ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+                              const struct pl_sample_filter_params *params)
+ {
+@@ -986,9 +1183,13 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+                        src->rect.y1 == src->tex->params.h;
+         }
+     }
++    // An upscaling by a whole ratio takes its weights exactly, and its taps
++    // with nearest sampling: see ortho_exact_plan()
++    struct ortho_exact exact;
++    const bool use_exact = ortho_exact_plan(sh, src, &params->filter, &exact);
+     if (!setup_src(sh, src, &src_tex, &pos, &pt,
+-                   &ratio[SEP_HORIZ], &ratio[SEP_VERT],
+-                   &comps, &scale, false, centered ? NEAREST : LINEAR))
++                   &ratio[SEP_HORIZ], &ratio[SEP_VERT], &comps, &scale, false,
++                   centered || use_exact ? NEAREST : LINEAR))
+         return false;
+ 
+ 
+@@ -1051,6 +1252,14 @@ bool pl_shader_sample_ortho2(pl_shader sh, const struct pl_sample_src *src,
+         }
+     }
+ 
++    if (use_exact) {
++        pl_assert(pass == exact.pass);
++        describe_filter(sh, &cfg, pass == SEP_HORIZ ? "ortho (horiz)" : "ortho (vert)",
++                        ratio[pass], ratio[pass]);
++        return ortho_exact_sample(sh, obj->filter, &cfg, &exact, comps, scale,
++                                  src_tex, pos, pt);
++    }
++
+     int N = obj->filter->row_size; // number of samples to convolve
+     int width = obj->filter->row_stride / 4; // width of the LUT texture
+     ident_t lut = sh_lut(sh, sh_lut_params(
