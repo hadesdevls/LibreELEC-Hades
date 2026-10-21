@@ -10,6 +10,7 @@ PKG_SITE="https://ffmpeg.org"
 PKG_URL="http://ffmpeg.org/releases/ffmpeg-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_TARGET="toolchain zlib bzip2 openssl speex libxml2"
 PKG_LONGDESC="FFmpeg is a complete, cross-platform solution to record, convert and stream audio and video."
+PKG_BUILD_FLAGS="+hardening -bindnow"
 PKG_PATCH_DIRS="postproc libreelec"
 PKG_NO_REFRESH_PATCHES="tools/ffmpeg/gen-patches.sh"
 

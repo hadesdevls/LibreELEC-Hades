@@ -1,0 +1,205 @@
+From 9be3e7739abb78da917d165c75c250dff5307db8 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:02:27 +0000
+Subject: [PATCH] windowing/gbm: show the GUI while a change of mode waits for
+ the video
+
+While the change of mode for a video that opens is held for the output of
+that video (CModeChangeHold, START; kodi-9284), nothing was committed, so
+that the mode would go out once with that output. The display kept the
+picture it had, and the GUI froze for as long as the hold lasted, up to 3 s:
+the "loading" of a stream over the network, among other things.
+
+A frame of the GUI that is drawn meanwhile now goes out alone, in the mode on
+the screen: CDRMAtomic::FlipPageAlone() commits its buffer on the output
+plane in a request of its own, as every frame sets it, and nothing else.
+The selected mode, the modeset that is pending and the properties that Kodi
+has queued stay for the commit that ends the hold, which still makes the
+change of mode with the output of the video, in one commit. The window keeps
+its size in a hold, so the plane is set as before. A refused frame alone
+stops this for the rest of that hold, as it was. Not for a STOP hold: the
+screen then has the HDR signalling of the video, which the GUI is not drawn
+for.
+---
+ xbmc/windowing/gbm/ModeChangeHold.h           |  7 +++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 28 +++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.h             |  7 +++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 15 ++++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp          | 26 +++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.h            |  5 ++++
+ 6 files changed, 88 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/ModeChangeHold.h b/xbmc/windowing/gbm/ModeChangeHold.h
+index 1ddec60..c9294f7 100644
+--- a/xbmc/windowing/gbm/ModeChangeHold.h
++++ b/xbmc/windowing/gbm/ModeChangeHold.h
+@@ -126,6 +126,13 @@ public:
+ 
+   Kind Holding() const { return m_kind; }
+ 
++  //! Hades: while this hold lasts, a frame of the GUI goes out alone, in the mode on the screen
++  //! (a commit of its own that changes nothing but the picture), and what is held stays for the
++  //! commit that ends the hold. START only: the GUI frames of the video that opens (its
++  //! "loading", the information of a stream) froze for up to START_MS. Not STOP: the screen has
++  //! the HDR signalling of the video then, which the GUI is not drawn for.
++  bool GuiGoesOn() const { return m_kind == Kind::START; }
++
+   //! A commit of the ordinary output would be made now: false while a hold lasts. At its deadline
+   //! the hold ends (End::DEADLINE) and the commit goes.
+   bool Commits(int64_t nowMs)
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 94a3a9d..df8e2a5 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -1714,6 +1714,8 @@ bool CWinSystemGbm::HoldModeChange(RESOLUTION_INFO& res)
+   m_DRM->SetVideoMode(res, nullptr);
+   m_modeHeldFrom = before;
+   m_modeAnnounce.Held();
++  m_heldGuiFlips = true;
++  m_heldGuiShown = 0;
+   m_modeHold.Start(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+@@ -1724,6 +1726,26 @@ bool CWinSystemGbm::HoldModeChange(RESOLUTION_INFO& res)
+   return true;
+ }
+ 
++bool CWinSystemGbm::FlipHeldGui()
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm || !m_GBM || !m_heldGuiFlips || !m_modeHold.GuiGoesOn())
++    return false;
++  // The buffer that was drawn, as FlipPage() takes it; committed alone, its flip waited for, in
++  // the mode on the screen: the mode and what Kodi has queued wait for the commit that ends the
++  // hold. The window keeps its size in a hold, and so does what a frame sets on the plane.
++  struct gbm_bo* bo = m_GBM->GetDevice().GetSurface().LockFrontBuffer().Get();
++  if (bo && drm->FlipPageAlone(bo))
++  {
++    ++m_heldGuiShown;
++    return true;
++  }
++  m_heldGuiFlips = false;
++  CLog::Log(LOGWARNING, "A frame of the GUI could not be shown while the change of mode waits: the "
++                        "display keeps the picture it has until then");
++  return false;
++}
++
+ void CWinSystemGbm::AnnounceHeldModeChange(bool transport)
+ {
+   if (!m_modeAnnounce.Before(transport))
+@@ -1787,7 +1809,13 @@ void CWinSystemGbm::TellModeHoldEnd()
+   using End = CModeChangeHold::End;
+   const bool start = kind == CModeChangeHold::Kind::START;
+   if (start)
++  {
+     m_modeHeldFrom = nullptr;
++    // (Hades: what the display showed meanwhile)
++    CLog::Log(LOGINFO, "{} frames of the GUI were shown in the mode on the screen while the change "
++                       "of mode waited",
++              std::exchange(m_heldGuiShown, 0));
++  }
+   switch (end)
+   {
+     case End::CONFIGURED:
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 2ef53f2..4667e4d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -276,6 +276,13 @@ protected:
+   //! with the next commit, and the other subsystems are told of it then (m_modeAnnounce). False,
+   //! with nothing done, where res cannot be chosen (the change is then made as always).
+   bool HoldModeChange(RESOLUTION_INFO& res);
++  //! ... a frame of the GUI that was drawn while a START hold lasts: shown alone, in the mode on
++  //! the screen (CModeChangeHold::GuiGoesOn()). False when it is not (nothing then is committed):
++  //! after a refusal, for the rest of that hold
++  bool FlipHeldGui();
++  bool m_heldGuiFlips = true;
++  unsigned int m_heldGuiShown = 0; //!< ... in this hold, for the log
++
+   //! Hades: when the other subsystems are told of a change of mode that was held
+   CHeldModeAnnouncement m_modeAnnounce;
+   //! ... a commit is about to be made (transport: a frame of native Dolby Vision output): where it
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 68eb626..72abdf3 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -627,8 +627,23 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+   // Hades: a change of the output that waits for the next one (CModeChangeHold): nothing is
+   // committed meanwhile, and the display keeps the picture it has. VideoPlayer is told that the
+   // display is back all the same: the picture whose output the change waits for comes from it.
++  // (Hades: but a frame of the GUI that was drawn while a change of mode waits for the video that
++  // opens, which goes out alone in the mode on the screen: FlipHeldGui())
+   if (!ModeHoldCommits())
+   {
++    if (rendered && !videoLayer && m_heldGuiFlips && m_modeHold.GuiGoesOn())
++    {
++      if (!m_eglContext.TrySwapBuffers())
++      {
++        CEGLUtils::Log(LOGERROR, "eglSwapBuffers failed");
++        throw std::runtime_error("eglSwapBuffers failed");
++      }
++      if (FlipHeldGui())
++      {
++        SendDisplayReset();
++        return;
++      }
++    }
+     KODI::TIME::Sleep(10ms);
+     SendDisplayReset();
+     return;
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 4bbce1f..759338f 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -472,6 +472,32 @@ bool CDRMAtomic::TestFramebuffer(struct gbm_bo* bo)
+   return true;
+ }
+ 
++bool CDRMAtomic::FlipPageAlone(struct gbm_bo* bo)
++{
++  CDRMPlane* plane = m_gui_plane ? m_gui_plane : m_video_plane;
++  struct drm_fb* fb = bo ? DrmFbGetFromBo(bo) : nullptr;
++  if (!fb || !plane || !m_crtc || !m_mode || !m_active)
++    return false;
++  // (what every frame sets on the output plane: DrmAtomicCommit())
++  CDRMAtomicRequest request;
++  if (!request.AddProperty(plane, "FB_ID", fb->fb_id) ||
++      !request.AddProperty(plane, "CRTC_ID", m_crtc->GetCrtcId()) ||
++      !request.AddProperty(plane, "SRC_X", 0) || !request.AddProperty(plane, "SRC_Y", 0) ||
++      !request.AddProperty(plane, "SRC_W", static_cast<uint64_t>(m_width) << 16) ||
++      !request.AddProperty(plane, "SRC_H", static_cast<uint64_t>(m_height) << 16) ||
++      !request.AddProperty(plane, "CRTC_X", 0) || !request.AddProperty(plane, "CRTC_Y", 0) ||
++      !request.AddProperty(plane, "CRTC_W", m_mode->hdisplay) ||
++      !request.AddProperty(plane, "CRTC_H", ScanoutHeight()))
++    return false;
++  if (drmModeAtomicCommit(m_fd, request.Get(), 0, nullptr) != 0)
++  {
++    CLog::LogF(LOGWARNING, "the driver refused a frame alone: {}", strerror(errno));
++    return false;
++  }
++  request.CacheProperties();
++  return true;
++}
++
+ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, bool async)
+ {
+   struct drm_fb* drm_fb = nullptr;
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index d690814..36c6250 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -53,6 +53,11 @@ public:
+   // does not wait.
+   bool FlipPageTransactional(struct gbm_bo* bo, bool modeset, bool* ahead = nullptr);
+   bool TestFramebuffer(struct gbm_bo* bo) override;
++  //! Hades: a frame alone, in a request of its own: this buffer on the output plane, as every
++  //! frame sets it, and nothing else. What is queued, and a modeset that is pending, stay for the
++  //! next commit. The commit waits for its flip. False when it cannot be made, or the driver
++  //! refuses it (nothing then changed).
++  bool FlipPageAlone(struct gbm_bo* bo);
+   bool TakeFlipRefused() override { return std::exchange(m_flipRefused, false); }
+   bool TakeFlipDropped() override { return std::exchange(m_flipDropped, false); }
+   FloatRefusal RefusedForBuffer(struct gbm_bo* bo) override;
+-- 
+2.53.0
+

@@ -1,0 +1,344 @@
+From 27877ca8e82e4f1b28f33ba93cf477f00a9f1867 Mon Sep 17 00:00:00 2001
+From: Martin Ellis <malard@gmail.com>
+Date: Fri, 9 Oct 2026 20:06:00 +0100
+Subject: [PATCH] [Announcements][CAnnouncementManager] Call announcers without
+ holding the announcer lock (#29515)
+
+DoAnnounce() held m_announcersCritSection while it called every
+announcer. An announcer that waits on another thread then deadlocks
+against that thread registering an announcer of its own:
+CGUIWindowSlideShow::Announce() closes its window on OnPlay, which waits
+on the GUI thread, while the GUI thread, refreshing a container's
+CDirectoryProvider, waits in AddAnnouncer() for the same lock. Both
+stop for good, and so do JSON-RPC and every player thread that touches
+the window manager.
+
+Release the lock around each call and re-check that the announcer is
+still registered before calling it. RemoveAnnouncer() now waits only
+for a call in progress to the announcer being removed, so its owner can
+still destroy it as soon as the call returns. An announcer removing
+itself from inside its own call is not made to wait.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 02f40fc0c314b09e40c19349ef0b0961f385fe10)
+---
+ cmake/treedata/common/tests.txt               |   1 +
+ xbmc/interfaces/AnnouncementManager.cpp       |  35 +++-
+ xbmc/interfaces/AnnouncementManager.h         |   5 +
+ xbmc/interfaces/test/CMakeLists.txt           |   3 +
+ .../test/TestAnnouncementManager.cpp          | 195 ++++++++++++++++++
+ 5 files changed, 235 insertions(+), 4 deletions(-)
+ create mode 100644 xbmc/interfaces/test/CMakeLists.txt
+ create mode 100644 xbmc/interfaces/test/TestAnnouncementManager.cpp
+
+diff --git a/cmake/treedata/common/tests.txt b/cmake/treedata/common/tests.txt
+index c1d6657..3a03cc3 100644
+--- a/cmake/treedata/common/tests.txt
++++ b/cmake/treedata/common/tests.txt
+@@ -31,6 +31,7 @@ xbmc/imagefiles/test              test/imagefiles
+ xbmc/input/test                   test/input
+ xbmc/input/keyboard/test          test/input/keyboard
+ xbmc/input/keymaps/test           test/input/keymaps
++xbmc/interfaces/test              test/interfaces
+ xbmc/interfaces/json-rpc/test     test/jsonrpc
+ xbmc/interfaces/python/test       test/python
+ xbmc/music/tags/test              test/music_tags
+diff --git a/xbmc/interfaces/AnnouncementManager.cpp b/xbmc/interfaces/AnnouncementManager.cpp
+index fe842b4..2a5c83f 100644
+--- a/xbmc/interfaces/AnnouncementManager.cpp
++++ b/xbmc/interfaces/AnnouncementManager.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include <memory>
+ #include <mutex>
++#include <vector>
+ 
+ #define LOOKUP_PROPERTY "database-lookup"
+ 
+@@ -263,6 +264,11 @@ void CAnnouncementManager::RemoveAnnouncer(IAnnouncer *listener)
+ 
+   std::unique_lock lock(m_announcersCritSection);
+   m_announcers.erase(listener);
++
++  // Its owner may destroy it once this returns, so a call in progress elsewhere must finish
++  // first. An announcer removing itself from inside that call is on this thread.
++  if (!IsCurrentThread())
++    m_announced.wait(lock, [this, listener] { return m_announcing != listener; });
+ }
+ 
+ void CAnnouncementManager::Announce(AnnouncementFlag flag, const std::string& message)
+@@ -343,14 +349,35 @@ void CAnnouncementManager::DoAnnounce(AnnouncementFlag flag,
+ 
+   std::unique_lock lock(m_announcersCritSection);
+ 
+-  // Make a copy of announcers. They may be removed or even remove themselves during execution of IAnnouncer::Announce()!
+-  std::unordered_map<IAnnouncer*, int> announcers{m_announcers};
+-  for (const auto& [announcer, flagMask] : announcers)
++  std::vector<IAnnouncer*> announcers;
++  announcers.reserve(m_announcers.size());
++  for (const auto& [announcer, flagMask] : m_announcers)
++    announcers.push_back(announcer);
++
++  for (IAnnouncer* announcer : announcers)
+   {
+-    if (flag & flagMask)
++    // Re-read: the list may have changed while the lock was released for the previous call.
++    const auto it = m_announcers.find(announcer);
++    if (it == m_announcers.end() || !(flag & it->second))
++      continue;
++
++    // The lock is released for the call. Announcers wait on other threads - closing a window
++    // waits on the GUI thread - and the GUI thread adds announcers of its own.
++    m_announcing = announcer;
++    try
+     {
++      CSingleExit unlock(m_announcersCritSection);
+       announcer->Announce(flag, sender, message, data);
+     }
++    catch (...)
++    {
++      // An exception ends this thread; a removal waiting on the call must not wait for ever
++      m_announcing = nullptr;
++      m_announced.notifyAll();
++      throw;
++    }
++    m_announcing = nullptr;
++    m_announced.notifyAll();
+   }
+ }
+ 
+diff --git a/xbmc/interfaces/AnnouncementManager.h b/xbmc/interfaces/AnnouncementManager.h
+index 162a80d..37e96a6 100644
+--- a/xbmc/interfaces/AnnouncementManager.h
++++ b/xbmc/interfaces/AnnouncementManager.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "IAnnouncer.h"
++#include "threads/Condition.h"
+ #include "threads/CriticalSection.h"
+ #include "threads/Event.h"
+ #include "threads/Thread.h"
+@@ -92,5 +93,9 @@ namespace ANNOUNCEMENT
+     CCriticalSection m_announcersCritSection;
+     CCriticalSection m_queueCritSection;
+     std::unordered_map<IAnnouncer*, int> m_announcers;
++
++    //! The announcer being called by DoAnnounce(), which runs without m_announcersCritSection.
++    IAnnouncer* m_announcing{nullptr};
++    XbmcThreads::ConditionVariable m_announced;
+   };
+ }
+diff --git a/xbmc/interfaces/test/CMakeLists.txt b/xbmc/interfaces/test/CMakeLists.txt
+new file mode 100644
+index 0000000..9fb2f06
+--- /dev/null
++++ b/xbmc/interfaces/test/CMakeLists.txt
+@@ -0,0 +1,3 @@
++set(SOURCES TestAnnouncementManager.cpp)
++
++core_add_test_library(interfaces_test)
+diff --git a/xbmc/interfaces/test/TestAnnouncementManager.cpp b/xbmc/interfaces/test/TestAnnouncementManager.cpp
+new file mode 100644
+index 0000000..6ea9f4b
+--- /dev/null
++++ b/xbmc/interfaces/test/TestAnnouncementManager.cpp
+@@ -0,0 +1,195 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "interfaces/AnnouncementManager.h"
++#include "threads/Event.h"
++#include "utils/Variant.h"
++
++#include <atomic>
++#include <chrono>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <thread>
++
++#include <gtest/gtest.h>
++
++using namespace ANNOUNCEMENT;
++using namespace std::chrono_literals;
++
++namespace
++{
++constexpr auto TIMEOUT = 5s;
++
++//! Stands in for an announcer that waits on another thread, as closing a window waits on the GUI
++//! thread.
++class CBlockingAnnouncer : public IAnnouncer
++{
++public:
++  void Announce(AnnouncementFlag flag,
++                const std::string& sender,
++                const std::string& message,
++                const CVariant& data) override
++  {
++    m_entered.Set();
++    m_released = m_release.Wait(TIMEOUT);
++  }
++
++  CEvent m_entered;
++  CEvent m_release;
++  std::atomic<bool> m_released{false};
++};
++
++class CRecordingAnnouncer : public IAnnouncer
++{
++public:
++  void Announce(AnnouncementFlag flag,
++                const std::string& sender,
++                const std::string& message,
++                const CVariant& data) override
++  {
++    if (m_removed)
++      m_calledAfterRemoval = true;
++  }
++
++  std::atomic<bool> m_removed{false};
++  std::atomic<bool> m_calledAfterRemoval{false};
++};
++
++class CSelfRemovingAnnouncer : public IAnnouncer
++{
++public:
++  explicit CSelfRemovingAnnouncer(CAnnouncementManager& manager) : m_manager(manager) {}
++
++  void Announce(AnnouncementFlag flag,
++                const std::string& sender,
++                const std::string& message,
++                const CVariant& data) override
++  {
++    m_manager.RemoveAnnouncer(this);
++    m_removed.Set();
++  }
++
++  CAnnouncementManager& m_manager;
++  CEvent m_removed;
++};
++
++class CThrowingAnnouncer : public IAnnouncer
++{
++public:
++  void Announce(AnnouncementFlag flag,
++                const std::string& sender,
++                const std::string& message,
++                const CVariant& data) override
++  {
++    m_called.Set();
++    throw std::runtime_error("announcer failed");
++  }
++
++  CEvent m_called;
++};
++} // namespace
++
++class TestAnnouncementManager : public ::testing::Test
++{
++protected:
++  void SetUp() override { m_manager.Start(); }
++
++  // Declared before the manager so they outlive its thread.
++  CBlockingAnnouncer m_blocking;
++  CRecordingAnnouncer m_recording;
++  CAnnouncementManager m_manager;
++};
++
++TEST_F(TestAnnouncementManager, AnAnnouncerCanBeAddedWhileAnotherIsBeingCalled)
++{
++  m_manager.AddAnnouncer(&m_blocking);
++  m_manager.Announce(Other, "Test");
++  ASSERT_TRUE(m_blocking.m_entered.Wait(TIMEOUT));
++
++  m_manager.AddAnnouncer(&m_recording);
++  m_blocking.m_release.Set();
++  m_manager.Deinitialize();
++
++  EXPECT_TRUE(m_blocking.m_released);
++}
++
++TEST_F(TestAnnouncementManager, AnAnnouncerRemovedDuringADispatchIsNotCalledAfterwards)
++{
++  m_manager.AddAnnouncer(&m_blocking);
++  m_manager.AddAnnouncer(&m_recording);
++  m_manager.Announce(Other, "Test");
++  ASSERT_TRUE(m_blocking.m_entered.Wait(TIMEOUT));
++
++  m_manager.RemoveAnnouncer(&m_recording);
++  m_recording.m_removed = true;
++  m_blocking.m_release.Set();
++  m_manager.Deinitialize();
++
++  EXPECT_TRUE(m_blocking.m_released);
++  EXPECT_FALSE(m_recording.m_calledAfterRemoval);
++}
++
++TEST_F(TestAnnouncementManager, RemovingAnAnnouncerWaitsForItsCallInProgress)
++{
++  m_manager.AddAnnouncer(&m_blocking);
++  m_manager.Announce(Other, "Test");
++  ASSERT_TRUE(m_blocking.m_entered.Wait(TIMEOUT));
++
++  std::atomic<bool> removed{false};
++  std::thread remover(
++      [this, &removed]
++      {
++        m_manager.RemoveAnnouncer(&m_blocking);
++        removed = true;
++      });
++  std::this_thread::sleep_for(200ms);
++  EXPECT_FALSE(removed);
++
++  m_blocking.m_release.Set();
++  remover.join();
++  EXPECT_TRUE(removed);
++  EXPECT_TRUE(m_blocking.m_released);
++}
++
++TEST_F(TestAnnouncementManager, AnAnnouncerCanRemoveItselfWhileBeingCalled)
++{
++  CSelfRemovingAnnouncer announcer(m_manager);
++  m_manager.AddAnnouncer(&announcer);
++  m_manager.Announce(Other, "Test");
++
++  EXPECT_TRUE(announcer.m_removed.Wait(TIMEOUT));
++  m_manager.Deinitialize();
++}
++
++TEST(TestAnnouncementManagerFailure, RemovingAnAnnouncerWhoseCallThrewDoesNotWait)
++{
++  // Leaked if the removal never returns, so the thread left waiting in it touches nothing freed
++  auto manager = std::make_unique<CAnnouncementManager>();
++  auto announcer = std::make_unique<CThrowingAnnouncer>();
++  manager->Start();
++  manager->AddAnnouncer(announcer.get());
++  manager->Announce(Other, "Test");
++  ASSERT_TRUE(announcer->m_called.Wait(TIMEOUT));
++
++  auto removed = std::make_shared<CEvent>();
++  std::thread remover(
++      [m = manager.get(), a = announcer.get(), removed]
++      {
++        m->RemoveAnnouncer(a);
++        removed->Set();
++      });
++  if (!removed->Wait(TIMEOUT))
++  {
++    remover.detach();
++    manager.release();
++    announcer.release();
++    FAIL() << "RemoveAnnouncer is still waiting on a call that threw";
++  }
++  remover.join();
++}
+-- 
+2.53.0
+

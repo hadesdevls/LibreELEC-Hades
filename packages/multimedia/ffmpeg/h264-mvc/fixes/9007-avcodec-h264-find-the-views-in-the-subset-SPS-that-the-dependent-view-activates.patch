@@ -1,0 +1,420 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:35:48 +0000
+Subject: [PATCH] avcodec/h264: find the views in the subset SPS that the
+ dependent view activates
+
+Parameter sets outlive a coded video sequence. Where a stream goes on
+with a subset SPS of another id that lists other views, the one of the
+sequence before stays in the list, and the series took the first subset
+SPS in the list that declares views (or the one with the id of the
+active PPS) for all of it: the view_id of a coded slice extension was
+looked up there, so that the slices of the view now in use were taken
+for a view that is not decoded, and skipped; the view list was exported
+from it; and a picture leaving the reorder buffer was output or not by
+its view_id, looked up in whatever list was current by then.
+
+The subset SPS in use is the one that the coded slice extensions
+activate, the one with the id that their PPS refers to (H.7.4.1.2.1).
+Now:
+- a coded slice extension is placed in its view by that subset SPS, and
+  the views of its inter-view dependency lists are looked up in the
+  subset SPS that the slice activated;
+- ff_h264_views_sps() says from which subset SPS the views are exported
+  and set up: the one that the first coded slice extension of the
+  packet activates; else, for a packet without one, the one they were
+  decided with, while it still is the subset SPS with its id; else as
+  before. get_last_needed_nal() asks it too (fix 9005), so that the
+  frame threads wait for the dependent view where h264_init_ps() will
+  decide the views again;
+- the subset SPS they were decided with is held as a reference, so that
+  a subset SPS that replaces it cannot be taken for it, and is handed on
+  to the next frame thread with the view list that it gave;
+- a picture is output, or not, by the VOIdx of the view it was decoded
+  in.
+A stream with one subset SPS is decoded as before.
+
+Measured against the reference decoder (JM 19.1) with a stream made on
+purpose: MVCDS1 of the ITU-T H.264.1 conformance set (views 0 and 1,
+subset SPS 1), then the same stream with its second view renamed 3,
+and its subset SPS and the PPS that refers to it given id 2; only
+parameter sets and NAL unit headers were changed. JM looks a view up in
+the subset SPS it used last and cannot take the stream as one: the
+reference is its decode of the two halves, one after the other. Without
+this change none of the 290 pictures of the second view of the second
+half came out, with one thread, 2 and 8 frame threads and 8 slice
+threads; with it, all 580 pictures of each view are JM's. The ITU-T
+streams and the two streams of the reference encoder: unchanged.
+---
+diff --git a/libavcodec/h264_picture.c b/libavcodec/h264_picture.c
+--- a/libavcodec/h264_picture.c
++++ b/libavcodec/h264_picture.c
+@@ -100,6 +100,7 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
+     dst->invalid_gap   = src->invalid_gap;
+     dst->sei_recovery_frame_cnt = src->sei_recovery_frame_cnt;
+     dst->view_id       = src->view_id;
++    dst->voidx         = src->voidx;
+     dst->base_view_pic = src->base_view_pic;
+     dst->mb_width      = src->mb_width;
+     dst->mb_height     = src->mb_height;
+diff --git a/libavcodec/h264_refs.c b/libavcodec/h264_refs.c
+--- a/libavcodec/h264_refs.c
++++ b/libavcodec/h264_refs.c
+@@ -161,7 +161,8 @@ static int build_inter_view_list(H264Context *h, H264Ref *dst, int dst_len,
+     }
+ 
+     for (int i = 0; i < nb_refs && index < dst_len; i++) {
+-        int ref_voidx = ff_h264_view_idx(h, refs[i]);
++        /* the dependency lists name views of the same subset SPS */
++        int ref_voidx = ff_h264_sps_view_idx(sps, refs[i]);
+         H264Picture *pic;
+ 
+         if (ref_voidx < 0 || ref_voidx >= FF_ARRAY_ELEMS(h->views)) {
+@@ -504,7 +505,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
+                     break;
+                 }
+ 
+-                ref_voidx = ff_h264_view_idx(h, refs[view_pred]);
++                ref_voidx = ff_h264_sps_view_idx(h->ps.sps, refs[view_pred]);
+                 if (ref_voidx < 0 || ref_voidx >= FF_ARRAY_ELEMS(h->views)) {
+                     i = -1;
+                     break;
+@@ -783,26 +784,7 @@ void ff_h264_view_sync(H264Context *h)
+ 
+ int ff_h264_view_idx(const H264Context *h, int view_id)
+ {
+-    const SPS *sps = ff_h264_pps_sps_mvc(&h->ps, h->ps.pps);
+-
+-    /* The base view's PPS may not point at a subset SPS, so fall back to any
+-     * subset SPS that declares views. */
+-    if (!sps || sps->mvc.num_views < 2) {
+-        sps = NULL;
+-        for (int i = 0; i < MAX_SPS_COUNT; i++)
+-            if (h->ps.subset_sps_list[i] && h->ps.subset_sps_list[i]->mvc.num_views > 1) {
+-                sps = h->ps.subset_sps_list[i];
+-                break;
+-            }
+-    }
+-    if (!sps)
+-        return AVERROR_INVALIDDATA;
+-
+-    for (int i = 0; i < sps->mvc.num_views; i++)
+-        if (sps->mvc.view_id[i] == view_id)
+-            return i;
+-
+-    return AVERROR_INVALIDDATA;
++    return ff_h264_sps_view_idx(ff_h264_views_sps(h), view_id);
+ }
+ 
+ /* The field pair state has to follow the view too, but only when the switch is
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -485,7 +485,9 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
+      * has not seen one cannot do -- and a picture allocated before it has is
+      * given view_id 0, so a dependent view picture would be tagged, output and
+      * counted as a base view one. Propagate it rather than waiting for the next
+-     * subset SPS to come round. */
++     * subset SPS to come round, with the subset SPS it was decided from, which
++     * ff_h264_views_sps() and the next decision go by. */
++    av_refstruct_replace(&h->mvc_sps, h1->mvc_sps);
+     if (h->nb_view_ids_available != h1->nb_view_ids_available ||
+         (h->nb_view_ids_available &&
+          memcmp(h->view_ids_available, h1->view_ids_available,
+@@ -643,6 +645,7 @@ static int h264_frame_start(H264Context *h)
+     pic->frame_num               = h->poc.frame_num;
+     pic->view_id                = (h->cur_view < h->nb_view_ids_available) ?
+                                   h->view_ids_available[h->cur_view] : 0;
++    pic->voidx                  = h->cur_view;
+     pic->base_view_pic          = -1;
+     /*
+      * Zero key_frame here; IDR markings per slice in frame or fields are ORed
+@@ -933,24 +936,81 @@ static void init_scan_tables(H264Context *h)
+ }
+ 
+ /**
+- * Find the subset SPS describing the views of an MVC stream.
++ * The subset SPS of a PPS named by a slice header, where it declares views:
++ * the header starts at byte @p start of the NAL unit.
++ */
++static const SPS *slice_views_sps(const H264ParamSets *ps, const H2645NAL *nal,
++                                  int start)
++{
++    const SPS *sps;
++    GetBitContext gb;
++    unsigned pps_id;
++
++    if (nal->size <= start || init_get_bits8(&gb, nal->data + start, nal->size - start) < 0)
++        return NULL;
++    get_ue_golomb_long(&gb);    // first_mb_in_slice
++    get_ue_golomb_31(&gb);      // slice_type
++    pps_id = get_ue_golomb(&gb);
++    if (pps_id >= MAX_PPS_COUNT)
++        return NULL;
++    sps = ff_h264_pps_sps_mvc(ps, ps->pps_list[pps_id]);
++    return sps && sps->mvc.num_views > 1 ? sps : NULL;
++}
++
++/**
++ * The subset SPS describing the views of an MVC stream, for the packet in
++ * h->pkt.
+  *
+  * Unlike HEVC, where the layer list lives in the VPS, H.264 carries it in the
+- * MVC extension of a subset SPS. A conforming MVC stream has exactly one such
+- * set of views, so the first usable subset SPS is authoritative; it is also
+- * available before the first slice of the base view, which is what lets the
+- * view list be exported from get_format().
++ * MVC extension of a subset SPS, and the one in use is the one that the coded
++ * slice extensions activate: the subset SPS with the id that their PPS refers
++ * to (H.7.4.1.2.1). Parameter sets outlive a coded video sequence, so a subset
++ * SPS kept from an earlier one may declare other views than the one in use, and
++ * the list alone does not say which is meant. In order:
++ *  - the one that the first coded slice extension of the packet activates;
++ *  - else the one the views were last decided with, while it still is the
++ *    subset SPS with its id: a packet without a dependent view says nothing
++ *    new about them;
++ *  - else the one with the id that the PPS of the first base view slice of the
++ *    packet refers to (the active PPS's, if the packet has none);
++ *  - else the first one in the list. This is the one available before any
++ *    slice, which lets the view list be exported from get_format().
++ * get_last_needed_nal() asks before the packet is decoded, h264_init_ps() at
++ * its first base view slice; the parameter sets of the packet that come before
++ * that slice are only known to the second.
+  */
+-static const SPS *find_mvc_sps(void *logctx, const H264ParamSets *ps)
++const SPS *ff_h264_views_sps(const H264Context *h)
+ {
++    const H264ParamSets *ps = &h->ps;
++    const H2645NAL *base = NULL, *dep = NULL;
+     const SPS *found = NULL;
+     int ambiguous = 0;
+ 
+-    /* The subset SPS the active PPS resolves to is authoritative when there is
+-     * one; the base view's PPS usually names an ordinary SPS, though, so fall
+-     * back to a scan. */
+-    found = ff_h264_pps_sps_mvc(ps, ps->pps);
+-    if (found && found->mvc.num_views > 1)
++    for (int i = 0; i < h->pkt.nb_nals; i++) {
++        const H2645NAL *nal = &h->pkt.nals[i];
++
++        if (!dep && nal->type == H264_NAL_EXTEN_SLICE)
++            dep = nal;
++        if (!base && (nal->type == H264_NAL_SLICE || nal->type == H264_NAL_IDR_SLICE))
++            base = nal;
++    }
++
++    /* the MVC NAL unit header takes the three bytes after the first */
++    if (dep && (found = slice_views_sps(ps, dep, 4)))
++        return found;
++
++    if (h->mvc_sps && h->mvc_sps->mvc.num_views > 1 &&
++        ps->subset_sps_list[h->mvc_sps->sps_id] == h->mvc_sps)
++        return h->mvc_sps;
++
++    if (base) {
++        found = slice_views_sps(ps, base, 1);
++    } else {
++        found = ff_h264_pps_sps_mvc(ps, ps->pps);
++        if (found && found->mvc.num_views < 2)
++            found = NULL;
++    }
++    if (found)
+         return found;
+ 
+     found = NULL;
+@@ -967,11 +1027,11 @@ static const SPS *find_mvc_sps(void *logctx, const H264ParamSets *ps)
+             ambiguous = 1;
+     }
+ 
+-    /* Several subset SPSs describing different view sets cannot all be right,
+-     * and nothing here says which the next slice will use. Take the lowest id so
+-     * the choice is at least deterministic, and say so once. */
++    /* Several subset SPSs describing different view sets, and nothing here says
++     * which the next slice will use. Take the lowest id so the choice is at
++     * least deterministic, and say so. */
+     if (ambiguous)
+-        av_log(logctx, AV_LOG_WARNING,
++        av_log(h->avctx, AV_LOG_WARNING,
+                "Subset SPSs describe differing view sets; using the lowest id\n");
+ 
+     return found;
+@@ -1504,10 +1564,10 @@ static int h264_init_ps(H264Context *h, const H264SliceContext *sl, int first_sl
+      * get_format() callback only sees views that were already known by then;
+      * setting view_ids up front always works. */
+     if (!h->cur_view && first_slice) {
+-        const SPS *mvc_sps = find_mvc_sps(h->avctx, &h->ps);
++        const SPS *mvc_sps = ff_h264_views_sps(h);
+ 
+         if (mvc_sps != h->mvc_sps) {
+-            h->mvc_sps = mvc_sps;
++            av_refstruct_replace(&h->mvc_sps, mvc_sps);
+             ret = export_multiview(h, mvc_sps);
+             if (ret < 0)
+                 return ret;
+@@ -1539,7 +1599,7 @@ static int h264_init_ps(H264Context *h, const H264SliceContext *sl, int first_sl
+ 
+     if (!h->context_initialized || must_reinit || needs_reinit) {
+         int flush_changes = h->context_initialized;
+-        const SPS *mvc_sps = find_mvc_sps(h->avctx, &h->ps);
++        const SPS *mvc_sps = ff_h264_views_sps(h);
+         h->context_initialized = 0;
+         if (sl != h->slice_ctx) {
+             av_log(h->avctx, AV_LOG_ERROR,
+@@ -1559,6 +1619,7 @@ static int h264_init_ps(H264Context *h, const H264SliceContext *sl, int first_sl
+         /* Export the available views before ff_get_format() so that the caller
+          * can pick views from its get_format() callback, then act on whatever it
+          * asked for. */
++        av_refstruct_replace(&h->mvc_sps, mvc_sps);
+         ret = export_multiview(h, mvc_sps);
+         if (ret < 0)
+             return ret;
+@@ -2579,7 +2640,13 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
+     /* Which view does this slice belong to? A slice that is not a coded slice
+      * extension is always the base view, cf. H.7.4.1.1. */
+     if (nal->type == H264_NAL_EXTEN_SLICE) {
+-        int voidx = ff_h264_view_idx(h, nal->view_id);
++        /* Its VOIdx is the place of its view_id in the list of the subset SPS
++         * that it activates, the one its PPS refers to (H.7.4.1.2.1): a subset
++         * SPS kept from another coded video sequence may list other views. The
++         * views decided last are asked only where the header does not say. */
++        const SPS *own = slice_views_sps(&h->ps, nal, 4);
++        int voidx = own ? ff_h264_sps_view_idx(own, nal->view_id)
++                        : ff_h264_view_idx(h, nal->view_id);
+ 
+         if (voidx <= 0 || !(h->views_active_decode & (1 << voidx))) {
+             /* not a view we know about or were asked to decode */
+diff --git a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+--- a/libavcodec/h264dec.c
++++ b/libavcodec/h264dec.c
+@@ -382,6 +382,7 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
+     ff_h264_sei_uninit(&h->sei);
+     ff_h264_ps_uninit(&h->ps);
+     av_refstruct_unref(&h->view_pps);
++    av_refstruct_unref(&h->mvc_sps);
+ 
+     ff_h2645_packet_uninit(&h->pkt);
+ 
+@@ -555,44 +556,16 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
+  * choose among them in get_format(), and sets them up. What the caller will
+  * choose cannot be known here.
+  *
+- * The subset SPS is found as find_mvc_sps() in h264_slice.c finds it: the one
+- * that the PPS of that slice resolves to, when it declares views, else the
+- * first one in the list that does.
++ * The subset SPS is found as h264_init_ps() finds it, by ff_h264_views_sps().
+  */
+ static int dependent_view_may_start(const H264Context *h)
+ {
+-    const SPS *sps = NULL;
++    const SPS *sps;
+ 
+     if (h->views_active_decode != 1 || h->avctx->hwaccel)
+         return 0;
+ 
+-    for (int i = 0; i < h->pkt.nb_nals; i++) {
+-        const H2645NAL *nal = &h->pkt.nals[i];
+-        GetBitContext gb;
+-        unsigned pps_id;
+-
+-        if (nal->type != H264_NAL_SLICE && nal->type != H264_NAL_IDR_SLICE)
+-            continue;
+-        if (init_get_bits8(&gb, nal->data + 1, nal->size - 1) < 0)
+-            break;
+-        get_ue_golomb_long(&gb);    // first_mb_in_slice
+-        get_ue_golomb_31(&gb);      // slice_type
+-        pps_id = get_ue_golomb(&gb);
+-        if (pps_id < MAX_PPS_COUNT)
+-            sps = ff_h264_pps_sps_mvc(&h->ps, h->ps.pps_list[pps_id]);
+-        break;
+-    }
+-    if (!sps || sps->mvc.num_views < 2) {
+-        sps = NULL;
+-        for (int i = 0; i < MAX_SPS_COUNT; i++) {
+-            const SPS *s = h->ps.subset_sps_list[i];
+-
+-            if (s && s->mvc.num_views > 1) {
+-                sps = s;
+-                break;
+-            }
+-        }
+-    }
++    sps = ff_h264_views_sps(h);
+     return sps && sps != h->mvc_sps;
+ }
+ 
+@@ -1115,9 +1088,10 @@ static int finalize_frame(H264Context *h, H264Picture *out)
+      * too, which is otherwise emitted even when only a dependent view was
+      * requested. */
+     if (h->nb_views > 1) {
+-        int voidx = ff_h264_view_idx(h, out->view_id);
+-
+-        if (voidx < 0 || !(h->views_active_output & (1 << voidx)))
++        /* by the view it was decoded in, not by looking its view_id up again:
++         * the views may have been decided again, from another subset SPS,
++         * since */
++        if (!(h->views_active_output & (1 << out->voidx)))
+             return 0;
+     }
+ 
+diff --git a/libavcodec/h264dec.h b/libavcodec/h264dec.h
+--- a/libavcodec/h264dec.h
++++ b/libavcodec/h264dec.h
+@@ -157,6 +157,13 @@ typedef struct H264Picture {
+ 
+     /** MVC view_id of this picture; 0 for a stream that is not multiview */
+     int view_id;
++    /**
++     * VOIdx of the view this picture was decoded in, which decides whether it is
++     * output. The views can be decided again, from another subset SPS, while a
++     * picture waits in the reorder buffer, and its view_id need not be in the
++     * new list.
++     */
++    int voidx;
+     /**
+      * For a dependent view picture, the DPB index of the base view picture of the
+      * same access unit, else -1. Used to pair the views up at output time.
+@@ -620,9 +627,10 @@ typedef struct H264Context {
+      * @{
+      */
+     /**
+-     * The subset SPS whose MVC extension declared the current view list, used
+-     * only to notice when it appears or changes. Borrowed, never dereferenced
+-     * after the fact.
++     * RefStruct reference: the subset SPS whose MVC extension declared the
++     * current view list (ff_h264_views_sps()). Handed on to the next frame
++     * thread with the list; held, so that a subset SPS that replaces it can
++     * never be taken for it.
+      */
+     const SPS *mvc_sps;
+ 
+@@ -785,12 +793,30 @@ void ff_h264_view_sync(H264Context *h);
+ 
+ /**
+  * Map a view_id onto its view order index (VOIdx), i.e. its position in the
+- * view_id[] list of the active subset SPS, cf. H.7.4.1.1.
++ * view_id[] list of the subset SPS that declares the views
++ * (ff_h264_views_sps()), cf. H.7.4.1.1.
+  *
+  * @return the VOIdx, or a negative value if the stream declares no such view.
+  */
+ int ff_h264_view_idx(const H264Context *h, int view_id);
+ 
++/**
++ * The VOIdx of @p view_id in the view list of @p sps, or a negative value.
++ */
++static inline int ff_h264_sps_view_idx(const SPS *sps, int view_id)
++{
++    for (int i = 0; sps && i < sps->mvc.num_views; i++)
++        if (sps->mvc.view_id[i] == view_id)
++            return i;
++    return AVERROR_INVALIDDATA;
++}
++
++/**
++ * The subset SPS that declares the views of what is being decoded, for the
++ * packet in h->pkt; see its definition in h264_slice.c.
++ */
++const SPS *ff_h264_views_sps(const H264Context *h);
++
+ /**
+  * Reset all per-view state, as at an IDR or a flush.
+  */

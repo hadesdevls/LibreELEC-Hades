@@ -1,0 +1,368 @@
+From 10bfcd1ab50e6360a5dc5879fde8e19ba92bc5d4 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 17:04:00 +0000
+Subject: [PATCH] tools/dvbridge: pass 3 writes what pass 8 takes of the
+ picture under each pixel
+
+Each call of drawn_over() in pass 8 made three PQ round trips: the picture under the pixel, its
+inverse for the correction of the first form, and what was drawn over the pixel. The first two
+depend on the codes of the pixel only, and each of the three calls of a pair made them again. On
+the integrated Radeon of a Ryzen 9 7950X3D with radeonsi, a profile 5 frame under the player
+information still took up to 52 to 56 ms of GPU time of the 41.7 ms of a 24 Hz refresh with the
+pass, where profiles 7 FEL and 8.1 took up to 33 and 28 ms; through D3D12 the same GPU takes 58
+ms for it in the host test of the bridge, so it measures within a tenth of radeonsi there.
+
+For a picture whose decoding is not affine, pass 3 is now PICTURE_CORR where pass 8 is made: it
+draws the picture as PICTURE draws it and, into a second target, for each pixel whether the first
+form of drawn_over() holds and its correction, codes - to_source(under), from the same expressions
+on the same values; pass 8's calls take them and make one round trip each, that of what was drawn
+over the pixel. The three calls of a pair stay apart as they were. PICTURE_CORR is made with pass
+8 and its transport, all three or none; where its target cannot be made for a picture, pass 3
+draws it alone and pass 8 is not drawn for that picture (the transport converts the pixels drawn
+over itself, as before). A picture made whole (dvbridge_source_complete()) has its corrections
+made whole with it. The corrections take a 3840x2160 texture of 32-bit floats while profile 5 is
+drawn with something over it.
+
+Measured with the host test of the bridge (162 frames of profile 5, 7 FEL and 8.1 pictures with
+Kodi's GUI composited over them, now with PQ subtitles drawn over a picture made whole beyond what
+the GUI covers): the same bytes as before on lavapipe and, through D3D12, on the integrated Radeon
+and an RTX 4080 SUPER; the GLSL of PACK, PACK_PAIRS, PICTURE and ROWS unchanged; the mutations of
+the pass and of its corrections make the bytes differ, and with any of the three programs that
+does not compile the bytes stay the same, the source transport is taken and the note of the
+renderer is raised. On the integrated Radeon through D3D12, in turns with the tree before, a
+profile 5 frame under the player information takes 51.2 ms where it took 59.7 to 60.4 ms, and 47.7
+against 58.3 ms on an idle machine; under a window over a dimmed screen, 63 against 73 ms. Profiles
+7 FEL and 8.1 stay as they were, and on the RTX 4080 SUPER every frame takes under 4 ms either way.
+Radeonsi is not verified.
+---
+ tools/dvbridge/dvbridge_source.c | 173 +++++++++++++++++++++++++++----
+ 1 file changed, 154 insertions(+), 19 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index a6a24c8..2d16529 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -200,7 +200,10 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+  * the player information) the packing took about 60 ms on an integrated Radeon (through D3D12),
+  * five times what it takes for the affine profiles. There pass 8 converts them first, a fragment
+  * for each pair, with the code of pass 4 (DRAWN_OVER) in the calls that pass 4 made but the odd
+- * pixel's second one, and pass 4 takes their codes. */
++ * pixel's second one, and pass 4 takes their codes.
++ * Hades: and pass 3 (PICTURE_CORR) writes, with the picture, what those calls take of the picture
++ * under each pixel (the correction of the first form, and whether it holds), once for each pixel
++ * where each call made it again: the calls of pass 8 make one PQ round trip each, not three. */
+ #define DRAWN_TILE 16
+ #define DRAWN_COLUMNS ((3840 + DRAWN_TILE - 1) / DRAWN_TILE)
+ #define DRAWN_ROWS ((2160 + DRAWN_TILE - 1) / DRAWN_TILE)
+@@ -583,8 +586,25 @@ static const char PAIRS[] =
+     COMMON
+     DRAWN_OVER
+     "uniform highp sampler2D drawn;\n"
++    /* Hades: of pass 3 (PICTURE_CORR), for each pixel: the correction of drawn_over()'s first form
++     * and 1 where that form holds, 0 where it does not */
++    "uniform highp sampler2D corrections;\n"
+     "uniform int apart;\n"
+     "out uvec4 color;\n"
++    /* drawn_over() with what pass 3 made of the picture under the pixel: where its first form
++     * holds, the round trip of what was drawn over it and nothing else; the second form as it is */
++    "vec3 drawn_over_corrected(ivec2 p, vec4 d)\n"
++    "{\n"
++    "    vec4 k = texelFetch(corrections, p, 0);\n"
++    "    float a = 2.0 - d.a;\n"
++    "    if (k.w > 0.5)\n"
++    "        return to_source(d.rgb) + (1.0 - a) * k.xyz;\n"
++    "    vec3 codes = codes_at(p);\n"
++    "    vec3 raw = inside(p.x, p.y) ? decode(codes) : vec3(0.0);\n"
++    "    vec3 under = clamp(raw, 0.0, 1.0);\n"
++    "    vec3 colour = (d.rgb - (1.0 - a) * under) / a;\n"
++    "    return (1.0 - a) * codes + a * to_source(colour);\n"
++    "}\n"
+     "void main()\n"
+     "{\n"
+     "    ivec2 e = ivec2(gl_FragCoord.xy) * ivec2(2, 1), o = e + ivec2(1, 0);\n"
+@@ -592,16 +612,45 @@ static const char PAIRS[] =
+     "    uvec4 r = uvec4(" NOT_OVER ");\n"
+     "    if (de.a != 2.0) {\n"
+     "        vec4 de2 = texelFetch(drawn, ivec2(e.x + apart, e.y), 0);\n"
+-    "        r.x = code(drawn_over(e, de).x);\n"
+-    "        vec3 v = drawn_over(ivec2(e.x + apart, e.y), de2);\n"
++    "        r.x = code(drawn_over_corrected(e, de).x);\n"
++    "        vec3 v = drawn_over_corrected(ivec2(e.x + apart, e.y), de2);\n"
+     "        r.z = code(v.y);\n"
+     "        r.w = code(v.z);\n"
+     "    }\n"
+     "    if (dq.a != 2.0)\n"
+-    "        r.y = code(drawn_over(o, dq).x);\n"
++    "        r.y = code(drawn_over_corrected(o, dq).x);\n"
+     "    color = r;\n"
+     "}\n";
+ 
++/* Hades: 3 for a picture whose decoding is not affine, where pass 8 will convert what is drawn over
++ * it: the picture, as PICTURE draws it, and in a second target what drawn_over() takes of the
++ * picture under each pixel, once for each pixel and before anything is drawn over it: whether its
++ * first form holds (w), and its correction, codes - to_source(under) (xyz), each from the same
++ * expressions on the same values as drawn_over(). Pass 8 then makes one PQ round trip in each of
++ * its calls where it made three (the picture under the pixel, its inverse, and what was drawn
++ * over it). */
++static const char PICTURE_CORR[] =
++    "#version 300 es\n"
++    COMMON
++    DRAWN_OVER
++    "layout(location = 0) out vec4 color;\n"
++    "layout(location = 1) out vec4 correction;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    vec3 codes = codes_at(p);\n"
++    "    vec3 raw = inside(p.x, p.y) ? decode(codes) : vec3(0.0);\n"
++    "    vec3 under = clamp(raw, 0.0, 1.0);\n"
++    "    color = vec4(under, 2.0);\n"
++    "    bool exact = affine != 0;\n"
++    "    if (!exact) {\n"
++    "        vec3 tp = ycc_forward * (codes / code_scale - ycc_offset);\n"
++    "        exact = all(greaterThanEqual(tp, vec3(0.0))) && all(lessThanEqual(tp, vec3(1.0))) &&\n"
++    "                raw == under;\n"
++    "    }\n"
++    "    correction = exact ? vec4(codes - to_source(under), 1.0) : vec4(0.0);\n"
++    "}\n";
++
+ /* 5. The edges drawn over (dvbridge_source_cover()): the raster in blocks of COVER_BLOCK x COVER_BLOCK
+  * pixels, a texel for each, which holds as its colour the edges that the pixels of the bars in its block
+  * (those outside the active picture) that are drawn over (alpha not 2) lie beyond; read back, the texels
+@@ -790,8 +839,18 @@ struct dvbridge_source_packer {
+     GLuint pairs_program, pack_pairs;
+     struct common_uniforms qc, wc;
+     struct {
+-        GLint drawn, code_max, ycc_inverse, lms_inverse, tiles, mode, flip, apart;
++        GLint drawn, code_max, ycc_inverse, lms_inverse, tiles, mode, flip, apart, corrections;
+     } q;
++    /* Hades: pass 3 for pass 8 (PICTURE_CORR: picture_corr, its uniforms, its framebuffer with the
++     * picture and the corrections), made with pass 8 or not at all. corrections_made: the last
++     * picture of dvbridge_source_picture() has its corrections wherever pass 8 reads them. */
++    GLuint picture_corr, corrections_fbo;
++    struct common_uniforms rc;
++    struct {
++        GLint tiles, mode, flip, ycc_inverse, lms_inverse;
++    } r_more;
++    struct texture corrections;
++    bool corrections_made;
+     struct pack_uniforms w;
+     struct {
+         GLint pairs, pairs_made, tiles, mode, flip;
+@@ -871,9 +930,11 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     static const char *const pack[] = {"drawn", "has_layer", "code_max", "ycc_inverse",
+         "lms_inverse", "metadata_words", "packet_count", "flip_y"};
+     static const char *const pairs[] = {"drawn", "code_max", "ycc_inverse", "lms_inverse",
+-        "drawn_tiles", "tiles_mode", "tiles_flip", "apart"};
++        "drawn_tiles", "tiles_mode", "tiles_flip", "apart", "corrections"};
+     static const char *const pack_pairs[] = {"pairs", "pairs_made", "drawn_tiles", "tiles_mode",
+                                              "tiles_flip"};
++    static const char *const picture_corr[] = {"drawn_tiles", "tiles_mode", "tiles_flip",
++                                               "ycc_inverse", "lms_inverse"};
+     static const char *const resite[] = {"chroma_plane", "code_scale", "taps", "first", "last_col",
+                                          "weights"};
+     static const char *const rows[] = {"chroma_plane", "chroma_read", "chroma_shift", "taps",
+@@ -885,6 +946,7 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     _Static_assert(sizeof(p->v) == COUNT(rows) * sizeof(GLint), "rows uniforms");
+     _Static_assert(sizeof(p->q) == COUNT(pairs) * sizeof(GLint), "pairs uniforms");
+     _Static_assert(sizeof(p->w_more) == COUNT(pack_pairs) * sizeof(GLint), "pack_pairs uniforms");
++    _Static_assert(sizeof(p->r_more) == COUNT(picture_corr) * sizeof(GLint), "picture_corr uniforms");
+     /* (Hades: passes 3 and 4 over the raster or over its tiles) */
+     p->pack = link_with(TILED_VERTEX, PACK);
+     p->picture = link_with(TILED_VERTEX, PICTURE);
+@@ -929,21 +991,25 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+         dvbridge_source_packer_destroy(p);
+         return NULL;
+     }
+-    /* Hades: pass 8 and the form of pass 4 that takes its codes, after the rest, which they do not
+-     * change: both or neither, so that a GPU that cannot make one of them has the packer it had
+-     * before them (said once here; Kodi's log says it of a stream that would take them, through
+-     * dvbridge_source_pairs_missed()) */
++    /* Hades: pass 8, the form of pass 4 that takes its codes and the form of pass 3 that writes the
++     * corrections it takes, after the rest, which they do not change: all three or none, so that a
++     * GPU that cannot make one of them has the packer it had before them (said once here; Kodi's
++     * log says it of a stream that would take them, through dvbridge_source_pairs_missed()) */
+     p->pairs_program = link_with(TILED_VERTEX, PAIRS);
+     p->pack_pairs = link_with(TILED_VERTEX, PACK_PAIRS);
+-    if (!p->pairs_program || !p->pack_pairs ||
++    p->picture_corr = link_with(TILED_VERTEX, PICTURE_CORR);
++    if (!p->pairs_program || !p->pack_pairs || !p->picture_corr ||
+         !locate(p->pairs_program, &p->qc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
+         !locate(p->pairs_program, &p->q.drawn, pairs, COUNT(pairs)) ||
+         !locate(p->pack_pairs, &p->wc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
+         !locate(p->pack_pairs, &p->w.drawn, pack, COUNT(pack)) ||
+-        !locate(p->pack_pairs, &p->w_more.pairs, pack_pairs, COUNT(pack_pairs))) {
++        !locate(p->pack_pairs, &p->w_more.pairs, pack_pairs, COUNT(pack_pairs)) ||
++        !locate(p->picture_corr, &p->rc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
++        !locate(p->picture_corr, &p->r_more.tiles, picture_corr, COUNT(picture_corr))) {
+         glDeleteProgram(p->pairs_program);
+         glDeleteProgram(p->pack_pairs);
+-        p->pairs_program = p->pack_pairs = 0;
++        glDeleteProgram(p->picture_corr);
++        p->pairs_program = p->pack_pairs = p->picture_corr = 0;
+         fprintf(stderr, "DV source transport: the pass that converts the pixels drawn over a "
+                         "profile 5 picture once could not be made; they are converted as before\n");
+     }
+@@ -976,6 +1042,8 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->gui_tiles);
+     texture_destroy(&p->tiles);
+     texture_destroy(&p->pairs);
++    texture_destroy(&p->corrections);
++    glDeleteFramebuffers(1, &p->corrections_fbo);
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+     glDeleteProgram(p->pack);
+@@ -988,6 +1056,7 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteProgram(p->drawn_program);
+     glDeleteProgram(p->pairs_program);
+     glDeleteProgram(p->pack_pairs);
++    glDeleteProgram(p->picture_corr);
+     free(p);
+ }
+ 
+@@ -1206,6 +1275,7 @@ void dvbridge_source_forget(struct dvbridge_source_packer *p)
+         return;
+     p->gui = 0;
+     p->tiles_mode = 0;
++    p->corrections_made = false;
+ }
+ 
+ /* Hades: passes 6 and 7, for the texture that dvbridge_source_drawn() gave: false where they could
+@@ -1242,12 +1312,52 @@ static bool make_tiles(struct dvbridge_source_packer *p)
+     return glGetError() == GL_NO_ERROR;
+ }
+ 
+-/* pass 3 into framebuffer: how 0 everywhere, 1 in the tiles, 2 outside them */
++/* Hades: the framebuffer of PICTURE_CORR, bound: the texture of the picture of framebuffer (bound,
++ * and checked by the caller) and that of the corrections. False, with framebuffer bound again,
++ * where it cannot be made. */
++static bool corrections_target(struct dvbridge_source_packer *p, unsigned framebuffer)
++{
++    GLint kind = 0, picture = 0, level = -1;
++    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                                          GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &kind);
++    if (kind == GL_TEXTURE) {
++        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                                              GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &picture);
++        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                                              GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL, &level);
++    }
++    bool ok = framebuffer && kind == GL_TEXTURE && picture > 0 && level == 0 &&
++              target(&p->corrections, GL_RGBA32F, 3840, 2160);
++    if (ok) {
++        if (!p->corrections_fbo)
++            glGenFramebuffers(1, &p->corrections_fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER, p->corrections_fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, (GLuint)picture,
++                               0);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
++                               p->corrections.texture, 0);
++        static const GLenum BUFFERS[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
++        glDrawBuffers(2, BUFFERS);
++        ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE &&
++             glGetError() == GL_NO_ERROR;
++    }
++    if (!ok) {
++        for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++            ;
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    }
++    glViewport(0, 0, 3840, 2160);
++    return ok;
++}
++
++/* pass 3 into framebuffer: how 0 everywhere, 1 in the tiles, 2 outside them. Hades: *corrected,
++ * whether the corrections of pass 8 were written with it (PICTURE_CORR) */
+ static bool draw_picture(struct dvbridge_source_packer *p,
+                          const struct dvbridge_source_params *params, unsigned luma, int width,
+                          int height, int x, int y, const unsigned margins[4], unsigned framebuffer,
+-                         int how)
++                         int how, bool *corrected)
+ {
++    *corrected = false;
+     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+     GLint red = 0, alpha = 0, type = 0;
+     glGetIntegerv(GL_RED_BITS, &red);
+@@ -1259,6 +1369,19 @@ static bool draw_picture(struct dvbridge_source_packer *p,
+         alpha != 32 || type != GL_FLOAT)
+         return false;
+     glViewport(0, 0, 3840, 2160);
++    /* Hades: where pass 8 will convert what is drawn over the picture, the picture with its
++     * corrections; where they cannot be written, the picture alone (pass 8 is then not drawn) */
++    if (!params->affine && p->picture_corr && corrections_target(p, framebuffer)) {
++        glUseProgram(p->picture_corr);
++        set_common(p, &p->rc, params, luma, width, height, x, y, margins);
++        set_tiles(p, p->r_more.tiles, p->r_more.mode, how);
++        glUniform1i(p->r_more.flip, 0);
++        set_matrix(p->r_more.ycc_inverse, params->ycc_inverse);
++        set_matrix(p->r_more.lms_inverse, params->lms_inverse);
++        glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(how));
++        *corrected = true;
++        return true;
++    }
+     glUseProgram(p->picture);
+     set_common(p, &p->cc, params, luma, width, height, x, y, margins);
+     set_tiles(p, p->cc_tiles, p->cc_mode, how);
+@@ -1272,8 +1395,10 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+                              int height, int x, int y, const unsigned margins[4],
+                              unsigned framebuffer)
+ {
+-    if (p)
++    if (p) {
+         p->tiles_mode = 0;
++        p->corrections_made = false;
++    }
+     if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
+         !rows_of(p, width, height, x, y, margins)) {
+         if (p)
+@@ -1289,10 +1414,13 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+     p->gui = 0;
+     for (int i = 0; !how && i < 16 && glGetError() != GL_NO_ERROR; ++i)
+         ;
+-    const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, how);
++    bool corrected = false;
++    const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, how,
++                                    &corrected);
+     if (!end(&state, drawn))
+         return false;
+     p->tiles_mode = how;
++    p->corrections_made = corrected;
+     return true;
+ }
+ 
+@@ -1308,8 +1436,13 @@ bool dvbridge_source_complete(struct dvbridge_source_packer *p,
+         return false;
+     struct dvbridge_gl_state state;
+     begin(p, &state);
+-    if (!draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, 2))
++    bool corrected = false;
++    if (!draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, 2, &corrected)) {
++        p->corrections_made = false;
+         return end(&state, false);
++    }
++    /* Hades: the corrections are wherever pass 8 reads them only where both draws wrote them */
++    p->corrections_made = p->corrections_made && corrected;
+     if (!end(&state, true))
+         return false;
+     p->tiles_mode = 0;
+@@ -1347,7 +1480,7 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+      * tiles that it may reach (or over the whole raster): the pixels drawn over converted back once
+      * each. Where it is not drawn, pass 4 converts them itself (the same codes, more slowly). */
+     bool pairs = false;
+-    if (layer && !params->affine && p->pairs_program) {
++    if (layer && !params->affine && p->pairs_program && p->corrections_made) {
+         const int pairs_how = p->tiles_mode ? 1 : 0;
+         if (target(&p->pairs, GL_RGBA16UI, 1920, 2160)) {
+             glUseProgram(p->pairs_program);
+@@ -1358,6 +1491,8 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+             glUniform1i(p->q.flip, 0);
+             set_inverse(p->q.ycc_inverse, p->q.lms_inverse, p->q.code_max, params);
+             glUniform1i(p->q.apart, 0);
++            bind(p, 5, p->corrections.texture);
++            glUniform1i(p->q.corrections, 5);
+             glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(pairs_how));
+             pairs = glGetError() == GL_NO_ERROR;
+         }
+-- 
+2.53.0
+

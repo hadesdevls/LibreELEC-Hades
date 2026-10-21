@@ -1,0 +1,176 @@
+From 00854afaeae6bc19e65eff366022f639ba69c298 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:19:06 +0000
+Subject: [PATCH] tools/dvbridge: read what the RPU of an access unit says
+ before it is decoded
+
+For a stream that no Dolby Vision record declares, and for two tracks that libavformat does not
+group, the RPU in the packets is what tells what they are. dvbridge_rpu_probe_packet() takes the RPU
+as FFmpeg's HEVC decoder takes it, reads its header as ff_dovi_rpu_parse() does and guesses the
+profile as ff_dovi_guess_profile_hevc(); it also says whether the access unit carries units of an
+enhancement layer (type 63). On 96 pictures of a profile 7 FEL stream its fields are those that
+FFmpeg's decoder parses.
+---
+ tools/dvbridge/CMakeLists.txt   |  2 +-
+ tools/dvbridge/dvbridge_probe.c | 87 +++++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_probe.h | 41 ++++++++++++++++
+ 3 files changed, 129 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_probe.c
+ create mode 100644 tools/dvbridge/dvbridge_probe.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 00f2c44..12a9444 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -12,7 +12,7 @@ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c
+-                                dvbridge_source.c)
++                                dvbridge_source.c dvbridge_probe.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_probe.c b/tools/dvbridge/dvbridge_probe.c
+new file mode 100644
+index 0000000..092d8f4
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_probe.c
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_probe.h. */
++#include "dvbridge_probe.h"
++
++#include "dvbridge_mel.h"
++
++#include <string.h>
++
++/* (dvbridge_rpu_units(): any unit of type 63 is one of the enhancement layer) */
++static bool find_layer_unit(const uint8_t *unit, size_t size, void *context)
++{
++    bool *found = context;
++    if (size >= 2 && !(unit[0] & 0x80) && (unit[0] >> 1 & 0x3f) == 63) {
++        *found = true;
++        return false;
++    }
++    return true;
++}
++
++void dvbridge_rpu_probe_packet(const uint8_t *data, size_t size, int length_size,
++                               struct dvbridge_rpu_probe *out)
++{
++    memset(out, 0, sizeof(*out));
++    if (!data || !size || length_size < 0 || length_size > 4)
++        return;
++
++    bool layer = false;
++    dvbridge_rpu_units(data, size, length_size, find_layer_unit, &layer);
++    struct dvbridge_rpu_find find = {0};
++    dvbridge_rpu_units(data, size, length_size, dvbridge_rpu_find_unit, &find);
++    if (!find.rpu)
++        return;
++    uint8_t rpu[DVBRIDGE_RPU_BYTES];
++    size_t n = dvbridge_rpu_unescape(find.rpu, find.size, rpu);
++    while (n && !rpu[n - 1])
++        --n;
++    if (n < 5 || rpu[0] != 25) /* the prefix of an RPU in a NAL unit */
++        return;
++
++    /* the header, as ff_dovi_rpu_parse() reads it (rpu_data_header()) */
++    struct dvbridge_rpu_bits b = {.data = rpu + 1, .size = n - 1};
++    if (dvbridge_rpu_bits_get(&b, 6) != 2) /* rpu_type */
++        return;
++    const unsigned format = (unsigned)dvbridge_rpu_bits_get(&b, 11);
++    const unsigned rpu_profile = (unsigned)dvbridge_rpu_bits_get(&b, 4);
++    dvbridge_rpu_bits_get(&b, 4); /* vdr_rpu_level */
++    if (!dvbridge_rpu_bits_get(&b, 1)) /* vdr_seq_info_present_flag */
++        return;
++    dvbridge_rpu_bits_get(&b, 1); /* chroma_resampling_explicit_filter_flag */
++    const uint64_t type = dvbridge_rpu_bits_get(&b, 2);
++    if (type > 1)
++        return;
++    if (type == 0) {
++        const uint64_t denom = dvbridge_rpu_bits_ue(&b);
++        if (denom < 13 || denom > 32)
++            return;
++    }
++    dvbridge_rpu_bits_get(&b, 2); /* vdr_rpu_normalized_idc */
++    const bool full_range = dvbridge_rpu_bits_get(&b, 1);
++    if (format & 0x700)
++        return;
++    const uint64_t bl = dvbridge_rpu_bits_ue(&b), el = dvbridge_rpu_bits_ue(&b);
++    const uint64_t vdr = dvbridge_rpu_bits_ue(&b);
++    if (bl > 8 || (el & 0xff) > 8 || vdr > 8)
++        return;
++    dvbridge_rpu_bits_get(&b, 1); /* spatial_resampling_filter_flag */
++    dvbridge_rpu_bits_get(&b, 3); /* reserved, or the compression of the metadata */
++    const bool el_resampling = dvbridge_rpu_bits_get(&b, 1);
++    const bool disabled = dvbridge_rpu_bits_get(&b, 1);
++    if (b.over)
++        return;
++
++    out->rpu = true;
++    out->layer = layer;
++    out->rpu_profile = rpu_profile;
++    out->vdr_bit_depth = (unsigned)vdr + 8;
++    out->bl_full_range = full_range;
++    out->el_resampling = el_resampling;
++    out->residual_disabled = disabled;
++    /* ff_dovi_guess_profile_hevc() */
++    if (rpu_profile == 0 && full_range)
++        out->profile = 5;
++    else if (rpu_profile == 1 && el_resampling && !disabled)
++        out->profile = out->vdr_bit_depth == 12 ? 7 : 4;
++    else if (rpu_profile == 1)
++        out->profile = 8;
++}
+diff --git a/tools/dvbridge/dvbridge_probe.h b/tools/dvbridge/dvbridge_probe.h
+new file mode 100644
+index 0000000..6692499
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_probe.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_PROBE_H
++#define DVBRIDGE_PROBE_H
++/* Hades: what an access unit says of Dolby Vision before it is decoded. For a stream that no Dolby
++ * Vision record declares, and for two tracks that nothing groups, the RPU in the stream is the one
++ * thing that does. The RPU is taken as FFmpeg's HEVC decoder takes it (dvbridge_rpu_find_unit():
++ * the last unit of type 62 that is not the first one), and its header is read as
++ * ff_dovi_rpu_parse() reads it. */
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct dvbridge_rpu_probe {
++    bool rpu;               /* an RPU of type 2 whose header could be read, sequence information
++                             * included */
++    bool layer;             /* units of the enhancement layer, each in a unit of type 63 (the
++                             * one-track form of a dual-layer stream) */
++    unsigned rpu_profile;   /* vdr_rpu_profile */
++    unsigned vdr_bit_depth; /* vdr_bit_depth_minus8 + 8 */
++    bool bl_full_range;     /* bl_video_full_range_flag */
++    bool el_resampling;     /* el_spatial_resampling_filter_flag */
++    bool residual_disabled; /* disable_residual_flag */
++    /* the profile as FFmpeg guesses it from the header (ff_dovi_guess_profile_hevc()): 4, 5, 7 or
++     * 8; 0 when it cannot be told */
++    unsigned profile;
++};
++
++/* data: an access unit framed with a length of length_size bytes before each unit (an hvcC
++ * record), or with start codes (0). out is all zeros when the access unit has no RPU, or one whose
++ * header cannot be read. */
++void dvbridge_rpu_probe_packet(const uint8_t *data, size_t size, int length_size,
++                               struct dvbridge_rpu_probe *out);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

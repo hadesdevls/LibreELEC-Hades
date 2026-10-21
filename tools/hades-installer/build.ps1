@@ -6,7 +6,7 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $csc)) { throw "The C# compiler of Windows was not found: $csc" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $exe = Join-Path $Out 'LibreELEC-Hades-Installer.exe'
-$sources = 'Model.cs', 'Image.cs', 'Disks.cs', 'Operations.cs', 'Window.cs', 'Tests.cs', 'VhdTest.cs', 'Program.cs' |
+$sources = 'Model.cs', 'Image.cs', 'Diagnostics.cs', 'Disks.cs', 'Operations.cs', 'Window.cs', 'Tests.cs', 'VhdTest.cs', 'Program.cs' |
   ForEach-Object { Join-Path $PSScriptRoot $_ }
 # The sources are UTF-8 without a byte order mark: /codepage says so, or the accents and quotes of the texts
 # would depend on what the compiler guesses.

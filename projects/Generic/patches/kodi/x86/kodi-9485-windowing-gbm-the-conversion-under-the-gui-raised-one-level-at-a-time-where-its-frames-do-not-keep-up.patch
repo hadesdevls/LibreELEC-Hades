@@ -1,0 +1,1178 @@
+From 8349b443344195c169340100d042a4e38735ef38 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:37:18 +0000
+Subject: [PATCH] windowing/gbm: the conversion under the GUI raised one level
+ at a time where its frames do not keep up
+
+CDVGuiLevel takes the place of CDVGuiRound: every frame is drawn at level 0,
+the conversion as 9ff2bad had it, and the frames with GUI elements of a profile
+5 picture go up one level only where they are measured not to keep up at their
+level, by the same rule (GPU time over the mark of CDVStepDown and missed
+refreshes, two windows in a row or one beyond the period, nothing while frames
+can still be presented a frame ahead, nothing in the seconds after a seek or
+after GUI elements come), up to the highest the bridge can draw: level 1 (the
+same bytes) first, level 2 (the simplified rounding) only where level 1 does
+not keep up either. Each level comes down by one when the level below would
+take, by the ratio measured when it went up, no more than the release mark,
+after a minute of film at it; where it has to go up again before the level
+below kept up for a minute, its wait doubles. Frames without GUI elements, a
+GPU that keeps up and the frames of profile 7 FEL and 8.1 stay at level 0.
+
+The targets of levels 1 and 2 are freed when the last format above level 0
+comes down to it, and when native output ends. The GPU time of a frame is
+taken with the pace it was presented at, not the pace when its time is read.
+A log line for each change (level 2, as before: "the rounding of the
+conversion under the GUI is simplified (at most 1 code in near-ties)"), and
+the player information says so while frames are drawn at level 2.
+
+The decision has a host test (both ways, the levels, 71 checks) and 21
+mutations of it, all caught.
+---
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  18 +-
+ xbmc/windowing/gbm/DVGuiLevel.h               | 383 ++++++++++++++++++
+ xbmc/windowing/gbm/DVGuiRound.h               | 367 -----------------
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 128 ++++--
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  41 +-
+ 5 files changed, 509 insertions(+), 428 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/DVGuiLevel.h
+ delete mode 100644 xbmc/windowing/gbm/DVGuiRound.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index ae4ea8f..74b508b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -86,14 +86,16 @@ public:
+   {
+     return dvbridge_render_step_levels(m_renderer, residual);
+   }
+-  //! Hades: the simplified rounding under the GUI for the frames prepared from now on (see
+-  //! dvbridge_render_simplify_gui()): only the pixels drawn over a profile 5 picture are drawn
+-  //! another way, a code apart in values close to a half
+-  void SimplifyGui(bool simplify) { dvbridge_render_simplify_gui(m_renderer, simplify); }
+-  //! ... the prepared frame is one that it draws (profile 5 in the source transport, its programs
+-  //! made), and the last frame packed was drawn with it
+-  bool GuiSimplifiable() const { return dvbridge_render_gui_simplifiable(m_renderer); }
+-  bool GuiSimplified() const { return dvbridge_render_gui_simplified(m_renderer); }
++  //! Hades: the level of the conversion of the pixels drawn over a profile 5 picture for the
++  //! frames prepared from now on (see dvbridge_render_gui_level()): 0, as it was; 1, the same bytes
++  //! with the picture under each pixel taken from pass 3; 2, the simplified rounding, a code apart
++  //! in values close to a half under what is drawn over only
++  void SetGuiLevel(int level) { dvbridge_render_gui_level(m_renderer, level); }
++  //! ... the highest the prepared frame can be drawn at (0: it is not one of those), the one the
++  //! last frame packed was drawn at, and the targets of levels 1 and 2 freed
++  int GuiTop() const { return dvbridge_render_gui_top(m_renderer); }
++  int GuiDrawn() const { return dvbridge_render_gui_drawn(m_renderer); }
++  void ReleaseGui() { dvbridge_render_gui_release(m_renderer); }
+   //! Hades: the renderer composes the picture as ETSI GS CCM 001 does (its step-down levels are
+   //! those of that composer: see dvbridge_render_set_step())
+   bool CCMComposer() const { return dvbridge_render_ccm_composer(m_renderer); }
+diff --git a/xbmc/windowing/gbm/DVGuiLevel.h b/xbmc/windowing/gbm/DVGuiLevel.h
+new file mode 100644
+index 0000000..f70525d
+--- /dev/null
++++ b/xbmc/windowing/gbm/DVGuiLevel.h
+@@ -0,0 +1,383 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "DVStepDown.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief The level of the conversion of the pixels drawn over a profile 5 picture in frames with
++ *        GUI elements (dvbridge_render_gui_level()), raised only where those frames do not keep up
++ *
++ * Converting a pixel drawn over a picture of profile 5 back to codes takes PQ round trips that the
++ * affine profiles do not, and on a small GPU the frames with GUI elements over most of the picture
++ * (the player information, a window over the dimmed video) can take more than a refresh while the
++ * others fit. Level 0, the conversion as it was, is that of every frame unless the frames with GUI
++ * elements of its format are measured not to keep up; then level 1, the same bytes with the
++ * picture under each pixel taken from pass 3 (and a target of 132.7 MB); and, only where level 1
++ * is measured not to keep up either, level 2, the simplified rounding (a code apart in values
++ * close to a half, under what is drawn over only).
++ *
++ * The frames measured are those with GUI elements whose picture the bridge can draw above level 0
++ * (profile 5 in the source transport, the programs of a level made: top), while the video plays.
++ * Each picture format (CDVFrameLoad) at each fidelity step-down level (CDVStepDown: the frames of
++ * another level are other work) and refresh period has a state of its own, at level 0 until its
++ * frames are found not to keep up. Its frames are measured in windows of WINDOW frames of one
++ * level drawn and one pace, leaving out the first seconds of a video and after a seek (SETTLE_MS),
++ * the first second after GUI elements come (GUI_SETTLE_MS: the GUI that appears is drawn and faded
++ * in meanwhile, and the GPU times of CDVAhead are set aside then too), the first frames after a
++ * change of level or of pace (SKIP), and the frames drawn at another level than the format's
++ * (frames in flight, or a level that the bridge could not draw). A window is behind as a window of
++ * CDVStepDown is: both its GPU times and its missed refreshes say so (frames presented a frame
++ * ahead that take more than LOADED_AHEAD of the period on average without the slowest, and
++ * LOST_PART of the presentations, LOST_MIN at least, late; frames that wait, LOST_PART of them over
++ * LOADED_WAITING of the period and as many presentations late); two windows in a row, or one in
++ * which the GPU could not keep up in any case, raise the level by one, up to top. While frames are
++ * still to be presented a frame ahead (CDVStepDown::Pace::PENDING), that comes first: nothing goes
++ * up.
++ *
++ * Raised: the first window at the new level says what it takes for what the level below took (the
++ * window that raised it). Down again by one only when the level below would take, by that, no more
++ * than RELEASE_AHEAD or RELEASE_WAITING of the period (room to spare below the marks), and only
++ * RELEASE_WAIT measured frames after the level was reached; where a level has to be raised to
++ * again after coming down from it, before the level below kept up for as long, its wait doubles.
++ * Nothing comes down on a guess.
++ *
++ * This class only decides. The window system asks it for each frame with GUI elements, tells it
++ * their GPU times and presentations, logs what changes and frees the targets of the levels when
++ * no format is above level 0 (Above()).
++ */
++class CDVGuiLevel
++{
++public:
++  using Pace = CDVStepDown::Pace;
++  static constexpr unsigned int WINDOW = CDVStepDown::WINDOW;
++  static constexpr int LEVELS = 3;
++
++  enum class Change
++  {
++    NONE,
++    UP, //!< the frames did not keep up at the level below: this one from now on
++    DOWN, //!< the level below would fit with room to spare: back to it
++  };
++
++  struct Step
++  {
++    Change change = Change::NONE;
++    int from = 0;
++    int to = 0;
++    Pace pace = Pace::PENDING;
++    double averageMs = 0; //!< the window's GPU time, without its slowest frame
++    double budgetMs = 0; //!< the mark of a frame at that pace and refresh period
++    double periodMs = 0;
++    unsigned int frames = 0;
++    unsigned int over = 0;
++    unsigned int presented = 0;
++    unsigned int lost = 0;
++    double estimateMs = 0; //!< DOWN: what the level below would take now
++  };
++
++  //! A frame with GUI elements of that format is to be drawn: at which level (0 where not known)
++  int Level(uint64_t format, int step, double periodMs) const
++  {
++    const Format* const f = Lookup(format, step, periodMs);
++    return f ? f->level : 0;
++  }
++
++  //! The GPU time of a frame with GUI elements whose picture the bridge can draw above level 0, up
++  //! to top, drawn at the level drawn, while the video played, presented at that pace
++  Step Measured(uint64_t format, int step, int drawn, int top, double ms, double periodMs, Pace pace)
++  {
++    if (format == 0 || !(ms > 0) || !std::isfinite(ms) || !(periodMs > 0) || !std::isfinite(periodMs))
++      return Step();
++    Format& f = *Find(format, step, periodMs);
++    // a frame drawn at another level than the format's (before a change, or one that the bridge
++    // could not draw): not taken
++    if (drawn != f.level)
++      return Step();
++    Window& w = f.window;
++    if (w.count > 0 && w.pace != pace)
++    {
++      f.Drop();
++      f.skip = std::max(f.skip, SKIP);
++    }
++    const bool settling = m_settlingMs > 0 || m_guiSettlingMs > 0 || f.skip > 0;
++    if (m_settlingMs > 0)
++      m_settlingMs -= periodMs;
++    if (m_guiSettlingMs > 0)
++      m_guiSettlingMs -= periodMs;
++    if (f.skip > 0)
++      --f.skip;
++    if (settling)
++      return Step();
++    if (w.count == 0)
++    {
++      w = Window();
++      w.pace = pace;
++    }
++    w.sum += ms;
++    w.max = std::max(w.max, ms);
++    w.over += ms > LOADED_WAITING * periodMs ? 1 : 0;
++    if (++w.count < WINDOW)
++      return Step();
++    return Decide(f, std::clamp(top, 0, LEVELS - 1));
++  }
++
++  //! A frame with GUI elements whose picture the bridge can draw above level 0 was presented, at
++  //! that pace, and whether it came with its refresh is known
++  void Presented(uint64_t format, int step, int drawn, bool late, Pace pace, double periodMs)
++  {
++    Format* const f = Lookup(format, step, periodMs);
++    if (!f || drawn != f->level || f->window.count == 0 || f->window.pace != pace)
++      return;
++    ++f->window.presented;
++    f->window.lost += late ? 1 : 0;
++  }
++
++  //! A frame without GUI elements was drawn while the video played: the first ones with GUI
++  //! elements that come after it are left out
++  void Plain()
++  {
++    m_guiSettlingMs = GUI_SETTLE_MS;
++    for (Format& f : m_formats)
++      f.Drop();
++  }
++
++  //! The video jumped (a seek, a change of stream): the frames around it say nothing
++  void Seeked()
++  {
++    for (Format& f : m_formats)
++      f.Drop();
++    m_settlingMs = SETTLE_MS;
++  }
++
++  //! Native output ended: what is found stays, the windows begin again with the next video
++  void Restart() { Seeked(); }
++
++  //! Whether a format is above level 0 (the targets of the levels are needed)
++  bool Above() const
++  {
++    return std::any_of(m_formats.begin(), m_formats.end(),
++                       [](const Format& f) { return f.id != 0 && f.level > 0; });
++  }
++
++private:
++  static constexpr unsigned int SKIP = 6; //!< frames left out after a change
++  static constexpr double SETTLE_MS = 2000; //!< the start of a video, and after a seek
++  static constexpr double GUI_SETTLE_MS = 1000; //!< after GUI elements come
++  static constexpr size_t FORMATS = 8; //!< formats and refresh periods known at a time
++  // (the marks of CDVStepDown, for the same frames presented the same ways)
++  static constexpr double LOADED_AHEAD = 0.85;
++  static constexpr double LOADED_WAITING = 0.8;
++  static constexpr double RELEASE_AHEAD = 0.75;
++  static constexpr double RELEASE_WAITING = 0.7;
++  static constexpr double LOST_PART = 0.05;
++  static constexpr unsigned int LOST_MIN = 3;
++  static constexpr unsigned int KNOWN_MIN = WINDOW / 2;
++  //! measured frames at a level before it comes down (a minute of film), doubled each time it had
++  //! to be raised to again, up to about an hour of film
++  static constexpr unsigned int RELEASE_WAIT = 1440;
++  static constexpr unsigned int RELEASE_MAX_WAIT = 64 * RELEASE_WAIT;
++
++  struct Window
++  {
++    unsigned int count = 0;
++    double sum = 0;
++    double max = 0;
++    unsigned int over = 0;
++    Pace pace = Pace::PENDING;
++    unsigned int presented = 0;
++    unsigned int lost = 0;
++  };
++
++  struct Format
++  {
++    uint64_t id = 0; //!< 0: none
++    int step = 0;
++    double periodMs = 0;
++    uint64_t used = 0; //!< m_clock of its last frame measured
++    int level = 0;
++    //! what the last window at each level took
++    std::array<double, LEVELS> knownMs{};
++    //! what level n takes for what level n + 1 takes (0: not known)
++    std::array<double, LEVELS - 1> ratio{};
++    bool justUp = false; //!< it went up, and no window at the new level has ended yet
++    //! it came down from that level, and has not kept up below it for RELEASE_WAIT measured
++    //! frames yet (downKept)
++    int downFrom = 0;
++    unsigned int downKept = 0;
++    unsigned int sinceLevel = 0; //!< measured frames at its level since it was reached
++    std::array<unsigned int, LEVELS> wait{0, RELEASE_WAIT, RELEASE_WAIT};
++    unsigned int behind = 0; //!< windows in a row that were behind
++    unsigned int skip = SKIP;
++    Window window;
++
++    void Drop()
++    {
++      window = Window();
++      behind = 0;
++    }
++  };
++
++  static bool SamePeriod(double a, double b) { return std::fabs(a - b) <= 0.02 * b; }
++
++  static unsigned int Mark(unsigned int count)
++  {
++    return std::max(LOST_MIN, static_cast<unsigned int>(std::ceil(LOST_PART * count)));
++  }
++
++  Format* Lookup(uint64_t id, int step, double periodMs)
++  {
++    for (Format& f : m_formats)
++    {
++      if (id != 0 && f.id == id && f.step == step && SamePeriod(f.periodMs, periodMs))
++        return &f;
++    }
++    return nullptr;
++  }
++  const Format* Lookup(uint64_t id, int step, double periodMs) const
++  {
++    return const_cast<CDVGuiLevel*>(this)->Lookup(id, step, periodMs);
++  }
++
++  //! The format at that step-down level and period, or a place for it: a free one, else the one
++  //! measured longest ago of those at level 0, else the one measured longest ago
++  Format* Find(uint64_t id, int step, double periodMs)
++  {
++    ++m_clock;
++    if (Format* const f = Lookup(id, step, periodMs))
++    {
++      f->used = m_clock;
++      return f;
++    }
++    const auto rank = [](const Format& g) { return g.id == 0 ? 0 : g.level > 0 ? 2 : 1; };
++    Format* place = &m_formats[0];
++    for (Format& f : m_formats)
++    {
++      if (rank(f) < rank(*place) || (rank(f) == rank(*place) && f.used < place->used))
++        place = &f;
++    }
++    *place = Format();
++    place->id = id;
++    place->step = step;
++    place->periodMs = periodMs;
++    place->used = m_clock;
++    return place;
++  }
++
++  Step To(Format& f, int level, Change change, Step step)
++  {
++    step.change = change;
++    step.from = f.level;
++    step.to = level;
++    f.level = level;
++    f.sinceLevel = 0;
++    f.Drop();
++    f.skip = std::max(f.skip, SKIP);
++    return step;
++  }
++
++  Step Decide(Format& f, int top)
++  {
++    const Window w = f.window;
++    f.window = Window();
++    const double average = (w.sum - w.max) / (w.count - 1);
++    Step step;
++    step.from = step.to = f.level;
++    step.pace = w.pace;
++    step.averageMs = average;
++    step.periodMs = f.periodMs;
++    step.budgetMs = (w.pace == Pace::AHEAD ? LOADED_AHEAD : LOADED_WAITING) * f.periodMs;
++    step.frames = w.count;
++    step.over = w.over;
++    step.presented = w.presented;
++    step.lost = w.lost;
++
++    const bool known = w.presented >= KNOWN_MIN;
++    const bool missed = w.lost >= Mark(w.presented);
++    bool behind = false;
++    bool beyond = false;
++    if (w.pace == Pace::AHEAD)
++    {
++      behind = known && missed && average > step.budgetMs;
++      beyond = average > f.periodMs;
++    }
++    else
++    {
++      behind = known && missed && w.over >= Mark(w.count);
++      beyond = 2 * w.over > w.count;
++    }
++
++    const int level = f.level;
++    // raised: the first window at it says what it takes for what the level below took
++    if (f.justUp)
++    {
++      f.justUp = false;
++      if (level > 0 && f.knownMs[level - 1] > 0 && average > 0)
++        f.ratio[level - 1] = f.knownMs[level - 1] / average;
++    }
++    f.knownMs[level] = average;
++
++    if (behind)
++    {
++      // frame ahead comes first; one window could have been slow for another reason
++      if (level >= top || w.pace == Pace::PENDING || (!beyond && ++f.behind < 2))
++        return step;
++      f.behind = 0;
++      // it came down from the level above and does not keep up after all: that level waits
++      // longer before it comes down again
++      if (f.downFrom == level + 1)
++        f.wait[level + 1] = std::min(2 * f.wait[level + 1], RELEASE_MAX_WAIT);
++      f.downFrom = 0;
++      f.justUp = true;
++      return To(f, level + 1, Change::UP, step);
++    }
++    f.behind = 0;
++    // it kept up for a minute of film after coming down: the wait of the level above is back to
++    // its start
++    if (known && f.downFrom == level + 1 && (f.downKept += w.count) >= RELEASE_WAIT)
++    {
++      f.downFrom = 0;
++      f.wait[level + 1] = RELEASE_WAIT;
++    }
++    if (level == 0)
++      return step;
++    f.sinceLevel += w.count;
++    if (!known || f.sinceLevel < f.wait[level] || !(f.ratio[level - 1] > 0))
++      return step;
++    const double estimate = average * f.ratio[level - 1];
++    const double release = (w.pace == Pace::AHEAD ? RELEASE_AHEAD : RELEASE_WAITING) * f.periodMs;
++    if (estimate > release)
++      return step;
++    step.estimateMs = estimate;
++    f.downFrom = level;
++    f.downKept = 0;
++    return To(f, level - 1, Change::DOWN, step);
++  }
++
++  std::array<Format, FORMATS> m_formats{};
++  uint64_t m_clock = 0;
++  double m_settlingMs = SETTLE_MS; //!< time of measured frames still left out, of any format
++  double m_guiSettlingMs = 0; //!< ... after GUI elements came
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/DVGuiRound.h b/xbmc/windowing/gbm/DVGuiRound.h
+deleted file mode 100644
+index 5fa963a..0000000
+--- a/xbmc/windowing/gbm/DVGuiRound.h
++++ /dev/null
+@@ -1,367 +0,0 @@
+-/*
+- *  Copyright (C) 2026 Hades
+- *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
+- *
+- *  SPDX-License-Identifier: GPL-2.0-or-later
+- *  See LICENSES/README.md for more information.
+- */
+-
+-#pragma once
+-
+-#include "DVStepDown.h"
+-
+-#include <algorithm>
+-#include <array>
+-#include <cmath>
+-#include <cstdint>
+-
+-namespace KODI
+-{
+-namespace WINDOWING
+-{
+-namespace GBM
+-{
+-
+-/*!
+- * \brief Whether the pixels drawn over a profile 5 picture are converted with the simplified
+- *        rounding (dvbridge_render_simplify_gui()), where the frames with GUI elements cannot keep up
+- *
+- * Converting a pixel drawn over a picture of profile 5 back to codes takes PQ round trips that the
+- * affine profiles do not, and on a small GPU the frames with GUI elements over most of the picture
+- * (the player information, a window over the dimmed video) can take more than a refresh while the
+- * others fit. The simplified rounding leaves out the correction of the round trip of the picture
+- * under such a pixel: a code apart in values close to a half, under the GUI only. It is drawn for
+- * the frames with GUI elements of a picture format only where those frames are measured not to keep
+- * up, and they go back to the exact rounding when that would fit with room to spare.
+- *
+- * The frames measured are those with GUI elements whose picture the simplified rounding draws (the
+- * bridge says so: profile 5 in the source transport, its programs made), while the video plays.
+- * Each picture format (CDVFrameLoad) at each fidelity step-down level (CDVStepDown: the frames of
+- * another level are other work) and refresh period has a state of its own, off until its frames
+- * are found not to keep up. Its frames are measured in windows of WINDOW frames of one
+- * rounding and one pace, leaving out the first seconds of a video and after a seek (SETTLE_MS), the
+- * first second after GUI elements come (GUI_SETTLE_MS: the GUI that appears is drawn and faded in
+- * meanwhile, and the GPU times of CDVAhead are set aside then too) and the first frames after a
+- * change of rounding or of pace (SKIP). A window is behind as a window of CDVStepDown is: both its
+- * GPU times and its missed refreshes say so (frames presented a frame ahead that take more than
+- * LOADED_AHEAD of the period on average without the slowest, and LOST_PART of the presentations,
+- * LOST_MIN at least, late; frames that wait, LOST_PART of them over LOADED_WAITING of the period and
+- * as many presentations late); two windows in a row, or one in which the GPU could not keep up in
+- * any case. While frames are still to be presented a frame ahead (CDVStepDown::Pace::PENDING), that
+- * comes first: nothing goes on.
+- *
+- * On: the frames of the format with GUI elements are drawn with the simplified rounding, and the
+- * first window of it says what it takes for what the exact rounding took (the window that turned it
+- * on). Off again only when the exact rounding would take, by that, no more than RELEASE_AHEAD or
+- * RELEASE_WAITING of the period (room to spare below the marks), and only RELEASE_WAIT measured
+- * frames after it went on; where it has to go on again after that, the wait doubles. Nothing goes
+- * off on a guess (with that ratio not measured, it stays on).
+- *
+- * This class only decides. The window system asks it for each frame with GUI elements, tells it
+- * their GPU times and presentations, and logs what changes.
+- */
+-class CDVGuiRound
+-{
+-public:
+-  using Pace = CDVStepDown::Pace;
+-  static constexpr unsigned int WINDOW = CDVStepDown::WINDOW;
+-
+-  enum class Change
+-  {
+-    NONE,
+-    ON, //!< the frames did not keep up: the simplified rounding from now on
+-    OFF, //!< the exact rounding would fit with room to spare: back to it
+-  };
+-
+-  struct Step
+-  {
+-    Change change = Change::NONE;
+-    Pace pace = Pace::PENDING;
+-    double averageMs = 0; //!< the window's GPU time, without its slowest frame
+-    double budgetMs = 0; //!< the mark of a frame at that pace and refresh period
+-    double periodMs = 0;
+-    unsigned int frames = 0;
+-    unsigned int over = 0;
+-    unsigned int presented = 0;
+-    unsigned int lost = 0;
+-    double estimateMs = 0; //!< OFF: what the exact rounding would take now
+-  };
+-
+-  //! A frame with GUI elements of that format is to be drawn: whether with the simplified rounding
+-  bool Simplified(uint64_t format, int level, double periodMs)
+-  {
+-    const Format* const f = Lookup(format, level, periodMs);
+-    return f && f->on;
+-  }
+-
+-  //! The GPU time of a frame with GUI elements whose picture the simplified rounding draws, drawn
+-  //! with it (simplified) or not, while the video played
+-  Step Measured(uint64_t format, int level, bool simplified, double ms, double periodMs, Pace pace)
+-  {
+-    if (format == 0 || !(ms > 0) || !std::isfinite(ms) || !(periodMs > 0) || !std::isfinite(periodMs))
+-      return Step();
+-    Format& f = *Find(format, level, periodMs);
+-    // a frame drawn with the other rounding than the format's (before a change): not taken
+-    if (simplified != f.on)
+-      return Step();
+-    Window& w = f.window;
+-    if (w.count > 0 && w.pace != pace)
+-    {
+-      f.Drop();
+-      f.skip = std::max(f.skip, SKIP);
+-    }
+-    const bool settling = m_settlingMs > 0 || m_guiSettlingMs > 0 || f.skip > 0;
+-    if (m_settlingMs > 0)
+-      m_settlingMs -= periodMs;
+-    if (m_guiSettlingMs > 0)
+-      m_guiSettlingMs -= periodMs;
+-    if (f.skip > 0)
+-      --f.skip;
+-    if (settling)
+-      return Step();
+-    if (w.count == 0)
+-    {
+-      w = Window();
+-      w.pace = pace;
+-    }
+-    w.sum += ms;
+-    w.max = std::max(w.max, ms);
+-    w.over += ms > LOADED_WAITING * periodMs ? 1 : 0;
+-    if (++w.count < WINDOW)
+-      return Step();
+-    return Decide(f);
+-  }
+-
+-  //! A frame with GUI elements whose picture the simplified rounding draws was presented, and
+-  //! whether it came with its refresh is known
+-  void Presented(uint64_t format, int level, bool simplified, bool late, Pace pace, double periodMs)
+-  {
+-    Format* const f = Lookup(format, level, periodMs);
+-    if (!f || simplified != f->on || f->window.count == 0 || f->window.pace != pace)
+-      return;
+-    ++f->window.presented;
+-    f->window.lost += late ? 1 : 0;
+-  }
+-
+-  //! A frame without GUI elements was drawn while the video played: the first ones with GUI
+-  //! elements that come after it are left out
+-  void Plain()
+-  {
+-    m_guiSettlingMs = GUI_SETTLE_MS;
+-    for (Format& f : m_formats)
+-      f.Drop();
+-  }
+-
+-  //! The video jumped (a seek, a change of stream): the frames around it say nothing
+-  void Seeked()
+-  {
+-    for (Format& f : m_formats)
+-      f.Drop();
+-    m_settlingMs = SETTLE_MS;
+-  }
+-
+-  //! Native output ended: what is found stays, the windows begin again with the next video
+-  void Restart() { Seeked(); }
+-
+-  //! Whether the frames of that format are drawn with the simplified rounding
+-  bool On(uint64_t format, int level, double periodMs) const
+-  {
+-    const Format* const f = Lookup(format, level, periodMs);
+-    return f && f->on;
+-  }
+-
+-private:
+-  static constexpr unsigned int SKIP = 6; //!< frames left out after a change
+-  static constexpr double SETTLE_MS = 2000; //!< the start of a video, and after a seek
+-  static constexpr double GUI_SETTLE_MS = 1000; //!< after GUI elements come
+-  static constexpr size_t FORMATS = 8; //!< formats and refresh periods known at a time
+-  // (the marks of CDVStepDown, for the same frames presented the same ways)
+-  static constexpr double LOADED_AHEAD = 0.85;
+-  static constexpr double LOADED_WAITING = 0.8;
+-  static constexpr double RELEASE_AHEAD = 0.75;
+-  static constexpr double RELEASE_WAITING = 0.7;
+-  static constexpr double LOST_PART = 0.05;
+-  static constexpr unsigned int LOST_MIN = 3;
+-  static constexpr unsigned int KNOWN_MIN = WINDOW / 2;
+-  //! measured frames after it went on before it goes off (a minute of film), doubled each time it
+-  //! had to go on again, up to about an hour of film
+-  static constexpr unsigned int RELEASE_WAIT = 1440;
+-  static constexpr unsigned int RELEASE_MAX_WAIT = 64 * RELEASE_WAIT;
+-
+-  struct Window
+-  {
+-    unsigned int count = 0;
+-    double sum = 0;
+-    double max = 0;
+-    unsigned int over = 0;
+-    Pace pace = Pace::PENDING;
+-    unsigned int presented = 0;
+-    unsigned int lost = 0;
+-  };
+-
+-  struct Format
+-  {
+-    uint64_t id = 0; //!< 0: none
+-    int level = 0;
+-    double periodMs = 0;
+-    uint64_t used = 0; //!< m_clock of its last frame measured
+-    bool on = false;
+-    double exactMs = 0; //!< what the exact rounding took, its last window
+-    double ratio = 0; //!< what the exact rounding takes for what the simplified one takes (0: not known)
+-    bool justOn = false; //!< it went on, and no window of the simplified rounding has ended yet
+-    bool offToKeep = false; //!< it went off, and no window of the exact rounding has kept up yet
+-    unsigned int sinceOn = 0; //!< measured frames since it went on
+-    unsigned int releaseWait = RELEASE_WAIT;
+-    unsigned int behind = 0; //!< windows in a row that were behind
+-    unsigned int skip = SKIP;
+-    Window window;
+-
+-    void Drop()
+-    {
+-      window = Window();
+-      behind = 0;
+-    }
+-  };
+-
+-  static bool SamePeriod(double a, double b) { return std::fabs(a - b) <= 0.02 * b; }
+-
+-  static unsigned int Mark(unsigned int count)
+-  {
+-    return std::max(LOST_MIN, static_cast<unsigned int>(std::ceil(LOST_PART * count)));
+-  }
+-
+-  Format* Lookup(uint64_t id, int level, double periodMs)
+-  {
+-    for (Format& f : m_formats)
+-    {
+-      if (id != 0 && f.id == id && f.level == level && SamePeriod(f.periodMs, periodMs))
+-        return &f;
+-    }
+-    return nullptr;
+-  }
+-  const Format* Lookup(uint64_t id, int level, double periodMs) const
+-  {
+-    return const_cast<CDVGuiRound*>(this)->Lookup(id, level, periodMs);
+-  }
+-
+-  //! The format at that level and period, or a place for it: a free one, else the one measured
+-  //! longest ago of those that are off, else the one measured longest ago
+-  Format* Find(uint64_t id, int level, double periodMs)
+-  {
+-    ++m_clock;
+-    if (Format* const f = Lookup(id, level, periodMs))
+-    {
+-      f->used = m_clock;
+-      return f;
+-    }
+-    const auto rank = [](const Format& g) { return g.id == 0 ? 0 : g.on ? 2 : 1; };
+-    Format* place = &m_formats[0];
+-    for (Format& f : m_formats)
+-    {
+-      if (rank(f) < rank(*place) || (rank(f) == rank(*place) && f.used < place->used))
+-        place = &f;
+-    }
+-    *place = Format();
+-    place->id = id;
+-    place->level = level;
+-    place->periodMs = periodMs;
+-    place->used = m_clock;
+-    return place;
+-  }
+-
+-  Step To(Format& f, bool on, Change change, Step step)
+-  {
+-    step.change = change;
+-    f.on = on;
+-    f.Drop();
+-    f.skip = std::max(f.skip, SKIP);
+-    return step;
+-  }
+-
+-  Step Decide(Format& f)
+-  {
+-    const Window w = f.window;
+-    f.window = Window();
+-    const double average = (w.sum - w.max) / (w.count - 1);
+-    Step step;
+-    step.pace = w.pace;
+-    step.averageMs = average;
+-    step.periodMs = f.periodMs;
+-    step.budgetMs = (w.pace == Pace::AHEAD ? LOADED_AHEAD : LOADED_WAITING) * f.periodMs;
+-    step.frames = w.count;
+-    step.over = w.over;
+-    step.presented = w.presented;
+-    step.lost = w.lost;
+-
+-    const bool known = w.presented >= KNOWN_MIN;
+-    const bool missed = w.lost >= Mark(w.presented);
+-    bool behind = false;
+-    bool beyond = false;
+-    if (w.pace == Pace::AHEAD)
+-    {
+-      behind = known && missed && average > step.budgetMs;
+-      beyond = average > f.periodMs;
+-    }
+-    else
+-    {
+-      behind = known && missed && w.over >= Mark(w.count);
+-      beyond = 2 * w.over > w.count;
+-    }
+-
+-    if (!f.on)
+-    {
+-      f.exactMs = average;
+-      if (!behind)
+-      {
+-        f.behind = 0;
+-        // it kept up after it went off: the wait is back to its start
+-        if (known && f.offToKeep)
+-        {
+-          f.offToKeep = false;
+-          f.releaseWait = RELEASE_WAIT;
+-        }
+-        return step;
+-      }
+-      // frame ahead comes first; one window could have been slow for another reason
+-      if (w.pace == Pace::PENDING || (!beyond && ++f.behind < 2))
+-        return step;
+-      f.behind = 0;
+-      // it went off and does not keep up after all: it waits longer before it goes off again
+-      if (f.offToKeep)
+-      {
+-        f.offToKeep = false;
+-        f.releaseWait = std::min(2 * f.releaseWait, RELEASE_MAX_WAIT);
+-      }
+-      f.sinceOn = 0;
+-      f.justOn = true;
+-      return To(f, true, Change::ON, step);
+-    }
+-
+-    // on: the first window says what it takes for what the exact rounding took
+-    if (f.justOn)
+-    {
+-      f.justOn = false;
+-      if (f.exactMs > 0 && average > 0)
+-        f.ratio = f.exactMs / average;
+-    }
+-    f.sinceOn += w.count;
+-    if (!known || behind || f.sinceOn < f.releaseWait || !(f.ratio > 0))
+-      return step;
+-    const double estimate = average * f.ratio;
+-    const double release = (w.pace == Pace::AHEAD ? RELEASE_AHEAD : RELEASE_WAITING) * f.periodMs;
+-    if (estimate > release)
+-      return step;
+-    step.estimateMs = estimate;
+-    f.offToKeep = true;
+-    return To(f, false, Change::OFF, step);
+-  }
+-
+-  std::array<Format, FORMATS> m_formats{};
+-  uint64_t m_clock = 0;
+-  double m_settlingMs = SETTLE_MS; //!< time of measured frames still left out, of any format
+-  double m_guiSettlingMs = 0; //!< ... after GUI elements came
+-};
+-
+-} // namespace GBM
+-} // namespace WINDOWING
+-} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index ff6e8ac..299e147 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -383,16 +383,22 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       cover = ahead ? CDVBridgeGLES::Cover::BARS : CDVBridgeGLES::Cover::MEASURE;
+     }
+     m_dvDrawnOver = false;
++    // Hades: (the level of the conversion under the GUI of this frame, once it is packed)
++    if (m_dvFrame)
++      m_dvGuiDrawn = 0;
+     // EGL's window framebuffer has a bottom-left GL origin, while transport
+     // metadata is indexed from the top-left of the HDMI raster.
+     if (m_dvFrame && m_dvBridge && m_dvBridge->Pack(0, m_nWidth, m_nHeight, true, cover))
+     {
+-      // Hades: whether its pixels drawn over were converted with the simplified rounding under the
+-      // GUI (CDVGuiRound): its time and its presentation count for that rounding
+-      m_dvGuiRounded = m_dvBridge->GuiSimplified();
+-      m_dvStepFrame.rounded = m_dvGuiRounded;
++      // Hades: the level its pixels drawn over were converted at (CDVGuiLevel): its time and its
++      // presentation count for that level
++      m_dvGuiDrawn = m_dvBridge->GuiDrawn();
++      m_dvStepFrame.drawn = m_dvGuiDrawn;
+       if (auto& timer = m_dvGpuTimers[m_dvGpuTimerIndex]; timer.begun)
+-        timer.rounded = m_dvGuiRounded;
++      {
++        timer.drawn = m_dvGuiDrawn;
++        m_dvGpuTimerFrame = static_cast<int>(m_dvGpuTimerIndex);
++      }
+       DVGpuTimerMark(false);
+       // Hades: the transport of this frame as it goes out (video/dvverify), after the time of its
+       // GPU work is taken: compared with the reference of its check, drawn before it, or copied
+@@ -568,6 +574,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       // Hades: whether the frame came with its refresh, for the fidelity step-down: presented the
+       // way that waits, by how long that took; a frame ahead, by the time of its flip, which is
+       // told while the next frame is presented (DVAheadFlipped())
++      // Hades: the pace it was presented at, for the time of its GPU work (CDVGuiLevel)
++      if (presented)
++        DVGpuTimerPaced(DVStepPace());
+       if (presented && m_dvAheadShown)
+         m_dvStepFlipFrame = m_dvStepFrame;
+       else if (presented && periodMs > 0)
+@@ -2421,6 +2430,7 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   m_dvPrepared = {};
+   m_dvFramePts = layer.pts;
+   m_dvStepFrame = {};
++  m_dvGpuTimerFrame = -1;
+   m_dvDrawnOver = false; // (Hades: nothing drawn over this frame's picture yet)
+   if (!BeginDVBridge())
+   {
+@@ -2440,7 +2450,7 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   const bool overlayFree =
+       m_guiWillRender && GetGUIElementCount() == 0 && !m_dvOverlays && !captured;
+   // Hades: GUI elements over the picture (not subtitles alone, nor a capture): the frames whose
+-  // pixels drawn over can be converted with the simplified rounding under the GUI (CDVGuiRound)
++  // pixels drawn over can be converted above level 0 (CDVGuiLevel)
+   const bool guiElements = m_guiWillRender && GetGUIElementCount() > 0;
+   const bool guiFrame = guiElements && !captured;
+   // What earlier sessions found with this GPU, driver and build, before the first frame; and the
+@@ -2482,20 +2492,22 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     m_dvStepSeeksSeen = seeks;
+     for (auto& step : m_dvStep.Now())
+       step.Seeked();
+-    m_dvGuiRound.Seeked();
++    m_dvGuiLevel.Seeked();
+   }
+   // The fidelity step-down level of this frame, by its format and by the levels that change
+   // anything for it: the way of drawing it is chosen, and its time measured, with it
+   m_dvStepLevel = DVStepLevel(layered, foreseen,
+                               m_dvBridge->StepLevels(CDVFrameLoad::WithResidual(foreseen)));
+   m_dvBridge->SetStepLevel(m_dvStepLevel);
+-  // Hades: the pixels drawn over the picture of a frame with GUI elements are converted with the
+-  // simplified rounding where the frames with GUI elements of its format and level were measured
+-  // not to keep up with the exact one (CDVGuiRound), and where Kodi chooses the fidelity (the
+-  // settings of the step-down). The bridge draws it only for a picture of profile 5 in the source
+-  // transport, with its programs made; anything else, and every other frame, the exact rounding.
+-  m_dvBridge->SimplifyGui(guiFrame && m_dvStepForced < 0 && m_dvStepAuto && foreseen != 0 &&
+-                          m_dvGuiRound.Simplified(foreseen, m_dvStepLevel, DVRefreshPeriodMs()));
++  // Hades: the pixels drawn over the picture of a frame with GUI elements are converted at the
++  // level that the frames with GUI elements of its format and step-down level were measured to
++  // need (CDVGuiLevel), where Kodi chooses the fidelity (the settings of the step-down); every
++  // other frame at level 0, the conversion as it was. The bridge draws a level only for a picture
++  // of profile 5 in the source transport, with its programs and its target made, else the highest
++  // below it.
++  m_dvBridge->SetGuiLevel(guiFrame && m_dvStepForced < 0 && m_dvStepAuto && foreseen != 0
++                              ? m_dvGuiLevel.Level(foreseen, m_dvStepLevel, DVRefreshPeriodMs())
++                              : 0);
+   // (as the setting gives it, or as measured for its load). Hades: a picture that goes out as
+   // certified source devices send it is drawn directly whenever nothing is over it (unless the
+   // setting asks for the composed way): that way is the composition of its planes and their
+@@ -2669,12 +2681,13 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     // in (the level was chosen with those of the frame before: a frame of another transport counts
+     // for its own, CDVStepDown::Measured())
+     const unsigned int ladder = m_dvBridge->StepLevels(CDVFrameLoad::WithResidual(load));
+-    // Hades: a frame with GUI elements whose picture the simplified rounding under the GUI can
+-    // draw (as it was drawn: profile 5 in the source transport), while the video plays, is one
+-    // that the decision of that rounding takes (CDVGuiRound)
+-    const bool guiMeasured = guiFrame && !still && m_dvBridge->GuiSimplifiable();
++    // Hades: a frame with GUI elements whose picture the bridge can draw above level 0 (as it was
++    // drawn: profile 5 in the source transport), while the video plays, is one that the decision
++    // of the level of the conversion under the GUI takes (CDVGuiLevel)
++    const int guiTop = m_dvBridge->GuiTop();
++    const bool guiMeasured = guiFrame && !still && guiTop > 0;
+     DVGpuTimerTag(measured, pathMeasured, direct, m_dvBridge->Direct(), layered, load, !still,
+-                  comparing, ladder, guiMeasured, !guiElements && !still);
++                  comparing, ladder, guiMeasured, guiTop, !guiElements && !still);
+     // what its presentation is told with (DVStepPresented())
+     m_dvStepFrame.valid = true;
+     m_dvStepFrame.layered = layered;
+@@ -2996,6 +3009,10 @@ bool CWinSystemGbmGLESContext::EndDVBridge(bool tellModeset)
+     glClear(GL_COLOR_BUFFER_BIT);
+     glEnable(GL_SCISSOR_TEST);
+   }
++  // Hades: the targets of the levels of the conversion under the GUI (CDVGuiLevel) freed: made again
++  // when a frame needs them
++  if (m_dvBridge)
++    m_dvBridge->ReleaseGui();
+   DVGpuTimerReset();
+   m_dvPresentStall.Reset();
+   // (the restoration is a commit that waits)
+@@ -3311,8 +3328,8 @@ void CWinSystemGbmGLESContext::PublishDVInfo(bool force)
+       info["hades.dv.ahead"] = m_dvAheadShown ? "yes" : "no";
+       info["hades.dv.step"] = std::to_string(m_dvStepLevel);
+       // Hades: the last frame (with GUI elements: this page is one) was drawn with the simplified
+-      // rounding under the GUI (CDVGuiRound)
+-      if (m_dvGuiRounded)
++      // rounding under the GUI (CDVGuiLevel, level 2)
++      if (m_dvGuiDrawn == 2)
+         info["hades.dv.guiround"] = "yes";
+     }
+   }
+@@ -3451,17 +3468,31 @@ void CWinSystemGbmGLESContext::DVStepPresented(const DVStepFrame& frame,
+ {
+   if (frame.valid && frame.measured && m_dvStepForced < 0 && m_dvStepAuto)
+     m_dvStep.Now()[frame.layered].Presented(frame.format, frame.level, late, pace, frame.ladder);
+-  // Hades: ... and for the simplified rounding under the GUI, a frame with GUI elements
++  // Hades: ... and for the level of the conversion under the GUI, a frame with GUI elements
+   if (frame.valid && frame.gui && m_dvStepForced < 0 && m_dvStepAuto)
+-    m_dvGuiRound.Presented(frame.format, frame.level, frame.rounded, late, pace,
+-                           DVRefreshPeriodMs());
++    m_dvGuiLevel.Presented(frame.format, frame.level, frame.drawn, late, pace, DVRefreshPeriodMs());
+ }
+ 
+-void CWinSystemGbmGLESContext::DVGuiRoundReport(const CDVGuiRound::Step& step,
++void CWinSystemGbmGLESContext::DVGpuTimerPaced(CDVStepDown::Pace pace)
++{
++  if (m_dvGpuTimerFrame >= 0)
++  {
++    auto& timer = m_dvGpuTimers[static_cast<size_t>(m_dvGpuTimerFrame)];
++    if (timer.pending)
++    {
++      timer.pace = pace;
++      timer.paced = true;
++    }
++  }
++  m_dvGpuTimerFrame = -1;
++}
++
++void CWinSystemGbmGLESContext::DVGuiLevelReport(const CDVGuiLevel::Step& step,
+                                                 uint64_t format,
+                                                 int level)
+ {
+-  if (step.change == CDVGuiRound::Change::NONE)
++  using Change = CDVGuiLevel::Change;
++  if (step.change == Change::NONE)
+     return;
+   // which frames, and what the window that decided found
+   const std::string which = StringUtils::Format(
+@@ -3474,19 +3505,36 @@ void CWinSystemGbmGLESContext::DVGuiRoundReport(const CDVGuiRound::Step& step,
+           : StringUtils::Format("presented the way that waits, {} of {} frames over {:.1f} ms, {} "
+                                 "of {} refreshes missed",
+                                 step.over, step.frames, step.budgetMs, step.lost, step.presented);
+-  if (step.change == CDVGuiRound::Change::ON)
++  // the targets of the levels are freed when no format needs them
++  const bool freed = step.change == Change::DOWN && step.to == 0 && !m_dvGuiLevel.Above();
++  if (freed && m_dvBridge)
++    m_dvBridge->ReleaseGui();
++  if (step.change == Change::UP && step.to == 1)
++    CLog::Log(LOGINFO,
++              "DVBridge: P5 frames with GUI elements: {:.1f} ms of {:.1f} ms, the conversion under "
++              "the GUI takes the picture under each pixel from its own pass from now on (the same "
++              "bytes, 132.7 MB more) ({}; {})",
++              step.averageMs, step.periodMs, which, window);
++  else if (step.change == Change::UP)
+     CLog::Log(LOGINFO,
+               "DVBridge: P5 frames with GUI elements: {:.1f} ms of {:.1f} ms, the rounding of the "
+               "conversion under the GUI is simplified (at most 1 code in near-ties) from now on; "
+               "the frames without GUI elements and the pixels not drawn over are as before ({}; "
+               "{})",
+               step.averageMs, step.periodMs, which, window);
+-  else
++  else if (step.to == 1)
+     CLog::Log(LOGINFO,
+               "DVBridge: P5 frames with GUI elements: {:.1f} ms of {:.1f} ms with the exact "
+               "rounding (by what the simplified one takes now, {:.1f} ms), which fits with room to "
+               "spare: the rounding of the conversion under the GUI is exact again ({}; {})",
+               step.estimateMs, step.periodMs, step.averageMs, which, window);
++  else
++    CLog::Log(LOGINFO,
++              "DVBridge: P5 frames with GUI elements: {:.1f} ms of {:.1f} ms with the conversion "
++              "under the GUI as it was (by what it takes from its own pass now, {:.1f} ms), which "
++              "fits with room to spare: as it was again{} ({}; {})",
++              step.estimateMs, step.periodMs, step.averageMs,
++              freed ? ", and the targets of the conversion are freed" : "", which, window);
+ }
+ 
+ void CWinSystemGbmGLESContext::DVStepReport(const CDVStepDown::Step& step,
+@@ -3600,13 +3648,16 @@ void CWinSystemGbmGLESContext::DVGpuTimerTag(bool measured,
+                                              bool comparing,
+                                              unsigned int ladder,
+                                              bool gui,
++                                             int top,
+                                              bool guiFree)
+ {
+   auto& timer = m_dvGpuTimers[m_dvGpuTimerIndex];
+   if (timer.begun)
+   {
+     timer.gui = gui;
+-    timer.rounded = false; // (told once it is packed)
++    timer.top = top;
++    timer.drawn = 0; // (told once it is packed)
++    timer.paced = false; // (... and once it is presented)
+     timer.guiFree = guiFree;
+     timer.ladder = ladder;
+     timer.playing = playing;
+@@ -3814,17 +3865,19 @@ void CWinSystemGbmGLESContext::DVGpuTimerCollect()
+                   m_dvAhead.Average(), timer.step, period,
+                   change == CDVAhead::Change::NEEDED ? "now" : "no longer");
+     }
+-    // Hades: the simplified rounding under the GUI (CDVGuiRound), where Kodi chooses the fidelity:
+-    // the frames with GUI elements whose picture it can draw are measured, and one without GUI
+-    // elements while the video plays leaves out the first ones that come after it
++    // Hades: the level of the conversion under the GUI (CDVGuiLevel), where Kodi chooses the
++    // fidelity: the frames with GUI elements whose picture the bridge can draw above level 0 are
++    // measured, at the pace they were presented at, and one without GUI elements while the video
++    // plays leaves out the first ones that come after it
+     if (m_dvStepForced < 0 && m_dvStepAuto)
+     {
+       if (timer.gui)
+-        DVGuiRoundReport(m_dvGuiRound.Measured(timer.load, timer.step, timer.rounded, ms,
+-                                               DVRefreshPeriodMs(), DVStepPace()),
++        DVGuiLevelReport(m_dvGuiLevel.Measured(timer.load, timer.step, timer.drawn, timer.top, ms,
++                                               DVRefreshPeriodMs(),
++                                               timer.paced ? timer.pace : DVStepPace()),
+                          timer.load, timer.step);
+       else if (timer.guiFree)
+-        m_dvGuiRound.Plain();
++        m_dvGuiLevel.Plain();
+     }
+     // what is being measured of the other kind of stream waits meanwhile
+     m_dvPath.Now()[!timer.layered].Interrupted();
+@@ -3893,8 +3946,9 @@ void CWinSystemGbmGLESContext::DVGpuTimerReset()
+   }
+   for (auto& step : m_dvStep.Kept())
+     step.Restart();
+-  m_dvGuiRound.Restart();
+-  m_dvGuiRounded = false;
++  m_dvGuiLevel.Restart();
++  m_dvGuiDrawn = 0;
++  m_dvGpuTimerFrame = -1;
+   for (auto& load : m_dvPathLoad)
+     load.Reset();
+   m_dvResidualLost = false;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index d49e903..6adaf8f 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -25,7 +25,7 @@
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "DVAhead.h"
+ #include "DVEngineSettings.h"
+-#include "DVGuiRound.h"
++#include "DVGuiLevel.h"
+ #include "DVModeMove.h"
+ #include "DVPathChoice.h"
+ #include "DVPresentStall.h"
+@@ -515,11 +515,15 @@ private:
+     int step = 0; //!< the fidelity step-down level it was drawn at (see DVStepLevel())
+     //! Hades: ... and the levels that changed anything for it, once it was drawn (DVStepFrame)
+     unsigned int ladder = 0;
+-    //! Hades: the frame had GUI elements, its picture is one that the simplified rounding under
+-    //! the GUI can draw (CDVGuiRound) and did not stand still: its time is one that the decision
+-    //! of that rounding takes ...
++    //! Hades: the frame had GUI elements, its picture is one that the bridge can draw above level 0
++    //! of the conversion under the GUI (CDVGuiLevel), up to top, and did not stand still: its time
++    //! is one that the decision of that level takes ...
+     bool gui = false;
+-    bool rounded = false; //!< ... and it was drawn with that rounding
++    int top = 0;
++    int drawn = 0; //!< ... the level it was drawn at (told once it is packed)
++    //! ... and the pace it was presented at (told once it is presented: paced)
++    CDVStepDown::Pace pace = CDVStepDown::Pace::PENDING;
++    bool paced = false;
+     //! the frame had no GUI elements (subtitles or not), and its picture did not stand still
+     bool guiFree = false;
+   };
+@@ -655,10 +659,10 @@ private:
+     //! transport it went out in): what it counts for (CDVStepDown::Presented())
+     unsigned int ladder = 0;
+     bool measured = false; //!< without GUI elements, its picture not standing still
+-    //! Hades: with GUI elements, as DVGpuTimer::gui, and with that rounding (rounded): what
+-    //! CDVGuiRound::Presented() is told
++    //! Hades: with GUI elements, as DVGpuTimer::gui, and the level of the conversion under the GUI
++    //! it was drawn at: what CDVGuiLevel::Presented() is told
+     bool gui = false;
+-    bool rounded = false;
++    int drawn = 0;
+   };
+   DVStepFrame m_dvStepFrame; //!< the frame prepared this pass
+   DVStepFrame m_dvStepFlipFrame; //!< the last one presented a frame ahead, whose flip is to come
+@@ -670,14 +674,18 @@ private:
+   void DVStepReport(const CDVStepDown::Step& step, bool layered, uint64_t format);
+   //! Keep what has been found of the levels for later sessions
+   void DVStepRemember();
+-  //! Hades: whether the pixels drawn over a profile 5 picture in frames with GUI elements are
+-  //! converted with the simplified rounding (CDVGuiRound), by picture format, step-down level and
+-  //! refresh period, where Kodi chooses the fidelity (as m_dvStep). Kept across videos.
+-  CDVGuiRound m_dvGuiRound;
+-  //! The last frame packed was drawn with it (for the player information)
+-  bool m_dvGuiRounded = false;
+-  //! Log a change of it, for the frames of that format and level
+-  void DVGuiRoundReport(const CDVGuiRound::Step& step, uint64_t format, int level);
++  //! Hades: the level of the conversion of the pixels drawn over a profile 5 picture in frames with
++  //! GUI elements (CDVGuiLevel), by picture format, step-down level and refresh period, where Kodi
++  //! chooses the fidelity (as m_dvStep). Kept across videos; its targets are freed when no format
++  //! is above level 0, and when native output ends.
++  CDVGuiLevel m_dvGuiLevel;
++  //! The level the last frame packed was drawn at (for the player information)
++  int m_dvGuiDrawn = 0;
++  //! Log a change of it, for the frames of that format and step-down level
++  void DVGuiLevelReport(const CDVGuiLevel::Step& step, uint64_t format, int level);
++  //! The timer of the frame packed this pass (-1: none), which is told the pace it is presented at
++  int m_dvGpuTimerFrame = -1;
++  void DVGpuTimerPaced(CDVStepDown::Pace pace);
+   //! How the last frame without GUI elements of this native output was drawn: directly (1),
+   //! composed (0), none yet (-1). For the player information, which is a GUI element itself:
+   //! the frames with GUI elements are always composed
+@@ -745,6 +753,7 @@ private:
+                      bool comparing,
+                      unsigned int ladder,
+                      bool gui,
++                     int top,
+                      bool guiFree);
+   //! A frame was drawn whose GPU time is not known (see CDVPathChoice::Untimed())
+   void DVPathUntimed(bool measured, bool layered, uint64_t load);
+-- 
+2.53.0
+

@@ -1,0 +1,1089 @@
+From 7f1d89873662230acd2b9db1a2e35a6de9277427 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 01:27:30 +0000
+Subject: [PATCH] tools/dvbridge: Dolby Vision metadata measured from an HDR10
+ picture
+
+An HDR10 video has no dynamic metadata of its studio. For a display that
+takes Dolby Vision, Hades can send it as Dolby Vision with metadata that
+it measures from the picture as it plays. They are not the studio's and
+say so (the setting, the log and the player information): no trims are
+made up (there is no colourist's grade to translate), and no level 3
+(CCM 001 reserves it).
+
+dvbridge_measure.c measures a picture on the GPU, in two passes over the
+reduced pixel set of ST 2094-10:2021 6.1 (2x2 means of R'G'B' from the
+10-bit 4:2:0 BT.2020 picture): per block row and column band the max, sum
+and min that level 1 is made of, and per block column the max that the
+bars are found by. The results are read back without waiting, when their
+fence has passed: Kodi measures the pictures queued for presentation ahead
+of it, so nothing waits for the GPU and no latency is added.
+
+dvbridge_measured.c decides. Level 1 is over the active area (level 5),
+the area of the picture that is ever not black around which the black
+edges can be bars (as wide at the top as at the bottom, around at least 40
+percent of the picture: a dark picture with a bright spot is no letterbox).
+It is held per scene, as Dolby Vision metadata are: the scene so far and
+the pictures measured after it that are of it, changing within a scene
+only by more than a step. A scene cut is a picture whose 16 x 9 grid of
+mean maxRGB differs from the one before by more than 0.05 PQ and by more
+than 2.5 times the median of the last 12 differences (motion), and, where
+the picture after it is measured too, one that the next picture stays
+close to (a step) and does not go back from (a flash is no cut). The cut
+refreshes the scene on its own picture. The clamps are dovi_tool's for CM
+v2.9, as for HDR10+.
+
+Measured on Cosmos Laundromat (Netflix Open Content, CC BY 4.0, the HDR P3
+PQ encode) against the 99 shot cuts of the Dolby Vision metadata that
+Dolby's tool made of its master: with one picture or more measured ahead,
+96 cuts found on their first picture, 3 missed, 12 made where there is
+none; without the look-ahead 98 found and 47 made up (with the first rule,
+a threshold alone, 349). Within the shots the level 1 sent changes 699
+times in 17520 pictures, against 14446 for a per-picture measurement. The
+average sent is 64 codes off the level 1 of each whole shot computed with
+full knowledge of it, and the max 290 (the brighter pictures of a shot are
+not known before they come, and a cut that is missed joins two shots); no
+picture's own max is above the max sent by more than a step, so nothing
+is mapped as brighter than it was measured.
+
+dvbridge_profile81_metadata() is the profile 8.1 builder of the HDR10+
+path, with a level 5 block; dvbridge_measured_placeholder() and
+dvbridge_measured_apply() make the metadata a picture leaves the decoder
+with (level 1 from the static metadata) and those it is presented with.
+---
+ tools/dvbridge/CMakeLists.txt       |   3 +-
+ tools/dvbridge/dvbridge_hdr10plus.c |  25 +-
+ tools/dvbridge/dvbridge_hdr10plus.h |   6 +
+ tools/dvbridge/dvbridge_measure.c   | 363 ++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_measure.h   |  39 +++
+ tools/dvbridge/dvbridge_measured.c  | 413 ++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_measured.h  | 107 +++++++
+ 7 files changed, 951 insertions(+), 5 deletions(-)
+ create mode 100644 tools/dvbridge/dvbridge_measure.c
+ create mode 100644 tools/dvbridge/dvbridge_measure.h
+ create mode 100644 tools/dvbridge/dvbridge_measured.c
+ create mode 100644 tools/dvbridge/dvbridge_measured.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 4bc6a7d..af091c6 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -12,7 +12,8 @@ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c
+-                                dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c)
++                                dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
++                                dvbridge_measure.c dvbridge_measured.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.c b/tools/dvbridge/dvbridge_hdr10plus.c
+index 9e62d01..81da393 100644
+--- a/tools/dvbridge/dvbridge_hdr10plus.c
++++ b/tools/dvbridge/dvbridge_hdr10plus.c
+@@ -227,7 +227,16 @@ AVDOVIMetadata *dvbridge_hdr10plus_metadata(const struct dvbridge_hdr10plus_l1 *
+                                             const AVContentLightMetadata *light, bool scene_refresh,
+                                             size_t *size)
+ {
+-    if (!l1 || !mastering || !mastering->has_luminance || !size || mastering->max_luminance.den <= 0 ||
++    return l1 ? dvbridge_profile81_metadata(l1->min_pq, l1->max_pq, l1->avg_pq, NULL, mastering, light, scene_refresh,
++                                            size)
++              : NULL;
++}
++
++AVDOVIMetadata *dvbridge_profile81_metadata(unsigned min_pq, unsigned max_pq, unsigned avg_pq, const unsigned area[4],
++                                            const AVMasteringDisplayMetadata *mastering,
++                                            const AVContentLightMetadata *light, bool scene_refresh, size_t *size)
++{
++    if (min_pq > max_pq || max_pq > 4095 || avg_pq > 4095 || !mastering || !mastering->has_luminance || !size || mastering->max_luminance.den <= 0 ||
+         mastering->min_luminance.den <= 0)
+         return NULL;
+     const double max_nits = av_q2d(mastering->max_luminance), min_nits = av_q2d(mastering->min_luminance);
+@@ -301,9 +310,17 @@ AVDOVIMetadata *dvbridge_hdr10plus_metadata(const struct dvbridge_hdr10plus_l1 *
+     m->num_ext_blocks = 0;
+     AVDOVIDmData *e = av_dovi_get_ext(m, m->num_ext_blocks++);
+     e->level = 1;
+-    e->l1.min_pq = l1->min_pq;
+-    e->l1.max_pq = l1->max_pq;
+-    e->l1.avg_pq = l1->avg_pq;
++    e->l1.min_pq = min_pq;
++    e->l1.max_pq = max_pq;
++    e->l1.avg_pq = avg_pq;
++    if (area) {
++        e = av_dovi_get_ext(m, m->num_ext_blocks++);
++        e->level = 5;
++        e->l5.left_offset = area[0];
++        e->l5.right_offset = area[1];
++        e->l5.top_offset = area[2];
++        e->l5.bottom_offset = area[3];
++    }
+     e = av_dovi_get_ext(m, m->num_ext_blocks++);
+     e->level = 6;
+     e->l6.max_luminance = (uint16_t)floor(max_nits + 0.5);
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.h b/tools/dvbridge/dvbridge_hdr10plus.h
+index b279792..e662485 100644
+--- a/tools/dvbridge/dvbridge_hdr10plus.h
++++ b/tools/dvbridge/dvbridge_hdr10plus.h
+@@ -64,6 +64,12 @@ AVDOVIMetadata *dvbridge_hdr10plus_metadata(const struct dvbridge_hdr10plus_l1 *
+                                             const AVContentLightMetadata *light, bool scene_refresh,
+                                             size_t *size);
+ 
++/* The same with a level 1 block given (12-bit PQ codes) and, with area, a level 5 block (the offsets left, right, top,
++ * bottom, in pixels of the picture): for HDR10 measured as Dolby Vision (dvbridge_measured.h) */
++AVDOVIMetadata *dvbridge_profile81_metadata(unsigned min_pq, unsigned max_pq, unsigned avg_pq, const unsigned area[4],
++                                            const AVMasteringDisplayMetadata *mastering,
++                                            const AVContentLightMetadata *light, bool scene_refresh, size_t *size);
++
+ /* What a decoder keeps of a stream from one picture to the next, to make the metadata of each
+  * (dvbridge_hdr10plus_next()): made once a scene. */
+ struct dvbridge_hdr10plus_scene;
+diff --git a/tools/dvbridge/dvbridge_measure.c b/tools/dvbridge/dvbridge_measure.c
+new file mode 100644
+index 0000000..572bd10
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_measure.c
+@@ -0,0 +1,363 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_measure.h. */
++#include "dvbridge_measure.h"
++
++#include "dvbridge_gl_pack.h"
++
++#include <GLES3/gl3.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SLOTS 8
++
++static const char VERTEX[] = "#version 300 es\n"
++                             "void main() {\n"
++                             "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
++                             "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
++                             "}\n";
++
++/* The block (2x2 pixels) of block column c and block row r: the means of its R'G'B' (BT.2020, from 10-bit limited
++ * range YCbCr, each pixel's components clamped to [0, 1] before the mean, as l1stats.py and framestats.c), max and
++ * min of them. P010: the 10 bits are the top of 16. The chroma sample of a 4:2:0 block is the block's own. */
++#define BLOCK                                                                                                  \
++    "float code(float v) { return floor(v * 65535.0 / 64.0 + 0.5); }\n"                                      \
++    "vec3 rgb(float y, vec2 c) {\n"                                                                           \
++    "  float yn = (y - 64.0) / 876.0;\n"                                                                      \
++    "  vec2 p = (c - 512.0) / 896.0;\n"                                                                       \
++    "  return clamp(vec3(yn + 1.4746 * p.y, yn - (0.0593 * 1.8814 / 0.6780) * p.x - (0.2627 * 1.4746 / 0.6780) " \
++    "* p.y, yn + 1.8814 * p.x), 0.0, 1.0);\n"                                                                 \
++    "}\n"                                                                                                     \
++    "vec2 block(int c, int r) {\n"                                                                            \
++    "  vec2 ch = texelFetch(chroma, ivec2(c, r), 0).rg;\n"                                                    \
++    "  ch = vec2(code(ch.x), code(ch.y));\n"                                                                  \
++    "  vec3 m = rgb(code(texelFetch(luma, ivec2(2 * c, 2 * r), 0).r), ch)\n"                                  \
++    "         + rgb(code(texelFetch(luma, ivec2(2 * c + 1, 2 * r), 0).r), ch)\n"                              \
++    "         + rgb(code(texelFetch(luma, ivec2(2 * c, 2 * r + 1), 0).r), ch)\n"                              \
++    "         + rgb(code(texelFetch(luma, ivec2(2 * c + 1, 2 * r + 1), 0).r), ch);\n"                         \
++    "  m *= 0.25;\n"                                                                                          \
++    "  return vec2(max(m.r, max(m.g, m.b)), min(m.r, min(m.g, m.b)));\n"                                      \
++    "}\n"
++
++#define HEAD                                                                                                   \
++    "#version 300 es\n"                                                                                       \
++    "precision highp float;\n"                                                                                \
++    "precision highp int;\n"                                                                                  \
++    "precision highp sampler2D;\n"                                                                            \
++    "uniform sampler2D luma;\n"                                                                               \
++    "uniform sampler2D chroma;\n"                                                                             \
++    "uniform ivec4 geo; /* blocks_w, blocks_h, the window's first and end block columns */\n"                 \
++    "out vec4 o;\n"
++
++/* rows: fragment (band b, block row r) */
++static const char ROWS[] = HEAD BLOCK
++    "void main() {\n"
++    "  int b = int(gl_FragCoord.x), r = int(gl_FragCoord.y);\n"
++    "  int c0 = b * geo.x / 16, c1 = (b + 1) * geo.x / 16;\n"
++    "  float mx = 0.0, s = 0.0, mn = 2.0, all = 0.0;\n"
++    "  for (int c = c0; c < c1; ++c) {\n"
++    "    vec2 v = block(c, r);\n"
++    "    all = max(all, v.x);\n"
++    "    if (c >= geo.z && c < geo.w) { mx = max(mx, v.x); s += v.x; mn = min(mn, v.y); }\n"
++    "  }\n"
++    "  o = vec4(mx, s, mn, all);\n"
++    "}\n";
++
++/* columns: fragment (block column c, j): the max of maxRGB of the row bands 4 j .. 4 j + 3 */
++static const char COLUMNS[] = HEAD BLOCK
++    "float band(int c, int k) {\n"
++    "  int r0 = k * geo.y / 8, r1 = (k + 1) * geo.y / 8;\n"
++    "  float all = 0.0;\n"
++    "  for (int r = r0; r < r1; ++r) all = max(all, block(c, r).x);\n"
++    "  return all;\n"
++    "}\n"
++    "void main() {\n"
++    "  int c = int(gl_FragCoord.x), j = int(gl_FragCoord.y);\n"
++    "  o = vec4(band(c, 4 * j), band(c, 4 * j + 1), band(c, 4 * j + 2), band(c, 4 * j + 3));\n"
++    "}\n";
++
++struct slot {
++    bool busy;
++    GLuint textures[2], framebuffers[2], buffers[2];
++    GLsync fence;
++    int blocks_w, blocks_h, window[2];
++    double pts;
++    uint64_t tag;
++    unsigned order;
++};
++
++struct dvbridge_measure {
++    GLuint programs[2], vertex_array;
++    GLint geo[2], luma[2], chroma[2];
++    struct slot slots[SLOTS];
++    unsigned next_order;
++    float *columns; /* (the column values in the order dvbridge_measured_raw has them) */
++    size_t columns_size;
++};
++
++static GLuint compile(GLenum type, const char *source)
++{
++    GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &source, NULL);
++    glCompileShader(s);
++    GLint ok = 0;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[1024] = "";
++        glGetShaderInfoLog(s, sizeof(log), NULL, log);
++        fprintf(stderr, "dvbridge_measure: shader: %s\n", log);
++        glDeleteShader(s);
++        return 0;
++    }
++    return s;
++}
++
++static GLuint program(const char *fragment)
++{
++    GLuint v = compile(GL_VERTEX_SHADER, VERTEX), f = compile(GL_FRAGMENT_SHADER, fragment);
++    GLuint p = v && f ? glCreateProgram() : 0;
++    if (p) {
++        glAttachShader(p, v);
++        glAttachShader(p, f);
++        glLinkProgram(p);
++        GLint ok = 0;
++        glGetProgramiv(p, GL_LINK_STATUS, &ok);
++        if (!ok) {
++            glDeleteProgram(p);
++            p = 0;
++        }
++    }
++    glDeleteShader(v);
++    glDeleteShader(f);
++    return p;
++}
++
++static void slot_free(struct slot *s)
++{
++    if (s->fence)
++        glDeleteSync(s->fence);
++    glDeleteFramebuffers(2, s->framebuffers);
++    glDeleteTextures(2, s->textures);
++    glDeleteBuffers(2, s->buffers);
++    memset(s, 0, sizeof(*s));
++}
++
++struct dvbridge_measure *dvbridge_measure_create(void)
++{
++    struct dvbridge_measure *m = calloc(1, sizeof(*m));
++    if (!m)
++        return NULL;
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    m->programs[0] = program(ROWS);
++    m->programs[1] = program(COLUMNS);
++    for (int i = 0; i < 2; ++i)
++        if (m->programs[i]) {
++            m->geo[i] = glGetUniformLocation(m->programs[i], "geo");
++            m->luma[i] = glGetUniformLocation(m->programs[i], "luma");
++            m->chroma[i] = glGetUniformLocation(m->programs[i], "chroma");
++        }
++    glGenVertexArrays(1, &m->vertex_array);
++    dvbridge_gl_state_restore(&state);
++    if (!m->programs[0] || !m->programs[1] || !m->vertex_array) {
++        dvbridge_measure_destroy(m);
++        return NULL;
++    }
++    return m;
++}
++
++void dvbridge_measure_destroy(struct dvbridge_measure *m)
++{
++    if (!m)
++        return;
++    for (int i = 0; i < SLOTS; ++i)
++        slot_free(&m->slots[i]);
++    glDeleteProgram(m->programs[0]);
++    glDeleteProgram(m->programs[1]);
++    glDeleteVertexArrays(1, &m->vertex_array);
++    free(m->columns);
++    free(m);
++}
++
++void dvbridge_measure_reset(struct dvbridge_measure *m)
++{
++    if (!m)
++        return;
++    for (int i = 0; i < SLOTS; ++i)
++        if (m->slots[i].busy) {
++            glDeleteSync(m->slots[i].fence);
++            m->slots[i].fence = 0;
++            m->slots[i].busy = false;
++        }
++}
++
++/* the targets and read back buffers of a slot, for a picture of these blocks */
++static bool slot_make(struct slot *s, int bw, int bh)
++{
++    if (s->textures[0] && s->blocks_w == bw && s->blocks_h == bh)
++        return true;
++    slot_free(s);
++    const int size[2][2] = {{DVBRIDGE_MEASURED_BANDS, bh}, {bw, DVBRIDGE_MEASURED_COLUMN_BANDS / 4}};
++    glGenTextures(2, s->textures);
++    glGenFramebuffers(2, s->framebuffers);
++    glGenBuffers(2, s->buffers);
++    for (int i = 0; i < 2; ++i) {
++        glBindTexture(GL_TEXTURE_2D, s->textures[i]);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, size[i][0], size[i][1]);
++        glBindFramebuffer(GL_FRAMEBUFFER, s->framebuffers[i]);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->textures[i], 0);
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            slot_free(s);
++            return false;
++        }
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffers[i]);
++        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)size[i][0] * size[i][1] * 16, NULL, GL_STREAM_READ);
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    s->blocks_w = bw;
++    s->blocks_h = bh;
++    return glGetError() == GL_NO_ERROR;
++}
++
++bool dvbridge_measure_submit(struct dvbridge_measure *m, unsigned luma, unsigned chroma, int width, int height,
++                             const int window[2], double pts, uint64_t tag)
++{
++    if (!m || !luma || !chroma || width < 2 * DVBRIDGE_MEASURED_BANDS || height < 2 * DVBRIDGE_MEASURED_ROW_GROUPS ||
++        width > 4096 || height > 2304 || !window || window[0] < 0 || window[1] > width / 2 || window[0] >= window[1])
++        return false;
++    struct slot *s = NULL;
++    for (int i = 0; i < SLOTS && !s; ++i)
++        if (!m->slots[i].busy)
++            s = &m->slots[i];
++    if (!s)
++        return false;
++    const int bw = width / 2, bh = height / 2;
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    GLint pack = 0;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    GLint pack_alignment = 4;
++    glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
++    }
++    bool ok = slot_make(s, bw, bh);
++    if (ok) {
++        glDisable(GL_BLEND);
++        glDisable(GL_SCISSOR_TEST);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_STENCIL_TEST);
++        glDisable(GL_CULL_FACE);
++        glDisable(GL_DITHER);
++        glDisable(GL_RASTERIZER_DISCARD);
++        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++        glBindVertexArray(m->vertex_array);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, luma);
++        glBindSampler(0, 0);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, chroma);
++        glBindSampler(1, 0);
++        const int size[2][2] = {{DVBRIDGE_MEASURED_BANDS, bh}, {bw, DVBRIDGE_MEASURED_COLUMN_BANDS / 4}};
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        for (int i = 0; i < 2; ++i) {
++            glUseProgram(m->programs[i]);
++            glUniform1i(m->luma[i], 0);
++            glUniform1i(m->chroma[i], 1);
++            glUniform4i(m->geo[i], bw, bh, window[0], window[1]);
++            glBindFramebuffer(GL_FRAMEBUFFER, s->framebuffers[i]);
++            glViewport(0, 0, size[i][0], size[i][1]);
++            glDrawArrays(GL_TRIANGLES, 0, 3);
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffers[i]);
++            glReadPixels(0, 0, size[i][0], size[i][1], GL_RGBA, GL_FLOAT, NULL);
++        }
++        s->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++        ok = s->fence && glGetError() == GL_NO_ERROR;
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
++    dvbridge_gl_state_restore(&state);
++    if (!ok) {
++        if (s->fence)
++            glDeleteSync(s->fence);
++        s->fence = 0;
++        return false;
++    }
++    s->busy = true;
++    s->window[0] = window[0];
++    s->window[1] = window[1];
++    s->pts = pts;
++    s->tag = tag;
++    s->order = m->next_order++;
++    return true;
++}
++
++unsigned dvbridge_measure_collect(struct dvbridge_measure *m,
++                                  void (*done)(const struct dvbridge_measured_raw *raw, uint64_t tag, void *context),
++                                  void *context)
++{
++    if (!m)
++        return 0;
++    for (;;) {
++        struct slot *s = NULL;
++        for (int i = 0; i < SLOTS; ++i)
++            if (m->slots[i].busy && (!s || (int)(m->slots[i].order - s->order) < 0))
++                s = &m->slots[i];
++        if (!s)
++            return 0;
++        const GLenum wait = glClientWaitSync(s->fence, 0, 0);
++        if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED) {
++            if (wait == GL_WAIT_FAILED) {
++                /* (a fence that cannot be waited on: given up) */
++                glDeleteSync(s->fence);
++                s->fence = 0;
++                s->busy = false;
++                continue;
++            }
++            unsigned in_flight = 0;
++            for (int i = 0; i < SLOTS; ++i)
++                in_flight += m->slots[i].busy;
++            return in_flight;
++        }
++        glDeleteSync(s->fence);
++        s->fence = 0;
++        s->busy = false;
++        GLint pack = 0;
++        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++        const size_t rows_size = (size_t)DVBRIDGE_MEASURED_BANDS * s->blocks_h * 16;
++        const size_t columns_size = (size_t)s->blocks_w * (DVBRIDGE_MEASURED_COLUMN_BANDS / 4) * 16;
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffers[0]);
++        const float *rows = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)rows_size, GL_MAP_READ_BIT);
++        if (rows) {
++            /* the rows as they are (r * bands + b) * 4; the columns from (j * bw + c) * 4 + k to c * 8 + 4 j + k */
++            const size_t need = (size_t)s->blocks_w * DVBRIDGE_MEASURED_COLUMN_BANDS * sizeof(float);
++            float *kept = malloc(rows_size);
++            if (kept)
++                memcpy(kept, rows, rows_size);
++            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++            if (m->columns_size < need) {
++                free(m->columns);
++                m->columns = malloc(need);
++                m->columns_size = m->columns ? need : 0;
++            }
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffers[1]);
++            const float *cols = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)columns_size, GL_MAP_READ_BIT);
++            if (cols && kept && m->columns) {
++                for (int j = 0; j < DVBRIDGE_MEASURED_COLUMN_BANDS / 4; ++j)
++                    for (int c = 0; c < s->blocks_w; ++c)
++                        for (int k = 0; k < 4; ++k)
++                            m->columns[(size_t)c * DVBRIDGE_MEASURED_COLUMN_BANDS + 4 * j + k] =
++                                cols[((size_t)j * s->blocks_w + c) * 4 + k];
++                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++                const struct dvbridge_measured_raw raw = {
++                    .pts = s->pts, .blocks_w = s->blocks_w, .blocks_h = s->blocks_h,
++                    .window = {s->window[0], s->window[1]}, .rows = kept, .columns = m->columns};
++                glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++                done(&raw, s->tag, context);
++            } else if (cols)
++                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++            free(kept);
++        }
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    }
++}
+diff --git a/tools/dvbridge/dvbridge_measure.h b/tools/dvbridge/dvbridge_measure.h
+new file mode 100644
+index 0000000..de62a2b
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_measure.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_MEASURE_H
++#define DVBRIDGE_MEASURE_H
++/* Hades: the measurement on the GPU of an HDR10 picture for HDR10 measured as Dolby Vision (dvbridge_measured.h):
++ * two passes over the reduced pixel set of ST 2094-10:2021 6.1 (2x2 means of R'G'B', from the 10-bit 4:2:0 BT.2020
++ * picture as decoded, limited range), into two small float targets that are read back without waiting: the read
++ * back of a picture is taken when its fence has passed (dvbridge_measure_collect()), a frame or more later, which
++ * is why Kodi measures the pictures queued ahead of their presentation. Nothing waits for the GPU here. The GL
++ * state of the caller is kept. */
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "dvbridge_measured.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct dvbridge_measure;
++/* (a GL ES 3 context with float render targets current, as the bridge's) */
++struct dvbridge_measure *dvbridge_measure_create(void);
++void dvbridge_measure_destroy(struct dvbridge_measure *m);
++/* Queues the measurement of a picture: the GL textures of its luma (R16, the 10 bits at the top) and chroma (RG16,
++ * half size), width x height, over the block columns window (dvbridge_measured_window()); tag is given back with it.
++ * false: not queued (every slot is in flight, or GL failed: the picture is not measured). */
++bool dvbridge_measure_submit(struct dvbridge_measure *m, unsigned luma, unsigned chroma, int width, int height,
++                             const int window[2], double pts, uint64_t tag);
++/* The measurements that the GPU has finished, in the order they were queued, each to done(); one not finished stops
++ * it (so that they come in order). Returns how many are still in flight. */
++unsigned dvbridge_measure_collect(struct dvbridge_measure *m,
++                                  void (*done)(const struct dvbridge_measured_raw *raw, uint64_t tag, void *context),
++                                  void *context);
++/* What is in flight is dropped (a seek, a new stream) */
++void dvbridge_measure_reset(struct dvbridge_measure *m);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/tools/dvbridge/dvbridge_measured.c b/tools/dvbridge/dvbridge_measured.c
+new file mode 100644
+index 0000000..043975c
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_measured.c
+@@ -0,0 +1,413 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_measured.h. */
++#include "dvbridge_measured.h"
++
++#include "dvbridge_hdr10plus.h"
++
++#include <libavutil/dovi_meta.h>
++#include <libavutil/mastering_display_metadata.h>
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define KEPT 32 /* pictures given and not yet taken, at most */
++
++const struct dvbridge_measured_params dvbridge_measured_default_params = {
++    .cut = 0.05f, .motion = 2.5f, .step = 0.7f, .avg_step = 24, .max_step = 16, .min_step = 4,
++};
++
++struct scene {
++    double max, min, sum;
++    unsigned n;
++};
++
++struct dvbridge_measured {
++    struct dvbridge_measured_params p;
++    struct dvbridge_measured_picture kept[KEPT];
++    unsigned count;
++    /* the active area of the stream: the union of the pictures' own; none until one has content */
++    bool area_known;
++    int area[4];
++    int blocks_w, blocks_h;
++    /* the last picture taken (or gone into the scene untaken) */
++    bool started;
++    float last_grid[DVBRIDGE_MEASURED_GRID];
++    struct scene scene;
++    struct dvbridge_measured_l1 sent;
++    /* the grid differences of the last pictures (not of flashes), for the median that tells motion */
++    float changes[12];
++    unsigned changes_n, changes_at;
++};
++
++struct dvbridge_measured *dvbridge_measured_create(const struct dvbridge_measured_params *params)
++{
++    struct dvbridge_measured *m = calloc(1, sizeof(*m));
++    if (m)
++        m->p = params ? *params : dvbridge_measured_default_params;
++    return m;
++}
++
++void dvbridge_measured_destroy(struct dvbridge_measured *m)
++{
++    free(m);
++}
++
++void dvbridge_measured_reset(struct dvbridge_measured *m, bool keep_area)
++{
++    if (!m)
++        return;
++    const struct dvbridge_measured_params p = m->p;
++    const bool known = m->area_known;
++    int area[4], bw = m->blocks_w, bh = m->blocks_h;
++    memcpy(area, m->area, sizeof(area));
++    memset(m, 0, sizeof(*m));
++    m->p = p;
++    if (keep_area && known) {
++        m->area_known = true;
++        memcpy(m->area, area, sizeof(area));
++        m->blocks_w = bw;
++        m->blocks_h = bh;
++    }
++}
++
++void dvbridge_measured_window(const struct dvbridge_measured *m, int blocks_w, int window[2])
++{
++    if (m && m->area_known && m->blocks_w == blocks_w) {
++        window[0] = m->area[2];
++        window[1] = m->area[3];
++    } else {
++        window[0] = 0;
++        window[1] = blocks_w;
++    }
++}
++
++bool dvbridge_measured_reduce(struct dvbridge_measured *m, const struct dvbridge_measured_raw *raw,
++                              struct dvbridge_measured_picture *out)
++{
++    if (!m || !raw || !out || !raw->rows || !raw->columns || raw->blocks_w < DVBRIDGE_MEASURED_BANDS ||
++        raw->blocks_h < DVBRIDGE_MEASURED_ROW_GROUPS || raw->window[0] < 0 || raw->window[1] > raw->blocks_w ||
++        raw->window[0] >= raw->window[1])
++        return false;
++    const int bw = raw->blocks_w, bh = raw->blocks_h;
++    memset(out, 0, sizeof(*out));
++    out->pts = raw->pts;
++    out->blocks_w = bw;
++    out->blocks_h = bh;
++    /* the picture's own active rows and columns */
++    int y0 = -1, y1 = -1, x0 = -1, x1 = -1;
++    for (int r = 0; r < bh; ++r) {
++        float all = 0;
++        for (int b = 0; b < DVBRIDGE_MEASURED_BANDS; ++b)
++            all = fmaxf(all, raw->rows[(r * DVBRIDGE_MEASURED_BANDS + b) * 4 + 3]);
++        if (all > DVBRIDGE_MEASURED_BLACK) {
++            if (y0 < 0)
++                y0 = r;
++            y1 = r + 1;
++        }
++    }
++    for (int c = 0; c < bw; ++c) {
++        float all = 0;
++        for (int k = 0; k < DVBRIDGE_MEASURED_COLUMN_BANDS; ++k)
++            all = fmaxf(all, raw->columns[c * DVBRIDGE_MEASURED_COLUMN_BANDS + k]);
++        if (all > DVBRIDGE_MEASURED_BLACK) {
++            if (x0 < 0)
++                x0 = c;
++            x1 = c + 1;
++        }
++    }
++    out->content = y0 >= 0 && x0 >= 0;
++    if (out->content) {
++        out->active[0] = y0;
++        out->active[1] = y1;
++        out->active[2] = x0;
++        out->active[3] = x1;
++    }
++    /* The area of the stream grows with the pictures whose black edges can be bars: as wide at the top as at the
++     * bottom (and at the left as at the right), to within 4 blocks, around at least 40 % of the picture. A dark
++     * picture with something bright in it says nothing of bars. (A new size starts it again.) */
++    const bool bars = out->content && abs(y0 - (bh - y1)) <= 4 && abs(x0 - (bw - x1)) <= 4 &&
++                      5 * (y1 - y0) >= 2 * bh && 5 * (x1 - x0) >= 2 * bw;
++    if (m->area_known && (m->blocks_w != bw || m->blocks_h != bh))
++        m->area_known = false;
++    if (bars) {
++        if (!m->area_known) {
++            m->area_known = true;
++            memcpy(m->area, out->active, sizeof(m->area));
++            m->blocks_w = bw;
++            m->blocks_h = bh;
++        } else {
++            m->area[0] = y0 < m->area[0] ? y0 : m->area[0];
++            m->area[1] = y1 > m->area[1] ? y1 : m->area[1];
++            m->area[2] = x0 < m->area[2] ? x0 : m->area[2];
++            m->area[3] = x1 > m->area[3] ? x1 : m->area[3];
++        }
++    }
++    /* level 1 over the rows of the area and the columns of the window */
++    const int ry0 = m->area_known && m->blocks_h == bh ? m->area[0] : 0;
++    const int ry1 = m->area_known && m->blocks_h == bh ? m->area[1] : bh;
++    int per_band[DVBRIDGE_MEASURED_BANDS];
++    for (int b = 0; b < DVBRIDGE_MEASURED_BANDS; ++b) {
++        const int c0 = b * bw / DVBRIDGE_MEASURED_BANDS, c1 = (b + 1) * bw / DVBRIDGE_MEASURED_BANDS;
++        const int a = c0 > raw->window[0] ? c0 : raw->window[0];
++        const int z = c1 < raw->window[1] ? c1 : raw->window[1];
++        per_band[b] = z > a ? z - a : 0;
++    }
++    double sum = 0, grid_sum[DVBRIDGE_MEASURED_GRID] = {0};
++    long count = 0, grid_count[DVBRIDGE_MEASURED_GRID] = {0};
++    float mx = 0, mn = 2;
++    for (int r = ry0; r < ry1; ++r) {
++        const int gy = (r - ry0) * DVBRIDGE_MEASURED_ROW_GROUPS / (ry1 - ry0);
++        for (int b = 0; b < DVBRIDGE_MEASURED_BANDS; ++b) {
++            if (!per_band[b])
++                continue;
++            const float *v = &raw->rows[(r * DVBRIDGE_MEASURED_BANDS + b) * 4];
++            mx = fmaxf(mx, v[0]);
++            mn = fminf(mn, v[2]);
++            sum += v[1];
++            count += per_band[b];
++            grid_sum[gy * DVBRIDGE_MEASURED_BANDS + b] += v[1];
++            grid_count[gy * DVBRIDGE_MEASURED_BANDS + b] += per_band[b];
++        }
++    }
++    if (!count)
++        return false;
++    out->max = mx;
++    out->min = mn > 1 ? 0 : mn;
++    out->avg = (float)(sum / count);
++    for (int i = 0; i < DVBRIDGE_MEASURED_GRID; ++i)
++        out->grid[i] = grid_count[i] ? (float)(grid_sum[i] / grid_count[i]) : 0;
++    return true;
++}
++
++void dvbridge_measured_add(struct dvbridge_measured *m, const struct dvbridge_measured_picture *p)
++{
++    if (!m || !p || !isfinite(p->pts))
++        return;
++    unsigned i = 0;
++    while (i < m->count && m->kept[i].pts < p->pts)
++        ++i;
++    if (i < m->count && m->kept[i].pts == p->pts) {
++        m->kept[i] = *p;
++        return;
++    }
++    if (m->count == KEPT) {
++        /* (no room: the latest is given up; the pictures kept are those that are presented first) */
++        if (i == KEPT)
++            return;
++        --m->count;
++    }
++    memmove(&m->kept[i + 1], &m->kept[i], (m->count - i) * sizeof(m->kept[0]));
++    m->kept[i] = *p;
++    ++m->count;
++}
++
++static float mad(const float *a, const float *b)
++{
++    double d = 0;
++    for (int i = 0; i < DVBRIDGE_MEASURED_GRID; ++i)
++        d += fabs((double)a[i] - b[i]);
++    return (float)(d / DVBRIDGE_MEASURED_GRID);
++}
++
++static unsigned code(double v)
++{
++    const double c = floor(v * 4095 + 0.5);
++    return c < 0 ? 0 : c > 4095 ? 4095 : (unsigned)c;
++}
++
++/* level 1 of a scene, clamped as dovi_tool clamps a level 1 block for CM v2.9 (as dvbridge_hdr10plus.c) */
++static void codes(const struct scene *s, unsigned out[3])
++{
++    unsigned mn = code(s->min), mx = code(s->max), avg = code(s->n ? s->sum / s->n : 0);
++    mn = mn > 12 ? 12 : mn;
++    mx = mx < 2081 ? 2081 : mx;
++    avg = avg < 819 ? 819 : avg;
++    if (avg > mx - 1)
++        avg = mx - 1;
++    out[0] = mn;
++    out[1] = mx;
++    out[2] = avg;
++}
++
++static void scene_add(struct scene *s, const struct dvbridge_measured_picture *p)
++{
++    if (!p->content)
++        return; /* (a black picture: nothing to measure; the scene keeps what it had) */
++    if (!s->n || p->max > s->max)
++        s->max = p->max;
++    if (!s->n || p->min < s->min)
++        s->min = p->min;
++    s->sum += p->avg;
++    ++s->n;
++}
++
++static float median(const float *v, unsigned n)
++{
++    float s[12];
++    memcpy(s, v, n * sizeof(*s));
++    for (unsigned i = 1; i < n; ++i)
++        for (unsigned j = i; j > 0 && s[j - 1] > s[j]; --j) {
++            const float x = s[j];
++            s[j] = s[j - 1];
++            s[j - 1] = x;
++        }
++    return n ? (n & 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : 0;
++}
++
++/* whether p, which differs by d from the picture before it (grid before), starts a scene; next: the picture after it
++ * where it is measured. *flash: no, it is one picture unlike those around it. */
++static bool is_cut(const struct dvbridge_measured *m, const float *before, const struct dvbridge_measured_picture *p,
++                   const struct dvbridge_measured_picture *next, float d, bool *flash)
++{
++    *flash = false;
++    if (d <= m->p.cut || (m->changes_n && d <= m->p.motion * median(m->changes, m->changes_n)))
++        return false;
++    if (next) {
++        if (mad(next->grid, before) <= m->p.cut) {
++            *flash = true;
++            return false;
++        }
++        if (mad(next->grid, p->grid) >= m->p.step * d)
++            return false;
++    }
++    return true;
++}
++
++/* the picture at kept[i] (the oldest) goes into the scene: a cut, or not; returns whether it starts one */
++static bool step(struct dvbridge_measured *m, unsigned i)
++{
++    const struct dvbridge_measured_picture *p = &m->kept[i];
++    const struct dvbridge_measured_picture *next = i + 1 < m->count ? &m->kept[i + 1] : NULL;
++    bool cut = !m->started, flash = false;
++    float d = 0;
++    if (!cut) {
++        d = mad(p->grid, m->last_grid);
++        cut = is_cut(m, m->last_grid, p, next, d, &flash);
++    }
++    if (cut)
++        memset(&m->scene, 0, sizeof(m->scene));
++    scene_add(&m->scene, p);
++    /* what the scene is known to be: so far, and the pictures measured after this one that are of it */
++    struct scene known = m->scene;
++    const float *before = flash ? m->last_grid : p->grid;
++    for (unsigned j = i + 1; j < m->count; ++j) {
++        bool other;
++        if (is_cut(m, before, &m->kept[j], j + 1 < m->count ? &m->kept[j + 1] : NULL,
++                   mad(m->kept[j].grid, before), &other))
++            break;
++        scene_add(&known, &m->kept[j]);
++        if (!other)
++            before = m->kept[j].grid;
++    }
++    if (known.n) {
++        unsigned c[3];
++        codes(&known, c);
++        if (cut || !m->sent.measured) {
++            m->sent.min_pq = c[0];
++            m->sent.max_pq = c[1];
++            m->sent.avg_pq = c[2];
++        } else {
++            if (c[1] > m->sent.max_pq + m->p.max_step)
++                m->sent.max_pq = c[1];
++            if (c[0] + m->p.min_step < m->sent.min_pq)
++                m->sent.min_pq = c[0];
++            if (c[2] > m->sent.avg_pq + m->p.avg_step || c[2] + m->p.avg_step < m->sent.avg_pq)
++                m->sent.avg_pq = c[2];
++            if (m->sent.avg_pq > m->sent.max_pq - 1)
++                m->sent.avg_pq = m->sent.max_pq - 1;
++        }
++        m->sent.measured = true;
++    }
++    if (m->area_known) {
++        m->sent.area[0] = (unsigned)m->area[2] * 2;
++        m->sent.area[1] = (unsigned)(m->blocks_w - m->area[3]) * 2;
++        m->sent.area[2] = (unsigned)m->area[0] * 2;
++        m->sent.area[3] = (unsigned)(m->blocks_h - m->area[1]) * 2;
++    }
++    if (!flash) {
++        memcpy(m->last_grid, p->grid, sizeof(m->last_grid));
++        if (m->started) {
++            m->changes[m->changes_at] = d;
++            m->changes_at = (m->changes_at + 1) % 12;
++            if (m->changes_n < 12)
++                ++m->changes_n;
++        }
++    }
++    m->started = true;
++    memmove(&m->kept[0], &m->kept[1], (m->count - 1) * sizeof(m->kept[0]));
++    --m->count;
++    return cut;
++}
++
++bool dvbridge_measured_take(struct dvbridge_measured *m, double pts, struct dvbridge_measured_l1 *l1)
++{
++    if (!m || !l1)
++        return false;
++    /* (pictures given before it and not presented: into the scene as they were) */
++    while (m->count && m->kept[0].pts < pts - 1e-6 * fabs(pts) - 1e-9)
++        step(m, 0);
++    bool found = m->count && fabs(m->kept[0].pts - pts) <= 1e-6 * fabs(pts) + 1e-9;
++    bool cut = false;
++    if (found)
++        cut = step(m, 0);
++    *l1 = m->sent;
++    l1->refresh = found && cut;
++    if (!found)
++        l1->refresh = false;
++    return found && m->sent.measured;
++}
++
++static double pq(double nits)
++{
++    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128;
++    const double c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
++    const double y = pow(nits < 0 ? 0 : nits > 10000 ? 1 : nits / 10000, m1);
++    return pow((c1 + c2 * y) / (1 + c3 * y), m2);
++}
++
++struct AVDOVIMetadata *dvbridge_measured_placeholder(const struct AVMasteringDisplayMetadata *mastering,
++                                                     const struct AVContentLightMetadata *light, size_t *size)
++{
++    if (!mastering || !mastering->has_luminance || mastering->max_luminance.den <= 0)
++        return NULL;
++    const double peak = light && light->MaxCLL ? light->MaxCLL : av_q2d(mastering->max_luminance);
++    struct scene s = {.max = pq(peak), .min = 0, .sum = light && light->MaxFALL ? pq(light->MaxFALL) : 0, .n = 1};
++    unsigned c[3];
++    codes(&s, c);
++    return dvbridge_profile81_metadata(c[0], c[1], c[2], NULL, mastering, light, false, size);
++}
++
++bool dvbridge_measured_apply(struct AVDOVIMetadata *m, size_t size, const struct dvbridge_measured_l1 *l1)
++{
++    if (!m || !l1 || size < sizeof(*m) || m->num_ext_blocks < 0 || m->num_ext_blocks > AV_DOVI_MAX_EXT_BLOCKS ||
++        m->ext_block_offset + (size_t)AV_DOVI_MAX_EXT_BLOCKS * m->ext_block_size > size || l1->min_pq > l1->max_pq ||
++        l1->max_pq > 4095 || l1->avg_pq > 4095)
++        return false;
++    AVDOVIDmData *level1 = NULL, *level5 = NULL;
++    for (int i = 0; i < m->num_ext_blocks; ++i) {
++        AVDOVIDmData *e = av_dovi_get_ext(m, i);
++        if (e->level == 1 && !level1)
++            level1 = e;
++        else if (e->level == 5 && !level5)
++            level5 = e;
++    }
++    if (!level1)
++        return false;
++    if (!level5) {
++        if (m->num_ext_blocks == AV_DOVI_MAX_EXT_BLOCKS)
++            return false;
++        level5 = av_dovi_get_ext(m, m->num_ext_blocks++);
++        memset(level5, 0, sizeof(*level5));
++        level5->level = 5;
++    }
++    level1->l1.min_pq = (uint16_t)l1->min_pq;
++    level1->l1.max_pq = (uint16_t)l1->max_pq;
++    level1->l1.avg_pq = (uint16_t)l1->avg_pq;
++    level5->l5.left_offset = (uint16_t)l1->area[0];
++    level5->l5.right_offset = (uint16_t)l1->area[1];
++    level5->l5.top_offset = (uint16_t)l1->area[2];
++    level5->l5.bottom_offset = (uint16_t)l1->area[3];
++    av_dovi_get_color(m)->scene_refresh_flag = l1->refresh;
++    return true;
++}
+diff --git a/tools/dvbridge/dvbridge_measured.h b/tools/dvbridge/dvbridge_measured.h
+new file mode 100644
+index 0000000..92b58fe
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_measured.h
+@@ -0,0 +1,107 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_MEASURED_H
++#define DVBRIDGE_MEASURED_H
++/* Hades: HDR10 sent as Dolby Vision with metadata measured from the picture. An HDR10 video has no dynamic
++ * metadata of its studio: what is sent is measured by Hades on each picture, in real time, as ST 2094-10:2021 6.1
++ * defines level 1 (the reduced pixel set of 2x2 means of R'G'B', over the active area: min of minRGB, mean and max
++ * of maxRGB, in PQ), and held per scene as Dolby Vision metadata are: a scene cut that is detected refreshes the
++ * scene, and within a scene the level 1 block changes only when the scene so far says otherwise by more than a
++ * step. The active area (level 5) is the area of the picture that is ever not black. Nothing else is sent: no
++ * trims (there is no colourist's grade to translate), no level 3 (CCM 001 reserves it).
++ *
++ * This part decides from the measurements (dvbridge_measure.c makes them on the GPU); it holds no GL. The
++ * pictures are given in the order of presentation, ahead of their presentation as far as they are measured
++ * (Kodi measures the pictures queued for presentation: a cut is detected before its first picture is shown when
++ * that picture and the one after it are measured in time), and taken when they are presented. */
++#include <stdbool.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define DVBRIDGE_MEASURED_BANDS 16       /* column bands of the measurement of the rows */
++#define DVBRIDGE_MEASURED_ROW_GROUPS 9   /* ... and groups of rows of the grid that cuts are told by */
++#define DVBRIDGE_MEASURED_COLUMN_BANDS 8 /* row bands of the measurement of the columns */
++#define DVBRIDGE_MEASURED_GRID (DVBRIDGE_MEASURED_BANDS * DVBRIDGE_MEASURED_ROW_GROUPS)
++/* a block whose maxRGB (PQ) is above it is picture; the bars are what is never above it */
++#define DVBRIDGE_MEASURED_BLACK 0.02f
++
++/* What the measurement of one picture gives (dvbridge_measure.c), on the reduced pixel set of blocks_w x blocks_h */
++struct dvbridge_measured_raw {
++    double pts;
++    int blocks_w, blocks_h;
++    int window[2]; /* the block columns [window[0], window[1]) that the values "in the window" are of */
++    /* per block row r and band b, at (r * DVBRIDGE_MEASURED_BANDS + b) * 4: the max of maxRGB, the sum of maxRGB and
++     * the min of minRGB of its blocks in the window (2 where none), and the max of maxRGB of all of its blocks */
++    const float *rows;
++    /* per block column c and row band k, at c * DVBRIDGE_MEASURED_COLUMN_BANDS + k: the max of maxRGB */
++    const float *columns;
++};
++
++/* One picture, as the decisions take it */
++struct dvbridge_measured_picture {
++    double pts;
++    bool content; /* it has blocks above the black level */
++    float min, avg, max; /* level 1 over the active area, PQ in [0, 1] */
++    float grid[DVBRIDGE_MEASURED_GRID]; /* the mean maxRGB of each cell of the active area (PQ) */
++    int active[4]; /* its own rows [0], [1) and columns [2], [3) with blocks above the black level */
++    int blocks_w, blocks_h;
++};
++
++/* A scene cut is a picture whose grid differs from the one before by more than cut on average (PQ), and by more than
++ * motion times the median of the last 12 such differences (a camera or a scene that moves differs much every
++ * picture); where the picture after it is measured as well, that one has to be within step of it (a cut is a step:
++ * the next picture is of the new scene) and away from the one before by more than cut (else it was one bright
++ * picture: a flash, no cut). */
++struct dvbridge_measured_params {
++    float cut, motion, step;
++    unsigned avg_step, max_step, min_step; /* within a scene, the level 1 sent changes by more than these (codes) */
++};
++
++/* What a picture is sent with */
++struct dvbridge_measured_l1 {
++    bool measured; /* from measurements (else nothing was measured yet: none) */
++    bool refresh;  /* the picture is the first of a scene */
++    unsigned min_pq, max_pq, avg_pq;  /* level 1, as a level 1 block carries it, clamped as dovi_tool clamps one */
++    unsigned area[4]; /* level 5: the offsets left, right, top, bottom, in pixels of the picture */
++};
++
++struct dvbridge_measured;
++/* params: NULL for the defaults (dvbridge_measured_default_params) */
++struct dvbridge_measured *dvbridge_measured_create(const struct dvbridge_measured_params *params);
++void dvbridge_measured_destroy(struct dvbridge_measured *m);
++/* A seek, or a new stream: what was measured goes; the active area stays only with keep_area (the same stream) */
++void dvbridge_measured_reset(struct dvbridge_measured *m, bool keep_area);
++extern const struct dvbridge_measured_params dvbridge_measured_default_params;
++
++/* The picture of what the GPU measured, over the rows of the active area known now (the area grows with it) */
++bool dvbridge_measured_reduce(struct dvbridge_measured *m, const struct dvbridge_measured_raw *raw,
++                              struct dvbridge_measured_picture *picture);
++/* A picture measured, in the order of presentation (one with the time of one given before replaces it) */
++void dvbridge_measured_add(struct dvbridge_measured *m, const struct dvbridge_measured_picture *picture);
++/* The metadata of the picture of pts, which is presented now: pictures before it that were given and not taken
++ * (not presented) go into the scene as they were. false: it was not measured; *l1 then holds what was sent
++ * last (measured false when nothing was), without a refresh. */
++bool dvbridge_measured_take(struct dvbridge_measured *m, double pts, struct dvbridge_measured_l1 *l1);
++/* The block columns that the next measurements are to be made over: those of the active area known now, all
++ * of them before any is known */
++void dvbridge_measured_window(const struct dvbridge_measured *m, int blocks_w, int window[2]);
++
++struct AVDOVIMetadata;
++struct AVMasteringDisplayMetadata;
++struct AVContentLightMetadata;
++/* The metadata that a picture of such a stream carries from its decoder (dvbridge_profile81_metadata(): profile 8.1,
++ * identity mapping, the mastering display as the source range), with level 1 from the static metadata until it is
++ * measured: max PQ(MaxCLL) (or of the mastering display's peak), average PQ(MaxFALL), clamped as dovi_tool clamps
++ * one. NULL without the luminance of the mastering display: no Dolby Vision. */
++struct AVDOVIMetadata *dvbridge_measured_placeholder(const struct AVMasteringDisplayMetadata *mastering,
++                                                     const struct AVContentLightMetadata *light, size_t *size);
++/* The metadata of a picture made from those, as it is presented: its level 1 block, its scene refresh and its level
++ * 5 block (added, or replaced) from l1. false: they cannot take it (no level 1 block, no room). */
++bool dvbridge_measured_apply(struct AVDOVIMetadata *metadata, size_t size, const struct dvbridge_measured_l1 *l1);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

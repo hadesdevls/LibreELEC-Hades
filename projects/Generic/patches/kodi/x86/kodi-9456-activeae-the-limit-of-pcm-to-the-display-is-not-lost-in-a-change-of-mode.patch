@@ -1,0 +1,377 @@
+From cc2f1e51f046d3687e6611437dc2a9f73770a640 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 07:31:58 +0000
+Subject: [PATCH] ActiveAE: the limit of PCM to the display is not lost in a
+ change of mode
+
+Since "AudioEngine: PCM in no more channels than the display takes" the
+channels of PCM follow the audio data of the display (its ELD), read when
+the outputs are listed. A test of 2026-10-21 (an LG C5 on the HDMI output
+of the integrated graphics, Raphael, amdgpu; the TV declared PCM in 2
+channels, "Number of channels" was 7.1) shows the limit lost for a whole
+film: the sink opened 2 channels for a DTS 5.1 track, the outputs were
+listed again right after, in the change of mode to the video, while the
+HDA HDMI codec had no valid ELD of the TV ("m_display: none", every
+channel of ALSA's maps), the sink opened 6 channels, and nothing listed
+the outputs again: the film went out in 5.1 PCM to a TV that takes 2.
+The same happened when the film stopped. On the NVIDIA card of the same
+PC one listing out of eleven of another start fell in a change of mode
+as well, and the next listing, 28 s later, healed it.
+
+Two reasons, from the code:
+
+- amdgpu tells the audio driver that the audio of an output is gone and
+  that it is back in the commit that sets a mode
+  (amdgpu_dm_commit_audio()); each is a change of the ELD control, which
+  Kodi takes as a device change. A device change that came while the
+  engine had the sink suspended for a lost display (between DISPLAYLOST
+  and DISPLAYRESET) was dropped, and a display reset opens the sink again
+  without listing the outputs. Around the two changes of mode for Dolby
+  Vision of that start no listing was made at all; the snapshot of the
+  diagnostics after them found the ELD of the TV valid. In which order
+  the two changes reached Kodi in the change of mode to the DTS film is
+  not in the log.
+- a listing that falls between the two finds no audio data, and the
+  limit was then taken away (0, not known).
+
+Now a device change while the sink is suspended for a lost display is
+kept, and at the display reset the outputs are listed again, and the
+settings loaded, before the sink is opened (logged: "the outputs changed
+while the display was being reset: they are listed again"); a reset
+without such a change costs nothing more than before. And while the
+display of an output has no audio data, the engine takes the last ones
+read from a display of that output in this run
+(AE::PCM::KeepWhileAway()); a display that is there gives what it says,
+also nothing. The log line of the limit says when they are the kept
+ones. An output whose display never had audio data in this run is not
+limited, as before.
+
+Not changed: what a listing in the middle of a change of mode says of
+whether a display is there, which the audio output that follows the
+display reads too: on the PC of the user no output was followed in that
+listing (every HDMI output said "none").
+
+Host tests (TestAEPcmChannels): the listings of that start, with the
+ELD of the TV, give 2.0 at each one, and the limit follows a display
+that is there; with the code before (what was read, always) and two more
+mutations they fail. The state machine is not run on the host: compiled,
+and read.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp | 47 ++++++++++++++---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.h   | 12 +++++
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 13 +++--
+ .../Engines/ActiveAE/ActiveAESink.h           | 11 ++--
+ xbmc/cores/AudioEngine/Utils/AEPcmChannels.h  | 34 +++++++++++++
+ .../Utils/test/TestAEPcmChannels.cpp          | 50 +++++++++++++++++++
+ 6 files changed, 154 insertions(+), 13 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index 6a6ccc7..7cc6805 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -1025,7 +1025,12 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         case CActiveAEControlProtocol::INIT:
+           m_extError = false;
+           m_extSuspended = false;
+-          if (!displayReset)
++          // Hades: and when the display is back after device changes that came while the sink was
++          // suspended for it (see DEVICECHANGE below), the outputs as they are now
++          if (displayReset && m_extDeviceChangeWhileSuspended)
++            CLog::Log(LOGINFO, "ActiveAE - the outputs changed while the display was being reset: "
++                               "they are listed again");
++          if (!displayReset || m_extDeviceChangeWhileSuspended)
+           {
+             m_controlPort.PurgeOut(CActiveAEControlProtocol::DEVICECHANGE);
+             m_controlPort.PurgeOut(CActiveAEControlProtocol::DEFAULTDEVICECHANGE);
+@@ -1034,6 +1039,7 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+             LoadSettings();
+             ValidateOutputDevices(false);
+           }
++          m_extDeviceChangeWhileSuspended = false;
+           Configure();
+           if (!displayReset)
+             msg->Reply(CActiveAEControlProtocol::ACC);
+@@ -1053,6 +1059,12 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         case CActiveAEControlProtocol::DEVICECHANGE:
+         case CActiveAEControlProtocol::DEFAULTDEVICECHANGE:
+         case CActiveAEControlProtocol::DEVICECOUNTCHANGE:
++          // Hades: not acted on while suspended, as before, but not forgotten: a change of display
++          // mode takes the audio of an HDMI output away and brings it back (amdgpu tells the audio
++          // driver both in the commit that sets the mode), and when that falls here, between
++          // DISPLAYLOST and DISPLAYRESET, the outputs were not listed again. A listing read while
++          // the audio data were away then stayed (the TV of 2026-10-21 got 5.1 PCM for a film).
++          m_extDeviceChangeWhileSuspended = true;
+           return;
+         default:
+           break;
+@@ -2965,30 +2977,51 @@ void CActiveAE::LimitChannelsToDisplay()
+ {
+   const auto component = CServiceBroker::GetSettingsComponent();
+   const auto advanced = component ? component->GetAdvancedSettings() : nullptr;
++  bool kept = false;
+   const unsigned int most = !advanced || advanced->m_audioPcmChannelsFromEld
+-                                ? m_sink.GetMaxPcmChannels(m_settings.device)
++                                ? DisplayAudioOf(m_settings.device, &kept).pcm
+                                 : 0;
+   const int limited = AE::PCM::LimitLayout(m_settings.channels, most);
+   // in the log when it changes
+   const std::string told = limited != m_settings.channels
+                                ? m_settings.device + '|' + std::to_string(m_settings.channels) +
+-                                     '|' + std::to_string(most)
++                                     '|' + std::to_string(most) + (kept ? "|kept" : "")
+                                : std::string();
+   if (told != m_channelsLimitTold)
+   {
+     m_channelsLimitTold = told;
+     if (!told.empty())
+       CLog::Log(LOGINFO,
+-                "ActiveAE - the display of '{}' takes PCM in {} channels at most (its audio "
+-                "data): PCM goes out in up to {} channels ({}), not {} (the setting is not "
+-                "changed)",
+-                m_settings.device, most, AE::PCM::ChannelsOfLayout(limited),
++                "ActiveAE - the display of '{}' takes PCM in {} channels at most ({}): PCM goes "
++                "out in up to {} channels ({}), not {} (the setting is not changed)",
++                m_settings.device, most,
++                kept ? "the audio data it had last: it has none at this moment, as during a "
++                       "change of display mode"
++                     : "its audio data",
++                AE::PCM::ChannelsOfLayout(limited),
+                 CAEUtil::GetStdChLayoutName(static_cast<AEStdChLayout>(limited)),
+                 AE::PCM::ChannelsOfLayout(m_settings.channels));
+   }
+   m_settings.channels = limited;
+ }
+ 
++AE::PCM::DisplayAudio CActiveAE::DisplayAudioOf(const std::string& device, bool* kept)
++{
++  if (kept)
++    *kept = false;
++  AE::PCM::DisplayAudio read;
++  bool displayThere = false;
++  if (!m_sink.GetDisplayAudio(device, read, displayThere))
++    return {};
++
++  const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
++  const AE::PCM::DisplayAudio used =
++      AE::PCM::KeepWhileAway(read, displayThere, m_keptDisplayAudio[dev.driver + ':' + dev.name]);
++  if (kept)
++    *kept = !displayThere && !(used == AE::PCM::DisplayAudio{});
++  return used;
++}
++
+ std::string CActiveAE::ResolveOutput(const std::string& device,
+                                      const std::string& followedBefore,
+                                      bool passthrough,
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+index 1641bc7..6ec6f62 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+@@ -18,6 +18,7 @@
+ 
+ #include <atomic>
+ #include <list>
++#include <map>
+ #include <memory>
+ #include <queue>
+ #include <string>
+@@ -344,6 +345,11 @@ protected:
+   //! Hades: m_settings.channels limited to the channels of PCM that the display of the device takes
+   //! (see the definition)
+   void LimitChannelsToDisplay();
++  //! Hades: the audio data of the display of an output (AE::PCM::KeepWhileAway()): those of the
++  //! last listing of the outputs, or, while its display is away (a change of display mode), the
++  //! last ones read from it in this run
++  //! \param kept set, when not null, to whether they are the kept ones
++  AE::PCM::DisplayAudio DisplayAudioOf(const std::string& device, bool* kept = nullptr);
+   void HandleDeviceCountChange(const std::string& driver, bool defaultDeviceChanged);
+   bool NeedReconfigureBuffers();
+   bool NeedReconfigureSink();
+@@ -390,6 +396,9 @@ protected:
+   //! What LimitChannelsToDisplay() last logged (device, setting and channels), empty when it did
+   //! not limit anything
+   std::string m_channelsLimitTold;
++  //! The audio data of the display of each output, the last ones read from a display of it in this
++  //! run (DisplayAudioOf()), by "driver:name"
++  std::map<std::string, AE::PCM::DisplayAudio> m_keptDisplayAudio;
+   //! The passthrough device that LoadSettings() took, for SupportsRaw(), which other threads
+   //! call.
+   std::string m_passthroughInUse;
+@@ -404,6 +413,9 @@ protected:
+   // Hades: in the error state, the display was lost and has not said it is back (DISPLAYRESET):
+   // device changes do not bring the next try of the sink forward
+   bool m_extDisplayLost{false};
++  // Hades: configured, with the sink suspended for a lost display, a device change came: the
++  // outputs are listed again when the display is back (DISPLAYRESET)
++  bool m_extDeviceChangeWhileSuspended{false};
+   bool m_extDrain;
+   XbmcThreads::EndTime<> m_extDrainTimer;
+   std::chrono::milliseconds m_extKeepConfig;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index 80cf78c..095ede9 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -84,7 +84,9 @@ AEDeviceType CActiveAESink::GetDeviceType(const std::string &device)
+   return AE_DEVTYPE_PCM;
+ }
+ 
+-unsigned int CActiveAESink::GetMaxPcmChannels(const std::string& device) const
++bool CActiveAESink::GetDisplayAudio(const std::string& device,
++                                    AE::PCM::DisplayAudio& audio,
++                                    bool& displayThere) const
+ {
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
+ 
+@@ -96,10 +98,15 @@ unsigned int CActiveAESink::GetMaxPcmChannels(const std::string& device) const
+     for (const auto& info : sink.m_deviceInfoList)
+     {
+       if (info.m_deviceName == dev.name)
+-        return info.m_maxPcmChannels;
++      {
++        audio = AE::PCM::DisplayAudio{};
++        audio.pcm = info.m_maxPcmChannels;
++        displayThere = info.m_display == CAEDeviceInfo::Display::PRESENT;
++        return true;
++      }
+     }
+   }
+-  return 0;
++  return false;
+ }
+ 
+ bool CActiveAESink::HasPassthroughDevice()
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+index 200f48b..e92a56e 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+@@ -12,6 +12,7 @@
+ #include "cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h"
+ #include "cores/AudioEngine/Interfaces/AE.h"
+ #include "cores/AudioEngine/Interfaces/AESink.h"
++#include "cores/AudioEngine/Utils/AEPcmChannels.h"
+ #include "threads/Event.h"
+ #include "threads/SystemClock.h"
+ #include "threads/Thread.h"
+@@ -124,9 +125,13 @@ public:
+   void Start();
+   void Dispose();
+   AEDeviceType GetDeviceType(const std::string &device);
+-  //! Hades: the most channels of linear PCM that the display of an output takes
+-  //! (CAEDeviceInfo::m_maxPcmChannels); 0 when not known
+-  unsigned int GetMaxPcmChannels(const std::string& device) const;
++  //! Hades: what the display of an output takes by its audio data (CAEDeviceInfo::m_maxPcmChannels),
++  //! as the last listing of the outputs read them
++  //! \param displayThere set to whether the driver said that a display was there (a valid ELD)
++  //! \return false when the output is not in the list
++  bool GetDisplayAudio(const std::string& device,
++                       AE::PCM::DisplayAudio& audio,
++                       bool& displayThere) const;
+   bool HasPassthroughDevice();
+   bool SupportsFormat(const std::string &device, AEAudioFormat &format);
+   bool DeviceExist(std::string driver, const std::string& device);
+diff --git a/xbmc/cores/AudioEngine/Utils/AEPcmChannels.h b/xbmc/cores/AudioEngine/Utils/AEPcmChannels.h
+index ad9a782..781244a 100644
+--- a/xbmc/cores/AudioEngine/Utils/AEPcmChannels.h
++++ b/xbmc/cores/AudioEngine/Utils/AEPcmChannels.h
+@@ -99,4 +99,38 @@ constexpr int LimitLayout(int layout, unsigned int maxChannels)
+   }
+   return 0;
+ }
++
++//! What the engine takes from the audio data of the display of an output
++struct DisplayAudio
++{
++  //! the most channels of linear PCM (MaxChannelsOfEld()); 0, not known
++  unsigned int pcm{0};
++
++  constexpr bool operator==(const DisplayAudio&) const = default;
++};
++
++/*!
++ * \brief The audio data that the engine takes for an output, at one listing of the outputs
++ *
++ * A change of display mode takes the audio of an HDMI output away and brings it back: amdgpu
++ * tells the HDA HDMI codec that the audio of the output is gone, and that it is back, in a commit
++ * that sets a mode (amdgpu_dm_commit_audio()), and in between the codec has no valid ELD. A
++ * listing of the outputs that falls there finds no audio data, and the channels of PCM were then
++ * not limited: a TV that takes PCM in 2 channels was sent 5.1 for the rest of a film (2026-10-21,
++ * a DTS track decoded to 5.1 PCM, an LG C5 on the HDMI output of the integrated graphics). While
++ * the display of an output is away, its audio data are the last ones read from a display of that
++ * output in this run.
++ *
++ * \param read what this listing read of the output
++ * \param displayThere the driver says that a display is there, with audio data (a valid ELD)
++ * \param kept what is kept of this output; updated to read where the display is there
++ * \return read where the display is there; else what is kept (nothing when no display of this
++ *         output had audio data in this run, as before)
++ */
++inline DisplayAudio KeepWhileAway(const DisplayAudio& read, bool displayThere, DisplayAudio& kept)
++{
++  if (displayThere)
++    kept = read;
++  return kept;
++}
+ } // namespace AE::PCM
+diff --git a/xbmc/cores/AudioEngine/Utils/test/TestAEPcmChannels.cpp b/xbmc/cores/AudioEngine/Utils/test/TestAEPcmChannels.cpp
+index 5baf3d3..058f504 100644
+--- a/xbmc/cores/AudioEngine/Utils/test/TestAEPcmChannels.cpp
++++ b/xbmc/cores/AudioEngine/Utils/test/TestAEPcmChannels.cpp
+@@ -112,6 +112,56 @@ TEST(TestAEPcmChannels, AnEldThatDoesNotHoldItsDescriptors)
+   EXPECT_EQ(0u, MaxOfEld(name, name.size()));
+ }
+ 
++TEST(TestAEPcmChannels, TheAudioDataOfADisplayThatIsThere)
++{
++  DisplayAudio kept;
++  EXPECT_EQ(2u, KeepWhileAway({2}, true, kept).pcm);
++  EXPECT_EQ(2u, kept.pcm);
++  // a display that is there gives what it says, also more, less, or nothing known
++  EXPECT_EQ(8u, KeepWhileAway({8}, true, kept).pcm);
++  EXPECT_EQ(6u, KeepWhileAway({6}, true, kept).pcm);
++  EXPECT_EQ(0u, KeepWhileAway({0}, true, kept).pcm);
++  EXPECT_EQ(0u, kept.pcm);
++}
++
++TEST(TestAEPcmChannels, TheAudioDataKeptWhileTheDisplayIsAway)
++{
++  // A start of 2026-10-21 on the integrated graphics: the LG C5 declared PCM
++  // in 2 channels, "Number of channels" was 7.1, and a DTS track in 5.1 was decoded. The outputs
++  // were listed when Kodi started (the TV there), then in the change of mode to the video and
++  // after it stopped, both while the codec had no valid ELD of the TV (its output "none"), and
++  // never again. Before: no limit after the second listing, and the sink opened 6 channels for the
++  // rest of the film.
++  constexpr int L2_0 = 1, L7_1 = 10;
++  DisplayAudio kept;
++  const unsigned int started = KeepWhileAway({MaxChannelsOfEld(Eld("LG TV SSCR2", LG_2).data(),
++                                                                Eld("LG TV SSCR2", LG_2).size())},
++                                             true, kept)
++                                   .pcm;
++  EXPECT_EQ(L2_0, LimitLayout(L7_1, started));
++  // the change of mode (01:25:39) and the stop (01:26:49): the output has no audio data
++  const unsigned int inTheChange = KeepWhileAway({0}, false, kept).pcm;
++  EXPECT_EQ(2u, inTheChange);
++  EXPECT_EQ(L2_0, LimitLayout(L7_1, inTheChange));
++  const unsigned int afterTheStop = KeepWhileAway({0}, false, kept).pcm;
++  EXPECT_EQ(L2_0, LimitLayout(L7_1, afterTheStop));
++  // the TV back with its sound bar's audio data (8 channels): those
++  EXPECT_EQ(L7_1, LimitLayout(L7_1, KeepWhileAway({8}, true, kept).pcm));
++  // and away again: the 8 it had last, not the 2 of before
++  EXPECT_EQ(8u, KeepWhileAway({0}, false, kept).pcm);
++}
++
++TEST(TestAEPcmChannels, NothingKeptOfAnOutputThatNeverHadAudioData)
++{
++  // an output whose display never had audio data in this run (a monitor without audio, an output
++  // with nothing on it): nothing to keep, no limit, as before
++  DisplayAudio kept;
++  EXPECT_EQ(0u, KeepWhileAway({0}, false, kept).pcm);
++  EXPECT_EQ(0u, KeepWhileAway({0}, false, kept).pcm);
++  constexpr int L7_1 = 10;
++  EXPECT_EQ(L7_1, LimitLayout(L7_1, KeepWhileAway({0}, false, kept).pcm));
++}
++
+ TEST(TestAEPcmChannels, ChannelsOfTheLayouts)
+ {
+   const unsigned int channels[] = {1, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8};
+-- 
+2.53.0
+

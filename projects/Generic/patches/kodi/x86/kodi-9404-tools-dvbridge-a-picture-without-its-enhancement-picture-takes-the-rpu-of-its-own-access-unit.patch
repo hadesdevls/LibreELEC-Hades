@@ -1,0 +1,565 @@
+From 1aa23d98c606014f03908f4ea9f2ce8afaace946 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:34:35 +0000
+Subject: [PATCH] tools/dvbridge: a picture without its enhancement picture
+ takes the RPU of its own access unit
+
+An RPU travels in the access unit of its enhancement picture. Where the two
+layers are coded in different picture order, the base picture of a packet
+is another picture than the enhancement picture of that packet (in the FEL
+test stream, 2822 of 2876), and the RPU that FFmpeg attaches to a base
+picture is then the one of a neighbour. A paired picture takes the RPU of
+its enhancement picture (dvbridge_fel_layer_metadata()), and a picture whose
+access unit is not decoded the one of its mark (MEL). A base picture that
+goes out without its enhancement picture kept the RPU carried with it: after
+a seek or a resynchronization while the layer waits for a picture to start
+at, the leading pictures of that picture, a picture that refers to one that
+was not decoded, a late one. That is the metadata of another picture: its
+mapping, its brightness, wrong at every cut.
+
+The module now keeps the RPU of each enhancement access unit whose time it
+knows, with the time of the base packet that brought it: an access unit that
+is given to the decoder, and, in a stream that gives the times of its
+enhancement pictures, one that it passes over while it waits for a picture
+to start at. Where dvbridge_fel_take() answered 2 for a base picture of such
+a time, it answers 4, with a frame that carries that RPU as coded and the
+metadata the base decoder made of it (the ring that Kodi feeds,
+dvbridge_fel_base_metadata()): the answer Kodi takes already for the
+pictures of a MEL whose layer is not decoded. It answers 0 while that access
+unit may still come in one of the next two base packets (by the times, an
+access unit can come a packet after the base picture of its time), and while
+the base picture that brought the RPU is still to come out of the base
+decoder, which Kodi now says for each one (dvbridge_fel_base_picture());
+never longer. Where it does not know the access unit (by picture order,
+before the layer has started; an access unit without its time), the picture
+keeps the RPU carried with it, as before.
+
+Kodi sends some pictures out without their layer for reasons of its own
+(late, the end of the base layer, the layer starting again): for those it
+asks dvbridge_fel_layer_rpu(), which gives the same frame and never waits,
+and only for a picture that could be paired, whose time is its own. The log
+at the end says how many pictures without their enhancement picture had the
+metadata of their own access unit.
+
+Nothing changes for a paired picture: the frame of an answer 4 changes only
+the metadata of a picture that goes out without the layer, through the rule
+it has today. Tested on the host with the FEL test stream in one track and
+in two (fel_rpu_test and fel_tracks_test, extended with what the stream says
+of the time of each access unit): the whole stream gives every picture the
+same enhancement picture and the same metadata as before, but four pictures
+after the resynchronization at its end by picture order, which now have the
+RPU of their own access unit; after seeks and in files that start later,
+every picture without its enhancement picture whose access unit the module
+was given with its time has its own RPU.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 247 +++++++++++++++++-
+ tools/dvbridge/dvbridge_fel.h                 |  23 ++
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  43 ++-
+ 3 files changed, 297 insertions(+), 16 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index 92fd517..c2ca5c5 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -77,6 +77,13 @@ struct dvbridge_fel_rpu {
+  * decoded (dvbridge_fel_base_metadata()): more than the base decoder holds back, and than the
+  * pictures between an access unit and the base picture it is presented with */
+ #define RING_MAX 32
++/* Hades: the RPUs of the enhancement access units whose time is known, kept for their base pictures should those
++ * go out without their enhancement picture (dvbridge_fel_take() 4, dvbridge_fel_layer_rpu()) */
++#define OWN_MAX MAP_MAX
++/* Base packets that a base picture without its enhancement picture waits for, after its own, for the access unit
++ * that brings its RPU: when the layers are coded in different picture order, that access unit can come in a later
++ * packet than the base picture of its time (one later in the FEL test stream). */
++#define OWN_WAIT_PACKETS 2
+ 
+ /* As dovi_split frames what it gives: a length of this many bytes before every unit when the
+  * enhancement layer has an hvcC configuration, start codes (0) otherwise. */
+@@ -204,6 +211,21 @@ struct dvbridge_fel {
+     bool marked; /* a mark was made since the layer last started */
+     unsigned not_needed, wanted;  /* base pictures that went out with a mark, by its kind */
+     unsigned decoded, not_decoded; /* enhancement access units given to the decoder, and not */
++    /* Hades: every base picture goes out with the RPU of its own enhancement access unit, also without its
++     * enhancement picture. own: the RPU of each access unit whose time is known (it was given to the decoder, or
++     * passed over in a stream paired by its times), with the time of the base
++     * packet that brought it (carrier), whose base picture the base decoder gives with the same RPU parsed (the
++     * ring). packet_carrier: that time, for each queued access unit. recent: the last base packets, by when they
++     * came (submitted counts them), to know how long a picture may wait for its access unit; last_base: the time
++     * of the last base picture the base decoder gave (dvbridge_fel_base_picture()), to know whether a carrier is
++     * still to come. */
++    int64_t packet_carrier[QUEUE_MAX];
++    struct { int64_t pts, carrier; struct dvbridge_fel_rpu rpu; } own[OWN_MAX];
++    unsigned num_own;
++    struct { int64_t pts; uint64_t seq; } recent[BASE_TIMES_MAX];
++    uint64_t submitted;
++    int64_t last_base;
++    unsigned own_given; /* base pictures that went out without their enhancement picture, with its RPU */
+ };
+ 
+ /* Hades: whether two times are the same but for what a time may lose on its way here. */
+@@ -348,6 +370,120 @@ static void forget_ring(struct dvbridge_fel *f)
+     f->next_ring = 0;
+ }
+ 
++/* Hades: what the base decoder made of an RPU, among the last base pictures it gave; NULL when none of them came
++ * with it */
++static const AVBufferRef *ring_find(const struct dvbridge_fel *f, const struct dvbridge_fel_rpu *rpu)
++{
++    for (unsigned k = 0; rpu->size && k < RING_MAX; ++k)
++        if (f->ring[k].parsed && f->ring[k].coded.size == rpu->size &&
++            !memcmp(f->ring[k].coded.data, rpu->data, rpu->size))
++            return f->ring[k].parsed;
++    return NULL;
++}
++
++/* Hades: a frame without a picture that carries an RPU as coded and as parsed, as the enhancement decoder would
++ * have attached them to its picture; NULL when it cannot be made */
++static AVFrame *metadata_frame(int64_t pts, const struct dvbridge_fel_rpu *rpu, const AVBufferRef *parsed)
++{
++    AVFrame *frame = av_frame_alloc();
++    if (!frame)
++        return NULL;
++    frame->pts = pts;
++    AVBufferRef *metadata = av_buffer_ref(parsed);
++    AVFrameSideData *coded = av_frame_new_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER, rpu->size);
++    if (!metadata || !coded ||
++        !av_frame_new_side_data_from_buf(frame, AV_FRAME_DATA_DOVI_METADATA, metadata)) {
++        av_buffer_unref(&metadata);
++        av_frame_free(&frame);
++        return NULL;
++    }
++    memcpy(coded->data, rpu->data, rpu->size);
++    return frame;
++}
++
++static void own_remove(struct dvbridge_fel *f, unsigned i)
++{
++    av_freep(&f->own[i].rpu.data);
++    --f->num_own;
++    memmove(f->own + i, f->own + i + 1, (f->num_own - i) * sizeof(*f->own));
++}
++
++static void own_forget(struct dvbridge_fel *f)
++{
++    while (f->num_own)
++        own_remove(f, f->num_own - 1);
++}
++
++/* Hades: the RPU of the enhancement access unit of the base picture of time pts (taken from *rpu, which is left
++ * empty; an access unit without an RPU of its own leaves an empty one, which says so). carrier: the time of the
++ * base packet that brought it. */
++static void own_add(struct dvbridge_fel *f, int64_t pts, int64_t carrier, struct dvbridge_fel_rpu *rpu)
++{
++    if (pts == AV_NOPTS_VALUE) {
++        av_freep(&rpu->data);
++        *rpu = (struct dvbridge_fel_rpu){0};
++        return;
++    }
++    unsigned i = 0;
++    while (i < f->num_own && f->own[i].pts != pts)
++        ++i;
++    if (i < f->num_own)
++        own_remove(f, i);
++    else if (f->num_own == OWN_MAX)
++        own_remove(f, 0);
++    f->own[f->num_own].pts = pts;
++    f->own[f->num_own].carrier = carrier;
++    f->own[f->num_own++].rpu = *rpu;
++    *rpu = (struct dvbridge_fel_rpu){0};
++}
++
++static int own_find(const struct dvbridge_fel *f, int64_t pts, int64_t slack)
++{
++    for (unsigned i = 0; i < f->num_own; ++i)
++        if (same_time(f->own[i].pts, pts, slack))
++            return (int)i;
++    return -1;
++}
++
++/* Base pictures are asked for in the order they are presented: what is kept for an earlier time is of a picture
++ * that was asked for, or that is not asked for. */
++static void own_drop_before(struct dvbridge_fel *f, int64_t pts, int64_t slack)
++{
++    for (unsigned i = 0; i < f->num_own;) {
++        if (f->own[i].pts < pts && !same_time(f->own[i].pts, pts, slack))
++            own_remove(f, i);
++        else
++            ++i;
++    }
++}
++
++/* Hades: the base packets that came after the one of time pts; UINT64_MAX when it is not among the last ones */
++static uint64_t packets_after(const struct dvbridge_fel *f, int64_t pts, int64_t slack)
++{
++    for (unsigned i = 0; i < BASE_TIMES_MAX; ++i)
++        if (f->recent[i].pts != AV_NOPTS_VALUE && same_time(f->recent[i].pts, pts, slack))
++            return f->submitted - f->recent[i].seq;
++    return UINT64_MAX;
++}
++
++/* Hades: the RPU of a split access unit of the layer, as FFmpeg's HEVC decoder takes it (dvbridge_mel.h), into
++ * *rpu: none (size 0) when it has none of its own. False when it could not be copied. */
++static bool layer_rpu(const struct dvbridge_fel *f, const AVPacket *packet, struct dvbridge_fel_rpu *rpu)
++{
++    struct dvbridge_rpu_find find = {0};
++    dvbridge_rpu_units(packet->data, (size_t)packet->size, f->layer_length_size,
++                       dvbridge_rpu_find_unit, &find);
++    *rpu = (struct dvbridge_fel_rpu){0};
++    if (!find.rpu)
++        return true;
++    const size_t size = rpu_length(find.rpu + 2, find.size - 2);
++    rpu->data = av_memdup(find.rpu + 2, size);
++    if (size && !rpu->data)
++        return false;
++    rpu->size = size;
++    return true;
++}
++
+ static void clear_queues(struct dvbridge_fel *f)
+ {
+     for (unsigned i = 0; i < f->num_packets; ++i) {
+@@ -402,6 +538,7 @@ void dvbridge_fel_destroy(struct dvbridge_fel *f)
+         return;
+     clear_queues(f);
+     forget_ring(f);
++    own_forget(f);
+     av_parser_close(f->base_order.parser);
+     av_parser_close(f->enhancement_order.parser);
+     avcodec_free_context(&f->base_order.context);
+@@ -429,6 +566,9 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+     if (f->apart_max < 0) /* a time base in which it does not fit */
+         f->apart_max = INT64_MAX;
+     forget_base_times(f, true);
++    f->last_base = AV_NOPTS_VALUE;
++    for (unsigned i = 0; i < BASE_TIMES_MAX; ++i)
++        f->recent[i].pts = AV_NOPTS_VALUE;
+     /* Hades: the RPU stays with the enhancement access unit (el_rpu), and the decoder attaches
+      * it to the enhancement picture: it is the metadata of that picture, which is not the base
+      * picture of the same packet when the layers are coded in different picture order. */
+@@ -603,7 +743,9 @@ static bool pump(struct dvbridge_fel *f)
+                 goto fail;
+             f->fed = true;
+             ++f->decoded;
+-            av_freep(&f->packet_rpu[0].data);
++            /* Hades: its RPU stays for its base picture, should that go out without its enhancement picture
++             * (a picture that refers to one that was not decoded does not come, nor one that is late) */
++            own_add(f, pts, f->packet_carrier[0], &f->packet_rpu[0]);
+         }
+         if (!timed) {
+             --f->num_times;
+@@ -618,6 +760,7 @@ static bool pump(struct dvbridge_fel *f)
+         memmove(f->packet_time, f->packet_time + 1, f->num_packets * sizeof(*f->packet_time));
+         memmove(f->packet_need, f->packet_need + 1, f->num_packets * sizeof(*f->packet_need));
+         memmove(f->packet_rpu, f->packet_rpu + 1, f->num_packets * sizeof(*f->packet_rpu));
++        memmove(f->packet_carrier, f->packet_carrier + 1, f->num_packets * sizeof(*f->packet_carrier));
+         if (!receive_frames(f))
+             goto fail;
+     }
+@@ -696,6 +839,10 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+      * the enhancement access unit of this packet, with the mappings that earlier RPUs sent */
+     const enum dvbridge_rpu_residual rpu =
+         dvbridge_rpu_nlq_packet(&f->rpu, packet->data, (size_t)packet->size, f->base_length_size);
++    /* Hades: and when it came, for a base picture that waits for the access unit that brings its RPU */
++    ++f->submitted;
++    f->recent[f->submitted % BASE_TIMES_MAX].pts = packet->pts;
++    f->recent[f->submitted % BASE_TIMES_MAX].seq = f->submitted;
+     if (f->failed || f->draining)
+         return false;
+     /* By picture order every base packet needs its time, which an enhancement picture takes.
+@@ -783,16 +930,21 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             goto fail;
+         }
+         if (!picture_identity(&f->enhancement_order, copy, &f->packet_order[f->num_packets])) {
+-            av_packet_free(&copy);
+             /* Hades: while the layer waits for a picture to start at, an access unit that cannot
+              * be read is one that cannot start it, like any other. After a seek the parser may
+              * have the parameter sets of the layer only from its next random-access picture on:
+              * a stream of two tracks brings them with those pictures and nowhere else. */
+             if (f->synchronizing) {
++                /* Hades: by its time, its RPU stays for its base picture */
++                struct dvbridge_fel_rpu own;
++                if (f->timed && time != AV_NOPTS_VALUE && layer_rpu(f, copy, &own))
++                    own_add(f, time, packet->pts, &own);
++                av_packet_free(&copy);
+                 f->num_times = 0;
+                 ++f->preroll_packets;
+                 continue;
+             }
++            av_packet_free(&copy);
+             f->reason = "the picture order of an enhancement picture could not be parsed";
+             goto fail;
+         }
+@@ -824,6 +976,10 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+              * layer presents before that picture cannot be decoded from it, or is not known to
+              * be: those base pictures go out without the layer. */
+             if (f->enhancement_order.parser->key_frame != 1) {
++                /* Hades: its RPU stays for the base picture of its time */
++                struct dvbridge_fel_rpu own;
++                if (layer_rpu(f, copy, &own))
++                    own_add(f, time, packet->pts, &own);
+                 av_packet_free(&copy);
+                 ++f->preroll_packets;
+                 continue;
+@@ -878,6 +1034,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             f->packet_rpu[f->num_packets].size = size;
+         }
+         f->packet_time[f->num_packets] = time;
++        f->packet_carrier[f->num_packets] = packet->pts;
+         f->packet_bytes += copy->size;
+         f->packets[f->num_packets++] = copy;
+     }
+@@ -971,6 +1128,60 @@ void dvbridge_fel_base_metadata(struct dvbridge_fel *f, const uint8_t *coded, si
+     f->ring[k].parsed = metadata;
+ }
+ 
++void dvbridge_fel_base_picture(struct dvbridge_fel *f, int64_t pts)
++{
++    if (f && pts != AV_NOPTS_VALUE && (f->last_base == AV_NOPTS_VALUE || pts > f->last_base))
++        f->last_base = pts;
++}
++
++/* Hades: the answer for a base picture of time pts that goes out without its enhancement picture: 4, with a frame
++ * that carries the RPU of its own enhancement access unit and the metadata that the base decoder made of it, when
++ * the module knows them; 0 while one of them is still to come; 2 otherwise (the picture keeps the RPU carried with
++ * it, as before). may_come: its access unit may come in a packet that is still to come (it is not known to have been
++ * passed over): it is waited for, for a few base packets after the one of its time. */
++static int without_layer(struct dvbridge_fel *f, int64_t pts, int64_t slack, bool may_come, AVFrame **frame)
++{
++    const int i = own_find(f, pts, slack);
++    if (i < 0)
++        return may_come && packets_after(f, pts, slack) < OWN_WAIT_PACKETS ? 0 : 2;
++    const struct dvbridge_fel_rpu *rpu = &f->own[i].rpu;
++    const AVBufferRef *parsed = rpu->size ? ring_find(f, rpu) : NULL;
++    if (rpu->size && !parsed && f->own[i].carrier != AV_NOPTS_VALUE &&
++        f->last_base != AV_NOPTS_VALUE && f->own[i].carrier > f->last_base)
++        return 0; /* the base picture that brought it is still to come */
++    AVFrame *made = parsed ? metadata_frame(pts, rpu, parsed) : NULL;
++    own_remove(f, (unsigned)i);
++    if (!made)
++        return 2; /* no RPU of its own (it keeps the one before), or none that can be had */
++    ++f->own_given;
++    *frame = made;
++    return 4;
++}
++
++int dvbridge_fel_layer_rpu(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
++{
++    if (!f || !frame || *frame || pts == AV_NOPTS_VALUE)
++        return 0;
++    const int64_t slack = f->timed ? f->tolerance : 0;
++    if (f->timed && f->zero_twice && same_time(pts, f->zero, f->tolerance))
++        return 0;
++    own_drop_before(f, pts, slack);
++    const int i = own_find(f, pts, slack);
++    const AVBufferRef *parsed = i >= 0 ? ring_find(f, &f->own[i].rpu) : NULL;
++    AVFrame *made = parsed ? metadata_frame(pts, &f->own[i].rpu, parsed) : NULL;
++    if (!made)
++        return 0;
++    own_remove(f, (unsigned)i);
++    ++f->own_given;
++    *frame = made;
++    return 1;
++}
++
++unsigned dvbridge_fel_own_rpus(const struct dvbridge_fel *f)
++{
++    return f ? f->own_given : 0;
++}
++
+ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+ {
+     if (!f || !frame || *frame || pts == AV_NOPTS_VALUE || !pump(f))
+@@ -1001,8 +1212,16 @@ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+         --f->num_skipped;
+         memmove(f->skipped + i, f->skipped + i + 1, (f->num_skipped - i) * sizeof(*f->skipped));
+     }
+-    if (f->synchronizing || (f->anchor_pts != AV_NOPTS_VALUE && pts < f->anchor_pts))
+-        return 2; /* Preroll before a recoverable EL picture, not a substitute. */
++    /* Hades: (likewise what is kept of the RPUs of the access units of earlier times) */
++    own_drop_before(f, pts, slack);
++    /* Preroll before a recoverable EL picture, not a substitute.
++     * Hades: with the RPU of its own access unit when the module knows it (not for a time that is
++     * not of one picture alone). */
++    if (f->synchronizing || (f->anchor_pts != AV_NOPTS_VALUE && pts < f->anchor_pts)) {
++        /* (by picture order, while the layer waits, the time of an access unit is not known) */
++        const bool may_come = f->timed || !f->synchronizing;
++        return ambiguous ? 2 : without_layer(f, pts, slack, may_come, frame);
++    }
+     for (unsigned i = 0; i < f->num_frames;) {
+         AVFrame *candidate = f->frames[i];
+         if (candidate->pts > pts && candidate->pts - pts > slack) {
+@@ -1015,6 +1234,10 @@ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+         if (!ambiguous && (candidate->pts >= pts || pts - candidate->pts <= slack)) {
+             candidate->pts = pts;
+             *frame = candidate;
++            /* Hades: (its RPU comes with its enhancement picture) */
++            const int own = own_find(f, pts, slack);
++            if (own >= 0)
++                own_remove(f, (unsigned)own);
+             return 1;
+         }
+         av_frame_free(&candidate);
+@@ -1033,8 +1256,12 @@ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+     /* Hades: so does a mark of a later time, left by an access unit that came after this one's
+      * in the order they are given (the decoder had given all it held before any mark was made) */
+     if (f->timed && (f->num_frames || f->num_skipped)) {
+-        ++f->passed_missing;
+-        return 2;
++        /* Hades: (its access unit came before the one of that later picture, if it came: with the RPU of its
++         * own access unit when the module knows it) */
++        const int answer = without_layer(f, pts, slack, false, frame);
++        if (answer)
++            ++f->passed_missing;
++        return answer;
+     }
+     return f->eof || f->num_frames == QUEUE_MAX ? -1 : 0;
+ }
+@@ -1075,6 +1302,9 @@ void dvbridge_fel_time_zero(struct dvbridge_fel *f, int64_t zero)
+         return;
+     f->zero = zero;
+     forget_base_times(f, true);
++    /* Hades: the times of what is kept for the RPUs of the base pictures are on the scale before */
++    own_forget(f);
++    f->last_base = AV_NOPTS_VALUE;
+ }
+ 
+ void dvbridge_fel_base_flushed(struct dvbridge_fel *f)
+@@ -1086,6 +1316,11 @@ void dvbridge_fel_base_flushed(struct dvbridge_fel *f)
+      * the metadata of its pictures is no picture's any more */
+     dvbridge_rpu_nlq_forget(&f->rpu);
+     forget_ring(f);
++    /* Hades: nor are the RPUs kept for the base pictures that were to come */
++    own_forget(f);
++    f->last_base = AV_NOPTS_VALUE;
++    for (unsigned i = 0; i < BASE_TIMES_MAX; ++i)
++        f->recent[i].pts = AV_NOPTS_VALUE;
+ }
+ 
+ void dvbridge_fel_layer_skip_counts(const struct dvbridge_fel *f,
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 61cca14..53017ec 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -25,6 +25,15 @@ bool dvbridge_fel_drain(struct dvbridge_fel *fel);
+  * was not decoded: its RPU can carry a residual and the layer, not decoded, waited for its next
+  * random-access picture to start at again, or it is a leading picture of the one it started at,
+  * whose picture does not come. It goes out without the layer, as with 2, with that metadata.
++ * Also, where the answer would be 2, for a base picture whose enhancement access unit the module
++ * knows (the stream gave its time, or it was given to the decoder): with the RPU of that access
++ * unit, as coded, and the metadata that the base
++ * decoder made of it (dvbridge_fel_base_metadata()). So a base picture that goes out without its
++ * enhancement picture has the metadata it has with it, also where the layers are coded in
++ * different picture order and the RPU carried with the base picture is the one of another
++ * picture. 0 is also the answer while that access unit, or the base picture that brought its
++ * RPU, may still come (dvbridge_fel_base_picture()); 2, with the RPU carried with the base
++ * picture, where the module does not know it.
+  * Hades: exact to the unit of the time base; in a stream that gives the times of its
+  * enhancement pictures (DVBRIDGE_FEL_LAYER_TIME), to the half millisecond that a time may lose
+  * on its way here. In such a stream 2 is also the answer for a base picture whose enhancement
+@@ -111,4 +120,18 @@ void dvbridge_fel_layer_skip_counts(const struct dvbridge_fel *fel,
+  * (dvbridge_fel_take()). */
+ void dvbridge_fel_base_metadata(struct dvbridge_fel *fel, const uint8_t *coded, size_t coded_size,
+                                 const uint8_t *parsed, size_t parsed_size);
++/* Hades: a base picture came out of the base decoder, at this time (each one, before
++ * dvbridge_fel_base_metadata() for it): the base decoder gives its pictures in the order they are
++ * presented, so the module knows which base pictures are still to come. */
++void dvbridge_fel_base_picture(struct dvbridge_fel *fel, int64_t pts);
++/* Hades: for a base picture that goes out without its enhancement picture for a reason of the
++ * caller (it is late, the base layer ended, the layer starts again): 1, with a frame such as an
++ * answer 4 of dvbridge_fel_take() carries, when the module knows the enhancement access unit of
++ * the picture of time pts and the metadata that the base decoder made of its RPU; 0 otherwise. It
++ * never waits. */
++int dvbridge_fel_layer_rpu(struct dvbridge_fel *fel, int64_t pts, AVFrame **frame);
++/* Hades, for the log: base pictures that went out without their enhancement picture with the RPU of
++ * their own enhancement access unit (answers 4 of dvbridge_fel_take() that are not of a MEL, and
++ * dvbridge_fel_layer_rpu()). */
++unsigned dvbridge_fel_own_rpus(const struct dvbridge_fel *fel);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 43cb690..5db6dc8 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -734,15 +734,18 @@ void CDVDVideoCodecFFmpeg::Dispose()
+     m_multiview.reset();
+   }
+ #ifdef HAVE_DVBRIDGE
+-  // The pictures that went out without their enhancement picture kept the metadata carried with
+-  // their base picture, which in such a stream is the one of a neighbouring picture.
+-  if (m_dvLayerRpu)
++  // The pictures that went out without their enhancement picture took the metadata of their own
++  // enhancement access unit where the module knew it (Hades); the others kept the metadata carried
++  // with their base picture, which in such a stream is the one of a neighbouring picture.
++  const unsigned int ownRpu = dvbridge_fel_own_rpus(m_dvFel.get());
++  if (m_dvLayerRpu || ownRpu)
+     CLog::Log(LOGINFO,
+-              "DV FEL: {} of {} paired pictures took the Dolby Vision metadata of their "
+-              "enhancement picture, another than the one carried with their base picture; {} "
+-              "pictures went out without their enhancement picture and kept the one carried "
+-              "with their base picture",
+-              m_dvLayerRpu, m_dvPaired, m_dvUnpaired);
++              "DV FEL: {} pictures took the Dolby Vision metadata of their enhancement access "
++              "unit, another than the one carried with their base picture ({} were paired with "
++              "their enhancement picture); {} pictures went out without their enhancement "
++              "picture, {} of them with the metadata of their own enhancement access unit and the "
++              "others with the one carried with their base picture",
++              m_dvLayerRpu, m_dvPaired, m_dvUnpaired, ownRpu);
+   if (const unsigned int untimed = dvbridge_fel_untimed(m_dvFel.get()))
+     CLog::Log(LOGINFO,
+               "DV FEL: {} enhancement access units came without their presentation time in a "
+@@ -1200,6 +1203,8 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+                             base->doviSourceTimed && (!timed || base->doviSourceEpoch == m_dvEpoch);
+       int result =
+           pairable ? dvbridge_fel_take(m_dvFel.get(), base->doviSourcePts, &enhancement) : 2;
++      // Hades: the picture has the metadata of its own enhancement access unit (answer 4)
++      bool layerMetadata = false;
+       if (result == 3)
+       {
+         // Hades: its enhancement picture was not decoded: the RPUs of the stream say that the
+@@ -1233,8 +1238,12 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+         // is a leading picture of the one it started at (dvbridge_mel.h). It goes out without the
+         // layer, as one whose enhancement picture is missing, with the metadata that picture
+         // would have brought.
++        // (Hades: and so does a picture whose enhancement picture does not come, when the module
++        // knows its enhancement access unit: the layer waits for a picture to start at, the picture
++        // is a leading picture of the one it started at, or its enhancement picture was not decoded.)
+         UseLayerDVMetadata(*base, enhancement, false);
+         av_frame_free(&enhancement);
++        layerMetadata = true;
+         result = 2;
+       }
+       if (result == 0 && baseEnded)
+@@ -1283,6 +1292,17 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+                     "enhancement packets passed over while the layer waited for a picture it "
+                     "can start at)",
+                     WITHOUT_LAYER_LOGGED, dvbridge_fel_preroll_packets(m_dvFel.get()));
++        // Hades: one that goes out without it for a reason of its own here (late, the base layer
++        // ended, the layer starts again) takes the metadata of its own enhancement access unit too,
++        // when the module knows it; otherwise it keeps the one carried with it, as before. Not one
++        // that could not be paired: its time is not known to be its own.
++        if (!layerMetadata && pairable)
++        {
++          AVFrame* own = nullptr;
++          if (dvbridge_fel_layer_rpu(m_dvFel.get(), base->doviSourcePts, &own) == 1)
++            UseLayerDVMetadata(*base, own, false);
++          av_frame_free(&own);
++        }
+         ++m_dvUnpaired;
+         pVideoPicture->CopyRef(*base);
+         m_dvPending.pop_front();
+@@ -1340,8 +1360,11 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+                               "layer needs VAAPI and is not decoded");
+         m_dvSoftware = true;
+       }
+-      // Hades: its RPU and metadata, for a picture whose enhancement access unit brought the same
+-      // RPU and was not decoded (MEL)
++      // Hades: that it came (a picture that waits for the RPU it brought waits no longer than that),
++      // and its RPU and metadata, for a picture whose enhancement access unit brought the same RPU
++      // and was not decoded (MEL), or whose enhancement picture does not come
++      if (base->doviSourceTimed)
++        dvbridge_fel_base_picture(m_dvFel.get(), base->doviSourcePts);
+       if (base->doviRpu.Size() && base->doviMetadata.Data())
+         dvbridge_fel_base_metadata(m_dvFel.get(), base->doviRpu.Data(), base->doviRpu.Size(),
+                                    base->doviMetadata.Data(), base->doviMetadata.Size());
+-- 
+2.53.0
+

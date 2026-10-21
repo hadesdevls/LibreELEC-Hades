@@ -221,6 +221,66 @@ namespace Hades.Installer
             return differ;
         }
 
+        // The folder hades-diag, where the diagnostics of Hades leave what they saved on the system partition, is
+        // written there by the FAT driver of Windows itself (long names, names in small letters, files of no
+        // cluster, of one, of a part of one and of many), and is still there after an update, as that driver reads
+        // it: every file, with the same hash. It is then taken away again, so that what follows finds the partition
+        // as it was. The system partition has the letter "second".
+        static void KeptByWindows(ImagePlan plan, char second, Action<string, bool> check, Action<string> say)
+        {
+            string diag = second + ":\\hades-diag";
+            string[] files = { @"README.txt", @"LEEME.txt", @"start-1\1-minute\kodi.log.gz", @"start-1\1-minute\empty.txt",
+                               @"start-1\.filtered", @"start-1\shutdown\dmesg.txt", @"start-2\during-dv-1\edid\card1-HDMI-A-1.bin",
+                               @"start-2\4-minutes\results.txt", @"start-10\after-dv-1\a name longer than one entry of a long name.txt" };
+            int[] sizes = { 4900, 5100, 700000, 0, 0, 16384, 256, 16385, 777 };
+            var made = new Dictionary<string, string>();
+            var random = new Random(7);
+            using (var sha = SHA256.Create())
+                for (int i = 0; i < files.Length; ++i)
+                {
+                    string path = Path.Combine(diag, files[i]);
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    var bytes = new byte[sizes[i]];
+                    random.NextBytes(bytes);
+                    File.WriteAllBytes(path, bytes);
+                    made[files[i]] = Words.Hex(sha.ComputeHash(bytes));
+                }
+            DiagKeep kept = null;
+            string failed = "";
+            try { kept = Operations.Update(Find(), plan, Place.Internal, false, Quiet); }
+            catch (Exception e) { failed = e.ToString(); }
+            say("   hades-diag: " + (kept != null ? kept.Summary() : failed));
+            // (Windows takes a moment to mount the partition again)
+            bool same = false;
+            string differ = "";
+            for (int wait = 0; wait < 30 && !same; ++wait)
+            {
+                try
+                {
+                    same = true;
+                    using (var sha = SHA256.Create())
+                        foreach (KeyValuePair<string, string> f in made)
+                        {
+                            string path = Path.Combine(diag, f.Key);
+                            if (!File.Exists(path) || Words.Hex(sha.ComputeHash(File.ReadAllBytes(path))) != f.Value)
+                            {
+                                same = false;
+                                differ = f.Key;
+                                break;
+                            }
+                        }
+                }
+                catch (Exception e) { same = false; differ = e.Message; }
+                if (!same) System.Threading.Thread.Sleep(500);
+            }
+            if (!same) say("   not as it was written: " + differ);
+            check("the folder hades-diag, written by the FAT driver of Windows on the system partition (" + second + ":), is kept " +
+                  "by an update, which says so and reads it back the same, and Windows reads every file of it back with its hash",
+                  kept != null && kept.State == DiagKeep.Outcome.Kept && kept.Verified && kept.Files == files.Length && same);
+            try { Directory.Delete(diag, true); }
+            catch (Exception e) { say("   it could not be taken away again: " + e.Message); }
+        }
+
         // A system partition that a program keeps open, as WSL keeps the drives that were there when it
         // started (its file server holds a folder of each). The update leaves such a partition alone and
         // says so. Told to take it, it replaces it whole, and this is looked at:
@@ -706,6 +766,7 @@ namespace Hades.Installer
                                       whyUpdate.Contains(partition) && whyRemove.Contains(partition) && Table(stays) == tableBefore &&
                                           Engine.FileHash(second + ":\\KERNEL", null, null) == kernelBefore);
 
+                                KeptByWindows(plan, second, check, say);
                                 Taken(directory, plan, withLetter, w1, w2, second, tableBefore, kernelBefore, check, say);
                             }
                             else

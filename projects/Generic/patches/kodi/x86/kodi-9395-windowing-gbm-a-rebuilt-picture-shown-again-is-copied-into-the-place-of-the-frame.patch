@@ -1,0 +1,273 @@
+From d49d8892195126ea3a8ff1533dcb9ba3400d8c34 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:00:56 +0000
+Subject: [PATCH] windowing/gbm: a rebuilt picture shown again is copied into
+ the place of the frame
+
+A Dolby Vision picture rebuilt as HDR10, or mapped to SDR, is copied into the
+window at its place, and Kodi's renderer draws black bars around the
+destination (CLinuxRendererGLES::DrawBlackBars()); the window is not cleared
+first (Kodi's geometry clear, on by default). In full screen the destination is
+in whole pixels (CBaseRenderer::CalcDestRect()) and the place is that
+destination, at every mode and size of the window: every pixel is written. A
+picture shown again for one that could not be rebuilt, though, was copied at
+its own place, which is another one when the view changed in between (zoom,
+aspect, shift): a larger one went over the bars of the frame, and around a
+smaller one the window kept what it held before.
+
+dvbridge_gl_copy_area() copies a picture where its rectangle is within an area
+and makes the rest of the area black, the black that the copy writes for 0 (of
+the limited range, where it is on); nothing outside the area is written.
+CDVBridgeGLES::CopyConversion() takes the area, and
+CWinSystemGbmGLESContext::RenderDVConversion() gives it the place of the frame.
+A frame whose picture was drawn at its place copies exactly what it copied.
+
+Tested on the host with the software OpenGL ES (zink on lavapipe): Kodi's bars
+emulated with the same rectangles, over a window that holds another colour, at
+1280x720, 1366x768, 1920x1080 and 3840x2160, 8 and 10 bits, full and limited
+range, with the destinations that CalcDestRect() gives seven aspect ratios (150
+frames): no pixel left unwritten and none of the picture outside the place of
+the frame. The same test with the copy as before fails in 87 of them, every one
+a picture kept from a smaller or a larger place; the 50 frames drawn at their
+place give the same bytes with both. The wiring in Kodi is compiled in
+syntax-only mode and read; not run.
+---
+ tools/dvbridge/dvbridge_gl_pack.c             | 97 ++++++++++++++++---
+ tools/dvbridge/dvbridge_gl_pack.h             | 14 +++
+ .../VideoRenderers/DVBridgeGLES.cpp           | 12 ++-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h | 11 ++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  9 +-
+ 5 files changed, 124 insertions(+), 19 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index 51b9e73..a586544 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -2,6 +2,7 @@
+ /* Pack transport bytes with isolated GL state; never apply ordinary RGB color processing. */
+ #include "dvbridge_gl_pack.h"
+ #include <GLES3/gl31.h>
++#include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -321,13 +322,71 @@ void dvbridge_gl_state_restore(const struct dvbridge_gl_state *s)
+ bool dvbridge_gl_copy(struct dvbridge_gl_copier *c, unsigned texture, unsigned framebuffer,
+                      int width, int height, int x, int y, int w, int h, bool flip, bool limited)
+ {
+-    if (!c || !texture || width < 1 || height < 1 || w < 1 || h < 1 || x < 0 || y < 0 ||
+-        x > width - w || y > height - h)
++    const struct dvbridge_gl_rect picture = {x, y, w, h};
++    return dvbridge_gl_copy_area(c, texture, framebuffer, width, height, &picture, &picture, flip,
++                                 limited);
++}
++
++/* Hades: a rectangle of at least a pixel within a framebuffer of that size */
++static bool rect_within(const struct dvbridge_gl_rect *r, int width, int height)
++{
++    return r && r->width >= 1 && r->height >= 1 && r->x >= 0 && r->y >= 0 &&
++           r->x <= width - r->width && r->y <= height - r->height;
++}
++
++/* Hades: the value that the copy writes for 0 (COPY_FRAGMENT, with the same levels and range, and
++ * the same 1/256 of a step above the level, for a framebuffer that cuts off what it is given) */
++static float copy_black(float levels, bool limited)
++{
++    float black = 0.0f;
++    if (limited && levels > 0.0f && levels != 1023.0f)
++        black = 16.0f * ((levels + 1.0f) / 256.0f) / levels;
++    else if (limited)
++        black = 64.0f / 1023.0f;
++    if (levels > 0.0f)
++        black = (floorf(black * levels + 0.5f) + 0.00390625f) / levels;
++    return black;
++}
++
++bool dvbridge_gl_copy_area(struct dvbridge_gl_copier *c, unsigned texture, unsigned framebuffer,
++                          int width, int height, const struct dvbridge_gl_rect *picture,
++                          const struct dvbridge_gl_rect *area, bool flip, bool limited)
++{
++    if (!c || !texture || width < 1 || height < 1 || !rect_within(picture, width, height) ||
++        !rect_within(area, width, height))
+         return false;
++    /* the part of the picture within the area, and the bands of the area around it (above and
++     * below it across the area, then left and right of it) */
++    const int x0 = picture->x > area->x ? picture->x : area->x;
++    const int y0 = picture->y > area->y ? picture->y : area->y;
++    const int x1 = picture->x + picture->width < area->x + area->width
++                       ? picture->x + picture->width
++                       : area->x + area->width;
++    const int y1 = picture->y + picture->height < area->y + area->height
++                       ? picture->y + picture->height
++                       : area->y + area->height;
++    const bool shown = x1 > x0 && y1 > y0;
++    struct dvbridge_gl_rect bands[4];
++    int count = 0;
++    if (!shown)
++        bands[count++] = *area;
++    else {
++        const int right = area->x + area->width, bottom = area->y + area->height;
++        if (y0 > area->y)
++            bands[count++] = (struct dvbridge_gl_rect){area->x, area->y, area->width, y0 - area->y};
++        if (bottom > y1)
++            bands[count++] = (struct dvbridge_gl_rect){area->x, y1, area->width, bottom - y1};
++        if (x0 > area->x)
++            bands[count++] = (struct dvbridge_gl_rect){area->x, y0, x0 - area->x, y1 - y0};
++        if (right > x1)
++            bands[count++] = (struct dvbridge_gl_rect){x1, y0, right - x1, y1 - y0};
++    }
+     for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
+         ;
+     struct dvbridge_gl_state state;
+     dvbridge_gl_state_save(&state);
++    GLfloat clear[4] = {0};
++    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+     for (unsigned i = 0; i < sizeof(STATE_CAPS) / sizeof(*STATE_CAPS); ++i)
+         glDisable(STATE_CAPS[i]);
+     glActiveTexture(GL_TEXTURE0);
+@@ -351,19 +410,33 @@ bool dvbridge_gl_copy(struct dvbridge_gl_copier *c, unsigned texture, unsigned f
+         goto restore;
+     glViewport(0, 0, width, height);
+     glEnable(GL_SCISSOR_TEST);
+-    glScissor(x, flip ? height - y - h : y, w, h);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-    glUseProgram(c->program);
+-    glBindVertexArray(c->vao);
+-    glBindSampler(0, c->sampler);
+-    glBindTexture(GL_TEXTURE_2D, texture);
+-    glUniform1i(c->picture, 0);
+-    glUniform1i(c->flip_height, flip ? height : 0);
+-    glUniform1f(c->levels, floating || red > 12 ? 0.0f : (float)((1u << red) - 1));
+-    glUniform1i(c->limited, limited);
+-    glDrawArrays(GL_TRIANGLES, 0, 3);
++    const float levels = floating || red > 12 ? 0.0f : (float)((1u << red) - 1);
++    /* Hades: the bands of the area that the picture does not cover, black */
++    if (count) {
++        const float black = copy_black(levels, limited);
++        glClearColor(black, black, black, 1.0f);
++        for (int i = 0; i < count; ++i) {
++            glScissor(bands[i].x, flip ? height - bands[i].y - bands[i].height : bands[i].y,
++                      bands[i].width, bands[i].height);
++            glClear(GL_COLOR_BUFFER_BIT);
++        }
++    }
++    if (shown) {
++        glScissor(x0, flip ? height - y1 : y0, x1 - x0, y1 - y0);
++        glUseProgram(c->program);
++        glBindVertexArray(c->vao);
++        glBindSampler(0, c->sampler);
++        glBindTexture(GL_TEXTURE_2D, texture);
++        glUniform1i(c->picture, 0);
++        glUniform1i(c->flip_height, flip ? height : 0);
++        glUniform1f(c->levels, levels);
++        glUniform1i(c->limited, limited);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++    }
+     ok = glGetError() == GL_NO_ERROR;
+ restore:
++    glClearColor(clear[0], clear[1], clear[2], clear[3]);
+     dvbridge_gl_state_restore(&state);
+     return ok && glGetError() == GL_NO_ERROR;
+ }
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index 0aca921..6a9d2ef 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -37,6 +37,20 @@ void dvbridge_gl_copier_destroy(struct dvbridge_gl_copier *copier);
+ bool dvbridge_gl_copy(struct dvbridge_gl_copier *copier, unsigned texture, unsigned framebuffer,
+                      int width, int height, int x, int y, int w, int h, bool flip_y,
+                      bool limited);
++/* Hades: as dvbridge_gl_copy(), with the area of the framebuffer that the picture is given (from
++ * the top left, within the framebuffer): the picture is written where its rectangle is within the
++ * area, and the rest of the area is made black, the black that the copy writes for a value of 0
++ * (of the limited range, where limited). Nothing outside the area is written. The caller draws
++ * around the area itself (Kodi's black bars); its pixels are then all written, also where the
++ * rectangle does not cover them (a picture kept from another place). */
++#define DVBRIDGE_GL_COPY_AREA 1
++struct dvbridge_gl_rect {
++    int x, y, width, height;
++};
++bool dvbridge_gl_copy_area(struct dvbridge_gl_copier *copier, unsigned texture,
++                          unsigned framebuffer, int width, int height,
++                          const struct dvbridge_gl_rect *picture,
++                          const struct dvbridge_gl_rect *area, bool flip_y, bool limited);
+ /* Hades: the GL state that a caller goes on drawing with when a picture is reconstructed in the
+  * middle of its frame, as it is for output as HDR10: Kodi draws its GUI over the video
+  * afterwards, with client-side vertex arrays and the viewport of the window. libplacebo leaves
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 2849b98..c445cc3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1283,7 +1283,8 @@ void CDVBridgeGLES::ConversionNotShown()
+   CDVPlaybackInfo::presented.store(0);
+ }
+ 
+-bool CDVBridgeGLES::CopyConversion(unsigned int framebuffer, int width, int height, bool limited)
++bool CDVBridgeGLES::CopyConversion(
++    unsigned int framebuffer, int width, int height, bool limited, const dvbridge_gl_rect* area)
+ {
+   // The picture just reconstructed, or the one before it when this one was not: the engine keeps
+   // the last whole one, at its place (Hades: also when the draw of this one failed halfway; none
+@@ -1292,10 +1293,11 @@ bool CDVBridgeGLES::CopyConversion(unsigned int framebuffer, int width, int heig
+   if (!picture || !m_copier || width != m_convertWidth || height != m_convertHeight)
+     return false;
+   const unsigned int texture = pl_opengl_unwrap(m_gl->gpu, picture, nullptr, nullptr, nullptr);
+-  if (!texture || !dvbridge_gl_copy(m_copier, texture, framebuffer, width, height,
+-                                    m_convertView.dst_x, m_convertView.dst_y,
+-                                    m_convertView.dst_width, m_convertView.dst_height, true,
+-                                    limited))
++  // Hades: within the pixels of the video in this frame, and what of them it does not cover black
++  const dvbridge_gl_rect place{m_convertView.dst_x, m_convertView.dst_y, m_convertView.dst_width,
++                               m_convertView.dst_height};
++  if (!texture || !dvbridge_gl_copy_area(m_copier, texture, framebuffer, width, height, &place,
++                                         area ? area : &place, true, limited))
+     return false;
+   // the picture is in the frame that goes out next
+   CDVPlaybackInfo::presented.store(m_convertInfo);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 29ad77f..5dc5a81 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -259,7 +259,16 @@ public:
+   //! Copy the last picture that was reconstructed into a framebuffer of that size whose first
+   //! row is the bottom one, at its place
+   //! \param limited into the limited range, as Kodi's video goes when its output is set to it
+-  bool CopyConversion(unsigned int framebuffer, int width, int height, bool limited);
++  //! \param area Hades: the pixels of the framebuffer that are the video's in this frame (the
++  //!        place of DVBRIDGE::PlaceConversion(), from the top left): the picture is copied where
++  //!        its own place is within them, and the rest of them is made black. They differ only for
++  //!        a picture kept from another place (shown again for one that could not be
++  //!        reconstructed). nullptr: the place of the picture.
++  bool CopyConversion(unsigned int framebuffer,
++                      int width,
++                      int height,
++                      bool limited,
++                      const dvbridge_gl_rect* area = nullptr);
+   //! What was reconstructed with this bridge, for the log
+   void LogConversion() const;
+   //! The mapping to the display of the pictures that follow (dvbridge_render_hdr10_mapping()),
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index b6e2642..51bf159 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1714,9 +1714,16 @@ int CWinSystemGbmGLESContext::RenderDVConversion(const CDVBridgeGLES::Layer& lay
+   // ... or the picture before it, when this one could not be reconstructed and that one is
+   // still whole: in the same run of the stream, or where the caller cannot show this one's base
+   // layer instead (Hades: DVBRIDGE::ConversionRepeats())
++  // Hades: into the place of this frame, all of it, and nowhere else: Kodi draws black around it
++  // (CLinuxRendererGLES::DrawBlackBars(), around a destination in whole pixels in full screen,
++  // CBaseRenderer::CalcDestRect()). A picture shown again for one that could not be reconstructed
++  // may be of another place (the view changed in between): it is cut to this one, and what of this
++  // one it does not cover is made black. It was copied at its own place: over the bars where that
++  // place was the larger, and with what the buffer held before around it where it was the smaller.
++  const dvbridge_gl_rect area{place.dstX, place.dstY, place.dstWidth, place.dstHeight};
+   if ((!reconstructed && !DVBRIDGE::ConversionRepeats(
+                              m_dvConvertBridge->ConvertedEpoch() == epoch, showsBase)) ||
+-      !m_dvConvertBridge->CopyConversion(0, m_nWidth, m_nHeight, UseLimitedColor()))
++      !m_dvConvertBridge->CopyConversion(0, m_nWidth, m_nHeight, UseLimitedColor(), &area))
+   {
+     // (Hades: nothing reconstructed in this frame, for the player information)
+     m_dvConvertBridge->ConversionNotShown();
+-- 
+2.53.0
+

@@ -453,6 +453,7 @@ namespace Hades.Installer
                           "does not take it, and it names the partition and WSL only when there is a letter and WSL is running", asked);
                 }
 
+                Diag();
                 Classification(realImage);
                 if (realImage != null) Real(directory, realImage);
                 foreach (string f in new[] { raw, packed, raw + ".sha256", Path.Combine(directory, "internal.img") })
@@ -470,6 +471,404 @@ namespace Hades.Installer
         }
 
         static int notRun;
+
+        // ---- the folder hades-diag across an update (DiagFolder)
+
+        // A FAT16 partition as mtools makes one: "clusters" clusters of one sector, two FATs, 512 entries in the root
+        // directory, a label, and a file KERNEL in its first "used" clusters.
+        static byte[] Fat16Partition(int clusters, int used)
+        {
+            const int rootSectors = 512 * 32 / S;
+            int fatSectors = ((clusters + 2) * 2 + S - 1) / S;
+            int total = 1 + 2 * fatSectors + rootSectors + clusters;
+            var p = new byte[(long)total * S];
+            p[12] = 2;                        // 512 bytes in a sector
+            p[13] = 1;                        // one sector in a cluster
+            p[14] = 1;                        // reserved sectors
+            p[16] = 2;                        // copies of the FAT
+            p[18] = 2;                        // 512 entries in the root directory
+            p[19] = (byte)total; p[20] = (byte)(total >> 8);
+            p[21] = 0xF8;
+            p[22] = (byte)fatSectors; p[23] = (byte)(fatSectors >> 8);
+            p[510] = 0x55; p[511] = 0xAA;
+            long root = (long)S * (1 + 2 * fatSectors), data = root + rootSectors * S;
+            for (int copy = 0; copy < 2; ++copy)
+            {
+                long fat = S + (long)copy * fatSectors * S;
+                p[fat] = 0xF8; p[fat + 1] = 0xFF; p[fat + 2] = 0xFF; p[fat + 3] = 0xFF;
+                for (int c = 2; c < 2 + used; ++c)
+                {
+                    int next = c + 1 < 2 + used ? c + 1 : 0xFFFF;
+                    p[fat + 2 * c] = (byte)next; p[fat + 2 * c + 1] = (byte)(next >> 8);
+                }
+            }
+            Entry(p, root, 0, "LIBREELEC  ", 0x08);
+            Entry(p, root, 1, "KERNEL     ", 0x20);
+            p[root + 32 + 26] = 2;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)(used * S)), 0, p, (int)(root + 32 + 28), 4);
+            byte[] noise = Noise(used * S, 5);
+            Buffer.BlockCopy(noise, 0, p, (int)data, noise.Length);
+            return p;
+        }
+
+        // A short entry: name (eleven letters), attributes, the bits that say which part is in small letters, times
+        // made up, size.
+        static byte[] ShortEntry(string name11, byte attributes, byte small, long size)
+        {
+            var e = new byte[32];
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes(name11), 0, e, 0, 11);
+            e[11] = attributes;
+            e[12] = small;
+            e[13] = 17;
+            e[14] = 0x20; e[15] = 0x5A; e[16] = 0x55; e[17] = 0x5D;
+            e[18] = 0x55; e[19] = 0x5D;
+            e[22] = 0x21; e[23] = 0x5A; e[24] = 0x55; e[25] = 0x5D;
+            Buffer.BlockCopy(BitConverter.GetBytes((uint)size), 0, e, 28, 4);
+            return e;
+        }
+
+        // The entries that spell a long name for a short entry, last part first, as Windows and Linux write them.
+        static byte[] LongNames(string longName, byte[] own)
+        {
+            byte check = 0;
+            for (int i = 0; i < 11; ++i) check = (byte)((((check & 1) << 7) + (check >> 1) + own[i]) & 0xFF);
+            int parts = (longName.Length + 12) / 13;
+            var all = new byte[parts * 32];
+            int[] places = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+            for (int part = parts, e = 0; part >= 1; --part, e += 32)
+            {
+                all[e] = (byte)(part | (part == parts ? 0x40 : 0));
+                all[e + 11] = 0x0F;
+                all[e + 13] = check;
+                for (int i = 0; i < 13; ++i)
+                {
+                    int letter = (part - 1) * 13 + i;
+                    ushort c = letter < longName.Length ? longName[letter] : letter == longName.Length ? (ushort)0 : (ushort)0xFFFF;
+                    all[e + places[i]] = (byte)c; all[e + places[i] + 1] = (byte)(c >> 8);
+                }
+            }
+            return all;
+        }
+
+        // A file (data) or a folder (data null) of a made-up hades-diag.
+        static DiagItem Item(string name, string name11, byte small, bool longName, byte[] data, params DiagItem[] items)
+        {
+            var i = new DiagItem();
+            i.Folder = data == null;
+            i.Own = ShortEntry(name11, i.Folder ? (byte)0x10 : (byte)0x20, small, i.Folder ? 0 : data.Length);
+            i.Names = longName ? LongNames(name, i.Own) : new byte[0];
+            i.Name = name;
+            i.Data = data;
+            i.Items.AddRange(items);
+            return i;
+        }
+
+        static byte[] Noise(int length, int seed)
+        {
+            var b = new byte[length];
+            new Random(seed).NextBytes(b);
+            return b;
+        }
+
+        // What the diagnostics of a few starts leave, as Linux writes it: long names, short names in small letters,
+        // files of no cluster, of one, of a part of one and of several, and a folder whose directory takes several
+        // clusters. 48 files in 8 folders. scale: how many times larger the files are.
+        static DiagItem DiagTree(int scale = 1)
+        {
+            var many = new List<DiagItem>();
+            for (int i = 0; i < 40; ++i)
+                many.Add(Item("card" + i + "-HDMI-A-1.txt", ("CARD" + i + "-~1").Substring(0, 8) + "TXT", 0, true, Noise(i * 37 * scale, i)));
+            return Item("hades-diag", "HADES-~1   ", 0, true, null,
+                Item("README.txt", "README  TXT", 0x10, false, Noise(300, 1)),
+                Item("LEEME.txt", "LEEME   TXT", 0x10, false, Noise(280, 2)),
+                Item("start-1", "START-1    ", 0x08, false, null,
+                     Item("1-minute", "1-MINUTE   ", 0x08, false, null,
+                          Item("kodi.log.gz", "KODILO~1GZ ", 0, true, Noise(5000 * scale, 3)),
+                          Item("empty.txt", "EMPTY   TXT", 0x18, false, new byte[0]),
+                          Item(".filtered", "FILTER~1   ", 0, true, new byte[0])),
+                     Item("shutdown", "SHUTDOWN   ", 0x08, false, null,
+                          Item("one.bin", "ONE     BIN", 0x18, false, Noise(512, 4)),
+                          Item("more.bin", "MORE    BIN", 0x18, false, Noise(513 * scale, 5)))),
+                Item("start-2", "START-2    ", 0x08, false, null, Item("cards", "CARDS      ", 0x08, false, null, many.ToArray())),
+                Item("start-10", "START-10   ", 0x08, false, null,
+                     Item("4-minutes", "4-MINU~1   ", 0, true, null, Item("dmesg.txt", "DMESG   TXT", 0x18, false, Noise(1500 * scale, 6)))));
+        }
+
+        static byte[] Slice(byte[] b, int count)
+        {
+            var s = new byte[count];
+            Buffer.BlockCopy(b, 0, s, 0, count);
+            return s;
+        }
+
+        // A copy of a partition that is at "systemStart" of its image, with patches of that image put on it.
+        static byte[] Patched(byte[] partition, long systemStart, List<Patch> patches)
+        {
+            var p = (byte[])partition.Clone();
+            foreach (Patch x in patches) Buffer.BlockCopy(x.Bytes, 0, p, (int)(x.Offset - systemStart), x.Bytes.Length);
+            return p;
+        }
+
+        // A made-up folder put into a partition the way an update puts one: the partition with it.
+        static byte[] WithDiag(byte[] partition, DiagItem folder)
+        {
+            string why;
+            Fat16 f = Fat16.Open(DiagFolder.Reader(partition), partition.Length, out why);
+            DiagKeep k = DiagFolder.Place(new DiagKeep(), folder, delegate { return Slice(partition, (int)f.DataAt); }, partition.Length, 0,
+                                          new List<Patch>(), 0);
+            if (k.State != DiagKeep.Outcome.Kept) throw new InvalidOperationException("a made-up folder could not be put: " + k.Summary());
+            return Patched(partition, 0, k.Patches);
+        }
+
+        // What an update keeps, and, as the update does once it has written the partition, read back from what it
+        // wrote (the image with the other changes and with those of the folder).
+        static DiagKeep KeepFrom(byte[] old, byte[] image, long systemStart, List<Patch> others, long reserve)
+        {
+            string why;
+            Fat16 f = Fat16.Open(DiagFolder.Reader(image), image.Length, out why);
+            DiagKeep keep = DiagFolder.Keep(DiagFolder.Reader(old), old.Length, delegate { return Slice(image, (int)f.DataAt); }, image.Length,
+                                            systemStart, others, reserve);
+            byte[] written = Patched(Patched(image, systemStart, others), systemStart, keep.Patches);
+            DiagFolder.Confirm(keep, DiagFolder.Reader(written), written.Length);
+            return keep;
+        }
+
+        // The folder hades-diag of a partition, read whole as an update reads it; null where there is none.
+        static DiagItem Reread(byte[] partition)
+        {
+            string why;
+            int damaged;
+            Fat16 f = Fat16.Open(DiagFolder.Reader(partition), partition.Length, out why);
+            return f == null ? null : DiagFolder.ReadWhole(f, out damaged);
+        }
+
+        // Where the short entry with that name is (the first place that has its eleven letters and the attributes of
+        // a file).
+        static int FindShort(byte[] p, string name11)
+        {
+            byte[] w = Encoding.ASCII.GetBytes(name11);
+            for (int i = 0; i + 12 <= p.Length; i += 32)
+            {
+                int k = 0;
+                while (k < 11 && p[i + k] == w[k]) ++k;
+                if (k == 11 && p[i + 11] == 0x20) return i;
+            }
+            return -1;
+        }
+
+        static void SetFat(byte[] p, Fat16 f, int cluster, int value)
+        {
+            for (int copy = 0; copy < f.Fats; ++copy)
+            {
+                long at = f.FatAt + (long)copy * f.FatSectors * S + 2 * cluster;
+                p[at] = (byte)value;
+                p[at + 1] = (byte)(value >> 8);
+            }
+        }
+
+        static void Diag()
+        {
+            const long At = 4L << 20; // where the system partition is in its made-up image
+            const int Root = S * (1 + 2 * 17);
+            byte[] blank = Fat16Partition(4200, 30);
+            byte[] old = WithDiag(blank, DiagTree());
+            // the new system partition: its own file is larger, so what is free is elsewhere
+            byte[] image = Fat16Partition(4200, 700);
+            // another change of the update: a name in the root directory, as the switch of the diagnostics is changed
+            var others = new List<Patch>();
+            var renamed = new Patch();
+            renamed.Offset = At + Root + 32;
+            renamed.Bytes = Encoding.ASCII.GetBytes("KERNELX    ");
+            others.Add(renamed);
+            string why, where;
+            Fat16 geometry = Fat16.Open(DiagFolder.Reader(image), image.Length, out why);
+            Check("hades-diag: the made-up partitions are taken for FAT16, with the root directory where the test puts it",
+                  geometry != null && geometry.Clusters == 4200 && geometry.RootAt == Root && geometry.SameFats);
+
+            DiagKeep keep = KeepFrom(old, image, At, others, 0);
+            Say("      " + keep.Summary());
+            Check("hades-diag: kept from the old partition, every file and folder of it, and said so",
+                  keep.State == DiagKeep.Outcome.Kept && keep.Files == 48 && keep.Folders == 8 && keep.Damaged == 0 &&
+                      keep.LeftOut.Count == 0 && keep.Patches.Count > 0 && keep.Verified && keep.Text().Contains("48 files") &&
+                      keep.Text().Contains("checked file by file"));
+            byte[] updated = Patched(image, At, others);
+            byte[] withKept = Patched(updated, At, keep.Patches);
+            Check("... read from the new partition, it is the folder that was put into the old one: names, long names, times, " +
+                  "what each file holds", DiagFolder.Same(DiagTree(), Reread(withKept) ?? new DiagItem(), out where));
+            Fat16 after = Fat16.Open(DiagFolder.Reader(withKept), withKept.Length, out why);
+            bool untouched = after != null && after.SameFats;
+            for (int c = 0; untouched && c < 2 + 700; ++c) untouched = after.Table[c] == geometry.Table[c];
+            for (long i = 0; untouched && i < geometry.ClusterAt(702); ++i)
+                untouched = (i >= geometry.FatAt && i < geometry.RootAt) || (i >= Root + 64 && i < geometry.DataAt) || withKept[i] == updated[i];
+            Check("... and what the new partition had stays as it was: boot sector, the first two entries of its root directory, " +
+                  "the FAT of its file, and the file; its two FATs are still the same", untouched);
+            keep.Verified = false;
+            DiagFolder.Confirm(keep, DiagFolder.Reader(withKept), withKept.Length);
+            Check("... read back as an update reads it from the disk afterwards, it is said to be the same", keep.Verified);
+            byte[] flipped = (byte[])withKept.Clone();
+            DiagItem readBack = Reread(withKept);
+            if (readBack != null) flipped[geometry.ClusterAt(readBack.Items[2].Items[0].Items[0].First) + 10] ^= 0x20;
+            DiagKeep again = KeepFrom(old, image, At, others, 0);
+            DiagFolder.Confirm(again, DiagFolder.Reader(flipped), flipped.Length);
+            Check("... and one byte of it that the disk gives back changed is found, and said", again.State == DiagKeep.Outcome.Kept &&
+                  !again.Verified && again.Text().Contains("do not trust"));
+
+            DiagItem shown = Reread(old);
+            Check("hades-diag: short names are taken with the small letters that their entry says, long names as they are spelled",
+                  shown != null && shown.Items.Count == 5 && shown.Items[0].Name == "README.txt" && shown.Items[2].Name == "start-1" &&
+                      shown.Items[2].Items[0].Items[1].Name == "empty.txt" && shown.Items[2].Items[0].Items[2].Name == ".filtered");
+
+            // nothing to keep, and a partition that cannot be read
+            keep = KeepFrom(blank, image, At, others, 0);
+            Check("hades-diag: an old partition without the folder: nothing to keep, nothing is changed, nothing is said",
+                  keep.State == DiagKeep.Outcome.NoFolder && keep.Patches.Count == 0 && keep.Text() == "");
+            keep = KeepFrom(Noise(blank.Length, 9), image, At, others, 0);
+            Check("... one that is not a FAT16: whether there was a folder cannot be told, and that is said; nothing is changed",
+                  keep.State == DiagKeep.Outcome.Unknown && keep.Why == DiagKeep.Cause.Unreadable && keep.Patches.Count == 0 &&
+                      keep.Text().Contains("could not be told"));
+
+            // what cannot be read on the old partition is left out, and counted
+            Fat16 oldFat = Fat16.Open(DiagFolder.Reader(old), old.Length, out why);
+            byte[] broken = (byte[])old.Clone();
+            SetFat(broken, oldFat, shown.Items[2].Items[0].Items[0].First, 0);
+            keep = KeepFrom(broken, image, At, others, 0);
+            Check("hades-diag: a file whose chain is cut on the old partition is left out, counted and said; the rest is kept",
+                  keep.State == DiagKeep.Outcome.Kept && keep.Damaged == 1 && keep.Files == 47 && keep.Text().Contains("could not be read"));
+            broken = (byte[])old.Clone();
+            List<int> cards = oldFat.Chain(shown.Items[3].Items[0].First, 100);
+            SetFat(broken, oldFat, cards[cards.Count - 1], cards[0]);
+            keep = KeepFrom(broken, image, At, others, 0);
+            Check("... a folder whose chain comes back to itself is left out with what is in it, and counted",
+                  cards.Count > 1 && keep.State == DiagKeep.Outcome.Kept && keep.Damaged == 1 && keep.Files == 8);
+            broken = (byte[])old.Clone();
+            SetFat(broken, oldFat, shown.First, 0);
+            keep = KeepFrom(broken, image, At, others, 0);
+            Check("... a folder hades-diag that cannot be read at all is not kept, and that is said",
+                  keep.State == DiagKeep.Outcome.NotKept && keep.Why == DiagKeep.Cause.Damaged && keep.Patches.Count == 0 &&
+                      keep.Text().Contains("could not be kept"));
+            broken = (byte[])old.Clone();
+            int log = FindShort(broken, "KODILO~1GZ "), dmesg = FindShort(broken, "DMESG   TXT");
+            broken[log - 32 + 13] ^= 0x55;
+            broken[dmesg] = 0xE5;
+            keep = KeepFrom(broken, image, At, others, 0);
+            DiagItem odd = keep.State == DiagKeep.Outcome.Kept ? Reread(Patched(updated, At, keep.Patches)) : null;
+            Check("... a long name that is not of the entry after it is not carried (the file keeps the short name that both " +
+                  "systems show), and a deleted file is not brought back",
+                  log > 0 && dmesg > 0 && odd != null && odd.Items[2].Items[0].Items[0].Name == "KODILO~1.GZ" &&
+                      odd.Items[2].Items[0].Items[0].Names.Length == 0 && odd.Items[4].Items[0].Items.Count == 0 && keep.Files == 47);
+
+            // room: the reserve stays free, the oldest starts go first, by their number
+            int cb = geometry.ClusterBytes, free = 0;
+            for (int c = 2; c <= geometry.Clusters + 1; ++c) if (geometry.Table[c] == 0) ++free;
+            DiagItem tree = DiagTree();
+            long need = DiagFolder.Need(tree, cb), first = DiagFolder.Need(tree.Items[2], cb), second = DiagFolder.Need(tree.Items[3], cb);
+            keep = KeepFrom(old, image, At, others, (free - need + first) * cb);
+            Check("hades-diag: with room for all but its oldest start, that one is left out and named, and the rest is kept",
+                  keep.State == DiagKeep.Outcome.Kept && keep.LeftOut.Count == 1 && keep.LeftOut[0] == "start-1" &&
+                      keep.Text().Contains("start-1") && keep.Text().Contains("no room") && keep.Files == 43);
+            keep = KeepFrom(old, image, At, others, (free - need + first + second) * cb);
+            Check("... with room for one start less, start-1 and start-2 go, not start-10 (by their number, as start.sh counts them)",
+                  keep.State == DiagKeep.Outcome.Kept && keep.LeftOut.Count == 2 && keep.LeftOut[1] == "start-2");
+            keep = KeepFrom(old, image, At, others, (long)free * cb);
+            Check("... with no room at all, it is not kept, and that is said",
+                  keep.State == DiagKeep.Outcome.NotKept && keep.Why == DiagKeep.Cause.NoRoom && keep.Patches.Count == 0 &&
+                      keep.Text().Contains("could not be kept"));
+
+            // a new partition that it cannot go into
+            byte[] taken = WithDiag(Fat16Partition(4200, 700), Item("Hades-Diag", "HADES-~1   ", 0, true, null));
+            keep = KeepFrom(old, taken, At, others, 0);
+            Check("hades-diag: an image that has something of that name already: not kept, said",
+                  keep.State == DiagKeep.Outcome.NotKept && keep.Why == DiagKeep.Cause.NameTaken);
+            byte[] full = Fat16Partition(4200, 700);
+            for (int e = 2; e < 512; ++e) Entry(full, Root, e, ("F" + e).PadRight(8) + "TXT", 0x20);
+            keep = KeepFrom(old, full, At, others, 0);
+            Check("... one whose root directory is full: not kept, said", keep.State == DiagKeep.Outcome.NotKept && keep.Why == DiagKeep.Cause.NoRoom);
+            byte[] differ = Fat16Partition(4200, 700);
+            differ[S + 17 * S + 2 * 4000] = 7;
+            keep = KeepFrom(old, differ, At, others, 0);
+            Check("... one whose two FATs differ: not kept, said", keep.State == DiagKeep.Outcome.NotKept && keep.Why == DiagKeep.Cause.ImageUnknown);
+            var over = new List<Patch>(others);
+            var into = new Patch();
+            into.Offset = At + geometry.ClusterAt(710);
+            into.Bytes = new byte[cb];
+            over.Add(into);
+            keep = KeepFrom(old, image, At, over, 0);
+            Check("... and where another change of the update writes into a cluster that the folder would take: not kept",
+                  keep.State == DiagKeep.Outcome.NotKept && keep.Patches.Count == 0);
+        }
+
+        // The folder hades-diag across an update of a real image: a made-up one, of the size of the real ones, put
+        // into the system partition that was just written for that image (as if Hades had saved it there); an update
+        // from that partition keeps it, and what it writes is, but for the folder, what it writes without it.
+        static void DiagReal(string directory, ImagePlan plan, string system)
+        {
+            string old = Path.Combine(directory, "real-sistema-con-diag.bin");
+            File.Copy(system, old, true);
+            using (var o = new FileStream(old, FileMode.Open, FileAccess.ReadWrite))
+            {
+                string why;
+                Fat16 f = Fat16.Open(DiagFolder.Reader(o, o.Length), o.Length, out why);
+                Check("real image: its system partition is a FAT16 (" + (why ?? "") + ")", f != null);
+                if (f == null) return;
+                byte[] meta = new byte[f.DataAt];
+                o.Seek(0, SeekOrigin.Begin);
+                o.Read(meta, 0, meta.Length);
+                DiagKeep put = DiagFolder.Place(new DiagKeep(), DiagTree(300), delegate { return (byte[])meta.Clone(); }, o.Length, 0,
+                                                new List<Patch>(), DiagFolder.Reserve);
+                Check("... a made-up hades-diag of " + Words.Size(put.Bytes) + " is put into it", put.State == DiagKeep.Outcome.Kept);
+                foreach (Patch p in put.Patches) { o.Seek(p.Offset, SeekOrigin.Begin); o.Write(p.Bytes, 0, p.Bytes.Length); }
+            }
+            const string there = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+            List<Patch> patches = Engine.Patches(plan, true, false, there, plan.SwitchOffset >= 0);
+            DiagKeep keep;
+            using (var o = new FileStream(old, FileMode.Open, FileAccess.Read)) keep = DiagFolder.Prepare(plan, o, o.Length, patches);
+            Say("      " + keep.Summary());
+            string with = Path.Combine(directory, "real-sistema-actualizado-diag.bin"), without = Path.Combine(directory, "real-sistema-actualizado.bin");
+            var all = new List<Patch>(patches);
+            all.AddRange(keep.Patches);
+            bool verified = true;
+            foreach (string file in new[] { with, without })
+                using (var f = new FileStream(file, FileMode.Create, FileAccess.ReadWrite))
+                {
+                    var part = new Engine.Target();
+                    part.Stream = f; part.Capacity = plan.System.Size; part.From = plan.System.Start; part.Length = plan.System.Size;
+                    Engine.Write(plan, new[] { part }, file == with ? all : patches, null, null);
+                    verified &= part.Result.Verified;
+                    if (file == with) DiagFolder.Confirm(keep, DiagFolder.Reader(f, plan.System.Size), plan.System.Size);
+                }
+            Check("real image, update: the folder hades-diag of the old system partition is kept, every file of it (48 files in " +
+                  "8 folders), and read back from what was written it is the same",
+                  keep.State == DiagKeep.Outcome.Kept && keep.Files == 48 && keep.Folders == 8 && keep.Verified && verified);
+            // what is written with the folder is what is written without it, but where its patches are
+            long differ = 0, inside = 0;
+            var spans = new List<Patch>(keep.Patches);
+            spans.Sort(delegate(Patch x, Patch y) { return x.Offset.CompareTo(y.Offset); });
+            using (var a = new FileStream(with, FileMode.Open, FileAccess.Read))
+            using (var b = new FileStream(without, FileMode.Open, FileAccess.Read))
+            {
+                var x = new byte[1 << 20];
+                var y = new byte[1 << 20];
+                int s = 0;
+                for (long done = 0; done < plan.System.Size; done += x.Length)
+                {
+                    int want = (int)Math.Min(x.Length, plan.System.Size - done);
+                    a.Read(x, 0, want);
+                    b.Read(y, 0, want);
+                    for (int i = 0; i < want; ++i)
+                    {
+                        if (x[i] == y[i]) continue;
+                        long at = plan.System.Start + done + i;
+                        while (s < spans.Count && spans[s].Offset + spans[s].Bytes.Length <= at) ++s;
+                        if (s < spans.Count && spans[s].Offset <= at) ++inside;
+                        else ++differ;
+                    }
+                }
+            }
+            Say("      bytes that differ from the update without the folder: " + inside + " where its patches are, " + differ + " elsewhere");
+            Check("... and the rest of what the update writes is what it writes without the folder, byte for byte", differ == 0 && inside > 0);
+            File.Delete(without);
+            File.Delete(old);
+        }
 
         // An image that says that it hides the other internal disks by itself and that has the switch of the
         // diagnostics: what the installer finds in it, and what it writes for an internal disk and with the
@@ -1013,6 +1412,7 @@ namespace Hades.Installer
                 Check("real image, next to the data: the two partitions written to files and read back the same",
                       parts[0].Result.Verified && parts[1].Result.Verified);
             }
+            DiagReal(directory, plan, sys);
         }
 
         // An image like the ones that the self-test makes, with what a current image has (it says that it hides the other
@@ -1027,22 +1427,32 @@ namespace Hades.Installer
         }
 
         // The system partition as an update would write it for a storage of the given UUID, to a file: for
-        // a virtual machine to start a disk that was updated.
-        public static int SimulateUpdate(string directory, string image, string existing, bool inside, bool diagnostics)
+        // a virtual machine to start a disk that was updated. old: the system partition that the update replaces,
+        // in a file, from which the folder hades-diag is kept as Operations.Update keeps it (null: none).
+        public static int SimulateUpdate(string directory, string image, string existing, bool inside, bool diagnostics, string old = null)
         {
             Directory.CreateDirectory(directory);
             ImagePlan plan = Engine.Plan(image, true, null, null);
             List<Patch> patches = Engine.Patches(plan, inside, false, existing, diagnostics);
+            DiagKeep kept = null;
+            if (old != null)
+                using (var o = new FileStream(old, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    kept = DiagFolder.Prepare(plan, o, o.Length, patches);
+            var all = new List<Patch>(patches);
+            if (kept != null) all.AddRange(kept.Patches);
             using (var f = new FileStream(Path.Combine(directory, "sistema-actualizado.bin"), FileMode.Create, FileAccess.ReadWrite))
             {
                 var part = new Engine.Target();
                 part.Stream = f; part.Capacity = plan.System.Size; part.From = plan.System.Start; part.Length = plan.System.Size;
-                Engine.Write(plan, new[] { part }, patches, null, null);
+                Engine.Write(plan, new[] { part }, all, null, null);
+                if (kept != null && part.Result.Verified) DiagFolder.Confirm(kept, DiagFolder.Reader(f, plan.System.Size), plan.System.Size);
                 File.WriteAllText(Path.Combine(directory, "sistema-actualizado.txt"),
                                   "image " + Path.GetFileName(image) + " names " + plan.StorageUuid + "; written for " + existing +
                                   (inside ? "; for a disk inside the PC" : "") + (diagnostics ? "; diagnostics on" : "") +
-                                  "; verified " + part.Result.Verified + "; " + part.Result.Written + "\r\n");
-                return part.Result.Verified ? 0 : 1;
+                                  "; verified " + part.Result.Verified + "; " + part.Result.Written +
+                                  (kept != null ? "\r\nhades-diag: " + kept.Summary() : "") + "\r\n");
+                return part.Result.Verified && (kept == null || kept.State == DiagKeep.Outcome.NoFolder ||
+                                                (kept.State == DiagKeep.Outcome.Kept && kept.Verified)) ? 0 : 1;
             }
         }
 
@@ -1276,7 +1686,12 @@ namespace Hades.Installer
                     take.Show();
                     Save(take, Path.Combine(directory, "14-confirm-take.png"));
                 }
-                form.ShowDone(has, Place.Usb, true);
+                // (with the folder hades-diag of that drive kept, as an update says it)
+                var kept = new DiagKeep();
+                kept.State = DiagKeep.Outcome.Kept;
+                kept.Verified = true;
+                kept.Files = 137;
+                form.ShowDone(has, Place.Usb, true, kept);
                 Save(form, Path.Combine(directory, "8-updated.png"));
             }
         }

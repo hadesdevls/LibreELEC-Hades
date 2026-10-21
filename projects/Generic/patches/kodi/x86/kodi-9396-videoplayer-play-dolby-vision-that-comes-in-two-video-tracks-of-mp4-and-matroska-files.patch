@@ -1,0 +1,904 @@
+From 77f6a6cea7005f4528bc03402773c541cdb8f407 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:43:54 +0000
+Subject: [PATCH] VideoPlayer: play Dolby Vision that comes in two video tracks
+ of MP4 and Matroska files
+
+Dolby Vision profile 7 in two video tracks was joined only from a
+transport stream. Two kinds of files that people play have the same two
+tracks in other containers, and they played HDR10:
+
+- Matroska files that keep the two tracks of a UHD Blu-ray (issue 5:
+  "DT" files play HDR10, "ST" ones Dolby Vision);
+- MP4 files with the dual-track carriage of Dolby's specification
+  ("Dolby Vision Streams Within the ISO Base Media File Format", Annex
+  C: a 'dvhe' or 'dvh1' enhancement track with a 'vdep' reference to the
+  base track). The file of issue 1 ("FEL TEST DT DL P7 CMV4.0 4000nits
+  V4") is one: its base track is 'hev1' with an empty hvcC record, which
+  is why the log said "no sequence parameter set in the extradata", and
+  it has no "DV:" line because the base track has no Dolby Vision record
+  of its own. The record, profile 7 with both layers and the RPU, is on
+  its enhancement track.
+
+libavformat 9.0 already groups both: an MP4 enhancement track by its
+reference, its sample entry and its record; a Matroska one, which has no
+reference, by its record when there is exactly one other HEVC track. The
+join takes them now, with what differs from a transport stream:
+
+- the units have a length before them (hvcC), not start codes. The units
+  of the enhancement access unit are appended in the framing of the base
+  packet (the length size of each track from its record), wrapped in
+  type 63 as before, the RPU as it is. A unit of type 63 in an
+  enhancement access unit is refused: no enhancement layer has one, and
+  a track that has them is a one-track stream that the Matroska grouping
+  could take for a layer;
+- Matroska gives no decoding times. libavformat makes some up for each
+  track from its own reordering, which differs between the layers (in
+  the test stream the base layer is coded in its presentation order and
+  the enhancement layer is not), so they do not pair: the first
+  enhancement unit, the random-access one, had no time and was dropped,
+  and every base access unit went with the enhancement unit of the
+  access unit after it (2874 of 2875). The time by which
+  two packets pair is made from the presentation times instead: each
+  track presents one picture at each time, so from a random-access
+  picture of a track on, the n-th of its times in order belongs to the
+  n-th access unit from there in both tracks. It is known once 16 more
+  packets of the track came (HEVC allows 15 pictures to be decoded ahead
+  of one that they follow). Packets of a track before its first
+  random-access picture (after a seek) have no time; base packets do not
+  wait for an enhancement layer that brought SetSilent() packets without
+  one;
+- each MP4 track has its own time base: the decoding times of the
+  enhancement track are taken to the one of the base track;
+- a Matroska enhancement record in use says that the track has a base
+  layer (libavformat ignores that bit for the same reason); MP4 and
+  transport-stream records must say it has none, as before;
+- libavformat pairs Matroska tracks by their records only: in MP4 and
+  Matroska the enhancement track must also have the size of an
+  enhancement layer of the base track (a quarter, or the same up to
+  1920x1080), or the pair is not joined;
+- the parameter sets of the enhancement layer are in the hvcC record of
+  its track, and in a 'dvh1' track nowhere else: the decoder of the layer
+  gets that record (doviELConfig), as it gets the one of the enhancement
+  layer of a one-track MP4 file.
+
+A transport stream is joined as before, to the byte. When anything does
+not fit (another container, another size, other framing, no record), the
+two tracks are left as they were and the base layer plays as HDR10, as
+it did.
+
+Measured with the host tests (dvmerge_test.cpp and fel_tracks_test.c, run
+with FFmpeg 9.0.2 on the files themselves): the profile 7 FEL test stream
+in Matroska and in MP4 (both made from its transport stream with
+FFmpeg's muxers; the MP4 given its reference and sample entry), with an
+enhancement record that says "base layer" and as 'dvh1', and the file of
+issue 1 in MP4, Matroska and a transport stream with the stream numbers
+of a disc:
+
+- every joined access unit has the same base units, the same enhancement
+  units and RPU, and the same time of its enhancement unit as the
+  transport stream gives (2875 of 2875 in Matroska and MP4; 2908 of 2908
+  for the file of issue 1, which joins every packet);
+- after five seeks, every joined packet is the one of the whole read;
+- through the enhancement-layer module, every picture gets the same
+  enhancement picture, by its samples, as from the transport stream
+  (2875 pictures), and that is the one the stream presents at its time;
+- the transport stream as 188-byte packets, with its descriptor and as
+  a disc, gives the same join as the BDAV stream;
+- the same two tracks where nothing declares them (a transport stream
+  with the stream numbers of a disc but no Blu-ray program, one with
+  other stream numbers, Matroska without the record, MP4 without the
+  reference) are not joined: the base layer plays as before;
+- the old code joins none of the MP4 and Matroska files; ten mutations
+  of the new code (each takes out one part of it) fail the test, and
+  without the record of a 'dvh1' enhancement track the module pairs 28
+  of 2875 pictures (none with another picture's layer).
+
+Not tested: a file written by MakeMKV (none was at hand: the Matroska
+files are made with FFmpeg's muxer), and playback itself, on a GPU and a
+TV.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  50 ++-
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.cpp  | 328 +++++++++++++++---
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.h    | 122 ++++++-
+ 3 files changed, 417 insertions(+), 83 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 9d0cb41..35ba53f 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1128,25 +1128,30 @@ double CDVDDemuxFFmpeg::ConvertTimestamp(int64_t pts, int den, int num)
+ }
+ 
+ #ifdef HAVE_DVBRIDGE
+-// The transport stream of a UHD Blu-ray carries Dolby Vision profile 7 in two video tracks, which
+-// libavformat puts in a stream group. Without this the player opens the first one, the base
+-// layer, and plays HDR10. Called while the streams are made, when the program that plays is known
+-// and before its streams are added.
++// Dolby Vision profile 7 can come in two video tracks, which libavformat puts in a stream group:
++// the transport stream of a UHD Blu-ray, Matroska files that keep its two tracks, and MP4 files
++// with the dual-track carriage of Dolby's specification. Without this the player opens
++// the first one, the base layer, and plays HDR10. Called while the streams are made, when the
++// program that plays is known and before its streams are added.
+ void CDVDDemuxFFmpeg::FindDVLayers()
+ {
+   using Result = CDVLayerMerge::Layers::Result;
++  using Container = CDVLayerMerge::Container;
+   const CDVLayerMerge::Layers layers = CDVLayerMerge::Find(m_pFormatContext, m_program);
+ 
+-  if (layers.result == Result::NOT_START_CODES)
++  if (layers.result == Result::FRAMING)
+     CLog::Log(LOGINFO,
+               "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks (streams {} and {}) "
+-              "that are not start-code streams: not joined, the base layer plays alone",
+-              layers.base, layers.enhancement);
++              "whose units are not framed as the container frames them (a length of {} and of {} "
++              "bytes before each unit, 0 for start codes; a transport stream has start codes, MP4 "
++              "and Matroska lengths): not joined, the base layer plays alone",
++              layers.base, layers.enhancement, layers.baseLengthSize,
++              layers.enhancementLengthSize);
+   else if (layers.result == Result::WRONG_SIZE)
+     CLog::Log(LOGINFO,
+-              "CDVDDemuxFFmpeg: the second HEVC track of this Blu-ray stream (stream {}) does "
+-              "not have the size of a Dolby Vision enhancement layer for the base layer of "
+-              "stream {}: not joined, the base layer plays alone",
++              "CDVDDemuxFFmpeg: the second HEVC track of this stream (stream {}) does not have "
++              "the size of a Dolby Vision enhancement layer for the base layer of stream {}: "
++              "not joined, the base layer plays alone",
+               layers.enhancement, layers.base);
+ 
+   const bool joined = layers.result == Result::JOINED;
+@@ -1160,7 +1165,7 @@ void CDVDDemuxFFmpeg::FindDVLayers()
+     {
+       // more may be known of it by now (the size, the frame rate)
+       m_dvRecord = layers.record;
+-      m_dvMerge.SetRate(layers.rate);
++      m_dvMerge.Configure(layers);
+     }
+     return;
+   }
+@@ -1173,13 +1178,20 @@ void CDVDDemuxFFmpeg::FindDVLayers()
+   if (!joined)
+     return;
+ 
+-  m_dvMerge.SetRate(layers.rate);
++  m_dvMerge.Configure(layers);
++  const char* how = "a Blu-ray stream, by its stream numbers";
++  if (layers.container == Container::MP4)
++    how = "MP4, by the reference and the Dolby Vision record of the enhancement track; units "
++          "with their lengths";
++  else if (layers.container == Container::MATROSKA)
++    how = "Matroska, by the Dolby Vision record of the enhancement track; units with their "
++          "lengths, decoding times made from the presentation times";
++  else if (layers.described)
++    how = "Dolby Vision descriptor";
+   CLog::Log(LOGINFO,
+             "CDVDDemuxFFmpeg: Dolby Vision profile 7 in two video tracks ({}): the enhancement "
+             "layer and the RPU of stream {} are joined to the base layer of stream {}",
+-            layers.described ? "Dolby Vision descriptor"
+-                             : "a Blu-ray stream, by its stream numbers",
+-            enhancement, base);
++            how, enhancement, base);
+ }
+ 
+ // After the streams are made: the enhancement layer is no stream of the player, but its packets
+@@ -2200,6 +2212,14 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+           // makes of the two tracks.
+           st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
+           st->dovi = m_dvRecord;
++          // In MP4 and Matroska the parameter sets of the enhancement layer are in the hvcC record
++          // of its track, and may be nowhere else ('dvh1'): its decoder takes that record, as it
++          // takes the one of the enhancement layer of a one-track MP4 file. A transport stream has
++          // them in the stream and no record.
++          const AVCodecParameters* layer =
++              m_pFormatContext->streams[m_dvEnhancementIndex]->codecpar;
++          if (CDVLayerMerge::IsConfigurationRecord(layer->extradata, layer->extradata_size))
++            st->doviELConfig = FFmpegExtraData(layer->extradata, layer->extradata_size);
+         }
+ #endif
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+index eb5fa62..e77dda3 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+@@ -34,6 +34,13 @@ constexpr uint8_t START_CODE[4] = {0, 0, 0, 1};
+ // the enhancement layer in the one-track form.
+ constexpr uint8_t WRAP[2] = {0x7e, 0x01};
+ constexpr unsigned int NAL_RPU = 62;
++constexpr unsigned int NAL_WRAPPED = 63;
++// the unit types of a random-access picture (IRAP: BLA, IDR, CRA, and the two reserved ones)
++constexpr unsigned int NAL_IRAP_FIRST = 16;
++constexpr unsigned int NAL_IRAP_LAST = 23;
++// the most an hvcC record of an enhancement track is taken to be (as Kodi's demuxer takes the one
++// of a one-track stream)
++constexpr int RECORD_MAX = 1024 * 1024;
+ 
+ // The position of the next 00 00 01 at or after from, or size when there is none.
+ size_t FindStartCode(const uint8_t* data, size_t size, size_t from)
+@@ -50,7 +57,7 @@ size_t FindStartCode(const uint8_t* data, size_t size, size_t from)
+ // one: something other than zeros before the first start code, a unit shorter than its header, or
+ // a unit with the forbidden bit set.
+ template<typename F>
+-bool ForEachUnit(const uint8_t* data, size_t size, F&& unit)
++bool ForEachStartCodeUnit(const uint8_t* data, size_t size, F&& unit)
+ {
+   size_t code = FindStartCode(data, size, 0);
+   if (code == size)
+@@ -81,15 +88,78 @@ bool ForEachUnit(const uint8_t* data, size_t size, F&& unit)
+   return true;
+ }
+ 
+-// Whether the packets of a stream are start-code streams (Annex B) and not length-prefixed units
+-// with their parameter sets in an hvcC record. As libavcodec tells them apart: such a record
+-// starts with its version, 1.
+-bool IsAnnexB(const AVCodecParameters* par)
++// Calls unit(pointer, size) for each unit of a buffer that has a length of lengthSize bytes before
++// each unit (MP4, Matroska), or of a start-code stream when lengthSize is 0. A length of 0 is no
++// unit, and fewer bytes at the end than a length are left, as libavcodec leaves them. False when
++// the buffer is no such stream: a length beyond its end, a unit shorter than its header, a unit
++// with the forbidden bit set, or no unit at all.
++template<typename F>
++bool ForEachUnit(const uint8_t* data, size_t size, int lengthSize, F&& unit)
++{
++  if (lengthSize == 0)
++    return ForEachStartCodeUnit(data, size, unit);
++  if (!data || lengthSize < 0 || lengthSize > 4)
++    return false;
++
++  const size_t prefix = static_cast<size_t>(lengthSize);
++  bool any = false;
++  size_t i = 0;
++  while (size - i >= prefix)
++  {
++    size_t length = 0;
++    for (size_t k = 0; k < prefix; ++k)
++      length = length << 8 | data[i + k];
++    i += prefix;
++    if (length > size - i)
++      return false;
++    if (length == 0)
++      continue;
++    if (length < 2 || (data[i] & 0x80))
++      return false;
++    unit(data + i, length);
++    any = true;
++    i += length;
++  }
++  return any;
++}
++
++// Whether an access unit holds a picture that a decoder can start at (a unit of an IRAP type).
++bool RandomAccess(const uint8_t* data, size_t size, int lengthSize)
++{
++  bool found = false;
++  if (data && size > 0)
++    ForEachUnit(data, size, lengthSize,
++                [&found](const uint8_t* unit, size_t)
++                {
++                  const unsigned int type = (unit[0] >> 1) & 0x3f;
++                  found |= type >= NAL_IRAP_FIRST && type <= NAL_IRAP_LAST;
++                });
++  return found;
++}
++
++bool SameTimeBase(AVRational a, AVRational b)
++{
++  return a.num > 0 && a.den > 0 && b.num > 0 && b.den > 0 && av_cmp_q(a, b) == 0;
++}
++
++bool KnownTimeBase(AVRational a)
+ {
+-  return !(par->extradata && par->extradata_size >= 23 && par->extradata[0] == 1);
++  return a.num > 0 && a.den > 0;
+ }
+ } // unnamed namespace
+ 
++int CDVLayerMerge::LengthSize(const AVCodecParameters* parameters)
++{
++  if (!parameters || !IsConfigurationRecord(parameters->extradata, parameters->extradata_size))
++    return 0;
++  return (parameters->extradata[21] & 3) + 1;
++}
++
++bool CDVLayerMerge::IsConfigurationRecord(const uint8_t* data, int size)
++{
++  return data && size >= 23 && size <= RECORD_MAX && data[0] == 1;
++}
++
+ uint8_t CDVLayerMerge::Level(int width, int height, AVRational rate)
+ {
+   struct Limit
+@@ -142,9 +212,18 @@ bool CDVLayerMerge::EnhancementSize(int baseWidth, int baseHeight, int width, in
+ CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int program)
+ {
+   Layers refused;
++  if (!context || !context->iformat || !context->iformat->name)
++    return refused;
+ 
+-  // The join is made for, and tested with, the start-code streams of a transport stream.
+-  if (!context || !context->iformat || std::strcmp(context->iformat->name, "mpegts") != 0)
++  // the names of the demuxers of libavformat that group the two tracks
++  Container container = Container::NONE;
++  if (std::strcmp(context->iformat->name, "mpegts") == 0)
++    container = Container::TRANSPORT_STREAM;
++  else if (std::strcmp(context->iformat->name, "mov,mp4,m4a,3gp,3g2,mj2") == 0)
++    container = Container::MP4;
++  else if (std::strcmp(context->iformat->name, "matroska,webm") == 0)
++    container = Container::MATROSKA;
++  else
+     return refused;
+ 
+   const auto played = [context, program](const AVStream* stream)
+@@ -175,6 +254,7 @@ CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int
+     const AVCodecParameters* e = enhancement->codecpar;
+ 
+     Layers layers;
++    layers.container = container;
+     layers.base = base->index;
+     layers.enhancement = enhancement->index;
+     layers.rate = av_guess_frame_rate(context, base, nullptr);
+@@ -186,11 +266,29 @@ CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int
+     layers.described = sideData && sideData->size >= sizeof(AVDOVIDecoderConfigurationRecord);
+     if (layers.described)
+     {
+-      // the Dolby Vision descriptor of the enhancement track
++      // The Dolby Vision record of the enhancement track (the descriptor in a transport stream):
++      // profile 7, with the enhancement layer and the RPU. It says that the track has no base
++      // layer; in Matroska files that are found in use it says that it has one (libavformat's
++      // matroskadec.c groups them all the same), so there the flag does not count.
+       std::memcpy(&layers.record, sideData->data, sizeof(layers.record));
+-      if (layers.record.dv_profile != 7 || layers.record.bl_present_flag ||
+-          !layers.record.el_present_flag || !layers.record.rpu_present_flag)
++      if (layers.record.dv_profile != 7 || !layers.record.el_present_flag ||
++          !layers.record.rpu_present_flag ||
++          (container != Container::MATROSKA && layers.record.bl_present_flag))
+         continue;
++      // libavformat pairs MP4 tracks by a reference, Matroska tracks by the records only: a
++      // second HEVC track of another size than an enhancement layer has is none.
++      if (container != Container::TRANSPORT_STREAM &&
++          !EnhancementSize(b->width, b->height, e->width, e->height))
++      {
++        layers.result = Layers::Result::WRONG_SIZE;
++        refused = layers;
++        continue;
++      }
++    }
++    else if (container != Container::TRANSPORT_STREAM)
++    {
++      // an MP4 or Matroska pair is only known by the record (none: libavformat made no group)
++      continue;
+     }
+     else
+     {
+@@ -212,12 +310,19 @@ CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int
+       layers.record.dv_bl_signal_compatibility_id = 6; // the base layer of a Blu-ray is HDR10
+     }
+ 
+-    if (!IsAnnexB(b) || !IsAnnexB(e))
++    // A transport stream has start codes; MP4 and Matroska a length before each unit, with an
++    // hvcC record. Both tracks are framed as their container frames them.
++    layers.baseLengthSize = LengthSize(b);
++    layers.enhancementLengthSize = LengthSize(e);
++    const bool startCodes = container == Container::TRANSPORT_STREAM;
++    if ((layers.baseLengthSize == 0) != startCodes ||
++        (layers.enhancementLengthSize == 0) != startCodes)
+     {
+-      layers.result = Layers::Result::NOT_START_CODES;
++      layers.result = Layers::Result::FRAMING;
+       refused = layers;
+       continue;
+     }
++    layers.decodingTimes = container != Container::MATROSKA;
+ 
+     // The record of the one-track form: both layers in one stream. The descriptor of the
+     // enhancement track has ones in the bits that newer streams use for the compression of the
+@@ -242,6 +347,17 @@ void CDVLayerMerge::Forget(Track& track)
+     av_packet_free(&waiting.packet);
+   track.waiting.clear();
+   track.known = false;
++  track.started = false;
++  track.unstarted = 0;
++  track.presented.clear();
++}
++
++void CDVLayerMerge::Configure(const Layers& layers)
++{
++  SetRate(layers.rate);
++  m_base.lengthSize = layers.baseLengthSize;
++  m_enhancement.lengthSize = layers.enhancementLengthSize;
++  m_fromPresentation = !layers.decodingTimes;
+ }
+ 
+ void CDVLayerMerge::Clear()
+@@ -270,40 +386,112 @@ void CDVLayerMerge::SetRate(AVRational rate)
+       std::clamp<int64_t>(packets, 0, static_cast<int64_t>(MAX_WAITING))));
+ }
+ 
++// A time of the enhancement track in the time base of the base track (as it is when the two are
++// the same or not known; AV_NOPTS_VALUE when it does not fit).
++int64_t CDVLayerMerge::ToBase(int64_t time) const
++{
++  if (time == AV_NOPTS_VALUE || !KnownTimeBase(m_timeBase) ||
++      !KnownTimeBase(m_enhancementTimeBase) || SameTimeBase(m_timeBase, m_enhancementTimeBase))
++    return time;
++  return av_rescale_q(time, m_enhancementTimeBase, m_timeBase);
++}
++
+ // The decoding time of an access unit is its own, or, when its PES packet gave it none (it was
+ // not the first one in it), the one that follows from the unit before it in the track: that time
+ // plus that duration. The duration is a rounded number, so a time that follows is only known to
+ // half a duration.
+-bool CDVLayerMerge::Queue(Track& track, AVPacket* packet)
++//
++// In Matroska the packets have no decoding times. There the time is made from the presentation
++// times (see REORDER): from a random-access packet of the track on, the times of its packets go
++// into a heap, and each time the heap holds more than REORDER of them, the least one is the time
++// of the oldest packet that waits for one. Packets of the track before such a packet have none.
++//
++// The times of the enhancement track are taken to the time base of the base track, with a slack
++// of one more for the rounding of that.
++bool CDVLayerMerge::Queue(Track& track, AVPacket* packet, bool enhancement)
+ {
+   Waiting waiting;
+-  waiting.time = packet->dts;
+-  if (packet->dts == AV_NOPTS_VALUE && track.known && track.time != AV_NOPTS_VALUE &&
+-      track.duration > 0 && track.time <= std::numeric_limits<int64_t>::max() - track.duration)
+-  {
+-    waiting.time = track.time + track.duration;
+-    waiting.slack = track.duration / 2;
+-  }
+-  track.time = waiting.time;
+-  track.duration = packet->duration;
+-  track.known = true;
+-
+   waiting.packet = av_packet_alloc();
+   if (!waiting.packet)
+   {
+     av_packet_unref(packet);
+     return false;
+   }
++
++  const bool converted = enhancement && KnownTimeBase(m_timeBase) &&
++                         KnownTimeBase(m_enhancementTimeBase) &&
++                         !SameTimeBase(m_timeBase, m_enhancementTimeBase);
++  if (m_fromPresentation)
++  {
++    waiting.time = AV_NOPTS_VALUE;
++    if (!track.started)
++      track.started = RandomAccess(packet->data, static_cast<size_t>(std::max(packet->size, 0)),
++                                   track.lengthSize);
++    if (!track.started && track.unstarted < std::numeric_limits<unsigned int>::max())
++      ++track.unstarted;
++    const int64_t pts = enhancement ? ToBase(packet->pts) : packet->pts;
++    if (track.started && pts != AV_NOPTS_VALUE)
++    {
++      track.presented.push_back(pts);
++      std::push_heap(track.presented.begin(), track.presented.end(), std::greater<int64_t>());
++      waiting.pending = true;
++      // the two times of an access unit are the same but for the rounding of a time base: a
++      // quarter of a duration takes that, and is far from the time of the next picture
++      const int64_t duration = enhancement ? ToBase(packet->duration) : packet->duration;
++      waiting.slack = (duration > 0 ? duration / 4 : 0) + (converted ? 1 : 0);
++    }
++  }
++  else
++  {
++    waiting.time = packet->dts;
++    if (packet->dts == AV_NOPTS_VALUE && track.known && track.time != AV_NOPTS_VALUE &&
++        track.duration > 0 && track.time <= std::numeric_limits<int64_t>::max() - track.duration)
++    {
++      waiting.time = track.time + track.duration;
++      waiting.slack = track.duration / 2;
++    }
++    track.time = waiting.time;
++    track.duration = packet->duration;
++    track.known = true;
++    if (converted)
++    {
++      waiting.time = ToBase(waiting.time);
++      waiting.slack = waiting.time == AV_NOPTS_VALUE
++                          ? 0
++                          : std::max<int64_t>(ToBase(waiting.slack), 0) + 1;
++    }
++  }
++
+   av_packet_move_ref(waiting.packet, packet);
+   track.waiting.push_back(waiting);
++  if (m_fromPresentation)
++    GiveTimes(track, REORDER);
+   return true;
+ }
+ 
++// The least times of the heap go to the oldest packets that wait for theirs, until it holds keep
++// of them. Each packet that waits for a time put one in the heap, so there is always one.
++void CDVLayerMerge::GiveTimes(Track& track, size_t keep)
++{
++  while (track.presented.size() > keep)
++  {
++    std::pop_heap(track.presented.begin(), track.presented.end(), std::greater<int64_t>());
++    const int64_t time = track.presented.back();
++    track.presented.pop_back();
++    const auto it = std::find_if(track.waiting.begin(), track.waiting.end(),
++                                 [](const Waiting& waiting) { return waiting.pending; });
++    if (it == track.waiting.end())
++      continue;
++    it->time = time;
++    it->pending = false;
++  }
++}
++
+ bool CDVLayerMerge::PushBase(AVPacket* packet)
+ {
+   if (m_silent < m_silentAfter && ++m_silent == m_silentAfter && !m_any)
+     m_absent = true;
+-  return Queue(m_base, packet);
++  return Queue(m_base, packet, false);
+ }
+ 
+ bool CDVLayerMerge::PushEnhancement(AVPacket* packet)
+@@ -311,25 +499,42 @@ bool CDVLayerMerge::PushEnhancement(AVPacket* packet)
+   m_silent = 0;
+   m_any = true;
+   m_absent = false;
++  // (the oldest packet has its time: fewer than MAX_QUEUED wait for theirs, see GiveTimes())
+   if (m_enhancement.waiting.size() >= MAX_QUEUED)
+   {
+     av_packet_free(&m_enhancement.waiting.front().packet);
+     m_enhancement.waiting.pop_front();
+     m_counts.dropped++;
+   }
+-  return Queue(m_enhancement, packet);
++  return Queue(m_enhancement, packet, true);
+ }
+ 
+-bool CDVLayerMerge::Append(AVPacket* base, const uint8_t* enhancement, size_t size)
++bool CDVLayerMerge::Append(AVPacket* base,
++                           const uint8_t* enhancement,
++                           size_t size,
++                           int baseLengthSize,
++                           int enhancementLengthSize)
+ {
+-  if (!base || base->size < 0 || !enhancement || size == 0)
++  if (!base || base->size < 0 || !enhancement || size == 0 || baseLengthSize < 0 ||
++      baseLengthSize > 4 || enhancementLengthSize < 0 || enhancementLengthSize > 4)
+     return false;
+ 
++  // what comes before each unit in the framing of the base packet, and the most a length says
++  const size_t prefix = baseLengthSize ? static_cast<size_t>(baseLengthSize) : sizeof(START_CODE);
++  const uint64_t most = baseLengthSize ? (UINT64_C(1) << (8 * baseLengthSize)) - 1 : UINT64_MAX;
+   size_t extra = 0;
+-  if (!ForEachUnit(enhancement, size, [&extra](const uint8_t* unit, size_t length) {
+-        const unsigned int type = (unit[0] >> 1) & 0x3f;
+-        extra += sizeof(START_CODE) + (type == NAL_RPU ? 0 : sizeof(WRAP)) + length;
+-      }))
++  bool wrapped = false;
++  bool fits = true;
++  if (!ForEachUnit(enhancement, size, enhancementLengthSize,
++                   [&](const uint8_t* unit, size_t length)
++                   {
++                     const unsigned int type = (unit[0] >> 1) & 0x3f;
++                     wrapped |= type == NAL_WRAPPED;
++                     const size_t body = (type == NAL_RPU ? 0 : sizeof(WRAP)) + length;
++                     fits &= body <= most;
++                     extra += prefix + body;
++                   }) ||
++      wrapped || !fits)
+     return false;
+ 
+   if (extra == 0 ||
+@@ -342,18 +547,29 @@ bool CDVLayerMerge::Append(AVPacket* base, const uint8_t* enhancement, size_t si
+     return false;
+ 
+   uint8_t* out = base->data + before;
+-  ForEachUnit(enhancement, size, [&out](const uint8_t* unit, size_t length) {
+-    const unsigned int type = (unit[0] >> 1) & 0x3f;
+-    std::memcpy(out, START_CODE, sizeof(START_CODE));
+-    out += sizeof(START_CODE);
+-    if (type != NAL_RPU)
+-    {
+-      std::memcpy(out, WRAP, sizeof(WRAP));
+-      out += sizeof(WRAP);
+-    }
+-    std::memcpy(out, unit, length);
+-    out += length;
+-  });
++  ForEachUnit(enhancement, size, enhancementLengthSize,
++              [&out, baseLengthSize](const uint8_t* unit, size_t length)
++              {
++                const unsigned int type = (unit[0] >> 1) & 0x3f;
++                const size_t body = (type == NAL_RPU ? 0 : sizeof(WRAP)) + length;
++                if (baseLengthSize)
++                {
++                  for (int k = baseLengthSize - 1; k >= 0; --k)
++                    *out++ = static_cast<uint8_t>(body >> (8 * k));
++                }
++                else
++                {
++                  std::memcpy(out, START_CODE, sizeof(START_CODE));
++                  out += sizeof(START_CODE);
++                }
++                if (type != NAL_RPU)
++                {
++                  std::memcpy(out, WRAP, sizeof(WRAP));
++                  out += sizeof(WRAP);
++                }
++                std::memcpy(out, unit, length);
++                out += length;
++              });
+   return true;
+ }
+ 
+@@ -541,18 +757,32 @@ bool CDVLayerMerge::Passed() const
+ 
+ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+ {
++  if (end)
++  {
++    // no more packets come to make the times of the last ones
++    GiveTimes(m_base, 0);
++    GiveTimes(m_enhancement, 0);
++  }
+   if (m_base.waiting.empty())
+     return false;
+ 
+   Waiting base = m_base.waiting.front();
++  // its time comes with the packets of its track that follow it
++  if (base.pending)
++    return false;
++
+   const auto match =
+       std::find_if(m_enhancement.waiting.begin(), m_enhancement.waiting.end(),
+                    [&base](const Waiting& enhancement) { return SameUnit(base, enhancement); });
+ 
+   if (match == m_enhancement.waiting.end())
+   {
+-    // Its enhancement packet may still come; but a packet whose time is not known has none.
+-    if (base.time != AV_NOPTS_VALUE && !end && m_silent < m_silentAfter &&
++    // Its enhancement packet may still come; but a packet whose time is not known has none, and
++    // an enhancement layer that brought SetSilent() packets without a picture to start at gives
++    // none a time (REORDER).
++    const bool unstarted = m_fromPresentation && !m_enhancement.started &&
++                           m_enhancement.unstarted >= m_silentAfter;
++    if (base.time != AV_NOPTS_VALUE && !end && m_silent < m_silentAfter && !unstarted &&
+         m_base.waiting.size() < MAX_WAITING && !Passed())
+       return false;
+ 
+@@ -572,8 +802,8 @@ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+     AVPacket* enhancement = match->packet;
+     m_enhancement.waiting.erase(m_enhancement.waiting.begin(), match + 1);
+ 
+-    if (Append(base.packet, enhancement->data,
+-               static_cast<size_t>(std::max(enhancement->size, 0))))
++    if (Append(base.packet, enhancement->data, static_cast<size_t>(std::max(enhancement->size, 0)),
++               m_base.lengthSize, m_enhancement.lengthSize))
+     {
+       m_counts.joined++;
+       AttachLayerTime(base.packet, enhancement->pts);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+index ee85be4..9c1550a 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+@@ -12,6 +12,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
++#include <vector>
+ 
+ extern "C"
+ {
+@@ -20,17 +21,21 @@ extern "C"
+ #include <libavutil/rational.h>
+ }
+ 
++struct AVCodecParameters;
+ struct AVFormatContext;
+ 
+ /*!
+  * \brief Joins the two video tracks of a Dolby Vision stream into the one-track form
+  *
+- * UHD Blu-ray carries Dolby Vision profile 7 in two video tracks of the transport stream: the
+- * base layer, and the enhancement layer with the RPU. A player that opens the first video track
+- * plays HDR10. Everything after the demuxer (the decoder, the split and the pairing of the
+- * layers) takes the one-track form that dovi_tool makes of the two and that Matroska files
+- * carry: after the units of the base layer of an access unit come the units of the enhancement
+- * layer, each inside a unit of type 63, and the RPU, a unit of type 62, as it is.
++ * Dolby Vision profile 7 can come in two video tracks: the base layer, and the enhancement layer
++ * with the RPU. UHD Blu-ray carries it so in its transport stream, Matroska files made of a disc
++ * may keep the two tracks, and MP4 files have them so in the dual-track carriage of Dolby's
++ * specification (Annex C of "Dolby Vision Streams Within the ISO Base Media File Format"). A
++ * player that opens the first video track plays HDR10. Everything after the demuxer (the decoder,
++ * the split and the pairing of the layers) takes the one-track form that dovi_tool makes of the
++ * two and that one-track Matroska files carry: after the units of the base layer of an access unit
++ * come the units of the enhancement layer, each inside a unit of type 63, and the RPU, a unit of
++ * type 62, as it is.
+  *
+  * This class finds the two tracks and makes that form while the stream is read. The two tracks
+  * have their access units in the same order and with the same decoding times (not the same
+@@ -38,7 +43,9 @@ struct AVFormatContext;
+  * of the decoded pictures resolves; for it a joined packet says when its enhancement access
+  * unit is presented, see LAYER_TIME). An access unit that has no time of its own (a PES packet may
+  * hold more than one) has the time that follows from the unit before it in its track: that time
+- * plus that duration.
++ * plus that duration. Matroska gives no decoding times at all; there the time by which two packets
++ * pair is made from the presentation times of each track (see REORDER). The times of the
++ * enhancement track are taken to the time base of the base track.
+  *
+  * A base packet waits for the enhancement packet of its decoding time and goes out alone when the
+  * enhancement layer has none for it:
+@@ -52,8 +59,10 @@ struct AVFormatContext;
+  * hence no fixed short wait: while the enhancement layer keeps coming, a base packet waits for
+  * its own.
+  *
+- * Both tracks must be start-code streams (Annex B), as a transport stream gives them.
+- * No part of this depends on Kodi, so that the same file is tested outside of it.
++ * The units of both tracks are framed as their container frames them: start codes (Annex B) in a
++ * transport stream; in MP4 and Matroska a length before each unit, with an hvcC record. A joined
++ * packet keeps the framing of the base track. No part of this depends on Kodi, so that the same
++ * file is tested outside of it.
+  */
+ class CDVLayerMerge
+ {
+@@ -63,6 +72,15 @@ public:
+   CDVLayerMerge(const CDVLayerMerge&) = delete;
+   CDVLayerMerge& operator=(const CDVLayerMerge&) = delete;
+ 
++  //! \brief The containers whose two tracks are joined
++  enum class Container
++  {
++    NONE,
++    TRANSPORT_STREAM,
++    MP4,
++    MATROSKA,
++  };
++
+   //! \brief What Find() found
+   struct Layers
+   {
+@@ -70,25 +88,56 @@ public:
+     {
+       NONE, //!< no pair of tracks
+       JOINED, //!< a pair that is joined
+-      NOT_START_CODES, //!< a pair whose tracks are not start-code streams: not joined
+-      WRONG_SIZE, //!< a Blu-ray pair whose second track is no enhancement layer: not joined
++      FRAMING, //!< a pair whose units are not framed as its container frames them: not joined
++      WRONG_SIZE, //!< a pair whose second track has not the size of an enhancement layer
+     };
+     Result result = Result::NONE;
++    Container container = Container::NONE;
+     int base = -1; //!< stream index of the base layer of the pair (joined or not)
+     int enhancement = -1; //!< stream index of its enhancement layer
+-    //! known by the Dolby Vision descriptor of the enhancement track; else by the stream numbers
+-    //! that the Blu-ray format gives to the two layers
++    //! known by the Dolby Vision record of the enhancement track; else (a disc) by the stream
++    //! numbers that the Blu-ray format gives to the two layers
+     bool described = false;
+     AVRational rate{0, 1}; //!< frame rate of the base layer, 0 when not known
+     AVDOVIDecoderConfigurationRecord record{}; //!< of the one-track form, when joined
++    //! bytes of the length before each unit of each track; 0: start codes
++    int baseLengthSize = 0;
++    int enhancementLengthSize = 0;
++    //! the container gives the packets their decoding times (a transport stream, MP4); Matroska
++    //! does not
++    bool decodingTimes = true;
+   };
+ 
+   /*!
+-   * \brief Look for the two tracks in the stream groups of a transport stream
++   * \brief Look for the two tracks in the stream groups that libavformat makes of them
++   *
++   * libavformat groups them by the Dolby Vision descriptor of the enhancement track of a
++   * transport stream, or by the stream numbers of a Blu-ray stream; by the 'vdep' reference of
++   * an MP4 enhancement track with its Dolby Vision sample entry and record; and in Matroska,
++   * which has no such reference, by the Dolby Vision record of the enhancement track when there
++   * is exactly one other HEVC track. For MP4 and Matroska the enhancement track must also have
++   * the size of an enhancement layer of the base track.
+    * \param program index of the program that plays; any other value: all streams play
+    */
+   static Layers Find(AVFormatContext* context, unsigned int program);
+ 
++  /*!
++   * \brief The framing of a track: the bytes of the length before each unit when its codec
++   *        parameters have an hvcC record, 0 for start codes. As libavcodec tells them apart: such
++   *        a record starts with its version, 1.
++   */
++  static int LengthSize(const AVCodecParameters* parameters);
++
++  /*!
++   * \brief Whether these bytes are an hvcC record that the decoder of the enhancement layer can
++   *        take as its configuration (the one of the enhancement track of a pair in MP4 or
++   *        Matroska, which may hold its parameter sets)
++   */
++  static bool IsConfigurationRecord(const uint8_t* data, int size);
++
++  //! \brief Take what Find() found of the pair that is read: its rate, framing and times
++  void Configure(const Layers& layers);
++
+   /*!
+    * \brief av_read_frame() with the two tracks joined
+    *
+@@ -175,6 +224,23 @@ public:
+   static constexpr size_t MAX_QUEUED = 240; //!< enhancement packets kept
+   static constexpr unsigned int SILENT = 60; //!< base packets without any enhancement packet
+ 
++  /*!
++   * \brief For the times that are made from the presentation times (Matroska): how many
++   *        pictures of a track may precede a picture in decoding order and follow it in output
++   *        order, at most
++   *
++   * Each track presents one picture at each time. From a random-access picture of a track on,
++   * the n-th of the times that its packets present, in order, is therefore the same for the n-th
++   * access unit from there in both tracks, also where the base and the enhancement picture of an
++   * access unit are presented at different times; it is the time by which the two packets of that
++   * access unit pair. It is known once REORDER more packets of the track came. HEVC allows 15
++   * (sps_max_num_reorder_pics); one more changes nothing but how long a packet waits for its
++   * time. The packets of a track before its first random-access picture (after a seek) have no
++   * time, and base packets do not wait for an enhancement layer that brought as many packets as
++   * SetSilent() says without one (no layer starts that late).
++   */
++  static constexpr size_t REORDER = 16;
++
+   /*!
+    * \brief After how many base packets without any enhancement packet the enhancement layer is
+    *        silent
+@@ -191,10 +257,19 @@ public:
+ 
+   /*!
+    * \brief Append the units of an enhancement-layer access unit to a base-layer packet
+-   * \return false when the enhancement layer is not a sequence of units or there is no memory;
+-   *         the base packet is then unchanged
++   * \param baseLengthSize framing of the base packet, and of what is appended: the bytes of the
++   *        length before each unit, 0 for start codes
++   * \param enhancementLengthSize framing of the enhancement access unit
++   * \return false when the enhancement layer is not a sequence of units, has a unit of type 63
++   *         (no enhancement layer has one: such a track would be the one-track form itself), a
++   *         unit does not fit the length of the base framing, or there is no memory; the base
++   *         packet is then unchanged
+    */
+-  static bool Append(AVPacket* base, const uint8_t* enhancement, size_t size);
++  static bool Append(AVPacket* base,
++                     const uint8_t* enhancement,
++                     size_t size,
++                     int baseLengthSize = 0,
++                     int enhancementLengthSize = 0);
+ 
+   /*!
+    * \brief The level of a Dolby Vision stream (Dolby Vision Profiles and Levels): the first one
+@@ -216,8 +291,9 @@ private:
+   struct Waiting
+   {
+     AVPacket* packet = nullptr;
+-    int64_t time = 0; //!< AV_NOPTS_VALUE when it is not known
++    int64_t time = 0; //!< in the time base of the base track; AV_NOPTS_VALUE when not known
+     int64_t slack = 0; //!< 0 for a time of its own; half a duration for one that follows
++    bool pending = false; //!< its time is made from presentation times and not known yet
+   };
+ 
+   //! The packets of a track that wait, and what gives the next one its time when it has none
+@@ -227,9 +303,16 @@ private:
+     int64_t time = 0; //!< of the last packet read
+     int64_t duration = 0; //!< of the last packet read
+     bool known = false; //!< time and duration are of a packet read since the last Clear()
++    // times made from the presentation times (Matroska):
++    bool started = false; //!< a random-access packet of the track came since the last Clear()
++    unsigned int unstarted = 0; //!< packets of the track before that one
++    std::vector<int64_t> presented; //!< a heap (least first) of the times not given yet
++    int lengthSize = 0; //!< framing of the units of the track, to find a random-access picture
+   };
+ 
+-  static bool Queue(Track& track, AVPacket* packet);
++  bool Queue(Track& track, AVPacket* packet, bool enhancement);
++  void GiveTimes(Track& track, size_t keep);
++  int64_t ToBase(int64_t time) const;
+   void AttachLayerTime(AVPacket* base, int64_t enhancementPts) const;
+   static bool SetLayerTime(AVPacket* packet, const char* value);
+   static void Forget(Track& track);
+@@ -246,5 +329,6 @@ private:
+   bool m_absent = false; //!< the layer went silent without ever having had a packet
+   bool m_any = false; //!< an enhancement packet has come
+   bool m_end = false; //!< the input ended and what waits is going out
++  bool m_fromPresentation = false; //!< the times are made from presentation times (REORDER)
+   Counts m_counts;
+ };
+-- 
+2.53.0
+

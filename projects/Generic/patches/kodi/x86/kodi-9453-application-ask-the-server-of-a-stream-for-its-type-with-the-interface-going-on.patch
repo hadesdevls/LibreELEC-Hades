@@ -1,0 +1,155 @@
+From 1008c8f79500c4381e5e36d1431e9e1775f0dd4f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 07:39:13 +0000
+Subject: [PATCH] application: ask the server of a stream for its type with the
+ interface going on
+
+For an http(s) or shout item without a MIME type,
+CApplicationPlay::GatherPlaybackDetails() calls CFileItem::FillInMimeType(),
+which asks the server (CCurlFile::Stat(): a HEAD request, a GET where HEAD is
+refused). It runs on the thread of the interface, and it takes as long as
+the server takes to answer. In the tests of 1.0 RC2 and 1.0 RC3 on hardware,
+every start of a film from a Debrid add-on froze the interface and its
+pointer for 3.2 to 6.7 s ("a pass of the main loop took ... ms (process
+...)", with CCurlFile::Stat() and curl_easy_perform() on the stack of that
+thread, just before VideoPlayer::OpenFile); curl's timeouts allow 30 s for
+each request.
+
+The same request is now made by a copy of the item on a thread of its own,
+and the thread of the interface waits for it with CGUIDialogBusy::Wait():
+drawing and taking input, with the busy dialog after 100 ms. That is how
+Kodi already waits, in this same function, for a plugin that resolves the
+path of the item (CScriptRunner::WaitOnScriptResult()) and for the listing
+of a folder. The wait cannot be cancelled, as before: a request of curl
+cannot be stopped from outside. The copy changes only the MIME type and,
+for an MMS stream, the dynamic path, and both are taken back, so what is
+asked and what is done with the answer (the inputstream, the flags of the
+file, the player) are the same. Where no server is asked, and on any other
+thread, FillInMimeType() runs where it did.
+
+What the nested loop of the wait processes is what it processes while a
+plugin resolves: a request to play or stop that comes in those seconds is
+handled during the wait, not after it. One line in the log says how long
+the server took and what it answered.
+---
+ xbmc/application/ApplicationPlay.cpp | 73 +++++++++++++++++++++++++++-
+ 1 file changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/application/ApplicationPlay.cpp b/xbmc/application/ApplicationPlay.cpp
+index 3ffbab6..58a10f2 100644
+--- a/xbmc/application/ApplicationPlay.cpp
++++ b/xbmc/application/ApplicationPlay.cpp
+@@ -15,8 +15,10 @@
+ #include "Util.h"
+ #include "cores/AudioEngine/Interfaces/AE.h"
+ #include "cores/playercorefactory/PlayerCoreFactory.h"
++#include "dialogs/GUIDialogBusy.h"
+ #include "filesystem/DirectoryFactory.h"
+ #include "filesystem/DiscDirectoryHelper.h"
++#include "messaging/ApplicationMessenger.h"
+ #include "music/MusicFileItemClassify.h"
+ #include "playlists/PlayList.h"
+ #include "playlists/PlayListFileItemClassify.h"
+@@ -25,6 +27,7 @@
+ #include "settings/MediaSettings.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
++#include "threads/IRunnable.h"
+ #include "utils/DiscsUtils.h"
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
+@@ -33,6 +36,7 @@
+ #include "video/VideoFileItemClassify.h"
+ #include "video/VideoInfoTag.h"
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
+@@ -327,6 +331,72 @@ void CApplicationPlay::DetermineFullScreen()
+     m_options.fullscreen = ShouldGoFullScreen(VIDEO);
+ }
+ 
++namespace
++{
++//! Asks the server of an internet stream for the MIME type of an item, on a thread of its own
++//! (Hades: see FillInMimeTypeKeepingGuiAlive())
++class CMimeTypeLookup : public IRunnable
++{
++public:
++  explicit CMimeTypeLookup(const CFileItem& item) : m_item(item) {}
++  void Run() override { m_item.FillInMimeType(true); }
++  //! (read only after Run() has returned)
++  const CFileItem& Item() const { return m_item; }
++
++private:
++  CFileItem m_item;
++};
++
++/*!
++ * \brief CFileItem::FillInMimeType(), with the thread of the interface going on while a server is
++ * asked (Hades)
++ *
++ * For an http(s) or shout path without a MIME type, FillInMimeType() asks the server
++ * (CCurlFile::Stat(): a HEAD request, a GET where HEAD is refused), which takes as long as the
++ * server takes to answer: 3 to 7 s for the resolver of a Debrid service in the tests on hardware,
++ * up to curl's timeouts (30 s each). Asked on the thread of the interface, that was the interface
++ * and its pointer frozen for all that time ("a pass of the main loop took 3200 to 6700 ms", with
++ * CCurlFile::Stat() on the stack of that thread, at every start of such a stream).
++ *
++ * The same request is made here on a thread of its own, and the thread of the interface waits for
++ * it as Kodi waits for a plugin that resolves the path of the item in this same function
++ * (ResolvePath(), CScriptRunner::WaitOnScriptResult()) and for the listing of a folder
++ * (CGUIMediaWindow::GetDirectory()): drawing and taking input, with the busy dialog after 100 ms.
++ * It cannot be cancelled (a request of curl cannot be stopped from outside), as before. What is
++ * asked and what is done with the answer are the same: the copy of the item that asks changes only
++ * the MIME type and, for an MMS stream, the dynamic path, and both are taken back.
++ *
++ * Where no server is asked (any other path, an item that has a MIME type, a folder, a PVR channel)
++ * or on any other thread, FillInMimeType() runs where it did.
++ */
++void FillInMimeTypeKeepingGuiAlive(CFileItem& item)
++{
++  CFileItem withoutAsking{item};
++  withoutAsking.FillInMimeType(false);
++  if (!withoutAsking.GetMimeType().empty() ||
++      !CServiceBroker::GetAppMessenger()->IsProcessThread())
++  {
++    item.FillInMimeType();
++    return;
++  }
++
++  const auto start = std::chrono::steady_clock::now();
++  CMimeTypeLookup lookup{item};
++  CGUIDialogBusy::Wait(&lookup, 100, false);
++  item.SetMimeType(lookup.Item().GetMimeType());
++  if (lookup.Item().GetDynPath() != item.GetDynPath())
++    item.SetDynPath(lookup.Item().GetDynPath());
++
++  CLog::Log(LOGINFO,
++            "CApplicationPlay: the server of the stream gave its type ({}) in {} ms, the interface "
++            "going on meanwhile",
++            item.GetMimeType(),
++            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
++                                                                  start)
++                .count());
++}
++} // namespace
++
+ CApplicationPlay::GatherPlaybackDetailsResult CApplicationPlay::GatherPlaybackDetails(
+     const CFileItem& item, std::string player, bool restart)
+ {
+@@ -349,8 +419,9 @@ CApplicationPlay::GatherPlaybackDetailsResult CApplicationPlay::GatherPlaybackDe
+   }
+ 
+   // Ensure the MIME type has been retrieved for http:// and shout:// streams
++  // (Hades: the interface goes on while the server is asked)
+   if (m_item.GetMimeType().empty())
+-    m_item.FillInMimeType();
++    FillInMimeTypeKeepingGuiAlive(m_item);
+ 
+   if (VIDEO::IsDiscStub(m_item))
+     return GatherPlaybackDetailsResult::RESULT_SUCCESS; // all done
+-- 
+2.53.0
+

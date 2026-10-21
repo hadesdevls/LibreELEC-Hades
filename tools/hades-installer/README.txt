@@ -72,14 +72,21 @@ If something does not work: diagnostics
      Windows shows it as DIAG-OFF, without the ending, name it DIAG-ON: the ending stays as it is.)
   2. Start Hades, do what does not work, wait five minutes, and turn the PC off from its menu.
   3. Back in Windows, a USB drive has the folder hades-diag on LIBREELEC. With Hades on an internal disk,
-     Windows does not show that part: in Hades, plug in a USB stick and copy the folder to it with its
-     file manager (Settings, File manager, Add source, Root filesystem, flash, hades-diag).
+     Windows does not show that part. Get the folder onto a USB stick (one that Windows reads: FAT32,
+     exFAT or NTFS) in one of two ways:
+       - in Hades: LibreELEC settings, System, "Copy the diagnostics to a USB drive", and choose the stick;
+       - with nothing on the screen (when the TV stays dark): make a folder named hades-diag at the top of
+         the stick in Windows, plug the stick into the PC while Hades is running, wait a minute, and pull
+         it out. Hades copies its folder into that one, in a folder named after the date and time.
+     Either way the copy is checked file by file, and nothing is overwritten on the stick.
   Each start of the PC has its own folder in there (start-1, start-2, and so on; the last eight are
   kept), so one drive can be taken to several PCs. A note in that folder (README.txt) says what each part
   is and what of it is personal. Read it before you give the folder to anyone.
   To turn it off: put OFF back in the name of the file, or update with the box unticked (for a drive
   that has the diagnostics on, the installer shows the box ticked, so that an update keeps them). Updating
-  replaces the part of the drive where the folder is: copy the folder first if you want to keep it.
+  replaces the part of the drive where the folder is, and the installer keeps the folder: it copies it
+  into the new part, checks it file by file, and says at the end what it kept (and what not, if anything
+  could not be kept).
 
 If the TV stays dark (a laptop, or a PC with two graphics cards)
   Hades shows itself on one screen: the TV on HDMI when it sees one, else a monitor, else the screen of a

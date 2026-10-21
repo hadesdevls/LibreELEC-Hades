@@ -1,0 +1,736 @@
+From 80d7cd123454a7ba50709db2e6949421c9f7469d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:36:32 +0000
+Subject: [PATCH] tools/dvbridge: make the picture that Kodi draws over only
+ where the drawing reaches
+
+A frame of native Dolby Vision with something drawn over it (the GUI, text
+subtitles) is composed: in the source transport, the transport is decoded
+into a 3840x2160 RGBA32F picture (pass 3), Kodi blends its GUI over that,
+and the packer reads that picture for every pixel to tell where something
+was drawn (its alpha is not 2) and converts those back (pass 4). Where
+nothing is drawn, the packer takes the codes of the transport and nothing
+of that picture. So for two lines of subtitles the frame wrote and read
+the whole 132 MB picture, twice: on the integrated Radeon of a Ryzen 9
+7950X3D, a frame with GUI elements took 24 to 31 ms of GPU time where the
+same frame drawn directly takes 13.4.
+
+Now, where the caller says before the frame what will be drawn over it,
+and that is a GUI texture composited over the whole raster as Kodi's
+CompositeGui() composites it (dvbridge_render_set_drawn(),
+dvbridge_source_drawn()), the packer first finds the tiles of 16 x 16
+pixels of the raster that it may reach: the tiles of the GUI texture with
+an alpha above 0 (pass 6, in two draws of 4 x 4 texels each), and the
+raster tiles whose pixels sample those texels with the composite's
+bilinear filter, its rows the other way up, four texels more on every side
+(pass 7: medium-precision texture coordinates are off by up to a texel at
+3840). Pass 3 then draws only those tiles, and pass 4 draws every tile,
+each knowing from its vertices whether something may be drawn over it,
+and reads the picture only there. Both are a quad for each tile with the
+same fragment shaders as before; a tile not drawn has no fragments (no
+discard and no lookup for each pixel, which cost more than they saved).
+Outside those tiles nothing is drawn over the picture, and pass 4 takes the
+codes of the transport, as it did where it read an alpha of 2: the same
+bytes, whatever the texture holds there from frames before. The measurement
+of what is drawn over the bars (pass 5) reads only those tiles too.
+Anything else that is to be drawn over the picture, or read from it,
+asks for the rest of it first (dvbridge_render_complete(): pass 3 for the
+other tiles). What draws over it without that is not shown (pass 4 reads
+nothing there), never as garbage. Without what will be drawn (0, the
+converted transport, a renderer for HDR10, the reference of a check, the
+warm-up), and where passes 6 and 7 cannot be made, everything is as before:
+the triangle over the whole raster.
+
+Measured with cover_test.c, the frames of a profile 7 FEL stream with Kodi's
+own composite (its shaders from the tree, its LUTs, projection and blend
+factors) over them, from GUI textures of 3840x2160, 1920x1080, 2560x1440
+and 1280x720 with nine drawings (empty, a window over a dimmed screen, an
+OSD, two lines of subtitles, a seek bar, text, the faintest opacity in a
+corner and over everything, random texels) and single texels at the
+boundaries of the tiles, the picture's texture filled with something else
+before each frame:
+- on Mesa's software OpenGL ES (zink on lavapipe), and on the integrated
+  Radeon and the RTX 4080 SUPER of a test PC through Mesa's OpenGL on
+  Direct3D 12 in WSL: the bytes of every frame (106 for each GPU and
+  picture) are those it has as before, also with PQ subtitles drawn
+  anywhere after the picture is made whole; the picture made whole is the
+  whole picture, to the bit;
+- eight mutations each make it fail (no margin, the picture read in every
+  tile, the tiles drawn the other way round, the rows of the GUI not
+  reversed, a faint alpha not counted, the measurement of the bars over
+  every tile, the rest made in the tiles, the quads one tile off);
+- the time of a frame with GUI elements over the video (cover_test
+  guitime: the frame as Kodi draws it, the GPU's work to its end, nothing
+  read back; medians of 9), 1.0 RC2 against this commit (with the
+  measurement of the bars block by block before it), the way that waits
+  (the edges measured) / a frame ahead (every edge with bars). On the
+  integrated Radeon through Direct3D 12: two lines of subtitles 29.8/24.2
+  ms before, 17.9/16.4 now; the seek bar 30.5/24.2, 18.2/16.4; an empty
+  GUI 29.7/24.0, 16.9/16.1; an OSD 42.6/25.9, 31.0/21.6; a window over a
+  dimmed screen 62.2/38.3, 49.6/38.5 (the frame drawn directly: 13.2). On
+  the RTX 4080 SUPER: 1.5 to 9.3 / 0.9 to 1.5 before, 1.2 to 2.2 / 0.8
+  to 1.6 now (directly: 0.8). On lavapipe, where a quad for each tile
+  costs more than one triangle: 70.9 to 185.3 / 53.7 to 75.6 before, 59.2
+  to 91.3 / 57.0 to 89.3 now (directly: 38.4).
+
+Not verified: the times with the drivers that LibreELEC runs (radeonsi,
+i915, nvidia-drm), and the frames on a display.
+---
+ tools/dvbridge/dvbridge_render.c |  55 ++++-
+ tools/dvbridge/dvbridge_render.h |  13 ++
+ tools/dvbridge/dvbridge_source.c | 335 ++++++++++++++++++++++++++++---
+ tools/dvbridge/dvbridge_source.h |  23 ++-
+ 4 files changed, 401 insertions(+), 25 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index b7b8ee7..99fbe22 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -74,6 +74,9 @@ struct dvbridge_renderer {
+     struct dvbridge_geometry geometry; /* of the last picture prepared */
+     /* Hades: the target that wraps the window (dvbridge_render_set_window()), or NULL */
+     pl_tex window;
++    /* Hades: what will be drawn over the next composed picture (dvbridge_render_set_drawn()) */
++    unsigned drawn_gui;
++    int drawn_w, drawn_h;
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -676,6 +679,9 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         ok = ok && source_pack(r, 0, fbo, flip);
+     } else if (ok) {
+         pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, &fbo);
++        /* Hades: in the tiles that what will be drawn over it may reach, where the caller said what
++         * that is (dvbridge_render_set_drawn()) */
++        dvbridge_source_drawn(r->source_packer, r->drawn_gui, r->drawn_w, r->drawn_h);
+         ok = fbo && dvbridge_source_picture(r->source_packer, &r->source_params, luma,
+                                             geometry.source_width, geometry.source_height,
+                                             geometry.x, geometry.y, margins, fbo);
+@@ -704,6 +710,9 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     r->packed = packed != NULL;
+     dvbridge_candidate_destroy(r->pending);
+     r->pending = NULL;
++    /* Hades: the picture that a composed render of the source transport made in the tiles of what
++     * was drawn over it is another frame's */
++    dvbridge_source_forget(r->source_packer);
+     if (!source || !isfinite(pts) || source->num_planes < 1 || source->num_planes > 4 || source->rotation ||
+         source->crop.x0 != 0 || source->crop.y0 != 0 ||
+         source->crop.x1 != geometry.source_width || source->crop.y1 != geometry.source_height)
+@@ -903,6 +912,9 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     save_gl_state(&state);
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+     restore_gl_state(&state);
++    /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
++    if (r)
++        r->drawn_gui = 0;
+     return ok;
+ }
+ 
+@@ -910,8 +922,12 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+                            const void *metadata, size_t bytes, double pts, double el_pts,
+                            struct dvbridge_geometry geometry, pl_tex target, bool flip)
+ {
+-    if (r)
++    if (r) {
+         r->ready = false;
++        /* (Hades: nothing is drawn over a frame drawn directly; a frame that is composed after
++         * this one was refused is told again) */
++        r->drawn_gui = 0;
++    }
+     /* (Hades: the converted transport's direct way also needs quad operations and a picture that
+      * fills the raster, which render() checks: the source transport packs a picture drawn at its own
+      * size anywhere, without them) */
+@@ -1328,10 +1344,17 @@ struct kept_state {
+     bool source;
+     const char *source_why;
+     struct dvbridge_geometry geometry;
++    unsigned drawn_gui;
++    int drawn_w, drawn_h;
+ };
+ 
+ static void keep_state(struct dvbridge_renderer *r, struct kept_state *k)
+ {
++    /* Hades: (what is to be drawn over the next frame is not drawn over these) */
++    k->drawn_gui = r->drawn_gui;
++    k->drawn_w = r->drawn_w;
++    k->drawn_h = r->drawn_h;
++    r->drawn_gui = 0;
+     k->pending = r->pending;
+     r->pending = NULL;
+     k->ready = r->ready;
+@@ -1372,6 +1395,11 @@ static void give_back_state(struct dvbridge_renderer *r, const struct kept_state
+     r->source = k->source;
+     r->source_why = k->source_why;
+     r->geometry = k->geometry;
++    r->drawn_gui = k->drawn_gui;
++    r->drawn_w = k->drawn_w;
++    r->drawn_h = k->drawn_h;
++    /* (the picture that these made is not the frames') */
++    dvbridge_source_forget(r->source_packer);
+     /* the picture was drawn into: what is outside the place of the next one is not known to be
+      * black (it is cleared then, which writes the same bytes) */
+     r->rgb_clean = false;
+@@ -1508,6 +1536,31 @@ void dvbridge_render_set_window(struct dvbridge_renderer *r, pl_tex window)
+         r->window = window;
+ }
+ 
++void dvbridge_render_set_drawn(struct dvbridge_renderer *r, unsigned gui, int width, int height)
++{
++    if (!r)
++        return;
++    r->drawn_gui = gui;
++    r->drawn_w = width;
++    r->drawn_h = height;
++}
++
++bool dvbridge_render_complete(struct dvbridge_renderer *r)
++{
++    /* only the composed way of the source transport makes its picture in tiles */
++    if (!r || !r->ready || r->packed || !r->source || !r->source_packer)
++        return true;
++    unsigned margins[4], fbo = 0;
++    if (!r->pending || !dvbridge_active_area(r->pending, margins))
++        return false;
++    pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, &fbo);
++    const unsigned luma = pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL);
++    return fbo && luma &&
++           dvbridge_source_complete(r->source_packer, &r->source_params, luma,
++                                    r->geometry.source_width, r->geometry.source_height,
++                                    r->geometry.x, r->geometry.y, margins, fbo);
++}
++
+ bool dvbridge_render_source(const struct dvbridge_renderer *r, const char **why)
+ {
+     if (why)
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 34f5737..a1f6457 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -236,6 +236,19 @@ bool dvbridge_render_source_planes(const struct dvbridge_renderer *renderer, uns
+  * or destroyed (another object may take its address). */
+ #define DVBRIDGE_RENDER_WINDOW 1
+ void dvbridge_render_set_window(struct dvbridge_renderer *renderer, pl_tex window);
++/* Hades: what will be drawn over the picture of the next dvbridge_render_rgb(), where it is known
++ * before: the GL texture gui (width x height) composited over it as Kodi composites its GUI
++ * (dvbridge_source_drawn()), and nothing else. The composed way of the source transport then makes
++ * the picture that Kodi draws over only where that may reach, and packs the frame reading it there
++ * only (the same bytes: nothing is drawn over it elsewhere). 0: not known, the whole picture, as
++ * without it. For that frame only. Anything else that is to be drawn over the picture (subtitles
++ * drawn into it, a capture that reads it) asks for the rest of it first: dvbridge_render_complete(). */
++#define DVBRIDGE_RENDER_DRAWN 1
++void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui, int width,
++                               int height);
++/* Hades: the picture of the last dvbridge_render_rgb() whole, if it was made in tiles; false where
++ * that could not be done (the picture is then whole only in those tiles) */
++bool dvbridge_render_complete(struct dvbridge_renderer *renderer);
+ /* Whether dvbridge_render_packed() may draw a picture of this geometry: full raster, or, with the
+  * source transport, a picture drawn at its own size anywhere */
+ bool dvbridge_render_direct_fits(const struct dvbridge_renderer *renderer,
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 7124a90..3f241af 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -179,7 +179,24 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+  *  4. the transport: per pixel its luma, the chroma of its pair, the metadata bit
+  *     (dvbridge_source_pack()).
+  * The planes hold h / 2^bits, and passes 1, 2 and the pixels of 4 that nothing was drawn over are
+- * integer arithmetic: they get the same bytes on any GPU. */
++ * integer arithmetic: they get the same bytes on any GPU.
++ * Hades: where what is drawn over the picture is known before it is drawn (Kodi's GUI, composited
++ * from a texture: dvbridge_source_drawn()), the tiles of the raster (DRAWN_TILE x DRAWN_TILE
++ * pixels) that it may reach are found first (passes 6 and 7), and passes 3 and 4 read and write the
++ * picture that Kodi draws over in those tiles only: everywhere else nothing is drawn over the
++ * picture, and pass 4 takes the codes of the transport there, as it did where it read an alpha of
++ * 2. What else is drawn over it (PQ subtitles, a capture) asks for the rest of that picture first
++ * (dvbridge_source_complete()). */
++#define DRAWN_TILE 16
++#define DRAWN_COLUMNS ((3840 + DRAWN_TILE - 1) / DRAWN_TILE)
++#define DRAWN_ROWS ((2160 + DRAWN_TILE - 1) / DRAWN_TILE)
++#define DRAWN_STRING2(x) #x
++#define DRAWN_STRING(x) DRAWN_STRING2(x)
++/* the GUI texels beyond those that a sample of the composite reads (its bilinear footprint), on
++ * every side, that a tile takes as reachable: for the precision of the interpolated coordinates of
++ * a shader that may run at medium precision (half a step of a 16-bit float at 1 is 0.94 texels of a
++ * 3840 texel wide GUI) */
++#define DRAWN_MARGIN 4
+ 
+ static const char VERTEX[] =
+     "#version 300 es\n"
+@@ -325,7 +342,46 @@ static const char ROWS[] =
+     "    return inside(p.x, p.y) ? clamp(decode(codes_at(p)), 0.0, 1.0) : vec3(0.0);\n"           \
+     "}\n"
+ 
+-/* 3. The picture that Kodi draws over. */
++/* Hades: the vertices of passes 3 and 4: the triangle over the whole raster, as for the other passes
++ * (tiles_mode 0), or a quad for each tile of the raster (DRAWN_TILE x DRAWN_TILE pixels), whose flag
++ * (pass 7: something may be drawn over it) the vertices read and hand on to its fragments: 1 the
++ * tiles with the flag only, 2 those without it only, 3 all of them. A tile that is not drawn has its
++ * vertices outside the clip volume: it has no fragments. The quads meet at the edges of the pixels,
++ * so every pixel of a tile drawn is drawn once. tiles_flip: the rows of the framebuffer are those of
++ * the raster the other way up (a window). */
++static const char TILED_VERTEX[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D drawn_tiles;\n"
++    "uniform int tiles_mode;\n"
++    "uniform int tiles_flip;\n"
++    "flat out int tile_drawn;\n"
++    "const int corner_x[6] = int[6](0, 1, 0, 0, 1, 1);\n"
++    "const int corner_y[6] = int[6](0, 0, 1, 1, 0, 1);\n"
++    "void main()\n"
++    "{\n"
++    "    if (tiles_mode == 0) {\n"
++    "        vec2 position = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
++    "        gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);\n"
++    "        tile_drawn = 1;\n"
++    "        return;\n"
++    "    }\n"
++    "    int quad = gl_VertexID / 6, corner = gl_VertexID - quad * 6;\n"
++    "    ivec2 t = ivec2(quad % " DRAWN_STRING(DRAWN_COLUMNS) ", quad / " DRAWN_STRING(DRAWN_COLUMNS) ");\n"
++    "    tile_drawn = texelFetch(drawn_tiles, t, 0).r > 0.5 ? 1 : 0;\n"
++    "    if ((tiles_mode == 1 && tile_drawn == 0) || (tiles_mode == 2 && tile_drawn != 0)) {\n"
++    "        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
++    "        return;\n"
++    "    }\n"
++    "    ivec2 a = t * " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    ivec2 b = min(a + " DRAWN_STRING(DRAWN_TILE) ", ivec2(3840, 2160));\n"
++    "    ivec2 q = ivec2(corner_x[corner] != 0 ? b.x : a.x, corner_y[corner] != 0 ? b.y : a.y);\n"
++    "    float y = tiles_flip != 0 ? float(2160 - q.y) : float(q.y);\n"
++    "    gl_Position = vec4(float(q.x) / 1920.0 - 1.0, y / 1080.0 - 1.0, 0.0, 1.0);\n"
++    "}\n";
++
++/* 3. The picture that Kodi draws over (Hades: over the whole raster, or the tiles asked for). */
+ static const char PICTURE[] =
+     "#version 300 es\n"
+     COMMON
+@@ -345,6 +401,7 @@ static const char PACK[] =
+     "uniform uvec4 metadata_words[128];\n"
+     "uniform uint packet_count;\n"
+     "uniform uint flip_y;\n"
++    "flat in int tile_drawn;\n" /* Hades: (TILED_VERTEX) something may be drawn over this tile */
+     "out vec4 color;\n"
+     "uint parity(uint v)\n"
+     "{\n"
+@@ -390,7 +447,9 @@ static const char PACK[] =
+     "    int ex = p.x & ~1;\n"
+     "    bool odd = (p.x & 1) != 0;\n"
+     "    vec4 own = vec4(0.0, 0.0, 0.0, 2.0), even = own;\n"
+-    "    if (has_layer != 0) {\n"
++    /* (Hades: outside the tiles that what is drawn over may reach, nothing is drawn over the
++     * picture; a pair is in the tile of its even pixel) */
++    "    if (has_layer != 0 && tile_drawn != 0) {\n"
+     "        own = texelFetch(drawn, p, 0);\n"
+     "        even = odd ? texelFetch(drawn, ivec2(ex, p.y), 0) : own;\n"
+     "    }\n"
+@@ -425,23 +484,28 @@ static const char PACK[] =
+  * OSD that spans the width), 2.1 million of them, which took about 40 ms of the 41.7 ms of a film
+  * refresh on a Radeon RX 7600 (issue 3), and made the frames that are not presented a frame ahead late:
+  * the GPU time that called for that, and those frames, measured nothing. The edges are the same. */
+-#define COVER_BLOCK 16
+-#define COVER_COLUMNS ((3840 + COVER_BLOCK - 1) / COVER_BLOCK)
+-#define COVER_ROWS ((2160 + COVER_BLOCK - 1) / COVER_BLOCK)
+-#define COVER_STRING2(x) #x
+-#define COVER_STRING(x) COVER_STRING2(x)
++/* Hades: the blocks are the tiles of what is drawn over (DRAWN_TILE): where those are known, a block
++ * outside them has nothing drawn over it */
++#define COVER_BLOCK DRAWN_TILE
++#define COVER_COLUMNS DRAWN_COLUMNS
++#define COVER_ROWS DRAWN_ROWS
++#define COVER_STRING(x) DRAWN_STRING(x)
+ static const char COVER[] =
+     "#version 300 es\n"
+     "precision highp float;\n"
+     "precision highp int;\n"
+     "uniform highp sampler2D drawn;\n"
+     "uniform ivec4 active_rect;\n" /* x0, y0, x1, y1 */
++    "uniform highp sampler2D drawn_tiles;\n"
++    "uniform int tiles_mode;\n"
+     "out vec4 color;\n"
+     "void main()\n"
+     "{\n"
+     "    ivec2 b0 = ivec2(gl_FragCoord.xy) * " COVER_STRING(COVER_BLOCK) ";\n"
+     "    ivec2 b1 = min(b0 + " COVER_STRING(COVER_BLOCK) ", ivec2(3840, 2160));\n"
+     "    vec4 edges = vec4(0.0);\n"
++    "    if (tiles_mode != 0 && texelFetch(drawn_tiles, ivec2(gl_FragCoord.xy), 0).r < 0.5)\n"
++    "        b1.y = b0.y;\n"
+     "    for (int y = b0.y; y < b1.y; ++y) {\n"
+     /* a row of the bars: the block's columns; a row of the active picture: those left of it and those
+      * right of it */
+@@ -460,6 +524,70 @@ static const char COVER[] =
+     "    color = edges;\n"
+     "}\n";
+ 
++/* Hades: 6. The tiles of the GUI texture (DRAWN_TILE x DRAWN_TILE texels of it) that hold anything
++ * drawn (an alpha above 0), in two draws that each take 4 x 4 texels of what they read for a
++ * fragment: from the GUI texture (its alpha) to a quarter of its size, and from that (its red) to
++ * the tiles. (One fragment for each tile, reading its 256 texels one after the other, took about 10
++ * ms on an integrated Radeon.) A texel beyond the texture read is the last one of its row or column,
++ * which is in the same 4 x 4. */
++_Static_assert(DRAWN_TILE == 16, "pass 6 takes 4 x 4 twice");
++static const char GUI_TILES[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui;\n"
++    "uniform ivec2 gui_size;\n" /* of the texture read */
++    "uniform int from_alpha;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 b0 = ivec2(gl_FragCoord.xy) * 4;\n"
++    "    ivec2 last = gui_size - 1;\n"
++    "    float most = 0.0;\n"
++    "    for (int y = 0; y < 4; ++y)\n"
++    "        for (int x = 0; x < 4; ++x) {\n"
++    "            vec4 t = texelFetch(gui, min(b0 + ivec2(x, y), last), 0);\n"
++    "            most = max(most, from_alpha != 0 ? t.a : t.r);\n"
++    "        }\n"
++    "    color = vec4(most > 0.0 ? 1.0 : 0.0);\n"
++    "}\n";
++
++/* Hades: 7. The tiles of the raster that the composite of that texture may draw on, one fragment
++ * for each. The composite (Kodi's CompositeGui()) draws the whole texture over the whole raster, the
++ * texture's rows the other way up (its last row on the first of the raster), sampling it with its
++ * bilinear filter clamped to its edges: a raster pixel x, y takes the texels around
++ * ((x + 0.5) w / 3840 - 0.5, h - 0.5 - (y + 0.5) h / 2160), and is drawn on only where one of them
++ * has an alpha above 0. A tile takes the texels around those of all its pixels, DRAWN_MARGIN more on
++ * every side, and is reachable where a tile of pass 6 among them holds anything drawn. */
++static const char DRAWN[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui_tiles;\n"
++    "uniform ivec2 gui_size;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 t = ivec2(gl_FragCoord.xy);\n"
++    "    vec2 scale = vec2(gui_size) / vec2(3840.0, 2160.0);\n"
++    "    float x0 = float(t.x * " DRAWN_STRING(DRAWN_TILE) ") + 0.5;\n"
++    "    float x1 = float(min(t.x * " DRAWN_STRING(DRAWN_TILE) " + " DRAWN_STRING(DRAWN_TILE) ", 3840) - 1) + 0.5;\n"
++    "    float y0 = float(t.y * " DRAWN_STRING(DRAWN_TILE) ") + 0.5;\n"
++    "    float y1 = float(min(t.y * " DRAWN_STRING(DRAWN_TILE) " + " DRAWN_STRING(DRAWN_TILE) ", 2160) - 1) + 0.5;\n"
++    "    int c0 = int(floor(x0 * scale.x - 0.5)) - " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int c1 = int(floor(x1 * scale.x - 0.5)) + 1 + " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int r0 = int(floor(float(gui_size.y) - 0.5 - y1 * scale.y)) - " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int r1 = int(floor(float(gui_size.y) - 0.5 - y0 * scale.y)) + 1 + " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    ivec2 last = gui_size - 1;\n"
++    "    ivec2 g0 = clamp(ivec2(c0, r0), ivec2(0), last) / " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    ivec2 g1 = clamp(ivec2(c1, r1), ivec2(0), last) / " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    float drawn = 0.0;\n"
++    "    for (int y = g0.y; y <= g1.y; ++y)\n"
++    "        for (int x = g0.x; x <= g1.x; ++x)\n"
++    "            drawn = max(drawn, texelFetch(gui_tiles, ivec2(x, y), 0).r);\n"
++    "    color = vec4(drawn);\n"
++    "}\n";
++
+ struct texture {
+     GLuint texture, framebuffer;
+     int w, h;
+@@ -480,6 +608,18 @@ struct dvbridge_source_packer {
+     GLint cover_drawn, cover_active;
+     /* Hades: the texels of the edges that dvbridge_source_cover() reads back */
+     uint8_t cover_read[COVER_COLUMNS * COVER_ROWS * 4];
++    /* Hades: what is drawn over (passes 6 and 7: dvbridge_source_drawn()). gui: the texture that the
++     * next picture will have composited over it, and its size (0: not known). tiles holds the tiles
++     * that it may reach, and tiles_mode says how passes 3, 4 and 5 take them: 0 not at all, 1 the
++     * picture is in those tiles only (and nothing is drawn over it elsewhere). */
++    GLuint gui_tiles_program, drawn_program;
++    GLint gt_gui, gt_size, gt_alpha, dr_tiles, dr_size;
++    GLint pc_tiles, pc_mode, cc_tiles, cc_mode, cv_tiles, cv_mode, pc_flip, cc_flip;
++    struct texture gui_quarter, gui_tiles, tiles;
++    bool drawn_usable; /* passes 6 and 7 were made */
++    unsigned gui;
++    int gui_w, gui_h;
++    int tiles_mode;
+     /* what the rows of `chroma` are of (dvbridge_source_rows()) */
+     bool rows_made;
+     int rows_of[8], rows_half;
+@@ -568,15 +708,39 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     _Static_assert(sizeof(p->u) == COUNT(pack) * sizeof(GLint), "pack uniforms");
+     _Static_assert(sizeof(p->h) == COUNT(resite) * sizeof(GLint), "resite uniforms");
+     _Static_assert(sizeof(p->v) == COUNT(rows) * sizeof(GLint), "rows uniforms");
+-    p->pack = link(PACK);
+-    p->picture = link(PICTURE);
++    /* (Hades: passes 3 and 4 over the raster or over its tiles) */
++    p->pack = link_with(TILED_VERTEX, PACK);
++    p->picture = link_with(TILED_VERTEX, PICTURE);
+     p->resite = link(RESITE);
+     p->rows = link(ROWS);
+     p->cover = link(COVER);
+     p->cover_drawn = p->cover ? glGetUniformLocation(p->cover, "drawn") : -1;
+     p->cover_active = p->cover ? glGetUniformLocation(p->cover, "active_rect") : -1;
++    /* Hades: passes 6 and 7, and how 3, 4 and 5 take their tiles */
++    p->gui_tiles_program = link(GUI_TILES);
++    p->drawn_program = link(DRAWN);
++    GLint *const slots[][2] = {{&p->pc_tiles, &p->pc_mode}, {&p->cc_tiles, &p->cc_mode},
++                               {&p->cv_tiles, &p->cv_mode}};
++    const GLuint with_tiles[] = {p->pack, p->picture, p->cover};
++    bool found = true;
++    for (unsigned i = 0; i < COUNT(with_tiles); ++i) {
++        *slots[i][0] = with_tiles[i] ? glGetUniformLocation(with_tiles[i], "drawn_tiles") : -1;
++        *slots[i][1] = with_tiles[i] ? glGetUniformLocation(with_tiles[i], "tiles_mode") : -1;
++        found = found && *slots[i][0] >= 0 && *slots[i][1] >= 0;
++    }
++    p->pc_flip = p->pack ? glGetUniformLocation(p->pack, "tiles_flip") : -1;
++    p->cc_flip = p->picture ? glGetUniformLocation(p->picture, "tiles_flip") : -1;
++    found = found && p->pc_flip >= 0 && p->cc_flip >= 0;
++    /* (without passes 6 and 7 what is drawn over is not known: the whole picture, as before) */
++    p->gt_gui = p->gui_tiles_program ? glGetUniformLocation(p->gui_tiles_program, "gui") : -1;
++    p->gt_size = p->gui_tiles_program ? glGetUniformLocation(p->gui_tiles_program, "gui_size") : -1;
++    p->gt_alpha = p->gui_tiles_program ? glGetUniformLocation(p->gui_tiles_program, "from_alpha") : -1;
++    p->dr_tiles = p->drawn_program ? glGetUniformLocation(p->drawn_program, "gui_tiles") : -1;
++    p->dr_size = p->drawn_program ? glGetUniformLocation(p->drawn_program, "gui_size") : -1;
++    p->drawn_usable = p->gt_gui >= 0 && p->gt_size >= 0 && p->gt_alpha >= 0 && p->dr_tiles >= 0 &&
++                      p->dr_size >= 0;
+     if (!p->pack || !p->picture || !p->resite || !p->rows || !p->cover || p->cover_drawn < 0 ||
+-        p->cover_active < 0 ||
++        p->cover_active < 0 || !found ||
+         !locate(p->pack, &p->pc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
+         !locate(p->picture, &p->cc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
+         !locate(p->pack, &p->u.drawn, pack, COUNT(pack)) ||
+@@ -610,6 +774,9 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->resited);
+     texture_destroy(&p->chroma);
+     texture_destroy(&p->edges);
++    texture_destroy(&p->gui_quarter);
++    texture_destroy(&p->gui_tiles);
++    texture_destroy(&p->tiles);
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+     glDeleteProgram(p->pack);
+@@ -617,6 +784,8 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteProgram(p->resite);
+     glDeleteProgram(p->rows);
+     glDeleteProgram(p->cover);
++    glDeleteProgram(p->gui_tiles_program);
++    glDeleteProgram(p->drawn_program);
+     free(p);
+ }
+ 
+@@ -785,16 +954,79 @@ static void set_common(struct dvbridge_source_packer *p, const struct common_uni
+     glUniform1i(u->affine, params->affine);
+ }
+ 
+-bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+-                             const struct dvbridge_source_params *params, unsigned luma, int width,
+-                             int height, int x, int y, const unsigned margins[4],
+-                             unsigned framebuffer)
++/* Hades: the tiles of what is drawn over, on unit 3, and how a pass takes them (tiles_mode) */
++static void set_tiles(struct dvbridge_source_packer *p, GLint tiles, GLint mode, int how)
+ {
+-    if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
+-        !rows_of(p, width, height, x, y, margins))
++    bind(p, 3, how ? p->tiles.texture : 0);
++    glUniform1i(tiles, 3);
++    glUniform1i(mode, how);
++}
++
++/* Hades: the vertices that passes 3 and 4 draw (TILED_VERTEX): the triangle over the raster, or
++ * a quad for each tile */
++static GLsizei tiled_vertices(int how)
++{
++    return how ? 6 * DRAWN_COLUMNS * DRAWN_ROWS : 3;
++}
++
++void dvbridge_source_drawn(struct dvbridge_source_packer *p, unsigned gui, int width, int height)
++{
++    if (!p)
++        return;
++    const bool known = gui && width > 0 && height > 0 && width <= 16384 && height <= 16384;
++    p->gui = known ? gui : 0;
++    p->gui_w = known ? width : 0;
++    p->gui_h = known ? height : 0;
++}
++
++void dvbridge_source_forget(struct dvbridge_source_packer *p)
++{
++    if (!p)
++        return;
++    p->gui = 0;
++    p->tiles_mode = 0;
++}
++
++/* Hades: passes 6 and 7, for the texture that dvbridge_source_drawn() gave: false where they could
++ * not be made (then what is drawn over is not known) */
++static bool make_tiles(struct dvbridge_source_packer *p)
++{
++    if (!p->drawn_usable || !p->gui)
+         return false;
+-    struct dvbridge_gl_state state;
+-    begin(p, &state);
++    /* the GUI texture to a quarter of its size, and that to its tiles (ceil(ceil(n / 4) / 4) is
++     * ceil(n / 16)) */
++    const int qw = (p->gui_w + 3) / 4, qh = (p->gui_h + 3) / 4;
++    const int gw = (qw + 3) / 4, gh = (qh + 3) / 4;
++    if (!target(&p->gui_quarter, GL_R8, qw, qh))
++        return false;
++    glUseProgram(p->gui_tiles_program);
++    bind(p, 0, p->gui);
++    glUniform1i(p->gt_gui, 0);
++    glUniform2i(p->gt_size, p->gui_w, p->gui_h);
++    glUniform1i(p->gt_alpha, 1);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    if (!target(&p->gui_tiles, GL_R8, gw, gh))
++        return false;
++    bind(p, 0, p->gui_quarter.texture);
++    glUniform2i(p->gt_size, qw, qh);
++    glUniform1i(p->gt_alpha, 0);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    if (!target(&p->tiles, GL_R8, DRAWN_COLUMNS, DRAWN_ROWS))
++        return false;
++    glUseProgram(p->drawn_program);
++    bind(p, 0, p->gui_tiles.texture);
++    glUniform1i(p->dr_tiles, 0);
++    glUniform2i(p->dr_size, p->gui_w, p->gui_h);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    return glGetError() == GL_NO_ERROR;
++}
++
++/* pass 3 into framebuffer: how 0 everywhere, 1 in the tiles, 2 outside them */
++static bool draw_picture(struct dvbridge_source_packer *p,
++                         const struct dvbridge_source_params *params, unsigned luma, int width,
++                         int height, int x, int y, const unsigned margins[4], unsigned framebuffer,
++                         int how)
++{
+     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+     GLint red = 0, alpha = 0, type = 0;
+     glGetIntegerv(GL_RED_BITS, &red);
+@@ -804,12 +1036,63 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+     /* 32-bit floats: the alpha of 2 and its 2 - a are exact */
+     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || red != 32 ||
+         alpha != 32 || type != GL_FLOAT)
+-        return end(&state, false);
++        return false;
+     glViewport(0, 0, 3840, 2160);
+     glUseProgram(p->picture);
+     set_common(p, &p->cc, params, luma, width, height, x, y, margins);
+-    glDrawArrays(GL_TRIANGLES, 0, 3);
+-    return end(&state, true);
++    set_tiles(p, p->cc_tiles, p->cc_mode, how);
++    glUniform1i(p->cc_flip, 0);
++    glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(how));
++    return true;
++}
++
++bool dvbridge_source_picture(struct dvbridge_source_packer *p,
++                             const struct dvbridge_source_params *params, unsigned luma, int width,
++                             int height, int x, int y, const unsigned margins[4],
++                             unsigned framebuffer)
++{
++    if (p)
++        p->tiles_mode = 0;
++    if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
++        !rows_of(p, width, height, x, y, margins)) {
++        if (p)
++            p->gui = 0;
++        return false;
++    }
++    struct dvbridge_gl_state state;
++    begin(p, &state);
++    /* Hades: in the tiles that what is drawn over may reach, where that is known; the whole
++     * picture where it is not, or where the tiles could not be made (whose GL errors are then not
++     * the picture's) */
++    const int how = make_tiles(p) ? 1 : 0;
++    p->gui = 0;
++    for (int i = 0; !how && i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, how);
++    if (!end(&state, drawn))
++        return false;
++    p->tiles_mode = how;
++    return true;
++}
++
++bool dvbridge_source_complete(struct dvbridge_source_packer *p,
++                              const struct dvbridge_source_params *params, unsigned luma, int width,
++                              int height, int x, int y, const unsigned margins[4],
++                              unsigned framebuffer)
++{
++    if (!p || !p->tiles_mode)
++        return true;
++    if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
++        !rows_of(p, width, height, x, y, margins))
++        return false;
++    struct dvbridge_gl_state state;
++    begin(p, &state);
++    if (!draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, 2))
++        return end(&state, false);
++    if (!end(&state, true))
++        return false;
++    p->tiles_mode = 0;
++    return true;
+ }
+ 
+ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+@@ -843,6 +1126,11 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+     bind(p, 2, layer);
+     glUniform1i(p->u.drawn, 2);
+     glUniform1i(p->u.has_layer, layer != 0);
++    /* Hades: the picture drawn over is read in the tiles that what is drawn over may reach: all the
++     * tiles drawn, each knowing whether something may be drawn over it */
++    const int how = layer && p->tiles_mode ? 3 : 0;
++    set_tiles(p, p->pc_tiles, p->pc_mode, how);
++    glUniform1i(p->pc_flip, flip_y);
+     glUniform1i(p->u.code_max, params->code_max);
+     float yi[9], li[9];
+     for (int i = 0; i < 3; ++i)
+@@ -855,7 +1143,7 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+     glUniform4uiv(p->u.words, 128, packets);
+     glUniform1ui(p->u.count, count);
+     glUniform1ui(p->u.flip, flip_y);
+-    glDrawArrays(GL_TRIANGLES, 0, 3);
++    glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(how));
+     return end(&state, true);
+ }
+ 
+@@ -888,6 +1176,7 @@ bool dvbridge_source_cover(struct dvbridge_source_packer *p, unsigned layer,
+     bind(p, 0, layer);
+     glUniform1i(p->cover_drawn, 0);
+     glUniform4i(p->cover_active, x0, y0, x1, y1);
++    set_tiles(p, p->cv_tiles, p->cv_mode, p->tiles_mode);
+     glDrawArrays(GL_TRIANGLES, 0, 3);
+     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index f829499..650a2d2 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -101,11 +101,32 @@ bool dvbridge_source_rows(struct dvbridge_source_packer *packer,
+ 
+ /* The picture that Kodi draws over, into a 3840x2160 RGBA32F framebuffer: the transport decoded
+  * with the chain of its DM header, PQ BT.2020 RGB within [0, 1] (the chroma of an odd pixel halfway
+- * between its pair's and the next pair's), 0 outside the active picture, alpha 2. */
++ * between its pair's and the next pair's), 0 outside the active picture, alpha 2.
++ * Hades: where dvbridge_source_drawn() said what will be drawn over it, only in the tiles of the
++ * raster that that may reach; the rest of the framebuffer is not written, and the calls below that
++ * take that picture read it in those tiles only (nothing is drawn over it elsewhere), until
++ * dvbridge_source_complete() or dvbridge_source_forget(). */
+ bool dvbridge_source_picture(struct dvbridge_source_packer *packer,
+                              const struct dvbridge_source_params *params, unsigned luma, int width,
+                              int height, int x, int y, const unsigned margins[4],
+                              unsigned framebuffer);
++/* Hades: what will be drawn over the next picture of dvbridge_source_picture(), and nothing else:
++ * the texture gui, of width x height, composited over the whole raster as Kodi's CompositeGui()
++ * composites its GUI (its last row on the first row of the raster, sampled with its bilinear filter
++ * clamped to its edges) with blend factors that leave a pixel as it is where the alpha of the sample
++ * is 0. 0: not known (the whole picture is made). For that picture only. */
++#define DVBRIDGE_SOURCE_DRAWN 1
++void dvbridge_source_drawn(struct dvbridge_source_packer *packer, unsigned gui, int width,
++                           int height);
++/* Hades: the rest of the last picture of dvbridge_source_picture() (outside its tiles), so that
++ * anything may be drawn over it; the calls that take it then read it whole. Nothing to do where it
++ * is whole already. The arguments are those of that picture. */
++bool dvbridge_source_complete(struct dvbridge_source_packer *packer,
++                              const struct dvbridge_source_params *params, unsigned luma, int width,
++                              int height, int x, int y, const unsigned margins[4],
++                              unsigned framebuffer);
++/* Hades: no picture of dvbridge_source_picture() is taken from now on (another render) */
++void dvbridge_source_forget(struct dvbridge_source_packer *packer);
+ 
+ /* Packs the transport into a 3840x2160 framebuffer (linear RGBA8/RGB8, no multisampling). layer:
+  * 0, or the picture of dvbridge_source_picture() with what was drawn over it: where its alpha is
+-- 
+2.53.0
+

@@ -461,14 +461,14 @@ namespace Hades.Installer
         public const string SwitchStart = "DIAG-ON";
 
         // The name that a directory entry has by itself: "DIAG-ON.TXT" for "DIAG-ON TXT".
-        static string ShortName(byte[] root, int e)
+        internal static string ShortName(byte[] root, int e)
         {
             string name = Encoding.ASCII.GetString(root, e, 8).TrimEnd(' '), ending = Encoding.ASCII.GetString(root, e + 8, 3).TrimEnd(' ');
             return ending.Length == 0 ? name : name + "." + ending;
         }
 
         // What the entries of a long name carry of the short name that they belong to.
-        static byte ShortSum(byte[] root, int e)
+        internal static byte ShortSum(byte[] root, int e)
         {
             int sum = 0;
             for (int i = 0; i < 11; ++i) sum = (((sum & 1) << 7) + (sum >> 1) + root[e + i]) & 0xFF;
@@ -476,7 +476,7 @@ namespace Hades.Installer
         }
 
         // The (up to 13) letters that one entry of a long name holds.
-        static string LongPart(byte[] root, int e)
+        internal static string LongPart(byte[] root, int e)
         {
             var part = new StringBuilder();
             foreach (int at in new[] { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 })
@@ -569,6 +569,20 @@ namespace Hades.Installer
             }
             catch (IOException) { return -1; }
             catch (InvalidDataException) { return -1; }
+        }
+
+        // The first "count" bytes of the system partition of the image, as the image has them (DiagFolder: the
+        // start of its file system, up to its first cluster).
+        public static byte[] SystemStart(ImagePlan plan, int count)
+        {
+            if (count < 0 || count > plan.System.Size) throw new InvalidOperationException("Past the system partition of the image.");
+            using (Stream source = Open(plan.Path))
+            {
+                Skip(source, plan.System.Start);
+                var bytes = new byte[count];
+                if (Fill(source, bytes, count) != count) throw new InvalidDataException(L.T("The image is incomplete.", "La imagen está incompleta."));
+                return bytes;
+            }
         }
 
         // The diagnostics turned on in what is written: the file DIAG-OFF.TXT of the image is DIAG-ON.TXT

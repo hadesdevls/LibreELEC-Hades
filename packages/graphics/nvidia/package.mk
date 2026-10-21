@@ -8,7 +8,7 @@ PKG_ARCH="x86_64"
 PKG_LICENSE="LicenseRef-nonfree"
 PKG_SITE="https://www.nvidia.com/en-us/drivers/unix/"
 PKG_URL="https://download.nvidia.com/XFree86/Linux-x86_64/${PKG_VERSION}/NVIDIA-Linux-x86_64-${PKG_VERSION}-no-compat32.run"
-PKG_DEPENDS_TARGET="toolchain util-macros libglvnd nvidia-open-kernel-modules"
+PKG_DEPENDS_TARGET="toolchain util-macros libglvnd nvidia-open-kernel-modules nvidia_egl-gbm"
 PKG_LONGDESC="The GBM/Wayland graphic driver for NVIDIA GPUs from Turing (GeForce GTX 16 and RTX 20 Series) on."
 PKG_TOOLCHAIN="manual"
 # Hades: NVIDIA's licence lets its files be passed on only as they are. They come already
@@ -78,14 +78,8 @@ makeinstall_target() {
   mkdir -p ${INSTALL}/usr/share/egl/egl_external_platform.d
     cp -p 10_nvidia_wayland.json ${INSTALL}/usr/share/egl/egl_external_platform.d
 
-  # EGL-GBM
-  mkdir -p ${INSTALL}/usr/lib
-    cp -p libnvidia-egl-gbm.so.1.1.3 ${INSTALL}/usr/lib/
-    ln -sf libnvidia-egl-gbm.so.1.1.3 ${INSTALL}/usr/lib/libnvidia-egl-gbm.so.1
-    ln -sf libnvidia-egl-gbm.so.1 ${INSTALL}/usr/lib/libnvidia-egl-gbm.so
-
-  mkdir -p ${INSTALL}/usr/share/egl/egl_external_platform.d
-    cp -p 15_nvidia_gbm.json ${INSTALL}/usr/share/egl/egl_external_platform.d
+  # EGL-GBM: Hades builds it from NVIDIA's published source (nvidia_egl-gbm, MIT); the copy in the
+  # installer is left out.
 
   # OpenGL / EGL
   mkdir -p ${INSTALL}/usr/lib

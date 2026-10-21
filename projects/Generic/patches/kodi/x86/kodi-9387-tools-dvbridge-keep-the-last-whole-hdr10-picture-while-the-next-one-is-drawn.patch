@@ -1,0 +1,233 @@
+From c3d7350f03b419b72aab2e8105240960777e6dfd Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:00:39 +0000
+Subject: [PATCH] tools/dvbridge: keep the last whole HDR10 picture while the
+ next one is drawn
+
+Dolby Vision reconstructed for output as HDR10 (dvbridge_render_hdr10()) was drawn into the one
+texture the renderer had, over the picture before it. A render that libplacebo starts and then says
+failed (a layer that cannot be sampled is drawn as the base layer alone and reported, a hook that
+fails is turned off, a framebuffer that cannot be made) left neither picture whole in it, and that
+frame went out without video: black, with the GUI over it. A frame that fails before anything is
+drawn (no metadata, a layer that cannot be imported) already showed the picture before it.
+
+Now a picture is drawn into a second texture while the last whole one is kept, and takes its place
+once it is drawn whole: a frame that fails halfway shows the last whole picture, as one that fails
+before drawing does. The second texture is made once there is a whole picture to keep; where the GPU
+does not give it, the picture is drawn into the one there is, as before. A whole picture of another
+size than the output asks for is forgotten (it is never copied to an output of another size).
+
+It costs one more texture of the size of the output: 132 MB at 3840x2160 (RGBA32F), 33 MB at
+1920x1080. It had been left out for that when this output was written (two seconds of black against two seconds of a
+still picture, for a failure that repeats); a review of 1.0 RC2 found that it also turns a
+single failure into a black frame, which the rule of no black screens does not allow.
+
+Each render writes the whole place it draws, so nothing changes where nothing fails. Measured on a
+software OpenGL ES (zink on lavapipe) with the FEL test stream: the floats of 32 drawings (whole, half,
+a smaller place, six pictures, before and after the failures) are the same, hash for hash, as with
+the engine before; the render test gives the same drawing and HDR10 lines (36 and 114, full and
+half). A render that fails halfway left nothing to show in 8 of 8 cases before (and had drawn over
+the picture in 8), now the picture before it in 8 of 8, the same floats. Four mutations of the change
+make the test fail.
+---
+ tools/dvbridge/dvbridge_render.c              | 68 +++++++++++++------
+ tools/dvbridge/dvbridge_render.h              | 14 ++--
+ .../VideoRenderers/DVBridgeGLES.cpp           |  5 +-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  9 ++-
+ 4 files changed, 68 insertions(+), 28 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 99fbe22..381e9f2 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -24,9 +24,16 @@ struct dvbridge_renderer {
+     pl_gpu gpu;
+     pl_renderer renderer;
+     pl_tex rgb;
+-    /* Hades: the picture for output as HDR10 (dvbridge_render_hdr10()); whether the last call
+-     * drew it, and whether the texture holds a whole picture (that one or an earlier one) */
+-    pl_tex hdr10;
++    /* Hades: the picture for output as HDR10 (dvbridge_render_hdr10()), in one of two textures:
++     * hdr10[hdr10_shown] holds the last picture that was drawn whole, when hdr10_whole, and a
++     * picture is drawn into the other one, which takes its place once it is drawn whole. One whose
++     * render fails halfway (libplacebo drew into its texture and then said that something failed)
++     * leaves the one before it as it was, to be shown again. The second texture is made once there
++     * is a whole picture to keep; where the GPU does not give it, the picture is drawn into the one
++     * there is, as before, and one that fails halfway leaves no whole picture. hdr10_ready: the
++     * last call drew its picture. */
++    pl_tex hdr10[2];
++    int hdr10_shown;
+     bool hdr10_ready, hdr10_whole;
+     /* Hades: its mapping to the display (dvbridge_render_hdr10_mapping()); off when calloc'd */
+     struct dvbridge_hdr10_mapping hdr10_mapping;
+@@ -353,7 +360,8 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     dvbridge_source_packer_destroy(r->source_packer);
+     pl_tex_destroy(r->gpu, &r->planes[0]);
+     pl_tex_destroy(r->gpu, &r->planes[1]);
+-    pl_tex_destroy(r->gpu, &r->hdr10);
++    pl_tex_destroy(r->gpu, &r->hdr10[0]);
++    pl_tex_destroy(r->gpu, &r->hdr10[1]);
+     pl_tex_destroy(r->gpu, &r->rgb);
+     pl_renderer_destroy(&r->renderer);
+     free(r);
+@@ -1055,6 +1063,15 @@ static void map_to_display(const struct dvbridge_hdr10_mapping *m, struct pl_col
+     params->gamut_expansion = false;
+ }
+ 
++/* Hades: a texture of the picture for output as HDR10, of that size (made again when it is of another) */
++static bool hdr10_texture(struct dvbridge_renderer *r, pl_fmt fmt, pl_tex *tex, int width, int height)
++{
++    if (*tex && (*tex)->params.w == width && (*tex)->params.h == height)
++        return true;
++    return pl_tex_recreate(r->gpu, tex, pl_tex_params(.w = width, .h = height, .format = fmt,
++                                                       .sampleable = true, .renderable = true));
++}
++
+ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *source,
+                          const void *metadata, size_t bytes, double pts, double el_pts,
+                          struct dvbridge_view view, int width, int height)
+@@ -1082,14 +1099,21 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     /* The format of the picture that the transport is packed from. A half-float one would be half
+      * the memory, and it is not as good: stored in one by a software renderer, the picture came
+      * out up to half a code of 1023 below this one (the values were cut off, not rounded). */
+-    if (!r->hdr10 || r->hdr10->params.w != width || r->hdr10->params.h != height) {
++    pl_fmt fmt = pl_find_fmt(r->gpu, PL_FMT_FLOAT, 4, 32, 32,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
++    if (!fmt)
++        return false;
++    /* Hades: a whole picture of another size is of no use any more (it is never copied to an output
++     * of another size, CDVBridgeGLES::CopyConversion()) */
++    const pl_tex held = r->hdr10[r->hdr10_shown];
++    if (!held || held->params.w != width || held->params.h != height)
+         r->hdr10_whole = false;
+-        pl_fmt fmt = pl_find_fmt(r->gpu, PL_FMT_FLOAT, 4, 32, 32,
+-                                 PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+-        if (!fmt || !pl_tex_recreate(r->gpu, &r->hdr10, pl_tex_params(.w = width, .h = height,
+-                .format = fmt, .sampleable = true, .renderable = true)))
+-            return false;
+-    }
++    /* the texture to draw into: the other one while the one shown holds a whole picture */
++    int into = r->hdr10_shown;
++    if (r->hdr10_whole && hdr10_texture(r, fmt, &r->hdr10[!r->hdr10_shown], width, height))
++        into = !r->hdr10_shown;
++    if (!hdr10_texture(r, fmt, &r->hdr10[into], width, height))
++        return false;
+     struct pl_frame image = *source, layer;
+     if (el) {
+         layer = *el;
+@@ -1108,7 +1132,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+      * is mapped to the display, below). */
+     struct pl_frame target = {
+         .num_planes = 1,
+-        .planes = {{.texture = r->hdr10, .components = 4, .component_mapping = {0, 1, 2, 3}}},
++        .planes = {{.texture = r->hdr10[into], .components = 4, .component_mapping = {0, 1, 2, 3}}},
+         .repr = pl_color_repr_rgb,
+         .color = mapped.color,
+         .crop = {view.dst_x, view.dst_y, view.dst_x + view.dst_width, view.dst_y + view.dst_height},
+@@ -1143,14 +1167,19 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         to_display.peak = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->hdr10_mapping.peak);
+         params.hooks = display_hooks;
+     }
+-    /* from here on the texture may hold a part of this picture over the one before it */
+-    r->hdr10_whole = false;
++    /* from here on the texture drawn into may hold a part of this picture over an earlier one: the
++     * one shown keeps its picture unless it is that texture */
++    if (into == r->hdr10_shown)
++        r->hdr10_whole = false;
+     bool ok = pl_render_image(r->renderer, &image, &target, &params) &&
+               (r->hdr10_mapping.enabled ? to_display.called : clamped);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+-    r->hdr10_whole = ok && !(errors.errors & ~PL_RENDER_ERR_DOVI_COMPOSER) &&
+-                     !errors.num_disabled_hooks;
+-    return r->hdr10_whole;
++    ok = ok && !(errors.errors & ~PL_RENDER_ERR_DOVI_COMPOSER) && !errors.num_disabled_hooks;
++    if (ok) {
++        r->hdr10_shown = into;
++        r->hdr10_whole = true;
++    }
++    return ok;
+ }
+ 
+ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *source,
+@@ -1174,12 +1203,13 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *s
+ 
+ pl_tex dvbridge_render_hdr10_texture(const struct dvbridge_renderer *r)
+ {
+-    return r && r->hdr10_ready ? r->hdr10 : NULL;
++    /* (a picture drawn whole is the one shown) */
++    return r && r->hdr10_ready ? r->hdr10[r->hdr10_shown] : NULL;
+ }
+ 
+ pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *r)
+ {
+-    return r && r->hdr10_whole ? r->hdr10 : NULL;
++    return r && r->hdr10_whole ? r->hdr10[r->hdr10_shown] : NULL;
+ }
+ 
+ pl_tex dvbridge_render_texture(const struct dvbridge_renderer *r)
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index a1f6457..93e0884 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -65,12 +65,18 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *renderer, const struct pl_f
+ /* The texture of the last dvbridge_render_hdr10() when it succeeded, or NULL. It goes to the
+  * output with dvbridge_gl_copy(). */
+ pl_tex dvbridge_render_hdr10_texture(const struct dvbridge_renderer *renderer);
+-/* ... or the picture before it: the texture still holds a whole picture, the last one that was
+- * drawn, also after a dvbridge_render_hdr10() that failed before it drew anything. NULL when it
+- * holds none. For a frame that could not be reconstructed, in place of nothing. */
++/* ... or the picture before it: the last one that was drawn whole, also after a
++ * dvbridge_render_hdr10() that failed before it drew anything and, Hades, after one that failed
++ * halfway: a picture is drawn into a second texture while the last whole one is kept, and takes its
++ * place once it is drawn whole. (Where the GPU does not give that second texture, a picture is drawn
++ * over the last one, and one that fails halfway leaves none.) NULL when there is none; one of another
++ * size is forgotten by a call that draws at the new size. For a frame that could not be
++ * reconstructed, in place of nothing. */
++#define DVBRIDGE_RENDER_HDR10_KEPT 1
+ pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *renderer);
+ /* Hades: a renderer for dvbridge_render_hdr10() alone, without the 3840x2160 picture that the
+- * transport is packed from (132 MB that such a renderer never uses). */
++ * transport is packed from (132 MB that such a renderer never uses). It keeps two pictures of the
++ * size of the output instead, the one shown and the one being drawn (132 MB each at 3840x2160). */
+ struct dvbridge_renderer *dvbridge_renderer_create_hdr10(pl_gpu gpu, pl_log log);
+ /* Hades: the mapping of the following dvbridge_render_hdr10() pictures to the display
+  * (struct dvbridge_hdr10_mapping, dvbridge_placebo.h). A renderer starts with it off, which draws
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 899d92a..a5cf6fe 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1244,8 +1244,9 @@ bool CDVBridgeGLES::PrepareConversion(const Layer& base,
+ 
+ bool CDVBridgeGLES::CopyConversion(unsigned int framebuffer, int width, int height, bool limited)
+ {
+-  // The picture just reconstructed, or the one before it when nothing of this one was drawn: the
+-  // texture still holds that one, at its place. None when the draw of this one failed.
++  // The picture just reconstructed, or the one before it when this one was not: the engine keeps
++  // the last whole one, at its place (Hades: also when the draw of this one failed halfway; none
++  // only where the GPU did not give the engine a second picture to draw into).
+   const pl_tex picture = m_renderer ? dvbridge_render_hdr10_last(m_renderer) : nullptr;
+   if (!picture || !m_copier || width != m_convertWidth || height != m_convertHeight)
+     return false;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 97ec660..fb998b8 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -234,9 +234,12 @@ public:
+   //!        draws its frame at every refresh, also while it is paused, and a picture that is
+   //!        asked for again at the same place is not reconstructed again
+   //! \return false when it could not be. The picture before it is still there when nothing of
+-  //!         this one was drawn (its metadata does not hold, a layer cannot be imported); when
+-  //!         the draw itself failed there is no whole picture, and CopyConversion() fails
+-  //!         until one is drawn. Such a picture is tried again when it is asked for again.
++  //!         this one was drawn (its metadata does not hold, a layer cannot be imported) and,
++  //!         Hades, also when the draw itself failed halfway: the engine draws into a second
++  //!         picture while it keeps the last whole one (dvbridge_render_hdr10_last()). Only where
++  //!         the GPU does not give that second picture is there none after such a failure, and
++  //!         CopyConversion() fails until one is drawn. Such a picture is tried again when it is
++  //!         asked for again.
+   bool PrepareConversion(const Layer& base,
+                          const AVFrame* enhancement,
+                          const CDVMetadataBuffer& metadata,
+-- 
+2.53.0
+

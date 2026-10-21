@@ -16,6 +16,10 @@
 # The same for an AMD GPU (amdgpu: load and current core clock, every 10 s in the timeline), and during
 # Dolby Vision a file gpu-amd.txt with five readings a second apart of its load, clocks, temperature, power
 # and power policy.
+# Every file of a capture goes through the filter of the diagnostics (redact.sh tree: addresses, serial
+# numbers, UUIDs, SSH keys, network names and the name of the system become markers) before it is copied,
+# and the end of Kodi's log through the filter for logs where it is taken; without the filter nothing is
+# copied.
 (
 dev=$(awk '$2 == "/storage" { print $1 }' /proc/mounts)
 part=${dev#/dev/}
@@ -54,7 +58,7 @@ D=/flash/hades-diag
 # (the folder of this start)
 H=start-${1:-0}
 K=/storage/.kodi/temp/kodi.log
-R=/usr/lib/hades-diag/redact.sed
+R=/usr/lib/hades-diag/redact.sh
 # Run a command for at most 20 s (the image has no timeout command).
 lim() {
   "$@" 2>&1 &
@@ -119,18 +123,22 @@ switch_on() { ls /flash 2>/dev/null | grep -qi '^diag-on'; }
 room_left() { [ "$(df -k /flash 2>/dev/null | awk 'END { print $4 + 0 }')" -gt 131072 ]; }
 # Lines of a log go through the filter; without it nothing of them is copied.
 clean() {
-  if [ -f $R ]; then sed -E -f $R; else cat >/dev/null; fi
+  if [ -f $R ]; then sh $R; else cat >/dev/null; fi
 }
 # With no room, a note on the partition says so, once: nothing else there would tell why nothing was saved.
 no_room() { [ -e $D/NO-ROOM.txt ] || { mkdir -p $D && cp /usr/lib/hades-diag/NO-ROOM.txt $D/; }; }
-# Copy the files of $1 into $2 of the folder of this start on the boot partition.
+# Copy the files of $1 into $2 of the folder of this start on the boot partition, each through the filter
+# that fits it first, into $1.filtered in RAM (a file that the filter fails on is not copied; without the
+# filter, nothing is). The second copy of a capture filters only its new files.
 to_flash() {
   switch_on || return 1
+  [ -f $R ] || return 1
+  sh $R tree $1 $1.filtered
   flash_lock || return 1
   if mount -o remount,rw /flash; then
     if room_left; then
       rm -f $D/NO-ROOM.txt
-      mkdir -p $D/$H/$2 && cp $1/* $D/$H/$2/
+      mkdir -p $D/$H/$2 && cp $1.filtered/* $D/$H/$2/ && : > $D/$H/.filtered
     else
       no_room
     fi
@@ -147,7 +155,7 @@ output_state() {
 # The captures after leaving Dolby Vision ($1 = slot): 5 s and 30 s later.
 after_dv() {
   S=/tmp/hades-after-dv-$1
-  rm -rf $S; mkdir -p $S
+  rm -rf $S $S.filtered; mkdir -p $S
   for w in 5 30; do
     if [ $w = 5 ]; then sleep 5; else sleep 25; fi
     {
@@ -162,16 +170,16 @@ after_dv() {
       [ -r "$f" ] && { echo "--- $f"; cat "$f"; }
     done > $S/drm-state-${w}s.txt 2>&1
     command -v nvidia-smi >/dev/null && lim nvidia-smi -q > $S/nvidia-smi-${w}s.txt
-    [ -f $R ] && tail -n 200 $K | sed -E -f $R > $S/kodi-tail-${w}s.txt
+    [ -f $R ] && tail -n 200 $K | sh $R > $S/kodi-tail-${w}s.txt
     to_flash $S after-dv-$1
   done
-  rm -rf $S
+  rm -rf $S $S.filtered
 }
 # The capture about 15 s into Dolby Vision ($1 = slot).
 during_dv() {
   sleep 15
   S=/tmp/hades-dv-$1
-  rm -rf $S; mkdir -p $S
+  rm -rf $S $S.filtered; mkdir -p $S
   {
     echo "== $(date -u '+%F %T') UTC, uptime $(cut -d' ' -f1 /proc/uptime) s"
     echo "== last DVBridge lines of kodi.log"; grep -h 'DVBridge' $K | tail -5 | clean
@@ -181,7 +189,7 @@ during_dv() {
   for f in /sys/kernel/debug/dri/*/state; do
     [ -r "$f" ] && { echo "--- $f"; cat "$f"; }
   done > $S/drm-state.txt 2>&1
-  [ -f $R ] && tail -n 400 $K | sed -E -f $R > $S/kodi-tail.txt
+  [ -f $R ] && tail -n 400 $K | sh $R > $S/kodi-tail.txt
   # what an AMD GPU is doing while it draws Dolby Vision
   for c in /sys/class/drm/card[0-9]; do
     [ -r $c/device/gpu_busy_percent ] || continue
@@ -205,7 +213,7 @@ during_dv() {
     } >> $S/gpu-amd.txt 2>&1
   done
   to_flash $S during-dv-$1
-  rm -rf $S
+  rm -rf $S $S.filtered
 }
 # The first free slot of $1 (during-dv or after-dv) in this start, taken at once with a directory in RAM, so
 # that a capture still running (not yet on the boot partition) keeps its slot. Prints nothing when all 6 are

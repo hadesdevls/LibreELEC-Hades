@@ -1,0 +1,742 @@
+From e15be90b6992f97e4100ee0aa65ea9dde0519300 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:19:35 +0000
+Subject: [PATCH] drm/amd/display: HDR10+ vendor InfoFrame in a generic packet
+ of its own
+
+HDR10PLUS_VSIF (linux-9980) on amdgpu, for DCN, on HDMI and DisplayPort
+connectors (not eDP).
+
+DC sends the packet of the stream (dc_stream_state.hdr10plus_infopacket)
+in a generic packet slot of its own, so that nothing else moves for it:
+the vendor slot keeps the HDMI 1.4 vendor InfoFrame (the HDMI VIC of
+2160p24, 25 and 30; 3D) or the Dolby VSIF of the tunnel, and the HDR
+InfoFrame stays where it is.
+
+- HDMI, DIO: generic packet 7, after the 0 to 5 of DCN 1 and the 0 to 6
+  of DCN 2 and later;
+- HDMI FRL, HPO: 13, after DSC (5 to 10), the HF-VSIF (11) and the
+  VTEM (12);
+- DisplayPort, DIO and HPO: 6, after the adaptive sync SDP (5); 4 is
+  the immediate SDP and 7 the PPS of DSC. The HPO DisplayPort encoder
+  gains the control register of its GSP 6 in its four register lists,
+  and stops it with the others.
+
+A change of HDR10PLUS_VSIF is a stream update of that packet
+(hdr10plus_infopacket in dc_stream_update and dc_fast_update: an info
+frame update of the fast type, as one of the vendor packet is), from
+the commit that sets it: never a modeset. A stream that is created
+takes it from the connector state. The atomic check refuses it with the
+Dolby Vision tunnel, whose Dolby VSIF is the dynamic metadata of its
+picture, and on a link that does not carry it.
+
+Each encoder remembers whether it sends the HDR10+ packet
+(hdr10plus_sent, which its stop functions clear), and its slot is
+written only while HDR10+ is or was sent there: GSP6 on DisplayPort and
+the HDMI packets 7 and 13 stay untouched otherwise, on eDP and on every
+stream without HDR10+, as before this patch (what the DMUB firmware does
+with them is not known).
+
+Like every other DC packet, it is written when the commit is applied,
+not latched with the flip: in which frame a change reaches the sink is
+not verified.
+
+Checked: W=1 without new warnings on the files changed and on the
+resources that use the new register, the whole of drm compiled; host
+test of the packet (amdgpu_dm_hdr10plus_packet()) with mutations. Not
+run on a GPU.
+---
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c | 74 ++++++++++++++++++-
+ .../display/amdgpu_dm/amdgpu_dm_hdr10plus.h   | 58 +++++++++++++++
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 10 +++
+ .../gpu/drm/amd/display/dc/core/dc_resource.c |  7 ++
+ drivers/gpu/drm/amd/display/dc/dc.h           |  1 +
+ drivers/gpu/drm/amd/display/dc/dc_stream.h    |  3 +
+ .../dc/dio/dcn10/dcn10_stream_encoder.c       | 17 +++++
+ .../dc/dio/dcn20/dcn20_stream_encoder.c       |  5 ++
+ .../dc/dio/dcn30/dcn30_dio_stream_encoder.c   | 17 +++++
+ .../dc/dio/dcn42/dcn42_dio_stream_encoder.c   |  5 ++
+ .../hpo/dcn30/dcn30_hpo_frl_stream_encoder.c  |  5 ++
+ .../hpo/dcn31/dcn31_hpo_dp_stream_encoder.c   | 16 ++++
+ .../hpo/dcn31/dcn31_hpo_dp_stream_encoder.h   |  2 +
+ .../dcn401/dcn401_hpo_frl_stream_encoder.c    |  5 ++
+ .../amd/display/dc/inc/hw/stream_encoder.h    |  9 +++
+ .../dc/resource/dcn32/dcn32_resource.h        |  1 +
+ .../dc/resource/dcn42/dcn42_resource.h        |  1 +
+ .../dc/resource/dcn42b/dcn42b_resource.h      |  1 +
+ 18 files changed, 236 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index ecfd0db..4558c83 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -53,6 +53,7 @@
+ #include "amdgpu_dm_plane.h"
+ #include "amdgpu_dm_crtc.h"
+ #include "amdgpu_dm_hdcp.h"
++#include "amdgpu_dm_hdr10plus.h"
+ #include <drm/display/drm_hdcp_helper.h>
+ #include "amdgpu_dm_wb.h"
+ #include "amdgpu_atombios.h"
+@@ -9568,6 +9569,29 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
+ 	return result;
+ }
+ 
++/* Hades: the links that carry HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) */
++static bool amdgpu_dm_hdr10plus_link(enum signal_type signal)
++{
++	return dc_is_hdmi_signal(signal) ||
++	       (dc_is_dp_signal(signal) && signal != SIGNAL_TYPE_EDP);
++}
++
++/*
++ * Hades: the HDR10+ packet of a connector state for a stream's link (amdgpu_dm_hdr10plus.h):
++ * invalid without HDR10PLUS_VSIF, and on a link that does not carry it, which the atomic check
++ * refuses on a stream that exists.
++ */
++static void amdgpu_dm_fill_hdr10plus(const struct drm_connector_state *state,
++				     enum signal_type signal, struct dc_info_packet *out)
++{
++	const struct drm_property_blob *blob = state->hdr10plus_vsif;
++
++	memset(out, 0, sizeof(*out));
++	if (!blob || !amdgpu_dm_hdr10plus_link(signal))
++		return;
++	amdgpu_dm_hdr10plus_packet(blob->data, blob->length, dc_is_hdmi_signal(signal), out);
++}
++
+ static int fill_hdr_info_packet(const struct drm_connector_state *state,
+ 				struct dc_info_packet *out)
+ {
+@@ -9768,6 +9792,31 @@ amdgpu_dm_connector_atomic_check(struct drm_connector *conn,
+ 			!new_con_state->hdr_output_metadata;
+ 	}
+ 
++	/*
++	 * Hades: HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h) changes a packet of the stream in place:
++	 * never a modeset. Not with the Dolby Vision tunnel, whose Dolby VSIF is the dynamic
++	 * metadata of its picture; not on a link that does not carry it.
++	 */
++	if (new_con_state->hdr10plus_vsif && dm_new_con_state->dvbridge_dv_standard) {
++		drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF with the Dolby Vision tunnel\n",
++			       conn->base.id, conn->name);
++		return -EINVAL;
++	}
++	if (!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state)) {
++		const struct dc_stream_state *stream;
++
++		new_crtc_state = drm_atomic_get_crtc_state(state, crtc);
++		if (IS_ERR(new_crtc_state))
++			return PTR_ERR(new_crtc_state);
++		stream = to_dm_crtc_state(new_crtc_state)->stream;
++		if (new_con_state->hdr10plus_vsif && stream &&
++		    !amdgpu_dm_hdr10plus_link(stream->signal)) {
++			drm_dbg_atomic(conn->dev, "[CONNECTOR:%d:%s] HDR10PLUS_VSIF on a link that does not carry it (signal %d)\n",
++				       conn->base.id, conn->name, stream->signal);
++			return -EINVAL;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -10539,6 +10588,11 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ 	    connector_type == DRM_MODE_CONNECTOR_eDP) {
+ 		drm_connector_attach_hdr_output_metadata_property(&aconnector->base);
+ 
++		/* Hades: HDR10PLUS_VSIF where DC sends it (amdgpu_dm_hdr10plus.h) */
++		if (connector_type != DRM_MODE_CONNECTOR_eDP &&
++		    adev->dm.dc->ctx->dce_version >= DCN_VERSION_1_0)
++			drm_connector_attach_hdr10plus_vsif_property(&aconnector->base);
++
+ 		if (!aconnector->mst_root)
+ 			drm_connector_attach_vrr_capable_property(&aconnector->base);
+ 
+@@ -12707,8 +12761,10 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 		struct dc_surface_update *dummy_updates;
+ 		struct dc_stream_update stream_update;
+ 		struct dc_info_packet hdr_packet;
++		struct dc_info_packet hdr10plus_packet; /* Hades */
+ 		struct dc_stream_status *status = NULL;
+ 		bool abm_changed, hdr_changed, scaling_changed, output_color_space_changed = false;
++		bool hdr10plus_changed;
+ 
+ 		memset(&stream_update, 0, sizeof(stream_update));
+ 
+@@ -12738,7 +12794,12 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 		hdr_changed =
+ 			!drm_connector_atomic_hdr_metadata_equal(old_con_state, new_con_state);
+ 
+-		if (!scaling_changed && !abm_changed && !hdr_changed && !output_color_space_changed)
++		/* Hades: HDR10PLUS_VSIF, the packet of this frame (amdgpu_dm_hdr10plus.h) */
++		hdr10plus_changed = dm_new_crtc_state->stream &&
++			!drm_connector_atomic_hdr10plus_vsif_equal(old_con_state, new_con_state);
++
++		if (!scaling_changed && !abm_changed && !hdr_changed && !output_color_space_changed &&
++		    !hdr10plus_changed)
+ 			continue;
+ 
+ 		stream_update.stream = dm_new_crtc_state->stream;
+@@ -12768,6 +12829,12 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_commit *state)
+ 			stream_update.hdr_static_metadata = &hdr_packet;
+ 		}
+ 
++		if (hdr10plus_changed) {
++			amdgpu_dm_fill_hdr10plus(new_con_state, dm_new_crtc_state->stream->signal,
++						 &hdr10plus_packet);
++			stream_update.hdr10plus_infopacket = &hdr10plus_packet;
++		}
++
+ 		status = dc_stream_get_status(dm_new_crtc_state->stream);
+ 
+ 		if (WARN_ON(!status))
+@@ -13301,6 +13368,11 @@ static int dm_update_crtc_state(struct amdgpu_display_manager *dm,
+ 
+ 		dm_new_crtc_state->abm_level = dm_new_conn_state->abm_level;
+ 
++		/* Hades: HDR10PLUS_VSIF (amdgpu_dm_hdr10plus.h); never with the Dolby Vision tunnel */
++		if (!dm_new_conn_state->dvbridge_dv_standard)
++			amdgpu_dm_fill_hdr10plus(drm_new_conn_state, new_stream->signal,
++						 &new_stream->hdr10plus_infopacket);
++
+ 		ret = fill_hdr_info_packet(drm_new_conn_state,
+ 					   &new_stream->hdr_static_metadata);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
+new file mode 100644
+index 0000000..77058b9
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Hades: HDR10PLUS_VSIF on amdgpu (drm_hdr10plus.h). DC sends the HDR10+ vendor-specific InfoFrame
++ * of a stream (dc_stream_state.hdr10plus_infopacket) in a generic packet slot of its own, so that
++ * nothing else moves for it: not the HDMI 1.4 vendor InfoFrame of the vendor slot (the HDMI VIC
++ * of 2160p24, 25 and 30; 3D), nor the Dolby VSIF of the tunnel, nor the HDR one:
++ *
++ * - HDMI (DIO): generic packet 7. DCN 1 sends packets 0 to 5, DCN 2 to 6, DCN 3 and later 0 to 6
++ *   (enc1/enc2/enc3_stream_encoder_update_hdmi_info_packets()); HDMI FRL (HPO): packet 13, past
++ *   the 5 to 10 of DSC, the HF-VSIF (11) and the VTEM (12);
++ * - DisplayPort (DIO and HPO): generic packet 6, the first after the adaptive sync SDP (5): 4 is
++ *   the immediate SDP, 7 the PPS of DSC on DCN 2 and later.
++ *
++ * Only for DCN, on HDMI and DisplayPort connectors (not eDP). A change of HDR10PLUS_VSIF is a
++ * stream update of that packet, from the commit that sets it (amdgpu_dm_atomic_commit_tail()),
++ * never a modeset; a stream that is created takes it from the connector state. The atomic check
++ * refuses it with the Dolby Vision tunnel and on a link that does not carry it.
++ */
++#ifndef __AMDGPU_DM_HDR10PLUS_H__
++#define __AMDGPU_DM_HDR10PLUS_H__
++
++#include <drm/drm_hdr10plus.h>
++
++/*
++ * The packet of a payload as DC takes it, for an HDMI signal (the InfoFrame: its header in
++ * hb0..hb2, the checksum in sb[0], the payload after it) or a DisplayPort one (the InfoFrame SDP:
++ * its header in hb0..hb3, its data bytes in sb). 0, or -errno with out invalid.
++ */
++static inline int amdgpu_dm_hdr10plus_packet(const u8 *vsif, size_t size, bool hdmi,
++					     struct dc_info_packet *out)
++{
++	u8 buf[DRM_HDR10PLUS_INFOFRAME_SIZE];
++	u8 hb[4];
++	ssize_t len;
++
++	memset(out, 0, sizeof(*out));
++	if (hdmi) {
++		len = drm_hdr10plus_hdmi_infoframe_pack(vsif, size, buf, sizeof(buf));
++		if (len < 0)
++			return len;
++		out->hb0 = buf[0];
++		out->hb1 = buf[1];
++		out->hb2 = buf[2];
++		memcpy(out->sb, &buf[3], len - 3);
++	} else {
++		len = drm_hdr10plus_dp_sdp_pack(vsif, size, hb, out->sb, sizeof(out->sb));
++		if (len < 0)
++			return len;
++		out->hb0 = hb[0];
++		out->hb1 = hb[1];
++		out->hb2 = hb[2];
++		out->hb3 = hb[3];
++	}
++	out->valid = true;
++	return 0;
++}
++
++#endif /* __AMDGPU_DM_HDR10PLUS_H__ */
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index ebfed18..c701863 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -3126,6 +3126,7 @@ static struct surface_update_descriptor check_update_surfaces_for_stream(
+ 				stream_update->vrr_infopacket ||
+ 				stream_update->vsc_infopacket ||
+ 				stream_update->vsp_infopacket ||
++				stream_update->hdr10plus_infopacket ||
+ 				stream_update->hfvsif_infopacket ||
+ 				stream_update->adaptive_sync_infopacket ||
+ 				stream_update->vtem_infopacket ||
+@@ -3452,6 +3453,9 @@ static void copy_stream_update_to_stream(struct dc *dc,
+ 	if (update->vsp_infopacket)
+ 		stream->vsp_infopacket = *update->vsp_infopacket;
+ 
++	if (update->hdr10plus_infopacket)
++		stream->hdr10plus_infopacket = *update->hdr10plus_infopacket;
++
+ 	if (update->adaptive_sync_infopacket)
+ 		stream->adaptive_sync_infopacket = *update->adaptive_sync_infopacket;
+ 
+@@ -4095,6 +4099,7 @@ static void commit_planes_do_stream_update_sequence(struct dc *dc,
+ 					stream_update->vrr_infopacket ||
+ 					stream_update->vsc_infopacket ||
+ 					stream_update->vsp_infopacket ||
++					stream_update->hdr10plus_infopacket ||
+ 					stream_update->hfvsif_infopacket ||
+ 					stream_update->adaptive_sync_infopacket ||
+ 					stream_update->vtem_infopacket ||
+@@ -4278,6 +4283,7 @@ static void commit_planes_do_stream_update(struct dc *dc,
+ 					stream_update->vrr_infopacket ||
+ 					stream_update->vsc_infopacket ||
+ 					stream_update->vsp_infopacket ||
++					stream_update->hdr10plus_infopacket ||
+ 					stream_update->hfvsif_infopacket ||
+ 					stream_update->adaptive_sync_infopacket ||
+ 					stream_update->vtem_infopacket ||
+@@ -5645,6 +5651,7 @@ void populate_fast_updates(struct dc_fast_update *fast_update,
+ 		fast_update[0].vrr_infopacket = stream_update->vrr_infopacket;
+ 		fast_update[0].vsc_infopacket = stream_update->vsc_infopacket;
+ 		fast_update[0].vsp_infopacket = stream_update->vsp_infopacket;
++		fast_update[0].hdr10plus_infopacket = stream_update->hdr10plus_infopacket;
+ 		fast_update[0].hfvsif_infopacket = stream_update->hfvsif_infopacket;
+ 		fast_update[0].vtem_infopacket = stream_update->vtem_infopacket;
+ 		fast_update[0].adaptive_sync_infopacket = stream_update->adaptive_sync_infopacket;
+@@ -5661,6 +5668,7 @@ void populate_fast_updates(struct dc_fast_update *fast_update,
+ 		fast_update[0].vrr_infopacket = NULL;
+ 		fast_update[0].vsc_infopacket = NULL;
+ 		fast_update[0].vsp_infopacket = NULL;
++		fast_update[0].hdr10plus_infopacket = NULL;
+ 		fast_update[0].hfvsif_infopacket = NULL;
+ 		fast_update[0].vtem_infopacket = NULL;
+ 		fast_update[0].adaptive_sync_infopacket = NULL;
+@@ -5693,6 +5701,7 @@ static bool fast_updates_exist(const struct dc_fast_update *fast_update, int sur
+ 		fast_update[0].vrr_infopacket ||
+ 		fast_update[0].vsc_infopacket ||
+ 		fast_update[0].vsp_infopacket ||
++		fast_update[0].hdr10plus_infopacket ||
+ 		fast_update[0].hfvsif_infopacket ||
+ 		fast_update[0].vtem_infopacket ||
+ 		fast_update[0].adaptive_sync_infopacket ||
+@@ -5728,6 +5737,7 @@ bool fast_nonaddr_updates_exist(struct dc_fast_update *fast_update, int surface_
+ 		fast_update[0].vrr_infopacket ||
+ 		fast_update[0].vsc_infopacket ||
+ 		fast_update[0].vsp_infopacket ||
++		fast_update[0].hdr10plus_infopacket ||
+ 		fast_update[0].hfvsif_infopacket ||
+ 		fast_update[0].vtem_infopacket ||
+ 		fast_update[0].adaptive_sync_infopacket ||
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 5f6cc1b..1a0ddf3 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -5182,6 +5182,7 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 	info->avi.valid = false;
+ 	info->gamut.valid = false;
+ 	info->vendor.valid = false;
++	info->hdr10plus.valid = false;
+ 	info->spd.valid = false;
+ 	info->hdrsmd.valid = false;
+ 	info->vsc.valid = false;
+@@ -5198,6 +5199,9 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 		set_avi_info_frame(&info->avi, pipe_ctx);
+ 
+ 		set_vendor_info_packet(&info->vendor, pipe_ctx->stream);
++		/* Hades: HDR10+, in a generic packet of its own (amdgpu_dm_hdr10plus.h) */
++		if (pipe_ctx->stream->hdr10plus_infopacket.valid)
++			info->hdr10plus = pipe_ctx->stream->hdr10plus_infopacket;
+ 		set_hfvs_info_packet(&info->hfvsif, pipe_ctx->stream);
+ 		set_vtem_info_packet(&info->vtem, pipe_ctx->stream);
+ 
+@@ -5210,6 +5214,9 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 		}
+ 	} else if (dc_is_dp_signal(signal)) {
+ 		set_vsc_info_packet(&info->vsc, pipe_ctx->stream);
++		/* Hades: HDR10+, as an InfoFrame SDP of its own (amdgpu_dm_hdr10plus.h) */
++		if (pipe_ctx->stream->hdr10plus_infopacket.valid)
++			info->hdr10plus = pipe_ctx->stream->hdr10plus_infopacket;
+ 
+ 		set_spd_info_packet(&info->spd, pipe_ctx->stream);
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc.h b/drivers/gpu/drm/amd/display/dc/dc.h
+index 7918438..43df27b 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc.h
++++ b/drivers/gpu/drm/amd/display/dc/dc.h
+@@ -1958,6 +1958,7 @@ struct dc_fast_update {
+ 	struct dc_info_packet *vrr_infopacket;
+ 	struct dc_info_packet *vsc_infopacket;
+ 	struct dc_info_packet *vsp_infopacket;
++	struct dc_info_packet *hdr10plus_infopacket; /* Hades */
+ 	struct dc_info_packet *hfvsif_infopacket;
+ 	struct dc_info_packet *vtem_infopacket;
+ 	struct dc_info_packet *adaptive_sync_infopacket;
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index 4154cd0..d471917 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -182,6 +182,8 @@ struct dc_stream_state {
+ 	struct dc_info_packet vrr_infopacket;
+ 	struct dc_info_packet vsc_infopacket;
+ 	struct dc_info_packet vsp_infopacket;
++	/* Hades: HDR10+ vendor InfoFrame, generic packet of its own (amdgpu_dm_hdr10plus.h) */
++	struct dc_info_packet hdr10plus_infopacket;
+ 	struct dc_info_packet hfvsif_infopacket;
+ 	struct dc_info_packet vtem_infopacket;
+ 	struct dc_info_packet adaptive_sync_infopacket;
+@@ -320,6 +322,7 @@ struct dc_stream_update {
+ 	struct dc_info_packet *vrr_infopacket;
+ 	struct dc_info_packet *vsc_infopacket;
+ 	struct dc_info_packet *vsp_infopacket;
++	struct dc_info_packet *hdr10plus_infopacket; /* Hades */
+ 	struct dc_info_packet *hfvsif_infopacket;
+ 	struct dc_info_packet *vtem_infopacket;
+ 	struct dc_info_packet *adaptive_sync_infopacket;
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c
+index d913f06..7ab59b1 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c
+@@ -671,6 +671,10 @@ static void enc1_stream_encoder_update_hdmi_info_packets(
+ 	enc1_update_hdmi_info_packet(enc1, 3, &info_frame->vendor);
+ 	enc1_update_hdmi_info_packet(enc1, 4, &info_frame->spd);
+ 	enc1_update_hdmi_info_packet(enc1, 5, &info_frame->hdrsmd);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		enc1_update_hdmi_info_packet(enc1, 7, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ static void enc1_stream_encoder_stop_hdmi_info_packets(
+@@ -678,6 +682,7 @@ static void enc1_stream_encoder_stop_hdmi_info_packets(
+ {
+ 	struct dcn10_stream_encoder *enc1 = DCN10STRENC_FROM_STRENC(enc);
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	/* stop generic packets 0 & 1 on HDMI */
+ 	REG_SET_6(HDMI_GENERIC_PACKET_CONTROL0, 0,
+ 		HDMI_GENERIC1_CONT, 0,
+@@ -759,6 +764,13 @@ void enc1_stream_encoder_update_dp_info_packets(
+ 				5,  /* packetIndex */
+ 				&info_frame->adaptive_sync);
+ 
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h) */
++	if (info_frame->hdr10plus.valid)
++		enc1_update_generic_info_packet(
++				enc1,
++				6,  /* packetIndex */
++				&info_frame->hdr10plus);
++
+ 	/* enable/disable transmission of packet(s).
+ 	 * If enabled, packet transmission begins on the next frame
+ 	 */
+@@ -766,6 +778,10 @@ void enc1_stream_encoder_update_dp_info_packets(
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP2_ENABLE, info_frame->spd.valid);
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP3_ENABLE, info_frame->hdrsmd.valid);
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP5_ENABLE, info_frame->adaptive_sync.valid);
++	/* Hades: GSP6 only while HDR10+ is or was sent here: never on eDP, nor without it */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP6_ENABLE, info_frame->hdr10plus.valid);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ 
+ 	/* This bit is the master enable bit.
+ 	 * When enabling secondary stream engine,
+@@ -881,6 +897,7 @@ void enc1_stream_encoder_stop_dp_info_packets(
+ 	struct dcn10_stream_encoder *enc1 = DCN10STRENC_FROM_STRENC(enc);
+ 	uint32_t value = 0;
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	REG_SET_10(DP_SEC_CNTL, 0,
+ 		DP_SEC_GSP0_ENABLE, 0,
+ 		DP_SEC_GSP1_ENABLE, 0,
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c
+index bec0b4a..26970df 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c
+@@ -159,6 +159,10 @@ static void enc2_stream_encoder_update_hdmi_info_packets(
+ 	enc2_update_hdmi_info_packet(enc1, 4, &info_frame->spd);
+ 	enc2_update_hdmi_info_packet(enc1, 5, &info_frame->hdrsmd);
+ 	enc2_update_hdmi_info_packet(enc1, 6, &info_frame->vtem);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		enc2_update_hdmi_info_packet(enc1, 7, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ static void enc2_stream_encoder_stop_hdmi_info_packets(
+@@ -166,6 +170,7 @@ static void enc2_stream_encoder_stop_hdmi_info_packets(
+ {
+ 	struct dcn10_stream_encoder *enc1 = DCN10STRENC_FROM_STRENC(enc);
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	/* stop generic packets 0,1 on HDMI */
+ 	REG_SET_4(HDMI_GENERIC_PACKET_CONTROL0, 0,
+ 		HDMI_GENERIC0_CONT, 0,
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c
+index c14fb51..9d0b09f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c
+@@ -210,6 +210,10 @@ void enc3_stream_encoder_update_hdmi_info_packets(
+ 	enc3_update_hdmi_info_packet(enc1, 3, &info_frame->spd);
+ 	enc3_update_hdmi_info_packet(enc1, 4, &info_frame->hdrsmd);
+ 	enc3_update_hdmi_info_packet(enc1, 6, &info_frame->vtem);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		enc3_update_hdmi_info_packet(enc1, 7, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ void enc3_stream_encoder_stop_hdmi_info_packets(
+@@ -217,6 +221,7 @@ void enc3_stream_encoder_stop_hdmi_info_packets(
+ {
+ 	struct dcn10_stream_encoder *enc1 = DCN10STRENC_FROM_STRENC(enc);
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	/* stop generic packets 0,1 on HDMI */
+ 	REG_SET_4(HDMI_GENERIC_PACKET_CONTROL0, 0,
+ 		HDMI_GENERIC0_CONT, 0,
+@@ -492,6 +497,14 @@ void enc3_stream_encoder_update_dp_info_packets(
+ 				&info_frame->adaptive_sync,
+ 				true);
+ 
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h) */
++	if (info_frame->hdr10plus.valid)
++		enc->vpg->funcs->update_generic_info_packet(
++				enc->vpg,
++				6,  /* packetIndex */
++				&info_frame->hdr10plus,
++				true);
++
+ 	/* enable/disable transmission of packet(s).
+ 	 * If enabled, packet transmission begins on the next frame
+ 	 */
+@@ -499,6 +512,10 @@ void enc3_stream_encoder_update_dp_info_packets(
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP2_ENABLE, info_frame->spd.valid);
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP3_ENABLE, info_frame->hdrsmd.valid);
+ 	REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP5_ENABLE, info_frame->adaptive_sync.valid);
++	/* Hades: GSP6 only while HDR10+ is or was sent here: never on eDP, nor without it */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		REG_UPDATE(DP_SEC_CNTL, DP_SEC_GSP6_ENABLE, info_frame->hdr10plus.valid);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ 
+ 	/* This bit is the master enable bit.
+ 	 * When enabling secondary stream engine,
+diff --git a/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_stream_encoder.c
+index 35845e6..c1103c7 100644
+--- a/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_stream_encoder.c
+@@ -161,6 +161,7 @@ static void enc42_stream_encoder_stop_dp_info_packets(
+ 	struct dcn10_stream_encoder *enc1 = DCN10STRENC_FROM_STRENC(enc);
+ 	uint32_t value = 0;
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	REG_SET_9(DP_SEC_CNTL, 0,
+ 		DP_SEC_GSP0_ENABLE, 0,
+ 		DP_SEC_GSP1_ENABLE, 0,
+@@ -198,6 +199,10 @@ static void enc42_stream_encoder_update_hdmi_info_packets(
+ 	enc3_update_hdmi_info_packet(enc1, 3, &info_frame->spd);
+ 	enc3_update_hdmi_info_packet(enc1, 4, &info_frame->hdrsmd);
+ 	enc3_update_hdmi_info_packet(enc1, 6, &info_frame->vtem);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		enc3_update_hdmi_info_packet(enc1, 7, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ static void enc42_dp_set_dsc_pps_info_packet(struct stream_encoder *enc,
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+index cff5c95..f385074 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn30/dcn30_hpo_frl_stream_encoder.c
+@@ -321,6 +321,10 @@ void hpo_enc3_update_hdmi_info_packets(struct hpo_frl_stream_encoder *enc,
+ 	/* 5-10 used by dsc */
+ 	hpo_enc3_update_hdmi_info_packet(enc3, 11, &info_frame->hfvsif);
+ 	hpo_enc3_update_hdmi_info_packet(enc3, 12, &info_frame->vtem);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		hpo_enc3_update_hdmi_info_packet(enc3, 13, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ void hpo_enc3_update_hdmi_info_packet(struct dcn30_hpo_frl_stream_encoder *enc3,
+@@ -560,6 +564,7 @@ void hpo_enc3_stop_hdmi_info_packets(
+ {
+ 	struct dcn30_hpo_frl_stream_encoder *enc3 = DCN30_HPO_FRL_STRENC_FROM_HPO_FRL_STRENC(enc);
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	/* TODO: should also set extended metadata packet bit back to 0? */
+ 
+ 	/* stop generic packets 0,1 on HDMI */
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c
+index 79d6ab8..409a6ee 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c
+@@ -486,6 +486,14 @@ static void dcn31_hpo_dp_stream_enc_update_dp_info_packets(
+ 				&info_frame->adaptive_sync,
+ 				true);
+ 
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h) */
++	if (info_frame->hdr10plus.valid)
++		enc->vpg->funcs->update_generic_info_packet(
++				enc->vpg,
++				6,  /* packetIndex */
++				&info_frame->hdr10plus,
++				true);
++
+ 	/* enable/disable transmission of packet(s).
+ 	 * If enabled, packet transmission begins on the next frame
+ 	 */
+@@ -493,6 +501,10 @@ static void dcn31_hpo_dp_stream_enc_update_dp_info_packets(
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL2, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, info_frame->spd.valid);
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL3, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, info_frame->hdrsmd.valid);
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL5, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, info_frame->adaptive_sync.valid);
++	/* Hades: GSP6 only while HDR10+ is or was sent here */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL6, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, info_frame->hdr10plus.valid);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ 
+ 	/* check if dynamic metadata packet transmission is enabled */
+ 	REG_GET(DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL,
+@@ -516,6 +528,10 @@ static void dcn31_hpo_dp_stream_enc_stop_dp_info_packets(
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL0, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, 0);
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL2, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, 0);
+ 	REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL3, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, 0);
++	/* Hades: GSP6 only where HDR10+ was sent */
++	if (enc->hdr10plus_sent)
++		REG_UPDATE(DP_SYM32_ENC_SDP_GSP_CONTROL6, GSP_VIDEO_CONTINUOUS_TRANSMISSION_ENABLE, 0);
++	enc->hdr10plus_sent = false;
+ 
+ 	/* Disable secondary data path if audio is also disabled */
+ 	REG_GET_4(DP_SYM32_ENC_SDP_AUDIO_CONTROL0,
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.h b/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.h
+index 66739c6..af97b5b 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.h
+@@ -77,6 +77,7 @@
+ 	SRI(DP_SYM32_ENC_SDP_GSP_CONTROL2, DP_SYM32_ENC, id),\
+ 	SRI(DP_SYM32_ENC_SDP_GSP_CONTROL3, DP_SYM32_ENC, id),\
+ 	SRI(DP_SYM32_ENC_SDP_GSP_CONTROL5, DP_SYM32_ENC, id),\
++	SRI(DP_SYM32_ENC_SDP_GSP_CONTROL6, DP_SYM32_ENC, id),\
+ 	SRI(DP_SYM32_ENC_SDP_GSP_CONTROL11, DP_SYM32_ENC, id),\
+ 	SRI(DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL, DP_SYM32_ENC, id),\
+ 	SRI(DP_SYM32_ENC_SDP_AUDIO_CONTROL0, DP_SYM32_ENC, id),\
+@@ -114,6 +115,7 @@
+ 	uint32_t DP_SYM32_ENC_SDP_GSP_CONTROL2;\
+ 	uint32_t DP_SYM32_ENC_SDP_GSP_CONTROL3;\
+ 	uint32_t DP_SYM32_ENC_SDP_GSP_CONTROL5;\
++	uint32_t DP_SYM32_ENC_SDP_GSP_CONTROL6;\
+ 	uint32_t DP_SYM32_ENC_SDP_GSP_CONTROL11;\
+ 	uint32_t DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL;\
+ 	uint32_t DP_SYM32_ENC_SDP_AUDIO_CONTROL0;\
+diff --git a/drivers/gpu/drm/amd/display/dc/hpo/dcn401/dcn401_hpo_frl_stream_encoder.c b/drivers/gpu/drm/amd/display/dc/hpo/dcn401/dcn401_hpo_frl_stream_encoder.c
+index 85b7a44..4b388cd 100644
+--- a/drivers/gpu/drm/amd/display/dc/hpo/dcn401/dcn401_hpo_frl_stream_encoder.c
++++ b/drivers/gpu/drm/amd/display/dc/hpo/dcn401/dcn401_hpo_frl_stream_encoder.c
+@@ -477,6 +477,10 @@ void hpo_enc401_update_hdmi_info_packets(struct hpo_frl_stream_encoder *enc,
+ 	/* 5-10 used by dsc */
+ 	hpo_enc401_update_hdmi_info_packet(enc401, 11, &info_frame->hfvsif);
+ 	hpo_enc401_update_hdmi_info_packet(enc401, 12, &info_frame->vtem);
++	/* Hades: HDR10+ (amdgpu_dm_hdr10plus.h); its packet only while it is or was sent */
++	if (info_frame->hdr10plus.valid || enc->hdr10plus_sent)
++		hpo_enc401_update_hdmi_info_packet(enc401, 13, &info_frame->hdr10plus);
++	enc->hdr10plus_sent = info_frame->hdr10plus.valid;
+ }
+ 
+ void hpo_enc401_hdmi_set_dsc_config(
+@@ -597,6 +601,7 @@ void hpo_enc401_stop_hdmi_info_packets(
+ {
+ 	struct dcn401_hpo_frl_stream_encoder *enc401 = DCN401_HPO_FRL_STRENC_FROM_HPO_FRL_STRENC(enc);
+ 
++	enc->hdr10plus_sent = false; /* Hades: the HDR10+ packet stops with the others */
+ 	/* TODO: should also set extended metadata packet bit back to 0? */
+ 
+ 	/* stop generic packets 0,1 on HDMI */
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
+index 2b95cb1..726a925 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
+@@ -92,6 +92,8 @@ struct encoder_info_frame {
+ 	struct dc_info_packet avi;
+ 	struct dc_info_packet gamut;
+ 	struct dc_info_packet vendor;
++	/* Hades: HDR10+ vendor InfoFrame (HDMI) or InfoFrame SDP (DP), amdgpu_dm_hdr10plus.h */
++	struct dc_info_packet hdr10plus;
+ 	struct dc_info_packet hfvsif;
+ 	struct dc_info_packet vtem;
+ 	/* source product description */
+@@ -129,6 +131,7 @@ struct stream_encoder {
+ 	struct vpg *vpg;
+ 	struct afmt *afmt;
+ 	struct apg *apg;
++	bool hdr10plus_sent; /* Hades: it sends the HDR10+ packet (amdgpu_dm_hdr10plus.h) */
+ };
+ 
+ struct enc_state {
+@@ -310,6 +313,11 @@ struct hpo_frl_stream_encoder_state {
+  * configuration.
+  */
+ struct hpo_frl_stream_encoder {
++	/**
++	 * @hdr10plus_sent: Hades: it sends the HDR10+ packet (amdgpu_dm_hdr10plus.h)
++	 */
++	bool hdr10plus_sent;
++
+ 	/**
+ 	 * @funcs: callback functions for using FRL stream encoder.
+ 	 */
+@@ -528,6 +536,7 @@ struct hpo_dp_stream_encoder {
+ 	enum engine_id id;
+ 	struct vpg *vpg;
+ 	struct apg *apg;
++	bool hdr10plus_sent; /* Hades: it sends the HDR10+ packet (amdgpu_dm_hdr10plus.h) */
+ };
+ 
+ struct hpo_dp_stream_encoder_funcs {
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.h b/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.h
+index 68e7140..354ce85 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.h
+@@ -388,6 +388,7 @@ unsigned int dcn32_get_max_hw_cursor_size(const struct dc *dc,
+       SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL2, DP_SYM32_ENC, id),                \
+       SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL3, DP_SYM32_ENC, id),                \
+       SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL5, DP_SYM32_ENC, id),                \
++      SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL6, DP_SYM32_ENC, id),                \
+       SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL11, DP_SYM32_ENC, id),               \
+       SRI_ARR(DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL, DP_SYM32_ENC, id),     \
+       SRI_ARR(DP_SYM32_ENC_SDP_AUDIO_CONTROL0, DP_SYM32_ENC, id),              \
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource.h b/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource.h
+index 3e4d9b1..87c2377 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource.h
+@@ -308,6 +308,7 @@
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL2, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL3, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL5, DP_SYM32_ENC, id),                           \
++		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL6, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL11, DP_SYM32_ENC, id),                          \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL, DP_SYM32_ENC, id),                \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_AUDIO_CONTROL0, DP_SYM32_ENC, id),                         \
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dcn42b/dcn42b_resource.h b/drivers/gpu/drm/amd/display/dc/resource/dcn42b/dcn42b_resource.h
+index 2824a0e..4ea5fa4 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dcn42b/dcn42b_resource.h
++++ b/drivers/gpu/drm/amd/display/dc/resource/dcn42b/dcn42b_resource.h
+@@ -290,6 +290,7 @@
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL2, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL3, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL5, DP_SYM32_ENC, id),                           \
++		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL6, DP_SYM32_ENC, id),                           \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_GSP_CONTROL11, DP_SYM32_ENC, id),                          \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_METADATA_PACKET_CONTROL, DP_SYM32_ENC, id),                \
+ 		SRI_ARR(DP_SYM32_ENC_SDP_AUDIO_CONTROL0, DP_SYM32_ENC, id)
+-- 
+2.53.0
+

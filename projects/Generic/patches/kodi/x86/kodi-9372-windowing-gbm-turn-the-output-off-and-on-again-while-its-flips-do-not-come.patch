@@ -1,0 +1,273 @@
+From fc4c25c25ab5deb23051a7e18f30b02726d2bca8 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:41:42 +0000
+Subject: [PATCH] windowing/gbm: turn the output off and on again while its
+ flips do not come
+
+When the flip of the frame before does not come (kodi-9207), Kodi turns the
+output off and on again from the second stall in a row. Whether it came on
+was read from Kodi's cache of the properties of the CRTC, which holds what
+Kodi asked for, and the next reset could only come a minute later, three
+times while Kodi runs. nvidia-drm takes the modeset that turns the head on
+and returns 0 even when it then fails to apply it ("Failed to apply atomic
+modeset. Error code: -22" in the kernel log): neither the cache nor the
+state of the kernel says so. That is the test of 2026-10-14, where the
+display stayed without a signal: one reset, nothing logged after it, and
+none again for a minute.
+
+Whether the output is on is now read from the kernel, and what tells whether
+the display came back is the flips: while they still do not come, the output
+is turned off and on again after 1, 2, 4 ... 64 s (CFlipStallRecovery, which
+only decides). A failure ends once flips have come for 10 s, and the next one
+starts again with the short waits. Each wait spans frames: nothing loops or
+blocks in one of them, and every reset is logged.
+---
+ xbmc/windowing/gbm/FlipStallRecovery.h        | 99 +++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 59 +++++------
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  | 11 +--
+ 3 files changed, 132 insertions(+), 37 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/FlipStallRecovery.h
+
+diff --git a/xbmc/windowing/gbm/FlipStallRecovery.h b/xbmc/windowing/gbm/FlipStallRecovery.h
+new file mode 100644
+index 0000000..dc78d8b
+--- /dev/null
++++ b/xbmc/windowing/gbm/FlipStallRecovery.h
+@@ -0,0 +1,99 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: when the output is turned off and on again for flips that do not come
++ *        (CWinSystemGbmGLESContext::FlipStalled())
++ *
++ * Stalls each within WINDOW of the one before are one failure that goes on; it ends once flips
++ * have come for WINDOW. From its second stall the output is turned off and on again, and again
++ * while the flips still do not come: FIRST_WAIT after that, then twice as long each time, up to
++ * MAX_WAIT. Whether turning it on worked is not known from the driver: nvidia-drm takes a modeset
++ * that it then fails to apply ("Failed to apply atomic modeset", the commit returning 0), and
++ * neither the state of the kernel nor Kodi's cache says so. Only the flips do.
++ *
++ * Before, a reset was made at most once a minute and three times while Kodi ran: in the test of
++ * 2026-10-14 the first one did not bring the display back, and the next could only come a minute
++ * later, with no picture meanwhile.
++ *
++ * This class only decides.
++ */
++class CFlipStallRecovery
++{
++public:
++  using Clock = std::chrono::steady_clock;
++
++  //! The flip of the frame before did not come in time: whether to turn the output off and on now
++  bool Stalled(Clock::time_point now)
++  {
++    if (!m_stalls || now - m_last >= WINDOW)
++    {
++      m_stalls = 0;
++      m_resetsHere = 0;
++      m_wait = FIRST_WAIT;
++    }
++    ++m_stalls;
++    ++m_seen;
++    m_last = now;
++    if (m_stalls < 2 || (m_resetsHere && now - m_lastReset < m_wait))
++      return false;
++    if (m_resetsHere)
++      m_wait = std::min<Clock::duration>(2 * m_wait, MAX_WAIT);
++    m_lastReset = now;
++    ++m_resetsHere;
++    ++m_resets;
++    return true;
++  }
++
++  //! A flip came in time: true when that ends a failure (none stalled for WINDOW)
++  bool Came(Clock::time_point now)
++  {
++    if (!m_stalls || now - m_last < WINDOW)
++      return false;
++    m_stalls = 0;
++    m_resetsHere = 0;
++    m_wait = FIRST_WAIT;
++    return true;
++  }
++
++  unsigned int Stalls() const { return m_stalls; } //!< in a row
++  unsigned int Seen() const { return m_seen; } //!< since Kodi started
++  unsigned int Resets() const { return m_resets; } //!< since Kodi started
++  unsigned int ResetsHere() const { return m_resetsHere; } //!< in this failure
++  //! How long after the last reset the next one may come
++  Clock::duration Wait() const { return m_wait; }
++
++  static constexpr auto WINDOW = std::chrono::seconds(10);
++  static constexpr auto FIRST_WAIT = std::chrono::seconds(1);
++  static constexpr auto MAX_WAIT = std::chrono::seconds(64);
++
++private:
++  unsigned int m_stalls = 0;
++  unsigned int m_seen = 0;
++  unsigned int m_resets = 0;
++  unsigned int m_resetsHere = 0;
++  Clock::time_point m_last{};
++  Clock::time_point m_lastReset{};
++  Clock::duration m_wait = FIRST_WAIT;
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 9982e24..1a88e7c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -112,12 +112,8 @@ int GuiReferenceWhite()
+ // the next refresh once the GPU has finished that frame, in tens of milliseconds; one that has
+ // not come by then does not come (FlipStalled()).
+ constexpr std::chrono::milliseconds FLIP_STALL_WAIT{2000};
+-// Stalls this close to each other are one failure that goes on
+-constexpr auto FLIP_STALL_WINDOW = std::chrono::seconds(10);
+-// The output is turned off and on again for it at most once in this time, and at most this many
+-// times while Kodi runs
+-constexpr auto FLIP_RESET_INTERVAL = std::chrono::seconds(60);
+-constexpr unsigned int FLIP_RESETS_MAX = 3;
++// (Hades: stalls that are one failure, and when the output is turned off and on again for them:
++// CFlipStallRecovery)
+ 
+ #ifdef HAVE_DVBRIDGE
+ // How long the flip of a commit is waited for: it comes with the next refresh once the GPU has
+@@ -747,34 +743,38 @@ bool CWinSystemGbmGLESContext::FlipStalled()
+   if (!drm || !drm->IsActive())
+     return false;
+   const auto now = std::chrono::steady_clock::now();
+-  m_flipStalls =
+-      m_flipStalls && now - m_flipStallLast < FLIP_STALL_WINDOW ? m_flipStalls + 1 : 1;
+-  m_flipStallLast = now;
+-  ++m_flipStallsSeen;
+-  const bool reset = m_flipStalls >= 2 && m_flipResets < FLIP_RESETS_MAX &&
+-                     (!m_flipResets || now - m_flipResetLast >= FLIP_RESET_INTERVAL);
+-  // The first 20, then one in 100: while the display engine does not come back, every frame
+-  // stalls
+-  if (m_flipStallsSeen <= 20 || m_flipStallsSeen % 100 == 0)
++  // Hades: from the second stall in a row, and again while the flips still do not come, after 1,
++  // 2, 4 ... 64 s (CFlipStallRecovery). Whether the output came on again is known only from the
++  // flips: nvidia-drm takes a modeset that it then fails to apply, and says nothing of it.
++  const bool reset = m_flipRecovery.Stalled(now);
++  const unsigned int seen = m_flipRecovery.Seen();
++  // The first 20, then one in 100, and every one that turns the output off and on: while the
++  // display engine does not come back, every frame stalls
++  if (seen <= 20 || seen % 100 == 0 || reset)
+     CLog::Log(LOGERROR,
+               "The flip of the frame before did not come within {} ms ({} in a row, {} since "
+               "Kodi started): {}",
+-              FLIP_STALL_WAIT.count(), m_flipStalls, m_flipStallsSeen,
+-              reset ? "the output is turned off and on again, and the commit of this frame waits"
+-                    : "the commit of this frame waits (the driver then completes the flips that "
+-                      "have not come)");
++              FLIP_STALL_WAIT.count(), m_flipRecovery.Stalls(), seen,
++              reset ? StringUtils::Format(
++                          "the output is turned off and on again ({} in this failure; again in "
++                          "{} s at the earliest if flips still do not come), and the commit of "
++                          "this frame waits",
++                          m_flipRecovery.ResetsHere(),
++                          std::chrono::duration_cast<std::chrono::seconds>(m_flipRecovery.Wait())
++                              .count())
++                    : std::string("the commit of this frame waits (the driver then completes the "
++                                  "flips that have not come)"));
+   if (reset)
+   {
+-    m_flipResetLast = now;
+-    ++m_flipResets;
+     // The output off first: that commit waits, and the flips that have not come are completed
+     // with it, and the fences that the GPU waits for (WaitSyncGPU()) with them. Only then are the
+     // display resources told that the display is lost, as for a change of mode: a renderer that
+     // is flushed for it waits for the GPU (glFinish()), which would wait for good before. They are
+     // told that it is back once the configured delay has passed (SendDisplayReset()).
+-    // (what the driver accepted is what the properties of the CRTC hold)
++    // (Hades: whether the output is on is what the kernel says of the CRTC now, not Kodi's cache
++    // of the properties, which holds what Kodi asked for)
+     const auto on = [&drm]
+-    { return drm->GetCrtc() && drm->GetCrtc()->GetPropertyValue("ACTIVE").value_or(0) != 0; };
++    { return drm->GetCrtc() && drm->GetCrtc()->ReadPropertyValue("ACTIVE").value_or(0) != 0; };
+     Hide();
+     // When the driver did not take the output off, nothing has completed the flips: the display
+     // resources are not told (the commit of this frame, which waits, completes them)
+@@ -806,14 +806,14 @@ bool CWinSystemGbmGLESContext::FlipStalled()
+ 
+ void CWinSystemGbmGLESContext::FlipCame()
+ {
+-  if (!m_flipStalls || std::chrono::steady_clock::now() - m_flipStallLast < FLIP_STALL_WINDOW)
++  const unsigned int stalls = m_flipRecovery.Stalls();
++  if (!m_flipRecovery.Came(std::chrono::steady_clock::now()))
+     return;
+   CLog::Log(LOGINFO,
+             "Flips come again: none has stalled for {} s since the last of {} in a row (the "
+             "output was turned off and on again {} times since Kodi started)",
+-            std::chrono::duration_cast<std::chrono::seconds>(FLIP_STALL_WINDOW).count(),
+-            m_flipStalls, m_flipResets);
+-  m_flipStalls = 0;
++            std::chrono::duration_cast<std::chrono::seconds>(CFlipStallRecovery::WINDOW).count(),
++            stalls, m_flipRecovery.Resets());
+ }
+ 
+ void CWinSystemGbmGLESContext::FlipOutputOn()
+@@ -825,8 +825,9 @@ void CWinSystemGbmGLESContext::FlipOutputOn()
+     m_flipOutputOff = false;
+     return;
+   }
+-  // (what the driver accepted is what the properties of the CRTC hold)
+-  if (drm->GetCrtc() && drm->GetCrtc()->GetPropertyValue("ACTIVE").value_or(0) != 0)
++  // (Hades: what the kernel says of the CRTC now; flips that still do not come once it says so are
++  // met by FlipStalled())
++  if (drm->GetCrtc() && drm->GetCrtc()->ReadPropertyValue("ACTIVE").value_or(0) != 0)
+   {
+     CLog::Log(LOGINFO, "The output is on again");
+     m_flipOutputOff = false;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 8c7d2ed..b45922b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "FlipStallRecovery.h"
+ #include "WinSystemGbmEGLContext.h"
+ #include "cores/VideoPlayer/VideoRenderers/FrameBufferObject.h"
+ #include "rendering/gles/RenderSystemGLES.h"
+@@ -214,14 +215,8 @@ private:
+   bool m_flipOutputOff{false};
+   std::chrono::steady_clock::time_point m_flipOutputTry{};
+   std::chrono::steady_clock::duration m_flipOutputWait{};
+-  //! Stalls of the flip, each within FLIP_STALL_WINDOW of the one before; 0 once flips have come
+-  //! for that long
+-  unsigned int m_flipStalls{0};
+-  unsigned int m_flipStallsSeen{0}; //!< since Kodi started, for the log
+-  std::chrono::steady_clock::time_point m_flipStallLast{};
+-  //! Times that the output was turned off and on again for it, and when the last was
+-  unsigned int m_flipResets{0};
+-  std::chrono::steady_clock::time_point m_flipResetLast{};
++  //! Stalls of the flip, and when the output is turned off and on again for them
++  CFlipStallRecovery m_flipRecovery;
+ 
+   bool m_guiCompositing{false};
+   CFrameBufferObject m_guiFbo;
+-- 
+2.53.0
+

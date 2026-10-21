@@ -1,0 +1,213 @@
+From 400e09e1fba4b4f181b45d4f9f500fc593707333 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:16:14 +0000
+Subject: [PATCH] windowing/gbm: set the mode again after a wake where the
+ driver left it off
+
+The user of an HP ZBook 17 G6 (Quadro RTX 4000) reports no picture after a
+wake from suspend. nvidia-drm turns every head off to suspend and resets
+its DRM state (drm_mode_config_reset() in nv_drm_suspend_resume()), and does
+not restore it on resume: its comment says that the DRM client will restore
+the mode, which assumes a VT switch that Kodi on GBM does not make. Kodi
+went on committing its planes on a head that the kernel has off: the kernel
+refuses those commits, the fallback to the last accepted request is refused
+too, and nothing sets the mode again. amdgpu and i915 restore the state
+themselves (drm_mode_config_helper_resume()).
+
+CPowerManager::OnWake() now first calls the new CWinSystemBase::OnSystemWake()
+(empty by default). On GBM it reads the ACTIVE property of the CRTC that Kodi
+drives from the kernel and decides with DRMWake.h (pure):
+- Kodi had the output off (DPMS): it is left off;
+- the kernel has it on (amdgpu, i915): nothing is done;
+- the kernel has it off while Kodi had it on: the next frame is a modeset
+  of the mode Kodi has (connector, mode and ACTIVE, as at start);
+- the state cannot be read: nothing is done.
+Each case is logged ("Wake: ..."), so that the next report says which one
+it was. Nothing changes outside a wake.
+---
+ xbmc/powermanagement/PowerManager.cpp |  7 ++--
+ xbmc/windowing/WinSystem.h            |  3 ++
+ xbmc/windowing/gbm/WinSystemGbm.cpp   | 41 ++++++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.h     |  3 ++
+ xbmc/windowing/gbm/drm/DRMWake.h      | 49 +++++++++++++++++++++++++++
+ 5 files changed, 101 insertions(+), 2 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/drm/DRMWake.h
+
+diff --git a/xbmc/powermanagement/PowerManager.cpp b/xbmc/powermanagement/PowerManager.cpp
+index 24b6b25..10b6c5d 100644
+--- a/xbmc/powermanagement/PowerManager.cpp
++++ b/xbmc/powermanagement/PowerManager.cpp
+@@ -37,9 +37,7 @@
+ #include "utils/log.h"
+ #include "weather/WeatherManager.h"
+ 
+-#if defined(TARGET_DARWIN_OSX) || defined(TARGET_WINDOWS)
+ #include "windowing/WinSystem.h"
+-#endif
+ 
+ #include <list>
+ #include <memory>
+@@ -219,6 +217,11 @@ void CPowerManager::OnWake()
+ {
+   CLog::Log(LOGINFO, "{}: Running resume jobs", __FUNCTION__);
+ 
++  // Hades: the output first, where the driver turned it off to suspend and left the mode to its
++  // client (nvidia-drm): CWinSystemGbm::OnSystemWake()
++  if (auto* winSystem = CServiceBroker::GetWinSystem())
++    winSystem->OnSystemWake();
++
+   CServiceBroker::GetNetwork().WaitForNet();
+ 
+   // reset out timers
+diff --git a/xbmc/windowing/WinSystem.h b/xbmc/windowing/WinSystem.h
+index 24f7e72..21a25c1 100644
+--- a/xbmc/windowing/WinSystem.h
++++ b/xbmc/windowing/WinSystem.h
+@@ -117,6 +117,9 @@ public:
+   virtual bool IsCreated(){ return m_bWindowCreated; }
+   virtual void NotifyAppFocusChange(bool bGaining) {}
+   virtual void NotifyAppActiveChange(bool bActivated) {}
++  //! Hades: the system woke from a suspend (CPowerManager::OnWake(), before the other resume
++  //! jobs): an output that the driver left off is set again (CWinSystemGbm)
++  virtual void OnSystemWake() {}
+   virtual void ShowOSMouse(bool show) {}
+   virtual bool HasCursor(){ return true; }
+   //some platforms have api for gesture inertial scrolling - default to false and use the InertialScrollingHandler
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 3f86a16..12cbcce 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -16,6 +16,7 @@
+ #include "dialogs/GUIDialogKaiToast.h"
+ #include "drm/DRMAtomic.h"
+ #include "drm/DRMDisplayWatch.h"
++#include "drm/DRMWake.h"
+ #include "drm/DVBridgeLink.h"
+ #ifdef HAVE_DVBRIDGE
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+@@ -26,6 +27,7 @@
+ #include "drm/OffScreenModeSetting.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIUtils.h"
++#include "guilib/GUIWindowManager.h"
+ #include "messaging/ApplicationMessenger.h"
+ #include "resources/LocalizeStrings.h"
+ #include "resources/ResourcesComponent.h"
+@@ -377,6 +379,45 @@ bool CWinSystemGbm::ResizeWindow(int newWidth, int newHeight, int newLeft, int n
+   return true;
+ }
+ 
++void CWinSystemGbm::OnSystemWake()
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  auto* crtc = drm ? drm->GetCrtc() : nullptr;
++  if (!crtc)
++    return;
++  const auto active = crtc->ReadPropertyValue("ACTIVE");
++  switch (DRMWAKE::AfterWake(drm->IsActive(), active))
++  {
++    case DRMWAKE::Output::OFF_BY_KODI:
++      CLog::Log(LOGINFO, "Wake: the output was off before the suspend (Kodi had turned it off): it "
++                         "is left off");
++      return;
++    case DRMWAKE::Output::UNKNOWN:
++      CLog::Log(LOGWARNING,
++                "Wake: the state of CRTC {} could not be read after the suspend: nothing is done",
++                crtc->GetCrtcId());
++      return;
++    case DRMWAKE::Output::KEPT:
++      CLog::Log(LOGINFO,
++                "Wake: the kernel kept the output on through the suspend (CRTC {} is active): "
++                "nothing to do",
++                crtc->GetCrtcId());
++      return;
++    case DRMWAKE::Output::SET_AGAIN:
++      break;
++  }
++  // The driver turned the output off to suspend and left the mode to its client: the next frame
++  // sets the mode Kodi has (a modeset with the connector, the mode and ACTIVE), as at start
++  CLog::Log(LOGINFO,
++            "Wake: the kernel has the output off after the suspend (CRTC {} is not active) while "
++            "Kodi had it on: the driver leaves the mode to its client (nvidia-drm turns every head "
++            "off to suspend); the mode is set again with the next frame",
++            crtc->GetCrtcId());
++  drm->AllowModeset();
++  if (auto* gui = CServiceBroker::GetGUI())
++    gui->GetWindowManager().MarkDirty();
++}
++
+ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays)
+ {
+   // (the output is being set up: the outputs are not looked at for a while, see VideoSeen())
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 4304e95..bc6be02 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -60,6 +60,9 @@ public:
+ 
+   bool ResizeWindow(int newWidth, int newHeight, int newLeft, int newTop) override;
+   bool SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays) override;
++  //! Hades: after a wake from suspend, the mode is set again with the next frame where the
++  //! kernel has the output off while Kodi had it on (DRMWake.h); the log says which case
++  void OnSystemWake() override;
+ 
+   void FlipPage(bool rendered, bool videoLayer, bool async);
+   //! Tells the user that the TV input is in its HDMI 1.4 compatibility mode
+diff --git a/xbmc/windowing/gbm/drm/DRMWake.h b/xbmc/windowing/gbm/drm/DRMWake.h
+new file mode 100644
+index 0000000..5163b33
+--- /dev/null
++++ b/xbmc/windowing/gbm/drm/DRMWake.h
+@@ -0,0 +1,49 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++/*
++ * Hades: what to do with the output after the system woke from a suspend (CPowerManager::OnWake(),
++ * CWinSystemGbm::OnSystemWake()).
++ *
++ * amdgpu and i915 save the state of their outputs on suspend and restore it on resume
++ * (drm_mode_config_helper_suspend()/resume()): the output is on as before, and Kodi's commits go
++ * on. nvidia-drm does not: NVKMS turns every head off to suspend, nvidia-drm resets the DRM state
++ * (drm_mode_config_reset() in nv_drm_suspend_resume()), and its comment says that "the DRM client
++ * (or fbdev helper functions) will restore the appropriate mode on resume", which assumes a VT
++ * switch that Kodi on GBM does not make. Kodi went on with commits of its planes on a head that the
++ * kernel has off: the kernel refuses them, and the screen stays black.
++ *
++ * The kernel's own state says which case it is: the ACTIVE property of the CRTC that Kodi drives,
++ * read from the kernel after the wake. Pure: a test builds it on the host.
++ */
++namespace DRMWAKE
++{
++enum class Output
++{
++  OFF_BY_KODI, //!< Kodi had the output off (DPMS): it is left so
++  UNKNOWN, //!< the kernel's state could not be read: nothing is done
++  KEPT, //!< the kernel has the output on, as Kodi does: nothing to do (amdgpu, i915)
++  SET_AGAIN, //!< the kernel has it off while Kodi had it on: the mode is set again (nvidia-drm)
++};
++
++//! \param kodiActive whether Kodi has the output on (CDRMAtomic::IsActive())
++//! \param kernelActive the ACTIVE property of the CRTC as the kernel has it now
++inline Output AfterWake(bool kodiActive, std::optional<uint64_t> kernelActive)
++{
++  if (!kodiActive)
++    return Output::OFF_BY_KODI;
++  if (!kernelActive.has_value())
++    return Output::UNKNOWN;
++  return *kernelActive != 0 ? Output::KEPT : Output::SET_AGAIN;
++}
++} // namespace DRMWAKE
+-- 
+2.53.0
+

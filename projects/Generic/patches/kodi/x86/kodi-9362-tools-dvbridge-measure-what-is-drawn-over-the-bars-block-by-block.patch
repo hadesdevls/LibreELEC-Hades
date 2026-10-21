@@ -1,0 +1,247 @@
+From 54e8a0ed4fd833b4f77e7c89ac9000dc30470950 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 15:12:50 +0000
+Subject: [PATCH] tools/dvbridge: measure what is drawn over the bars block by
+ block
+
+With something drawn over the bars of a film (the dimmed background of a
+window, an OSD that spans the width, the seek bar of an Estuary skin), a
+Radeon RX 7600 showed the frames of native Dolby Vision at about 16 a
+second instead of 24 (issue 3: 158 to 167 frames in 10 s, nearly all of
+them composed with GUI elements), and their GPU time alternated about
+every second between 42-50 ms and 3.5-4.5 ms, with the presentation a
+frame ahead switched on and off with it. Text subtitles, which cover few
+pixels of the bars, kept 240 of 240.
+
+A frame with something drawn over its picture tells the display, in its
+level 5 block, the edges beyond which something is drawn. A frame
+presented the way that waits measures them before it is packed
+(dvbridge_source_cover()); a frame presented a frame ahead does not, and
+takes every edge that has bars. The measurement drew one point for each
+pixel of the bars into a 1x1 target, where each pixel that something is
+drawn over landed and was blended by the maximum: for a 2.39:1 film, 2.1
+million points, every one of them under a dimmed background blended into
+the same pixel. A GPU blends the fragments of one pixel one after the
+other, in the order of the points. On that GPU it took about 40 ms of GPU
+time (the frames that measured took 42-50 ms, the same frames a frame
+ahead 3.5-4.5 ms): more than the 41.7 ms of a film refresh. Such frames
+then called for being presented a frame ahead (CDVAhead: half a refresh
+over 24 frames), which skipped the measurement, after which 4.5 ms no
+longer called for it (a third), and the next 24 frames measured again; a
+frame of 42-50 ms presented the way that waits misses its refresh, so 24
+frames went at 12 a second and 24 at 24, about 16 a second in all.
+
+Now one fragment for each block of 16 x 16 pixels of the raster reads the
+pixels of the bars in its block and writes the edges that those drawn
+over among them lie beyond; the 240 x 135 texels are read back and put
+together on the CPU. Each pixel of the bars is read once, nothing is
+blended, and the blocks are read side by side. The edges are the same:
+the same pixels (those outside the active picture), the same test of each
+(its alpha is not 2), the same edges of each (left where x < x0, right
+where x >= x1, top where y < y0, bottom where y >= y1). Nothing is kept
+from one frame to the next. The state that the read back takes (the row
+length and skips of packing, a pixel pack buffer) is set for it and put
+back.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe), not on a GPU or
+a display, with a test of its own (cover_test.c):
+- the edges, against those counted on the CPU from the picture read back
+  and against those of the measurement before (copied into the test), in
+  268 cases: 9 active areas (a 2.39:1 film, pillarbox, windowbox, odd
+  margins, one row of bars, one active column, one active row, margins
+  at the boundaries of the blocks, none) with, for each, 9 drawings (none,
+  a dimmed background, an OSD strip, a strip over the top, text, an
+  opacity of 1/255 over everything, of 2^-20, something inside the active
+  picture only, 300 random pixels) and up to 25 single pixels (each
+  corner, either side of each edge, the boundaries of the blocks, random
+  ones): the same in all of them;
+- five mutations each make it fail: the last row of each block left out,
+  the first column right of the active picture left out, an alpha below
+  1.99 taken for drawn over, two edges swapped, half of the texels not
+  read;
+- 28 frames of two pictures of a profile 7 FEL stream, in each transport,
+  drawn the composed way with seven drawings over them, packed with what
+  is drawn measured and committed one after the other: the bytes are
+  those of the tree before, to the bit, and so are the level 5 blocks,
+  the metadata ids and the scene refreshes they carry;
+- the measurement, its read back included, over the bars of the 2.39:1
+  picture (medians of 5, in two runs): with nothing drawn 9.3-9.9 ms
+  before and 1.9 ms now, under an OSD strip 49.0-71.0 and 2.1 ms, under a
+  dimmed background 81.6-126.8 and 2.1-2.2 ms; a frame composed with an
+  OSD strip, a progress bar and a label over it (medians of 12), 100-128
+  ms before and 50-51 ms now, and 103-140 and 50-51 ms with a GUI that
+  changes every 6 frames: what the GUI shows does not change the time,
+  and nothing is made again when it changes (the GL objects of the bridge
+  and the GPU programs of libplacebo, counted).
+
+Not verified: the time on a GPU, and the frames on a display.
+---
+ tools/dvbridge/dvbridge_source.c | 116 +++++++++++++++++--------------
+ 1 file changed, 62 insertions(+), 54 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 04ef2b6..7124a90 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -412,47 +412,51 @@ static const char PACK[] =
+     "    color = vec4(float(c >> 4u), float(y >> 4u), float((y & 15u) | ((c & 15u) << 4u)), 255.0) / 255.0;\n"
+     "}\n";
+ 
+-/* 5. The edges drawn over (dvbridge_source_cover()): one point for each pixel of the bars, which lands
+- * on the single pixel of the target where something was drawn over that pixel and outside it where
+- * nothing was, with the edges that the pixel lies beyond as its colour; blended by their maximum, the
+- * target holds the edges of all. The pixels of the bars, in the order of i: the rows above the active
+- * picture, the rows below it, and the columns on its left and right in its rows. */
+-static const char COVER_VERTEX[] =
++/* 5. The edges drawn over (dvbridge_source_cover()): the raster in blocks of COVER_BLOCK x COVER_BLOCK
++ * pixels, one fragment for each, which reads the pixels of the bars in its block (those outside the
++ * active picture) and writes, as the colour of its texel, the edges that the pixels drawn over (alpha
++ * not 2) among them lie beyond; read back, the texels together give the edges of all. A pixel lies
++ * beyond the left edge where x < x0, the right where x >= x1, the top where y < y0 and the bottom
++ * where y >= y1 (a pixel in a corner lies beyond two). Each pixel of the bars is read once, by the
++ * fragment of its block, and the blocks are read side by side.
++ * Hades: it was one point for each pixel of the bars, which landed on the single pixel of a 1x1 target
++ * where it was drawn over, blended by their maximum. A GPU blends the fragments that land on one pixel
++ * one after the other: under a GUI that covers the bars of a 2.39:1 film (its dimmed background, an
++ * OSD that spans the width), 2.1 million of them, which took about 40 ms of the 41.7 ms of a film
++ * refresh on a Radeon RX 7600 (issue 3), and made the frames that are not presented a frame ahead late:
++ * the GPU time that called for that, and those frames, measured nothing. The edges are the same. */
++#define COVER_BLOCK 16
++#define COVER_COLUMNS ((3840 + COVER_BLOCK - 1) / COVER_BLOCK)
++#define COVER_ROWS ((2160 + COVER_BLOCK - 1) / COVER_BLOCK)
++#define COVER_STRING2(x) #x
++#define COVER_STRING(x) COVER_STRING2(x)
++static const char COVER[] =
+     "#version 300 es\n"
+     "precision highp float;\n"
+     "precision highp int;\n"
+     "uniform highp sampler2D drawn;\n"
+     "uniform ivec4 active_rect;\n" /* x0, y0, x1, y1 */
+-    "flat out vec4 edges;\n"
+-    "void main()\n"
+-    "{\n"
+-    "    int i = gl_VertexID;\n"
+-    "    int above = 3840 * active_rect.y, below = 3840 * (2160 - active_rect.w);\n"
+-    "    int left = active_rect.x, sides = left + 3840 - active_rect.z;\n"
+-    "    ivec2 p;\n"
+-    "    if (i < above) {\n"
+-    "        p = ivec2(i % 3840, i / 3840);\n"
+-    "    } else if (i < above + below) {\n"
+-    "        i -= above;\n"
+-    "        p = ivec2(i % 3840, active_rect.w + i / 3840);\n"
+-    "    } else {\n"
+-    "        i -= above + below;\n"
+-    "        int s = i % sides;\n"
+-    "        p = ivec2(s < left ? s : active_rect.z + s - left, active_rect.y + i / sides);\n"
+-    "    }\n"
+-    "    edges = vec4(p.x < active_rect.x, p.x >= active_rect.z, p.y < active_rect.y,\n"
+-    "                 p.y >= active_rect.w);\n"
+-    "    bool covered = texelFetch(drawn, p, 0).a != 2.0;\n"
+-    "    gl_Position = covered ? vec4(0.0, 0.0, 0.0, 1.0) : vec4(2.0, 2.0, 2.0, 1.0);\n"
+-    "    gl_PointSize = 1.0;\n"
+-    "}\n";
+-static const char COVER_FRAGMENT[] =
+-    "#version 300 es\n"
+-    "precision highp float;\n"
+-    "flat in vec4 edges;\n"
+     "out vec4 color;\n"
+     "void main()\n"
+     "{\n"
++    "    ivec2 b0 = ivec2(gl_FragCoord.xy) * " COVER_STRING(COVER_BLOCK) ";\n"
++    "    ivec2 b1 = min(b0 + " COVER_STRING(COVER_BLOCK) ", ivec2(3840, 2160));\n"
++    "    vec4 edges = vec4(0.0);\n"
++    "    for (int y = b0.y; y < b1.y; ++y) {\n"
++    /* a row of the bars: the block's columns; a row of the active picture: those left of it and those
++     * right of it */
++    "        bool bars = y < active_rect.y || y >= active_rect.w;\n"
++    "        int left_end = bars ? b1.x : min(b1.x, active_rect.x);\n"
++    "        int right_start = bars ? b1.x : max(b0.x, active_rect.z);\n"
++    "        for (int x = b0.x; x < left_end; ++x)\n"
++    "            if (texelFetch(drawn, ivec2(x, y), 0).a != 2.0)\n"
++    "                edges = max(edges, vec4(x < active_rect.x, x >= active_rect.z, y < active_rect.y,\n"
++    "                                        y >= active_rect.w));\n"
++    "        for (int x = right_start; x < b1.x; ++x)\n"
++    "            if (texelFetch(drawn, ivec2(x, y), 0).a != 2.0)\n"
++    "                edges = max(edges, vec4(x < active_rect.x, x >= active_rect.z, y < active_rect.y,\n"
++    "                                        y >= active_rect.w));\n"
++    "    }\n"
+     "    color = edges;\n"
+     "}\n";
+ 
+@@ -474,6 +478,8 @@ struct dvbridge_source_packer {
+     GLuint pack, picture, resite, rows, cover, vao, sampler;
+     struct texture resited, chroma, edges;
+     GLint cover_drawn, cover_active;
++    /* Hades: the texels of the edges that dvbridge_source_cover() reads back */
++    uint8_t cover_read[COVER_COLUMNS * COVER_ROWS * 4];
+     /* what the rows of `chroma` are of (dvbridge_source_rows()) */
+     bool rows_made;
+     int rows_of[8], rows_half;
+@@ -566,7 +572,7 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     p->picture = link(PICTURE);
+     p->resite = link(RESITE);
+     p->rows = link(ROWS);
+-    p->cover = link_with(COVER_VERTEX, COVER_FRAGMENT);
++    p->cover = link(COVER);
+     p->cover_drawn = p->cover ? glGetUniformLocation(p->cover, "drawn") : -1;
+     p->cover_active = p->cover ? glGetUniformLocation(p->cover, "active_rect") : -1;
+     if (!p->pack || !p->picture || !p->resite || !p->rows || !p->cover || p->cover_drawn < 0 ||
+@@ -867,33 +873,35 @@ bool dvbridge_source_cover(struct dvbridge_source_packer *p, unsigned layer,
+         return true; /* no bars */
+     struct dvbridge_gl_state state;
+     begin(p, &state);
+-    /* (what dvbridge_gl_state does not keep, and this pass changes) */
+-    GLint equation[2] = {GL_FUNC_ADD, GL_FUNC_ADD}, alignment = 4;
+-    GLfloat clear[4] = {0};
+-    glGetIntegerv(GL_BLEND_EQUATION_RGB, &equation[0]);
+-    glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &equation[1]);
++    /* (what dvbridge_gl_state does not keep, and the read back takes: tightly packed rows into
++     * client memory, not into a buffer) */
++    GLint alignment = 4, row_length = 0, skip_rows = 0, skip_pixels = 0, pack_buffer = 0;
+     glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+-    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
+-    if (!target(&p->edges, GL_RGBA8, 1, 1))
++    glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
++    glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
++    glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
++    if (!target(&p->edges, GL_RGBA8, COVER_COLUMNS, COVER_ROWS))
+         return end(&state, false);
+-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+-    glClear(GL_COLOR_BUFFER_BIT);
++    /* every texel is written: nothing to clear, nothing blended */
+     glUseProgram(p->cover);
+     bind(p, 0, layer);
+     glUniform1i(p->cover_drawn, 0);
+     glUniform4i(p->cover_active, x0, y0, x1, y1);
+-    glEnable(GL_BLEND);
+-    glBlendEquation(GL_MAX);
+-    glBlendFunc(GL_ONE, GL_ONE);
+-    glDrawArrays(GL_POINTS, 0, points);
+-    glDisable(GL_BLEND);
+-    uint8_t rgba[4] = {0};
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+-    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+-    for (int i = 0; i < 4; ++i)
+-        *edges |= (rgba[i] >= 128 ? 1u : 0u) << i;
+-    glBlendEquationSeparate((GLenum)equation[0], (GLenum)equation[1]);
++    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
++    glReadPixels(0, 0, COVER_COLUMNS, COVER_ROWS, GL_RGBA, GL_UNSIGNED_BYTE, p->cover_read);
++    for (size_t t = 0; t < sizeof(p->cover_read); t += 4)
++        for (int i = 0; i < 4; ++i)
++            *edges |= (p->cover_read[t + i] >= 128 ? 1u : 0u) << i;
+     glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+-    glClearColor(clear[0], clear[1], clear[2], clear[3]);
++    glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
++    glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
++    glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack_buffer);
+     return end(&state, true);
+ }
+-- 
+2.53.0
+

@@ -27,16 +27,19 @@ namespace Hades.Installer
             if (args.Length >= 3 && (test == "--vhd-test" || test == "--prueba-vhd")) return VhdTest.Run(args[1], args[2]);
             if (args.Length >= 4 && (test == "--simulate-update" || test == "--simular-actualizar"))
             {
-                // after the three that are needed, in any order: "internal" (a disk inside the PC) and "diagnostics".
-                // Any other word is a mistake: nothing is written for it.
+                // after the three that are needed, in any order: "internal" (a disk inside the PC), "diagnostics", and
+                // "keep=<file>": the system partition that the update replaces, from which the folder hades-diag is
+                // kept. Any other word is a mistake: nothing is written for it.
                 bool inside = false, diagnostics = false;
+                string old = null;
                 for (int i = 4; i < args.Length; ++i)
                 {
                     if (args[i] == "internal" || args[i] == "interno") inside = true;
                     else if (args[i] == "diagnostics" || args[i] == "diagnostico") diagnostics = true;
+                    else if (args[i].StartsWith("keep=", StringComparison.Ordinal) && args[i].Length > 5) old = args[i].Substring(5);
                     else return 2;
                 }
-                return SelfTest.SimulateUpdate(args[1], args[2], args[3], inside, diagnostics);
+                return SelfTest.SimulateUpdate(args[1], args[2], args[3], inside, diagnostics, old);
             }
             if (args.Length >= 2 && test == "--make-test-image") return SelfTest.MakeTestImage(args[1]);
             if (!Pc.Elevated)

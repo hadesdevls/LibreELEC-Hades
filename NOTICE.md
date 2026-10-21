@@ -18,6 +18,9 @@ page of its system information says what it is.
 The Dolby Vision output is an independent implementation that follows a public specification (ETSI GS
 CCM 001). It contains no Dolby code, and Dolby has neither tested nor certified it.
 
+HDR10+ is named in this build only as a format: the metadata that it reads from a video and sends to
+a display. LibreELEC Hades is not certified by HDR10+ Technologies or by Dolby.
+
 ## Work by others that it is built on
 
 - **LibreELEC** (Team LibreELEC, and OpenELEC before it): the whole distribution and its build system.
@@ -34,14 +37,25 @@ CCM 001). It contains no Dolby code, and Dolby has neither tested nor certified 
   here to a copy of that decoder; and, in Kodi (GPL-2.0-or-later), how the two clips of a 3D disc are
   read together and one change to how the 3D modes of a display are read, as he wrote them.
 - **cinema-ONE's LibreELEC tree**: four changes to the AMD graphics driver of the Linux kernel for 3D
-  over HDMI, used here with fixes. https://github.com/cinema-ONE/LibreELEC.tv
+  over HDMI, used here with fixes, and, by **Adrian Betschart**, the change to that driver that sends
+  HDMI RGB output in limited range by default on CTA modes. https://github.com/cinema-ONE/LibreELEC.tv
+- **cinemaONE**: Kodi pull request 29463 (GPL-2.0-or-later), its two changes as written: the opaque
+  parts of the GUI kept opaque when it is composited over HDR video, and the video seen through a video
+  window then.
 - **NVIDIA open GPU kernel modules** (NVIDIA Corporation, MIT/GPL-2.0), compiled from their published
-  source with three patches, and **nvidia-vaapi-driver** (MIT).
+  source with three patches, **egl-gbm** (NVIDIA Corporation, MIT), the GBM platform library of
+  NVIDIA's EGL, compiled from its published source in place of the copy in NVIDIA's installer, and
+  **nvidia-vaapi-driver** (MIT).
 - **Jost**, a typeface by indestructible type* (SIL Open Font License 1.1): the name of the build is
   set in it in the pictures of the build, which a script of this project draws
   (`packages/mediacenter/kodi/brand`).
 - **BlueZ**: fixes from its own repository, applied as patches with their authors kept.
-- **dovi_tool** by quietvoid (MIT): a reference for the Dolby Vision metadata syntax.
+- **dovi_tool** and **hdr10plus_tool** by quietvoid (MIT): references for the syntax of the Dolby Vision
+  and HDR10+ metadata, and the sources of rules and defaults that this build follows when it makes
+  Dolby Vision metadata (dovi_tool's for content mapping v2.9, hdr10plus_tool's scenes).
+- **CoreELEC**, and **Amlogic**'s code in it (GPL-2.0): the layout of the HDR10+ vendor InfoFrame and
+  the coding of each of its fields, read as data in the GPL code with which CoreELEC sends it.
+  https://github.com/CoreELEC
 - **OpenSSL 4.0.3**: the change to LibreELEC's recipe is Rudi Heitbaum's, from LibreELEC pull request
   11104, taken as his commit.
 - Everything else comes from LibreELEC unchanged: about 290 packages, each under its own licence.
@@ -83,7 +97,8 @@ its source is in that tree, in `tools/hades-installer`.
 Kodi is a registered trademark of the XBMC Foundation. Dolby, Dolby Vision and Dolby Atmos are
 trademarks of Dolby Laboratories. NVIDIA, GeForce and RTX are trademarks of NVIDIA Corporation. AMD,
 Radeon and Ryzen are trademarks of Advanced Micro Devices, Inc. Intel is a trademark of Intel
-Corporation. HDMI is a trademark of HDMI Licensing Administrator, Inc. LibreELEC is the name of the
+Corporation. HDMI is a trademark of HDMI Licensing Administrator, Inc. HDR10+ is a trademark of HDR10+
+Technologies, LLC. LibreELEC is the name of the
 project of Team LibreELEC. Other names belong to their owners.
 
 These names are used only to say what this software is based on and what it works with. Their use

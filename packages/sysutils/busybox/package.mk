@@ -149,7 +149,9 @@ makeinstall_target() {
 }
 
 post_install() {
-  echo "chmod 4755 ${INSTALL}/usr/bin/busybox" >>${FAKEROOT_SCRIPT}
+  # Hades: not setuid root: nothing that is not root needs it, and it gave the services that do not run
+  # as root a large program that runs as root
+  echo "chmod 0755 ${INSTALL}/usr/bin/busybox" >>${FAKEROOT_SCRIPT}
   echo "chmod 000 ${INSTALL}/usr/cache/shadow" >>${FAKEROOT_SCRIPT}
 
   add_user root "${ROOT_PASSWORD}" 0 0 "Root User" "/storage" "/bin/sh"

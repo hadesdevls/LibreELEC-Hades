@@ -102,4 +102,6 @@ post_install()  {
   if [ "${SWAP_SUPPORT}" = "yes" ]; then
     enable_service swap.service
   fi
+  # Hades: the storage partition is trimmed once a week
+  enable_service fstrim.timer
 }

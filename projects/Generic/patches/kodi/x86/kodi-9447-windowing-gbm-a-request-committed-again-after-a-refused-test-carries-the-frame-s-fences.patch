@@ -1,0 +1,156 @@
+From a93e41165cd4215137d470ed9eaeb978bfaf7a87 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 03:52:16 +0000
+Subject: [PATCH] windowing/gbm: a request committed again after a refused test
+ carries the frame's fences
+
+When the driver refuses the test of a commit, CDRMAtomic commits the
+request before it (the front of the queue) again, with the framebuffer of
+the frame. Only FB_ID was updated: the request still named the IN_FENCE_FD
+of its own commit, a descriptor that FinishRequest() closed once that
+commit was made, and its OUT_FENCE_PTR. By then the number may name another
+file, or none: the kernel refuses the commit (no sync file) or waits for
+the fence of something else, and the frame is lost or shown at the wrong
+time. This is an older defect of Kodi; it matters more since HDR10+
+metadata goes with every frame.
+
+The request now carries the fences of the frame, as the frame's own
+request would have: its in-fence on the output plane and the out-fence of
+its flip on the CRTC, or none where the frame has none (no framebuffer, or
+no fence was made for it). A fence that it names on another plane or CRTC
+is dropped. A property that a request names twice goes with the value
+added last (drmModeAtomicCommit()), so the front is overridden, not
+rebuilt. FenceFallback() in DRMRequestQueue.h decides it;
+CDRMAtomicRequest::Naming() says of which objects a request names a
+property.
+
+Host test: fallback_fence_test, FenceFallback() on a double of the
+request: a frame with its fence, without one, without a framebuffer, with
+another output plane, and a front without fences. Without this change the
+closed descriptor stays in the request.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp     | 22 ++++++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.h       |  2 ++
+ xbmc/windowing/gbm/drm/DRMRequestQueue.h | 46 ++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 50d71b5..d93a824 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -265,6 +265,16 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     // update the old atomic request with the new fb id to avoid tearing
+     if (rendered)
+       AddProperty(outputPlane, "FB_ID", fb_id);
++    // Hades: ... and with the fences of the frame: those it names are of its own commit, its
++    // in-fence closed since (FenceFallback())
++    const bool fenced = rendered && m_inFenceFd != -1;
++    FenceFallback(*m_req, static_cast<CDRMObject*>(outputPlane), static_cast<CDRMObject*>(m_crtc),
++                  fenced ? std::optional<std::pair<uint64_t, uint64_t>>(
++                               {static_cast<uint64_t>(m_inFenceFd),
++                                reinterpret_cast<uint64_t>(&m_outFenceFd)})
++                         : std::nullopt,
++                  [this](CDRMObject* object, const char* name, uint64_t value)
++                  { AddProperty(object, name, value); });
+   }
+ 
+   ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
+@@ -659,6 +669,18 @@ bool CDRMAtomic::CDRMAtomicRequest::AddProperty(CDRMObject* object,
+   return true;
+ }
+ 
++std::vector<CDRMObject*> CDRMAtomic::CDRMAtomicRequest::Naming(const char* name) const
++{
++  std::vector<CDRMObject*> objects;
++  for (const auto& [object, properties] : m_atomicRequestItems)
++  {
++    const uint32_t propertyId = object->GetPropertyId(name);
++    if (propertyId != 0 && properties.contains(propertyId))
++      objects.push_back(object);
++  }
++  return objects;
++}
++
+ void CDRMAtomic::CDRMAtomicRequest::CacheProperties()
+ {
+   for (const auto& [object, properties] : m_atomicRequestItems)
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index 1715bbf..a4ce335 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -156,6 +156,8 @@ private:
+     bool Empty() const { return m_atomicRequestItems.empty(); }
+ 
+     bool AddProperty(CDRMObject* object, const char* name, uint64_t value);
++    //! Hades: the objects of which this request names the property (FenceFallback())
++    std::vector<CDRMObject*> Naming(const char* name) const;
+     //! Hades: the blob of the mode that this request carries lives as long as it does (a blob
+     //! that is destroyed gives its id back to the kernel, which gives it to the next one)
+     void KeepModeBlob(CDRMPropertyBlob blob) { m_modeBlob = std::move(blob); }
+diff --git a/xbmc/windowing/gbm/drm/DRMRequestQueue.h b/xbmc/windowing/gbm/drm/DRMRequestQueue.h
+index ab1bbae..dea1a5f 100644
+--- a/xbmc/windowing/gbm/drm/DRMRequestQueue.h
++++ b/xbmc/windowing/gbm/drm/DRMRequestQueue.h
+@@ -8,6 +8,10 @@
+ 
+ #pragma once
+ 
++#include <cstdint>
++#include <optional>
++#include <utility>
++
+ namespace KODI
+ {
+ namespace WINDOWING
+@@ -47,6 +51,48 @@ void FinishAtomicRequest(Queue& queue, const Request* committed, bool taken)
+     queue.pop_back();
+ }
+ 
++/*!
++ * \brief Hades: the fences of the request that a refused test falls back to
++ *
++ * That request (the front of the queue) went out with the fences of its own commit, and named
++ * them still: the commit that fell back to it, with the framebuffer of the frame, carried its
++ * in-fence, a descriptor that was closed once that commit was made (CDRMAtomic::FinishRequest()),
++ * whose number may name another file by now (the driver refuses the commit, or waits for a fence
++ * of something else), and its out-fence, written where nothing takes it. Now the request carries
++ * the fences of the frame, as the request of the frame would have: its in-fence on the output
++ * plane, with its framebuffer, and the out-fence of its flip on the CRTC; without one (no
++ * framebuffer, or none was made for it), no fence. A property that a request names twice goes
++ * with the value it was added with last (drmModeAtomicCommit()).
++ *
++ * \param request the request that is committed again: request.Naming(name) are the objects of
++ *        which it names a property
++ * \param fences the in-fence of the frame and where the out-fence of its flip is written
++ * \param add adds a property to the request: add(object, name, value)
++ */
++template<typename Request, typename Object, typename Add>
++void FenceFallback(const Request& request,
++                   Object* plane,
++                   Object* crtc,
++                   std::optional<std::pair<uint64_t, uint64_t>> fences,
++                   Add add)
++{
++  for (Object* object : request.Naming("IN_FENCE_FD"))
++  {
++    if (!fences || object != plane)
++      add(object, "IN_FENCE_FD", static_cast<uint64_t>(-1));
++  }
++  for (Object* object : request.Naming("OUT_FENCE_PTR"))
++  {
++    if (!fences || object != crtc)
++      add(object, "OUT_FENCE_PTR", 0);
++  }
++  if (fences)
++  {
++    add(crtc, "OUT_FENCE_PTR", fences->second);
++    add(plane, "IN_FENCE_FD", fences->first);
++  }
++}
++
+ } // namespace GBM
+ } // namespace WINDOWING
+ } // namespace KODI
+-- 
+2.53.0
+

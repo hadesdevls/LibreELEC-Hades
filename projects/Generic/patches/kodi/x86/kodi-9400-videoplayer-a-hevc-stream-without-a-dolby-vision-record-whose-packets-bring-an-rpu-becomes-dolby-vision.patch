@@ -1,0 +1,238 @@
+From 3004002f8cdee8a5b34c6fb3fefd3a2f57de3082 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:19:06 +0000
+Subject: [PATCH] VideoPlayer: a HEVC stream without a Dolby Vision record
+ whose packets bring an RPU becomes Dolby Vision
+
+A stream muxed without its Dolby Vision record played as HDR10 or SDR although every access unit
+carries its RPU. The first 48 packets of a HEVC stream that is not Dolby Vision are probed; at the
+first RPU, CDVLayerMerge::RecordFromRpu() makes a record only of what is sure: profile 7 where the
+stream carries both layers and the RPU of profile 7, profile 5, and profile 8 over a base layer of PQ
+and BT.2020, HLG or SDR BT.709. The stream then becomes Dolby Vision (VideoPlayer opens its codec
+again). Anything else is logged and plays as it is. A stream without RPUs changes in nothing, not
+even in the log.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 69 +++++++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  6 ++
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.cpp  | 51 ++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.h    | 17 +++++
+ 4 files changed, 143 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index fe98299..25dc822 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -63,6 +63,10 @@ extern "C"
+ #include <libavutil/pixdesc.h>
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++#include "dvbridge_probe.h"
++#endif
++
+ using namespace KODI::UTILS;
+ using namespace std::chrono_literals;
+ 
+@@ -773,6 +777,8 @@ void CDVDDemuxFFmpeg::Dispose()
+   m_dvBaseIndex = -1;
+   m_dvEnhancementIndex = -1;
+   m_dvVerified = true;
++  m_dvProbed.clear();
++  m_dvPromoted.clear();
+ #endif
+ 
+   if (m_pFormatContext)
+@@ -1278,6 +1284,60 @@ void CDVDDemuxFFmpeg::PromoteDolbyVision(CDemuxStream* stream,
+   video->changes++;
+ }
+ 
++// A HEVC stream that no Dolby Vision record declares, and whose first packets bring an RPU: the
++// RPU says what it is (CDVLayerMerge::RecordFromRpu()), and only what can be told for sure makes
++// it Dolby Vision. A stream without one stays as it is: nothing of it changes.
++void CDVDDemuxFFmpeg::ProbeDolbyVision(CDemuxStream* stream,
++                                       int streamIdx,
++                                       const uint8_t* data,
++                                       int size)
++{
++  // the packets of a stream that are looked at
++  static constexpr unsigned int PROBED_PACKETS = 48;
++
++  if (!stream || stream->type != StreamType::VIDEO || stream->codec != AV_CODEC_ID_HEVC ||
++      streamIdx == m_dvBaseIndex || streamIdx == m_dvEnhancementIndex || !data || size <= 0)
++    return;
++  unsigned int& probed = m_dvProbed[streamIdx];
++  if (probed >= PROBED_PACKETS)
++    return;
++  auto* video = static_cast<CDemuxStreamVideo*>(stream);
++  if (video->hdr_type == StreamHdrType::HDR_TYPE_DOLBYVISION || video->dovi.dv_profile)
++  {
++    probed = PROBED_PACKETS;
++    return;
++  }
++  ++probed;
++
++  const AVStream* avStream = m_pFormatContext->streams[streamIdx];
++  dvbridge_rpu_probe probe;
++  dvbridge_rpu_probe_packet(data, static_cast<size_t>(size),
++                            CDVLayerMerge::LengthSize(avStream->codecpar), &probe);
++  if (!probe.rpu)
++    return;
++  probed = PROBED_PACKETS;
++
++  AVRational rate = av_guess_frame_rate(m_pFormatContext, const_cast<AVStream*>(avStream), nullptr);
++  AVDOVIDecoderConfigurationRecord record{};
++  if (!CDVLayerMerge::RecordFromRpu(probe, avStream->codecpar, rate, record))
++  {
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: stream {} has Dolby Vision RPUs but no Dolby Vision record, and "
++              "they do not say for sure what it is (RPU profile {}, {} enhancement layer, a "
++              "guess of profile {}): it plays as it is",
++              streamIdx, probe.rpu_profile, probe.layer ? "with an" : "no", probe.profile);
++    return;
++  }
++  CLog::Log(LOGINFO,
++            "CDVDDemuxFFmpeg: stream {} has Dolby Vision RPUs but no Dolby Vision record: it is "
++            "Dolby Vision profile {} ({} enhancement layer, base layer compatibility {}) from "
++            "here on",
++            streamIdx, record.dv_profile, record.el_present_flag ? "with an" : "no",
++            record.dv_bl_signal_compatibility_id);
++  m_dvPromoted[streamIdx] = record;
++  PromoteDolbyVision(stream, record, nullptr);
++}
++
+ void CDVDDemuxFFmpeg::ReportDVLayers()
+ {
+   const CDVLayerMerge::Counts& counts = m_dvMerge.GetCounts();
+@@ -1545,6 +1605,9 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+       if (stream && stream->codec == AV_CODEC_ID_H264)
+         pPacket->recoveryPoint = m_seekToKeyFrame;
+       m_seekToKeyFrame = false;
++#ifdef HAVE_DVBRIDGE
++      ProbeDolbyVision(stream, pPacket->iStreamId, pPacket->pData, pPacket->iSize);
++#endif
+     }
+     if (!stream)
+     {
+@@ -2272,6 +2335,12 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+ #endif
+         }
+ #ifdef HAVE_DVBRIDGE
++        // made Dolby Vision by its RPUs (ProbeDolbyVision()), and made again
++        if (const auto promoted = m_dvPromoted.find(streamIdx); promoted != m_dvPromoted.end())
++        {
++          st->hdr_type = StreamHdrType::HDR_TYPE_DOLBYVISION;
++          st->dovi = promoted->second;
++        }
+         // (an unverified pair is no Dolby Vision stream until its packets show it: CheckDVLayers())
+         if (streamIdx == m_dvBaseIndex && m_dvVerified)
+         {
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 5cc3041..47cf33d 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -199,6 +199,12 @@ protected:
+   //! what the packets of an unverified pair said: the base stream becomes Dolby Vision, or the
+   //! two tracks go on as two streams
+   void CheckDVLayers();
++  //! A HEVC stream that no Dolby Vision record declares and whose first packets have an RPU
++  //! (CDVLayerMerge::RecordFromRpu()): the packets that were looked at, by stream index, and the
++  //! records of the streams that became Dolby Vision so.
++  std::map<int, unsigned int> m_dvProbed;
++  std::map<int, AVDOVIDecoderConfigurationRecord> m_dvPromoted;
++  void ProbeDolbyVision(CDemuxStream* stream, int streamIdx, const uint8_t* data, int size);
+   //! the stream is Dolby Vision from here on: VideoPlayer opens its codec again
+   void PromoteDolbyVision(CDemuxStream* stream, const AVDOVIDecoderConfigurationRecord& record,
+                           const AVCodecParameters* enhancement);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+index b165095..501cf17 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+@@ -415,6 +415,57 @@ CDVLayerMerge::Layers CDVLayerMerge::Find(AVFormatContext* context, unsigned int
+   return layers;
+ }
+ 
++bool CDVLayerMerge::RecordFromRpu(const dvbridge_rpu_probe& probe,
++                                  const AVCodecParameters* parameters,
++                                  AVRational rate,
++                                  AVDOVIDecoderConfigurationRecord& record)
++{
++  if (!probe.rpu || !parameters)
++    return false;
++
++  record = AVDOVIDecoderConfigurationRecord{};
++  record.dv_version_major = 1;
++  record.dv_version_minor = 0;
++  record.rpu_present_flag = 1;
++  record.bl_present_flag = 1;
++  record.dv_md_compression = AV_DOVI_COMPRESSION_NONE;
++  if (probe.layer)
++  {
++    // both layers in the stream: the RPU of profile 7, FEL or MEL alike (a 12-bit picture made
++    // with the resampled enhancement layer and its residual); profile 4, whose base layer is SDR,
++    // has another one
++    if (probe.rpu_profile != 1 || probe.profile != 7)
++      return false;
++    record.dv_profile = 7;
++    record.el_present_flag = 1;
++    record.dv_bl_signal_compatibility_id = 6;
++  }
++  else if (probe.profile == 5)
++  {
++    record.dv_profile = 5;
++    record.dv_bl_signal_compatibility_id = 0;
++  }
++  else if (probe.profile == 8)
++  {
++    // the base layer is a picture of its own: what it is, its colour says
++    const bool bt2020 = parameters->color_primaries == AVCOL_PRI_BT2020;
++    if (bt2020 && parameters->color_trc == AVCOL_TRC_SMPTE2084)
++      record.dv_bl_signal_compatibility_id = 1;
++    else if (parameters->color_trc == AVCOL_TRC_ARIB_STD_B67)
++      record.dv_bl_signal_compatibility_id = 4;
++    else if (parameters->color_primaries == AVCOL_PRI_BT709 &&
++             parameters->color_trc == AVCOL_TRC_BT709)
++      record.dv_bl_signal_compatibility_id = 2;
++    else
++      return false;
++    record.dv_profile = 8;
++  }
++  else
++    return false;
++  record.dv_level = Level(parameters->width, parameters->height, rate);
++  return true;
++}
++
+ CDVLayerMerge::~CDVLayerMerge()
+ {
+   Forget(m_base);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+index a58e20f..3a2d5cc 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+@@ -135,6 +135,23 @@ public:
+    */
+   static Layers Find(AVFormatContext* context, unsigned int program);
+ 
++  /*!
++   * \brief The record of a stream that no Dolby Vision record declares, from what an access unit
++   *        of it says (dvbridge_rpu_probe_packet())
++   *
++   * Only what can be told for sure: profile 7 where the stream carries both layers (units of type
++   * 63) and its RPU is the one of profile 7; profile 5; profile 8 with a base layer of
++   * PQ and BT.2020 (compatibility 1), HLG (4) or SDR BT.709 (2). Nothing else: an RPU of a full
++   * enhancement layer without that layer in the stream (it is in another track, or missing),
++   * profile 4, or a base layer whose signal is not one of those.
++   * \param parameters of the stream: its size and colour
++   * \return false when the stream is not to be taken as Dolby Vision
++   */
++  static bool RecordFromRpu(const struct dvbridge_rpu_probe& probe,
++                            const AVCodecParameters* parameters,
++                            AVRational rate,
++                            AVDOVIDecoderConfigurationRecord& record);
++
+   //! \brief What the packets of an unverified pair said (Layers::verified)
+   enum class Verification
+   {
+-- 
+2.53.0
+

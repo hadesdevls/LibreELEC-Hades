@@ -1,0 +1,687 @@
+From ea7a34d11b89709aaff3ade4e57d978eba65d2d6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:35:02 +0000
+Subject: [PATCH] tools/dvbridge: start the enhancement layer by picture order
+ at a random-access picture of its own
+
+In a stream of one track, the layer starts by picture order at a packet
+where both layers have a random-access picture with the same picture order
+count, or at an IDR picture of the layer where the base layer does not
+reorder its pictures. A stream whose layers have their random-access
+pictures in other packets, or number them otherwise, and whose base layer
+reorders its pictures, has neither: after a seek, or from the start of a
+file that does not begin with both, the layer never starts and every FEL
+picture goes without its residual for the rest of the video. The FEL test
+stream with its two tracks swapped, made into a file of one track (the base
+layer is then the track that reorders), never starts after a seek nor from a
+later start. A profile 7 title of one track played from its start in a test
+on integrated AMD graphics never started its layer either (253 enhancement
+access units passed over in 10 s); whether for this reason is not known.
+
+Every picture that comes before a random-access picture in decoding order
+is presented before it, and so are its leading pictures; every other picture
+after it is presented after it (ITU-T H.265, 7.4.3). So with one picture of
+each layer in every packet, the random-access picture j of the layer is
+presented at the place (j - b) + leading(j) - leading(b) among the base
+pictures presented from the last random-access picture b of the base layer
+on. The module counts that while it waits: the packets since b, the leading
+pictures of b and of j, and the picture order of the base pictures from b on.
+The place is read as an identity only when every identity from b to it, in
+the step that the base layer has (1 for most streams), has come: no picture
+can come afterwards that is presented before it. Then the pictures of the
+layer take the identities of the base pictures by their own picture order,
+as from any other picture the layer starts at; the leading pictures of j are
+not decoded, as after a seek. The access units from j on wait in the queue,
+not decoded, until then (sixteen base packets at most). A packet without one
+picture of each layer, an access unit that cannot be read, a place that does
+not come in time: the count is given up, and the layer waits as before. Where
+the shortcuts start it, they do, as before.
+
+With the time of each access unit known from the place on, the access units
+the layer passed over since its last IDR picture give their RPUs to their
+base pictures that are still to come (dvbridge_fel_take() 4).
+
+The rule holds, checked against the times of the two tracks, for all 1244
+pairs of a random-access picture of the base layer and one of the layer in
+the FEL test stream, and for all 1220 with its tracks swapped. On the host:
+four files that start at a random-access picture of the base layer that the
+layer does not share, by picture order, now pair exactly the pictures that the
+times of the two tracks pair (892 pictures; 891 with the tracks swapped), each
+with the same enhancement picture; with the tracks swapped, none was paired
+before. After seeks the layer starts at the next random-access picture of the
+layer instead of the next IDR picture. The whole stream is paired as before.
+
+For the next report of a layer that does not start, the line of 240
+pictures without the layer says what the layer met while it waited: access
+units that could not be read, random-access pictures of each layer, places
+counted and given up.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 397 +++++++++++++++++-
+ tools/dvbridge/dvbridge_fel.h                 |  20 +-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  17 +-
+ 3 files changed, 412 insertions(+), 22 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index c2ca5c5..f188c6b 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -84,6 +84,14 @@ struct dvbridge_fel_rpu {
+  * that brings its RPU: when the layers are coded in different picture order, that access unit can come in a later
+  * packet than the base picture of its time (one later in the FEL test stream). */
+ #define OWN_WAIT_PACKETS 2
++/* Hades: the place of a random-access picture of the layer, counted from one of the base layer (rank_try()): the
++ * identities of the base pictures it reads, and the base packets after the picture of the layer that the count
++ * may wait for (until its leading pictures, and the base pictures before its place, have come) */
++#define RANK_SPAN 256
++#define RANK_WAIT 16
++/* the enhancement access units that the layer passes over while it waits for a picture to start at, by picture
++ * order: their RPUs, for their base pictures, once the place of the layer is known */
++#define EARLY_MAX 64
+ 
+ /* As dovi_split frames what it gives: a length of this many bytes before every unit when the
+  * enhancement layer has an hvcC configuration, start codes (0) otherwise. */
+@@ -213,7 +221,7 @@ struct dvbridge_fel {
+     unsigned decoded, not_decoded; /* enhancement access units given to the decoder, and not */
+     /* Hades: every base picture goes out with the RPU of its own enhancement access unit, also without its
+      * enhancement picture. own: the RPU of each access unit whose time is known (it was given to the decoder, or
+-     * passed over in a stream paired by its times), with the time of the base
++     * passed over in a stream paired by its times, or placed once the layer started), with the time of the base
+      * packet that brought it (carrier), whose base picture the base decoder gives with the same RPU parsed (the
+      * ring). packet_carrier: that time, for each queued access unit. recent: the last base packets, by when they
+      * came (submitted counts them), to know how long a picture may wait for its access unit; last_base: the time
+@@ -226,6 +234,30 @@ struct dvbridge_fel {
+     uint64_t submitted;
+     int64_t last_base;
+     unsigned own_given; /* base pictures that went out without their enhancement picture, with its RPU */
++    /* Hades: by picture order, the layer also starts at a random-access picture that it does not share with the
++     * base layer, also where the base layer reorders its pictures: its place is counted from the last
++     * random-access picture of the base layer (rank_try()). */
++    struct {
++        bool valid;              /* a random-access picture of the base layer came, and every packet since then
++                                    has had one enhancement picture */
++        int64_t base_id;         /* its identity (picture order) */
++        unsigned since;          /* base packets after it */
++        unsigned base_leading;   /* its leading pictures */
++        bool base_leading_done;  /* a picture that is not one came after them */
++        uint64_t seen[RANK_SPAN / 64]; /* the identities base_id + i that base pictures from it on had */
++        uint64_t step;           /* the greatest common divisor of those i: the step of the picture order
++                                    of the base layer (0 while none but its own came) */
++        bool pending;            /* a random-access picture of the layer waits for its place: the access units
++                                    from it on are queued and not decoded */
++        unsigned at;             /* its packet, counted as since */
++        int64_t layer_id;        /* its identity by the layer's own count */
++        unsigned layer_leading;
++        bool layer_leading_done;
++    } rank;
++    unsigned ranked; /* times the layer started at a place that was counted */
++    struct dvbridge_fel_wait wait; /* what the layer met while it waited for a picture to start at */
++    struct { int64_t identity, carrier; struct dvbridge_fel_rpu rpu; } early[EARLY_MAX];
++    unsigned num_early;
+ };
+ 
+ /* Hades: whether two times are the same but for what a time may lose on its way here. */
+@@ -466,6 +498,81 @@ static uint64_t packets_after(const struct dvbridge_fel *f, int64_t pts, int64_t
+     return UINT64_MAX;
+ }
+ 
++static void early_forget(struct dvbridge_fel *f)
++{
++    for (unsigned i = 0; i < f->num_early; ++i)
++        av_freep(&f->early[i].rpu.data);
++    f->num_early = 0;
++}
++
++/* Hades: an enhancement access unit that the layer passed over by picture order: its identity by the layer's own
++ * count, the time of its base packet, and its RPU (taken from *rpu) */
++static void early_add(struct dvbridge_fel *f, int64_t identity, int64_t carrier,
++                      struct dvbridge_fel_rpu *rpu)
++{
++    if (f->num_early == EARLY_MAX) {
++        av_freep(&f->early[0].rpu.data);
++        --f->num_early;
++        memmove(f->early, f->early + 1, f->num_early * sizeof(*f->early));
++    }
++    f->early[f->num_early].identity = identity;
++    f->early[f->num_early].carrier = carrier;
++    f->early[f->num_early++].rpu = *rpu;
++    *rpu = (struct dvbridge_fel_rpu){0};
++}
++
++/* Hades: an access unit of the layer whose identity, by picture order, is now that of a base picture: the RPU is
++ * kept for the time of that base picture, when it is among those that wait (times) */
++static void own_identity(struct dvbridge_fel *f, int64_t identity, int64_t carrier,
++                         struct dvbridge_fel_rpu *rpu)
++{
++    for (unsigned i = 0; i < f->num_times; ++i)
++        if (f->times[i].order == identity) {
++            own_add(f, f->times[i].pts, carrier, rpu);
++            return;
++        }
++    av_freep(&rpu->data);
++    *rpu = (struct dvbridge_fel_rpu){0};
++}
++
++/* Hades: the base pictures before the identity at which the layer starts are not asked for by its access units */
++static void prune_times(struct dvbridge_fel *f, int64_t identity)
++{
++    unsigned k = 0;
++    for (unsigned i = 0; i < f->num_times; ++i)
++        if (f->times[i].order >= identity)
++            f->times[k++] = f->times[i];
++    f->num_times = k;
++}
++
++/* Hades: the unit type of the picture of an access unit (its first unit of the video coding layer), -1 without */
++static bool first_picture_unit(const uint8_t *unit, size_t size, void *context)
++{
++    int *type = context;
++    if (size < 2 || (unit[0] >> 1 & 0x3f) >= 32)
++        return true;
++    *type = unit[0] >> 1 & 0x3f;
++    return false;
++}
++
++static int picture_type(const uint8_t *data, int size, int length_size)
++{
++    int type = -1;
++    if (data && size > 0)
++        dvbridge_rpu_units(data, (size_t)size, length_size, first_picture_unit, &type);
++    return type;
++}
++
++static bool random_access_type(int type)
++{
++    return type >= 16 && type <= 23;
++}
++
++static bool leading_type(int type)
++{
++    return type >= 6 && type <= 9;
++}
++
+ /* Hades: the RPU of a split access unit of the layer, as FFmpeg's HEVC decoder takes it (dvbridge_mel.h), into
+  * *rpu: none (size 0) when it has none of its own. False when it could not be copied. */
+ static bool layer_rpu(const struct dvbridge_fel *f, const AVPacket *packet, struct dvbridge_fel_rpu *rpu)
+@@ -503,14 +610,178 @@ static void clear_queues(struct dvbridge_fel *f)
+     f->fed = f->stopping = f->stopped = f->resume = f->marked = false;
+ }
+ 
++/* Hades: the random-access picture of the layer whose place was being counted gives way: the access units queued
++ * from it on go back to those that the layer passed over (their RPUs stay for a later start), and the layer waits
++ * for a picture to start at as before. While it waits nothing else is queued. */
++static void rank_cancel(struct dvbridge_fel *f)
++{
++    if (!f->rank.pending)
++        return;
++    for (unsigned i = 0; i < f->num_packets; ++i) {
++        early_add(f, f->packet_order[i], f->packet_carrier[i], &f->packet_rpu[i]);
++        av_packet_free(&f->packets[i]);
++    }
++    f->preroll_packets += f->num_packets;
++    f->num_packets = 0;
++    f->packet_bytes = 0;
++    f->rank.pending = false;
++    ++f->wait.given_up;
++    /* (the layer starts again at a random-access picture, decoded or not by its RPU) */
++    dvbridge_layer_need_restart(&f->need);
++}
++
++/* Hades: nothing is counted from the last random-access picture of the base layer any more, until the next one */
++static void rank_drop(struct dvbridge_fel *f)
++{
++    rank_cancel(f);
++    f->rank.valid = false;
++}
++
++/* Hades: a base packet came while the layer waits for a picture to start at, by picture order. type: the unit type
++ * of its picture; identity: its picture order (picture_identity()). */
++static void rank_base(struct dvbridge_fel *f, int type, int64_t identity)
++{
++    f->wait.base_keys += random_access_type(type);
++    if (random_access_type(type) && !f->rank.pending) {
++        memset(&f->rank, 0, sizeof(f->rank));
++        f->rank.valid = true;
++        f->rank.base_id = identity;
++        f->rank.seen[0] = 1;
++        return;
++    }
++    if (!f->rank.valid)
++        return;
++    ++f->rank.since;
++    if (!f->rank.base_leading_done && leading_type(type)) {
++        ++f->rank.base_leading;
++        return;
++    }
++    f->rank.base_leading_done = true;
++    /* A picture that is presented before the random-access picture and is not one of its leading pictures: not
++     * a stream that this count is made for. */
++    if (type < 0 || identity < f->rank.base_id) {
++        rank_drop(f);
++        return;
++    }
++    if (identity - f->rank.base_id < RANK_SPAN) {
++        const uint64_t i = (uint64_t)(identity - f->rank.base_id);
++        f->rank.seen[i / 64] |= UINT64_C(1) << (i % 64);
++        uint64_t a = f->rank.step, b = i; /* (Euclid's) */
++        while (b) {
++            const uint64_t r = a % b;
++            a = b;
++            b = r;
++        }
++        f->rank.step = a;
++    }
++    if (!f->rank.pending && f->rank.since >= RANK_SPAN)
++        f->rank.valid = false;
++}
++
++/* Hades: the place of the random-access picture of the layer that waits for it (rank.pending), once it can be
++ * known, and the layer starts there.
++ *
++ * Every picture that comes before a random-access picture in decoding order is presented before it, and so are
++ * its leading pictures; every other picture after it is presented after it (ITU-T H.265, 7.4.3 and 8.1). So the
++ * base pictures presented before the random-access picture b of the base layer are those of the packets before it
++ * and its leading pictures, and the pictures of the layer presented before its random-access picture j are those of
++ * the packets before it and its leading pictures. The two layers present the same pictures: with one picture of
++ * each in every packet, the picture j is presented at the place
++ *     (j - b) + leading(j) - leading(b)
++ * among the base pictures presented from b on, counted from 0. Where the base layer does not reorder its pictures
++ * and j is an IDR picture, that is the base picture of the packet of j (el_idr in dvbridge_fel_submit()).
++ *
++ * The base pictures are known by their picture order, which is the order they are presented in. The place is
++ * read as an identity only when every identity from the one of b to it has come, in the step that the identities
++ * of the base pictures from b on have between them (their greatest common divisor; 1 for most streams): none can
++ * come afterwards that would be presented before it, but in a stream that changes the step of its picture order. The pictures of the layer then take the identities of the base pictures by their
++ * own picture order, as from any other picture the layer starts at (the two layers number their pictures alike).
++ * The leading pictures of j are not decoded: they are presented before it, the pictures of the base layer before it
++ * go out without the layer, and no other picture refers to them. */
++static void rank_try(struct dvbridge_fel *f)
++{
++    if (!f->rank.pending)
++        return;
++    const bool waited = f->rank.since - f->rank.at > RANK_WAIT;
++    if (!f->rank.layer_leading_done || !f->rank.base_leading_done) {
++        if (waited)
++            rank_cancel(f);
++        return;
++    }
++    const int64_t place = (int64_t)f->rank.at + f->rank.layer_leading - f->rank.base_leading;
++    const int64_t step = (int64_t)f->rank.step;
++    if (place < 0 || (place && !step && waited) || (step && place * step >= RANK_SPAN)) {
++        rank_cancel(f);
++        return;
++    }
++    for (int64_t i = 0; i <= place; ++i) {
++        const int64_t bit = i * step;
++        if (!step && i) {
++            if (waited)
++                rank_cancel(f);
++            return;
++        }
++        if (!(f->rank.seen[bit / 64] >> (bit % 64) & 1)) {
++            if (waited)
++                rank_cancel(f);
++            return;
++        }
++    }
++    const int64_t identity = f->rank.base_id + place * step;
++    unsigned m = 0;
++    while (m < f->num_times && f->times[m].order != identity)
++        ++m;
++    /* (the queue holds the random-access picture first, then its leading pictures) */
++    if (m == f->num_times || !f->num_packets || f->num_packets <= f->rank.layer_leading) {
++        rank_cancel(f);
++        return;
++    }
++    const int64_t delta = identity - f->rank.layer_id;
++    for (unsigned i = 0; i < f->num_packets; ++i)
++        f->packet_order[i] += delta;
++    for (unsigned i = 1; i <= f->rank.layer_leading; ++i) {
++        own_identity(f, f->packet_order[i], f->packet_carrier[i], &f->packet_rpu[i]);
++        f->packet_bytes -= f->packets[i]->size;
++        av_packet_free(&f->packets[i]);
++    }
++    const unsigned leading = f->rank.layer_leading;
++    f->num_packets -= leading;
++    memmove(f->packets + 1, f->packets + 1 + leading, (f->num_packets - 1) * sizeof(*f->packets));
++    memmove(f->packet_order + 1, f->packet_order + 1 + leading,
++            (f->num_packets - 1) * sizeof(*f->packet_order));
++    memmove(f->packet_time + 1, f->packet_time + 1 + leading,
++            (f->num_packets - 1) * sizeof(*f->packet_time));
++    memmove(f->packet_need + 1, f->packet_need + 1 + leading,
++            (f->num_packets - 1) * sizeof(*f->packet_need));
++    memmove(f->packet_rpu + 1, f->packet_rpu + 1 + leading,
++            (f->num_packets - 1) * sizeof(*f->packet_rpu));
++    memmove(f->packet_carrier + 1, f->packet_carrier + 1 + leading,
++            (f->num_packets - 1) * sizeof(*f->packet_carrier));
++    for (unsigned i = 0; i < f->num_early; ++i)
++        own_identity(f, f->early[i].identity + delta, f->early[i].carrier, &f->early[i].rpu);
++    early_forget(f);
++    f->enhancement_order.offset += delta;
++    f->enhancement_order.maximum += delta;
++    f->anchor_pts = f->times[m].pts;
++    prune_times(f, identity);
++    f->synchronizing = false;
++    f->rank.pending = f->rank.valid = false;
++    ++f->ranked;
++}
++
+ void dvbridge_fel_reset(struct dvbridge_fel *f)
+ {
+     if (!f)
+         return;
+     clear_queues(f);
++    /* Hades: what was counted for a start of the layer is of the layer before (the RPUs of the access units
++     * whose time is known stay for the base pictures that are still to come) */
++    memset(&f->rank, 0, sizeof(f->rank));
++    early_forget(f);
+     f->synchronizing = true;
+     f->anchor_pts = AV_NOPTS_VALUE;
+     f->preroll_packets = 0;
++    f->wait = (struct dvbridge_fel_wait){0};
+     forget_base_times(f, false);
+     /* Hades: the layer starts again at a random-access picture, decoded or not by its RPU */
+     dvbridge_layer_need_restart(&f->need);
+@@ -539,6 +810,7 @@ void dvbridge_fel_destroy(struct dvbridge_fel *f)
+     clear_queues(f);
+     forget_ring(f);
+     own_forget(f);
++    early_forget(f);
+     av_parser_close(f->base_order.parser);
+     av_parser_close(f->enhancement_order.parser);
+     avcodec_free_context(&f->base_order.context);
+@@ -666,7 +938,9 @@ static bool pump(struct dvbridge_fel *f)
+         return true;
+     if (!receive_frames(f))
+         goto fail;
+-    while (f->num_packets && f->num_frames < QUEUE_MAX) {
++    /* Hades: (while the place of a random-access picture of the layer is being counted, what is queued from it on
++     * waits: it has no identities of base pictures yet; rank_try()) */
++    while (f->num_packets && f->num_frames < QUEUE_MAX && !f->rank.pending) {
+         AVPacket *packet = f->packets[0];
+         unsigned match = 0;
+         /* Hades: an access unit that the stream gave its time has it; any other one takes the
+@@ -863,6 +1137,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+     if (time != AV_NOPTS_VALUE && !f->timed) {
+         f->timed = true;
+         f->num_times = 0;
++        rank_drop(f);
+         if (!f->synchronizing) {
+             f->reason = "the stream gives the times of its enhancement pictures from here on";
+             goto fail;
+@@ -882,6 +1157,13 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+         goto fail;
+     }
+     if (!f->timed) {
++        /* Hades: while the layer waits for a picture to start at and counts from a random-access picture
++         * of the base layer (rank_try()), the base pictures stay: the place it counts is one of them. The
++         * oldest give way. */
++        if (f->num_times == MAP_MAX && f->synchronizing && f->rank.valid) {
++            --f->num_times;
++            memmove(f->times, f->times + 1, f->num_times * sizeof(*f->times));
++        }
+         if (f->num_times == MAP_MAX) {
+             f->reason = "too many base pictures wait for their enhancement pictures";
+             goto fail;
+@@ -890,14 +1172,24 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             f->reason = "the base-layer picture order could not be parsed";
+             goto fail;
+         }
++        bool twice = false;
+         for (unsigned i = 0; i < f->num_times; ++i)
+-            if (f->times[i].order == base_identity) {
+-                f->reason = "two base pictures have the same picture order";
+-                goto fail;
+-            }
++            twice |= f->times[i].order == base_identity;
++        if (twice && f->synchronizing && f->rank.valid) {
++            /* Hades: (kept for the count: of no use when two of them have the same identity) */
++            f->num_times = 0;
++            rank_drop(f);
++        } else if (twice) {
++            f->reason = "two base pictures have the same picture order";
++            goto fail;
++        }
+         f->times[f->num_times].order = base_identity;
+         f->times[f->num_times++].pts = packet->pts;
++        if (f->synchronizing)
++            rank_base(f, picture_type(packet->data, packet->size, f->base_length_size), base_identity);
+     }
++    /* Hades: by picture order, the enhancement pictures of this packet (rank_try() counts one in each) */
++    unsigned layer_pictures = 0;
+     AVPacket *copy = av_packet_clone(packet);
+     if (!copy)
+         goto fail;
+@@ -912,8 +1204,17 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+         result = av_bsf_receive_packet(f->split, copy);
+         if (result < 0) {
+             av_packet_free(&copy);
+-            if (result == AVERROR(EAGAIN))
++            if (result == AVERROR(EAGAIN)) {
++                /* Hades: the place of a random-access picture of the layer, by picture order, is counted
++                 * in packets that have one enhancement picture each */
++                if (f->synchronizing && !f->timed && f->rank.valid) {
++                    if (layer_pictures != 1)
++                        rank_drop(f);
++                    else
++                        rank_try(f);
++                }
+                 return pump(f);
++            }
+             goto fail;
+         }
+         /* Hades: an access unit without enhancement units still gives its RPU now. That is
+@@ -923,6 +1224,8 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             av_packet_free(&copy);
+             continue;
+         }
++        const int layer_type = picture_type(copy->data, copy->size, f->layer_length_size);
++        layer_pictures += layer_type >= 0;
+         if (f->num_packets == QUEUE_MAX || copy->size <= 0 ||
+             (size_t)copy->size > PACKET_BYTES_MAX - f->packet_bytes) {
+             av_packet_free(&copy);
+@@ -935,19 +1238,29 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+              * have the parameter sets of the layer only from its next random-access picture on:
+              * a stream of two tracks brings them with those pictures and nowhere else. */
+             if (f->synchronizing) {
+-                /* Hades: by its time, its RPU stays for its base picture */
++                /* Hades: by its time, its RPU stays for its base picture. By picture order such an
++                 * access unit has no place: one whose place was being counted gives way. */
+                 struct dvbridge_fel_rpu own;
+                 if (f->timed && time != AV_NOPTS_VALUE && layer_rpu(f, copy, &own))
+                     own_add(f, time, packet->pts, &own);
+                 av_packet_free(&copy);
+-                f->num_times = 0;
++                rank_cancel(f);
++                if (!f->rank.valid)
++                    f->num_times = 0;
+                 ++f->preroll_packets;
++                ++f->wait.unreadable;
+                 continue;
+             }
+             av_packet_free(&copy);
+             f->reason = "the picture order of an enhancement picture could not be parsed";
+             goto fail;
+         }
++        /* Hades: an IDR picture of the layer starts its picture order again: what the layer passed over
++         * before it is not counted alike any more (rank_try()) */
++        if (f->synchronizing && !f->timed && f->enhancement_order.parser->key_frame == 1 &&
++            f->enhancement_order.parser->output_picture_number == 0)
++            early_forget(f);
++        f->wait.layer_keys += f->synchronizing && f->enhancement_order.parser->key_frame == 1;
+         if (f->timed && time == AV_NOPTS_VALUE) {
+             /* Hades: an access unit without a time in a stream that gives them. It cannot be
+              * paired, so it is not decoded: its base picture goes out without the layer, and so
+@@ -996,18 +1309,54 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+              * time. Never use this shortcut for a BL with reordered pictures. */
+             bool el_idr = ep->key_frame == 1 && ep->output_picture_number == 0 &&
+                           f->base_order.context->has_b_frames == 0;
+-            if (!common_key && !el_idr) {
++            if (common_key || el_idr) {
++                /* Hades: a random-access picture of the layer whose place was being counted gives way
++                 * to this one; the access units passed over since the last IDR picture of the layer
++                 * take the identities of their base pictures from here, for their RPUs. */
++                const int64_t layer_identity = f->packet_order[f->num_packets];
++                rank_cancel(f);
++                const int64_t delta = base_identity - layer_identity;
++                /* (an IDR picture: what came before it is of another picture order) */
++                const bool idr = ep->key_frame == 1 && ep->output_picture_number == 0;
++                f->enhancement_order.offset = base_identity - ep->output_picture_number;
++                f->enhancement_order.maximum = base_identity;
++                f->packet_order[f->num_packets] = base_identity;
++                f->anchor_pts = packet->pts;
++                f->synchronizing = false;
++                for (unsigned i = 0; !idr && i < f->num_early; ++i)
++                    own_identity(f, f->early[i].identity + delta, f->early[i].carrier, &f->early[i].rpu);
++                early_forget(f);
++                prune_times(f, base_identity);
++                memset(&f->rank, 0, sizeof(f->rank));
++            } else if (f->rank.pending ||
++                       (f->rank.valid && ep->key_frame == 1 && random_access_type(layer_type))) {
++                /* Hades: a random-access picture of the layer that it does not share with the base layer,
++                 * where the base layer may reorder its pictures: queued, and not decoded, until its place
++                 * is known (rank_try()); and what comes after it, its leading pictures counted */
++                if (!f->rank.pending) {
++                    ++f->wait.counted;
++                    f->rank.pending = true;
++                    f->rank.at = f->rank.since;
++                    f->rank.layer_id = f->packet_order[f->num_packets];
++                    f->rank.layer_leading = 0;
++                    f->rank.layer_leading_done = false;
++                } else if (!f->rank.layer_leading_done && leading_type(layer_type)) {
++                    ++f->rank.layer_leading;
++                } else {
++                    f->rank.layer_leading_done = true;
++                }
++            } else {
++                /* Hades: its RPU stays, for its base picture once the layer has started */
++                struct dvbridge_fel_rpu own;
++                if (f->rank.valid && layer_rpu(f, copy, &own))
++                    early_add(f, f->packet_order[f->num_packets], packet->pts, &own);
+                 av_packet_free(&copy);
+-                f->num_times = 0;
++                if (!f->rank.valid)
++                    f->num_times = 0;
+                 /* Hades: no bound; the base pictures meanwhile go out without the layer. */
+                 ++f->preroll_packets;
+                 continue;
+             }
+-            f->enhancement_order.offset = base_identity - ep->output_picture_number;
+-            f->enhancement_order.maximum = base_identity;
+-            f->packet_order[f->num_packets] = base_identity;
+-            f->anchor_pts = packet->pts;
+-            f->synchronizing = false;
+         }
+         else if (f->timed ? !same_time(time, packet->pts, f->tolerance)
+                           : f->packet_order[f->num_packets] != base_identity) {
+@@ -1177,11 +1526,22 @@ int dvbridge_fel_layer_rpu(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+     return 1;
+ }
+ 
++void dvbridge_fel_wait_counts(const struct dvbridge_fel *f, struct dvbridge_fel_wait *out)
++{
++    if (out)
++        *out = f ? f->wait : (struct dvbridge_fel_wait){0};
++}
++
+ unsigned dvbridge_fel_own_rpus(const struct dvbridge_fel *f)
+ {
+     return f ? f->own_given : 0;
+ }
+ 
++unsigned dvbridge_fel_ranked(const struct dvbridge_fel *f)
++{
++    return f ? f->ranked : 0;
++}
++
+ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+ {
+     if (!f || !frame || *frame || pts == AV_NOPTS_VALUE || !pump(f))
+@@ -1218,8 +1578,9 @@ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+      * Hades: with the RPU of its own access unit when the module knows it (not for a time that is
+      * not of one picture alone). */
+     if (f->synchronizing || (f->anchor_pts != AV_NOPTS_VALUE && pts < f->anchor_pts)) {
+-        /* (by picture order, while the layer waits, the time of an access unit is not known) */
+-        const bool may_come = f->timed || !f->synchronizing;
++        /* (by picture order, while the layer waits, the time of an access unit is known only once it
++         * starts: rank_try()) */
++        const bool may_come = f->timed || !f->synchronizing || f->rank.pending;
+         return ambiguous ? 2 : without_layer(f, pts, slack, may_come, frame);
+     }
+     for (unsigned i = 0; i < f->num_frames;) {
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 53017ec..8f59870 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -26,8 +26,8 @@ bool dvbridge_fel_drain(struct dvbridge_fel *fel);
+  * random-access picture to start at again, or it is a leading picture of the one it started at,
+  * whose picture does not come. It goes out without the layer, as with 2, with that metadata.
+  * Also, where the answer would be 2, for a base picture whose enhancement access unit the module
+- * knows (the stream gave its time, or it was given to the decoder): with the RPU of that access
+- * unit, as coded, and the metadata that the base
++ * knows (the stream gave its time, or it was given to the decoder, or its place was known once
++ * the layer started): with the RPU of that access unit, as coded, and the metadata that the base
+  * decoder made of it (dvbridge_fel_base_metadata()). So a base picture that goes out without its
+  * enhancement picture has the metadata it has with it, also where the layers are coded in
+  * different picture order and the RPU carried with the base picture is the one of another
+@@ -134,4 +134,20 @@ int dvbridge_fel_layer_rpu(struct dvbridge_fel *fel, int64_t pts, AVFrame **fram
+  * their own enhancement access unit (answers 4 of dvbridge_fel_take() that are not of a MEL, and
+  * dvbridge_fel_layer_rpu()). */
+ unsigned dvbridge_fel_own_rpus(const struct dvbridge_fel *fel);
++/* Hades, for the log: the times that the layer started, by picture order, at a random-access
++ * picture of its own whose place was counted from one of the base layer (where the base layer
++ * reorders its pictures, or the two layers do not have theirs in the same packets with the same
++ * picture order count). */
++unsigned dvbridge_fel_ranked(const struct dvbridge_fel *fel);
++/* Hades, for the log: what the layer met since it last started to wait for a picture to start at (since the last
++ * dvbridge_fel_reset(), with dvbridge_fel_preroll_packets()) */
++struct dvbridge_fel_wait {
++    unsigned unreadable; /* enhancement access units whose picture order could not be read */
++    unsigned layer_keys; /* random-access pictures of the layer */
++    unsigned base_keys;  /* by picture order, random-access pictures of the base layer */
++    unsigned counted;    /* by picture order, random-access pictures of the layer whose place was counted */
++    unsigned given_up;   /* ... and the count given up (a packet without one picture of each layer, a place that
++                            could not be read in time) */
++};
++void dvbridge_fel_wait_counts(const struct dvbridge_fel *fel, struct dvbridge_fel_wait *out);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 5db6dc8..ae8c0dd 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -746,6 +746,11 @@ void CDVDVideoCodecFFmpeg::Dispose()
+               "picture, {} of them with the metadata of their own enhancement access unit and the "
+               "others with the one carried with their base picture",
+               m_dvLayerRpu, m_dvPaired, m_dvUnpaired, ownRpu);
++  if (const unsigned int ranked = dvbridge_fel_ranked(m_dvFel.get()))
++    CLog::Log(LOGINFO,
++              "DV FEL: by picture order, the layer started {} times at a random-access picture of "
++              "its own, whose place was counted from one of the base layer",
++              ranked);
+   if (const unsigned int untimed = dvbridge_fel_untimed(m_dvFel.get()))
+     CLog::Log(LOGINFO,
+               "DV FEL: {} enhancement access units came without their presentation time in a "
+@@ -1287,11 +1292,19 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+         // instead of stopping the video. dvbridge draws it without the FEL residual, counted.
+         constexpr unsigned int WITHOUT_LAYER_LOGGED = 240;
+         if (++m_dvWithoutLayer == WITHOUT_LAYER_LOGGED)
++        {
++          // Hades: and what the layer met meanwhile, which says why it did not start
++          dvbridge_fel_wait wait{};
++          dvbridge_fel_wait_counts(m_dvFel.get(), &wait);
+           CLog::Log(LOGINFO,
+                     "DV FEL: {} base pictures in a row without their enhancement picture ({} "
+                     "enhancement packets passed over while the layer waited for a picture it "
+-                    "can start at)",
+-                    WITHOUT_LAYER_LOGGED, dvbridge_fel_preroll_packets(m_dvFel.get()));
++                    "can start at: {} could not be read, {} were random-access pictures of the "
++                    "layer; {} random-access pictures of the base layer came, {} pictures of the "
++                    "layer were placed by counting from one and {} of those counts given up)",
++                    WITHOUT_LAYER_LOGGED, dvbridge_fel_preroll_packets(m_dvFel.get()),
++                    wait.unreadable, wait.layer_keys, wait.base_keys, wait.counted, wait.given_up);
++        }
+         // Hades: one that goes out without it for a reason of its own here (late, the base layer
+         // ended, the layer starts again) takes the metadata of its own enhancement access unit too,
+         // when the module knows it; otherwise it keeps the one carried with it, as before. Not one
+-- 
+2.53.0
+

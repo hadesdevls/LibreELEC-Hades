@@ -1,0 +1,282 @@
+From 0c68b67292efd824ce3507c82808f33579b189ce Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:48:27 +0000
+Subject: [PATCH] tools/dvbridge: the program cache reads only a regular file
+ and writes to a name of its own
+
+CroqueMr took this file into his fork and changed two things in it: the
+temporary file of a save is made with mkstemp(), and what is read of a
+cache file is bounded to 64 MiB. Both are right, and are written here
+again, with the rest of what they lead to.
+
+Reading:
+- The file is opened with O_NOFOLLOW and O_NONBLOCK and read only when
+  fstat() says it is a regular file of at most what the cache may hold
+  and its headers, exactly that many bytes. Before, fopen() followed a
+  link that stood at the path, and a FIFO there blocked the opening of
+  the bridge for good; and a buffer of the whole bound (48 MiB for the
+  32 MiB that Kodi asks for) was allocated for every file that was read.
+  A link, or anything that is not a regular file, is deleted, as a file
+  that does not hold was.
+- What a cache holds is at most 42 MiB, whatever is asked: its file,
+  with the headers of its entries, is then under 64 MiB, the most that is
+  ever read. Before, a bound near SIZE_MAX overflowed the size to read,
+  and the file of a large cache could not be read back. Kodi asks for 32
+  MiB, for which nothing changes.
+
+Writing:
+- A save goes to a file that mkostemps() makes: a name that nothing has,
+  made with O_EXCL (no link that is there is followed, no file is taken
+  over), for its owner only (0600), close-on-exec. It still ends in
+  ".tmp", which the caller deletes when it opens the folder. Before, the
+  name was the path, the process id and ".tmp", opened with fopen(),
+  which followed a link planted at that name and wrote where it led.
+  The bytes go out with write() in a loop.
+
+Kodi runs as root and the folder is its own (special://temp/dvbridge), so
+this is a hardening against what something else running there could
+leave, not a fix of anything seen.
+
+Tested on the host with the cache test that Hades has for this file,
+extended:
+58 checks, of which the 31 that there were pass as before. The new ones:
+a link where the cache is (not followed, deleted, what it led to left as
+it was), a FIFO (opened within 10 s, deleted), a folder, a link planted at
+the old name of a write (what it leads to is not written), the mode of
+what is written, the largest bound (the good file read; 48 MiB of entries
+held to 42 MiB, written and read back whole), a file of 70 MiB, and a
+whole file longer than what is read for its bound. The file as it was
+fails 11 of them, and 7 mutations of this change are caught. And the
+bridge drawing the FEL test stream through zink on lavapipe, built once
+with the file as it was and once with this one, with the libplacebo of
+the tree: the hashes of all 36 drawings are the same without a cache,
+with a cache written cold (29 programs, written for its owner only) and
+with it read warm (all 29 taken from the file, nothing written again).
+---
+ tools/dvbridge/dvbridge_cache.c | 124 ++++++++++++++++++++++++--------
+ tools/dvbridge/dvbridge_cache.h |  19 +++--
+ 2 files changed, 109 insertions(+), 34 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_cache.c b/tools/dvbridge/dvbridge_cache.c
+index 90bfa1b..34928fd 100644
+--- a/tools/dvbridge/dvbridge_cache.c
++++ b/tools/dvbridge/dvbridge_cache.c
+@@ -6,12 +6,17 @@
+  *  See LICENSES/README.md for more information.
+  */
+ /* Hades: the GPU programs that libplacebo makes, kept in a file from one session to the next. */
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE 1 /* mkostemps() */
++#endif
+ #include "dvbridge_cache.h"
+ #include <errno.h>
++#include <fcntl.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ struct dvbridge_shader_cache {
+@@ -86,11 +91,54 @@ static bool well_formed(const unsigned char *data, size_t length, size_t max_byt
+     return at == length;
+ }
+ 
++/* What is read of a file: what the cache may hold and the headers of its entries, at most. The
++ * programs are some kilobytes each, so their headers, 24 bytes and the padding, are well within half
++ * of that again and 64 KiB. */
++static size_t most_to_read(size_t max_bytes)
++{
++    return max_bytes + max_bytes / 2 + 65536;
++}
++
++/* The file that fd is open on, whole: exactly the length that fstat() told, then its end. A file that
++ * grows or shrinks meanwhile is not whole. */
++static bool read_whole(int fd, unsigned char *data, size_t length)
++{
++    size_t got = 0;
++    for (;;) {
++        const ssize_t n = read(fd, data + got, length + 1 - got);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n < 0)
++            return false;
++        if (n == 0)
++            return got == length;
++        got += (size_t)n;
++        if (got > length)
++            return false;
++    }
++}
++
++static bool write_whole(int fd, const unsigned char *data, size_t length)
++{
++    while (length) {
++        const ssize_t n = write(fd, data, length);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0)
++            return false;
++        data += n;
++        length -= (size_t)n;
++    }
++    return true;
++}
++
+ struct dvbridge_shader_cache *dvbridge_shader_cache_open(const char *path, size_t max_bytes, pl_log log)
+ {
+     struct dvbridge_shader_cache *c = calloc(1, sizeof(*c));
+     if (!c)
+         return NULL;
++    if (max_bytes > DVBRIDGE_SHADER_CACHE_MOST)
++        max_bytes = DVBRIDGE_SHADER_CACHE_MOST;
+     c->path = strdup(path ? path : "");
+     c->max_bytes = max_bytes;
+     /* Hades: no object of more than a quarter of it: libplacebo keeps its tables in the cache too
+@@ -106,29 +154,40 @@ struct dvbridge_shader_cache *dvbridge_shader_cache_open(const char *path, size_
+     }
+     if (!c->path[0])
+         return c;
+-    FILE *f = fopen(c->path, "rb");
+-    if (!f)
++    /* No link is followed, and nothing that is not a regular file is read: a FIFO would block the
++     * read (and its opening, without O_NONBLOCK), a device would not end. Such a thing, or a link, is
++     * not a file that this writes, and it is deleted, as a file that does not hold is. */
++    const int fd = open(c->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY);
++    if (fd < 0) {
++        if (errno == ELOOP)
++            remove(c->path);
+         return c;
+-    /* The whole file, of what the cache may hold and its headers at most */
+-    const size_t most = max_bytes + max_bytes / 2 + 65536;
+-    unsigned char *data = malloc(most + 1);
+-    size_t length = data ? fread(data, 1, most + 1, f) : 0;
+-    const bool read_whole = data && !ferror(f) && length <= most;
+-    fclose(f);
+-    if (read_whole && well_formed(data, length, max_bytes)) {
+-        const int taken = pl_cache_load(c->cache, data, length);
+-        c->loaded = taken > 0 ? taken : 0;
+-        /* (what was not taken, with a checksum that does not match, makes the file differ from
+-         * the cache: it is written anew without it the next time) */
+-        if (c->loaded == (int)read_u32(data + 12))
+-            c->on_disk = state_of(c->cache);
+-        else
+-            c->on_disk = (struct state){0, -1, 0};
+-    } else if (data) {
+-        /* not a file that this writes, or not whole: it is written anew */
+-        remove(c->path);
+     }
+-    free(data);
++    struct stat st;
++    bool taken = false, keep = false;
++    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
++        (uint64_t)st.st_size <= most_to_read(max_bytes)) {
++        const size_t length = (size_t)st.st_size;
++        unsigned char *data = malloc(length + 1);
++        /* (no memory: nothing is taken, and the file is not to blame) */
++        keep = !data;
++        if (data && read_whole(fd, data, length) && well_formed(data, length, max_bytes)) {
++            const int loaded = pl_cache_load(c->cache, data, length);
++            c->loaded = loaded > 0 ? loaded : 0;
++            /* (what was not taken, with a checksum that does not match, makes the file differ from
++             * the cache: it is written anew without it the next time) */
++            if (c->loaded == (int)read_u32(data + 12))
++                c->on_disk = state_of(c->cache);
++            else
++                c->on_disk = (struct state){0, -1, 0};
++            taken = true;
++        }
++        free(data);
++    }
++    close(fd);
++    /* not a file that this writes, or not whole: it is written anew */
++    if (!taken && !keep)
++        remove(c->path);
+     return c;
+ }
+ 
+@@ -174,24 +233,33 @@ int dvbridge_shader_cache_save(struct dvbridge_shader_cache *c)
+         free(data);
+         return -1;
+     }
+-    const size_t name = strlen(c->path) + 32;
++    /* Into a file of its own beside it, which takes its name when whole. mkostemps() makes that file
++     * with a name that nothing has (O_EXCL: it follows no link that is there, and a name that a write
++     * that did not end left is not taken) and for its owner only. The name ends in ".tmp": what is
++     * left of a write that did not end is deleted with that when the folder is opened. Not synced: a
++     * file that a power cut leaves cut is not whole, and is not taken. */
++    const size_t name = strlen(c->path) + sizeof(".XXXXXX.tmp");
+     char *temporary = malloc(name);
+     if (!temporary) {
+         free(data);
+         return -1;
+     }
+-    snprintf(temporary, name, "%s.%ld.tmp", c->path, (long)getpid());
+-    FILE *f = fopen(temporary, "wb");
+-    bool written = f && fwrite(data, 1, length, f) == length;
+-    if (f)
+-        written = fclose(f) == 0 && written;
++    snprintf(temporary, name, "%s.XXXXXX.tmp", c->path);
++    const int fd = mkostemps(temporary, 4, O_CLOEXEC);
++    if (fd < 0) {
++        free(temporary);
++        free(data);
++        return -1;
++    }
++    bool written = write_whole(fd, data, length);
++    written = close(fd) == 0 && written;
+     free(data);
+     if (written && rename(temporary, c->path) == 0) {
+         free(temporary);
+         c->on_disk = now;
+         return 1;
+     }
+-    remove(temporary);
++    unlink(temporary);
+     free(temporary);
+     return -1;
+ }
+diff --git a/tools/dvbridge/dvbridge_cache.h b/tools/dvbridge/dvbridge_cache.h
+index 38db158..fa1ce63 100644
+--- a/tools/dvbridge/dvbridge_cache.h
++++ b/tools/dvbridge/dvbridge_cache.h
+@@ -22,14 +22,20 @@
+  * Not thread safe beyond what pl_cache is; the cache must outlive every pl_gpu that uses it. */
+ struct dvbridge_shader_cache;
+ 
++/* The most that a cache holds, whatever is asked: then its file, with the headers of its entries,
++ * is less than 64 MiB, which is the most that is read of one. */
++#define DVBRIDGE_SHADER_CACHE_MOST ((size_t)42 * 1024 * 1024)
++
+ /* Takes what the file at path holds when it is a whole file of the format that
+  * dvbridge_shader_cache_save() writes: its header and the size of every entry are checked
+  * against the file before anything of it is taken, and libplacebo checks the checksum of each
+- * entry as it takes it (an entry that does not match is left out, with the ones after it). A file
+- * that does not hold is deleted. A missing or bad file is no failure: the cache starts empty.
+- * max_bytes bounds what the cache holds (the oldest entries make room) and what is read; Hades:
+- * an entry of more than a quarter of it is not kept (DVBRIDGE_SHADER_CACHE_OBJECT_QUARTER).
+- * Returns NULL only when there is no memory. */
++ * entry as it takes it (an entry that does not match is left out, with the ones after it). Only a
++ * regular file is read, of at most what the cache may hold and its headers, and no link is
++ * followed. A file that does not hold, or anything else there (a link, a FIFO), is deleted. A
++ * missing or bad file is no failure: the cache starts empty. max_bytes, of at most
++ * DVBRIDGE_SHADER_CACHE_MOST, bounds what the cache holds (the oldest entries make room) and what
++ * is read; Hades: an entry of more than a quarter of it is not kept
++ * (DVBRIDGE_SHADER_CACHE_OBJECT_QUARTER). Returns NULL only when there is no memory. */
+ #define DVBRIDGE_SHADER_CACHE_OBJECT_QUARTER 1
+ struct dvbridge_shader_cache *dvbridge_shader_cache_open(const char *path, size_t max_bytes, pl_log log);
+ /* Without saving it. The pl_cache goes with it. */
+@@ -39,7 +45,8 @@ pl_cache dvbridge_shader_cache_get(const struct dvbridge_shader_cache *cache);
+ int dvbridge_shader_cache_loaded(const struct dvbridge_shader_cache *cache);
+ /* Writes the file when what the cache holds is not what the file holds (it has been loaded or
+  * written with other entries): into a file beside it, which then takes its name, so that a file
+- * is whole or not there. 1 written, 0 nothing to write, -1 it could not be written. */
++ * is whole or not there. That file is made with a name that nothing has, which ends in ".tmp", for
++ * its owner only. 1 written, 0 nothing to write, -1 it could not be written. */
+ int dvbridge_shader_cache_save(struct dvbridge_shader_cache *cache);
+ /* What the cache holds: entries and bytes. */
+ void dvbridge_shader_cache_size(const struct dvbridge_shader_cache *cache, int *entries, size_t *bytes);
+-- 
+2.53.0
+

@@ -4,8 +4,11 @@
 # minutes after Kodi is started, at every start. Each snapshot is copied to the FAT as soon as it is taken,
 # so an early power-off still leaves the first one. Commands that talk to the GPU run in the background and
 # are never waited for, so a wedged GPU cannot block the copy. Kodi's logs (the last 8 MiB of each, packed)
-# and the journal pass through redact.sed first (without it they are not copied). Nothing is written once
-# the switch is off, or with little room left on the partition. Nothing is powered off or reconfigured.
+# and the journal pass through the filter for logs (redact.sh) where they are taken, and every file of a
+# snapshot through the filter that fits it (redact.sh tree: addresses, serial numbers, UUIDs, SSH keys,
+# network names and the name of the system become markers) before it is copied; without the filter nothing
+# is copied. Nothing is written once the switch is off, or with little room left on the partition. Nothing
+# is powered off or reconfigured.
 # Arguments: the build (VERSION of os-release), written to build.txt in each snapshot, and the number of
 # this start (start.sh).
 # All of it only reads what the system is doing, but for what the first snapshot does for a display that is
@@ -19,7 +22,7 @@
 (
 D=/flash/hades-diag
 T=/tmp/hades-diag
-R=/usr/lib/hades-diag/redact.sed
+R=/usr/lib/hades-diag/redact.sh
 B=$1
 H=start-${2:-0}
 # The level of the kernel's display messages, and where what it was is kept while this has it turned up
@@ -35,9 +38,9 @@ lim() {
   wait $lp
   kill $lw 2>/dev/null
 }
-# Redact credentials; without the rules, print nothing of the input.
+# Redact a log (identifiers, credentials, paths of media); without the filter, print nothing of the input.
 clean() {
-  if [ -f $R ]; then sed -E -f $R; else cat >/dev/null; echo "(not copied: $R missing)"; fi
+  if [ -f $R ]; then sh $R; else cat >/dev/null; echo "(not copied: $R missing)"; fi
 }
 # The last $1 bytes of the file $2, from the start of a line: an address that is cut in two is no address to
 # the filter.
@@ -63,21 +66,54 @@ room_left() { [ "$(df -k /flash 2>/dev/null | awk 'END { print $4 + 0 }')" -gt 1
 # With no room, a note on the partition says so, once: nothing else there would tell why nothing was saved.
 no_room() { [ -e $D/NO-ROOM.txt ] || { mkdir -p $D && cp /usr/lib/hades-diag/NO-ROOM.txt $D/; }; }
 
-# Copy the snapshot $1 into the folder of this start on the boot partition.
+# Copy the snapshot $1 into the folder of this start on the boot partition: each of its files through the
+# filter that fits it first, into $T/$1.filtered in RAM (a file that the filter fails on is not copied;
+# without the filter, nothing is). The second copy of a snapshot filters only what changed since the first.
 to_flash() {
   switch_on || return 0
+  [ -f $R ] || return 0
+  sh $R tree $T/$1 $T/$1.filtered
   flash_lock || return 0
   if mount -o remount,rw /flash; then
     # (without room for a new copy, the one that is there stays)
     if room_left; then
       rm -rf $D/$H/$1 $D/NO-ROOM.txt
-      mkdir -p $D/$H/$1 && cp -r $T/$1/. $D/$H/$1/
+      mkdir -p $D/$H/$1 && cp -r $T/$1.filtered/. $D/$H/$1/ && : > $D/$H/.filtered
     else
       no_room
     fi
     mount -o remount,ro /flash
   fi
   flash_unlock
+}
+
+# What versions of the diagnostics before 15 left on the partition went there without the filter of
+# identifiers: each of their folders (of a start, or of the layout before the folders of starts) is put
+# through the filter once, file by file, in RAM, and written back with an empty file .filtered in it, which
+# this version puts in every folder of a start that it writes to. A file that the filter fails on is not
+# written back. The folder is written beside the old one first, and the old one goes only when it is there.
+# (Run in the background before the first snapshot: start.sh is waited for by Kodi.)
+refilter() {
+  [ -f $R ] || return 0
+  for d in $D/*/; do
+    d=${d%/}
+    [ -d "$d" ] && [ ! -e "$d/.filtered" ] && [ "${d##*/}" != "$H" ] || continue
+    case ${d##*/} in *.part) continue ;; esac
+    rm -rf $T.refilter
+    sh $R tree "$d" $T.refilter
+    mkdir -p $T.refilter && : > $T.refilter/.filtered
+    switch_on || break
+    flash_lock || break
+    # (with less than 128 MiB free, nothing is written: an update needs room there; the next start tries again)
+    if room_left && mount -o remount,rw /flash; then
+      rm -rf "$d.part"
+      cp -r $T.refilter "$d.part" && rm -rf "$d" && mv "$d.part" "$d"
+      rm -rf "$d.part"
+      mount -o remount,ro /flash
+    fi
+    flash_unlock
+  done
+  rm -rf $T.refilter
 }
 
 # The graphics devices that Kodi is the DRM master of (the one it shows itself on, and those whose displays it
@@ -223,7 +259,7 @@ listen() {
 }
 
 snapshot() {
-  S=$T/$1; rm -rf $S; mkdir -p $S/edid
+  S=$T/$1; rm -rf $S $S.filtered; mkdir -p $S/edid
   echo "$B" > $S/build.txt
   dmesg > $S/dmesg.txt 2>&1
   # (the second snapshot has the kernel log now: see listen())
@@ -332,11 +368,12 @@ snapshot() {
   sleep 30
   to_flash $1
   # (it is on the boot partition now: not kept in RAM as well)
-  rm -rf $S
+  rm -rf $S $S.filtered
 }
 
 # (what a run of this that was killed left turned up)
 debug_down
+refilter
 sleep 60; snapshot 1-minute
 sleep 150; snapshot 4-minutes
 ) >/dev/null 2>&1 &

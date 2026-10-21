@@ -9,6 +9,7 @@ Off by default. While it is on, every start of the PC leaves a record of what th
 - **Turning it on:** tick "Save diagnostics there" in the Windows installer when you install or update; or, on a drive that is plugged into a Windows PC, rename the file `DIAG-OFF.TXT` at the top of that partition to `DIAG-ON.TXT`.
 - **Turning it off:** rename it back, or update with the box unticked.
 - **Where it goes:** the folder `hades-diag` on that partition. Kodi's file manager reaches it too (*Settings > File manager > Add source > Root filesystem > flash > hades-diag*).
+- **From a system on a disk inside the PC**, whose boot partition Windows does not show: *LibreELEC settings > System > Copy the diagnostics to a USB drive*; or, with nothing on the screen, make a folder named `hades-diag` at the top of a USB drive in Windows, plug the drive into the PC while Hades runs, wait a minute and pull it out. Either way the copy goes into the folder `hades-diag` of the drive, in a folder named after the date and time, is read back from the drive file by file (its sums are in `SHA256SUMS.txt`), and nothing on the drive is written over. When the drive with the folder cannot take it, a note `NOT-COPIED.txt` in that folder says why. An update with the installer keeps the folder `hades-diag` of the drive it updates, and says what it kept.
 
 Each start of the PC has a folder of its own, `start-1`, `start-2` and so on; the last eight are kept, so a drive taken from one PC to the next keeps what each of them had to tell.
 
@@ -21,11 +22,17 @@ Each start of the PC has a folder of its own, `start-1`, `start-2` and so on; th
 
 Nothing is written when the partition has less than 128 MiB free (a note, `NO-ROOM.txt`, then says so). Turn the PC off from the menu on screen, not with its button, so that the `shutdown` folder is written.
 
-**Privacy.** Before a log of Kodi or of the system's services is written there, it goes through a filter that removes the path of every address (only the server's name stays), e-mail addresses, and anything that looks like a token, a key or a password; without the filter no such log is copied. The kernel log is written as it is. No filter is perfect: look at the files before you give them to anyone. What stays is what tells one PC from another: the names of your add-ons and of what you played, the make and model of your devices (and the serial numbers they report), the PC's network name and addresses, your time zone. **Nothing is sent anywhere**: the files stay on the drive. The folder has a `README.txt` that says the same.
+**Privacy.** Everything that is written there goes through a filter first; without the filter nothing is copied.
+
+- Addresses of your network and of the internet (IPv4 and IPv6), MAC and Bluetooth addresses, Wi-Fi network names, the PC's name on the network and the names of the computers of your home network in addresses, the serial numbers of displays (also inside their EDID), graphics cards and USB devices, the UUIDs of disks and partitions, and SSH keys and fingerprints become markers, such as `[lan-ip-1a2b.3c4d]` or `[mac-5e6f70]`. The same value gives the same marker on that PC, so a report still shows which lines are about the same device or the same network (the first part of an address's marker is the same for its whole network), but a marker cannot be turned back into its value: it is made with a secret kept on the PC (`/storage/.cache/hades-diag/key`, readable by root only), which never goes into the diagnostics.
+- In the logs of Kodi and of the system, the path of every address goes (only the server's name stays), and so do the names of films, songs and searches (only the extension stays, as in `[redacted].mkv`), e-mail addresses, and anything that looks like a token, a key or a password.
+- A line of 32767 characters or more, or with more than 1024 addresses, names or paths in it, is left out, and says so in its place.
+
+No filter is perfect: look at the files before you give them to anyone. What stays is what tells one PC from another: the names of your add-ons and of your drives, the make and model of your devices, the names of public servers, which services were listening, and your time zone. **Nothing is sent anywhere**: the files stay on the drive. The folder has a `README.txt` that says the same.
 
 ## Submit Log
 
-*LibreELEC settings > System > Submit Log* works as in LibreELEC, with one difference: before anything is uploaded, it asks. By default the log is **saved on the system**, through the same filter, in `/storage/logfiles` (reachable with Kodi's file manager: *Root filesystem > storage > logfiles*). Uploading to LibreELEC's paste service is still offered, with what that means explained first; "No" is preselected.
+*LibreELEC settings > System > Submit Log* works as in LibreELEC, with two differences: before anything is uploaded, it asks; and the log goes through the same filter as the diagnostics, whether it is kept or uploaded. By default the log is **saved on the system** in `/storage/logfiles` (reachable with Kodi's file manager: *Root filesystem > storage > logfiles*). Uploading to LibreELEC's paste service is still offered, with what that means explained first; "No" is preselected. The command `pastekodi`, run over SSH, still uploads the log as it is, as in LibreELEC.
 
 ## What to look for in `kodi.log`
 
@@ -36,6 +43,7 @@ The lines of the Dolby Vision output start with `DVBridge:`. The ones that tell 
 | `DVBridge: the first picture of this stream: base ...` | What the stream is: size and layout, whether it has an enhancement layer, the content mapping, how much metadata, where it is drawn |
 | `DVBridge: native Dolby Vision output started` | Native output began |
 | `DVBridge: native Dolby Vision output disabled: <reason>; the video continues on the ordinary output. ...` | Why native output was not used, and when it will be tried again |
+| `DVBridge: the display reads Dolby Vision display management N: frames carry the content mapping v2.9 part ...` | A TV of display management 2 or 3: the content mapping v4.0 blocks are left out of the metadata it is sent |
 | `DVBridge: the display offers Dolby Vision Low-Latency only ...` | The TV input is set up for games or a PC: Dolby Vision Standard is not available there |
 | `DVBridge: last 10 s: N frames shown, N not shown, ...` | Every 10 s during a video: frames shown and missed, preparation and presentation times, frames presented a frame ahead and refreshes missed, GPU time and the fidelity step-down level of the frames it is from |
 | `DVBridge: the fidelity step-down of native Dolby Vision frames is forced to level N ...` | `advancedsettings.xml` forces a level ([settings.md](settings.md)): the picture is not the faithful one above level 0 |

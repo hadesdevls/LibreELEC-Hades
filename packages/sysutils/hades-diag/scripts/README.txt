@@ -22,9 +22,9 @@ WHAT IS WRITTEN HERE
 
   1-minute, 4-minutes
       About 1 and 4 minutes after the media centre starts: the graphics cards and what is connected to
-      each (with the EDID of every display), the kernel log, the last of the media centre's log
-      (kodi.log), the warnings of the system, sound devices, USB devices, the state of the network,
-      services, the clock. The first of the two also has:
+      each (with the EDID of every display, without its serial number), the kernel log, the last of the
+      media centre's log (kodi.log), the warnings of the system, sound devices, USB devices, the state of
+      the network, services, the clock. The first of the two also has:
         - redetect.txt: what the kernel said when the HDMI and DisplayPort sockets with nothing connected
           were asked again, and whether a graphics card was asleep. An AMD graphics card answers from what
           it last saw: it looks at a socket when it starts, when it wakes up and when something is plugged
@@ -51,23 +51,29 @@ WHAT IS WRITTEN HERE
   Nothing is written when this drive has less than 128 MB free: a note in this folder, NO-ROOM.txt, then
   says so.
   Folders named 1-minute, shutdown-1 and the like beside the start folders are of an earlier version.
+  Folders that a version before this one wrote without the filter below are put through it once, when
+  this version starts; each folder that has been through it has an empty file named .filtered.
 
 PRIVACY
 
-  Before a log of the media centre or of the services of the system is written here, it goes through a
-  filter that removes the path of every address (only the name of the server is left), e-mail addresses,
-  and what looks like a token, a key or a password. Without that filter no such log is copied. The log of
-  the kernel (dmesg, and the part of it in redetect.txt) is written as it is: it names your devices, and
-  the address of a network folder if one was connected by the system itself. No filter is perfect: look at
-  the files before you give them to anyone.
+  Everything that is written here goes through a filter first. Without the filter nothing is copied.
+    - Addresses of your network and of the internet (IPv4 and IPv6), MAC and Bluetooth addresses, the
+      names of Wi-Fi networks, the name of this PC on the network and those of the computers of your home
+      network in addresses, the serial numbers of displays, graphics cards and USB devices (also inside
+      the EDID of a display), the UUIDs of disks and partitions, and SSH keys and their fingerprints
+      become markers, such as [lan-ip-1a2b.3c4d] or [mac-5e6f70]. A marker is the same for the same value
+      on this PC, so the files still tell which lines are about the same device or the same network, but
+      it cannot be turned back into the value: it is made with a secret that never leaves this PC.
+    - From the logs of the media centre and of the system, the path of every address (only the name of
+      the server stays), the names of films, songs and searches (only the extension stays, as in
+      [redacted].mkv), e-mail addresses, and what looks like a token, a key or a password are removed.
+  No filter is perfect: look at the files before you give them to anyone.
 
   What does stay, because it is what tells one PC from another:
-    - the names of your add-ons and of what you played, as the media centre logs them;
-    - the make, model and serial number of your displays, sound devices, disks, USB devices and graphics
-      card, as they give them, the make and model of the PC, and the names of the drives that were plugged
-      in;
-    - the name of this PC on the network, the name and the addresses of your network (also those of the
-      network cards, of the access point and of Bluetooth devices), and which services were listening;
+    - the names of your add-ons, and the names of your drives as you labelled them;
+    - the make and model of your displays, sound devices, disks, USB devices, graphics card and PC;
+    - the names of public servers (for example, of the services that your add-ons use), and which
+      services of this PC were listening;
     - your time zone.
 
   Nothing is sent anywhere: the files stay on this drive.

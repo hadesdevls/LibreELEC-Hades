@@ -10,6 +10,7 @@ PKG_SITE="https://taglib.org"
 PKG_URL="https://taglib.org/releases/${PKG_NAME}-${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="toolchain cmake:host utfcpp zlib"
 PKG_LONGDESC="TagLib is a library for reading and editing the meta-data of several popular audio formats."
+PKG_BUILD_FLAGS="+hardening"
 
 PKG_CMAKE_OPTS_TARGET="-DBUILD_EXAMPLES=OFF \
                        -DBUILD_SHARED_LIBS=OFF \

@@ -287,11 +287,13 @@ namespace Hades.Installer
         // Hades is already on the disk: its system partition is replaced by the one of the image, and its
         // storage partition, with what the user has there, is not touched. The boot menus of the image are
         // made to name that storage, and on a disk inside the PC they are changed as when it is installed
-        // there (Engine.ForInternalDisk). diagnostics: with the switch of its diagnostics turned on; what
-        // the diagnostics had saved on the old system partition goes with that partition.
+        // there (Engine.ForInternalDisk). diagnostics: with the switch of its diagnostics turned on. What the
+        // diagnostics had saved on the old system partition (the folder hades-diag) is read from it before it
+        // is written over and goes into the new one (DiagFolder); what became of it is returned, and whatever
+        // goes wrong with it leaves the update as it would be without it.
         // A system partition that some program has open is left alone (PartitionInUseException), unless
         // take says to take it from that program (Native.OpenPartition): the user is asked first.
-        public static void Update(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take = false)
+        public static DiagKeep Update(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take = false)
         {
             report(0, L.T("Preparing the update…", "Preparando la actualización…"));
             // (only the system partition of Hades is written, through a handle that cannot write outside it)
@@ -320,21 +322,34 @@ namespace Hades.Installer
                      ": system #" + system.Number + " at " + system.Offset + "; the storage is " + existing +
                      " (the image names " + plan.StorageUuid + ")");
             var part = new Engine.Target();
+            DiagKeep kept;
             using (FileStream stream = Native.OpenPartition(now.Number, system.Number, system.Offset, system.Size, true, take))
             {
+                report(30, L.T("Reading what the diagnostics saved…", "Leyendo lo que guardó el diagnóstico…"));
+                kept = DiagFolder.Prepare(plan, stream, system.Size, patches);
+                Log.Line("update: hades-diag before writing: " + kept.Summary());
+                var all = new List<Patch>(patches);
+                all.AddRange(kept.Patches);
                 part.Stream = stream;
                 part.Capacity = system.Size;
                 part.From = plan.System.Start;
                 part.Length = plan.System.Size;
-                Engine.Write(plan, new[] { part }, patches, Bar(report), null);
+                Engine.Write(plan, new[] { part }, all, Bar(report), null);
+                if (part.Result.Verified) DiagFolder.Confirm(kept, DiagFolder.Reader(stream, system.Size), system.Size);
             }
             Disks.Refresh(now.Number);
             Log.Line("update: written " + part.Result.Written + ", read back " + part.Result.ReadBack);
+            Log.Line("update: hades-diag: " + kept.Summary());
             if (!part.Result.Verified)
                 throw new IOException(L.T("What was written does NOT match the image. Update again before starting Hades: " +
                                           "your settings are still on the disk, but the system was left half written.",
                                           "Lo que quedó escrito NO coincide con la imagen. Vuelve a actualizar antes de arrancar Hades: " +
-                                          "tus ajustes siguen en el disco, pero el sistema quedó a medias."));
+                                          "tus ajustes siguen en el disco, pero el sistema quedó a medias.") +
+                                      (kept.State == DiagKeep.Outcome.Kept
+                                           ? L.T(" What its diagnostics had saved (the folder hades-diag) is lost as well.",
+                                                 " Lo que había guardado su diagnóstico (la carpeta hades-diag) también se pierde.")
+                                           : ""));
+            return kept;
         }
 
         // Takes Hades off an internal disk. Next to anything else: its two partitions go, and the volume

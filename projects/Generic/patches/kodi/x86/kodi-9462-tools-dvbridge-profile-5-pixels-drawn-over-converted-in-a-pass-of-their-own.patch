@@ -1,0 +1,414 @@
+From 3f94f1ca6683c68f7e5655a689192b22fb4f5b8d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 08:01:40 +0000
+Subject: [PATCH] tools/dvbridge: profile 5 pixels drawn over converted in a
+ pass of their own
+
+Where decoding is not affine (IPT-PQ-c2, profile 5), converting a pixel drawn over back to codes
+takes three PQ round trips, and the pass of the transport converted each pixel twice: for its own
+luma, and for the chroma of its pair, which an odd pixel takes from the even one, so the odd pixel
+converted the even one again. Under a GUI that spans most of the raster (the background of the
+player information spans its width and three quarters of its height) the packing of a frame took
+60 ms on the integrated Radeon of a Ryzen 9 7950X3D through D3D12, five times what it takes for
+profiles 7 and 8.1. On that GPU with radeonsi, a profile 5 film took 43 to 54 ms of GPU time a
+frame of the 41.7 ms of a 24 Hz refresh with the player information open, and 10.6 ms without it,
+in a test of the build before.
+
+A pass before the transport (pass 8) now converts the pixels drawn over, a fragment for each pair
+of the raster in the tiles that the GUI may reach (or over the whole raster where that is not
+known), into a texture of codes: drawn_over() of the even pixel for its luma, another call of it
+for the chroma, and one of the odd pixel for its luma, three calls where the transport made four.
+The transport takes their codes. The two calls of the even pixel are kept apart, as the transport
+had them: one call for both, or for parts of both, gave the same codes on lavapipe and on an RTX
+4080 SUPER, but not on the integrated Radeon through D3D12, where the chroma came out a code apart
+on about one pixel drawn over in 20,000, at values within 0.03 of a half. drawn_over(), to_source()
+and code() moved, unchanged, into DRAWN_OVER, which both passes take. The affine profiles do not
+take the pass. Where it cannot be made, the transport converts the pixels itself as before: the
+same codes, more slowly.
+
+Measured with a host test of the bridge (162 frames of profile 5, 7 FEL and 8.1 pictures with
+Kodi's GUI composited over them, as for the commit before): the same bytes as before on lavapipe
+and on the integrated Radeon and the RTX 4080 SUPER through D3D12; seven mutations of the pass made
+them differ, and without the pass they stay the same. On the integrated Radeon, a profile 5 frame
+under the player information takes 58.9 ms (76.7 ms after the commit before, 83.1 ms before it), a
+window over a dimmed screen 70.7 ms (93.0, 101.9), the OSD 29.8 ms (35.2, 37.6); profiles 7 FEL and
+8.1 stay as they were, and on the RTX 4080 SUPER every frame takes under 3.5 ms either way.
+Radeonsi, the driver of that GPU in LibreELEC, is not verified.
+---
+ tools/dvbridge/dvbridge_source.c | 239 ++++++++++++++++++++++++-------
+ tools/dvbridge/dvbridge_source.h |   4 +-
+ 2 files changed, 187 insertions(+), 56 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 9415a0b..aab3c37 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -192,7 +192,15 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+  * picture that Kodi draws over in those tiles only: everywhere else nothing is drawn over the
+  * picture, and pass 4 takes the codes of the transport there, as it did where it read an alpha of
+  * 2. What else is drawn over it (PQ subtitles, a capture) asks for the rest of that picture first
+- * (dvbridge_source_complete()). */
++ * (dvbridge_source_complete()).
++ * Hades: where decoding is not affine (IPT-PQ-c2, profile 5), converting a pixel drawn over back to
++ * codes takes three PQ round trips (the picture under it, its inverse, and the blended colour's),
++ * and pass 4 converted each pixel twice: for its own luma, and for the chroma of its pair, which the
++ * odd pixel takes from the even one. Under a GUI that spans most of the raster (the background of
++ * the player information) the packing took about 60 ms on an integrated Radeon (through D3D12),
++ * five times what it takes for the affine profiles. There pass 8 converts them first, a fragment
++ * for each pair, with the code of pass 4 (DRAWN_OVER) in the calls that pass 4 made but the odd
++ * pixel's second one, and pass 4 takes their codes. */
+ #define DRAWN_TILE 16
+ #define DRAWN_COLUMNS ((3840 + DRAWN_TILE - 1) / DRAWN_TILE)
+ #define DRAWN_ROWS ((2160 + DRAWN_TILE - 1) / DRAWN_TILE)
+@@ -397,13 +405,62 @@ static const char PICTURE[] =
+     "    color = vec4(picture_at(ivec2(gl_FragCoord.xy)), 2.0);\n"
+     "}\n";
+ 
++/* A pixel drawn over converted back to codes. (Hades: the same code in passes 4 and 8; pass 8 makes
++ * three of the four calls that pass 4 made for a pair, see above.) */
++#define DRAWN_OVER                                                                                \
++    "uniform int code_max;\n"                                                                     \
++    "uniform mat3 ycc_inverse, lms_inverse;\n"                                                    \
++    /* the inverse of decode(): PQ BT.2020 RGB -> codes, not rounded */                           \
++    "vec3 to_source(vec3 rgb)\n"                                                                  \
++    "{\n"                                                                                         \
++    "    vec3 tp = rgb;\n"                                                                        \
++    "    if (affine == 0)\n"                                                                      \
++    "        tp = pq_oetf(lms_inverse * pq_eotf(rgb));\n"                                         \
++    "    return (ycc_inverse * tp + ycc_offset) * code_scale;\n"                                  \
++    "}\n"                                                                                         \
++    /* the codes of a pixel that something was drawn over: d.a = 2 - a, a the opacity of all that \
++     * was drawn over it, and d.rgb = a colour + (1 - a) picture (dvbridge_source.h) */           \
++    "vec3 drawn_over(ivec2 p, vec4 d)\n"                                                          \
++    "{\n"                                                                                         \
++    "    float a = 2.0 - d.a;\n"                                                                  \
++    /* (Hades: the picture under the pixel, as picture_at() has it, from the decode() that the    \
++     * test below takes, not from a second one: compilers need not merge the two, and the D3D12   \
++     * one of an integrated Radeon made both, a tenth of the packing's time under a GUI over the  \
++     * whole raster) */                                                                           \
++    "    vec3 codes = codes_at(p);\n"                                                             \
++    "    vec3 raw = inside(p.x, p.y) ? decode(codes) : vec3(0.0);\n"                              \
++    "    vec3 under = clamp(raw, 0.0, 1.0);\n"                                                    \
++    /* the first form where decoding is invertible: affine, whatever the picture clamps; else with \
++     * T' within [0, 1] and the picture not clamped */                                            \
++    "    bool exact = affine != 0;\n"                                                             \
++    "    if (!exact) {\n"                                                                         \
++    "        vec3 tp = ycc_forward * (codes / code_scale - ycc_offset);\n"                        \
++    "        exact = all(greaterThanEqual(tp, vec3(0.0))) && all(lessThanEqual(tp, vec3(1.0))) &&\n" \
++    "                raw == under;\n"                                                             \
++    "    }\n"                                                                                     \
++    "    if (exact)\n"                                                                            \
++    "        return to_source(d.rgb) + (1.0 - a) * (codes - to_source(under));\n"                 \
++    "    vec3 colour = (d.rgb - (1.0 - a) * under) / a;\n"                                        \
++    "    return (1.0 - a) * codes + a * to_source(colour);\n"                                     \
++    "}\n"                                                                                         \
++    "uint code(float v)\n"                                                                        \
++    "{\n"                                                                                         \
++    "    return uint(clamp(int(floor(v + 0.5)), 0, code_max));\n"                                 \
++    "}\n"
++
++/* Hades: what pass 8 writes for a pixel that nothing was drawn over (the codes are below 4096) */
++#define NOT_OVER "65535u"
++
+ /* 4. The transport. */
+ static const char PACK[] =
+     "#version 300 es\n"
+     COMMON
++    DRAWN_OVER
+     "uniform highp sampler2D drawn;\n" /* the picture of pass 3, with what was drawn over it */
+-    "uniform int has_layer, code_max;\n"
+-    "uniform mat3 ycc_inverse, lms_inverse;\n"
++    "uniform int has_layer;\n"
++    /* Hades: pass 8 converted the pixels drawn over, into pairs (pairs_made); then drawn is not read */
++    "uniform highp usampler2D pairs;\n"
++    "uniform int pairs_made;\n"
+     "uniform uvec4 metadata_words[128];\n"
+     "uniform uint packet_count;\n"
+     "uniform uint flip_y;\n"
+@@ -414,42 +471,6 @@ static const char PACK[] =
+     "    v ^= v >> 16u; v ^= v >> 8u; v ^= v >> 4u; v ^= v >> 2u; v ^= v >> 1u;\n"
+     "    return v & 1u;\n"
+     "}\n"
+-    /* the inverse of decode(): PQ BT.2020 RGB -> codes, not rounded */
+-    "vec3 to_source(vec3 rgb)\n"
+-    "{\n"
+-    "    vec3 tp = rgb;\n"
+-    "    if (affine == 0)\n"
+-    "        tp = pq_oetf(lms_inverse * pq_eotf(rgb));\n"
+-    "    return (ycc_inverse * tp + ycc_offset) * code_scale;\n"
+-    "}\n"
+-    /* the codes of a pixel that something was drawn over: d.a = 2 - a, a the opacity of all that
+-     * was drawn over it, and d.rgb = a colour + (1 - a) picture (dvbridge_source.h) */
+-    "vec3 drawn_over(ivec2 p, vec4 d)\n"
+-    "{\n"
+-    "    float a = 2.0 - d.a;\n"
+-    /* (Hades: the picture under the pixel, as picture_at() has it, from the decode() that the test
+-     * below takes, not from a second one: compilers need not merge the two, and the D3D12 one of an
+-     * integrated Radeon made both, a tenth of the packing's time under a GUI over the whole raster) */
+-    "    vec3 codes = codes_at(p);\n"
+-    "    vec3 raw = inside(p.x, p.y) ? decode(codes) : vec3(0.0);\n"
+-    "    vec3 under = clamp(raw, 0.0, 1.0);\n"
+-    /* the first form where decoding is invertible: affine, whatever the picture clamps; else with
+-     * T' within [0, 1] and the picture not clamped */
+-    "    bool exact = affine != 0;\n"
+-    "    if (!exact) {\n"
+-    "        vec3 tp = ycc_forward * (codes / code_scale - ycc_offset);\n"
+-    "        exact = all(greaterThanEqual(tp, vec3(0.0))) && all(lessThanEqual(tp, vec3(1.0))) &&\n"
+-    "                raw == under;\n"
+-    "    }\n"
+-    "    if (exact)\n"
+-    "        return to_source(d.rgb) + (1.0 - a) * (codes - to_source(under));\n"
+-    "    vec3 colour = (d.rgb - (1.0 - a) * under) / a;\n"
+-    "    return (1.0 - a) * codes + a * to_source(colour);\n"
+-    "}\n"
+-    "uint code(float v)\n"
+-    "{\n"
+-    "    return uint(clamp(int(floor(v + 0.5)), 0, code_max));\n"
+-    "}\n"
+     "void main()\n"
+     "{\n"
+     "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+@@ -457,15 +478,29 @@ static const char PACK[] =
+     "    int ex = p.x & ~1;\n"
+     "    bool odd = (p.x & 1) != 0;\n"
+     "    vec4 own = vec4(0.0, 0.0, 0.0, 2.0), even = own;\n"
++    /* (Hades: pass 8's codes of this pair: the luma of the even pixel, of the odd one, and the
++     * chroma of the pair; NOT_OVER where nothing was drawn over that pixel) */
++    "    uvec4 pair = uvec4(" NOT_OVER ");\n"
+     /* (Hades: outside the tiles that what is drawn over may reach, nothing is drawn over the
+      * picture; a pair is in the tile of its even pixel) */
+     "    if (has_layer != 0 && tile_drawn != 0) {\n"
+-    "        own = texelFetch(drawn, p, 0);\n"
+-    "        even = odd ? texelFetch(drawn, ivec2(ex, p.y), 0) : own;\n"
++    "        if (pairs_made != 0) {\n"
++    "            pair = texelFetch(pairs, ivec2(p.x >> 1, p.y), 0);\n"
++    "        } else {\n"
++    "            own = texelFetch(drawn, p, 0);\n"
++    "            even = odd ? texelFetch(drawn, ivec2(ex, p.y), 0) : own;\n"
++    "        }\n"
+     "    }\n"
+-    "    uint y = own.a != 2.0 ? code(drawn_over(p, own).x) : luma_code(p);\n"
+-    "    uint c;\n"
+-    "    if (even.a != 2.0) {\n"
++    "    uint y, c;\n"
++    "    if (pairs_made != 0) {\n"
++    "        uint luma = odd ? pair.y : pair.x;\n"
++    "        y = luma != " NOT_OVER " ? luma : luma_code(p);\n"
++    "    } else {\n"
++    "        y = own.a != 2.0 ? code(drawn_over(p, own).x) : luma_code(p);\n"
++    "    }\n"
++    "    if (pairs_made != 0 && pair.x != " NOT_OVER ") {\n"
++    "        c = odd ? pair.w : pair.z;\n"
++    "    } else if (pairs_made == 0 && even.a != 2.0) {\n"
+     "        vec3 e = drawn_over(ivec2(ex, p.y), even);\n"
+     "        c = code(odd ? e.z : e.y);\n"
+     "    } else {\n"
+@@ -481,6 +516,42 @@ static const char PACK[] =
+     "    color = vec4(float(c >> 4u), float(y >> 4u), float((y & 15u) | ((c & 15u) << 4u)), 255.0) / 255.0;\n"
+     "}\n";
+ 
++/* Hades: 8. The pixels drawn over converted back to codes (where decoding is not affine), before
++ * pass 4: a fragment for each pair of the raster (fragment x is the pair whose even pixel is 2 x,
++ * fragment y its row of the raster; drawn as passes 3 and 4, a 1920 wide viewport makes the tiles'
++ * quads those of their pairs), which writes the luma codes of its even and its odd pixel and the
++ * chroma codes of the pair, NOT_OVER where nothing was drawn over that pixel. Each as pass 4 computed
++ * it: drawn_over() of the even pixel for its luma, another of it for the chroma, and one of the odd
++ * pixel for its luma, three calls where pass 4 made four (its odd pixel converted the even one again
++ * for the chroma). The two calls of the even pixel stay apart, as pass 4 had them (a coordinate of
++ * the second moved by `apart`, a uniform of 0, so that no compiler merges them): one call for both,
++ * or for parts of both, gave the same codes on two GPUs' compilers but not on the D3D12 one of an
++ * integrated Radeon, where the chroma came out a code apart on about one pixel drawn over in 20,000
++ * (values within 0.03 of a half). */
++static const char PAIRS[] =
++    "#version 300 es\n"
++    COMMON
++    DRAWN_OVER
++    "uniform highp sampler2D drawn;\n"
++    "uniform int apart;\n"
++    "out uvec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 e = ivec2(gl_FragCoord.xy) * ivec2(2, 1), o = e + ivec2(1, 0);\n"
++    "    vec4 de = texelFetch(drawn, e, 0), dq = texelFetch(drawn, o, 0);\n"
++    "    uvec4 r = uvec4(" NOT_OVER ");\n"
++    "    if (de.a != 2.0) {\n"
++    "        vec4 de2 = texelFetch(drawn, ivec2(e.x + apart, e.y), 0);\n"
++    "        r.x = code(drawn_over(e, de).x);\n"
++    "        vec3 v = drawn_over(ivec2(e.x + apart, e.y), de2);\n"
++    "        r.z = code(v.y);\n"
++    "        r.w = code(v.z);\n"
++    "    }\n"
++    "    if (dq.a != 2.0)\n"
++    "        r.y = code(drawn_over(o, dq).x);\n"
++    "    color = r;\n"
++    "}\n";
++
+ /* 5. The edges drawn over (dvbridge_source_cover()): the raster in blocks of COVER_BLOCK x COVER_BLOCK
+  * pixels, a texel for each, which holds as its colour the edges that the pixels of the bars in its block
+  * (those outside the active picture) that are drawn over (alpha not 2) lie beyond; read back, the texels
+@@ -656,8 +727,17 @@ struct dvbridge_source_packer {
+     int rows_of[8], rows_half;
+     struct common_uniforms pc, cc; /* of pass 4 and of pass 3 */
+     struct {
+-        GLint drawn, has_layer, code_max, ycc_inverse, lms_inverse, words, count, flip;
++        GLint drawn, has_layer, code_max, ycc_inverse, lms_inverse, words, count, flip, pairs,
++            pairs_made;
+     } u;
++    /* Hades: pass 8, its uniforms, and the codes that it writes. Where it could not be made, pass 4
++     * converts the pixels drawn over itself, as before. */
++    GLuint pairs_program;
++    struct common_uniforms qc;
++    struct {
++        GLint drawn, code_max, ycc_inverse, lms_inverse, tiles, mode, flip, apart;
++    } q;
++    struct texture pairs;
+     struct {
+         GLint chroma, code_scale, taps, first, last_col, weights;
+     } h;
+@@ -729,7 +809,9 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     GLint previous = 0;
+     glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+     static const char *const pack[] = {"drawn", "has_layer", "code_max", "ycc_inverse",
+-        "lms_inverse", "metadata_words", "packet_count", "flip_y"};
++        "lms_inverse", "metadata_words", "packet_count", "flip_y", "pairs", "pairs_made"};
++    static const char *const pairs[] = {"drawn", "code_max", "ycc_inverse", "lms_inverse",
++        "drawn_tiles", "tiles_mode", "tiles_flip", "apart"};
+     static const char *const resite[] = {"chroma_plane", "code_scale", "taps", "first", "last_col",
+                                          "weights"};
+     static const char *const rows[] = {"chroma_plane", "chroma_read", "chroma_shift", "taps",
+@@ -739,6 +821,7 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+     _Static_assert(sizeof(p->u) == COUNT(pack) * sizeof(GLint), "pack uniforms");
+     _Static_assert(sizeof(p->h) == COUNT(resite) * sizeof(GLint), "resite uniforms");
+     _Static_assert(sizeof(p->v) == COUNT(rows) * sizeof(GLint), "rows uniforms");
++    _Static_assert(sizeof(p->q) == COUNT(pairs) * sizeof(GLint), "pairs uniforms");
+     /* (Hades: passes 3 and 4 over the raster or over its tiles) */
+     p->pack = link_with(TILED_VERTEX, PACK);
+     p->picture = link_with(TILED_VERTEX, PICTURE);
+@@ -783,6 +866,14 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+         dvbridge_source_packer_destroy(p);
+         return NULL;
+     }
++    /* Hades: pass 8; without it pass 4 converts the pixels drawn over itself (the same codes) */
++    p->pairs_program = link_with(TILED_VERTEX, PAIRS);
++    if (p->pairs_program &&
++        (!locate(p->pairs_program, &p->qc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
++         !locate(p->pairs_program, &p->q.drawn, pairs, COUNT(pairs)))) {
++        glDeleteProgram(p->pairs_program);
++        p->pairs_program = 0;
++    }
+     glGenVertexArrays(1, &p->vao);
+     glGenSamplers(1, &p->sampler);
+     glSamplerParameteri(p->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+@@ -811,6 +902,7 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->gui_quarter);
+     texture_destroy(&p->gui_tiles);
+     texture_destroy(&p->tiles);
++    texture_destroy(&p->pairs);
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+     glDeleteProgram(p->pack);
+@@ -821,6 +913,7 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteProgram(p->cover_blocks);
+     glDeleteProgram(p->gui_tiles_program);
+     glDeleteProgram(p->drawn_program);
++    glDeleteProgram(p->pairs_program);
+     free(p);
+ }
+ 
+@@ -989,6 +1082,25 @@ static void set_common(struct dvbridge_source_packer *p, const struct common_uni
+     glUniform1i(u->affine, params->affine);
+ }
+ 
++/* a row-major 3x3 matrix into a mat3 uniform (GLSL matrices are column-major) */
++static void set_matrix(GLint location, const float m[9])
++{
++    float t[9];
++    for (int i = 0; i < 3; ++i)
++        for (int j = 0; j < 3; ++j)
++            t[j * 3 + i] = m[i * 3 + j];
++    glUniformMatrix3fv(location, 1, GL_FALSE, t);
++}
++
++/* the uniforms of DRAWN_OVER (passes 4 and 8): the inverse matrices, the codes' largest */
++static void set_inverse(GLint ycc, GLint lms, GLint code_max,
++                        const struct dvbridge_source_params *params)
++{
++    set_matrix(ycc, params->ycc_inverse);
++    set_matrix(lms, params->lms_inverse);
++    glUniform1i(code_max, params->code_max);
++}
++
+ /* Hades: the tiles of what is drawn over, on unit 3, and how a pass takes them (tiles_mode) */
+ static void set_tiles(struct dvbridge_source_packer *p, GLint tiles, GLint mode, int how)
+ {
+@@ -1155,26 +1267,43 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+             green != 8 || blue != 8 || samples > 1 || encoding != GL_LINEAR)
+             return end(&state, false);
+     }
++    /* Hades: pass 8, where decoding is not affine and something was drawn over the picture, in the
++     * tiles that it may reach (or over the whole raster): the pixels drawn over converted back once
++     * each. Where it is not drawn, pass 4 converts them itself (the same codes, more slowly). */
++    bool pairs = false;
++    if (layer && !params->affine && p->pairs_program) {
++        const int pairs_how = p->tiles_mode ? 1 : 0;
++        if (target(&p->pairs, GL_RGBA16UI, 1920, 2160)) {
++            glUseProgram(p->pairs_program);
++            set_common(p, &p->qc, params, luma, width, height, x, y, margins);
++            bind(p, 2, layer);
++            glUniform1i(p->q.drawn, 2);
++            set_tiles(p, p->q.tiles, p->q.mode, pairs_how);
++            glUniform1i(p->q.flip, 0);
++            set_inverse(p->q.ycc_inverse, p->q.lms_inverse, p->q.code_max, params);
++            glUniform1i(p->q.apart, 0);
++            glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(pairs_how));
++            pairs = glGetError() == GL_NO_ERROR;
++        }
++        for (int i = 0; !pairs && i < 16 && glGetError() != GL_NO_ERROR; ++i)
++            ;
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    }
+     glViewport(0, 0, 3840, 2160);
+     glUseProgram(p->pack);
+     set_common(p, &p->pc, params, luma, width, height, x, y, margins);
+     bind(p, 2, layer);
+     glUniform1i(p->u.drawn, 2);
+     glUniform1i(p->u.has_layer, layer != 0);
++    bind(p, 4, pairs ? p->pairs.texture : 0);
++    glUniform1i(p->u.pairs, 4);
++    glUniform1i(p->u.pairs_made, pairs);
+     /* Hades: the picture drawn over is read in the tiles that what is drawn over may reach: all the
+      * tiles drawn, each knowing whether something may be drawn over it */
+     const int how = layer && p->tiles_mode ? 3 : 0;
+     set_tiles(p, p->pc_tiles, p->pc_mode, how);
+     glUniform1i(p->pc_flip, flip_y);
+-    glUniform1i(p->u.code_max, params->code_max);
+-    float yi[9], li[9];
+-    for (int i = 0; i < 3; ++i)
+-        for (int j = 0; j < 3; ++j) {
+-            yi[j * 3 + i] = params->ycc_inverse[i * 3 + j];
+-            li[j * 3 + i] = params->lms_inverse[i * 3 + j];
+-        }
+-    glUniformMatrix3fv(p->u.ycc_inverse, 1, GL_FALSE, yi);
+-    glUniformMatrix3fv(p->u.lms_inverse, 1, GL_FALSE, li);
++    set_inverse(p->u.ycc_inverse, p->u.lms_inverse, p->u.code_max, params);
+     glUniform4uiv(p->u.words, 128, packets);
+     glUniform1ui(p->u.count, count);
+     glUniform1ui(p->u.flip, flip_y);
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index ee05761..e9a77f3 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -139,7 +139,9 @@ void dvbridge_source_forget(struct dvbridge_source_packer *packer);
+  * not 2 something was, and the pixel is converted back (see above), the luma of each pixel from
+  * its own and the chroma of a pair from its even pixel. packets: the DM metadata packets, count of
+  * them (at most 16: dvbridge_packets(), 32 words each, four bytes to a word, the first in the high
+- * bits). */
++ * bits). Hades: where decoding is not affine (profile 5), the pixels drawn over are converted back
++ * in a pass of their own before the transport, three conversions for a pair where four were (the
++ * same codes). */
+ bool dvbridge_source_pack(struct dvbridge_source_packer *packer,
+                           const struct dvbridge_source_params *params, unsigned luma, int width,
+                           int height, int x, int y, unsigned layer, const unsigned margins[4],
+-- 
+2.53.0
+

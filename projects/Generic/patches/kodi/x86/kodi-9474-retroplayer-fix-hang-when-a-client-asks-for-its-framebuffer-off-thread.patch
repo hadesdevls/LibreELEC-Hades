@@ -1,0 +1,133 @@
+From 4b3f99ff36ca1d8d0355cde7255b76f3ae88307d Mon Sep 17 00:00:00 2001
+From: Chris <meischris39@hotmail.com>
+Date: Mon, 19 Oct 2026 13:29:08 +0100
+Subject: [PATCH] RetroPlayer: Fix hang when a client asks for its framebuffer
+ off-thread
+
+PPSSPP 1.20 runs its emulation on a thread of its own, which asks for the
+hardware framebuffer while retro_run() waits for that thread. The render
+manager holds its hardware lock for the whole client call, so the request
+never returns: the game stays black and stopping it hangs Kodi.
+
+A framebuffer large enough for the request doesn't change, so it is now
+kept aside to answer a request made while another thread holds the lock.
+
+(cherry picked from commit 9c442a8235a8f89e4d2cc7604d21698e10142908)
+---
+ .../RetroPlayer/rendering/RPRenderManager.cpp | 27 ++++++++++++++++++-
+ .../RetroPlayer/rendering/RPRenderManager.h   |  8 ++++++
+ .../rendering/test/TestRPRenderManager.cpp    | 20 ++++++++++++++
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+index 7f26f9c..59bc8fd 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.cpp
+@@ -452,6 +452,12 @@ bool CRPRenderManager::Create(unsigned int width, unsigned int height)
+   {
+     m_hwBufferWidth = width;
+     m_hwBufferHeight = height;
++    {
++      std::unique_lock framebufferLock(m_framebufferMutex);
++      m_framebuffer = m_hwRenderBuffer->GetCurrentFramebuffer();
++      m_framebufferWidth = width;
++      m_framebufferHeight = height;
++    }
+     CLog::Log(LOGDEBUG, "RetroPlayer[RENDER]: Allocated a {}x{} framebuffer for the game client",
+               width, height);
+   }
+@@ -477,6 +483,11 @@ void CRPRenderManager::ReleaseHwRenderBuffer()
+                     return true;
+                   });
+   }
++  {
++    std::unique_lock framebufferLock(m_framebufferMutex);
++    m_framebuffer = 0;
++    m_framebufferWidth = m_framebufferHeight = 0;
++  }
+   m_hwRenderBuffer->Release();
+   m_hwRenderBuffer = nullptr;
+   m_hwBufferWidth = m_hwBufferHeight = 0;
+@@ -486,7 +497,21 @@ void CRPRenderManager::ReleaseHwRenderBuffer()
+ 
+ uintptr_t CRPRenderManager::GetCurrentFramebuffer(unsigned int width, unsigned int height)
+ {
+-  std::unique_lock lock(m_hwMutex);
++  std::unique_lock lock(m_hwMutex, std::try_to_lock);
++  if (!lock.owns_lock())
++  {
++    // A client can ask from a thread of its own while a call into it holds the
++    // lock and waits for that thread, as PPSSPP's emulation thread does.
++    // Growing the framebuffer needs the context that call has current, but one
++    // already large enough is answered as is.
++    {
++      std::unique_lock framebufferLock(m_framebufferMutex);
++      if (m_framebuffer != 0 && width != 0 && height != 0 && width <= m_framebufferWidth &&
++          height <= m_framebufferHeight)
++        return m_framebuffer;
++    }
++    lock.lock();
++  }
+   if (!m_hwRenderBuffer || width == 0 || height == 0)
+     return 0;
+   if ((width > m_hwBufferWidth || height > m_hwBufferHeight) && !Create(width, height))
+diff --git a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+index 75ca8ad..90187cb 100644
+--- a/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
++++ b/xbmc/cores/RetroPlayer/rendering/RPRenderManager.h
+@@ -313,6 +313,14 @@ private:
+   //! the last frame's size, not the space available.
+   unsigned int m_hwBufferWidth{0};
+   unsigned int m_hwBufferHeight{0};
++
++  //! \brief The client's framebuffer and its allocated size, for a client that
++  //! asks for it from a thread of its own while one of its calls holds m_hwMutex
++  std::mutex m_framebufferMutex;
++  uintptr_t m_framebuffer{0};
++  unsigned int m_framebufferWidth{0};
++  unsigned int m_framebufferHeight{0};
++
+   uintptr_t m_loggedFramebuffer{0};
+   bool m_loggedHardwareCapture{false};
+   std::vector<IRenderBuffer*> m_renderBuffers;
+diff --git a/xbmc/cores/RetroPlayer/rendering/test/TestRPRenderManager.cpp b/xbmc/cores/RetroPlayer/rendering/test/TestRPRenderManager.cpp
+index 0ab64c3..45638cd 100644
+--- a/xbmc/cores/RetroPlayer/rendering/test/TestRPRenderManager.cpp
++++ b/xbmc/cores/RetroPlayer/rendering/test/TestRPRenderManager.cpp
+@@ -17,6 +17,7 @@
+ #include "games/addons/streams/GameClientStreamHwFramebuffer.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <functional>
+ #include <future>
+ #include <memory>
+@@ -415,6 +416,25 @@ TEST_F(TestRPRenderManager, FramebufferGrowthPreservesBufferAndOtherAxis)
+   manager.DestroyContext();
+ }
+ 
++TEST_F(TestRPRenderManager, ClientThreadGetsFramebufferDuringClientCall)
++{
++  auto& manager = m_environment.Renderer();
++  m_pool->hardware = true;
++  ASSERT_TRUE(manager.CreateContext({}));
++  ASSERT_TRUE(manager.Create(480, 272));
++  const auto framebuffer = manager.GetCurrentFramebuffer(480, 272);
++  ASSERT_NE(framebuffer, 0);
++  ASSERT_TRUE(manager.BeginClientFrame());
++  auto fromClientThread = std::async(std::launch::async, [&manager]
++                                     { return manager.GetCurrentFramebuffer(480, 270); });
++  const bool answered =
++      fromClientThread.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
++  manager.EndClientFrame();
++  EXPECT_TRUE(answered);
++  EXPECT_EQ(fromClientThread.get(), framebuffer);
++  manager.DestroyContext();
++}
++
+ TEST_F(TestRPRenderManager, CapturedFrameOwnsOneReferenceAndCanRemainInUse)
+ {
+   auto& manager = m_environment.Renderer();
+-- 
+2.53.0
+

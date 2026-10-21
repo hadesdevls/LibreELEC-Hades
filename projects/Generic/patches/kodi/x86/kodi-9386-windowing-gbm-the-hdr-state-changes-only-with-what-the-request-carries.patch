@@ -1,0 +1,480 @@
+From 964b1088b48b990d7aceff1041c06aa266009c03 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:39:26 +0000
+Subject: [PATCH] windowing/gbm: the HDR state changes only with what the
+ request carries
+
+SetHDR() took the EOTF of a picture as the one of the output before it
+looked at whether the display declares it, released the blob of the
+metadata only where it made a new one, and did not look at whether
+HDR_OUTPUT_METADATA was added to the request. The code is Kodi's own. So
+GetEotf() said HLG for an HLG video on a display that declares PQ only,
+while nothing was sent; the same with a display whose EDID, read again
+when a video starts, no longer declares HDR, with a connector without the
+property, and with a blob that the driver did not make. Three things
+read it:
+- the palette of the PGS subtitles of an HDR video is converted to sRGB
+  unless the destination is HDR (ShouldConvertPQPaletteToSRGB()): on that
+  SDR output they kept their PQ colours;
+- a capture is tagged with it (CaptureMetadata);
+- the depth of the HDR output is asked and logged for it ("HDR output:
+  ...", and NV_OUTPUT_BPC with nvidia-drm), of an SDR output.
+And where the property was not added, SetHDR() said that HDR goes out
+(m_hdrBlob.IsValid()), so the renderer passed HDR through without its
+signalling.
+
+CHDRSignal (HDRSignal.h, pure) now holds the rule, and SetHDR() calls it
+with the request:
+- the metadata of a PQ or HLG picture is made and queued where the
+  connector and the display take its EOTF; then, and only then, the
+  EOTF, the blob and the value that a modeset queues again are the
+  picture's, and what goes with HDR metadata (the stereo InfoFrame that
+  ends, the choice of YCbCr 4:2:0) is queued with it;
+- otherwise the output signals no HDR for that picture: metadata of
+  another one that is still queued is taken away, with its blob; where
+  none is, nothing is queued, so there is no modeset that changes nothing
+  (Kodi made one where the driver did not make the blob);
+- SetHDR(nullptr) takes the metadata away as always, also where none is
+  known to be queued (Kodi's start);
+- where not even that can be queued, the state stays the one before,
+  since it is what the kernel keeps, and so does its blob, while its id
+  may be queued again (Kodi released it before the new one was queued).
+The blob of a new picture is made apart and replaces the one before only
+once it is queued: no blob is alive but the one queued.
+
+An HDR video that goes out without HDR says why, once ("HDR output: no
+HDR signalling for this HLG video: the display does not declare this
+transfer function in its EDID"); a line says when metadata of the video
+before is taken away, and a warning when it could not be.
+
+Whether the driver then accepts the commit that carries the request is
+not decided here: a refused commit falls back to the request before it
+(CDRMAtomic), as before.
+
+A host test runs CHDRSignal::Request() with doubles of the request and of
+the blob, and the same checks against Kodi's SetHDR() as it was,
+transcribed on those doubles: they pass here and fail there. Seven
+mutations of the header make it fail too.
+---
+ xbmc/windowing/gbm/HDRSignal.h      | 220 ++++++++++++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp | 126 +++++++++-------
+ xbmc/windowing/gbm/WinSystemGbm.h   |   7 +
+ 3 files changed, 299 insertions(+), 54 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/HDRSignal.h
+
+diff --git a/xbmc/windowing/gbm/HDRSignal.h b/xbmc/windowing/gbm/HDRSignal.h
+new file mode 100644
+index 0000000..21a144f
+--- /dev/null
++++ b/xbmc/windowing/gbm/HDRSignal.h
+@@ -0,0 +1,220 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "utils/DisplayInfo.h"
++
++#include <cstdint>
++#include <optional>
++#include <utility>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief The HDR signalling of the output, as CWinSystemGbm::SetHDR() asks for it
++ *
++ * Kodi took the EOTF of a picture as the one of the output before it looked at whether the
++ * display declares it, released the blob of the metadata only where it made a new one, and did
++ * not look at whether the property was added to the request. So GetEotf() said HLG for an HLG
++ * video on a display that declares PQ only, with nothing sent: its PGS subtitles were not
++ * converted to sRGB (ShouldConvertPQPaletteToSRGB()), a capture was tagged HLG, and the depth of
++ * an HDR output was asked of an SDR one. The same with a display whose EDID, read again when a
++ * video starts, no longer declares HDR, and with a blob that the driver did not make. And
++ * SetHDR() said that HDR goes out for metadata that was not queued.
++ *
++ * Here the state (the EOTF that GetEotf() says, the blob of the metadata, the value that a
++ * modeset queues again) changes only with what the request carries:
++ * - the metadata of a picture is made and queued where the connector and the display take its
++ *   EOTF; then, and only then, the state is the picture's;
++ * - otherwise the output signals no HDR for it: metadata of another picture that is still
++ *   queued is taken away (where none is, nothing is queued: no modeset that changes nothing);
++ * - where not even that can be queued, the state stays as it was, since it is what the kernel
++ *   still has, and the blob stays alive while its id may be queued again.
++ * Whether a commit that carries the request is then accepted is not decided here (a refused
++ * commit falls back to the request before it: CDRMAtomic).
++ *
++ * Nothing of DRM is here: a test runs it on the host, with doubles of the request and the blob.
++ */
++class CHDRSignal
++{
++public:
++  //! Why the output signals HDR for a picture, or does not
++  enum class Reason
++  {
++    SENT, //!< its metadata is queued: the output signals its EOTF
++    NOT_HDR, //!< no picture, or one that is neither PQ nor HLG
++    NO_PROPERTY, //!< the connector has no HDR_OUTPUT_METADATA
++    NO_DISPLAY_INFO, //!< no EDID of the display could be read
++    NO_STATIC_HDR, //!< the display declares no HDR static metadata (type 1)
++    NO_EOTF, //!< ... or not the EOTF of the picture (HLG on a display that declares PQ only)
++    NO_BLOB, //!< the driver did not make the blob of the metadata
++    NOT_QUEUED, //!< the property could not be added to the request
++  };
++
++  //! What the connector and the display take, as read for the picture
++  struct Display
++  {
++    bool property = false; //!< the connector has HDR_OUTPUT_METADATA
++    bool info = false; //!< display information from an EDID
++    bool staticHdr = false; //!< ... that declares HDR static metadata, type 1
++    bool eotf = false; //!< ... with the EOTF of the picture
++  };
++
++  //! What a request did
++  struct Outcome
++  {
++    Reason reason = Reason::NOT_HDR;
++    bool cleared = false; //!< metadata of another picture was taken away
++    bool kept = false; //!< ... or could not be: the state stays the one before
++    bool Sent() const { return reason == Reason::SENT; }
++  };
++
++  //! Whether the output can be asked for the HDR of a picture: SENT where it can
++  static Reason Admit(const Display& display)
++  {
++    if (!display.property)
++      return Reason::NO_PROPERTY;
++    if (!display.info)
++      return Reason::NO_DISPLAY_INFO;
++    if (!display.staticHdr)
++      return Reason::NO_STATIC_HDR;
++    if (!display.eotf)
++      return Reason::NO_EOTF;
++    return Reason::SENT;
++  }
++
++  /*!
++   * \brief Asks the output for the HDR signalling of a picture, or for none
++   * \param eotf, blob, queued the state: what GetEotf() says, the blob of the metadata queued, and
++   *        the value queued last for HDR_OUTPUT_METADATA (what a modeset queues again)
++   * \param want the EOTF of the picture, PQ or HLG; nothing for no picture or one of no HDR
++   * \param display what the connector and the display take (only the property, without want)
++   * \param always without want, no HDR metadata is queued even where none is known to be: no
++   *        picture (Kodi's start, the end of a video)
++   * \param out the request. Make() makes the blob of the picture's metadata (an invalid one when
++   *        the driver does not); Queue(value) adds HDR_OUTPUT_METADATA = value to it, false when
++   *        it was not; Modeset() makes its commit a modeset; Along() queues what goes with HDR
++   *        metadata of a picture.
++   */
++  template<typename Blob, typename Out>
++  static Outcome Request(UTILS::Eotf& eotf,
++                         Blob& blob,
++                         std::optional<uint64_t>& queued,
++                         std::optional<UTILS::Eotf> want,
++                         const Display& display,
++                         bool always,
++                         Out& out)
++  {
++    Outcome outcome;
++    if (want)
++    {
++      outcome.reason = Admit(display);
++      if (outcome.reason == Reason::SENT)
++      {
++        // The blob before stays until this one is queued: its id is still the one to queue
++        // again if this one is not
++        Blob made = out.Make();
++        if (!made.IsValid())
++          outcome.reason = Reason::NO_BLOB;
++        else if (!out.Queue(made.Get()))
++          outcome.reason = Reason::NOT_QUEUED;
++        else
++        {
++          out.Along();
++          out.Modeset();
++          queued = made.Get();
++          blob = std::move(made);
++          eotf = *want;
++          return outcome;
++        }
++      }
++    }
++
++    // No HDR for this picture. A connector without the property signals none.
++    if (!display.property)
++    {
++      eotf = UTILS::Eotf::TRADITIONAL_SDR;
++      return outcome;
++    }
++    const bool signalled = queued && *queued != 0;
++    if (!always && !signalled)
++    {
++      eotf = UTILS::Eotf::TRADITIONAL_SDR;
++      return outcome;
++    }
++    if (!out.Queue(0))
++    {
++      // What was queued is what the kernel keeps
++      outcome.kept = signalled;
++      if (!signalled)
++        eotf = UTILS::Eotf::TRADITIONAL_SDR;
++      return outcome;
++    }
++    out.Modeset();
++    queued = 0;
++    blob.Reset();
++    eotf = UTILS::Eotf::TRADITIONAL_SDR;
++    outcome.cleared = signalled;
++    return outcome;
++  }
++
++  /*!
++   * \brief Whether why a picture of HDR goes out without it is written to the log: once for the
++   *        same reason, until HDR goes out or a request without HDR comes (the end of a video)
++   * \param told the reason written last
++   */
++  static bool Tell(std::optional<UTILS::Eotf> want,
++                   const Outcome& outcome,
++                   std::optional<Reason>& told)
++  {
++    if (!want || outcome.Sent())
++    {
++      told.reset();
++      return false;
++    }
++    if (told == outcome.reason)
++      return false;
++    told = outcome.reason;
++    return true;
++  }
++
++  //! The reason, for the log
++  static const char* Why(Reason reason)
++  {
++    switch (reason)
++    {
++      case Reason::SENT:
++        return "its HDR metadata is queued";
++      case Reason::NOT_HDR:
++        return "it is no PQ or HLG video";
++      case Reason::NO_PROPERTY:
++        return "the driver has no HDR_OUTPUT_METADATA on this connector";
++      case Reason::NO_DISPLAY_INFO:
++        return "no EDID of the display could be read";
++      case Reason::NO_STATIC_HDR:
++        return "the display declares no HDR (no HDR static metadata in its EDID)";
++      case Reason::NO_EOTF:
++        return "the display does not declare this transfer function in its EDID";
++      case Reason::NO_BLOB:
++        return "the driver did not make the blob of its HDR metadata";
++      case Reason::NOT_QUEUED:
++        return "its HDR metadata could not be added to the request";
++    }
++    return "";
++  }
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 12cbcce..230674d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -2214,45 +2214,33 @@ bool CWinSystemGbm::SetHDR(const VideoPicture* videoPicture)
+   if (!connector)
+     return false;
+ 
+-  if (!videoPicture)
+-  {
+-    if (connector->SupportsProperty("HDR_OUTPUT_METADATA"))
+-    {
+-      CLog::LogF(LOGDEBUG, "clearing HDR_OUTPUT_METADATA");
+-      drm->AddProperty(connector, "HDR_OUTPUT_METADATA", 0);
+-      drm->SetActive(true);
+-      m_queuedHdrMetadata = 0;
+-
+-      m_hdrBlob.Reset();
+-    }
+-
+-    m_eotf = KODI::UTILS::Eotf::TRADITIONAL_SDR;
+-    return false;
+-  }
+-
+   // Only enable HDR for PQ (HDR10/HDR10+/DV) or HLG transfer functions
+-  if (videoPicture->color_transfer != AVCOL_TRC_SMPTE2084 &&
+-      videoPicture->color_transfer != AVCOL_TRC_ARIB_STD_B67)
++  std::optional<KODI::UTILS::Eotf> want;
++  if (videoPicture && (videoPicture->color_transfer == AVCOL_TRC_SMPTE2084 ||
++                       videoPicture->color_transfer == AVCOL_TRC_ARIB_STD_B67))
++    want = KODI::UTILS::GetEOTF(*videoPicture);
++  const KODI::UTILS::Eotf eotf = want.value_or(KODI::UTILS::Eotf::TRADITIONAL_SDR);
++
++  // Hades: what the output signals (GetEotf(), the blob, what a modeset queues again) changes
++  // only with what the request carries (CHDRSignal). An HDR picture that the display does not
++  // take, or whose metadata is not queued, goes out without HDR signalling, and the log says why.
++  CHDRSignal::Display display;
++  display.property = connector->SupportsProperty("HDR_OUTPUT_METADATA");
++  if (want)
+   {
+-    m_eotf = KODI::UTILS::Eotf::TRADITIONAL_SDR;
+-    return false;
++    const auto info = DisplayInfo();
++    display.info = info != nullptr;
++    display.staticHdr = info && info->SupportsHDRStaticMetadataType1();
++    display.eotf = info && info->SupportsEOTF(eotf);
+   }
+ 
+-  KODI::UTILS::Eotf eotf = KODI::UTILS::GetEOTF(*videoPicture);
+-  m_eotf = eotf;
+-
+-  const auto info = DisplayInfo();
+-  if (connector->SupportsProperty("HDR_OUTPUT_METADATA") && info &&
+-      info->SupportsHDRStaticMetadataType1() && info->SupportsEOTF(eotf))
++  hdr_output_metadata hdr_metadata = {};
++  if (want && CHDRSignal::Admit(display) == CHDRSignal::Reason::SENT)
+   {
+-    hdr_output_metadata hdr_metadata = {};
+-
+     hdr_metadata.metadata_type = KODI::UTILS::HDMI_STATIC_METADATA_TYPE1;
+     hdr_metadata.hdmi_metadata_type1.eotf = static_cast<uint8_t>(eotf);
+     hdr_metadata.hdmi_metadata_type1.metadata_type = KODI::UTILS::HDMI_STATIC_METADATA_TYPE1;
+ 
+-    m_hdrBlob.Reset();
+-
+     if (hdr_metadata.hdmi_metadata_type1.eotf)
+     {
+       const AVMasteringDisplayMetadata* mdmd =
+@@ -2312,34 +2300,64 @@ bool CWinSystemGbm::SetHDR(const VideoPicture* videoPicture)
+         CLog::Log(LOGDEBUG, LOGVIDEO, "CWinSystemGbm::{} - max_fall: {}", __FUNCTION__,
+                   hdr_metadata.hdmi_metadata_type1.max_fall);
+       }
+-
+-      m_hdrBlob = CDRMPropertyBlob(drm->GetFileDescriptor(), &hdr_metadata, sizeof(hdr_metadata));
+     }
++  }
++  else if (!videoPicture && display.property)
++    CLog::LogF(LOGDEBUG, "clearing HDR_OUTPUT_METADATA");
++
++  // The request, as CHDRSignal::Request() uses it
++  struct HdrRequest
++  {
++    CWinSystemGbm& gbm;
++    CDRMAtomic& drm;
++    CDRMConnector& connector;
++    const hdr_output_metadata& metadata;
++    CSettings& settings;
+ 
+-    // Hades: the HDMI vendor InfoFrame that says "no 3D", where the driver still has it from
+-    // here (nvidia-drm, after a half 3D layout), goes with the commit that signals HDR: NVKMS
+-    // takes no HDR signalling next to a vendor InfoFrame of its user on most graphics cards.
+-    if (m_hdrBlob.IsValid())
+-      DropEndedStereoInfoFrame();
+-
+-    // Hades: ... and, where the driver takes it (i915 and amdgpu with the Hades patches), the
+-    // choice of the user for HDR where RGB would be 8 bits: YCbCr 4:2:0 at 10 bits ("deep", the
+-    // driver's default) or RGB at 8 ("never"). It acts only with HDR metadata, and the driver keeps
+-    // it with the connector's state: it is set with each video, as the setting is then.
+-    if (m_hdrBlob.IsValid() && connector->SupportsProperty(DVBRIDGE::LINK::HDR_YCBCR420))
++    CDRMPropertyBlob Make() const
+     {
+-      const bool rgb = settings->GetInt(CSettings::SETTING_VIDEOSCREEN_HADESHDR420) == 1;
+-      if (const auto value =
+-              connector->GetPropertyEnumValue(DVBRIDGE::LINK::HDR_YCBCR420, rgb ? "never" : "deep"))
+-        drm->AddProperty(connector, DVBRIDGE::LINK::HDR_YCBCR420, *value);
++      return CDRMPropertyBlob(drm.GetFileDescriptor(), &metadata, sizeof(metadata));
+     }
+-
+-    drm->AddProperty(connector, "HDR_OUTPUT_METADATA", m_hdrBlob.Get());
+-    drm->SetActive(true);
+-    m_queuedHdrMetadata = m_hdrBlob.Get();
+-  }
+-
+-  return m_hdrBlob.IsValid();
++    bool Queue(uint64_t value) const
++    {
++      return drm.AddProperty(&connector, "HDR_OUTPUT_METADATA", value);
++    }
++    void Modeset() const { drm.SetActive(true); }
++    void Along() const
++    {
++      // Hades: the HDMI vendor InfoFrame that says "no 3D", where the driver still has it from
++      // here (nvidia-drm, after a half 3D layout), goes with the commit that signals HDR: NVKMS
++      // takes no HDR signalling next to a vendor InfoFrame of its user on most graphics cards.
++      gbm.DropEndedStereoInfoFrame();
++
++      // Hades: ... and, where the driver takes it (i915 and amdgpu with the Hades patches), the
++      // choice of the user for HDR where RGB would be 8 bits: YCbCr 4:2:0 at 10 bits ("deep",
++      // the driver's default) or RGB at 8 ("never"). It acts only with HDR metadata, and the
++      // driver keeps it with the connector's state: it is set with each video, as the setting
++      // is then.
++      if (connector.SupportsProperty(DVBRIDGE::LINK::HDR_YCBCR420))
++      {
++        const bool rgb = settings.GetInt(CSettings::SETTING_VIDEOSCREEN_HADESHDR420) == 1;
++        if (const auto value = connector.GetPropertyEnumValue(DVBRIDGE::LINK::HDR_YCBCR420,
++                                                              rgb ? "never" : "deep"))
++          drm.AddProperty(&connector, DVBRIDGE::LINK::HDR_YCBCR420, *value);
++      }
++    }
++  } request{*this, *drm, *connector, hdr_metadata, *settings};
++
++  const CHDRSignal::Outcome outcome = CHDRSignal::Request(
++      m_eotf, m_hdrBlob, m_queuedHdrMetadata, want, display, !videoPicture, request);
++  if (CHDRSignal::Tell(want, outcome, m_hdrTold))
++    CLog::Log(LOGINFO, "HDR output: no HDR signalling for this {} video: {}",
++              eotf == KODI::UTILS::Eotf::HLG ? "HLG" : "PQ", CHDRSignal::Why(outcome.reason));
++  if (outcome.cleared)
++    CLog::Log(LOGINFO, "HDR output: the HDR metadata of the video before is taken away");
++  if (outcome.kept)
++    CLog::Log(LOGWARNING, "HDR output: the HDR metadata queued before could not be taken away "
++                          "(HDR_OUTPUT_METADATA was not added to the request): the output keeps "
++                          "it, and so does the state of Kodi");
++
++  return outcome.Sent();
+ }
+ 
+ void CWinSystemGbm::RequeueOutputProperties()
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index bc6be02..0261a63 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "HDRSignal.h"
+ #include "VideoLayerBridge.h"
+ #ifdef HAVE_DVBRIDGE
+ #include "DisplayLook.h"
+@@ -426,11 +427,17 @@ private:
+   //! Whether those say that the display takes stereoscopic 3D (STEREO::TakesStereo())
+   std::atomic<bool> m_stereoDisplay{false};
+ 
++  //! The blob of the HDR metadata queued (SetHDR(): CHDRSignal), kept while its id may be
++  //! queued again
+   CDRMPropertyBlob m_hdrBlob;
+   //! The values queued last for the Colorspace and HDR_OUTPUT_METADATA of the connector, if any
+   std::optional<uint64_t> m_queuedColorspace;
+   std::optional<uint64_t> m_queuedHdrMetadata;
++  //! The EOTF that the output is asked to signal: the picture's only while its metadata is
++  //! queued (GetEotf())
+   KODI::UTILS::Eotf m_eotf = KODI::UTILS::Eotf::TRADITIONAL_SDR;
++  //! Hades: the reason written last for an HDR picture without HDR signalling
++  std::optional<CHDRSignal::Reason> m_hdrTold;
+   KODI::UTILS::Colorimetry m_colorimetry = KODI::UTILS::Colorimetry::DEFAULT;
+ 
+   //! The display information from its EDID at Kodi's start, as in Kodi: HDR and colorimetry
+-- 
+2.53.0
+

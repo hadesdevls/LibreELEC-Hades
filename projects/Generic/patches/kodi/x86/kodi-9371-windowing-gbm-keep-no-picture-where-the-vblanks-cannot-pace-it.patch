@@ -1,0 +1,515 @@
+From 3d880749ff46ba659f7de5ea87ae744214e801eb Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:38:18 +0000
+Subject: [PATCH] windowing/gbm: keep no picture where the vblanks cannot pace
+ it
+
+A picture of native Dolby Vision output that is on the screen and would be
+drawn again the same way is kept there (kodi-9268), and the loop is paced by
+the vblanks of the CRTC. nvidia-drm with its defaults has no vblank at all:
+its module parameter vblank is off, drm_vblank_init() is not called, and the
+ioctl returns EOPNOTSUPP. Every keep then presented nothing, slept 10 ms and
+forgot the picture, and the next pass drew it again, late: in a host model of
+the loop, 126 of 631 refreshes of a film at 59.94 Hz showed another picture
+than the one of their time, against none with every refresh drawn (1.0 RC1).
+The commit message of kodi-9268 said that such an output draws every frame;
+it did not.
+
+CDVRepeatKeep now remembers it: EOPNOTSUPP for the device until Kodi is
+started again, any other failure for the native output in which it happened.
+From then on the pictures are drawn again every refresh, as in 1.0 RC1, and
+the log says so once.
+
+The line of every 10 s tells how many pictures that were on the screen were
+drawn again, and why (keeping turned off, no vblank, drawn over, drawn
+another way, the output changing, the flip before not reported).
+
+And, off by default to be measured on a GPU first, video/dvkeepbycommit in
+advancedsettings.xml: a kept picture is committed again, as it is, in a
+commit that waits for its flip, which paces the loop without any vblank. Only
+after a frame presented the way that waits; after a frame presented a frame
+ahead the vblanks are still needed. A refused commit turns it off for the
+native output. Such a commit counts for CDVPresentStall like any plain frame.
+---
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   4 +
+ xbmc/windowing/gbm/DVRepeatKeep.h             | 156 ++++++++++++++++++
+ xbmc/windowing/gbm/GBMUtils.h                 |   2 +
+ xbmc/windowing/gbm/WinSystemGbm.cpp           |  12 ++
+ xbmc/windowing/gbm/WinSystemGbm.h             |   5 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 113 +++++++++++--
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   9 +
+ 8 files changed, 290 insertions(+), 13 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/DVRepeatKeep.h
+
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 5095fb7..354e0e8 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -207,6 +207,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVAheadAlways = false;
+   m_videoDVStepDown = -1;
+   m_videoDVKeepRepeats = true;
++  m_videoDVKeepByCommit = false;
+   m_videoDVVerify = 0;
+   m_videoDVWarmup = true;
+   m_videoSmoothPercentToTimeSeeking = true;
+@@ -709,6 +710,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+     XMLUtils::GetInt(pElement, "dvstepdown", m_videoDVStepDown, 0, 3);
+     XMLUtils::GetBoolean(pElement, "dvkeeprepeats", m_videoDVKeepRepeats);
++    XMLUtils::GetBoolean(pElement, "dvkeepbycommit", m_videoDVKeepByCommit);
+     XMLUtils::GetInt(pElement, "dvverify", m_videoDVVerify, 0, 1000000);
+     XMLUtils::GetBoolean(pElement, "dvwarmup", m_videoDVWarmup);
+     XMLUtils::GetBoolean(pElement, "smoothpercenttotimeseeking", m_videoSmoothPercentToTimeSeeking);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index bb7e578..eda3650 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -185,6 +185,10 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! same way (paused, or a film at a higher refresh rate) is kept there instead
+     //! (video/dvkeeprepeats). Off to have every refresh drawn, as before
+     bool m_videoDVKeepRepeats;
++    //! Hades: ... and such a picture is committed again, its commit waiting for its flip, instead
++    //! of the vblanks pacing it (video/dvkeepbycommit; CDVRepeatKeep): a picture can be kept where
++    //! the driver has no vblank (nvidia-drm). Off, the default, until it is measured on a GPU
++    bool m_videoDVKeepByCommit;
+     //! Hades: native Dolby Vision frames checked against the same picture drawn once more with
+     //! every optimisation that must not change bytes turned off (video/dvverify; CDVVerify), for
+     //! a test on a GPU: at most this many frames in each native output. 0, the default: none, and
+diff --git a/xbmc/windowing/gbm/DVRepeatKeep.h b/xbmc/windowing/gbm/DVRepeatKeep.h
+new file mode 100644
+index 0000000..3e3043c
+--- /dev/null
++++ b/xbmc/windowing/gbm/DVRepeatKeep.h
+@@ -0,0 +1,156 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <array>
++#include <cerrno>
++#include <cstddef>
++#include <string>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: how a picture of native Dolby Vision output that is on the screen is kept there
++ *        instead of being drawn again (CWinSystemGbmGLESContext::KeepDVBridgeFrame()), and why
++ *        the pictures that repeated were drawn again
++ *
++ * A kept picture paces the render loop as the commit of its frame would have. By the vblanks of
++ * the CRTC (the legacy vblank ioctl), or, where advancedsettings.xml asks for it
++ * (video/dvkeepbycommit, off: to be measured on a GPU first), by a commit of the same picture that
++ * waits for its flip, which needs no vblank. That one only stands in for a frame presented the way
++ * that waits: after a frame presented a frame ahead, only the vblanks can.
++ *
++ * nvidia-drm with its defaults has no vblank at all (its module parameter vblank is off, and
++ * without drm_vblank_init() the ioctl returns EOPNOTSUPP). Every picture that it tried to keep
++ * presented nothing, slept 10 ms, and was drawn again late by the pass after it. That is known for
++ * the device until Kodi is started again; any other failure (the CRTC off, say) for the native
++ * output in which it happened. From then on the pictures are drawn again every refresh, as in
++ * 1.0 RC1, unless a commit keeps them.
++ *
++ * This class only decides.
++ */
++class CDVRepeatKeep
++{
++public:
++  //! Why a picture that was on the screen, and that a frame would draw again, was drawn again
++  enum class Reason
++  {
++    SETTING, //!< keeping is turned off in the settings
++    NO_VBLANK, //!< nothing can pace a kept picture: no vblank to wait for
++    DRAWN_OVER, //!< something was drawn over the picture (the GUI, subtitles, a capture)
++    OTHER_WAY, //!< it would be drawn another way than the one on the screen
++    OUTPUT, //!< the output: not shown yet, ending, off, or more than a frame to commit
++    FLIP, //!< the flip of the frame before it was not reported
++    COMMIT, //!< the commit of the same picture was refused
++    COUNT
++  };
++  static constexpr std::size_t REASONS = static_cast<std::size_t>(Reason::COUNT);
++  using Counts = std::array<unsigned int, REASONS>;
++
++  //! How a kept picture is paced now
++  enum class Pace
++  {
++    NONE, //!< it is not kept
++    VBLANK,
++    COMMIT,
++  };
++
++  //! A native output begins; byCommit: video/dvkeepbycommit
++  void Begin(bool byCommit)
++  {
++    m_vblankFailedHere = false;
++    m_byCommit = byCommit;
++  }
++
++  //! \param ahead the frame on the screen was presented a frame ahead
++  Pace Way(bool ahead) const
++  {
++    if (m_byCommit && !ahead)
++      return Pace::COMMIT;
++    if (!m_noVBlank && !m_vblankFailedHere)
++      return Pace::VBLANK;
++    return Pace::NONE;
++  }
++
++  //! The vblank of the CRTC could not be waited for, with this error (errno). True when the log
++  //! is to be told (once for the device, the first three times for another error)
++  bool VBlankFailed(int error)
++  {
++    if (error == EOPNOTSUPP)
++    {
++      const bool tell = !m_noVBlank;
++      m_noVBlank = true;
++      return tell;
++    }
++    const bool tell = !m_vblankFailedHere && m_othersTold < 3;
++    if (tell)
++      ++m_othersTold;
++    m_vblankFailedHere = true;
++    return tell;
++  }
++  //! ... the device has none, until Kodi is started again
++  bool DeviceHasNoVBlank() const { return m_noVBlank; }
++
++  //! The commit that kept a picture was refused: the vblanks pace the rest of this native output
++  void CommitFailed() { m_byCommit = false; }
++  bool ByCommit() const { return m_byCommit; }
++
++  static constexpr const char* Name(Reason reason)
++  {
++    switch (reason)
++    {
++      case Reason::SETTING:
++        return "turned off in the settings";
++      case Reason::NO_VBLANK:
++        return "no vblank to wait for";
++      case Reason::DRAWN_OVER:
++        return "drawn over";
++      case Reason::OTHER_WAY:
++        return "drawn another way";
++      case Reason::OUTPUT:
++        return "the output was changing";
++      case Reason::FLIP:
++        return "the flip before it was not reported";
++      case Reason::COMMIT:
++        return "its commit was refused";
++      default:
++        return "";
++    }
++  }
++  //! "N" and, where any, " (reason: n, ...)", for the log
++  static std::string Describe(const Counts& counts)
++  {
++    unsigned int total = 0;
++    std::string reasons;
++    for (std::size_t i = 0; i < REASONS; ++i)
++    {
++      if (!counts[i])
++        continue;
++      total += counts[i];
++      reasons += (reasons.empty() ? " (" : ", ") + std::string(Name(static_cast<Reason>(i))) +
++                 ": " + std::to_string(counts[i]);
++    }
++    return std::to_string(total) + (reasons.empty() ? "" : reasons + ")");
++  }
++
++private:
++  bool m_noVBlank = false;
++  bool m_vblankFailedHere = false;
++  bool m_byCommit = false;
++  unsigned int m_othersTold = 0;
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/GBMUtils.h b/xbmc/windowing/gbm/GBMUtils.h
+index 9e414e4..b11dc49 100644
+--- a/xbmc/windowing/gbm/GBMUtils.h
++++ b/xbmc/windowing/gbm/GBMUtils.h
+@@ -134,6 +134,8 @@ public:
+       // after that flip, or until ReleaseRetiredBuffer().
+       void CompleteTransactionalBuffer(bool presented, bool ahead = false);
+       void ReleaseRetiredBuffer() { m_retiredBuffer.reset(); }
++      // Hades: the buffer of the last transactional commit that was presented (none: nullptr)
++      gbm_bo* ScanoutBuffer() const { return m_scanoutBuffer ? m_scanoutBuffer->Get() : nullptr; }
+       // A buffer is left to draw the next frame into
+       bool HasFreeBuffers() const;
+       void EndTransactionalMode();
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index c9f7d4c..2c23e87 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -1605,6 +1605,18 @@ bool CWinSystemGbm::FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip
+   return accepted;
+ }
+ 
++bool CWinSystemGbm::FlipDVBridgeAgain(CDVBridgeState& state)
++{
++  auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  if (!drm || !m_GBM || !state.Captured() || !state.TransportLive() || drm->HasPendingRequest())
++    return false;
++  // The buffer that is the scanout stays one: nothing of the surface changes. The properties are
++  // those of every transport frame, unchanged (Stage()), and nothing else: the kernel takes it as a
++  // flip to the same buffer, and its commit returns with that flip, with every driver.
++  gbm_bo* bo = m_GBM->GetDevice().GetSurface().ScanoutBuffer();
++  return bo && drm->FlipPageTransactional(state.Stage(*drm, false) ? bo : nullptr, false);
++}
++
+ bool CWinSystemGbm::OtherTiming(const RESOLUTION_INFO& res) const
+ {
+   const CDRMConnector* connector = m_DRM ? m_DRM->GetConnector() : nullptr;
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 836187d..287719b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -80,6 +80,11 @@ public:
+     bool refused = false;
+   };
+   bool FlipDVBridgePage(CDVBridgeState& state, bool restore, DVFlip* flip = nullptr);
++  //! Hades: the transport frame on the screen committed again as it is (its buffer, the
++  //! properties of the transport), in a commit that waits for its flip: what paces a picture that
++  //! is kept on the screen where no vblank can (video/dvkeepbycommit). False when it was refused,
++  //! or there is no such frame.
++  bool FlipDVBridgeAgain(CDVBridgeState& state);
+   //! Hades: native Dolby Vision can be left with res, the mode that Kodi sets next, in one commit
+   //! (see FlipDVBridgePage()), with every backend (CModeChangeHold::DVRestoreJoins()): the output
+   //! is captured for native output and on, and res is another mode of the size of the window, not
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 75754be..9982e24 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1817,6 +1817,13 @@ void CWinSystemGbmGLESContext::DVEngineRead()
+   }
+   m_dvEngine = CDVEngineSettings::Resolve(read, fromFile);
+   m_dvKeepRepeats = m_dvEngine.keepRepeats;
++  // Hades: how a kept picture is paced in this native output: by the vblanks, or, where
++  // advancedsettings.xml asks for it (video/dvkeepbycommit), by a commit of the same picture
++  const bool keepByCommit = advanced && advanced->m_videoDVKeepByCommit;
++  m_dvKeep.Begin(keepByCommit);
++  if (keepByCommit && m_dvKeepRepeats)
++    CLog::Log(LOGINFO, "DVBridge: a picture that is kept on the screen is committed again, its "
++                       "commit waiting for its flip (advancedsettings.xml: dvkeepbycommit)");
+   // the composition of the pictures that the bridge prepares from now on, and their transport
+   if (m_dvBridge)
+   {
+@@ -2047,6 +2054,7 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     }
+     return true;
+   }
++  DVRepeatDrawn(frame);
+   // Hades: the check of this frame: its reference is drawn now, before the time of the frame's
+   // own GPU work is taken, the way the frame is going to be drawn; its transport is compared once
+   // it is packed (PresentRender())
+@@ -3335,7 +3343,10 @@ bool CWinSystemGbmGLESContext::WaitDVBridgeVBlank(bool absolute,
+   // index); the kernel answers a sequence that has passed at once, and gives up after 3 s.
+   const CDRMCrtc* crtc = m_DRM ? m_DRM->GetCrtc() : nullptr;
+   if (!crtc)
++  {
++    errno = ENODEV; // (Hades: what failed, for CDVRepeatKeep)
+     return false;
++  }
+   drmVBlank vblank{};
+   vblank.request.type = static_cast<drmVBlankSeqType>(
+       (absolute ? DRM_VBLANK_ABSOLUTE : DRM_VBLANK_RELATIVE) |
+@@ -3362,7 +3373,9 @@ bool CWinSystemGbmGLESContext::DVKeepsPicture(const DVPicture& frame) const
+     return a.source_width == b.source_width && a.source_height == b.source_height &&
+            a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+   };
+-  return m_dvKeepRepeats && frame.valid && frame.serial != 0 && frame.clean && m_dvShown.valid &&
++  // (Hades: and only while something can pace it: CDVRepeatKeep)
++  return m_dvKeepRepeats && m_dvKeep.Way(m_dvAheadShown) != CDVRepeatKeep::Pace::NONE &&
++         frame.valid && frame.serial != 0 && frame.clean && m_dvShown.valid &&
+          m_dvShown.clean && m_dvShown.serial == frame.serial &&
+          m_dvShown.layered == frame.layered && m_dvShown.allowPacked == frame.allowPacked &&
+          m_dvShown.step == frame.step && same(m_dvShown.geometry, frame.geometry) &&
+@@ -3370,6 +3383,30 @@ bool CWinSystemGbmGLESContext::DVKeepsPicture(const DVPicture& frame) const
+          m_dvState.TransportLive() && drm && drm->IsActive() && !drm->HasPendingRequest();
+ }
+ 
++void CWinSystemGbmGLESContext::DVRepeatDrawn(const DVPicture& frame)
++{
++  // Hades: the picture on the screen, at the same place, is drawn again: why it was not kept
++  // (DVKeepsPicture(), in that order), for the line of every 10 s
++  const auto& a = m_dvShown.geometry;
++  const auto& b = frame.geometry;
++  if (!frame.valid || frame.serial == 0 || !m_dvShown.valid || m_dvShown.serial != frame.serial ||
++      a.source_width != b.source_width || a.source_height != b.source_height || a.x != b.x ||
++      a.y != b.y || a.width != b.width || a.height != b.height)
++    return;
++  using Reason = CDVRepeatKeep::Reason;
++  Reason why = Reason::OUTPUT;
++  if (!m_dvKeepRepeats)
++    why = Reason::SETTING;
++  else if (m_dvKeep.Way(m_dvAheadShown) == CDVRepeatKeep::Pace::NONE)
++    why = Reason::NO_VBLANK;
++  else if (!frame.clean || !m_dvShown.clean)
++    why = Reason::DRAWN_OVER;
++  else if (m_dvShown.layered != frame.layered || m_dvShown.allowPacked != frame.allowPacked ||
++           m_dvShown.step != frame.step)
++    why = Reason::OTHER_WAY;
++  m_dvStats.notKept[static_cast<size_t>(why)]++;
++}
++
+ void CWinSystemGbmGLESContext::KeepDVBridgeFrame()
+ {
+   // Hades: instead of drawing the picture on the screen again, and committing it again, the
+@@ -3398,20 +3435,57 @@ void CWinSystemGbmGLESContext::KeepDVBridgeFrame()
+       m_dvAheadPending = false;
+     }
+   }
+-  if (paced && m_dvRepeatFlipPending)
+-    paced = WaitDVBridgeVBlank(true, m_dvRepeatFlip, now);
+-  m_dvRepeatFlipPending = false;
+-  paced = paced && WaitDVBridgeVBlank(false, 0, now);
+-  if (paced && m_dvAheadShown)
++  // Hades: why it could not be kept, if it could not (the line of every 10 s); and a commit of the
++  // same picture that waits for its flip in place of the vblanks, where it is asked for and the
++  // frame on the screen was presented the way that waits (CDVRepeatKeep)
++  auto why = CDVRepeatKeep::Reason::FLIP;
++  const bool flipped = paced;
++  const bool byCommit = m_dvKeep.Way(m_dvAheadShown) == CDVRepeatKeep::Pace::COMMIT;
++  int vblankError = 0;
++  if (byCommit)
+   {
+-    m_dvRepeatFlip = now + 1;
+-    m_dvRepeatFlipPending = true;
+-    ++m_dvAheadRepeats;
++    if (paced && !FlipDVBridgeAgain(m_dvState))
++    {
++      paced = false;
++      why = CDVRepeatKeep::Reason::COMMIT;
++      m_dvKeep.CommitFailed();
++      CLog::Log(LOGWARNING, "DVBridge: the commit that kept a picture on the screen was refused; "
++                            "the vblanks pace the pictures kept in the rest of this native output");
++    }
++  }
++  else
++  {
++    if (paced && m_dvRepeatFlipPending)
++      paced = WaitDVBridgeVBlank(true, m_dvRepeatFlip, now);
++    m_dvRepeatFlipPending = false;
++    paced = paced && WaitDVBridgeVBlank(false, 0, now);
++    if (paced && m_dvAheadShown)
++    {
++      m_dvRepeatFlip = now + 1;
++      m_dvRepeatFlipPending = true;
++      ++m_dvAheadRepeats;
++    }
++    else if (paced)
++      paced = WaitDVBridgeVBlank(true, now + 1, now);
++    vblankError = errno;
++  }
++  if (!paced && flipped && !byCommit)
++  {
++    // Hades: the vblanks cannot be waited for: the pictures that repeat are drawn again from now
++    // on, as in 1.0 RC1, instead of every one of them presenting nothing and drawing the next
++    // pass late (nvidia-drm has no vblank with its defaults)
++    why = CDVRepeatKeep::Reason::NO_VBLANK;
++    if (m_dvKeep.VBlankFailed(vblankError))
++      CLog::Log(LOGINFO,
++                "DVBridge: the vblanks of the output cannot be waited for ({}): a picture that "
++                "repeats is drawn again every refresh, {}",
++                strerror(vblankError),
++                m_dvKeep.DeviceHasNoVBlank() ? "until Kodi is started again (the driver has none)"
++                                             : "for the rest of this native output");
+   }
+-  else if (paced)
+-    paced = WaitDVBridgeVBlank(true, now + 1, now);
+   if (!paced)
+   {
++    m_dvStats.notKept[static_cast<size_t>(why)]++;
+     // (not counted either way: the next frame is presented, and tells)
+     m_dvShown = {};
+     m_dvRepeatFlipPending = false;
+@@ -3423,6 +3497,14 @@ void CWinSystemGbmGLESContext::KeepDVBridgeFrame()
+   // Counted as a presentation of that picture: it is shown for this refresh
+   const auto end = std::chrono::steady_clock::now();
+   const double presentMs = std::chrono::duration<double, std::milli>(end - start).count();
++  // Hades: a commit that kept it is a frame whose flip the display shows, or does not
++  // (CDVPresentStall): it changed nothing but the picture
++  if (byCommit)
++  {
++    if (DVPresentStalled(true, presentMs, false))
++      return;
++    m_dvStats.keptByCommit++;
++  }
+   m_dvStats.presentSumMs += presentMs;
+   m_dvStats.presentMaxMs = std::max(m_dvStats.presentMaxMs, presentMs);
+   if (const double periodMs = DVRefreshPeriodMs(); periodMs > 0 && presentMs > 1.5 * periodMs)
+@@ -3587,7 +3669,8 @@ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+             "composed; {} frames "
+             "with the picture standing still); {} renderer flushes, {} buffer discards "
+             "(seeks, stream changes, decoder resets); FEL residual reconstructed on {} "
+-            "presentations, {} FEL presentations without it (enhancement layer resynchronizing)",
++            "presentations, {} FEL presentations without it (enhancement layer resynchronizing); "
++            "{} pictures that were on the screen drawn again{}",
+             period, m_dvStats.shown, m_dvStats.kept, m_dvStats.notShown, m_dvStats.withGui,
+             m_dvStats.prepared ? m_dvStats.prepareSumMs / m_dvStats.prepared : 0.0,
+             m_dvStats.prepareMaxMs, attempts ? m_dvStats.presentSumMs / attempts : 0.0,
+@@ -3602,7 +3685,11 @@ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+                                         : 0.0,
+             m_dvStats.gpuComposedFrames, m_dvStats.still, m_dvStats.flushes,
+             m_dvDiscards.exchange(0, std::memory_order_relaxed), m_dvStats.fel,
+-            m_dvStats.felWithoutLayer);
++            m_dvStats.felWithoutLayer, CDVRepeatKeep::Describe(m_dvStats.notKept),
++            m_dvKeep.ByCommit() || m_dvStats.keptByCommit
++                ? StringUtils::Format("; {} of the pictures kept were committed again",
++                                      m_dvStats.keptByCommit)
++                : std::string());
+   m_dvLastWindow.valid = true;
+   m_dvLastWindow.shown = m_dvStats.shown;
+   m_dvLastWindow.notShown = m_dvStats.notShown;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 0d4041a..8c7d2ed 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -26,6 +26,7 @@
+ #include "DVEngineSettings.h"
+ #include "DVPathChoice.h"
+ #include "DVPresentStall.h"
++#include "DVRepeatKeep.h"
+ #include "DVStepDown.h"
+ #include "DVVerify.h"
+ #include "cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h"
+@@ -346,6 +347,10 @@ private:
+     //! of the frames shown, the refreshes that kept the picture on the screen instead of drawing
+     //! it again (KeepDVBridgeFrame())
+     unsigned int kept = 0;
++    //! Hades: ... of those, kept by a commit of the same picture (CDVRepeatKeep), and the
++    //! pictures that were on the screen and were drawn again, by why they were not kept
++    unsigned int keptByCommit = 0;
++    CDVRepeatKeep::Counts notKept{};
+     unsigned int ahead = 0; //!< presentations a frame ahead (see CDVAhead)
+     //! ... and of those, the times between the flips of two in a row that the kernel told of:
+     //! how many, the longest, and how many over 1.5 refresh periods (a refresh was missed)
+@@ -472,6 +477,10 @@ private:
+   bool m_dvRepeat = false; //!< this pass keeps the picture on the screen (RenderDVBridge())
+   //! videoscreen.hadesdvkeeprepeats with video/dvkeeprepeats, read for each native output
+   bool m_dvKeepRepeats = true;
++  //! Hades: how a kept picture is paced (vblanks, or a commit), and what is known of the vblanks
++  CDVRepeatKeep m_dvKeep;
++  //! ... a picture on the screen is drawn again: why, for the log
++  void DVRepeatDrawn(const DVPicture& frame);
+   //! A picture kept on the screen in place of a frame presented a frame ahead: that commit would
+   //! have been flipped with this refresh (the vblank sequence of the CRTC), and the commit that
+   //! follows waits for it, as it would wait for that flip
+-- 
+2.53.0
+

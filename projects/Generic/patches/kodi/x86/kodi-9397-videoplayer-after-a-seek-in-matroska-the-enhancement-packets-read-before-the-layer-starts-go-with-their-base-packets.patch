@@ -1,0 +1,146 @@
+From 0017a4cba9adcd1f43a1856e80026a034d569278 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:19:06 +0000
+Subject: [PATCH] VideoPlayer: after a seek in Matroska, the enhancement
+ packets read before the layer starts go with their base packets
+
+Matroska packets have no decoding times: the join makes them from the presentation times, from the
+first random-access packet of each track on. After a seek the enhancement track starts some packets
+before its own random-access packet. Those packets got no time and were dropped, and their base
+pictures went out without their RPU: 18, 4, 20, 5 and 11 pictures after seeks to 10, 25, 50, 75 and
+90 % of the FEL test stream, two of them more than the 12 after which Kodi leaves native output.
+
+They are the access units just before the first packet of the track that has a time, in order, and
+so are the base packets just before its base packet: Backfill() gives them those times, and base
+packets wait for that as they wait for a missing layer. Only what was read after the seek point is
+used: a base packet whose enhancement access unit lies before it in the file (in the same stream muxed
+again by ffmpeg, the first one of each seek point is in the cluster before) still goes out alone, and
+Kodi does not draw that one picture.
+---
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.cpp  | 58 +++++++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.h    | 12 +++-
+ 2 files changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+index e77dda3..c3749d2 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+@@ -360,6 +360,59 @@ void CDVLayerMerge::Configure(const Layers& layers)
+   m_fromPresentation = !layers.decodingTimes;
+ }
+ 
++// The early packets of the enhancement track (Waiting::early): when the first one after them has
++// its time, they are the access units just before it, in order, and so are the base packets just
++// before the base packet of that time. Those that the base track does not have (it starts later,
++// or they went out) stay without a time, and are dropped. True while that has to be waited for:
++// the track may still start, or the time of its first packet or the base packet of it is still
++// to come.
++bool CDVLayerMerge::Backfill()
++{
++  std::deque<Waiting>& layer = m_enhancement.waiting;
++  if (!m_fromPresentation || layer.empty() || !layer.front().early)
++    return false;
++
++  size_t first = 0;
++  while (first < layer.size() && layer[first].early)
++    ++first;
++  const auto resolve = [&layer, first]()
++  {
++    for (size_t k = 0; k < first; ++k)
++      layer[k].early = false;
++    return false;
++  };
++  if (first == layer.size() || layer[first].pending || layer[first].time == AV_NOPTS_VALUE)
++  {
++    // the track has not started, or its first time is still to come
++    if (!m_enhancement.started && m_enhancement.unstarted >= m_silentAfter)
++      return resolve();
++    return true;
++  }
++
++  std::deque<Waiting>& base = m_base.waiting;
++  const Waiting& start = layer[first];
++  const auto it = std::find_if(base.begin(), base.end(), [&start](const Waiting& b)
++                               { return SameUnit(b, start); });
++  if (it == base.end())
++  {
++    // a base packet with a time after it: the base packet of it is gone, or never came
++    const bool past = std::any_of(base.begin(), base.end(), [&start](const Waiting& b)
++                                  { return After(b, start); });
++    return past ? resolve() : true;
++  }
++  size_t k = first;
++  for (auto b = it; k > 0 && b != base.begin();)
++  {
++    --b;
++    if (b->pending || b->time == AV_NOPTS_VALUE)
++      break;
++    --k;
++    layer[k].time = b->time;
++    layer[k].slack = b->slack;
++  }
++  return resolve();
++}
++
+ void CDVLayerMerge::Clear()
+ {
+   Forget(m_base);
+@@ -429,6 +482,7 @@ bool CDVLayerMerge::Queue(Track& track, AVPacket* packet, bool enhancement)
+                                    track.lengthSize);
+     if (!track.started && track.unstarted < std::numeric_limits<unsigned int>::max())
+       ++track.unstarted;
++    waiting.early = enhancement && !track.started;
+     const int64_t pts = enhancement ? ToBase(packet->pts) : packet->pts;
+     if (track.started && pts != AV_NOPTS_VALUE)
+     {
+@@ -770,6 +824,10 @@ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+   // its time comes with the packets of its track that follow it
+   if (base.pending)
+     return false;
++  // the enhancement track starts: its first packets get their times from the base track
++  const bool starting = Backfill();
++  if (starting && !end && m_base.waiting.size() < MAX_WAITING)
++    return false;
+ 
+   const auto match =
+       std::find_if(m_enhancement.waiting.begin(), m_enhancement.waiting.end(),
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+index 9c1550a..22ec184 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+@@ -236,8 +236,12 @@ public:
+    * access unit pair. It is known once REORDER more packets of the track came. HEVC allows 15
+    * (sps_max_num_reorder_pics); one more changes nothing but how long a packet waits for its
+    * time. The packets of a track before its first random-access picture (after a seek) have no
+-   * time, and base packets do not wait for an enhancement layer that brought as many packets as
+-   * SetSilent() says without one (no layer starts that late).
++   * time of their own. For the enhancement track those are the access units just before its
++   * first random-access one, in order: they get the times of the base packets just before the
++   * base packet of that one, and with them the base pictures their RPUs, as in a transport stream
++   * (their pictures cannot be decoded, their RPUs are the metadata of the pictures). Base packets
++   * wait for that, but not for an enhancement layer that brought as many packets as SetSilent()
++   * says without a random-access picture (no layer starts that late).
+    */
+   static constexpr size_t REORDER = 16;
+ 
+@@ -294,6 +298,9 @@ private:
+     int64_t time = 0; //!< in the time base of the base track; AV_NOPTS_VALUE when not known
+     int64_t slack = 0; //!< 0 for a time of its own; half a duration for one that follows
+     bool pending = false; //!< its time is made from presentation times and not known yet
++    //! a packet of the enhancement track before its first random-access packet, where the times
++    //! are made from presentation times: its time comes from the base track (Backfill())
++    bool early = false;
+   };
+ 
+   //! The packets of a track that wait, and what gives the next one its time when it has none
+@@ -311,6 +318,7 @@ private:
+   };
+ 
+   bool Queue(Track& track, AVPacket* packet, bool enhancement);
++  bool Backfill();
+   void GiveTimes(Track& track, size_t keep);
+   int64_t ToBase(int64_t time) const;
+   void AttachLayerTime(AVPacket* base, int64_t enhancementPts) const;
+-- 
+2.53.0
+

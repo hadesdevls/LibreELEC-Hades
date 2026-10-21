@@ -11,7 +11,7 @@ PKG_URL="https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${PKG_
 PKG_DEPENDS_HOST="cmake:host ninja:host"
 PKG_DEPENDS_TARGET="cmake:host ninja:host gcc:host"
 PKG_LONGDESC="A JPEG image codec that uses SIMD instructions."
-PKG_BUILD_FLAGS="+pic +pic:host"
+PKG_BUILD_FLAGS="+pic +pic:host +hardening"
 
 PKG_CMAKE_OPTS_HOST="-DENABLE_STATIC=ON \
                      -DENABLE_SHARED=OFF \

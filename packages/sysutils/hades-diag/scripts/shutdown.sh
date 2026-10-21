@@ -1,8 +1,10 @@
 #!/bin/sh
 # Hades diagnostics: at every power-off or reboot (hades-diag.service is stopped after Kodi has stopped),
-# copy this session's Kodi logs and journal, redacted, the kernel log, and what is connected to each output
-# at that moment to hades-diag/start-N/shutdown/ on the boot partition (N: the number of this start, as
-# start.sh left it). Without redact.sed no log is copied, and nothing is done once the switch (a file
+# copy this session's Kodi logs and journal, the kernel log, and what is connected to each output at that
+# moment to hades-diag/start-N/shutdown/ on the boot partition (N: the number of this start, as start.sh
+# left it). The logs go through the filter for logs (redact.sh), everything else through the filter for
+# identifiers (redact.sh ids: addresses, serial numbers, UUIDs, SSH keys, network names and the name of the
+# system become markers). Without the filter nothing is copied, and nothing is done once the switch (a file
 # DIAG-ON... at the top of the boot partition) is gone, or with less than 128 MiB free there (a note on the
 # partition then says so). The stop is bounded: the last 16 MiB of each log, from the start of a line, the
 # journal for 15 s at most, the lock for 10 s.
@@ -10,7 +12,7 @@
 # only the boot partition is flushed, by remounting it read-only: a global sync would also flush everything
 # pending on the (slow) data partition here.
 D=/flash/hades-diag
-R=/usr/lib/hades-diag/redact.sed
+R=/usr/lib/hades-diag/redact.sh
 ls /flash 2>/dev/null | grep -qi '^diag-on' && [ -f $R ] || exit 0
 N=$(cat /run/hades-diag-start 2>/dev/null)
 # (without the number of this start: a start of its own, after the last one that is there)
@@ -44,7 +46,7 @@ rm -f $T/jobs
     echo "${c##*/}: driver=$(basename "$(readlink $c/device/driver 2>/dev/null)") runtime_status=$(cat $c/device/power/runtime_status 2>/dev/null)"
   done
   echo "kernel display messages: drm.debug=$(cat /sys/module/drm/parameters/debug 2>/dev/null)"
-} > $T/shutdown.txt 2>&1
+} 2>&1 | sh $R ids > $T/shutdown.txt
 # The last $1 bytes of the file $2, from the start of a line: an address that is cut in two is no address to
 # the filter.
 last() {
@@ -52,18 +54,18 @@ last() {
   if [ $z -gt $1 ]; then tail -c +$((z - $1 + 1)) "$2" | sed 1d; else cat "$2"; fi
 }
 for f in /storage/.kodi/temp/kodi.log /storage/.kodi/temp/kodi.old.log; do
-  [ -f $f ] && last 16777216 $f | sed -E -f $R | gzip > $T/${f##*/}.gz
+  [ -f $f ] && last 16777216 $f | sh $R | gzip > $T/${f##*/}.gz
 done
-dmesg | gzip > $T/dmesg.txt.gz
+dmesg | sh $R ids | gzip > $T/dmesg.txt.gz
 # storage: the timeline kept by watch-dv.sh and the final statistics of each disk
-[ -f /run/hades-io.log ] && gzip -c /run/hades-io.log > $T/io-timeline.txt.gz
+[ -f /run/hades-io.log ] && sh $R ids < /run/hades-io.log | gzip > $T/io-timeline.txt.gz
 {
   grep -E ' /storage | /flash ' /proc/mounts
   echo "(/sys/block/<dev>/stat: reads rmerged rsectors read_ms writes wmerged wsectors write_ms in_flight busy_ms weighted_ms discards dmerged dsectors discard_ms flushes flush_ms)"
   for b in /sys/block/sd* /sys/block/nvme* /sys/block/mmcblk*; do [ -e "$b/stat" ] && echo "${b##*/}:$(cat $b/stat)"; done
-} > $T/storage.txt 2>&1
+} 2>&1 | sh $R ids > $T/storage.txt
 # the journal, for at most 15 s
-journalctl -b --no-pager 2>&1 | sed -E -f $R | gzip > $T/journal.txt.gz &
+journalctl -b --no-pager 2>&1 | sh $R | gzip > $T/journal.txt.gz &
 j=$!
 ( sleep 15; kill $j 2>/dev/null ) >/dev/null 2>&1 &
 w=$!
@@ -76,7 +78,7 @@ while ! mkdir /run/hades-flash.lock 2>/dev/null && [ $w -lt 10 ]; do w=$((w + 1)
 if mount -o remount,rw /flash; then
   if [ "$(df -k /flash 2>/dev/null | awk 'END { print $4 + 0 }')" -gt 131072 ]; then
     rm -rf $D/NO-ROOM.txt $D/$H/shutdown
-    mkdir -p $D/$H/shutdown && cp $T/* $D/$H/shutdown/
+    mkdir -p $D/$H/shutdown && cp $T/* $D/$H/shutdown/ && : > $D/$H/.filtered
   else
     # (a note on the partition says so, once: nothing else there would tell why nothing was saved)
     [ -e $D/NO-ROOM.txt ] || { mkdir -p $D && cp /usr/lib/hades-diag/NO-ROOM.txt $D/; }

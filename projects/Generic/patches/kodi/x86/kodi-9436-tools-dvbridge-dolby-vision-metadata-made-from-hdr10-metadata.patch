@@ -1,0 +1,573 @@
+From ce6657e8ddd5ae019b2f0637464b93847912d190 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 23:01:56 +0000
+Subject: [PATCH] tools/dvbridge: Dolby Vision metadata made from HDR10+
+ metadata
+
+For a display that takes Dolby Vision and not HDR10+, the dynamic metadata
+of an HDR10+ video can be translated into what an RPU of profile 8.1 says
+of the same picture: an identity mapping (the HDR10 picture is not
+changed), BT.2020 PQ, the mastering display as the source range, and a
+level 1 block (min, max and average of the scene) from the HDR10+
+statistics (SMPTE ST 2094-40:2020 8.3 to 8.5). The rule and the profile
+8.1 defaults follow dovi_tool's generator (MIT, read as data), with two
+differences, measured:
+
+- the average. dovi_tool takes PQ of AverageMaxRGB, the PQ of the linear
+  mean, where ST 2094-10:2021 6.1 defines the mean of maxRGB in PQ. On 166
+  pictures of four test streams, against the level 1 computed on the
+  pictures themselves, that is 112 codes too high on average (up to 512).
+  Here the mean in PQ is taken over the quantile function that the
+  percentiles give, linear in PQ between them; between the 95th and the
+  last (made at 99.98 percent, ST 2094-40 8.5.3 and 8.5.4), where the
+  points are farthest apart, it is shaped so that its linear mean is the
+  AverageMaxRGB that HDR10+ carries exactly: 11 codes off on average;
+- the max. dovi_tool takes the highest distribution value, the 99.98th
+  percentile, which clips the pixels above it (37 codes below the
+  level 1 of ST 2094-10 on average). Here it is PQ of the highest MaxSCL,
+  which clips none (45 codes above, the level 1 being of the reduced
+  pixel set, 2x2 averages).
+
+The entries at 5 and 10 percent of ApplicationVersion 1 are not
+percentiles (8.5.4: 0 and 0.00255) and are left out.
+
+The min is 0, as dovi_tool
+makes it: HDR10+ has none. The clamps are dovi_tool's for CM v2.9 (the
+max at least 2081, the average at least 819), which it also applies to
+Dolby's own CM XML when it makes RPUs of them. CM v2.9 only: no trims and
+no CM v4.0 blocks, which HDR10+ has nothing to make from.
+
+dvbridge_hdr10plus_next() makes the metadata of each picture of a
+stream: once a scene (scenes told as hdr10plus_tool tells them,
+dvbridge_hdr10plus_same_scene()), with a scene refresh on the first
+picture of each. A picture without HDR10+ metadata of its own, or with
+metadata that describe no distribution, gets the last metadata as a
+repeated RPU, which a decoder counts as a missing one.
+
+Measured with the bridge on a software OpenGL ES, with an HDR10+ stream
+made from a test stream's base layer: in both ways of drawing, the luma of
+the transport of certified source devices is the decoded luma times 4 in
+all 165 million samples, and so is the chroma of the rows it is sited on;
+a luma mapping off by 1/4096 is seen in every sample. The level 1 block
+is carried as made.
+---
+ tools/dvbridge/CMakeLists.txt       |   2 +-
+ tools/dvbridge/dvbridge_hdr10plus.c | 389 ++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_hdr10plus.h |  96 +++++++
+ 3 files changed, 486 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_hdr10plus.c
+ create mode 100644 tools/dvbridge/dvbridge_hdr10plus.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 12a9444..4bc6a7d 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -12,7 +12,7 @@ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c
+-                                dvbridge_source.c dvbridge_probe.c)
++                                dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.c b/tools/dvbridge/dvbridge_hdr10plus.c
+new file mode 100644
+index 0000000..9e62d01
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_hdr10plus.c
+@@ -0,0 +1,389 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_hdr10plus.h. */
++#include "dvbridge_hdr10plus.h"
++
++#include "dvbridge_mel.h"
++
++#include <math.h>
++#include <string.h>
++
++#include <libavutil/mem.h>
++#include <libavutil/rational.h>
++
++/* SMPTE ST 2084, on light in [0, 1] of 10000 cd/m2 */
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++
++static double pq_from_linear(double y)
++{
++    y = y < 0 ? 0 : y > 1 ? 1 : y;
++    const double p = pow(y, PQ_M1);
++    return pow((PQ_C1 + PQ_C2 * p) / (1 + PQ_C3 * p), PQ_M2);
++}
++
++static double linear_from_pq(double e)
++{
++    e = e < 0 ? 0 : e > 1 ? 1 : e;
++    const double p = pow(e, 1 / PQ_M2);
++    const double n = p - PQ_C1;
++    return n <= 0 ? 0 : pow(n / (PQ_C2 - PQ_C3 * p), 1 / PQ_M1);
++}
++
++static unsigned code12(double e)
++{
++    const double c = floor(e * 4095 + 0.5);
++    return c < 0 ? 0 : c > 4095 ? 4095 : (unsigned)c;
++}
++
++/* (a value of ST 2094-40 in [0, 1], in multiples of 0.00001) */
++static bool value(AVRational q, double *v)
++{
++    if (q.den <= 0 || q.num < 0)
++        return false;
++    *v = av_q2d(q);
++    return *v <= 1.0;
++}
++
++/* The points of t over a segment of the quantile function: 91 to 0.9, then 400 nearer to 1 by powers, then 1
++ * (the high end is where t^k with a large k does all its rising). */
++#define GRID_POINTS 492
++static void make_grid(double t[GRID_POINTS])
++{
++    int n = 0;
++    for (int i = 0; i <= 90; ++i)
++        t[n++] = 0.9 * i / 90;
++    for (int i = 0; i < 400; ++i)
++        t[n++] = 1 - 0.1 * pow(1e-6, i / 399.0);
++    t[n++] = 1;
++}
++
++/* the mean of PQ and of light over a segment of p of width w, where e(t) = e0 + (e1 - e0) t^k */
++static void segment(const double *t, double e0, double e1, double k, double w, double *pq, double *light)
++{
++    double sp = 0, sl = 0, ep = e0, lp = linear_from_pq(e0);
++    for (int i = 1; i < GRID_POINTS; ++i) {
++        const double e = e0 + (e1 - e0) * (k == 1 ? t[i] : pow(t[i], k));
++        const double l = linear_from_pq(e);
++        const double dt = t[i] - t[i - 1];
++        sp += (e + ep) / 2 * dt;
++        sl += (l + lp) / 2 * dt;
++        ep = e;
++        lp = l;
++    }
++    *pq += sp * w;
++    *light += sl * w;
++}
++
++#define MAX_KNOTS 17
++
++bool dvbridge_hdr10plus_level1(const AVDynamicHDRPlus *m, struct dvbridge_hdr10plus_l1 *l1)
++{
++    if (!m || !l1 || m->num_windows < 1)
++        return false;
++    memset(l1, 0, sizeof(*l1));
++    const AVHDRPlusColorTransformParams *w = &m->params[0];
++    double peak = 0, average;
++    for (int c = 0; c < 3; ++c) {
++        double v;
++        if (!value(w->maxscl[c], &v))
++            return false;
++        if (v > peak)
++            peak = v;
++    }
++    if (!value(w->average_maxrgb, &average))
++        return false;
++    const unsigned n = w->num_distribution_maxrgb_percentiles;
++    if (n < 1 || n > 15)
++        return false;
++    /* ST 2094-40 8.5.4: with ApplicationVersion 1, the entries at 5 and 10 are not part of the distribution (0 and
++     * 0.00255); an encoder that writes version 0 with those two values exactly is taken the same way */
++    double v1 = -1, v2 = -1;
++    if (n >= 3) {
++        value(w->distribution_maxrgb[1].percentile, &v1);
++        value(w->distribution_maxrgb[2].percentile, &v2);
++    }
++    const bool reserved = n >= 3 && w->distribution_maxrgb[1].percentage == 5 &&
++                          w->distribution_maxrgb[2].percentage == 10 &&
++                          (m->application_version >= 1 || (v1 == 0 && fabs(v2 - 0.00255) < 1e-9));
++    double ps[MAX_KNOTS], vs[MAX_KNOTS];
++    unsigned k = 0, last_percentage = 0;
++    ps[k] = 0;
++    vs[k++] = 0; /* (set to the first percentile below) */
++    for (unsigned i = 0; i < n; ++i) {
++        const unsigned j = w->distribution_maxrgb[i].percentage;
++        double v;
++        if (j > 100 || (i && j <= last_percentage) || !value(w->distribution_maxrgb[i].percentile, &v))
++            return false;
++        last_percentage = j;
++        if (reserved && (i == 1 || i == 2))
++            continue;
++        if (k > 1 && v < vs[k - 1])
++            return false; /* percentiles that go down describe no distribution */
++        ps[k] = j == 99 ? 0.9998 : j / 100.0;
++        vs[k++] = v;
++    }
++    if (k < 3)
++        return false;
++    vs[0] = vs[1];
++    ps[k] = 1;
++    vs[k] = peak > vs[k - 1] ? peak : vs[k - 1];
++    ++k;
++    l1->knots = k - 2;
++
++    double t[GRID_POINTS], es[MAX_KNOTS];
++    make_grid(t);
++    for (unsigned i = 0; i < k; ++i)
++        es[i] = pq_from_linear(vs[i]);
++    /* the segments below the top two, linear in PQ */
++    double fixed_pq = 0, fixed_light = 0;
++    for (unsigned i = 0; i + 3 < k; ++i)
++        if (ps[i + 1] > ps[i])
++            segment(t, es[i], es[i + 1], 1, ps[i + 1] - ps[i], &fixed_pq, &fixed_light);
++    /* the top two, shaped as t^k (k > 1 lowers them, k < 1 raises them), k found by halving its logarithm */
++    double top_pq, top_light, lo = 1.0 / 64, hi = 65536.0, chosen;
++#define TOP(kk)                                                                                       \
++    do {                                                                                              \
++        top_pq = fixed_pq;                                                                            \
++        top_light = fixed_light;                                                                      \
++        for (unsigned i = k - 3; i + 1 < k; ++i)                                                      \
++            if (ps[i + 1] > ps[i])                                                                    \
++                segment(t, es[i], es[i + 1], (kk), ps[i + 1] - ps[i], &top_pq, &top_light);           \
++    } while (0)
++    TOP(lo);
++    if (top_light <= average)
++        chosen = lo;
++    else {
++        TOP(hi);
++        if (top_light >= average)
++            chosen = hi;
++        else {
++            for (int i = 0; i < 40; ++i) {
++                const double mid = sqrt(lo * hi);
++                TOP(mid);
++                if (top_light > average)
++                    lo = mid;
++                else
++                    hi = mid;
++            }
++            chosen = sqrt(lo * hi);
++        }
++    }
++    TOP(chosen);
++#undef TOP
++    l1->max_measured = code12(pq_from_linear(peak));
++    l1->avg_measured = code12(top_pq);
++    /* as dovi_tool clamps a level 1 block for CM v2.9 (ExtMetadataBlockLevel1::clamp_values_int()) */
++    l1->min_pq = 0;
++    l1->max_pq = l1->max_measured < 2081 ? 2081 : l1->max_measured;
++    l1->avg_pq = l1->avg_measured < 819 ? 819 : l1->avg_measured;
++    if (l1->avg_pq > l1->max_pq - 1)
++        l1->avg_pq = l1->max_pq - 1;
++    return true;
++}
++
++static bool same_q(AVRational a, AVRational b)
++{
++    return av_cmp_q(a, b) == 0 || (a.num == 0 && b.num == 0);
++}
++
++bool dvbridge_hdr10plus_same_scene(const AVDynamicHDRPlus *a, const AVDynamicHDRPlus *b)
++{
++    if (!a || !b || a->num_windows != b->num_windows ||
++        !same_q(a->targeted_system_display_maximum_luminance, b->targeted_system_display_maximum_luminance))
++        return false;
++    const int windows = a->num_windows < 1 ? 1 : a->num_windows > 3 ? 3 : a->num_windows;
++    for (int i = 0; i < windows; ++i) {
++        const AVHDRPlusColorTransformParams *p = &a->params[i], *q = &b->params[i];
++        for (int c = 0; c < 3; ++c)
++            if (!same_q(p->maxscl[c], q->maxscl[c]))
++                return false;
++        if (!same_q(p->average_maxrgb, q->average_maxrgb) ||
++            p->num_distribution_maxrgb_percentiles != q->num_distribution_maxrgb_percentiles)
++            return false;
++        for (int j = 0; j < p->num_distribution_maxrgb_percentiles && j < 15; ++j)
++            if (p->distribution_maxrgb[j].percentage != q->distribution_maxrgb[j].percentage ||
++                !same_q(p->distribution_maxrgb[j].percentile, q->distribution_maxrgb[j].percentile))
++                return false;
++        /* (hdr10plus_tool: the curve where it is carried, its profile B) */
++        if (p->tone_mapping_flag != q->tone_mapping_flag)
++            return false;
++        if (p->tone_mapping_flag) {
++            if (!same_q(p->knee_point_x, q->knee_point_x) || !same_q(p->knee_point_y, q->knee_point_y) ||
++                p->num_bezier_curve_anchors != q->num_bezier_curve_anchors)
++                return false;
++            for (int j = 0; j < p->num_bezier_curve_anchors && j < 15; ++j)
++                if (!same_q(p->bezier_curve_anchors[j], q->bezier_curve_anchors[j]))
++                    return false;
++        }
++    }
++    return true;
++}
++
++AVDOVIMetadata *dvbridge_hdr10plus_metadata(const struct dvbridge_hdr10plus_l1 *l1,
++                                            const AVMasteringDisplayMetadata *mastering,
++                                            const AVContentLightMetadata *light, bool scene_refresh,
++                                            size_t *size)
++{
++    if (!l1 || !mastering || !mastering->has_luminance || !size || mastering->max_luminance.den <= 0 ||
++        mastering->min_luminance.den <= 0)
++        return NULL;
++    const double max_nits = av_q2d(mastering->max_luminance), min_nits = av_q2d(mastering->min_luminance);
++    if (!(max_nits > 0 && max_nits <= 10000 && min_nits >= 0 && min_nits < max_nits))
++        return NULL;
++    AVDOVIMetadata *m = av_dovi_metadata_alloc(size);
++    if (!m)
++        return NULL;
++
++    /* profile 8.1 as dovi_tool makes it (dovi_rpu.rs, profiles/profile81.rs, rpu_data_header.rs) */
++    AVDOVIRpuDataHeader *h = av_dovi_get_header(m);
++    h->rpu_type = 2;
++    h->rpu_format = 18;
++    h->vdr_rpu_profile = 1;
++    h->vdr_rpu_level = 0;
++    h->coef_data_type = 0;
++    h->coef_log2_denom = 23;
++    h->vdr_rpu_normalized_idc = 1;
++    h->bl_video_full_range_flag = 0;
++    h->bl_bit_depth = 10;
++    h->el_bit_depth = 10;
++    h->vdr_bit_depth = 12;
++    h->spatial_resampling_filter_flag = 0;
++    h->el_spatial_resampling_filter_flag = 0;
++    h->disable_residual_flag = 1;
++
++    /* the identity mapping: one piece over the base layer's codes, x^1 (rpu_data_mapping.rs) */
++    AVDOVIDataMapping *map = av_dovi_get_mapping(m);
++    map->vdr_rpu_id = 0;
++    map->mapping_color_space = 0;
++    map->mapping_chroma_format_idc = 0;
++    for (int c = 0; c < 3; ++c) {
++        AVDOVIReshapingCurve *curve = &map->curves[c];
++        curve->num_pivots = 2;
++        curve->pivots[0] = 0;
++        curve->pivots[1] = 1023;
++        curve->mapping_idc[0] = AV_DOVI_MAPPING_POLYNOMIAL;
++        curve->poly_order[0] = 1;
++        curve->poly_coef[0][0] = 0;
++        curve->poly_coef[0][1] = 1 << 23;
++        curve->poly_coef[0][2] = 0;
++    }
++    map->nlq_method_idc = AV_DOVI_NLQ_NONE;
++    map->num_x_partitions = 1;
++    map->num_y_partitions = 1;
++
++    /* BT.2020 PQ (vdr_dm_data.rs) */
++    AVDOVIColorMetadata *col = av_dovi_get_color(m);
++    static const int ycc[9] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
++    static const int lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
++    for (int i = 0; i < 9; ++i) {
++        col->ycc_to_rgb_matrix[i] = (AVRational){ycc[i], 8192};
++        col->rgb_to_lms_matrix[i] = (AVRational){lms[i], 16384};
++    }
++    col->ycc_to_rgb_offset[0] = (AVRational){16777216, 1 << 28};
++    col->ycc_to_rgb_offset[1] = (AVRational){134217728, 1 << 28};
++    col->ycc_to_rgb_offset[2] = (AVRational){134217728, 1 << 28};
++    col->dm_metadata_id = 0;
++    col->scene_refresh_flag = scene_refresh;
++    col->signal_eotf = 65535;
++    col->signal_bit_depth = 12;
++    col->signal_color_space = 0;
++    col->signal_chroma_format = 0;
++    col->signal_full_range_flag = 1;
++    /* the mastering display, as PQ codes (dovi_tool's table, Level6::source_meta_from_l6(), is these codes for
++     * 1000, 2000, 4000 and 10000 cd/m2 and 0.005; a minimum of at most 0.001 is 7 there) */
++    col->source_min_pq = min_nits <= 0.001 ? 7 : code12(pq_from_linear(min_nits / 10000));
++    col->source_max_pq = code12(pq_from_linear(max_nits / 10000));
++    col->source_diagonal = 42;
++
++    m->num_ext_blocks = 0;
++    AVDOVIDmData *e = av_dovi_get_ext(m, m->num_ext_blocks++);
++    e->level = 1;
++    e->l1.min_pq = l1->min_pq;
++    e->l1.max_pq = l1->max_pq;
++    e->l1.avg_pq = l1->avg_pq;
++    e = av_dovi_get_ext(m, m->num_ext_blocks++);
++    e->level = 6;
++    e->l6.max_luminance = (uint16_t)floor(max_nits + 0.5);
++    e->l6.min_luminance = (uint16_t)floor(min_nits * 10000 + 0.5);
++    e->l6.max_cll = light ? (uint16_t)(light->MaxCLL > 65535 ? 65535 : light->MaxCLL) : 0;
++    e->l6.max_fall = light ? (uint16_t)(light->MaxFALL > 65535 ? 65535 : light->MaxFALL) : 0;
++    return m;
++}
++
++struct dvbridge_hdr10plus_scene {
++    AVDynamicHDRPlus from; /* the HDR10+ metadata that the metadata were made of last */
++    AVDOVIMetadata *first; /* those metadata, with a scene refresh: what the first picture of the scene gets */
++    AVDOVIMetadata *made;  /* ... and without one: what the next pictures get */
++    size_t size;
++};
++
++struct dvbridge_hdr10plus_scene *dvbridge_hdr10plus_scene_create(void)
++{
++    return av_mallocz(sizeof(struct dvbridge_hdr10plus_scene));
++}
++
++void dvbridge_hdr10plus_scene_reset(struct dvbridge_hdr10plus_scene *s)
++{
++    if (!s)
++        return;
++    av_freep(&s->first);
++    av_freep(&s->made);
++    memset(s, 0, sizeof(*s));
++}
++
++void dvbridge_hdr10plus_scene_destroy(struct dvbridge_hdr10plus_scene *s)
++{
++    dvbridge_hdr10plus_scene_reset(s);
++    av_free(s);
++}
++
++const AVDOVIMetadata *dvbridge_hdr10plus_next(struct dvbridge_hdr10plus_scene *s,
++                                              const AVDynamicHDRPlus *hdr10plus,
++                                              const AVMasteringDisplayMetadata *mastering,
++                                              const AVContentLightMetadata *light, size_t *size,
++                                              bool *repeated)
++{
++    if (!s || !size || !repeated)
++        return NULL;
++    *repeated = false;
++    if (hdr10plus && mastering && mastering->has_luminance) {
++        if (s->made && dvbridge_hdr10plus_same_scene(&s->from, hdr10plus)) {
++            *size = s->size;
++            return s->made;
++        }
++        struct dvbridge_hdr10plus_l1 l1;
++        size_t bytes = 0;
++        AVDOVIMetadata *first = dvbridge_hdr10plus_level1(hdr10plus, &l1)
++                                    ? dvbridge_hdr10plus_metadata(&l1, mastering, light, true, &bytes)
++                                    : NULL;
++        AVDOVIMetadata *made = first ? av_malloc(bytes) : NULL;
++        if (made) {
++            memcpy(made, first, bytes);
++            av_dovi_get_color(made)->scene_refresh_flag = 0;
++            av_free(s->first);
++            av_free(s->made);
++            s->first = first;
++            s->made = made;
++            s->size = bytes;
++            s->from = *hdr10plus;
++            *size = bytes;
++            return s->first;
++        }
++        av_free(first);
++    }
++    if (!s->made)
++        return NULL;
++    *repeated = true;
++    *size = s->size;
++    return s->made;
++}
++
++void dvbridge_hdr10plus_units(const uint8_t *data, size_t size, int length_size,
++                              bool (*found)(const uint8_t *unit, size_t size, void *context), void *context)
++{
++    if (data && size && found && length_size >= 0 && length_size <= 4)
++        dvbridge_rpu_units(data, size, length_size, found, context);
++}
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.h b/tools/dvbridge/dvbridge_hdr10plus.h
+new file mode 100644
+index 0000000..b279792
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_hdr10plus.h
+@@ -0,0 +1,96 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_HDR10PLUS_H
++#define DVBRIDGE_HDR10PLUS_H
++/* Hades: Dolby Vision metadata made from the HDR10+ metadata of a picture (SMPTE ST 2094-40:2020), for a display
++ * that takes Dolby Vision and not HDR10+. What is made is what an RPU of profile 8.1 says of a picture that is
++ * the HDR10 picture itself: an identity mapping (the picture is not changed), the colour of BT.2020 PQ, the
++ * mastering display as the source range, and a level 1 block with the range of the scene that the HDR10+
++ * statistics describe. Nothing is invented: the level 1 block is a translation of what the studio's HDR10+
++ * metadata measures, and what HDR10+ has no counterpart for is left out (see dvbridge_hdr10plus_level1()).
++ * The rule for the level 1 block from HDR10+ statistics, and the profile 8.1 defaults, follow dovi_tool's
++ * generator (MIT, read as data); the average is made otherwise, measured (see below). */
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include <libavutil/dovi_meta.h>
++#include <libavutil/hdr_dynamic_metadata.h>
++#include <libavutil/mastering_display_metadata.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct dvbridge_hdr10plus_l1 {
++    /* the level 1 block, as 12-bit PQ codes: min, max and average, clamped as dovi_tool clamps a
++     * level 1 block that it makes for CM v2.9 (min at most 12, max at least 2081, the average from
++     * 819 to max - 1) */
++    unsigned min_pq, max_pq, avg_pq;
++    /* ... and before that clamp (for the tests): the highest MaxSCL and the estimated average */
++    unsigned max_measured, avg_measured;
++    unsigned knots; /* the points of the distribution that were taken */
++};
++
++/* The level 1 block of a picture from its HDR10+ metadata (the statistics of processing window 0, the whole
++ * picture). ST 2094-10:2021 6.1 defines level 1 on the picture (min and max of minRGB and maxRGB, and the mean of
++ * maxRGB, in PQ); HDR10+ carries, in linear light, MaxSCL (the maximum of each component), AverageMaxRGB (the mean
++ * of maxRGB) and percentiles of maxRGB (ST 2094-40 8.3 to 8.5). They are taken so:
++ *  - max: PQ of the highest MaxSCL. It is never below a pixel of the picture: nothing is clipped by it.
++ *  - min: 0, as dovi_tool makes it: HDR10+ has no minimum.
++ *  - average: the mean over the picture of PQ(maxRGB), from the percentiles: the quantile function goes through
++ *    them, linear in PQ between them, and from the last one to the highest MaxSCL. Between the 95th and the last
++ *    one, where the points are farthest apart (99.98: ST 2094-40 8.5.3 and 8.5.4 have the entry at 99 made at
++ *    99.98 percent), it is shaped as t^k in PQ, with k such that the linear mean of the quantile function is the
++ *    AverageMaxRGB that HDR10+ gives exactly. (dovi_tool takes PQ of AverageMaxRGB, the PQ of the linear mean,
++ *    which is higher than the mean in PQ. Measured on 166 pictures of four test streams, against the level 1 of ST
++ *    2094-10 computed on the pictures themselves: that rule 112 codes too high on average and up to 512; this
++ *    one 11 codes off on average, 9 too low.)
++ * The entries at 5 and 10 percent of ApplicationVersion 1, which are not percentiles (ST 2094-40 8.5.4: 0 and
++ * 0.00255), are left out. false: no level 1 block can be made (no distribution, percentages that do not ascend,
++ * percentiles that go down, values out of range); the picture then has no Dolby Vision metadata of its own. */
++bool dvbridge_hdr10plus_level1(const AVDynamicHDRPlus *metadata, struct dvbridge_hdr10plus_l1 *l1);
++
++/* Whether a picture's HDR10+ metadata are of the scene of the one before, as hdr10plus_tool tells its scenes:
++ * the same luminance parameters (MaxSCL, AverageMaxRGB and the distribution of each window), number of
++ * windows and targeted system display maximum luminance, and, where a curve is carried, the same curve. */
++bool dvbridge_hdr10plus_same_scene(const AVDynamicHDRPlus *a, const AVDynamicHDRPlus *b);
++
++/* The Dolby Vision metadata of the picture (av_free() it; *size its bytes): profile 8.1 over a 10-bit base layer,
++ * identity mapping, BT.2020 PQ as dovi_tool's profile 8.1 has it, the source range of the mastering display (PQ
++ * codes; at most 0.001 cd/m2 is 7, as dovi_tool has it), level 1 and level 6 (the static metadata). CM v2.9: no
++ * trims, no CM v4.0 blocks. NULL without the luminance of the mastering display. */
++AVDOVIMetadata *dvbridge_hdr10plus_metadata(const struct dvbridge_hdr10plus_l1 *l1,
++                                            const AVMasteringDisplayMetadata *mastering,
++                                            const AVContentLightMetadata *light, bool scene_refresh,
++                                            size_t *size);
++
++/* What a decoder keeps of a stream from one picture to the next, to make the metadata of each
++ * (dvbridge_hdr10plus_next()): made once a scene. */
++struct dvbridge_hdr10plus_scene;
++struct dvbridge_hdr10plus_scene *dvbridge_hdr10plus_scene_create(void);
++void dvbridge_hdr10plus_scene_destroy(struct dvbridge_hdr10plus_scene *scene);
++/* A seek, or a new stream: the next picture refreshes the scene, and none gets metadata from before. */
++void dvbridge_hdr10plus_scene_reset(struct dvbridge_hdr10plus_scene *scene);
++/* The metadata of the next picture (NULL: none), owned by scene until the next call (the caller copies them), from
++ * its own HDR10+ metadata and the static metadata of the stream (the luminance of the mastering display is needed):
++ * made when its scene is another than the last one made (with a scene refresh), the same bytes as for the picture
++ * before when it is of that scene (without one). A picture without HDR10+ metadata of its own, or with metadata
++ * from which no level 1 block can be made (dvbridge_hdr10plus_level1()), or without the mastering display, gets the
++ * last metadata made, *repeated: as FFmpeg's HEVC decoder gives the last RPU to a picture without one, so that it
++ * counts as a picture without metadata of its own. NULL when nothing was made yet. */
++const AVDOVIMetadata *dvbridge_hdr10plus_next(struct dvbridge_hdr10plus_scene *scene,
++                                              const AVDynamicHDRPlus *hdr10plus,
++                                              const AVMasteringDisplayMetadata *mastering,
++                                              const AVContentLightMetadata *light, size_t *size,
++                                              bool *repeated);
++
++/* The units of an access unit (a length of length_size bytes before each, or start codes with 0), each to
++ * found(unit, size, context) from its header, until it returns false (dvbridge_rpu_units()): for the probe of a
++ * stream's HDR10+ metadata, which reads its SEI with Kodi's own parser. */
++void dvbridge_hdr10plus_units(const uint8_t *data, size_t size, int length_size,
++                              bool (*found)(const uint8_t *unit, size_t size, void *context), void *context);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

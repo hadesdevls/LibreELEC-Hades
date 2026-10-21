@@ -184,6 +184,7 @@ namespace Hades.Installer
         DiskInfo doneDisk;       // what the last panel says (ShowDone), to say it in the other language
         Place donePlace;
         bool doneUpdated;
+        DiagKeep doneDiag;       // what became of the folder hades-diag in that update (null: not an update)
 
         Place Where { get { return inside.Checked ? Place.Internal : Place.Usb; } }
 
@@ -982,8 +983,8 @@ namespace Hades.Installer
         {
             Log.Line("start update " + place + (take ? ", taking the partition" : "") + ": disk " + disk.Number + " " + disk.Name +
                      " <- " + image);
-            Run(delegate { Operations.Update(disk, chosen, place, diagnose, Report, take); },
-                delegate { ShowDone(disk, place, true); },
+            Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Update(disk, chosen, place, diagnose, Report, take); },
+                delegate(object result) { ShowDone(disk, place, true, result as DiagKeep); },
                 delegate(Exception error)
                 {
                     if (take || !(error is PartitionInUseException)) return false;
@@ -1076,12 +1077,14 @@ namespace Hades.Installer
                 "The Hades system on this drive is replaced by the one in the image (" + imageName + ").\r\n\r\n" +
                 "Your settings, your add-ons and whatever you have saved in Hades are not touched. No other disk is touched.\r\n\r\n" +
                 "The boot partition of Hades (Windows calls it LIBREELEC) is replaced whole: if you put anything there by hand, " +
-                "copy it first. What its diagnostics saved there (the folder hades-diag) goes too.\r\n" +
+                "copy it first. What its diagnostics saved there (the folder hades-diag) is kept: the installer copies it into the " +
+                "new partition, checks it, and says so when it is done.\r\n" +
                 "Do not unplug the drive or turn the PC off while it lasts.",
                 "Se cambia el sistema de Hades de esta unidad por el de la imagen (" + imageName + ").\r\n\r\n" +
                 "Tus ajustes, tus addons y lo que tengas guardado en Hades no se tocan. Ningún otro disco se toca.\r\n\r\n" +
                 "La partición de arranque de Hades (Windows la llama LIBREELEC) se sustituye entera: si guardaste " +
-                "algo ahí a mano, cópialo antes. Lo que su diagnóstico haya guardado ahí (la carpeta hades-diag) también se va.\r\n" +
+                "algo ahí a mano, cópialo antes. Lo que su diagnóstico haya guardado ahí (la carpeta hades-diag) se conserva: el " +
+                "instalador lo copia a la partición nueva, lo comprueba y lo dice al terminar.\r\n" +
                 "No desconectes la unidad ni apagues el PC mientras dure.") + others;
             return new ConfirmForm(L.T("Update LibreELEC Hades on this drive", "Actualizar LibreELEC Hades en esta unidad"), false, details,
                                    L.T("UPDATE", "ACTUALIZAR"), L.T("Update", "Actualizar"));
@@ -1151,6 +1154,8 @@ namespace Hades.Installer
                                         "comprobado releyendo lo escrito.")
                                   : L.T("LibreELEC Hades is installed on " + name + ", and this was checked by reading back what was written.",
                                         "LibreELEC Hades está instalado en " + name + " y se ha comprobado releyendo lo escrito."));
+            string diag = updated && doneDiag != null ? doneDiag.Text() : "";
+            if (diag.Length > 0) sb.AppendLine(diag);
             sb.AppendLine();
             sb.AppendLine(L.T("How to start it", "Cómo arrancarlo"));
             sb.AppendLine(place == Place.Usb ? L.T("  1.  Leave the drive plugged in and restart the PC.", "  1.  Deja la unidad conectada y reinicia el PC.")
@@ -1193,11 +1198,13 @@ namespace Hades.Installer
             return sb.ToString();
         }
 
-        public void ShowDone(DiskInfo disk, Place place, bool updated)
+        // diag: what became of the folder hades-diag in an update
+        public void ShowDone(DiskInfo disk, Place place, bool updated, DiagKeep diag = null)
         {
             doneDisk = disk;
             donePlace = place;
             doneUpdated = updated;
+            doneDiag = diag;
             doneText.Text = DoneText();
             language.Enabled = !busy; // (it was off while the disk was worked on, and nothing else puts it on again here)
             foreach (Control c in Controls)
