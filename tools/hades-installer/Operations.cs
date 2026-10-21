@@ -67,7 +67,11 @@ namespace Hades.Installer
         {
             report(0, L.T("Preparing the disk…", "Preparando el disco…"));
             List<Patch> patches = Engine.Patches(plan, place == Place.Internal, true, null, diagnostics);
-            Current(disk, place, plan.Size, Disks.Keeping(plan.Path), true);
+            DiskInfo now = Current(disk, place, plan.Size, Disks.Keeping(plan.Path), true);
+            // Each volume of the disk written out and dismounted first, taken from the programs that have it open: Windows
+            // erases a disk whose volume is in use all the same, and what that volume still had to write must not land on
+            // the partitions that are written in its place (Native.FlushAndDismount). Then the disk is erased at once.
+            foreach (PartitionInfo p in now.Partitions) Native.FlushAndDismount(disk.Number, p);
             Disks.Clear(disk.Number);
             System.Threading.Thread.Sleep(1500);
             // erasing leaves a disk without partitions; what identifies it has to be the same
@@ -369,6 +373,8 @@ namespace Hades.Installer
             if (how == Removal.WholeDisk)
             {
                 report(200, L.T("Erasing the disk…", "Borrando el disco…"));
+                // (as before an install on the whole disk: nothing of its volumes may land on the one that is made)
+                foreach (PartitionInfo p in now.Partitions) Native.FlushAndDismount(disk.Number, p);
                 Disks.Clear(disk.Number);
                 System.Threading.Thread.Sleep(1500);
                 Disks.InitializeGpt(disk.Number);

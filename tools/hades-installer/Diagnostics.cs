@@ -121,6 +121,7 @@ namespace Hades.Installer
         public Cause Why = Cause.None;
         public string Detail = "";                       // for the log, in English
         public bool Verified;                            // read back from the disk, file by file, as it was
+        public bool ReadBack;                            // it has been read back (Confirm): Verified says how
         public int Files, Folders, Damaged;              // kept; and what could not be read on the old partition
         public long Bytes;
         public List<string> LeftOut = new List<string>(); // the oldest starts, for want of room
@@ -145,7 +146,8 @@ namespace Hades.Installer
             if (State == Outcome.Kept)
                 s += ": " + Files + " files in " + Folders + " folders, " + Bytes + " bytes, " + Patches.Count + " patches" +
                      (LeftOut.Count > 0 ? "; left out for want of room: " + string.Join(", ", LeftOut.ToArray()) : "") +
-                     (Damaged > 0 ? "; " + Damaged + " that could not be read" : "") + "; read back the same: " + Verified;
+                     (Damaged > 0 ? "; " + Damaged + " that could not be read" : "") +
+                     (ReadBack ? "; read back the same: " + Verified : "; to be read back once the partition is written");
             if (Why != Cause.None) s += " (" + Why + ")";
             if (Detail.Length > 0) s += ": " + Detail;
             return s;
@@ -851,6 +853,7 @@ namespace Hades.Installer
         {
             keep.Verified = false;
             if (keep.State != DiagKeep.Outcome.Kept) return;
+            keep.ReadBack = true;
             try
             {
                 string why;

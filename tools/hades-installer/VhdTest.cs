@@ -221,6 +221,312 @@ namespace Hades.Installer
             return differ;
         }
 
+        // The clusters of each file and folder of a FAT16, by its path: what a difference in a partition is in.
+        static Dictionary<int, string> ClusterOwners(Fat16 fat)
+        {
+            var owners = new Dictionary<int, string>();
+            var folders = new List<KeyValuePair<string, List<DiagItem>>>();
+            folders.Add(new KeyValuePair<string, List<DiagItem>>("", DiagFolder.Entries(fat.Root)));
+            for (int i = 0; i < folders.Count && i < 10000; ++i)
+                foreach (DiagItem item in folders[i].Value)
+                {
+                    string path = folders[i].Key + "/" + item.Name;
+                    List<int> chain = item.First < 2 ? null : fat.Chain(item.First, fat.Clusters);
+                    if (chain == null) continue;
+                    foreach (int c in chain) owners[c] = path;
+                    if (!item.Folder) continue;
+                    var dir = new byte[(long)chain.Count * fat.ClusterBytes];
+                    for (int k = 0; k < chain.Count; ++k) Buffer.BlockCopy(fat.Cluster(chain[k]), 0, dir, k * fat.ClusterBytes, fat.ClusterBytes);
+                    folders.Add(new KeyValuePair<string, List<DiagItem>>(path, DiagFolder.Entries(dir)));
+                }
+            return owners;
+        }
+
+        // The part of a FAT16 partition that an offset is in.
+        static string Region(Fat16 fat, Dictionary<int, string> owners, long at)
+        {
+            if (at < Fat16.Sector) return "the boot sector";
+            if (at < fat.FatAt) return "the reserved sectors";
+            if (at < fat.RootAt)
+            {
+                long fatBytes = (long)fat.FatSectors * Fat16.Sector, into = (at - fat.FatAt) % fatBytes;
+                return "FAT " + (1 + (at - fat.FatAt) / fatBytes) + ", the entry of cluster " + into / 2;
+            }
+            if (at < fat.DataAt) return "the root directory, entry " + (at - fat.RootAt) / 32;
+            int cluster = (int)((at - fat.DataAt) / fat.ClusterBytes) + 2;
+            string who;
+            return "cluster " + cluster + (owners.TryGetValue(cluster, out who) ? " of " + who : ", free in the image");
+        }
+
+        // 32 bytes from "from" (rounded down to 16), in hexadecimal and as letters: a signature shows (NTFS writes FILE,
+        // INDX, RCRD and RSTR at the start of its records).
+        static string Bytes(byte[] b, int from)
+        {
+            from &= ~15;
+            var hex = new StringBuilder();
+            var text = new StringBuilder();
+            for (int i = from; i < Math.Min(b.Length, from + 32); ++i)
+            {
+                hex.Append(b[i].ToString("x2"));
+                text.Append(b[i] >= 32 && b[i] < 127 ? (char)b[i] : '.');
+            }
+            return "[" + from + "] " + hex + " \"" + text + "\"";
+        }
+
+        // A part of another stream, from "start" and "length" long, read-only: a partition of a disk read through the disk.
+        sealed class PartOf : Stream
+        {
+            readonly Stream inner;
+            readonly long start, length;
+            long position;
+
+            public PartOf(Stream inner, long start, long length) { this.inner = inner; this.start = start; this.length = length; }
+            public override bool CanRead { get { return true; } }
+            public override bool CanSeek { get { return true; } }
+            public override bool CanWrite { get { return false; } }
+            public override long Length { get { return length; } }
+            public override long Position { get { return position; } set { position = value; } }
+            public override void Flush() { }
+            public override void SetLength(long value) { throw new NotSupportedException(); }
+            public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                position = origin == SeekOrigin.Begin ? offset : origin == SeekOrigin.Current ? position + offset : length + offset;
+                return position;
+            }
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                count = (int)Math.Max(0, Math.Min(count, length - position));
+                if (count == 0) return 0;
+                inner.Seek(start + position, SeekOrigin.Begin);
+                int read = inner.Read(buffer, offset, count);
+                position += read;
+                return read;
+            }
+        }
+
+        public const string SystemVolumeInformation = "System Volume Information";
+
+        // The clusters of a folder and of everything in it (files by their chains, folders the same way). Null, or what is
+        // wrong with them.
+        static string Owned(Fat16 fat, DiagItem folder, List<int> clusters, int depth)
+        {
+            if (depth > 8) return "its folders go too deep";
+            List<int> chain = folder.First < 2 ? null : fat.Chain(folder.First, 256);
+            if (chain == null) return "the chain of one of its folders is broken";
+            clusters.AddRange(chain);
+            var dir = new byte[(long)chain.Count * fat.ClusterBytes];
+            for (int k = 0; k < chain.Count; ++k) Buffer.BlockCopy(fat.Cluster(chain[k]), 0, dir, k * fat.ClusterBytes, fat.ClusterBytes);
+            foreach (DiagItem item in DiagFolder.Entries(dir))
+            {
+                if (item.Folder)
+                {
+                    string wrong = Owned(fat, item, clusters, depth + 1);
+                    if (wrong != null) return wrong;
+                    continue;
+                }
+                if (item.First < 2) continue; // a file with nothing in it
+                List<int> c = fat.Chain(item.First, fat.Clusters);
+                if (c == null) return "the chain of one of its files is broken";
+                clusters.AddRange(c);
+            }
+            return null;
+        }
+
+        // How a FAT16 partition read from a disk (actual) differs from what was written there (expected) when Windows has
+        // mounted it meanwhile. Its FAT driver puts a folder System Volume Information (with files of its own) in the
+        // root directory of a FAT that it mounts, and may set the bits that say that the volume is in use (bits 0 and 1
+        // of byte 37 of the boot sector, bits 14 and 15 of the entry of cluster 1 in each FAT). Those are allowed, and
+        // only those: the entries of that folder in the root directory, where the image has free entries; its clusters
+        // and those of what is in it, which the image has free, and their entries in each FAT. A block of 4 KiB that
+        // differs is Windows' when every byte that differs in it is one of those, and "other" when any is not. why:
+        // what is not as Windows makes it (that folder in entries or clusters that the image uses, a broken chain), or
+        // null.
+        internal static void WindowsOnly(Stream expected, Stream actual, long length, out int windows, out int other, out string why)
+        {
+            windows = other = 0;
+            why = null;
+            var allowed = new List<long[]>(); // ranges of bytes, from and to
+            long dirtyByte = -1;
+            var inUse = new List<long>();     // the high byte of the entry of cluster 1, in each FAT
+            string unused;
+            Fat16 was = Fat16.Open(DiagFolder.Reader(expected, length), length, out unused);
+            Fat16 now = Fat16.Open(DiagFolder.Reader(actual, length), length, out unused);
+            if (was == null || now == null || was.FatAt != now.FatAt || was.RootAt != now.RootAt || was.DataAt != now.DataAt ||
+                was.ClusterBytes != now.ClusterBytes || was.Fats != now.Fats)
+                why = "the partition on the disk is not the FAT16 that was written";
+            else
+            {
+                long fatBytes = (long)was.FatSectors * Fat16.Sector;
+                dirtyByte = 37;
+                for (int copy = 0; copy < was.Fats; ++copy) inUse.Add(was.FatAt + copy * fatBytes + 3);
+                DiagItem folder = null;
+                foreach (DiagItem item in DiagFolder.Entries(now.Root))
+                    if (item.Folder && string.Equals(item.Name, SystemVolumeInformation, StringComparison.OrdinalIgnoreCase)) folder = item;
+                if (folder != null)
+                {
+                    var entries = new byte[folder.Names.Length + 32];
+                    Buffer.BlockCopy(folder.Names, 0, entries, 0, folder.Names.Length);
+                    Buffer.BlockCopy(folder.Own, 0, entries, folder.Names.Length, 32);
+                    int at = -1;
+                    for (int e = 0; e + entries.Length <= now.Root.Length && at < 0; e += 32)
+                    {
+                        bool same = true;
+                        for (int k = 0; k < entries.Length && same; ++k) same = now.Root[e + k] == entries[k];
+                        if (same) at = e;
+                    }
+                    bool wasFree = at >= 0;
+                    for (int e = at; wasFree && e < at + entries.Length; e += 32) wasFree = was.Root[e] == 0 || was.Root[e] == 0xE5;
+                    var clusters = new List<int>();
+                    string wrong = wasFree ? Owned(now, folder, clusters, 0) : null;
+                    if (!wasFree) why = "a folder " + SystemVolumeInformation + " is in the root directory where the image has an entry";
+                    else if (wrong != null) why = SystemVolumeInformation + ": " + wrong;
+                    else
+                    {
+                        allowed.Add(new long[] { was.RootAt + at, was.RootAt + at + entries.Length });
+                        foreach (int c in clusters)
+                        {
+                            if (was.Table[c] != 0) { why = SystemVolumeInformation + " is in cluster " + c + ", which the image uses"; break; }
+                            for (int copy = 0; copy < was.Fats; ++copy)
+                                allowed.Add(new long[] { was.FatAt + copy * fatBytes + 2L * c, was.FatAt + copy * fatBytes + 2L * c + 2 });
+                            allowed.Add(new long[] { now.ClusterAt(c), now.ClusterAt(c) + now.ClusterBytes });
+                        }
+                        if (why != null) allowed.Clear();
+                    }
+                }
+            }
+            var a = new byte[1 << 20];
+            var b = new byte[1 << 20];
+            expected.Seek(0, SeekOrigin.Begin);
+            actual.Seek(0, SeekOrigin.Begin);
+            for (long done = 0; done < length; done += a.Length)
+            {
+                int want = (int)Math.Min(a.Length, length - done);
+                ReadFull(expected, a, want);
+                ReadFull(actual, b, want);
+                for (int block = 0; block < want; block += 4096)
+                {
+                    int end = Math.Min(block + 4096, want);
+                    bool differs = false, outside = false;
+                    for (int i = block; i < end && !outside; ++i)
+                    {
+                        if (a[i] == b[i]) continue;
+                        differs = true;
+                        long where = done + i;
+                        int changed = a[i] ^ b[i];
+                        bool ok = (where == dirtyByte && (changed & ~0x03) == 0) || (inUse.Contains(where) && (changed & ~0xC0) == 0);
+                        foreach (long[] r in allowed) if (where >= r[0] && where < r[1]) ok = true;
+                        if (!ok) outside = true;
+                    }
+                    if (differs)
+                    {
+                        if (outside) ++other;
+                        else ++windows;
+                    }
+                }
+            }
+        }
+
+        const string SameSystem = "... and the system partition is the same as in the other install, but for what Windows puts in a FAT " +
+                                  "partition that it mounts (a folder " + SystemVolumeInformation + ", and the bits of a volume in use)";
+
+        // The system partition that the whole-disk install left is not, byte for byte, what was written (and read back the
+        // same by the install itself). Windows may have mounted it meanwhile (it is a FAT partition, and the test reads it
+        // through its volume) and put in it what it puts in every FAT that it mounts (WindowsOnly): that, and nothing
+        // else, may differ. The blocks of each kind are said; anything else fails, and is shown (Differences).
+        static void WholeSystem(string directory, ImagePlan plan, int disk, PartitionInfo p, Action<string, bool> check, Action<string> say)
+        {
+            string expected = Path.Combine(directory, "esperado-entero.bin");
+            try
+            {
+                using (var e = new FileStream(expected, FileMode.Create, FileAccess.ReadWrite))
+                {
+                    var part = new Engine.Target();
+                    part.Stream = e; part.Capacity = plan.System.Size; part.From = plan.System.Start; part.Length = plan.System.Size;
+                    Engine.Write(plan, new[] { part }, Engine.ForInternalDisk(plan), null, null);
+                }
+                int windows, other;
+                string why;
+                using (var e = new FileStream(expected, FileMode.Open, FileAccess.Read))
+                using (FileStream d = Native.OpenDisk(disk, false))
+                using (var a = new PartOf(d, p.Offset, plan.System.Size))
+                    WindowsOnly(e, a, plan.System.Size, out windows, out other, out why);
+                say("   blocks of 4 KiB of the system partition, read from the disk itself, that are not what was written: " + (windows + other) +
+                    "; " + windows + " of them hold what Windows puts in a FAT partition that it mounts, " + other + " anything else" +
+                    (why != null ? "; " + why : ""));
+                bool ok = other == 0 && why == null;
+                check(SameSystem, ok);
+                if (!ok) Differences(expected, plan, disk, p, say);
+            }
+            catch (Exception e)
+            {
+                check(SameSystem + ": " + e, false);
+            }
+            finally
+            {
+                try { File.Delete(expected); }
+                catch (Exception) { }
+            }
+        }
+
+        // The system partition that the whole-disk install left is not what was written (and read back the same by the
+        // install itself), and not only by what Windows puts in it. Where it is not, read from the disk itself and not
+        // through the partition and its file system, at once and six seconds later; in which part of the file system; and
+        // what is there instead. expected: what was written, in a file.
+        static void Differences(string expected, ImagePlan plan, int disk, PartitionInfo p, Action<string> say)
+        {
+            try
+            {
+                var where = new List<long>();
+                int now = RawDifference(disk, p, expected, plan.System.Size, where);
+                System.Threading.Thread.Sleep(6000);
+                var whereLater = new List<long>();
+                int later = RawDifference(disk, p, expected, plan.System.Size, whereLater);
+                say("   blocks of 4 KiB of the system partition, read from the disk itself, that are not what was written: " + now +
+                    " at once, " + later + " six seconds later");
+                if (now == 0 && later == 0)
+                {
+                    say("   (the disk itself holds what was written: what differed came from reading it through the partition)");
+                    return;
+                }
+                var blocks = new List<long>(where);
+                foreach (long x in whereLater) if (!blocks.Contains(x)) blocks.Add(x);
+                using (var a = new FileStream(expected, FileMode.Open, FileAccess.Read))
+                using (FileStream d = Native.OpenDisk(disk, false))
+                {
+                    string why;
+                    Fat16 fat = Fat16.Open(DiagFolder.Reader(a, a.Length), a.Length, out why);
+                    Dictionary<int, string> owners = fat == null ? new Dictionary<int, string>() : ClusterOwners(fat);
+                    foreach (long at in blocks)
+                    {
+                        var was = new byte[4096];
+                        var there = new byte[4096];
+                        a.Seek(at, SeekOrigin.Begin);
+                        ReadFull(a, was, was.Length);
+                        d.Seek(p.Offset + at, SeekOrigin.Begin);
+                        ReadFull(d, there, there.Length);
+                        int first = 0, count = 0, zeros = 0;
+                        while (first < 4096 && was[first] == there[first]) ++first;
+                        for (int i = 0; i < 4096; ++i)
+                        {
+                            if (was[i] != there[i]) ++count;
+                            if (there[i] == 0) ++zeros;
+                        }
+                        if (first == 4096) first = 0;
+                        say("   at " + at + " (" + (fat == null ? why : Region(fat, owners, at + first)) + "): " + count +
+                            " bytes differ, the first at +" + first + (zeros == 4096 ? "; on the disk the block is all zeros" : "") +
+                            "; the block starts on the disk with " + Bytes(there, 0));
+                        say("      written " + Bytes(was, first));
+                        say("      on disk " + Bytes(there, first));
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                say("   the differences could not be looked at: " + e.Message);
+            }
+        }
+
         // The folder hades-diag, where the diagnostics of Hades leave what they saved on the system partition, is
         // written there by the FAT driver of Windows itself (long names, names in small letters, files of no
         // cluster, of one, of a part of one and of many), and is still there after an update, as that driver reads
@@ -694,7 +1000,10 @@ namespace Hades.Installer
                         string got;
                         using (FileStream f = Native.OpenPartition(whole.Number, s1.Number, s1.Offset, s1.Size))
                             got = Engine.ReadHash(f, plan.System.Size, null, null);
-                        check("... and the system partition is the same as in the other install", got == expectSystem);
+                        // (what the install wrote was read back the same by the install itself: what is not the same now
+                        // came after it. Windows may have mounted the partition meanwhile, and that alone is allowed)
+                        if (got == expectSystem) check(SameSystem, true);
+                        else WholeSystem(directory, plan, whole.Number, s1, check, say);
                     }
 
                     Find();

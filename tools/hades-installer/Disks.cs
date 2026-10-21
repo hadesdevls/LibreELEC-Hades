@@ -796,6 +796,66 @@ namespace Hades.Installer
             return f;
         }
 
+        // Before a disk is erased whole, for each of its partitions: what its file system still had to write is
+        // written out (its cache flushed through a handle of the volume), the volume is locked where Windows grants
+        // it (nothing has it open), and dismounted, locked or not, as "format /X" does. A program that has a folder
+        // or a file of it open (Explorer, WSL) can then no longer write through it, and the file system has nothing
+        // left to write: nothing of the old volume can land on the partitions that are written in its place.
+        // A partition without a file system answers these requests with errors, which are only written down. One
+        // with a drive letter that cannot be dismounted stops the install, before anything is erased.
+        public static void FlushAndDismount(int disk, PartitionInfo p)
+        {
+            string name = "partition " + disk + "/" + p.Number;
+            FileStream f;
+            try { f = Open(@"\\.\Harddisk" + disk + "Partition" + p.Number, true); }
+            catch (Win32Exception e)
+            {
+                Log.Line(name + ": not opened to be dismounted (" + e.NativeErrorCode + ")");
+                if (p.Letter != '\0') throw NotDismounted(p, e.NativeErrorCode);
+                return;
+            }
+            using (f)
+            {
+                uint returned;
+                IntPtr info = Marshal.AllocHGlobal(256);
+                try
+                {
+                    bool asked = DeviceIoControl(f.SafeFileHandle, IoctlDiskGetPartitionInfoEx, IntPtr.Zero, 0, info, 256, out returned, IntPtr.Zero);
+                    if (!asked || Marshal.ReadInt64(info, 8) != p.Offset || Marshal.ReadInt64(info, 16) != p.Size)
+                        throw new InvalidOperationException(L.T("The disk has changed since you chose it. Nothing was written: choose it again.",
+                                                                "El disco ha cambiado desde que lo elegiste. No se ha escrito nada: vuelve a elegirlo."));
+                }
+                finally { Marshal.FreeHGlobal(info); }
+                bool flushed = true;
+                try { f.Flush(true); }
+                catch (IOException) { flushed = false; }
+                bool locked = false;
+                int lockError = 0;
+                for (int attempt = 0; attempt < 4 && !locked; ++attempt)
+                {
+                    if (attempt > 0) System.Threading.Thread.Sleep(500);
+                    locked = DeviceIoControl(f.SafeFileHandle, FsctlLockVolume, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
+                    lockError = locked ? 0 : Marshal.GetLastWin32Error();
+                    if (!locked && lockError != ErrorAccessDenied) break; // not "in use": waiting does not help
+                }
+                bool dismounted = DeviceIoControl(f.SafeFileHandle, FsctlDismountVolume, IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero);
+                int dismountError = dismounted ? 0 : Marshal.GetLastWin32Error();
+                Log.Line(name + (p.Letter != '\0' ? " (" + p.Letter + ":)" : "") + ", before the disk is erased: flushed " + flushed +
+                         ", locked " + locked + (locked ? "" : " (" + lockError + ")") + ", dismounted " + dismounted +
+                         (dismounted ? "" : " (" + dismountError + ")") + (!locked && dismounted ? ", taken from what had it open" : ""));
+                if (!dismounted && p.Letter != '\0') throw NotDismounted(p, dismountError);
+            }
+        }
+
+        static InvalidOperationException NotDismounted(PartitionInfo p, int error)
+        {
+            return new InvalidOperationException(L.T(
+                "Windows did not let the installer close partition " + p.Letter + ": of that disk before erasing it (error " + error +
+                "). Nothing was written. Close the programs that use that drive, or restart the PC, and try again.",
+                "Windows no ha dejado que el instalador cierre la partición " + p.Letter + ": de ese disco antes de borrarlo (error " +
+                error + "). No se ha escrito nada. Cierra los programas que usen esa unidad, o reinicia el PC, y vuelve a intentarlo."));
+        }
+
         // Whether this PC was started by UEFI (the other way is the BIOS of older PCs)
         public static bool Uefi
         {

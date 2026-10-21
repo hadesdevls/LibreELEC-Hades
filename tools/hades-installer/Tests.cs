@@ -454,6 +454,7 @@ namespace Hades.Installer
                 }
 
                 Diag();
+                WindowsMount();
                 Classification(realImage);
                 if (realImage != null) Real(directory, realImage);
                 foreach (string f in new[] { raw, packed, raw + ".sha256", Path.Combine(directory, "internal.img") })
@@ -795,6 +796,107 @@ namespace Hades.Installer
             keep = KeepFrom(old, image, At, over, 0);
             Check("... and where another change of the update writes into a cluster that the folder would take: not kept",
                   keep.State == DiagKeep.Outcome.NotKept && keep.Patches.Count == 0);
+        }
+
+        // What Windows puts in a FAT partition that it mounts, as the test of the virtual disk found it on the system
+        // partition of a whole-disk install: a folder System Volume Information in the root directory (entries 2 and on
+        // here, free in the image), with two files in it, in clusters that were free (702 to 705), with their entries
+        // in both FATs; and, with "dirty", the bits of a volume in use. folderAt: the first cluster of that folder.
+        static byte[] WithSystemVolumeInformation(byte[] partition, bool dirty, int folderAt = 702, string name = VhdTest.SystemVolumeInformation)
+        {
+            string why;
+            byte[] p = (byte[])partition.Clone();
+            Fat16 f = Fat16.Open(DiagFolder.Reader(p), p.Length, out why);
+            int a = folderAt, b = folderAt + 1, c = folderAt + 2, d = folderAt + 3;
+            byte[] own = ShortEntry("SYSTEM~1   ", 0x16, 0, 0);
+            own[26] = (byte)a; own[27] = (byte)(a >> 8);
+            byte[] names = LongNames(name, own);
+            Buffer.BlockCopy(names, 0, p, (int)f.RootAt + 64, names.Length);
+            Buffer.BlockCopy(own, 0, p, (int)f.RootAt + 64 + names.Length, 32);
+            var dir = new byte[f.ClusterBytes];
+            byte[] dot = ShortEntry(".          ", 0x10, 0, 0), dotdot = ShortEntry("..         ", 0x10, 0, 0);
+            dot[26] = (byte)a; dot[27] = (byte)(a >> 8);
+            Buffer.BlockCopy(dot, 0, dir, 0, 32);
+            Buffer.BlockCopy(dotdot, 0, dir, 32, 32);
+            byte[] settings = ShortEntry("WPSETT~1DAT", 0x20, 0, 12), guid = ShortEntry("INDEXE~1   ", 0x20, 0, 600);
+            settings[26] = (byte)b; settings[27] = (byte)(b >> 8);
+            guid[26] = (byte)c; guid[27] = (byte)(c >> 8);
+            int put = 64;
+            foreach (byte[][] e in new[] { new[] { LongNames("WPSettings.dat", settings), settings }, new[] { LongNames("IndexerVolumeGuid", guid), guid } })
+            {
+                Buffer.BlockCopy(e[0], 0, dir, put, e[0].Length);
+                Buffer.BlockCopy(e[1], 0, dir, put + e[0].Length, 32);
+                put += e[0].Length + 32;
+            }
+            Buffer.BlockCopy(dir, 0, p, (int)f.ClusterAt(a), dir.Length);
+            Buffer.BlockCopy(Noise(12, 21), 0, p, (int)f.ClusterAt(b), 12);
+            Buffer.BlockCopy(Noise(600, 22), 0, p, (int)f.ClusterAt(c), 600);
+            SetFat(p, f, a, 0xFFFF);
+            SetFat(p, f, b, 0xFFFF);
+            SetFat(p, f, c, d);
+            SetFat(p, f, d, 0xFFFF);
+            if (dirty)
+            {
+                p[37] |= 1;
+                SetFat(p, f, 1, 0x7FFF);
+            }
+            return p;
+        }
+
+        static void WindowsMount()
+        {
+            byte[] image = Fat16Partition(4200, 700);
+            int windows = 0, other = 0;
+            string why = null;
+            Func<byte[], string> compare = delegate(byte[] disk)
+            {
+                VhdTest.WindowsOnly(new MemoryStream(image), new MemoryStream(disk), image.Length, out windows, out other, out why);
+                return windows + "/" + other + (why != null ? "/" + why : "");
+            };
+            Check("whole disk in the test of the virtual disk: a system partition that is what was written has no block that differs",
+                  compare(image) == "0/0");
+            byte[] mounted = WithSystemVolumeInformation(image, true);
+            string got = compare(mounted);
+            Say("      Windows mounted it: " + got);
+            Check("... one that Windows mounted (System Volume Information in free entries and clusters, its FAT entries, the bits of " +
+                  "a volume in use) has only blocks that are what Windows writes", windows > 4 && other == 0 && why == null);
+            Check("... the bits of a volume in use alone are Windows' (two blocks: the boot sector with the first FAT, and the second " +
+                  "FAT)", CompareDirtyOnly(image, compare) == "2/0");
+            byte[] more = (byte[])mounted.Clone();
+            more[DataOf(image, 10) + 5] ^= 1;
+            Check("... a byte of a file of the image that changed as well is not Windows'", compare(more) != null && other == 1 && why == null);
+            more = (byte[])mounted.Clone();
+            Entry(more, S * (1 + 2 * 17), 20, "FOO     TXT", 0x20);
+            Check("... nor is another entry of the root directory", (compare(more) != null) && other == 1);
+            more = (byte[])mounted.Clone();
+            string unused;
+            Fat16 f = Fat16.Open(DiagFolder.Reader(more), more.Length, out unused);
+            SetFat(more, f, 10, 0xFFFF);
+            Check("... nor the entry of a cluster that the image uses, in the FAT", compare(more) != null && other >= 1);
+            more = (byte[])mounted.Clone();
+            more[37] |= 4;
+            Check("... nor another bit of the byte of the boot sector that says that the volume is in use", compare(more) != null && other == 1);
+            Check("... a folder of another name is not taken for it", compare(WithSystemVolumeInformation(image, false, 702, "System Volume Informatio")) != null &&
+                  other > 0 && windows == 0);
+            Check("... nor one in clusters that the image uses (and what was there is not Windows')",
+                  compare(WithSystemVolumeInformation(image, false, 300)) != null && why != null && other > 0);
+        }
+
+        // where cluster c of the made-up partitions starts
+        static int DataOf(byte[] partition, int c)
+        {
+            string why;
+            return (int)Fat16.Open(DiagFolder.Reader(partition), partition.Length, out why).ClusterAt(c);
+        }
+
+        static string CompareDirtyOnly(byte[] image, Func<byte[], string> compare)
+        {
+            string why;
+            byte[] p = (byte[])image.Clone();
+            Fat16 f = Fat16.Open(DiagFolder.Reader(p), p.Length, out why);
+            p[37] |= 1;
+            SetFat(p, f, 1, 0x7FFF);
+            return compare(p);
         }
 
         // The folder hades-diag across an update of a real image: a made-up one, of the size of the real ones, put
