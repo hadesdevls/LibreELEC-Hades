@@ -43,9 +43,10 @@ The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER
 
 | Graphics | Tried on |
 | --- | --- |
+| NVIDIA GeForce RTX 50 series | RTX 5060 (author) |
 | NVIDIA GeForce RTX 40 series | RTX 4080 SUPER (author), RTX 4080 Laptop GPU (user) |
 | NVIDIA GeForce RTX 30 series | RTX 3070 (user) |
-| NVIDIA GeForce GTX 16, RTX 20 and RTX 50 series | Not tried yet |
+| NVIDIA GeForce GTX 16 and RTX 20 series | Not tried yet |
 | AMD Radeon RX 7000 series | RX 7600 (user) |
 | AMD Radeon RX 5000, RX 6000 and RX 9000 series | Not tried yet |
 | AMD Ryzen integrated graphics | Ryzen 9 7950X3D (author), Ryzen 7 5800H (user) |
