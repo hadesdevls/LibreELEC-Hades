@@ -2,7 +2,7 @@
 
 **English** | [Español](README.es.md)
 
-LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 64-bit PCs (the "Generic x86_64" image). It adds one main thing: native Dolby Vision over HDMI from the PC's graphics, a graphics card or the graphics built into the processor, where LibreELEC falls back to HDR10. Everything else LibreELEC does is kept. It grew out of CroqueMr's Dolby Vision fork of LibreELEC (see "Credits").
+LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 64-bit PCs (the "Generic x86_64" image). It adds native Dolby Vision and HDR10+ over HDMI from the PC's graphics, a graphics card or the graphics built into the processor, where LibreELEC sends HDR10. Everything else LibreELEC does is kept.
 
 > **This is not LibreELEC and it is not official.** LibreELEC Hades is not made, supported, endorsed or certified by Team LibreELEC, Team Kodi or the XBMC Foundation, Dolby Laboratories, HDR10+ Technologies, NVIDIA, AMD or Intel, and has no affiliation with any of them. Please do not ask them for help with it. Kodi is a registered trademark of the XBMC Foundation. Dolby Vision and HDR10+ are named here only as video formats: LibreELEC Hades uses neither logo and is certified by neither. Other trademarks belong to their owners; see [NOTICE.md](NOTICE.md).
 
