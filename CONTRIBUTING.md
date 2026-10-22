@@ -2,9 +2,9 @@
 
 ## Problems and questions
 
-Report problems with LibreELEC Hades in the issues of this repository, with the bug report form: it asks for what is needed to find a problem (the build, the graphics and the TV, what was played, and a log). "Reporting problems" in the [README](README.md#reporting-problems) says the same. A question or an idea can go in a blank issue.
+Report problems with LibreELEC Hades in the issues of this repository, with the bug report form. It asks for what is needed to find a problem: the build, the graphics and the TV, what was played, and a log (see [Reporting problems](README.md#reporting-problems) in the README). A question or an idea can go in a blank issue.
 
-Do not report problems with this build to LibreELEC, Kodi, Dolby, NVIDIA, AMD or Intel: they do not make it and cannot help with it. If the same problem also happens with an official LibreELEC image, it belongs to LibreELEC or Kodi and can be reported there, against their image.
+Do not report problems with this build to LibreELEC, Kodi, Dolby, NVIDIA, AMD or Intel: they do not make it and cannot help with it. If the same problem also happens with an official LibreELEC image, it belongs to LibreELEC or Kodi and can be reported there.
 
 ## Suggesting changes
 

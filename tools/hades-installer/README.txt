@@ -1,5 +1,5 @@
-LIBREELEC HADES  ·  how to install it
-=====================================
+LIBREELEC HADES: how to install it
+==================================
 (Versión en español: LEEME.txt)
 
 LibreELEC Hades is a system for watching films on your PC with real Dolby Vision over HDMI. You start it
@@ -43,7 +43,7 @@ Installing
 
 Starting Hades
   1. Restart the PC and, as soon as it turns on, press the key of the boot menu several times:
-       ASUS F8  ·  MSI F11  ·  Gigabyte F12  ·  ASRock F11  ·  laptops: F12 or Esc
+       ASUS F8, MSI F11, Gigabyte F12, ASRock F11; laptops: F12 or Esc
   2. Choose the USB drive (the entry that says UEFI) or the disk where you installed it.
   3. The first time it prepares its space and restarts by itself: choose it again in the menu.
   To go back to Windows: shut Hades down and turn the PC on without pressing anything.
@@ -121,13 +121,13 @@ What the installer never does
   What it does is written to LibreELEC-Hades-Installer.log, next to the program. That file names the
   disks of your PC: delete it before you pass this folder on to someone else.
 
-Licenses
-  LibreELEC Hades is LibreELEC (https://libreelec.tv) with changes, under the GPL-2.0 license. Its media
-  center is Kodi (https://kodi.tv), modified: that is why it shows itself as LibreELEC Hades and not as
+Licences
+  LibreELEC Hades is LibreELEC (https://libreelec.tv) with changes, under the GPL-2.0 licence. Its media
+  centre is Kodi (https://kodi.tv), modified: that is why it shows itself as LibreELEC Hades and not as
   Kodi, which is a registered trademark of the XBMC Foundation. It includes other free software as well,
-  and the NVIDIA drivers under their own license. It is not made or endorsed by LibreELEC, by Team Kodi or
+  and the NVIDIA drivers under their own licence. It is not made or endorsed by LibreELEC, by Team Kodi or
   the XBMC Foundation, by Dolby, or by NVIDIA, AMD or Intel.
   The source code of LibreELEC Hades and of this installer (the folder tools/hades-installer) is in the
   repository of the project, which is where this folder is published. The image names the exact source
-  it was built from (BUILD_ID in /etc/os-release) and carries the license texts: the folder "licenses"
+  it was built from (BUILD_ID in /etc/os-release) and carries the licence texts: the folder "licenses"
   and the file NOTICE.md on the part of the drive that Windows shows as LIBREELEC.
