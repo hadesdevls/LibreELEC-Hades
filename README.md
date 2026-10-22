@@ -50,7 +50,7 @@ The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER
 | AMD Radeon RX 7000 series | RX 7600 (user) |
 | AMD Radeon RX 5000, RX 6000 and RX 9000 series | Not tried yet |
 | AMD Ryzen integrated graphics | Ryzen 9 7950X3D (author), Ryzen 7 5800H (user) |
-| Intel integrated graphics | Core i5-12450H (author), Core i3-1005G1 and Core 5 255H (users) |
+| Intel integrated graphics | Core i5-12450H (author), Core i3-1005G1, Core 5 255H and N100 (users) |
 | Intel UHD 6xx graphics | Not tried yet |
 
 TVs: LG C5 (author); LG G5, LG C2 and a Panasonic TV with native Dolby Vision, a Samsung S90H with HDR10+, and a Sony TV that offers Dolby Vision only as low-latency (users).

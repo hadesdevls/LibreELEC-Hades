@@ -50,7 +50,7 @@ El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER,
 | AMD Radeon serie RX 7000 | RX 7600 (usuario) |
 | AMD Radeon series RX 5000, RX 6000 y RX 9000 | Sin probar todavía |
 | Gráficas integradas de AMD Ryzen | Ryzen 9 7950X3D (autor), Ryzen 7 5800H (usuario) |
-| Gráficas integradas de Intel | Core i5-12450H (autor), Core i3-1005G1 y Core 5 255H (usuarios) |
+| Gráficas integradas de Intel | Core i5-12450H (autor), Core i3-1005G1, Core 5 255H y N100 (usuarios) |
 | Gráficas Intel UHD 6xx | Sin probar todavía |
 
 Teles: LG C5 (autor); LG G5, LG C2 y una tele Panasonic con Dolby Vision nativo, una Samsung S90H con HDR10+ y una tele Sony que solo ofrece Dolby Vision de baja latencia (usuarios).
