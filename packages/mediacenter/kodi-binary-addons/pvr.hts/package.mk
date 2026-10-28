@@ -3,8 +3,8 @@
 # Copyright (C) 2018-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="pvr.hts"
-PKG_VERSION="22.9.3-Piers"
-PKG_SHA256="af9e9adce1a96073280f49b19adac4cdc0145a0e2889a530b067ed2a9708ce43"
+PKG_VERSION="22.9.5-Piers"
+PKG_SHA256="42a27ddddf758e122506009375eed291ac96416348795dc8f759e55459b3732b"
 PKG_REV="1"
 PKG_ARCH="any"
 PKG_LICENSE="GPL-2.0-or-later"
