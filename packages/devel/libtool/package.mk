@@ -20,6 +20,13 @@ post_unpack() {
   chmod u+w ${PKG_BUILD}/build-aux/ltmain.sh
 }
 
+pre_configure_target() {
+  # The default search path of libltdl is the image's: on Linux, libtool's configure adds the folders of
+  # the /etc/ld.so.conf of the machine it runs on, the build host's also when it cross-compiles
+  # (/usr/local/lib and Ubuntu's multiarch folders, and once WSL's /usr/lib/wsl/lib)
+  export lt_cv_sys_dlsearch_path="/lib /usr/lib"
+}
+
 pre_make_host() {
   # do not rebuild man, or txt pages
   touch ${PKG_BUILD}/doc/*.1 \

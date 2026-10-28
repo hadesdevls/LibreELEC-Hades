@@ -1,0 +1,429 @@
+From 9f08c0f23bba159cefcf7b48f5297d122d3e9288 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:27:25 +0000
+Subject: [PATCH] tools/dvbridge, VideoRenderers, windowing/gbm: a picture for
+ output as HDR10 kept as the codes of a 10-bit window
+
+Dolby Vision shown as HDR10 (and an HDR10 or HLG picture mapped to SDR) is
+drawn into a float texture of the size of the output, RGBA32F: 133 MB at
+3840x2160, two of them (the one shown and the one being drawn), and the
+copy into the window reads one at every refresh (DVBridgeGLES.cpp,
+CopyConversion()), also while a picture stays on the screen. Where the
+window is 10-bit fixed point in full range, what the copy makes of each
+value is a code of 10 bits: floor(c * 1023 + 0.5), written 1/256 of a step
+above it (COPY_FRAGMENT, dvbridge_gl_pack.c).
+
+Now such a picture is kept as those codes, in an RGB10_A2 texture
+(libplacebo-9946): the output hook quantizes it as the copy does, with the
+same expression on a uniform, and the copy of a code is that code. The
+same bytes in the window by construction, a quarter of the memory (33 MB
+per texture) and of what each copy reads (at 60 Hz, about 6 GB/s less).
+dvbridge_render_hdr10_store() takes the levels of the target and the range
+the copy writes (dvbridge_gl_copy_levels(), the copy's own query, now one
+function that both use); Kodi tells it before each picture
+(CDVBridgeGLES::SetConversionTarget()), and kodi.log says in which form the
+pictures are kept when that changes. A floating-point window (NVIDIA), 8 or
+12 bits, the limited range (where the copy computes from the value), a GPU
+without the format, and a renderer that is not told keep the float
+texture, as before. A picture kept in the other form is not copied after
+the target changes: it is drawn again.
+
+Measured on Mesa's zink with the render test of the bridge (6 pictures of
+a profile 7 FEL stream, the composer of CCM 001 and libplacebo's
+reshaping): the 10-bit window from the codes and from the float texture,
+248 832 000 words in 30 pictures, with each output hook (as it is, mapped
+to a display of 600 cd/m2, to SDR, and a plain HDR10 picture as it is and
+mapped to SDR): 0 differ; with the quantization cut off instead of rounded
+(a mutation), 198 241 465 differ. Every other line of the test, the same.
+---
+ tools/dvbridge/dvbridge_gl_pack.c             |  52 ++++++---
+ tools/dvbridge/dvbridge_gl_pack.h             |   8 ++
+ tools/dvbridge/dvbridge_render.c              | 105 ++++++++++++++----
+ tools/dvbridge/dvbridge_render.h              |  12 ++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  21 ++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   7 ++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |   3 +
+ 7 files changed, 169 insertions(+), 39 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index c6a4167..f86c18c 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -348,6 +348,40 @@ static float copy_black(float levels, bool limited)
+     return black;
+ }
+ 
++/* Hades: the levels of the framebuffer bound for drawing, as a copy quantizes to them
++ * (dvbridge_gl_copy_levels()), or -1 */
++static int bound_levels(unsigned framebuffer)
++{
++    const GLenum attachment = framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK;
++    GLint red = 0, green = 0, blue = 0, samples = 0, type = 0, encoding = 0;
++    glGetIntegerv(GL_RED_BITS, &red);
++    glGetIntegerv(GL_GREEN_BITS, &green);
++    glGetIntegerv(GL_BLUE_BITS, &blue);
++    glGetIntegerv(GL_SAMPLES, &samples);
++    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
++        GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
++    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
++        GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING, &encoding);
++    const bool floating = type == GL_FLOAT;
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || glGetError() ||
++        (!floating && type != GL_UNSIGNED_NORMALIZED) || red != green || red != blue ||
++        red < 8 || red > 16 || samples > 1 || encoding != GL_LINEAR)
++        return -1;
++    return floating || red > 12 ? 0 : (int)((1u << red) - 1);
++}
++
++int dvbridge_gl_copy_levels(unsigned framebuffer)
++{
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    GLint bound = 0;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    const int levels = bound_levels(framebuffer);
++    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)bound);
++    return levels;
++}
++
+ bool dvbridge_gl_copy_area(struct dvbridge_gl_copier *c, unsigned texture, unsigned framebuffer,
+                           int width, int height, const struct dvbridge_gl_rect *picture,
+                           const struct dvbridge_gl_rect *area, bool flip, bool limited)
+@@ -393,25 +427,13 @@ bool dvbridge_gl_copy_area(struct dvbridge_gl_copier *c, unsigned texture, unsig
+     bool ok = false;
+     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+     /* what the framebuffer holds: fixed-point levels, or floating-point values */
+-    const GLenum attachment = framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK;
+-    GLint red = 0, green = 0, blue = 0, samples = 0, type = 0, encoding = 0;
+-    glGetIntegerv(GL_RED_BITS, &red);
+-    glGetIntegerv(GL_GREEN_BITS, &green);
+-    glGetIntegerv(GL_BLUE_BITS, &blue);
+-    glGetIntegerv(GL_SAMPLES, &samples);
+-    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
+-        GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
+-    glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
+-        GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING, &encoding);
+-    const bool floating = type == GL_FLOAT;
+-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE || glGetError() ||
+-        (!floating && type != GL_UNSIGNED_NORMALIZED) || red != green || red != blue ||
+-        red < 8 || red > 16 || samples > 1 || encoding != GL_LINEAR)
++    const int held = bound_levels(framebuffer);
++    if (held < 0)
+         goto restore;
+     glViewport(0, 0, width, height);
+     glEnable(GL_SCISSOR_TEST);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-    const float levels = floating || red > 12 ? 0.0f : (float)((1u << red) - 1);
++    const float levels = (float)held;
+     /* Hades: the bands of the area that the picture does not cover, black */
+     if (count) {
+         const float black = copy_black(levels, limited);
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index a3f5ee1..f37b541 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -49,6 +49,14 @@ bool dvbridge_gl_copy(struct dvbridge_gl_copier *copier, unsigned texture, unsig
+  * around the area itself (Kodi's black bars); its pixels are then all written, also where the
+  * rectangle does not cover them (a picture kept from another place). */
+ #define DVBRIDGE_GL_COPY_AREA 1
++/* Hades: the levels that a copy into that framebuffer quantizes to: the highest code of a
++ * fixed-point framebuffer of up to 12 bits (1023 for 10 bits), 0 for a floating-point one or one of
++ * more bits (the values go as they are), -1 for one that a copy cannot write (incomplete,
++ * multisampled, sRGB, of unequal or of fewer than 8 bits per component). The same query as
++ * dvbridge_gl_copy() makes; GL errors left by earlier work are taken, and the framebuffer that was
++ * bound is bound again. */
++#define DVBRIDGE_GL_COPY_LEVELS 1
++int dvbridge_gl_copy_levels(unsigned framebuffer);
+ struct dvbridge_gl_rect {
+     int x, y, width, height;
+ };
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 8e251b8..7f78d6b 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -55,6 +55,8 @@ struct dvbridge_renderer {
+     pl_tex hdr10[2];
+     int hdr10_shown;
+     bool hdr10_ready, hdr10_whole;
++    /* Hades: the pictures are kept as 10-bit codes (dvbridge_render_hdr10_store()) */
++    bool hdr10_codes;
+     /* Hades: its mapping to the display (dvbridge_render_hdr10_mapping()); off when calloc'd */
+     struct dvbridge_hdr10_mapping hdr10_mapping;
+     struct dvbridge_context *context;
+@@ -1286,15 +1288,33 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+ 
+ /* Hades: the picture stays within [0, 1]: a floating-point target does not clamp what is
+  * written to it. */
++/* Hades: a picture kept as 10-bit codes (dvbridge_render_hdr10_store()) is quantized at the end of
++ * the output hook as the copy does it (COPY_FRAGMENT, dvbridge_gl_pack.c): the level nearest the
++ * value, written 1/256 of a step above it so that a texture that rounds and one that cuts off store
++ * that level; the copy reads it back and writes the same level. The same arithmetic, on a uniform
++ * as there. */
++#define QUANTIZE_CODES "color.rgb = (floor(color.rgb * dvbridge_levels + 0.5) + 0.00390625) / dvbridge_levels;\n"
++
++struct picture_clamp {
++    bool called;
++    bool codes;   /* quantized to the codes of 10 bits */
++    float levels; /* 1023 */
++};
++
+ static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params *p)
+ {
+-    bool *called = priv;
+-    static const struct pl_custom_shader shader = {
++    struct picture_clamp *c = priv;
++    struct pl_shader_var var = {.var = pl_var_float("dvbridge_levels"), .data = &c->levels,
++                                .dynamic = true};
++    const struct pl_custom_shader shader = {
+         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+-        .body = "color = clamp(color, 0.0, 1.0);",
+-        .description = "DV picture within the range of an HDR10 output"};
+-    *called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
+-    return (struct pl_hook_res){.failed = !*called, .output = PL_HOOK_SIG_NONE};
++        .body = c->codes ? "color = clamp(color, 0.0, 1.0);\n" QUANTIZE_CODES
++                         : "color = clamp(color, 0.0, 1.0);",
++        .variables = &var, .num_variables = c->codes ? 1 : 0,
++        .description = c->codes ? "DV picture within the range of an HDR10 output, as 10-bit codes"
++                                : "DV picture within the range of an HDR10 output"};
++    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
+ }
+ 
+ /* Hades: the same, and no channel above the peak of the display that the picture is mapped to
+@@ -1305,19 +1325,26 @@ static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params
+ struct display_clamp {
+     bool called;
+     float peak; /* in PQ */
++    bool codes; /* Hades: quantized to the codes of 10 bits (clamp_picture()) */
++    float levels;
+ };
+ 
+ static struct pl_hook_res clamp_to_display(void *priv, const struct pl_hook_params *p)
+ {
+     struct display_clamp *c = priv;
+-    struct pl_shader_var var = {.var = pl_var_float("dvbridge_peak"), .data = &c->peak,
+-                                .dynamic = true};
++    struct pl_shader_var vars[] = {
++        {.var = pl_var_float("dvbridge_peak"), .data = &c->peak, .dynamic = true},
++        {.var = pl_var_float("dvbridge_levels"), .data = &c->levels, .dynamic = true}};
+     const struct pl_custom_shader shader = {
+         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+-        .body = "color = clamp(color, 0.0, 1.0);\n"
+-                "color.rgb = min(color.rgb, vec3(dvbridge_peak));",
+-        .variables = &var, .num_variables = 1,
+-        .description = "DV picture within the peak of the display it is mapped to"};
++        .body = c->codes ? "color = clamp(color, 0.0, 1.0);\n"
++                           "color.rgb = min(color.rgb, vec3(dvbridge_peak));\n" QUANTIZE_CODES
++                         : "color = clamp(color, 0.0, 1.0);\n"
++                           "color.rgb = min(color.rgb, vec3(dvbridge_peak));",
++        .variables = vars, .num_variables = c->codes ? 2 : 1,
++        .description = c->codes ? "DV picture within the peak of the display it is mapped to, as "
++                                  "10-bit codes"
++                                : "DV picture within the peak of the display it is mapped to"};
+     c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
+     return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
+ }
+@@ -1515,10 +1542,36 @@ bool dvbridge_render_gamut_table(const struct dvbridge_renderer *r, struct dvbri
+     return true;
+ }
+ 
+-/* Hades: a texture of the picture for output as HDR10, of that size (made again when it is of another) */
++/* Hades: the format of a picture kept as 10-bit codes (dvbridge_render_hdr10_store()), or NULL */
++static pl_fmt hdr10_codes_format(pl_gpu gpu)
++{
++    pl_fmt fmt = pl_find_named_fmt(gpu, "rgb10a2");
++    const enum pl_fmt_caps caps = PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE;
++    return fmt && fmt->type == PL_FMT_UNORM && fmt->num_components == 4 &&
++                   fmt->component_depth[0] == 10 && fmt->component_depth[1] == 10 &&
++                   fmt->component_depth[2] == 10 && (fmt->caps & caps) == caps
++               ? fmt
++               : NULL;
++}
++
++bool dvbridge_render_hdr10_store(struct dvbridge_renderer *r, int levels, bool limited)
++{
++    if (!r)
++        return false;
++    const bool codes = levels == 1023 && !limited && hdr10_codes_format(r->gpu);
++    /* a picture kept in the other form is not copied to this target */
++    if (codes != r->hdr10_codes)
++        r->hdr10_whole = false;
++    r->hdr10_codes = codes;
++    return codes;
++}
++
++/* Hades: a texture of the picture for output as HDR10, of that size and format (made again when it
++ * is of another) */
+ static bool hdr10_texture(struct dvbridge_renderer *r, pl_fmt fmt, pl_tex *tex, int width, int height)
+ {
+-    if (*tex && (*tex)->params.w == width && (*tex)->params.h == height)
++    if (*tex && (*tex)->params.w == width && (*tex)->params.h == height &&
++        (*tex)->params.format == fmt)
+         return true;
+     return pl_tex_recreate(r->gpu, tex, pl_tex_params(.w = width, .h = height, .format = fmt,
+                                                        .sampleable = true, .renderable = true));
+@@ -1593,15 +1646,17 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     r->residual_drawn = paired && mapped.dovi.nlq_active;
+     /* The format of the picture that the transport is packed from. A half-float one would be half
+      * the memory, and it is not as good: stored in one by a software renderer, the picture came
+-     * out up to half a code of 1023 below this one (the values were cut off, not rounded). */
+-    pl_fmt fmt = pl_find_fmt(r->gpu, PL_FMT_FLOAT, 4, 32, 32,
+-                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
++     * out up to half a code of 1023 below this one (the values were cut off, not rounded).
++     * Hades: or the codes of a 10-bit target in full range (dvbridge_render_hdr10_store()) */
++    pl_fmt fmt = r->hdr10_codes ? hdr10_codes_format(r->gpu)
++                                : pl_find_fmt(r->gpu, PL_FMT_FLOAT, 4, 32, 32,
++                                              PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+     if (!fmt)
+         return false;
+     /* Hades: a whole picture of another size is of no use any more (it is never copied to an output
+-     * of another size, CDVBridgeGLES::CopyConversion()) */
++     * of another size, CDVBridgeGLES::CopyConversion()), nor one of the other form */
+     const pl_tex held = r->hdr10[r->hdr10_shown];
+-    if (!held || held->params.w != width || held->params.h != height)
++    if (!held || held->params.w != width || held->params.h != height || held->params.format != fmt)
+         r->hdr10_whole = false;
+     /* the texture to draw into: the other one while the one shown holds a whole picture */
+     int into = r->hdr10_shown;
+@@ -1646,10 +1701,11 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     params.dovi_ccm_composed = &ccm_composed;
+     /* (the levels step down the reconstruction: a plain picture has none) */
+     step_down(&params, plain ? 0 : r->step);
+-    bool clamped = false;
++    struct picture_clamp clamped = {.codes = r->hdr10_codes, .levels = 1023.0f};
+     const struct pl_hook hook = {
+         .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &clamped,
+-        .hook = clamp_picture, .signature = 0x4456424844523130ULL};
++        .hook = clamp_picture,
++        .signature = r->hdr10_codes ? 0x4456424844523132ULL : 0x4456424844523130ULL};
+     const struct pl_hook *hooks[] = {&hook};
+     params.hooks = hooks;
+     params.num_hooks = 1;
+@@ -1662,10 +1718,11 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+      * and then held within its peak (in an SDR signal the peak is 1.0, which the clamp to [0, 1]
+      * holds it within) */
+     struct pl_color_map_params mapping;
+-    struct display_clamp to_display = {0};
++    struct display_clamp to_display = {.codes = r->hdr10_codes, .levels = 1023.0f};
+     const struct pl_hook display_hook = {
+         .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &to_display,
+-        .hook = clamp_to_display, .signature = 0x4456424844523131ULL};
++        .hook = clamp_to_display,
++        .signature = r->hdr10_codes ? 0x4456424844523133ULL : 0x4456424844523131ULL};
+     const struct pl_hook *display_hooks[] = {&display_hook};
+     const bool peak_hook =
+         r->hdr10_mapping.enabled && r->hdr10_mapping.target != DVBRIDGE_HDR10_TARGET_SDR;
+@@ -1689,7 +1746,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         r->hdr10_whole = false;
+     time_render(r, &params);
+     bool ok = pl_render_image(r->renderer, &image, &target, &params) &&
+-              (peak_hook ? to_display.called : clamped) && (!plain || signal_clamped);
++              (peak_hook ? to_display.called : clamped.called) && (!plain || signal_clamped);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     ok = ok && !(errors.errors & ~PL_RENDER_ERR_DOVI_COMPOSER) && !errors.num_disabled_hooks;
+     r->base_sdr_refused = r->base_sdr && !plain && !ccm_composed;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 3b1ceca..d329547 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -112,6 +112,18 @@ pl_tex dvbridge_render_hdr10_texture(const struct dvbridge_renderer *renderer);
+  * reconstructed, in place of nothing. */
+ #define DVBRIDGE_RENDER_HDR10_KEPT 1
+ pl_tex dvbridge_render_hdr10_last(const struct dvbridge_renderer *renderer);
++/* Hades: what the pictures of dvbridge_render_hdr10() and dvbridge_render_plain() are copied to: the
++ * levels of that framebuffer (dvbridge_gl_copy_levels()) and the range the copy writes. Where that is
++ * a 10-bit fixed-point target in full range (levels 1023, not limited), a picture is kept as the
++ * codes the copy writes, in an RGB10_A2 texture of the GPU: the output hook quantizes it as the copy
++ * does (COPY_FRAGMENT), and the copy of a code is then that code, the same bytes as from the float
++ * texture. A quarter of the memory, and of what each copy reads. Any other target (floating point, 8
++ * or 12 bits, the limited range, where the copy computes from the value), a GPU without that format,
++ * and a renderer that is not told: the float texture, as always. From the next picture drawn; the
++ * one kept in the other form is forgotten (dvbridge_render_hdr10_last() is NULL until one is drawn).
++ * True when the pictures are kept as codes. */
++#define DVBRIDGE_RENDER_HDR10_STORE 1
++bool dvbridge_render_hdr10_store(struct dvbridge_renderer *renderer, int levels, bool limited);
+ /* Hades: a renderer for dvbridge_render_hdr10() alone, without the 3840x2160 picture that the
+  * transport is packed from (132 MB that such a renderer never uses). It keeps two pictures of the
+  * size of the output instead, the one shown and the one being drawn (132 MB each at 3840x2160). */
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index b4ac2fa..965d559 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1616,6 +1616,27 @@ void CDVBridgeGLES::LogConversion() const
+               m_convertedFel, m_convertFailed);
+ }
+ 
++void CDVBridgeGLES::SetConversionTarget(unsigned int framebuffer, bool limited)
++{
++  if (!m_renderer)
++    return;
++  const int levels = dvbridge_gl_copy_levels(framebuffer);
++  const int codes = dvbridge_render_hdr10_store(m_renderer, levels, limited) ? 1 : 0;
++  if (codes == m_convertCodes)
++    return;
++  CLog::Log(LOGINFO,
++            "DVBridge: pictures for output as HDR10 are kept {} (the window: {}, {} range)",
++            codes ? "as the codes of 10 bits it is written with, in a texture of 10 bits"
++                  : "as floating-point values",
++            levels > 0 ? std::to_string(levels + 1) + " levels"
++            : levels == 0 ? std::string("floating point")
++                          : std::string("not one a picture is copied to"),
++            limited ? "limited" : "full");
++  m_convertCodes = codes;
++  // a picture that is asked for again is drawn again, in this form
++  m_convertSerial = 0;
++}
++
+ void CDVBridgeGLES::SetConversionMapping(const dvbridge_hdr10_mapping& mapping)
+ {
+   const bool same =
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index da20c18..2f24816 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -342,6 +342,11 @@ public:
+                       const dvbridge_gl_rect* area = nullptr);
+   //! What was reconstructed with this bridge, for the log
+   void LogConversion() const;
++  //! Hades: the framebuffer that CopyConversion() copies the pictures that follow to, and the range
++  //! it writes (dvbridge_render_hdr10_store()): before PrepareConversion() or PreparePlain(), after
++  //! InitializeConversion(). Into a 10-bit window in full range the picture is kept as its codes. A
++  //! picture that was drawn in the other form is drawn again.
++  void SetConversionTarget(unsigned int framebuffer, bool limited);
+   //! The mapping to the display of the pictures that follow (dvbridge_render_hdr10_mapping()),
+   //! after InitializeConversion(). A picture that was drawn with another one is drawn again.
+   void SetConversionMapping(const dvbridge_hdr10_mapping& mapping);
+@@ -469,6 +474,8 @@ private:
+   const char* m_convertLayers = ""; //!< see ConversionLayers()
+   dvbridge_hdr10_mapping m_convertMapping{}; //!< see SetConversionMapping()
+   bool m_convertMappingSet = false;
++  //! Hades: the pictures are kept as 10-bit codes (SetConversionTarget()); -1 before it is told
++  int m_convertCodes = -1;
+   //! Hades: a mapping to SDR was asked for and the renderer did not take it: nothing is drawn
+   bool m_convertSdrRefused = false;
+   unsigned m_convertInfo = 0; //!< CDVPlaybackInfo of the last picture that was reconstructed
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 923f2f1..8be0326 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -2197,6 +2197,8 @@ int CWinSystemGbmGLESContext::RenderDVConversion(const CDVBridgeGLES::Layer& lay
+     return -1;
+   // mapped to the display as the output was told when the renderer was configured
+   m_dvConvertBridge->SetConversionMapping(m_dvConvertMapping);
++  // Hades: kept in the form that the copy into the window needs (dvbridge_render_hdr10_store())
++  m_dvConvertBridge->SetConversionTarget(0, UseLimitedColor());
+   const bool reconstructed = m_dvConvertBridge->PrepareConversion(
+       layer, enhancement, metadata, view, m_nWidth, m_nHeight, serial, layerNotDecoded, epoch);
+   // ... or the picture before it, when this one could not be reconstructed and that one is
+@@ -2261,6 +2263,7 @@ int CWinSystemGbmGLESContext::RenderPlainMapping(const CDVBridgeGLES::Layer& lay
+   if (!m_dvConvertBridge->InitializeConversion())
+     return -1;
+   m_dvConvertBridge->SetConversionMapping(m_dvConvertMapping);
++  m_dvConvertBridge->SetConversionTarget(0, UseLimitedColor());
+   const bool mapped =
+       m_dvConvertBridge->PreparePlain(layer, plain, view, m_nWidth, m_nHeight, serial);
+   // ... or the picture before it, mapped whole, where this one could not be (none: Kodi draws it)
+-- 
+2.53.0
+

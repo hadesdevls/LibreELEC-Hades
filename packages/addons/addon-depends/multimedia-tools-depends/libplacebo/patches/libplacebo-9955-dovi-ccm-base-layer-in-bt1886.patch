@@ -1,0 +1,548 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:12:18 +0000
+Subject: [PATCH] dovi_ccm: a base layer in BT.1886, as clauses 5.4.3.3 and 5.5
+ of CCM 001 say
+
+ETSI GS CCM 001 V1.1.1, clause 5.2.2 a), admits a base layer in SMPTE ST
+2084 or in Recommendation ITU-R BT.1886. The second is the SDR base layer
+of Dolby Vision profile 8.2, whose configuration record says base layer
+signal compatibility 2. For it clause 5.4.3.3 makes the samples h of the
+reconstructed signal 14 bits (out_bit_depth), and clause 5.5 converts them
+to SMPTE ST 2084 at hdr_bit_depth. The composer of libplacebo-9930 had no
+way to know the transfer of the base layer and composed every picture as
+if it were in PQ, and so does libplacebo's own reshaping: a profile 8.2
+picture came out in other colours and brightness than the clauses give.
+
+New pl_render_params.dovi_ccm_bl_transfer, the transfer of the base layer
+as the stream says it:
+ - PL_COLOR_TRC_UNKNOWN (the default) and PL_COLOR_TRC_PQ: as before;
+ - PL_COLOR_TRC_BT_1886: h at 14 bits, then the conversion of clause 5.5
+   by the method of its annex C (informative), as the annex writes it: the
+   chroma up-sampled with its integer filter (vertical [-4 36 36 -4] / 64,
+   then horizontal, rounded), the normalization of the 14-bit signal,
+   YCbCr to R'G'B' of BT.2020, the EOTF of BT.1886 (annex 1) with L_W and
+   L_B the luminances of the mastering display, the inverse EOTF of SMPTE
+   ST 2084, R'G'B' to YCbCr of BT.2020, the quantization at hdr_bit_depth
+   and the chroma down-sampled ([1 6 1], horizontal then vertical), edges
+   by replication of the picture's samples. Five passes after the
+   composer's two; the arithmetic between the filters is 32-bit floating
+   point (the annex gives no precision). The composed planes, also the
+   caller's (dovi_ccm_planes), hold the converted signal. L_W and L_B are
+   max_display_mastering_luminance and min_display_mastering_luminance of
+   clause 5.3.2, which its clause 5.3.1 lets come "by other means": taken
+   from the source display of the RPU's display management metadata
+   (source_max_PQ, source_min_PQ, new fields of pl_dovi_ccm that
+   pl_map_dovi_metadata() fills), in the units of those syntax elements
+   (1 and 0.0001 cd/m2). The conversion takes and gives YCbCr of BT.2020
+   in the narrow range, as the annex does: an RPU whose YCCtoRGB is another
+   (the default of clause 6.2.2 is that of BT.709) is not composed, nor one
+   without the luminances, nor where the GPU has no rgba32f target. Rows
+   are not left out (pl_render_params.active_rows): the filters cross them;
+ - any other transfer is not composed (clause 5.2.2 a)).
+
+A Dolby Vision image whose base layer is not in PQ is never composed by
+libplacebo's own reshaping, which would take it for PQ: where the composer
+does not compose it (dovi_ccm off, or one of its reasons), pass_read_image()
+fails the render, and the reason is logged once a stream.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe) against a 64-bit
+transcription of 5.4.3.3 and of annex C, written from their text apart
+from this (the integer reference of clause 5.4 of the fidelity bench, which
+without the transfer still gives its planes bit for bit), with a base layer
+marked BT.1886 (no profile 8.2 sample was at hand: the picture of the
+profile 7 FEL test stream with and without its residual, and random and
+ramp planes at 1920x1080 with its RPU): every sample within one code of
+4095 of the reference, 0.42 to 0.53 % of them one code apart; without the
+change the same planes were up to 1043 codes apart in every luma sample.
+An RPU with the YCCtoRGB of BT.709, one whose source display has no range,
+HLG, and the composer off: the render fails, with its reason. With a base
+layer in PQ nothing changes: the composed planes byte for byte as before,
+and every drawing of the bridge's render test and every file of its
+fidelity bench.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the files changed,
+whose notices stay as they are.
+---
+ src/include/libplacebo/colorspace.h           |   6 +
+ src/include/libplacebo/renderer.h             |  22 ++
+ src/include/libplacebo/utils/libav_internal.h |   2 +
+ src/renderer.c                                | 338 +++++++++++++++++-
+ 4 files changed, 354 insertions(+), 14 deletions(-)
+
+diff --git a/src/include/libplacebo/colorspace.h b/src/include/libplacebo/colorspace.h
+index 71adee76..b7df9d79 100644
+--- a/src/include/libplacebo/colorspace.h
++++ b/src/include/libplacebo/colorspace.h
+@@ -190,6 +190,12 @@ struct pl_dovi_metadata {
+             uint16_t offset;
+             uint64_t hdr_in_max, slope, threshold;
+         } nlq[3];
++        // The source display of the HDR display management metadata (12-bit
++        // codes of SMPTE ST 2084, CCM 001 clause 6.2.2), from which the
++        // conversion of clause 5.5 takes the luminances L_W and L_B of the
++        // mastering display, where the base layer is in BT.1886
++        // (`pl_render_params.dovi_ccm_bl_transfer`)
++        uint16_t source_min_pq, source_max_pq;
+     } ccm;
+ };
+ 
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 067956f8..52295cfe 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -462,6 +462,28 @@ struct pl_render_params {
+     int dovi_ccm_el_linear;
+     const struct pl_filter_config *dovi_ccm_plane_upscaler;
+ 
++    // The transfer characteristics of the base layer of a Dolby Vision image,
++    // as its stream says them (a Dolby Vision configuration record whose base
++    // layer signal compatibility is 2 has an SDR base layer, in Recommendation
++    // ITU-R BT.1886). ETSI GS CCM 001 V1.1.1, clause 5.2.2 a), admits a base
++    // layer in SMPTE ST 2084 or in BT.1886:
++    //  - PL_COLOR_TRC_UNKNOWN (the default) and PL_COLOR_TRC_PQ: as without
++    //    this, the samples h of clause 5.4.3.3 at hdr_bit_depth;
++    //  - PL_COLOR_TRC_BT_1886: with `dovi_ccm`, h at out_bit_depth = 14, which
++    //    clause 5.5 converts to SMPTE ST 2084 at hdr_bit_depth as the method
++    //    of its annex C (informative) does, with L_W and L_B the luminances of
++    //    the source display of the RPU (source_max_PQ and source_min_PQ); the
++    //    composed planes (also `dovi_ccm_planes`) hold that conversion. The
++    //    conversion takes and gives YCbCr of BT.2020 in the narrow range, as
++    //    the annex does: an RPU whose YCCtoRGB is another is not composed;
++    //  - any other transfer is not composed (clause 5.2.2 a)).
++    // libplacebo's own reshaping composes every image as if its base layer
++    // were in SMPTE ST 2084. A Dolby Vision image whose base layer is in
++    // another transfer is therefore never drawn by it: where the composer of
++    // CCM 001 does not compose such an image (`dovi_ccm` off, or a reason it
++    // logs), the render fails. Hades extension.
++    enum pl_color_transfer dovi_ccm_bl_transfer;
++
+     // This callback is invoked for every pass successfully executed in the
+     // process of rendering a frame. Optional.
+     //
+diff --git a/src/include/libplacebo/utils/libav_internal.h b/src/include/libplacebo/utils/libav_internal.h
+index 87948d86..4dac5424 100644
+--- a/src/include/libplacebo/utils/libav_internal.h
++++ b/src/include/libplacebo/utils/libav_internal.h
+@@ -1065,6 +1065,8 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
+         out->ccm.nlq[c].slope = mapping->nlq[c].linear_deadzone_slope;
+         out->ccm.nlq[c].threshold = mapping->nlq[c].linear_deadzone_threshold;
+     }
++    out->ccm.source_min_pq = color->source_min_pq;
++    out->ccm.source_max_pq = color->source_max_pq;
+ }
+ 
+ PL_DEPRECATED_IN(v7.370)
+diff --git a/src/renderer.c b/src/renderer.c
+index 92a33d68..69097244 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -1964,6 +1964,14 @@ struct ccm_ctx {
+     bool rows;              // leave rows out (pl_render_params.active_rows)
+     int el_linear;          // pl_render_params.dovi_ccm_el_linear
+     int luma_rows[2], chroma_rows[2];
++    // Hades: out_bit_depth of 5.4.3.3: hdr_bit_depth, or 14 for a base layer in
++    // BT.1886, which clause 5.5 converts (bt1886) with the luminances L_W and
++    // L_B of the mastering display (lw, lb, cd/m2), through textures of four
++    // components (fmt4: rgba32f)
++    int out_depth;
++    bool bt1886;
++    double lw, lb;
++    pl_fmt fmt4;
+ };
+ 
+ static bool ccm_find_channel(const struct pl_frame *frame, int channel,
+@@ -2144,12 +2152,12 @@ static ident_t ccm_el_horizontal(pl_shader sh, struct ccm_binds *b, pl_tex vert,
+     return fn;
+ }
+ 
+-// h of 5.4.3.3 from v + r (`in`, an int or ivec2), into `out` as h / 2^hdr_bit_depth
+-// (`type`: float or vec2); the division by a power of two is exact
+-static void ccm_output(pl_shader sh, const struct pl_dovi_ccm_prep *pp,
+-                       const char *in, const char *out, const char *type)
++// h of 5.4.3.3 from v + r (`in`, an int or ivec2), into `out` as h / 2^out_bit_depth
++// (`type`: float or vec2); the division by a power of two is exact. (Hades:
++// out_bit_depth `d`, hdr_bit_depth or 14, see ccm_ctx.out_depth.)
++static void ccm_output(pl_shader sh, int d, const char *in, const char *out,
++                       const char *type)
+ {
+-    const int d = pp->hdr_depth;
+     GLSL("%s = %s(clamp((%s + %d) >> %d, 0, %d)) / %d.0; \n",
+          out, type, in, 1 << (15 - d), 16 - d, (1 << d) - 1, 1 << d);
+ }
+@@ -2183,8 +2191,11 @@ static pl_tex ccm_luma(struct pass_state *pass, const struct ccm_ctx *x,
+              lut, PL_DOVI_CCM_LUT_W - 1);
+     }
+ 
+-    ccm_output(sh, pp, "v", "color.x", "float");
+-    return ccm_end(pass, sh, x->fmt1, w, h, pass->params->dovi_ccm_planes[0]);
++    ccm_output(sh, x->out_depth, "v", "color.x", "float");
++    // (Hades: for a base layer in BT.1886 the caller's texture takes the
++    // conversion of clause 5.5)
++    return ccm_end(pass, sh, x->fmt1, w, h,
++                   x->bt1886 ? NULL : pass->params->dovi_ccm_planes[0]);
+ }
+ 
+ // 5.4.2.3.3 for the chroma component ci (0 = Cb, 1 = Cr), into v[ci]: the
+@@ -2375,8 +2386,249 @@ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+              PL_DOVI_CCM_LUT_W - 1, lut, lut);
+     }
+ 
+-    ccm_output(sh, pp, "v", "color.xy", "vec2");
+-    return ccm_end(pass, sh, x->fmt2, w, h, pass->params->dovi_ccm_planes[1]);
++    ccm_output(sh, x->out_depth, "v", "color.xy", "vec2");
++    return ccm_end(pass, sh, x->fmt2, w, h,
++                   x->bt1886 ? NULL : pass->params->dovi_ccm_planes[1]);
++}
++
++// Hades: clause 5.5, a base layer in Recommendation ITU-R BT.1886. The samples
++// h of 5.4.3.3 are of out_bit_depth = 14 bits there, and the clause converts
++// them to SMPTE ST 2084 at hdr_bit_depth: the chroma up-sampled and the signal
++// taken to the R'G'B' of BT.2020, to linear light by the EOTF of BT.1886
++// (annex 1) with L_W and L_B the luminances of the mastering display, to SMPTE
++// ST 2084 by its inverse EOTF, back to YCbCr of BT.2020, and the chroma down-
++// sampled. The clause names the steps; their equations and filters here are
++// those of the method of its annex C (informative), as the annex writes them:
++// integer filters with edges by replication of the picture's samples, the
++// equations with their Clip3() and Round(). Between the two filters the
++// arithmetic is 32-bit floating point (the annex does not give a precision).
++
++// Annex C, the up-sampling filter, vertical pass (first): f(2n) = 64 s(n),
++// f(2n+1) = -4 s(n-1) + 36 s(n) + 36 s(n+1) - 4 s(n+2), of the 14-bit chroma
++// (both components), as integers. Output: the width of the chroma planes, the
++// height of the luma plane.
++static pl_tex ccm_1886_up(struct pass_state *pass, const struct ccm_ctx *x,
++                          pl_tex c14, int w, int h)
++{
++    pl_shader sh = ccm_begin(pass, w, h,
++                             "DV composer: BT.1886, chroma up, vertical (CCM 001 5.5, annex C)",
++                             NULL, false);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t tex = ccm_tex(sh, &binds, c14, "dv_c14");
++    ident_t s = sh_fresh(sh, "dv_c14_at");
++    GLSLH("ivec2 "$"(int px, int py) {                                     \n"
++          "    return ivec2(texelFetch("$", ivec2(px, clamp(py, 0, %d)), 0).xy \n"
++          "                 * 16384.0 + 0.5);                              \n"
++          "}                                                               \n",
++          s, tex, c14->params.h - 1);
++    GLSL("int n = p.y >> 1;                                                \n"
++         "ivec2 f = (p.y & 1) == 0 ? 64 * "$"(p.x, n)                      \n"
++         "        : -4 * "$"(p.x, n - 1) + 36 * "$"(p.x, n)                \n"
++         "          + 36 * "$"(p.x, n + 1) - 4 * "$"(p.x, n + 2);          \n"
++         "color.xy = vec2(f);                                              \n",
++         s, s, s, s, s);
++    return ccm_end(pass, sh, x->fmt2, w, h, NULL);
++}
++
++// Annex C, the up-sampling filter, horizontal pass, g(2m) = (f(m) + 32) >> 6,
++// g(2m+1) = (-4 f(m-1) + 36 f(m) + 36 f(m+1) - 4 f(m+2) + 2048) >> 12, and then
++// every equation of the conversion at a sample of the luma: the normalization
++// of the 14-bit signal, YCbCr to R'G'B' (BT.2020), the EOTF of BT.1886, the
++// inverse EOTF of SMPTE ST 2084, R'G'B' to YCbCr (BT.2020) and the
++// quantization at hdr_bit_depth. Output: D'Y, D'Cb and D'Cr at that depth (the
++// chroma not yet down-sampled), as integers.
++static pl_tex ccm_1886_convert(struct pass_state *pass, const struct ccm_ctx *x,
++                               pl_tex y14, pl_tex up, int w, int h)
++{
++    pl_shader sh = ccm_begin(pass, w, h,
++                             "DV composer: BT.1886 to SMPTE ST 2084 (CCM 001 5.5, annex C)",
++                             NULL, false);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t ty = ccm_tex(sh, &binds, y14, "dv_y14");
++    ident_t tu = ccm_tex(sh, &binds, up, "dv_up");
++    ident_t f = sh_fresh(sh, "dv_up_at");
++    GLSLH("ivec2 "$"(int px, int py) {                                     \n"
++          "    return ivec2(texelFetch("$", ivec2(clamp(px, 0, %d), py), 0).xy); \n"
++          "}                                                               \n",
++          f, tu, up->params.w - 1);
++
++    // BT.1886, annex 1: L = a max(V + b, 0)^2.4, a = (L_W^(1/2.4) - L_B^(1/2.4))^2.4,
++    // b = L_B^(1/2.4) / (L_W^(1/2.4) - L_B^(1/2.4))
++    const double rw = pow(x->lw, 1 / 2.4), rb = pow(x->lb, 1 / 2.4);
++    const float a = pow(rw - rb, 2.4), b = rb / (rw - rb);
++    const int d = x->prep->hdr_depth;
++    GLSL("int dy = int(texelFetch("$", p, 0).x * 16384.0 + 0.5);           \n"
++         "int m = p.x >> 1;                                                 \n"
++         "ivec2 dc = (p.x & 1) == 0 ? (("$"(m, p.y) + 32) >> 6)             \n"
++         "         : ((-4 * "$"(m - 1, p.y) + 36 * "$"(m, p.y)              \n"
++         "             + 36 * "$"(m + 1, p.y) - 4 * "$"(m + 2, p.y)         \n"
++         "             + 2048) >> 12);                                      \n"
++         "float ey = clamp((float(dy) / 64.0 - 16.0) / 219.0, 0.0, 1.0);    \n"
++         "vec2 ec = clamp((vec2(dc) / 64.0 - 128.0) / 224.0, -0.5, 0.5);    \n"
++         "vec3 e = clamp(vec3(ey + 1.47460 * ec.y,                          \n"
++         "                    ey - 0.16455 * ec.x - 0.57135 * ec.y,         \n"
++         "                    ey + 1.88140 * ec.x), 0.0, 1.0);              \n"
++         "vec3 l = clamp("$" * pow(max(e + vec3("$"), 0.0), vec3(2.4)),     \n"
++         "               "$", "$");                                         \n"
++         "vec3 yl = pow(max(l / 10000.0, 0.0), vec3(0.1593017578125));      \n"
++         "vec3 q = clamp(pow((0.8359375 + 18.8515625 * yl)                  \n"
++         "                   / (1.0 + 18.6875 * yl), vec3(78.84375)),       \n"
++         "               0.0, 1.0);                                         \n"
++         "float qy = 0.2627 * q.r + 0.6780 * q.g + 0.0593 * q.b;            \n"
++         "vec2 qc = vec2((q.b - qy) / 1.8814, (q.r - qy) / 1.4746);         \n"
++         "color.xyz = clamp(floor(vec3(%d.0 * (219.0 * qy + 16.0),          \n"
++         "                             %d.0 * (224.0 * qc + 128.0)) + 0.5), \n"
++         "                  0.0, %d.0);                                     \n",
++         ty, f, f, f, f, f, SH_FLOAT(a), SH_FLOAT(b), SH_FLOAT(x->lb), SH_FLOAT(x->lw),
++         1 << (d - 8), 1 << (d - 8), (1 << d) - 1);
++    return ccm_end(pass, sh, x->fmt4, w, h, NULL);
++}
++
++// The luma of the conversion, as the composed luma plane: D'Y / 2^hdr_bit_depth
++static pl_tex ccm_1886_luma(struct pass_state *pass, const struct ccm_ctx *x,
++                            pl_tex conv, int w, int h, pl_tex dst)
++{
++    pl_shader sh = ccm_begin(pass, w, h,
++                             "DV composer: BT.1886, the luma at hdr_bit_depth (CCM 001 5.5)",
++                             NULL, false);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t t = ccm_tex(sh, &binds, conv, "dv_conv");
++    GLSL("color.x = texelFetch("$", p, 0).x / %d.0; \n", t, 1 << x->prep->hdr_depth);
++    return ccm_end(pass, sh, x->fmt1, w, h, dst);
++}
++
++// Annex C, the down-sampling filter, horizontal pass (first):
++// f(n) = s(2n-1) + 6 s(2n) + s(2n+1), of the chroma of the conversion, as
++// integers. Output: the width of the chroma planes, the height of the luma.
++static pl_tex ccm_1886_down_h(struct pass_state *pass, const struct ccm_ctx *x,
++                              pl_tex conv, int w, int h)
++{
++    pl_shader sh = ccm_begin(pass, w, h,
++                             "DV composer: BT.1886, chroma down, horizontal (CCM 001 5.5, annex C)",
++                             NULL, false);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t t = ccm_tex(sh, &binds, conv, "dv_conv");
++    ident_t s = sh_fresh(sh, "dv_conv_at");
++    GLSLH("vec2 "$"(int px, int py) {                                      \n"
++          "    return texelFetch("$", ivec2(clamp(px, 0, %d), py), 0).yz;  \n"
++          "}                                                               \n",
++          s, t, conv->params.w - 1);
++    GLSL("color.xy = "$"(2 * p.x - 1, p.y) + 6.0 * "$"(2 * p.x, p.y)       \n"
++         "         + "$"(2 * p.x + 1, p.y);                                \n",
++         s, s, s);
++    return ccm_end(pass, sh, x->fmt2, w, h, NULL);
++}
++
++// Annex C, the down-sampling filter, vertical pass:
++// g(n) = (f(2n-1) + 6 f(2n) + f(2n+1) + 32) >> 6, as the composed chroma plane:
++// D'C / 2^hdr_bit_depth
++static pl_tex ccm_1886_down_v(struct pass_state *pass, const struct ccm_ctx *x,
++                              pl_tex fh, int w, int h, pl_tex dst)
++{
++    pl_shader sh = ccm_begin(pass, w, h,
++                             "DV composer: BT.1886, chroma down, vertical (CCM 001 5.5, annex C)",
++                             NULL, false);
++    if (!sh)
++        return NULL;
++
++    struct ccm_binds binds = {0};
++    ident_t t = ccm_tex(sh, &binds, fh, "dv_down");
++    ident_t s = sh_fresh(sh, "dv_down_at");
++    GLSLH("ivec2 "$"(int px, int py) {                                     \n"
++          "    return ivec2(texelFetch("$", ivec2(px, clamp(py, 0, %d)), 0).xy); \n"
++          "}                                                               \n",
++          s, t, fh->params.h - 1);
++    GLSL("ivec2 g = ("$"(p.x, 2 * p.y - 1) + 6 * "$"(p.x, 2 * p.y)         \n"
++         "         + "$"(p.x, 2 * p.y + 1) + 32) >> 6;                     \n"
++         "color.xy = vec2(g) / %d.0;                                       \n",
++         s, s, s, 1 << x->prep->hdr_depth);
++    return ccm_end(pass, sh, x->fmt2, w, h, dst);
++}
++
++// Hades: the base layer of the image is not in SMPTE ST 2084
++// (pl_render_params.dovi_ccm_bl_transfer)
++static bool ccm_bl_not_pq(const struct pl_render_params *params)
++{
++    return params->dovi_ccm_bl_transfer != PL_COLOR_TRC_UNKNOWN &&
++           params->dovi_ccm_bl_transfer != PL_COLOR_TRC_PQ;
++}
++
++// The EOTF of SMPTE ST 2084 for a 12-bit code, in cd/m2
++static double ccm_pq_nits(int code)
++{
++    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128;
++    const double c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
++    const double e = pow(code / 4095.0, 1 / m2);
++    return 10000 * pow(fmax(e - c1, 0) / (c2 - c3 * e), 1 / m1);
++}
++
++// The RPU's YCCtoRGB is that of YCbCr of BT.2020 in the narrow range, which the
++// conversion of annex C takes and gives (and which decodes the composed planes
++// afterwards, and a display that is sent them): rows R, G, B of Y, Cb, Cr, with
++// the luma scale k of a narrow-range code (255/219 at 8 bits to 65535/56064 at
++// 16, as the RPU rounds it) and the chroma scale k 219 / 224
++static bool ccm_ycc_bt2020(const struct pl_dovi_metadata *dovi)
++{
++    const float (*m)[3] = dovi->nonlinear.m;
++    const float k = m[0][0], kc = k * 219.0f / 224.0f;
++    const float ref[3][2] = { { 0.0f, 1.47460f }, { -0.16455f, -0.57135f }, { 1.88140f, 0.0f } };
++    if (k < 1.160f || k > 1.172f)
++        return false;
++    for (int r = 0; r < 3; r++) {
++        if (fabsf(m[r][0] - k) > 1e-3f)
++            return false;
++        for (int c = 0; c < 2; c++) {
++            if (fabsf(m[r][1 + c] / kc - ref[r][c]) > 2e-3f)
++                return false;
++        }
++    }
++    return fabsf(dovi->nonlinear_offset[0] - 1.0f / 16) < 1e-3f &&
++           fabsf(dovi->nonlinear_offset[1] - 0.5f) < 1e-3f &&
++           fabsf(dovi->nonlinear_offset[2] - 0.5f) < 1e-3f;
++}
++
++// Hades: why an image whose base layer is in BT.1886 cannot be composed with
++// clause 5.5 (NULL: it can); fills the fields of `x` for it
++static const char *ccm_check_bt1886(struct pass_state *pass, struct ccm_ctx *x)
++{
++    const struct pl_dovi_metadata *dovi = pass->image.repr.dovi;
++    const struct pl_dovi_ccm *ccm = &dovi->ccm;
++    if (!ccm_ycc_bt2020(dovi))
++        return "a base layer in BT.1886 whose HDR signal (the RPU's YCCtoRGB) is not YCbCr of "
++               "BT.2020 in the narrow range, which the conversion of clause 5.5 (annex C) takes";
++    // L_W and L_B: max_display_mastering_luminance and min_display_mastering_luminance
++    // of clause 5.3.2, in their units (1 and 0.0001 cd/m2), from the source display of
++    // the RPU's display management metadata (5.3.1: "or by other means")
++    if (ccm->source_max_pq > 4095 || ccm->source_min_pq >= ccm->source_max_pq)
++        return "a base layer in BT.1886 without the luminances of the mastering display "
++               "(source_min_PQ, source_max_PQ), which clause 5.5 needs";
++    x->lw = round(ccm_pq_nits(ccm->source_max_pq));
++    x->lb = round(ccm_pq_nits(ccm->source_min_pq) * 10000) / 10000;
++    if (x->lw < 1 || x->lw > 10000 || x->lb >= x->lw)
++        return "a base layer in BT.1886 whose mastering display luminances are outside "
++               "clause 5.3.2";
++    x->fmt4 = pl_find_fmt(pass->rr->gpu, PL_FMT_FLOAT, 4, 32, 32,
++                          PL_FMT_CAP_SAMPLEABLE | PL_FMT_CAP_RENDERABLE);
++    if (!x->fmt4)
++        return "no 32-bit floating-point render target of four components, which the "
++               "conversion of clause 5.5 needs";
++    x->out_depth = 14;
++    x->bt1886 = true;
++    // (the conversion filters across rows: every row is composed)
++    x->rows = false;
++    return NULL;
+ }
+ 
+ // Why the image cannot be composed so (NULL: it can); fills `x`
+@@ -2502,16 +2754,38 @@ static const char *ccm_check(struct pass_state *pass, struct ccm_ctx *x)
+         x->chroma_rows[1] = PL_MIN((y1 + 1) / 2 + 6, chh);
+     }
+ 
++    // Hades: the transfer of the base layer (clause 5.2.2 a)): out_bit_depth of
++    // 5.4.3.3, and the conversion of clause 5.5
++    x->out_depth = pp->hdr_depth;
++    x->bt1886 = false;
++    switch (params->dovi_ccm_bl_transfer) {
++    case PL_COLOR_TRC_UNKNOWN:
++    case PL_COLOR_TRC_PQ:
++        break;
++    case PL_COLOR_TRC_BT_1886:
++        return ccm_check_bt1886(pass, x);
++    default:
++        return "a base layer whose transfer is neither SMPTE ST 2084 nor Recommendation "
++               "ITU-R BT.1886 (clause 5.2.2 a))";
++    }
++
+     return NULL;
+ }
+ 
+ // Logs each reason not to compose (static strings) once a stream, and composing
+ // once a stream, however often the pictures of the stream change between them.
+-static void ccm_say(pl_renderer rr, struct dovi_ccm_state *st, const char *why)
++// (Hades: `not_pq`, a base layer that is not in SMPTE ST 2084, which nothing else
++// composes: pl_render_params.dovi_ccm_bl_transfer)
++static void ccm_say(pl_renderer rr, struct dovi_ccm_state *st, const char *why,
++                    bool not_pq)
+ {
+     if (!why) {
+-        if (!st->said_composed)
++        if (!st->said_composed && not_pq) {
++            PL_INFO(rr, "Dolby Vision: composed as ETSI GS CCM 001 clauses 5.4 and 5.5 do "
++                    "(a base layer in BT.1886, converted to SMPTE ST 2084)");
++        } else if (!st->said_composed) {
+             PL_INFO(rr, "Dolby Vision: composed as ETSI GS CCM 001 clause 5.4 does");
++        }
+         st->said_composed = true;
+         return;
+     }
+@@ -2520,8 +2794,14 @@ static void ccm_say(pl_renderer rr, struct dovi_ccm_state *st, const char *why)
+         if (st->said[i] == why)
+             return;
+     }
+-    PL_WARN(rr, "Dolby Vision: a picture is not composed as ETSI GS CCM 001 does "
+-            "(%s); it is composed by the reshaping of libplacebo", why);
++    if (not_pq) {
++        PL_WARN(rr, "Dolby Vision: a picture whose base layer is not in SMPTE ST 2084 is "
++                "not composed as ETSI GS CCM 001 does (%s); it is not drawn (the reshaping "
++                "of libplacebo would compose it as if it were)", why);
++    } else {
++        PL_WARN(rr, "Dolby Vision: a picture is not composed as ETSI GS CCM 001 does "
++                "(%s); it is composed by the reshaping of libplacebo", why);
++    }
+     if (st->num_said < PL_ARRAY_SIZE(st->said))
+         st->said[st->num_said++] = why;
+ }
+@@ -2548,7 +2828,7 @@ static bool pass_dovi_ccm(struct pass_state *pass)
+         why = st->prep.reason;
+     if (!why)
+         why = ccm_check(pass, &x);
+-    ccm_say(rr, st, why);
++    ccm_say(rr, st, why, ccm_bl_not_pq(pass->params));
+     if (why)
+         return false;
+ 
+@@ -2588,6 +2868,20 @@ static bool pass_dovi_ccm(struct pass_state *pass)
+     if (!ly || !lc)
+         goto error;
+ 
++    // Hades: clause 5.5, a base layer in BT.1886: the 14-bit planes converted
++    // to SMPTE ST 2084 at hdr_bit_depth, into the caller's textures when given
++    if (x.bt1886) {
++        pl_tex up = ccm_1886_up(pass, &x, lc, cb->params.w, y->params.h);
++        pl_tex conv = up ? ccm_1886_convert(pass, &x, ly, up, y->params.w, y->params.h) : NULL;
++        pl_tex down = conv ? ccm_1886_down_h(pass, &x, conv, cb->params.w, y->params.h) : NULL;
++        ly = conv ? ccm_1886_luma(pass, &x, conv, y->params.w, y->params.h,
++                                  pass->params->dovi_ccm_planes[0]) : NULL;
++        lc = down ? ccm_1886_down_v(pass, &x, down, cb->params.w, cb->params.h,
++                                    pass->params->dovi_ccm_planes[1]) : NULL;
++        if (!ly || !lc)
++            goto error;
++    }
++
+     struct pl_plane luma = *x.bl[0].plane, chroma = *x.bl[1].plane;
+     luma.texture = ly;
+     luma.components = 1;
+@@ -2655,6 +2949,22 @@ static bool pass_read_image(struct pass_state *pass)
+     dovi_composed = pass_dovi_ccm(pass);
+     if (dovi_composed)
+         pass->plane_upscaler = params->dovi_ccm_plane_upscaler;
++    // Hades: a Dolby Vision image whose base layer is not in SMPTE ST 2084 is
++    // composed by the composer of CCM 001 (clause 5.5) or not at all: the
++    // reshaping of libplacebo would compose it as if it were (see
++    // pl_render_params.dovi_ccm_bl_transfer). The composer logged why it did
++    // not; with it off, that is said here, once a stream.
++    if (!dovi_composed && image->repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
++        image->repr.dovi && ccm_bl_not_pq(params))
++    {
++        if (!params->dovi_ccm) {
++            if (!rr->dovi_ccm)
++                rr->dovi_ccm = pl_zalloc_ptr(rr, rr->dovi_ccm);
++            ccm_say(rr, rr->dovi_ccm, "the composer of CCM 001 is off "
++                    "(pl_render_params.dovi_ccm)", true);
++        }
++        return false;
++    }
+ #endif
+ 
+     struct plane_state planes[4];

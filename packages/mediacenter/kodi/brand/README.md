@@ -27,6 +27,7 @@ Elsewhere in the tree:
 | --- | --- |
 | `distributions/LibreELEC/splash/splash-720.png` to `splash-2160.png` | the screen while the system starts, one for each of eleven heights of screen. LibreELEC's five carried its logo and the words "Just enough OS for KODI" |
 | `packages/mediacenter/LibreELEC-settings/brand/logo.png`, `wizard.png` | the logo at the foot of the window of LibreELEC's settings and the side of its first-run wizard, which carried the same; installed by the recipe of that add-on |
+| `packages/mediacenter/kodi/hades/processinfo.png` | not a picture of the build's name: the icon of the button of Estuary's video OSD that opens the player information (`kodi-9005`), drawn for this build by `make-processinfo-icon.py` next to it (a panel with three lines, 128 by 128, white with alpha like Estuary's other OSD buttons); nothing of it comes from Estuary or from any other source. The recipe of Kodi copies it into the skin |
 
 `logo.png` has the size of the file that it replaces. `wizard.png` has not: the add-on draws it into a place of 270 by 676 whatever its proportions, so it has those proportions, at twice that size (LibreELEC's own, 318 by 732, is drawn narrower than it is).
 

@@ -126,6 +126,15 @@ makeinstall_target() {
       cp ${PKG_DIR}/scripts/internal-disks ${INSTALL}/usr/lib/libreelec
       chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-disks
     fi
+    # Hades: which internal partitions are shown while the internal disks are shown, asked by
+    # 95-udevil-mount.rules (udevil) before it mounts one, on every device: without it nothing internal
+    # is mounted
+    cp ${PKG_DIR}/scripts/internal-partitions ${INSTALL}/usr/lib/libreelec
+    chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-partitions
+    # Hades: which internal disks are kept away from the kernel while the internal disks are shown, for
+    # the settings; the initramfs has the same script, which the init asks (makeinstall_init)
+    cp ${PKG_DIR}/scripts/internal-disk-choice ${INSTALL}/usr/lib/libreelec
+    chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-disk-choice
 
   mkdir -p ${INSTALL}/usr/lib/systemd/system-generators/
     cp ${PKG_DIR}/scripts/libreelec-target-generator ${INSTALL}/usr/lib/systemd/system-generators/
@@ -204,4 +213,10 @@ makeinstall_init() {
       -e "s/@SYSTEM_SIZE@/${SYSTEM_SIZE}/g" \
       -i ${INSTALL}/init
   chmod 755 ${INSTALL}/init
+
+  # Hades: which internal disks the init keeps away from the kernel while the internal disks are shown
+  # (hide_chosen_disks in the init); the system has the same script, for the settings
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+    cp ${PKG_DIR}/scripts/internal-disk-choice ${INSTALL}/usr/lib/libreelec
+    chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-disk-choice
 }

@@ -1,0 +1,159 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:11:59 +0000
+Subject: [PATCH] renderer: the scale of a plane outside a sampler that leaves
+ rows out
+
+With pl_render_params.active_rows (libplacebo-9912), the sampler of a
+plane that is part of the shader that writes the target returns black
+from its function for the rows outside the picture, before it samples.
+Where that sampler also applied the scale of its source (the
+normalization of the plane, such as P010 codes to their range), the
+scale was applied on one branch only. A compiler folds consecutive
+constant scales into one product where it can, and it could no longer
+fold that one into the scale that follows the function: for Dolby
+Vision reshaped by libplacebo, the code scale of
+pl_color_repr_code_scale(), 1023/1024 since upstream c9076f7c (1.0
+before, which needs no multiplication). The rows that hold picture then
+came out with other roundings than with all rows sampled. With Kodi's
+Dolby Vision bridge on Mesa's zink, its render test found up to
+1 081 460 values (4.3 % of the colour values of a 3840x2160 picture)
+apart by one unit in the last place (1.2e-7 at most where they were
+dumped), and up to 29 bytes of the packed transport changed, in each
+drawing with letterbox bars; with c9076f7c reverted, fewer (294 046
+values and 4 bytes in 24 drawings).
+
+Now, where a sampler leaves rows out of that shader, the scale of its
+source is left to the caller (pass_read_image(), sample_el()), who
+applies it to what the function returns, after both branches, as the
+scales that follow it. The separable scaler applies it in its first
+pass, which writes a texture of its own, as always. Where no rows are
+left out nothing changes, not even the text of a shader.
+
+Measured with Kodi's bridge on zink (its render test: 6 pictures of a
+profile 7 FEL stream, 24 drawings each way, the full and the half
+raster): libplacebo's reshaping now draws the same float picture and
+the same bytes with and without the rows left out (before: 15 502 532
+values and 312 bytes in all), also with c9076f7c reverted; the pictures
+drawn without rows left out keep their hashes (36 of 36, with either
+composer), and the composer of ETSI GS CCM 001 draws the same bytes in
+every drawing.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the file changed,
+whose notice stays as it is.
+---
+ src/renderer.c | 48 +++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/src/renderer.c b/src/renderer.c
+index 6c550571..92a33d68 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -434,6 +434,11 @@ struct pass_state {
+     // see dispatch_sampler(), SAMPLER_NOOP
+     bool exact_identity;
+ 
++    // Hades: the scale of its source that the last call of dispatch_sampler()
++    // left to its caller, to be applied to what the sampler returns: 1.0 but
++    // where the sampler leaves rows out (see there)
++    float sampler_scale;
++
+     // Hades: in place of `pl_render_params.plane_upscaler` while the planes
+     // of an image composed by pass_dovi_ccm() are read
+     // (`pl_render_params.dovi_ccm_plane_upscaler`), or NULL
+@@ -751,6 +756,14 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
+     return info;
+ }
+ 
++// A sampler of a plane of that height leaves rows out (skip_inactive_rows())
++static bool rows_left_out(const struct pass_state *pass, int height)
++{
++    const struct pl_render_params *params = pass->params;
++    const int y0 = params->active_rows[0], y1 = params->active_rows[1];
++    return height == 2160 && y0 >= 0 && y1 <= 2160 && y0 < y1 && (y0 || y1 != 2160);
++}
++
+ // Leaves the rows outside `pl_render_params.active_rows` out of the sampler of a
+ // plane: see the description of that field. `target`: the shader is part of the
+ // one that writes the target of the render, whose coordinates may be flipped;
+@@ -760,7 +773,7 @@ static bool skip_inactive_rows(struct pass_state *pass, pl_shader sh, int height
+ {
+     const struct pl_render_params *params = pass->params;
+     const int y0 = params->active_rows[0], y1 = params->active_rows[1];
+-    if (height != 2160 || y0 < 0 || y1 > 2160 || y0 >= y1 || (!y0 && y1 == 2160))
++    if (!rows_left_out(pass, height))
+         return true;
+ 
+     // sh_require() is made for an operation that leaves a color behind. This
+@@ -814,13 +827,33 @@ static bool exact_identity_src(const struct pl_sample_src *src)
+ 
+ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+                              struct sampler *sampler, enum sampler_usage usage,
+-                             pl_tex target_tex, const struct pl_sample_src *src)
++                             pl_tex target_tex, const struct pl_sample_src *src_in)
+ {
+     const struct pl_render_params *params = pass->params;
+     // (a plane that is read; `target_tex`: a plane of the target that is written)
+     const bool rows = usage == SAMPLER_PLANE && !target_tex;
+-    if (rows && !skip_inactive_rows(pass, sh, src->new_h, true))
++    pass->sampler_scale = 1.0f;
++    if (rows && !skip_inactive_rows(pass, sh, src_in->new_h, true))
+         return;
++
++    // Hades: a sampler that leaves rows out of the shader that writes the
++    // target returns from its function before it samples those rows. A scale
++    // that it applied to what it samples would then be applied on one branch
++    // only, where a compiler can no longer fold it into the scales that follow
++    // the function (the normalization of the planes, a decoding), as it can
++    // when no rows are left out: the rows that hold picture would come out
++    // with other roundings than with all rows sampled. So there the scale of
++    // the source is left to the caller, who applies it to what the function
++    // returns, after both branches. The separable scaler applies it in its
++    // first pass, which writes a texture of its own, as always. Where no rows
++    // are left out nothing changes.
++    struct pl_sample_src unscaled = *src_in;
++    const struct pl_sample_src *src = src_in;
++    if (rows && rows_left_out(pass, src_in->new_h)) {
++        pass->sampler_scale = src_in->scale ? src_in->scale : 1.0f;
++        unscaled.scale = 1.0f;
++        src = &unscaled;
++    }
+     if (!sampler)
+         goto fallback;
+ 
+@@ -902,6 +935,9 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
+     } else if (info.dir_sep[0] && info.dir_sep[1]) {
+         // Scaling is needed in both directions
+         struct pl_sample_src src1 = *src, src2 = *src;
++        // Hades: its first pass applies the scale (see above)
++        src1.scale = src_in->scale;
++        pass->sampler_scale = 1.0f;
+         src1.new_w = src->tex->params.w;
+         src1.rect.x0 = 0;
+         src1.rect.x1 = src1.new_w;;
+@@ -1866,6 +1902,8 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+         dispatch_sampler(pass, plane_sh, &rr->samplers_el[i], SAMPLER_PLANE,
+                          NULL, &src);
+         pass->params = params;
++        // Hades: and what the sampler left to its caller (see dispatch_sampler())
++        const float plane_scale = el_scale * pass->sampler_scale;
+ 
+         ident_t sub = sh_subpass(sh, plane_sh);
+         pl_dispatch_abort(rr->dp, &plane_sh);
+@@ -1874,7 +1912,7 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
+             return NULL;
+         }
+ 
+-#pragma GLSL tmp = vec4(${float: el_scale}) * $sub();
++#pragma GLSL tmp = vec4(${float: plane_scale}) * $sub();
+         for (int c = 0; c < src.components; c++) {
+             int idx = plane->component_mapping[c];
+             if (idx < 0 || idx > 2)
+@@ -2943,7 +2981,7 @@ static bool pass_read_image(struct pass_state *pass)
+             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
+             st->img.w = st->img.rect.x1 = src.new_w;
+             st->img.h = st->img.rect.y1 = src.new_h;
+-            src.scale = 1.0;
++            src.scale = pass->sampler_scale; // Hades: see dispatch_sampler()
+         }
+ 
+         pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);

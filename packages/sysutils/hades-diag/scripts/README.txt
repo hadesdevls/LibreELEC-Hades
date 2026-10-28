@@ -17,14 +17,24 @@ all for a TV that is plugged in and not seen:
 
 WHAT IS WRITTEN HERE
 
-  Each start of the PC has a folder of its own: start-1, start-2, and so on. The last eight are kept, so a
-  drive that is taken from one PC to the next keeps what each of them had to tell. In each of them:
+  Each start of the PC has a folder of its own: start-1, start-2, and so on. The number goes on from the start
+  before, also after an update of the system or once the folders have been deleted, so a name is never given
+  to two starts. The last eight are kept, so a drive that is taken from one PC to the next keeps what each of
+  them had to tell. In each of them:
+
+  start.txt
+      Which start the folder is of: its number, the build of LibreELEC Hades, and when the PC started.
+      What is in a folder is always of that one start: a folder of the same name that is of another start
+      (for example, left by an earlier version) is emptied before this start writes there, and start.txt
+      then says what it was.
 
   1-minute, 4-minutes
       About 1 and 4 minutes after the media centre starts: the graphics cards and what is connected to
       each (with the EDID of every display, without its serial number), the kernel log, the last of the
       media centre's log (kodi.log), the warnings of the system, sound devices, USB devices, the state of
-      the network, services, the clock. The first of the two also has:
+      the network, services, the clock, and Bluetooth (bluetooth.txt: the controllers and their firmware,
+      the settings, and of each paired device its kind, its state and the connection that it asked for;
+      never a key, and its name only as a marker, below). The first of the two also has:
         - redetect.txt: what the kernel said when the HDMI and DisplayPort sockets with nothing connected
           were asked again, and whether a graphics card was asleep. An AMD graphics card answers from what
           it last saw: it looks at a socket when it starts, when it wakes up and when something is plugged
@@ -36,7 +46,9 @@ WHAT IS WRITTEN HERE
       and buttons.
 
   during-dv-1 to during-dv-6
-      About 15 seconds after each Dolby Vision playback starts: what is really sent to the TV.
+      About 15 seconds after each Dolby Vision playback starts: what is really sent to the TV. With an
+      NVIDIA graphics card, also nvidia-smi.txt: its clocks, what holds them down, its power and its
+      temperature at that moment (state.txt says when; the rest is taken 12 seconds later).
 
   after-dv-1 to after-dv-6
       5 and 30 seconds after each Dolby Vision playback ends. Written at once, so it is there even if the
@@ -47,12 +59,14 @@ WHAT IS WRITTEN HERE
       was connected to each socket at that moment, and how the drive and the graphics card were doing
       second by second. Always turn the PC off from that menu, not with its button.
 
+  Each of these folders also has build.txt: the build of LibreELEC Hades that wrote it.
   Of the two kinds of Dolby Vision, the first six playbacks of a start are kept.
   Nothing is written when this drive has less than 128 MB free: a note in this folder, NO-ROOM.txt, then
   says so.
   Folders named 1-minute, shutdown-1 and the like beside the start folders are of an earlier version.
-  Folders that a version before this one wrote without the filter below are put through it once, when
-  this version starts; each folder that has been through it has an empty file named .filtered.
+  Folders that a version before this one wrote without the filter below, or put through it before it
+  took the names of Bluetooth devices out, are put through it once, when this version starts; each folder
+  that has been through it has a file named .filtered, in which this version writes 2.
 
 PRIVACY
 
@@ -60,10 +74,13 @@ PRIVACY
     - Addresses of your network and of the internet (IPv4 and IPv6), MAC and Bluetooth addresses, the
       names of Wi-Fi networks, the name of this PC on the network and those of the computers of your home
       network in addresses, the serial numbers of displays, graphics cards and USB devices (also inside
-      the EDID of a display), the UUIDs of disks and partitions, and SSH keys and their fingerprints
-      become markers, such as [lan-ip-1a2b.3c4d] or [mac-5e6f70]. A marker is the same for the same value
-      on this PC, so the files still tell which lines are about the same device or the same network, but
-      it cannot be turned back into the value: it is made with a secret that never leaves this PC.
+      the EDID of a display), the UUIDs of disks and partitions, SSH keys and their fingerprints, and the
+      names of the Bluetooth devices that this PC knows (those that are paired, and those that it saw when
+      it looked for devices: a keyboard or a phone is often named after its owner, as in "Magic Keyboard
+      de Juan") become markers, such as [lan-ip-1a2b.3c4d], [mac-5e6f70] or [bt-name-7a8b9c]. A marker is
+      the same for the same value on this PC, so the files still tell which lines are about the same
+      device or the same network, but it cannot be turned back into the value: it is made with a secret
+      that never leaves this PC.
     - From the logs of the media centre and of the system, the path of every address (only the name of
       the server stays), the names of films, songs and searches (only the extension stays, as in
       [redacted].mkv), e-mail addresses, and what looks like a token, a key or a password are removed.
@@ -75,6 +92,9 @@ PRIVACY
     - the names of public servers (for example, of the services that your add-ons use), and which
       services of this PC were listening;
     - your time zone.
+  And a name of a Bluetooth device that is short or one plain word, such as "TV", "K" or "Keyboard",
+  stays where it stands as an ordinary word: it becomes a marker only where a line names an input device
+  by it.
 
   Nothing is sent anywhere: the files stay on this drive.
 

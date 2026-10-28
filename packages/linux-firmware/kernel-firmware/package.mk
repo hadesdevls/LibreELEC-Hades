@@ -75,6 +75,14 @@ makeinstall_target() {
     done <"${fwlist}"
   done
 
+  # Hades: the terms of the firmware go into the system with it. WHENCE names the licence of each
+  # file and has the copyright notices that some of those licences ask to be reproduced; LICENSES
+  # has the licence texts. (licenses/ of the tree, on the boot partition and in the release .tar,
+  # has besides the texts for the firmware that packages/linux builds into the kernel.)
+  mkdir -p ${INSTALL}/usr/share/licenses/${PKG_NAME}
+    cp -p ${PKG_BUILD}/WHENCE ${INSTALL}/usr/share/licenses/${PKG_NAME}
+    cp -pR ${PKG_BUILD}/LICENSES ${INSTALL}/usr/share/licenses/${PKG_NAME}
+
   PKG_KERNEL_CFG_FILE=$(kernel_config_path) || die
 
   # The following files are RPi specific and installed by brcmfmac_sdio-firmware-rpi instead.

@@ -1,4 +1,6 @@
 @echo off
+rem SPDX-License-Identifier: GPL-2.0-or-later
+rem Copyright (C) 2026-present Hades
 rem LibreELEC Hades: test of the installer on a VIRTUAL disk (a .vhd file that Windows attaches as a disk).
 rem It touches no real disk: it makes the file in the folder "pruebas", installs Hades on it in both ways,
 rem updates it, removes it, checks that the test files are still intact and deletes the file.

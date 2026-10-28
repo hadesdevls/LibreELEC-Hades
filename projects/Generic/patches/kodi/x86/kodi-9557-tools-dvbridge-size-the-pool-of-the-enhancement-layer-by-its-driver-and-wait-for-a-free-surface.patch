@@ -1,0 +1,267 @@
+From 7bf6f0d2738a0a92fc2fb77f7847523608d5f816 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:20:26 +0000
+Subject: [PATCH] tools/dvbridge: size the pool of the enhancement layer by its
+ driver, and wait for a free surface
+
+The decoder of the enhancement layer had a fixed pool of 32 surfaces with
+every driver, reserved in full when the decoder opens (av_hwframe_ctx_init()
+makes them all): 32 P010 surfaces of 1920x1088, about 200 MB (computed;
+each driver's alignment adds to it), also where the layer holds a third of
+them. And a picture that found all of them held was a decoder failure: the
+layer left until its next random-access picture.
+
+The 32 is nvidia-vaapi-driver's: it gives a decoder context 32 picture
+indices whatever surfaces it is given (nvCreateContext(): 32 when it is
+given none, never more), and a surface decoded into beyond them takes the
+index of the one used least recently (acquirePictureIdxLocked()), which can
+be a reference that a later picture still needs. A fixed pool of 32 never
+has more surfaces than indices, so it stays with that driver, known by
+what it says it is ("VA-API NVDEC driver", vaQueryVendorString()), and with
+a driver that does not say. Any other one (Mesa's, Intel's iHD) takes
+surfaces as they come: there the pool is FFmpeg's own with VAAPI 1, one that
+grows as surfaces are needed, and the layer has as many as its pictures
+hold at once. Fixed pools from a libva without VAAPI 1 are sized as before.
+
+With either pool, an access unit of the layer is not given to its decoder
+while the layer holds 32 surfaces (counted since the commit before this
+one): it waits, as when the module's queue is full, until a picture gives
+one back (one that waits for its base picture is taken, or the screen is
+done with one). Its base pictures meanwhile wait for it as for any picture
+that is late, and go out without it when it is too late, as before. So a
+fixed pool has a surface for every picture (one that the decoder makes up
+for a missing reference can still find none, and says so), and one that
+grows never has more surfaces than the renderer's cache of their images
+has entries: that cache's size is now the same constant.
+
+Kodi logs, when a stream closes, the pool, the most surfaces held at once,
+and how many access units waited for one.
+
+Measured on the host (fel_rpu_test, BL_EL.mkv, as Kodi, 8 paired pictures
+held as by the screen; the layer needs 16 there): with an emulated fixed
+pool of 12 as the module's limit, before this the layer stopped 90 times
+for want of a surface and 469 of 2878 pictures were paired; now 2864
+access units waited for a surface, none found none, and 2876 pictures are
+paired, every one with the enhancement picture and the metadata it has in
+a run without a limit. Without a limit nothing waits, and the pictures of
+the runs are byte for byte those of before. Which pool a driver gets is
+checked with the vendor strings of nvidia-vaapi-driver, Mesa and iHD.
+---
+ tools/dvbridge/CMakeLists.txt                 |  4 +-
+ tools/dvbridge/dvbridge_dmabuf.c              |  5 +-
+ tools/dvbridge/dvbridge_fel.c                 | 62 +++++++++++++++++--
+ tools/dvbridge/dvbridge_fel.h                 | 10 ++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  9 +--
+ 5 files changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index af091c6..125740b 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -9,6 +9,8 @@ pkg_check_modules(DVAvcodec REQUIRED IMPORTED_TARGET libavcodec>=62)
+ pkg_check_modules(DVGles REQUIRED IMPORTED_TARGET glesv2)
+ pkg_check_modules(DVEgl REQUIRED IMPORTED_TARGET egl)
+ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
++# Hades: the enhancement layer asks its VAAPI driver what it is (dvbridge_fel.c, fixed_pool_driver())
++pkg_check_modules(DVVa REQUIRED IMPORTED_TARGET libva)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c
+@@ -18,4 +20,4 @@ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_ST
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+                                          PkgConfig::DVAvcodec PkgConfig::DVGles
+-                                         PkgConfig::DVEgl PkgConfig::DVDrm m)
++                                         PkgConfig::DVEgl PkgConfig::DVDrm PkgConfig::DVVa m)
+diff --git a/tools/dvbridge/dvbridge_dmabuf.c b/tools/dvbridge/dvbridge_dmabuf.c
+index ae2c91c..9756e03 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.c
++++ b/tools/dvbridge/dvbridge_dmabuf.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-3.0-or-later */
+ /* Import validated VAAPI DMA-BUF planes without copying decoded video to the CPU. */
+ #include "dvbridge_dmabuf.h"
++#include "dvbridge_fel.h"
+ #include <EGL/eglext.h>
+ #include <GLES3/gl3.h>
+ #include <GLES2/gl2ext.h>
+@@ -192,7 +193,9 @@ struct surface_identity {
+     int width, height;
+ };
+ 
+-#define CACHE_ENTRIES 32
++/* Hades: as many as the surfaces that the enhancement layer holds at most (dvbridge_fel.h), whose pool may grow as
++ * they are needed: the cache keeps the images of every one of them */
++#define CACHE_ENTRIES DVBRIDGE_FEL_SURFACES_MAX
+ 
+ struct cache_entry {
+     bool used;
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index 1dcb71a..62b034e 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -16,8 +16,8 @@
+ #define QUEUE_MAX 32
+ #define PACKET_BYTES_MAX (64u * 1024u * 1024u)
+ #define MAP_MAX (QUEUE_MAX * 2)
+-/* nvidia-vaapi-driver gives a decoder context at most 32 surfaces and fails the decode of any
+- * further surface for the rest of the context; a larger pool is never used safely. */
++/* The most surfaces the layer holds (dvbridge_fel.h), and the size of its fixed pool where it has one
++ * (fixed_pool_driver()) */
+ #define SURFACES_MAX DVBRIDGE_FEL_SURFACES_MAX
+ /* Base pictures between two attempts to open an enhancement decoder that failed to open. */
+ #define OPEN_RETRY_PICTURES 240
+@@ -278,6 +278,10 @@ struct dvbridge_fel {
+     AVBufferRef *surfaces;
+     unsigned surfaces_peak, surfaces_pool, surfaces_none_free, surfaces_uncounted;
+     bool surface_failed;
++    /* the most surfaces the layer may hold (SURFACES_MAX); the access units that waited for one to be given back,
++     * and whether the first one queued waits now (pump()) */
++    unsigned surface_limit, surface_waits;
++    bool surface_waiting;
+     char reason_text[320]; /* a reason made for this failure (surface_reason()) */
+ };
+ 
+@@ -476,6 +480,30 @@ void dvbridge_fel_surface_counts(const struct dvbridge_fel *f, struct dvbridge_f
+     out->pool = f->surfaces_pool;
+     out->none_free = f->surfaces_none_free;
+     out->uncounted = f->surfaces_uncounted;
++    out->limit = f->surface_limit;
++    out->waits = f->surface_waits;
++}
++
++/* Hades: whether the decoder of the layer has a fixed pool of SURFACES_MAX surfaces, by what its VAAPI driver says it
++ * is (vaQueryVendorString()).
++ * nvidia-vaapi-driver ("VA-API NVDEC driver [direct backend]" or "[egl backend]", vabackend.c) gives a decoder
++ * context 32 picture indices, whatever surfaces it is given (nvCreateContext(): 32 when it is given none, never
++ * more), and a surface decoded into beyond them takes the index of the one used least recently
++ * (acquirePictureIdxLocked()), which can be a reference that a later picture still needs. A fixed pool of 32 never has
++ * more surfaces than indices.
++ * Any other driver (Mesa's, for AMD; Intel's iHD) takes surfaces as they come: the pool grows as they are needed
++ * (FFmpeg's own with VAAPI 1, an initial_pool_size of 0), and the layer has as many as its pictures hold at once,
++ * not 32 from the start. A driver that does not say what it is keeps the fixed pool, as before. */
++static bool fixed_pool_vendor(const char *vendor)
++{
++    return !vendor || strstr(vendor, "NVDEC") != NULL;
++}
++
++static bool fixed_pool_driver(const AVBufferRef *device)
++{
++    const AVHWDeviceContext *d = device ? (const AVHWDeviceContext *)device->data : NULL;
++    const AVVAAPIDeviceContext *va = d && d->type == AV_HWDEVICE_TYPE_VAAPI ? d->hwctx : NULL;
++    return fixed_pool_vendor(va && va->display ? vaQueryVendorString(va->display) : NULL);
+ }
+ 
+ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+@@ -489,9 +517,14 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
+     if (avcodec_get_hw_frames_parameters(ctx, ctx->hw_device_ctx, AV_PIX_FMT_VAAPI, &frames) < 0)
+         return AV_PIX_FMT_NONE;
+     AVHWFramesContext *hw = (void *)frames->data;
+-    hw->initial_pool_size += QUEUE_MAX + 4;
+-    if (hw->initial_pool_size > SURFACES_MAX)
+-        hw->initial_pool_size = SURFACES_MAX; /* an exhausted pool fails a decode: resynchronized */
++    /* Hades: a fixed pool of SURFACES_MAX with nvidia-vaapi-driver; with any other driver the pool FFmpeg gives, which
++     * with VAAPI 1 grows as surfaces are needed (0). (A libva without VAAPI 1, which LibreELEC does not have, gets a
++     * fixed one sized by the references alone: the queue's own come on top, up to SURFACES_MAX, as before.) Either
++     * way the layer holds at most SURFACES_MAX (surface_limit, pump()). */
++    if (fixed_pool_driver(ctx->hw_device_ctx))
++        hw->initial_pool_size = SURFACES_MAX;
++    else if (hw->initial_pool_size > 0)
++        hw->initial_pool_size = FFMIN(hw->initial_pool_size + QUEUE_MAX + 4, SURFACES_MAX);
+     if (av_hwframe_ctx_init(frames) < 0) {
+         av_buffer_unref(&frames);
+         return AV_PIX_FMT_NONE;
+@@ -731,7 +764,7 @@ static void clear_queues(struct dvbridge_fel *f)
+     f->reason = NULL;
+     f->num_skipped = 0;
+     f->fed = f->stopping = f->stopped = f->resume = f->marked = false;
+-    f->surface_failed = false;
++    f->surface_failed = f->surface_waiting = false;
+ }
+ 
+ /* Hades: the random-access picture of the layer whose place was being counted gives way: the access units queued
+@@ -1005,6 +1038,7 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+     if (!f->surfaces)
+         goto fail;
+     atomic_init(&((struct surface_count *)f->surfaces->data)->live, 0);
++    f->surface_limit = SURFACES_MAX;
+     f->decoder = avcodec_alloc_context3(codec);
+     if (!prepare_decoder(f, f->decoder))
+         goto fail;
+@@ -1131,6 +1165,22 @@ static bool pump(struct dvbridge_fel *f)
+             f->marked = true;
+             ++f->not_decoded;
+         } else {
++            /* Hades: a picture of the layer needs a surface of its own, besides those its decoder holds (the new
++             * picture takes one before the decoder lets go of the references it no longer needs). While the layer
++             * holds as many as it may, the access unit waits, as when the queue is full, until a picture gives one
++             * back: one that waits for its base picture is taken (it goes on with it, or is dropped), or the screen
++             * is done with one. Its base pictures meanwhile wait for it as for any picture that is late, and go out
++             * without it if it is too late (Kodi's GetPairedPicture()). So a fixed pool has a surface for every
++             * picture, and one that grows never has more surfaces than the renderer keeps images of
++             * (dvbridge_dmabuf.c). (A picture of the layer that the decoder makes up in place of a reference that is
++             * missing takes one more: with a fixed pool, that one can find none free.) */
++            if (surfaces_live(f) >= f->surface_limit) {
++                if (!f->surface_waiting)
++                    ++f->surface_waits;
++                f->surface_waiting = true;
++                break;
++            }
++            f->surface_waiting = false;
+             if (f->resume) {
+                 /* Hades: the layer is decoded again from this random-access picture on. The
+                  * decoder starts again (it gave all it held), and a base picture presented before
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 3f11647..b7cf86a 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -69,8 +69,14 @@ const char *dvbridge_fel_reason(const struct dvbridge_fel *fel);
+  * with their base pictures (the renderer holds a few). A fixed pool whose surfaces are all held has none for the next
+  * picture, which then cannot be decoded: the module says so (dvbridge_fel_reason(): "no free surface for the
+  * enhancement layer: ..."), and the layer starts again as after any failure. The most surfaces any pool of the layer
+- * may have (nvidia-vaapi-driver's limit for a decoder context). */
++ * may have (nvidia-vaapi-driver's limit for a decoder context).
++ * The pool is a fixed one of DVBRIDGE_FEL_SURFACES_MAX with nvidia-vaapi-driver, and one that grows as surfaces are
++ * needed with any other driver; either way an enhancement access unit is not decoded while the layer holds
++ * DVBRIDGE_FEL_SURFACES_MAX surfaces (DVBRIDGE_FEL_WAITS_FOR_SURFACES): it waits, as when the module's queue is full,
++ * until a picture gives one back. So the renderer's cache of the images of the layer's surfaces (dvbridge_dmabuf.c)
++ * has room for every surface of the layer. */
+ #define DVBRIDGE_FEL_SURFACES_MAX 32
++#define DVBRIDGE_FEL_WAITS_FOR_SURFACES 1
+ struct dvbridge_fel_surfaces {
+     unsigned live;      /* held now */
+     unsigned peak;      /* held at most at once, since the stream was opened */
+@@ -78,6 +84,8 @@ struct dvbridge_fel_surfaces {
+                            needed, or none yet */
+     unsigned none_free; /* pictures of the layer that found no free surface */
+     unsigned uncounted; /* pictures whose surface could not be counted (live and peak are low by as many) */
++    unsigned limit;     /* the most the layer holds: an access unit waits while it holds as many */
++    unsigned waits;     /* access units that waited for a surface to be given back */
+ };
+ void dvbridge_fel_surface_counts(const struct dvbridge_fel *fel, struct dvbridge_fel_surfaces *out);
+ /* Enhancement packets discarded while waiting for a random-access point since the last reset. */
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index cfc37f6..265ce2c 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -822,12 +822,13 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   dvbridge_fel_surface_counts(m_dvFel.get(), &surfaces);
+   if (surfaces.peak || surfaces.none_free)
+     CLog::Log(LOGINFO,
+-              "DV FEL: at most {} surfaces of the enhancement layer were held at once ({}{}); {} pictures of the "
+-              "layer found none free{}",
++              "DV FEL: at most {} surfaces of the enhancement layer were held at once ({}{}, at most {}); {} "
++              "enhancement access units waited for one to be given back, and {} pictures of the layer found none "
++              "free{}",
+               surfaces.peak,
+               surfaces.pool ? "of the fixed pool of its decoder, " : "its decoder's pool grows as they are needed",
+-              surfaces.pool ? std::to_string(surfaces.pool) : std::string(), surfaces.none_free,
+-              surfaces.uncounted ? "; some pictures could not be counted" : "");
++              surfaces.pool ? std::to_string(surfaces.pool) : std::string(), surfaces.limit, surfaces.waits,
++              surfaces.none_free, surfaces.uncounted ? "; some pictures could not be counted" : "");
+   m_dvNotDecoded = 0;
+   m_dvNotDecodedLogged = false;
+   m_dvDecodedAgain = 0;
+-- 
+2.53.0
+

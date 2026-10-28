@@ -147,4 +147,18 @@ makeinstall_target() {
   # App profiles
   mkdir -p ${INSTALL}/usr/share/nvidia
     cp -P nvidia-application-profiles-${PKG_VERSION}-rc ${INSTALL}/usr/share/nvidia
+
+  # Hades: the image also carries NVIDIA's 580 driver for Maxwell, Pascal and Volta
+  # (nvidia-legacy), and kernel-overlays-setup chooses one at boot by the PCI IDs of the cards
+  # (scripts/stack-select). The names that user space opens (stack-names) go through
+  # /run/nvidia, which it points at the files of the driver chosen (scripts/stack-links); this
+  # driver's are in /usr/lib/nvidia/stacks/open. nvidia-smi goes with its release.
+  . ${PKG_DIR}/scripts/stack-functions
+  mkdir -p ${INSTALL}/usr/lib/nvidia/${PKG_VERSION} ${INSTALL}/usr/lib/nvidia/stacks
+    mv ${INSTALL}/usr/bin/nvidia-smi ${INSTALL}/usr/lib/nvidia/${PKG_VERSION}/nvidia-smi
+    ln -sf ../lib/nvidia/${PKG_VERSION}/nvidia-smi ${INSTALL}/usr/bin/nvidia-smi
+  nvidia_stack_targets ${INSTALL} ${PKG_DIR}/stack-names > ${INSTALL}/usr/lib/nvidia/stacks/open
+  nvidia_stack_redirect ${INSTALL} ${PKG_DIR}/stack-names
+    cp ${PKG_DIR}/scripts/stack-select ${PKG_DIR}/scripts/stack-links ${INSTALL}/usr/lib/nvidia
+    chmod 0755 ${INSTALL}/usr/lib/nvidia/stack-select ${INSTALL}/usr/lib/nvidia/stack-links
 }

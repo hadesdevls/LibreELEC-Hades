@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Draws the images under which LibreELEC Hades shows itself, in place of the logos and splash screens of
 # Kodi and of LibreELEC (Kodi's trademark policy: a modified build that the XBMC Foundation has not
 # approved does not use Kodi's name and logos as its own; and an unofficial build does not show the logo

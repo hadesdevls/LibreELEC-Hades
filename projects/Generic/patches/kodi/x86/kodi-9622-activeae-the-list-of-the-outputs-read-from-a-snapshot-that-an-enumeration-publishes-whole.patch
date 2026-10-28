@@ -1,0 +1,419 @@
+From c11674c95288210d74deb36bd0623b4d90fa02bb Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 07:07:44 +0000
+Subject: [PATCH] ActiveAE: the list of the outputs read from a snapshot that
+ an enumeration publishes whole
+
+CActiveAESink::EnumerateSinkList() made the list of the outputs of every driver again in place: it
+cleared m_sinkInfoList, then let the drivers fill it (CAESinkFactory::EnumerateEx(), which may take
+seconds, and tries again with a sleep of 1.5 s while nothing is found). Other threads read that
+vector meanwhile, with no lock: the settings and JSON-RPC (CActiveAE::EnumerateOutputDevices(), and
+the settings that ask what an output takes: SupportsRaw(), IsSettingVisible()), the thread of the
+sink (OpenSink(), GetDeviceFriendlyName(), NeedIECPacking()), and the output of the display that
+Hades looks for when a display comes or goes (CActiveAE::OutputOfTheDisplay()), which is exactly
+when the engine enumerates again. A reader could walk a vector being cleared or growing: entries
+destroyed or moved under it.
+
+Now the list is a snapshot, std::shared_ptr<const std::vector<AE::AESinkInfo>>, held in a
+std::atomic (C++20, as Kodi is built): EnumerateSinkList() makes the next list apart, with no lock
+held and with its retries as before, and publishes it whole when it is done; every reader of the
+list (fifteen of them) takes the snapshot of the moment once (SinkInfo()) and reads that, with no
+lock held, as long as it needs (a reference into it stays valid while the reader holds it). No
+reader waits for an enumeration, and none holds a lock while it calls other code. What each reader
+returns does not change; the readers read through const iterators and references, and PrintSinks()
+prints a copy of each output (its text is made by a member that is not const). The one difference
+is the moment between two lists: a reader on another thread goes on with the list before until the
+new one is published, where it used to see a list half made or none.
+
+Checked on the host: the readers, EnumerateSinkList() and the helpers of ActiveAESink.cpp as the
+tree has them, with the real AESinkFactory.h, AEDeviceInfo.cpp, AEChannelInfo.cpp and
+ActiveAEFollowDisplay.h, and drivers made for the test: every reader for twelve devices on two lists,
+and again after one driver is enumerated again, gives the same 30 lines of results before and after
+the change. An enumeration again and again on one thread and the readers on three others: on the code
+before, 157 data races under ThreadSanitizer and a heap-use-after-free under AddressSanitizer
+(GetFriendlyName() of an output that the enumeration had freed); with the snapshot, none, in six
+passes of 108000 reads each with ThreadSanitizer and with AddressSanitizer.
+---
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 107 +++++++++++-------
+ .../Engines/ActiveAE/ActiveAESink.h           |  15 ++-
+ 2 files changed, 79 insertions(+), 43 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index 572e0da..106783a 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -71,12 +71,13 @@ void CActiveAESink::Dispose()
+ AEDeviceType CActiveAESink::GetDeviceType(const std::string &device)
+ {
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
++  const auto sinks = SinkInfo();
+ 
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+-    for (AEDeviceInfoList::iterator itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
++    for (AEDeviceInfoList::const_iterator itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
+     {
+-      CAEDeviceInfo& info = *itt2;
++      const CAEDeviceInfo& info = *itt2;
+       if (info.m_deviceName == dev.name)
+         return info.m_deviceType;
+     }
+@@ -89,8 +90,9 @@ bool CActiveAESink::GetDisplayAudio(const std::string& device,
+                                     bool& displayThere) const
+ {
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
++  const auto sinks = SinkInfo();
+ 
+-  for (const auto& sink : m_sinkInfoList)
++  for (const auto& sink : *sinks)
+   {
+     if (sink.m_sinkName != dev.driver)
+       continue;
+@@ -113,11 +115,12 @@ bool CActiveAESink::GetDisplayAudio(const std::string& device,
+ 
+ bool CActiveAESink::HasPassthroughDevice()
+ {
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  const auto sinks = SinkInfo();
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+-    for (AEDeviceInfoList::iterator itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
++    for (AEDeviceInfoList::const_iterator itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
+     {
+-      CAEDeviceInfo& info = *itt2;
++      const CAEDeviceInfo& info = *itt2;
+       if (info.m_deviceType != AE_DEVTYPE_PCM && !info.m_streamTypes.empty())
+         return true;
+     }
+@@ -128,14 +131,15 @@ bool CActiveAESink::HasPassthroughDevice()
+ bool CActiveAESink::SupportsFormat(const std::string &device, AEAudioFormat &format)
+ {
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
++  const auto sinks = SinkInfo();
+ 
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+     if (dev.driver == itt->m_sinkName)
+     {
+       for (auto itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
+       {
+-        CAEDeviceInfo& info = *itt2;
++        const CAEDeviceInfo& info = *itt2;
+         if (info.m_deviceName == dev.name)
+         {
+           bool isRaw = format.m_dataFormat == AE_FMT_RAW;
+@@ -167,20 +171,20 @@ bool CActiveAESink::SupportsFormat(const std::string &device, AEAudioFormat &for
+               default:
+                 break;
+             }
+-            AEDataTypeList::iterator iit3;
++            AEDataTypeList::const_iterator iit3;
+             iit3 = find(info.m_streamTypes.begin(), info.m_streamTypes.end(), format.m_streamInfo.m_type);
+             formatExists = (iit3 != info.m_streamTypes.end());
+           }
+           else if (isRaw && !info.m_wantsIECPassthrough)
+           {
+             samplerate = 48000;
+-            AEDataTypeList::iterator iit3;
++            AEDataTypeList::const_iterator iit3;
+             iit3 = find(info.m_streamTypes.begin(), info.m_streamTypes.end(), format.m_streamInfo.m_type);
+             formatExists = (iit3 != info.m_streamTypes.end());
+           }
+           else // PCM case
+           {
+-            AEDataFormatList::iterator itt3;
++            AEDataFormatList::const_iterator itt3;
+             itt3 = find(info.m_dataFormats.begin(), info.m_dataFormats.end(), format.m_dataFormat);
+             formatExists = (itt3 != info.m_dataFormats.end());
+           }
+@@ -188,7 +192,7 @@ bool CActiveAESink::SupportsFormat(const std::string &device, AEAudioFormat &for
+           // check if samplerate is available
+           if (formatExists)
+           {
+-            AESampleRateList::iterator itt4;
++            AESampleRateList::const_iterator itt4;
+             itt4 = find(info.m_sampleRates.begin(), info.m_sampleRates.end(), samplerate);
+             return itt4 != info.m_sampleRates.end();
+           }
+@@ -210,14 +214,15 @@ bool CActiveAESink::NeedIECPacking()
+     return true;
+ 
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(m_device);
++  const auto sinks = SinkInfo();
+ 
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+     if (dev.driver == itt->m_sinkName)
+     {
+       for (auto itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
+       {
+-        CAEDeviceInfo& info = *itt2;
++        const CAEDeviceInfo& info = *itt2;
+         if (info.m_deviceName == dev.name)
+         {
+           return info.m_wantsIECPassthrough;
+@@ -232,8 +237,9 @@ bool CActiveAESink::DeviceExist(std::string driver, const std::string& device)
+ {
+   if (driver.empty() && m_sink)
+     driver = m_sink->GetName();
++  const auto sinks = SinkInfo();
+ 
+-  for (const auto& itt : m_sinkInfoList)
++  for (const auto& itt : *sinks)
+   {
+     if (itt.m_sinkName != driver)
+       continue;
+@@ -725,44 +731,53 @@ void CActiveAESink::OnExit()
+   RevertTask();
+ }
+ 
++std::shared_ptr<const CActiveAESink::SinkInfoList> CActiveAESink::SinkInfo() const
++{
++  return m_sinkInfo.load();
++}
++
+ void CActiveAESink::EnumerateSinkList(bool force, std::string driver)
+ {
+-  if (!m_sinkInfoList.empty() && !force)
++  const auto before = SinkInfo();
++  if (!before->empty() && !force)
+     return;
+ 
+   if (!CAESinkFactory::HasSinks())
+     return;
+ 
+-  std::vector<AE::AESinkInfo> tmpList(m_sinkInfoList);
+-
++  // Hades: the next list is made apart, with no lock held (the drivers may take seconds, and try
++  // again), and published whole when it is done (m_sinkInfo): a reader goes on with the list it has
++  // meanwhile, and never sees one half made.
++  SinkInfoList list;
+   unsigned int c_retry = 4;
+-  m_sinkInfoList.clear();
+ 
+   if (!driver.empty())
+   {
+-    for (auto const& info : tmpList)
++    for (auto const& info : *before)
+     {
+       if (info.m_sinkName != driver)
+-        m_sinkInfoList.push_back(info);
++        list.push_back(info);
+     }
+   }
+ 
+-  CAESinkFactory::EnumerateEx(m_sinkInfoList, false, driver);
+-  while (m_sinkInfoList.empty() && c_retry > 0)
++  CAESinkFactory::EnumerateEx(list, false, driver);
++  while (list.empty() && c_retry > 0)
+   {
+     CLog::Log(LOGINFO, "No Devices found - retry: {}", c_retry);
+     CThread::Sleep(1500ms);
+     c_retry--;
+     // retry the enumeration
+-    CAESinkFactory::EnumerateEx(m_sinkInfoList, true, driver);
++    CAESinkFactory::EnumerateEx(list, true, driver);
+   }
+-  CLog::Log(LOGINFO, "Found {} Lists of Devices", m_sinkInfoList.size());
++  CLog::Log(LOGINFO, "Found {} Lists of Devices", list.size());
++  m_sinkInfo.store(std::make_shared<const SinkInfoList>(std::move(list)));
+   PrintSinks(driver);
+ }
+ 
+ void CActiveAESink::PrintSinks(std::string& driver)
+ {
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  const auto sinks = SinkInfo();
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+     if (!driver.empty() && itt->m_sinkName != driver)
+       continue;
+@@ -772,7 +787,8 @@ void CActiveAESink::PrintSinks(std::string& driver)
+     for (auto itt2 = itt->m_deviceInfoList.begin(); itt2 != itt->m_deviceInfoList.end(); ++itt2)
+     {
+       CLog::Log(LOGINFO, "    Device {}", ++count);
+-      CAEDeviceInfo& info = *itt2;
++      // (a copy: its text is made by a member that is not const)
++      CAEDeviceInfo info = *itt2;
+       std::stringstream ss((std::string)info);
+       std::string line;
+       while(std::getline(ss, line, '\n'))
+@@ -868,10 +884,11 @@ std::string CActiveAESink::FollowDisplay(const std::string& device,
+   if (familyListed)
+     *familyListed = false;
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
++  const auto sinks = SinkInfo();
+   if (dev.driver.empty() || dev.name.empty())
+     return device;
+ 
+-  for (const auto& sink : m_sinkInfoList)
++  for (const auto& sink : *sinks)
+   {
+     if (sink.m_sinkName != dev.driver)
+       continue;
+@@ -924,10 +941,11 @@ bool CActiveAESink::IsMissingBesideItsFamily(const std::string& device) const
+ // Hades: as OpenSink() falls back
+ std::string CActiveAESink::FallbackOutput(bool passthrough) const
+ {
+-  if (m_sinkInfoList.empty() || m_sinkInfoList.front().m_deviceInfoList.empty())
++  const auto sinks = SinkInfo();
++  if (sinks->empty() || sinks->front().m_deviceInfoList.empty())
+     return {};
+ 
+-  const AE::AESinkInfo& firstSink = m_sinkInfoList.front();
++  const AE::AESinkInfo& firstSink = sinks->front();
+   const CAEDeviceInfo& first = firstSink.m_deviceInfoList.front();
+   const CAEDeviceInfo* other = DisplayOutputInstead(firstSink, first, passthrough);
+   return (other ? *other : first).ToDeviceString(firstSink.m_sinkName);
+@@ -938,10 +956,11 @@ std::string CActiveAESink::OutputOfTheDisplay(bool passthrough,
+                                               const KODI::UTILS::DisplayIdentity& driven,
+                                               INTERNAL::DisplayOutputFound& found) const
+ {
++  const auto sinks = SinkInfo();
+   using INTERNAL::FollowCandidate;
+   std::vector<INTERNAL::DisplayOutputCandidate> outputs;
+   std::vector<std::string> devices;
+-  for (const auto& sink : m_sinkInfoList)
++  for (const auto& sink : *sinks)
+   {
+     for (const auto& d : sink.m_deviceInfoList)
+     {
+@@ -967,7 +986,8 @@ std::string CActiveAESink::OutputOfTheDisplay(bool passthrough,
+ 
+ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool passthrough) const
+ {
+-  if (m_sinkInfoList.empty())
++  const auto sinks = SinkInfo();
++  if (sinks->empty())
+     return {};
+ 
+   const AESinkDevice dev = CAESinkFactory::ParseDevice(device);
+@@ -975,7 +995,7 @@ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool p
+   // find exact match of deviceName in same driver
+   if (!dev.driver.empty() && !dev.name.empty())
+   {
+-    for (const auto& sink : m_sinkInfoList)
++    for (const auto& sink : *sinks)
+     {
+       if (sink.m_sinkName != dev.driver)
+         continue;
+@@ -997,7 +1017,7 @@ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool p
+   // find same friendly name on other device in same driver
+   if (!dev.driver.empty() && !dev.friendlyName.empty())
+   {
+-    for (const auto& sink : m_sinkInfoList)
++    for (const auto& sink : *sinks)
+     {
+       if (sink.m_sinkName != dev.driver)
+         continue;
+@@ -1021,7 +1041,7 @@ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool p
+   // find default device of same driver or first device of same driver
+   if (!dev.driver.empty())
+   {
+-    for (const auto& sink : m_sinkInfoList)
++    for (const auto& sink : *sinks)
+     {
+       if (sink.m_sinkName != dev.driver)
+         continue;
+@@ -1056,7 +1076,7 @@ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool p
+   firstDevice.clear();
+ 
+   // find the default of any driver or first of any driver
+-  for (const auto& sink : m_sinkInfoList)
++  for (const auto& sink : *sinks)
+   {
+     for (const auto& d : sink.m_deviceInfoList)
+     {
+@@ -1084,8 +1104,9 @@ std::string CActiveAESink::ValidateOuputDevice(const std::string& device, bool p
+ void CActiveAESink::EnumerateOutputDevices(AEDeviceList &devices, bool passthrough)
+ {
+   EnumerateSinkList(false, "");
++  const auto sinks = SinkInfo();
+ 
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+     AESinkInfo sinkInfo = *itt;
+     for (AEDeviceInfoList::iterator itt2 = sinkInfo.m_deviceInfoList.begin(); itt2 != sinkInfo.m_deviceInfoList.end(); ++itt2)
+@@ -1108,7 +1129,7 @@ void CActiveAESink::EnumerateOutputDevices(AEDeviceList &devices, bool passthrou
+       std::stringstream ss;
+ 
+       /* add the sink name if we have more then one sink type */
+-      if (m_sinkInfoList.size() > 1)
++      if (sinks->size() > 1)
+         ss << sinkInfo.m_sinkName << ": ";
+ 
+       ss << devInfo.m_displayName;
+@@ -1122,9 +1143,10 @@ void CActiveAESink::EnumerateOutputDevices(AEDeviceList &devices, bool passthrou
+ 
+ void CActiveAESink::GetDeviceFriendlyName(const std::string& device)
+ {
++  const auto sinks = SinkInfo();
+   m_deviceFriendlyName = "Device not found";
+   /* Match the device and find its friendly name */
+-  for (auto itt = m_sinkInfoList.begin(); itt != m_sinkInfoList.end(); ++itt)
++  for (auto itt = sinks->begin(); itt != sinks->end(); ++itt)
+   {
+     AESinkInfo sinkInfo = *itt;
+     for (AEDeviceInfoList::iterator itt2 = sinkInfo.m_deviceInfoList.begin(); itt2 != sinkInfo.m_deviceInfoList.end(); ++itt2)
+@@ -1142,6 +1164,7 @@ void CActiveAESink::GetDeviceFriendlyName(const std::string& device)
+ void CActiveAESink::OpenSink()
+ {
+   bool passthrough = (m_requestedFormat.m_dataFormat == AE_FMT_RAW);
++  const auto sinks = SinkInfo();
+ 
+   AESinkDevice dev = CAESinkFactory::ParseDevice(m_device);
+ 
+@@ -1187,9 +1210,9 @@ void CActiveAESink::OpenSink()
+ 
+     // try first device in out list (or the output with the display in its place, as
+     // FollowDisplay() does; FallbackOutput() is this choice)
+-    if (!m_sink && !m_sinkInfoList.empty() && !m_sinkInfoList.front().m_deviceInfoList.empty())
++    if (!m_sink && !sinks->empty() && !sinks->front().m_deviceInfoList.empty())
+     {
+-      const AE::AESinkInfo& firstSink = m_sinkInfoList.front();
++      const AE::AESinkInfo& firstSink = sinks->front();
+       const CAEDeviceInfo& first = firstSink.m_deviceInfoList.front();
+       const CAEDeviceInfo* other = DisplayOutputInstead(firstSink, first, passthrough);
+       dev.driver = firstSink.m_sinkName;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+index 01dd398..6d2331b 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+@@ -19,8 +19,10 @@
+ #include "threads/Thread.h"
+ #include "utils/ActorProtocol.h"
+ 
++#include <atomic>
+ #include <memory>
+ #include <utility>
++#include <vector>
+ 
+ class CAEBitstreamPacker;
+ 
+@@ -189,7 +191,18 @@ protected:
+ 
+   std::string m_deviceFriendlyName;
+   std::string m_device;
+-  std::vector<AE::AESinkInfo> m_sinkInfoList;
++  //! Hades: the outputs of every driver as the last enumeration found them (EnumerateSinkList()),
++  //! published whole and never changed after it: a reader takes the list of the moment
++  //! (SinkInfo()) and reads it with no lock held, while an enumeration makes the next one apart.
++  //! The list used to be made again in place (cleared, then filled by the drivers, which may take
++  //! seconds and try again) while other threads read it: the settings and JSON-RPC
++  //! (EnumerateOutputDevices(), the settings that ask what an output takes), the thread of the
++  //! sink (OpenSink()), and the output of the display that is looked for when a display comes or
++  //! goes (OutputOfTheDisplay()), which is when the engine enumerates again.
++  using SinkInfoList = std::vector<AE::AESinkInfo>;
++  std::atomic<std::shared_ptr<const SinkInfoList>> m_sinkInfo{
++      std::make_shared<const SinkInfoList>()};
++  std::shared_ptr<const SinkInfoList> SinkInfo() const;
+   std::unique_ptr<IAESink> m_sink;
+   AEAudioFormat m_sinkFormat, m_requestedFormat;
+   CEngineStats *m_stats;
+-- 
+2.53.0
+

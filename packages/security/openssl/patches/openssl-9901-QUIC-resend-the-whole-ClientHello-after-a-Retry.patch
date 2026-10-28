@@ -1,0 +1,733 @@
+From ff2623da27e62c8f66bcf81add4f590aa1b6b0cb Mon Sep 17 00:00:00 2001
+From: Nikolas Gauder <nikolas.gauder@tum.de>
+Date: Wed, 21 Oct 2026 18:42:30 +0200
+Subject: [PATCH] QUIC: resend the whole ClientHello after a Retry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the client received a Retry, ch_retry() marked only its first
+Initial packet as pseudo-lost, assuming that the ClientHello fits in
+it.  Since 3.5 the default key shares (X25519MLKEM768 and X25519) put
+the ClientHello into two Initial packets.  The second one stayed in
+flight, so the client resent only the first part of the ClientHello,
+and the server could do no more than acknowledge it.  The rest was sent
+only once that acknowledgement had the second packet declared lost:
+one more round trip for every Retry, and a congestion event that halved
+the congestion window although nothing was lost.
+
+RFC 9002 section 6.3 has a client that receives a Retry reset its loss
+recovery state, as the server processed none of its Initial packets.
+Mark every Initial packet still in flight as pseudo-lost instead.
+ch_restart() marked only the first Initial packet after version
+negotiation in the same way.  It now shares the helper, so ch_retry()
+no longer needs drop_later_pn to work out which packet number to mark.
+
+A Version Negotiation packet and a Retry can be processed in the same
+batch of datagrams.  The first then leaves no Initial packet in flight
+for the second, and their data is already queued, so that is not an
+error.  test_quic_retry_after_version_neg covers this order.
+
+The SSL_trace reference recorded the extra round trip, and is updated.
+The radix forbidden_frame_types script injects a frame into the
+server's Initial packets.  With the whole ClientHello sent at once, a
+post-quantum ServerHello can fill the server's only Initial packet,
+leaving no room, so the script's server now uses classical groups.
+
+Fixes: f538b4215528 "QUIC_CHANNEL: Implementation"
+Fixes #33077
+Assisted-by: Claude:claude-opus-5-5
+
+Reviewed-by: Mounir Idrassi <mounir.idrassi@idrix.fr>
+Reviewed-by: Saša Nedvědický <sashan@openssl.org>
+Merge-date: Fri Oct 23 12:53:54 2026
+Merged-from: https://github.com/openssl/openssl/pull/33298
+(cherry picked from commit c69b5af10a754051274ef2e5ed17f47753bd6ea9)
+---
+ ssl/quic/quic_channel.c                       |  61 ++--
+ test/quicapitest.c                            | 340 ++++++++++++++++++
+ .../75-test_quicapi_data/ssltraceref-zlib.txt |  46 +--
+ .../75-test_quicapi_data/ssltraceref.txt      |  46 +--
+ 4 files changed, 390 insertions(+), 103 deletions(-)
+
+diff --git a/ssl/quic/quic_channel.c b/ssl/quic/quic_channel.c
+index dc62238..84a6dfc 100644
+--- a/ssl/quic/quic_channel.c
++++ b/ssl/quic/quic_channel.c
+@@ -46,8 +46,7 @@ static OSSL_TIME ch_determine_next_tick_deadline(QUIC_CHANNEL *ch);
+ static int ch_retry(QUIC_CHANNEL *ch,
+     const unsigned char *retry_token,
+     size_t retry_token_len,
+-    const QUIC_CONN_ID *retry_scid,
+-    int drop_later_pn);
++    const QUIC_CONN_ID *retry_scid);
+ static int ch_restart(QUIC_CHANNEL *ch);
+ 
+ static void ch_cleanup(QUIC_CHANNEL *ch);
+@@ -75,8 +74,7 @@ static void rxku_detected(QUIC_PN pn, void *arg);
+ static int ch_retry(QUIC_CHANNEL *ch,
+     const unsigned char *retry_token,
+     size_t retry_token_len,
+-    const QUIC_CONN_ID *retry_scid,
+-    int drop_later_pn);
++    const QUIC_CONN_ID *retry_scid);
+ static void ch_update_idle(QUIC_CHANNEL *ch);
+ static int ch_discard_el(QUIC_CHANNEL *ch,
+     uint32_t enc_level);
+@@ -2629,7 +2627,7 @@ static void ch_rx_handle_packet(QUIC_CHANNEL *ch, int channel_only)
+ 
+         if (!ch_retry(ch, ch->qrx_pkt->hdr->data,
+                 ch->qrx_pkt->hdr->len - QUIC_RETRY_INTEGRITY_TAG_LEN,
+-                &ch->qrx_pkt->hdr->src_conn_id, old_have_processed_any_pkt))
++                &ch->qrx_pkt->hdr->src_conn_id))
+             ossl_quic_channel_raise_protocol_error(ch, OSSL_QUIC_ERR_INTERNAL_ERROR,
+                 0, "handling retry packet");
+         break;
+@@ -2997,9 +2995,29 @@ void ossl_quic_channel_local_close(QUIC_CHANNEL *ch, uint64_t app_error_code,
+     ch_start_terminating(ch, &tcause, 0);
+ }
+ 
++/*
++ * Force the ACKM to consider every Initial packet still in flight as lost, so
++ * that the CRYPTO data they carried is sent again. None may be in flight, e.g.
++ * when a Version Negotiation packet has just had us mark them all and a Retry
++ * follows before we send again; their data is then already queued.
++ *
++ * Returns 1 on success, 0 on failure.
++ */
++static int ch_mark_initial_pkts_pseudo_lost(QUIC_CHANNEL *ch)
++{
++    OSSL_ACKM *ackm = ch->ackm;
++    QUIC_PN pn;
++
++    while (ossl_ackm_get_largest_unacked(ackm, QUIC_PN_SPACE_INITIAL, &pn))
++        if (!ossl_ackm_mark_packet_pseudo_lost(ackm, QUIC_PN_SPACE_INITIAL, pn))
++            return 0;
++
++    return 1;
++}
++
+ /**
+  * ch_restart - Restarts the QUIC channel by simulating loss of the initial
+- * packet. This forces the packet to be regenerated with the updated protocol
++ * packets. This forces them to be regenerated with the updated protocol
+  * version number.
+  *
+  * @ch: Pointer to the QUIC_CHANNEL structure.
+@@ -3009,22 +3027,19 @@ void ossl_quic_channel_local_close(QUIC_CHANNEL *ch, uint64_t app_error_code,
+ static int ch_restart(QUIC_CHANNEL *ch)
+ {
+     /*
+-     * Just pretend we lost our initial packet, so it gets
++     * Just pretend we lost our initial packets, so they get
+      * regenerated, with our updated protocol version number
+      */
+-    return ossl_ackm_mark_packet_pseudo_lost(ch->ackm, QUIC_PN_SPACE_INITIAL,
+-        /* PN= */ 0);
++    return ch_mark_initial_pkts_pseudo_lost(ch);
+ }
+ 
+ /* Called when a server asks us to do a retry. */
+ static int ch_retry(QUIC_CHANNEL *ch,
+     const unsigned char *retry_token,
+     size_t retry_token_len,
+-    const QUIC_CONN_ID *retry_scid,
+-    int drop_later_pn)
++    const QUIC_CONN_ID *retry_scid)
+ {
+     void *buf;
+-    QUIC_PN pn = 0;
+ 
+     /*
+      * RFC 9000 s. 17.2.5.1: "A client MUST discard a Retry packet that contains
+@@ -3061,24 +3076,16 @@ static int ch_retry(QUIC_CHANNEL *ch,
+     ch->doing_retry = 1;
+ 
+     /*
+-     * If a retry isn't our first response, we need to drop packet number
+-     * one instead (i.e. the case where we did version negotiation first
+-     */
+-    if (drop_later_pn == 1)
+-        pn = 1;
+-
+-    /*
+-     * We need to stimulate the Initial EL to generate the first CRYPTO frame
++     * We need to stimulate the Initial EL to generate the CRYPTO frames
+      * again. We can do this most cleanly by simply forcing the ACKM to consider
+-     * the first Initial packet as lost, which it effectively was as the server
+-     * hasn't processed it. This also maintains the desired behaviour with e.g.
+-     * PNs not resetting and so on.
++     * every Initial packet we have sent as lost, which they effectively were as
++     * the server hasn't processed them (RFC 9002 s. 6.3). This also maintains
++     * the desired behaviour with e.g. PNs not resetting and so on.
+      *
+-     * The PN we used initially is always zero, because QUIC does not allow
+-     * repeated retries.
++     * The ClientHello may span more than one Initial packet, so all of them
++     * must be marked, not only the first.
+      */
+-    if (!ossl_ackm_mark_packet_pseudo_lost(ch->ackm, QUIC_PN_SPACE_INITIAL,
+-            pn))
++    if (!ch_mark_initial_pkts_pseudo_lost(ch))
+         return 0;
+ 
+     /*
+diff --git a/test/quicapitest.c b/test/quicapitest.c
+index 9413361..fa6d608 100644
+--- a/test/quicapitest.c
++++ b/test/quicapitest.c
+@@ -26,6 +26,7 @@
+ #include "internal/quic_ssl.h"
+ #include "internal/quic_port.h"
+ #include "internal/quic_txp.h"
++#include "internal/quic_cc.h"
+ 
+ static OSSL_LIB_CTX *libctx = NULL;
+ static char *propq = NULL;
+@@ -3959,6 +3960,342 @@ err:
+     return ret;
+ }
+ 
++/*
++ * Test that after a Retry the client sends its whole ClientHello again at
++ * once, also when it spans more than one Initial packet. The server should
++ * then be able to answer the client's first flight after the Retry with its
++ * Handshake packets, without hearing from the client again. Nothing is lost,
++ * so the client's congestion window must not shrink either.
++ */
++static int test_quic_retry_split_client_hello(void)
++{
++#if !defined(OPENSSL_NO_ML_KEM) && !defined(OPENSSL_NO_ECX)
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
++    QUIC_CHANNEL *cch, *sch;
++    QUIC_PN pn;
++    OSSL_PARAM params[2];
++    uint64_t cwnd = 0, init_cwnd;
++    int testresult = 0, i, ret;
++
++    if (!TEST_ptr(sctx = create_server_ctx())
++        || !TEST_ptr(cctx = create_client_ctx()))
++        goto err;
++
++    /* This key share puts the ClientHello into two Initial packets. */
++    if (!TEST_true(SSL_CTX_set1_groups_list(cctx, "X25519MLKEM768")))
++        goto err;
++
++    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl)
++        || !TEST_ptr(cch = ossl_quic_conn_get_channel(clientssl)))
++        goto err;
++
++    params[0] = OSSL_PARAM_construct_uint64(OSSL_CC_OPTION_CUR_CWND_SIZE,
++        &cwnd);
++    params[1] = OSSL_PARAM_construct_end();
++    if (!TEST_true(cch->cc_method->bind_diagnostics(cch->cc_data, params)))
++        goto err;
++
++    init_cwnd = cwnd;
++
++    /* Send ClientHello and server retry */
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
++        goto err;
++
++    /* The ClientHello must have needed more than one Initial packet. */
++    pn = ossl_quic_tx_packetiser_get_next_pn(cch->txp, QUIC_PN_SPACE_INITIAL);
++    if (!TEST_uint64_t_ge(pn, 2))
++        goto err;
++
++    SSL_handle_events(qlistener);
++
++    /* The client processes the Retry and sends its ClientHello again. */
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
++        goto err;
++
++    /*
++     * Only the server runs now, so it must make do with what the client sent
++     * right after the Retry. If that was only the first part of the
++     * ClientHello, the server can do no more than ACK it, and sends no
++     * Handshake packets.
++     */
++    for (i = 0; i < 8; i++)
++        SSL_handle_events(qlistener);
++
++    if (!TEST_ptr(serverssl = SSL_accept_connection(qlistener, 0))
++        || !TEST_ptr(sch = ossl_quic_conn_get_channel(serverssl)))
++        goto err;
++
++    pn = ossl_quic_tx_packetiser_get_next_pn(sch->txp, QUIC_PN_SPACE_HANDSHAKE);
++    if (!TEST_uint64_t_gt(pn, 0))
++        goto err;
++
++    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE, 0, 0))
++        || !TEST_uint64_t_ge(cwnd, init_cwnd))
++        goto err;
++
++    testresult = 1;
++
++err:
++    SSL_CTX_free(cctx);
++    SSL_CTX_free(sctx);
++    SSL_free(clientssl);
++    SSL_free(serverssl);
++    SSL_free(qlistener);
++
++    return testresult;
++#else
++    return TEST_skip("ML-KEM or X25519 is not supported in this build");
++#endif
++}
++
++#if !defined(OPENSSL_NO_ML_KEM) && !defined(OPENSSL_NO_ECX)
++struct initial_version {
++    size_t to_alter;
++    QUIC_PKT_HDR hdr;
++};
++
++/*
++ * Packet mutator giving the next to_alter Initial packets the client sends a
++ * version the server does not support, so that the server answers each of
++ * them with a Version Negotiation packet.
++ */
++static int alter_initial_version(const QUIC_PKT_HDR *hdrin,
++    const OSSL_QTX_IOVEC *iovecin, size_t numin,
++    QUIC_PKT_HDR **hdrout,
++    const OSSL_QTX_IOVEC **iovecout,
++    size_t *numout,
++    void *arg)
++{
++    struct initial_version *iv = arg;
++
++    iv->hdr = *hdrin;
++    if (iv->to_alter > 0 && hdrin->type == QUIC_PKT_TYPE_INITIAL) {
++        iv->hdr.version = 0xdeadbeef;
++        --iv->to_alter;
++    }
++
++    *hdrout = &iv->hdr;
++    *iovecout = iovecin;
++    *numout = numin;
++    return 1;
++}
++#endif
++
++/*
++ * Test that the client copes with a Version Negotiation packet and a Retry
++ * that it processes together, before it sends again. The ClientHello spans
++ * two Initial packets, and only the first has an unsupported version, so the
++ * server answers that one with a Version Negotiation packet and the second
++ * with a Retry. The Version Negotiation packet leaves no Initial packet in
++ * flight when the Retry follows, but the ClientHello is already queued to be
++ * sent again, so the handshake must still complete.
++ */
++static int test_quic_retry_after_version_neg(void)
++{
++#if !defined(OPENSSL_NO_ML_KEM) && !defined(OPENSSL_NO_ECX)
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
++    QUIC_CHANNEL *cch;
++    QUIC_PN pn;
++    struct initial_version iv = { 0 };
++    int testresult = 0, i, ret;
++
++    if (!TEST_ptr(sctx = create_server_ctx())
++        || !TEST_ptr(cctx = create_client_ctx()))
++        goto err;
++
++    /* This key share puts the ClientHello into two Initial packets. */
++    if (!TEST_true(SSL_CTX_set1_groups_list(cctx, "X25519MLKEM768")))
++        goto err;
++
++    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl)
++        || !TEST_ptr(cch = ossl_quic_conn_get_channel(clientssl))
++        || !TEST_true(ossl_quic_channel_set_mutator(cch,
++            alter_initial_version, NULL, &iv)))
++        goto err;
++
++    iv.to_alter = 1;
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ)
++        || !TEST_size_t_eq(iv.to_alter, 0))
++        goto err;
++
++    /* The ClientHello must have needed more than one Initial packet. */
++    pn = ossl_quic_tx_packetiser_get_next_pn(cch->txp, QUIC_PN_SPACE_INITIAL);
++    if (!TEST_uint64_t_ge(pn, 2))
++        goto err;
++
++    /* The server answers with a Version Negotiation packet and a Retry. */
++    SSL_handle_events(qlistener);
++
++    /* The client reads and processes both before it sends again. */
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ)
++        || !TEST_true(cch->doing_retry))
++        goto err;
++
++    for (i = 0; i < 8; i++)
++        SSL_handle_events(qlistener);
++
++    if (!TEST_ptr(serverssl = SSL_accept_connection(qlistener, 0))
++        || !TEST_true(create_bare_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE, 0, 0)))
++        goto err;
++
++    testresult = 1;
++
++err:
++    SSL_CTX_free(cctx);
++    SSL_CTX_free(sctx);
++    SSL_free(clientssl);
++    SSL_free(serverssl);
++    SSL_free(qlistener);
++
++    return testresult;
++#else
++    return TEST_skip("ML-KEM or X25519 is not supported in this build");
++#endif
++}
++
++/*
++ * Test that the client sends its whole ClientHello again after a Version
++ * Negotiation packet, also when it spans more than one Initial packet. Every
++ * Initial packet the client sends first has an unsupported version, so the
++ * server answers with Version Negotiation packets alone.
++ *
++ * Test 0: The server does not validate addresses, so it answers the
++ *         ClientHello the client sends after Version Negotiation with its
++ *         Handshake packets, without hearing from the client again.
++ * Test 1: The server answers that ClientHello with a Retry, which the client
++ *         processes on a later tick. The Retry has the ClientHello sent again
++ *         anyway, so the client must have sent it whole before.
++ */
++static int test_quic_version_neg_split_client_hello(int idx)
++{
++#if !defined(OPENSSL_NO_ML_KEM) && !defined(OPENSSL_NO_ECX)
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
++    BIO *sbio;
++    QUIC_CHANNEL *cch, *sch;
++    QUIC_PN first_pn, pn;
++    struct initial_version iv = { 0 };
++    int testresult = 0, i, ret;
++
++    if (!TEST_ptr(sctx = create_server_ctx())
++        || !TEST_ptr(cctx = create_client_ctx()))
++        goto err;
++
++    /* This key share puts the ClientHello into two Initial packets. */
++    if (!TEST_true(SSL_CTX_set1_groups_list(cctx, "X25519MLKEM768")))
++        goto err;
++
++    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl)
++        || !TEST_ptr(cch = ossl_quic_conn_get_channel(clientssl))
++        || !TEST_true(ossl_quic_channel_set_mutator(cch,
++            alter_initial_version, NULL, &iv)))
++        goto err;
++
++    if (idx == 0) {
++        /* Replace the listener with one that does not validate addresses. */
++        sbio = SSL_get_rbio(qlistener);
++        if (!TEST_true(BIO_up_ref(sbio)))
++            goto err;
++        SSL_free(qlistener);
++        qlistener = SSL_new_listener(sctx, SSL_LISTENER_FLAG_NO_VALIDATE);
++        if (!TEST_ptr(qlistener)) {
++            BIO_free(sbio);
++            goto err;
++        }
++        SSL_set_bio(qlistener, sbio, sbio);
++        if (!TEST_true(SSL_listen(qlistener)))
++            goto err;
++    }
++
++    iv.to_alter = SIZE_MAX;
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
++        goto err;
++    iv.to_alter = 0;
++
++    /* The ClientHello must have needed more than one Initial packet. */
++    first_pn = ossl_quic_tx_packetiser_get_next_pn(cch->txp,
++        QUIC_PN_SPACE_INITIAL);
++    if (!TEST_uint64_t_ge(first_pn, 2))
++        goto err;
++
++    /* The server answers with Version Negotiation packets. */
++    SSL_handle_events(qlistener);
++
++    /* The client processes them and sends its ClientHello again. */
++    ret = SSL_connect(clientssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ)
++        || !TEST_false(cch->doing_retry))
++        goto err;
++
++    /*
++     * The whole ClientHello takes as many Initial packets as it did the first
++     * time. If only its first part was sent again, the rest waits for loss
++     * detection.
++     */
++    pn = ossl_quic_tx_packetiser_get_next_pn(cch->txp, QUIC_PN_SPACE_INITIAL);
++    if (!TEST_uint64_t_ge(pn - first_pn, first_pn))
++        goto err;
++
++    if (idx == 1) {
++        /* The server answers with a Retry, and the client processes it. */
++        SSL_handle_events(qlistener);
++
++        ret = SSL_connect(clientssl);
++        if (!TEST_int_le(ret, 0)
++            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ)
++            || !TEST_true(cch->doing_retry))
++            goto err;
++    }
++
++    /*
++     * Only the server runs now, so it must make do with what the client sent
++     * last.
++     */
++    for (i = 0; i < 8; i++)
++        SSL_handle_events(qlistener);
++
++    if (!TEST_ptr(serverssl = SSL_accept_connection(qlistener, 0))
++        || !TEST_ptr(sch = ossl_quic_conn_get_channel(serverssl)))
++        goto err;
++
++    pn = ossl_quic_tx_packetiser_get_next_pn(sch->txp, QUIC_PN_SPACE_HANDSHAKE);
++    if (!TEST_uint64_t_gt(pn, 0))
++        goto err;
++
++    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE, 0, 0)))
++        goto err;
++
++    testresult = 1;
++
++err:
++    SSL_CTX_free(cctx);
++    SSL_CTX_free(sctx);
++    SSL_free(clientssl);
++    SSL_free(serverssl);
++    SSL_free(qlistener);
++
++    return testresult;
++#else
++    return TEST_skip("ML-KEM or X25519 is not supported in this build");
++#endif
++}
++
+ static SSL *quic_verify_ssl = NULL;
+ 
+ static int quic_verify_cb(int ok, X509_STORE_CTX *ctx)
+@@ -5048,6 +5385,9 @@ int setup_tests(void)
+     ADD_TEST(test_ssl_accept_connection);
+     ADD_TEST(test_quic_amplification_limit);
+     ADD_TEST(test_quic_retry_token_refused);
++    ADD_TEST(test_quic_retry_split_client_hello);
++    ADD_TEST(test_quic_retry_after_version_neg);
++    ADD_ALL_TESTS(test_quic_version_neg_split_client_hello, 2);
+     ADD_TEST(test_ssl_set_verify);
+     ADD_TEST(test_accept_stream);
+     ADD_TEST(test_reject_stream_gc);
+diff --git a/test/recipes/75-test_quicapi_data/ssltraceref-zlib.txt b/test/recipes/75-test_quicapi_data/ssltraceref-zlib.txt
+index 1bce022..7a6c75f 100644
+--- a/test/recipes/75-test_quicapi_data/ssltraceref-zlib.txt
++++ b/test/recipes/75-test_quicapi_data/ssltraceref-zlib.txt
+@@ -126,7 +126,7 @@ Sent Packet
+   Packet Number: 0x00000002
+ Sent Frame: Crypto
+     Offset: 1098
+-    Len: 60
++    Len: ?
+ Sent Frame: Padding
+ Sent Packet
+   Packet Type: Initial
+@@ -142,36 +142,6 @@ Sent Datagram
+   Length: 1200
+ Received Datagram
+   Length: 1200
+-Received Packet
+-  Packet Type: Initial
+-  Version: 0x00000001
+-  Destination Conn Id: <zero length id>
+-  Source Conn Id: 0x?
+-  Payload length: 1178
+-  Token: <zero length token>
+-  Packet Number: 0x00000000
+-Received Frame: Ack  (without ECN)
+-    Largest acked: 3
+-    Ack delay (raw) 0
+-    Ack range count: 0
+-    First ack range: 1
+-Received Frame: Padding
+-Sent Frame: Crypto
+-    Offset: 1158
+-    Len: ?
+-Sent Frame: Padding
+-Sent Packet
+-  Packet Type: Initial
+-  Version: 0x00000001
+-  Destination Conn Id: 0x?
+-  Source Conn Id: <zero length id>
+-  Payload length: 1118
+-  Token: ?
+-  Packet Number: 0x00000004
+-Sent Datagram
+-  Length: 1200
+-Received Datagram
+-  Length: 1200
+ Received Datagram
+   Length: 1199
+ Received Datagram
+@@ -183,7 +153,7 @@ Received Packet
+   Source Conn Id: 0x?
+   Payload length: 1178
+   Token: <zero length token>
+-  Packet Number: 0x00000001
++  Packet Number: 0x00000000
+ Received Packet
+   Packet Type: Initial
+   Version: 0x00000001
+@@ -191,12 +161,12 @@ Received Packet
+   Source Conn Id: 0x?
+   Payload length: 45
+   Token: <zero length token>
+-  Packet Number: 0x00000002
++  Packet Number: 0x00000001
+ Received Frame: Ack  (without ECN)
+-    Largest acked: 4
++    Largest acked: 3
+     Ack delay (raw) 0
+     Ack range count: 0
+-    First ack range: 2
++    First ack range: 1
+ Received Frame: Crypto
+     Offset: 0
+     Len: 1153
+@@ -373,10 +343,10 @@ Header:
+       verify_data (len=32): ?
+ 
+ Sent Frame: Ack  (without ECN)
+-    Largest acked: 2
++    Largest acked: 1
+     Ack delay (raw) 0
+     Ack range count: 0
+-    First ack range: 2
++    First ack range: 1
+ Sent Frame: Ack  (without ECN)
+     Largest acked: 1
+     Ack delay (raw) 0
+@@ -393,7 +363,7 @@ Sent Packet
+   Source Conn Id: <zero length id>
+   Payload length: 1037
+   Token: ?
+-  Packet Number: 0x00000005
++  Packet Number: 0x00000004
+ Sent Packet
+   Packet Type: Handshake
+   Version: 0x00000001
+diff --git a/test/recipes/75-test_quicapi_data/ssltraceref.txt b/test/recipes/75-test_quicapi_data/ssltraceref.txt
+index 300b4ca..c3d56b3 100644
+--- a/test/recipes/75-test_quicapi_data/ssltraceref.txt
++++ b/test/recipes/75-test_quicapi_data/ssltraceref.txt
+@@ -124,7 +124,7 @@ Sent Packet
+   Packet Number: 0x00000002
+ Sent Frame: Crypto
+     Offset: 1098
+-    Len: 60
++    Len: ?
+ Sent Frame: Padding
+ Sent Packet
+   Packet Type: Initial
+@@ -140,36 +140,6 @@ Sent Datagram
+   Length: 1200
+ Received Datagram
+   Length: 1200
+-Received Packet
+-  Packet Type: Initial
+-  Version: 0x00000001
+-  Destination Conn Id: <zero length id>
+-  Source Conn Id: 0x?
+-  Payload length: 1178
+-  Token: <zero length token>
+-  Packet Number: 0x00000000
+-Received Frame: Ack  (without ECN)
+-    Largest acked: 3
+-    Ack delay (raw) 0
+-    Ack range count: 0
+-    First ack range: 1
+-Received Frame: Padding
+-Sent Frame: Crypto
+-    Offset: 1158
+-    Len: ?
+-Sent Frame: Padding
+-Sent Packet
+-  Packet Type: Initial
+-  Version: 0x00000001
+-  Destination Conn Id: 0x?
+-  Source Conn Id: <zero length id>
+-  Payload length: 1118
+-  Token: ?
+-  Packet Number: 0x00000004
+-Sent Datagram
+-  Length: 1200
+-Received Datagram
+-  Length: 1200
+ Received Datagram
+   Length: 1199
+ Received Datagram
+@@ -181,7 +151,7 @@ Received Packet
+   Source Conn Id: 0x?
+   Payload length: 1178
+   Token: <zero length token>
+-  Packet Number: 0x00000001
++  Packet Number: 0x00000000
+ Received Packet
+   Packet Type: Initial
+   Version: 0x00000001
+@@ -189,12 +159,12 @@ Received Packet
+   Source Conn Id: 0x?
+   Payload length: 45
+   Token: <zero length token>
+-  Packet Number: 0x00000002
++  Packet Number: 0x00000001
+ Received Frame: Ack  (without ECN)
+-    Largest acked: 4
++    Largest acked: 3
+     Ack delay (raw) 0
+     Ack range count: 0
+-    First ack range: 2
++    First ack range: 1
+ Received Frame: Crypto
+     Offset: 0
+     Len: 1153
+@@ -371,10 +341,10 @@ Header:
+       verify_data (len=32): ?
+ 
+ Sent Frame: Ack  (without ECN)
+-    Largest acked: 2
++    Largest acked: 1
+     Ack delay (raw) 0
+     Ack range count: 0
+-    First ack range: 2
++    First ack range: 1
+ Sent Frame: Ack  (without ECN)
+     Largest acked: 1
+     Ack delay (raw) 0
+@@ -391,7 +361,7 @@ Sent Packet
+   Source Conn Id: <zero length id>
+   Payload length: 1037
+   Token: ?
+-  Packet Number: 0x00000005
++  Packet Number: 0x00000004
+ Sent Packet
+   Packet Type: Handshake
+   Version: 0x00000001

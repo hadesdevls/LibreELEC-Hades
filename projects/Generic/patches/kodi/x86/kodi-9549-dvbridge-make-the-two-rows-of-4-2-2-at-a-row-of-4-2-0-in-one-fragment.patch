@@ -1,0 +1,257 @@
+From bfbb3f8cd5d3e686a41b81e921f590ca44dbf65f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:57:30 +0000
+Subject: [PATCH] dvbridge: make the two rows of 4:2:2 at a row of 4:2:0 in one
+ fragment
+
+Pass 2 of the source transport (dvbridge_source_rows()) made the chroma of
+each row of 4:2:2 from the rows of 4:2:0 in two draws, one for each parity
+of row, into a texture whose first half held the even rows and its second
+half the odd ones. The two rows of a pair read the same rows of 4:2:0 but
+one, and each fetched them on its own: with HEVC's chroma location (left:
+both filters are 12-tap Lanczos, a quarter row apart) 24 fetches of RG32F
+for the two rows; with UHD Blu-ray's (top left: one sample, and 12) 13.
+
+Now one draw makes both: a fragment for each row of 4:2:0 fetches the rows
+that the two filters read once (13 with HEVC's location, 12 with UHD
+Blu-ray's: ROWS_SPAN is 13 at most for every location that
+dvbridge_source_setup() takes) and writes the two rows into one texel of
+RGBA16UI (the even row in rg, the odd one in ba); the passes that read the
+rows (COMMON's pair_chroma()) take their half of it. The sums are the same
+integer sums, with the same weights, rounding and clamp, so the codes are
+the same by construction; rows_half and the second draw are gone.
+
+Proved on a software OpenGL ES (zink on lavapipe):
+- rows_test.c computes the integer filter of dvbridge_source.h on the CPU
+  and compares every code of pass 2 with it, for eight chroma locations,
+  three pictures (the raster, 1920x1080 at 960,540, and 1280x537 at an odd
+  row), three sets of margins, with and without all: 530 657 280 codes, all
+  the same, with the bridge before and with this one;
+- the packed transport of the FEL test stream through pass 4, in both
+  transports and with seven kinds of things drawn over it (the cover test
+  of 1.0 RC3), and the direct way of the source transport: the bytes of
+  every frame are the same as before (29 frames).
+Fetches of pass 2 for a pair of rows: 24 -> 13 (left, centre), 13 -> 12
+(top left, top, bottom). How many milliseconds that is on a GPU: not
+measured.
+---
+ tools/dvbridge/dvbridge_source.c | 106 ++++++++++++++++++-------------
+ 1 file changed, 63 insertions(+), 43 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 531930d..c76e6c3 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -178,9 +178,13 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+ /* --- the packer ---
+  *  1. (chroma that is not on the even luma column only) the chroma moved onto it, horizontally;
+  *  2. the chroma of every row of 4:2:2, from the rows of 4:2:0: in a texture of 16-bit integers
+- *     whose first half holds the even rows of the picture and its second half the odd ones, drawn
+- *     in two draws so that every fragment of one runs the same filter (one sample, or 12)
+- *     (dvbridge_source_rows());
++ *     with a texel for each row of 4:2:0, which holds the chroma of the two rows of 4:2:2 at it
++ *     (the even one in rg, the odd one in ba), each with its own filter (one sample, or 12)
++ *     (dvbridge_source_rows()). Hades: it was a texel for each row of 4:2:2, the even rows in its
++ *     first half and the odd ones in its second, drawn in two draws: the two filters of a pair of
++ *     rows read the same rows of 4:2:0 but one, and each read them on its own (24 fetches for the
++ *     two rows with HEVC's chroma location, 13 for UHD Blu-ray's); now a fragment reads each row
++ *     once (13, and 12) and makes both rows, with the same integer sums;
+  *  3. where Kodi draws over the video, the picture it draws over (dvbridge_source_picture());
+  *  4. the transport: per pixel its luma, the chroma of its pair, the metadata bit
+  *     (dvbridge_source_pack()).
+@@ -253,9 +257,12 @@ static const char RESITE[] =
+     "    color = vec4(vec2(acc), 0.0, 1.0);\n"
+     "}\n";
+ 
+-/* 2. The rows of 4:2:2 of one parity: fragment row i of the draw is row 2 i + parity of the picture,
+- * at row i + offset of the texture. Only the columns and rows that the transport reads (the active
+- * picture) are computed. */
++/* 2. The rows of 4:2:2 at a row of 4:2:0: fragment row i of the draw is rows 2 i (rg) and 2 i + 1
++ * (ba) of the picture. Each is the filter of its parity over rows i + first ... of 4:2:0, as the
++ * draw of each parity computed it before, in the same integer sums; the rows that the two read,
++ * i + lo ... i + lo + span - 1 (13 at most, ROWS_SPAN), are fetched once. Only the columns and rows
++ * that the transport reads (the active picture) are computed; the others are 0, as before. */
++#define ROWS_SPAN 13
+ static const char ROWS[] =
+     "#version 300 es\n"
+     "precision highp float;\n"
+@@ -263,26 +270,37 @@ static const char ROWS[] =
+     "uniform highp sampler2D chroma_plane;\n"
+     "uniform float chroma_read;\n" /* the factor from a chroma value to an integer */
+     "uniform int chroma_shift;\n"  /* 14 + the fractional bits of the chroma read */
+-    "uniform int taps, first, parity, row_offset, last_row, code_max;\n"
+-    "uniform int weights[12];\n"
++    "uniform int lo, span;\n"      /* the rows read, from i + lo, relative to row i of 4:2:0 */
++    "uniform int taps0, first0, taps1, first1, last_row, code_max;\n"
++    "uniform int weights0[12], weights1[12];\n"
+     "uniform ivec4 needed;\n" /* columns x0..x1 and rows y0..y1 (of the picture) read */
+     "out uvec4 color;\n"
+     "void main()\n"
+     "{\n"
+     "    ivec2 q = ivec2(gl_FragCoord.xy);\n"
+-    "    int r = 2 * (q.y - row_offset) + parity;\n"
+-    "    if (q.x < needed.x || q.x >= needed.y || r < needed.z || r >= needed.w) {\n"
++    "    bool column = q.x >= needed.x && q.x < needed.y;\n"
++    "    bool even = column && 2 * q.y >= needed.z && 2 * q.y < needed.w;\n"
++    "    bool odd = column && 2 * q.y + 1 >= needed.z && 2 * q.y + 1 < needed.w;\n"
++    "    if (!even && !odd) {\n"
+     "        color = uvec4(0u);\n"
+     "        return;\n"
+     "    }\n"
+-    "    int base = (r >> 1) + first;\n"
+-    "    ivec2 acc = ivec2(0);\n"
+-    "    for (int i = 0; i < taps; i++) {\n"
+-    "        vec2 v = texelFetch(chroma_plane, ivec2(q.x, clamp(base + i, 0, last_row)), 0).rg;\n"
+-    "        acc += weights[i] * ivec2(floor(v * chroma_read + 0.5));\n"
++    "    ivec2 v[" DRAWN_STRING(ROWS_SPAN) "];\n"
++    "    for (int k = 0; k < span; k++) {\n"
++    "        int row = clamp(q.y + lo + k, 0, last_row);\n"
++    "        vec2 c = texelFetch(chroma_plane, ivec2(q.x, row), 0).rg;\n"
++    "        v[k] = ivec2(floor(c * chroma_read + 0.5));\n"
+     "    }\n"
+-    "    acc = (acc + (1 << (chroma_shift - 1))) >> chroma_shift;\n"
+-    "    color = uvec4(uvec2(clamp(acc, ivec2(0), ivec2(code_max))), 0u, 0u);\n"
++    "    ivec2 a0 = ivec2(0), a1 = ivec2(0);\n"
++    "    for (int k = 0; k < taps0; k++)\n"
++    "        a0 += weights0[k] * v[first0 - lo + k];\n"
++    "    for (int k = 0; k < taps1; k++)\n"
++    "        a1 += weights1[k] * v[first1 - lo + k];\n"
++    "    a0 = (a0 + (1 << (chroma_shift - 1))) >> chroma_shift;\n"
++    "    a1 = (a1 + (1 << (chroma_shift - 1))) >> chroma_shift;\n"
++    "    uvec2 c0 = even ? uvec2(clamp(a0, ivec2(0), ivec2(code_max))) : uvec2(0u);\n"
++    "    uvec2 c1 = odd ? uvec2(clamp(a1, ivec2(0), ivec2(code_max))) : uvec2(0u);\n"
++    "    color = uvec4(c0, c1);\n"
+     "}\n";
+ 
+ /* What passes 3 and 4 share, the same code in both: the codes of the transport at a pixel and the
+@@ -292,12 +310,11 @@ static const char ROWS[] =
+     "precision highp float;\n"                                                                    \
+     "precision highp int;\n"                                                                      \
+     "uniform highp sampler2D luma_plane;\n"                                                       \
+-    "uniform highp usampler2D chroma_rows;\n" /* pass 2: even rows, then odd ones from rows_half */ \
++    "uniform highp usampler2D chroma_rows;\n" /* pass 2: rows 2 i (rg) and 2 i + 1 (ba) at row i */ \
+     "uniform ivec4 picture_rect;\n" /* x, y, width, height on the raster */                       \
+     "uniform ivec4 active_rect;\n"  /* x0, y0, x1, y1 of the active picture */                    \
+     "uniform ivec3 black;\n"                                                                      \
+     "uniform float code_scale;\n" /* 2^bits */                                                    \
+-    "uniform int rows_half;\n"                                                                    \
+     "uniform mat3 ycc_forward, lms_forward;\n"                                                    \
+     "uniform vec3 ycc_offset;\n"                                                                  \
+     "uniform int affine;\n"                                                                       \
+@@ -320,8 +337,8 @@ static const char ROWS[] =
+     "    if (!inside(ex, y))\n"                                                                   \
+     "        return uvec2(black.yz);\n"                                                           \
+     "    int r = y - picture_rect.y;\n"                                                           \
+-    "    return texelFetch(chroma_rows, ivec2((ex - picture_rect.x) >> 1,\n"                      \
+-    "                                         (r & 1) * rows_half + (r >> 1)), 0).rg;\n"          \
++    "    uvec4 t = texelFetch(chroma_rows, ivec2((ex - picture_rect.x) >> 1, r >> 1), 0);\n"      \
++    "    return (r & 1) != 0 ? t.ba : t.rg;\n"                                                    \
+     "}\n"                                                                                         \
+     /* the codes of a pixel: its luma, the chroma of its pair, at an odd pixel halfway to the next \
+      * pair's (the chroma of 4:2:2 is on the even pixels) */                                      \
+@@ -889,12 +906,10 @@ struct texture {
+ 
+ /* the uniforms of COMMON, in a program that has them */
+ struct common_uniforms {
+-    GLint luma, rows, picture, active, black, code_scale, half, ycc_forward, lms_forward, offset,
+-        affine;
++    GLint luma, rows, picture, active, black, code_scale, ycc_forward, lms_forward, offset, affine;
+ };
+ static const char *const COMMON_NAMES[] = {"luma_plane", "chroma_rows", "picture_rect",
+-    "active_rect", "black", "code_scale", "rows_half", "ycc_forward", "lms_forward", "ycc_offset",
+-    "affine"};
++    "active_rect", "black", "code_scale", "ycc_forward", "lms_forward", "ycc_offset", "affine"};
+ 
+ /* the uniforms of pass 4 besides COMMON's (Hades: in either of its forms) */
+ struct pack_uniforms {
+@@ -925,7 +940,7 @@ struct dvbridge_source_packer {
+     int tiles_mode;
+     /* what the rows of `chroma` are of (dvbridge_source_rows()) */
+     bool rows_made;
+-    int rows_of[8], rows_half;
++    int rows_of[8];
+     struct common_uniforms pc, cc; /* of pass 4 and of pass 3 */
+     struct pack_uniforms u;
+     /* Hades: pass 8, its uniforms, the codes that it writes, and the form of pass 4 that takes them
+@@ -979,8 +994,8 @@ struct dvbridge_source_packer {
+         GLint chroma, code_scale, taps, first, last_col, weights;
+     } h;
+     struct {
+-        GLint chroma, chroma_read, chroma_shift, taps, first, parity, offset, last_row, code_max,
+-            weights, needed;
++        GLint chroma, chroma_read, chroma_shift, lo, span, taps0, first0, taps1, first1, last_row,
++            code_max, weights0, weights1, needed;
+     } v;
+ };
+ 
+@@ -1060,8 +1075,9 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+         "drawn_tiles", "tiles_mode", "tiles_flip", "flags"};
+     static const char *const resite[] = {"chroma_plane", "code_scale", "taps", "first", "last_col",
+                                          "weights"};
+-    static const char *const rows[] = {"chroma_plane", "chroma_read", "chroma_shift", "taps",
+-        "first", "parity", "row_offset", "last_row", "code_max", "weights", "needed"};
++    static const char *const rows[] = {"chroma_plane", "chroma_read", "chroma_shift", "lo", "span",
++        "taps0", "first0", "taps1", "first1", "last_row", "code_max", "weights0", "weights1",
++        "needed"};
+     _Static_assert(sizeof(struct common_uniforms) == COUNT(COMMON_NAMES) * sizeof(GLint),
+                    "common uniforms");
+     _Static_assert(sizeof(p->u) == COUNT(pack) * sizeof(GLint), "pack uniforms");
+@@ -1323,7 +1339,14 @@ bool dvbridge_source_rows(struct dvbridge_source_packer *p,
+         glDrawArrays(GL_TRIANGLES, 0, 3);
+         chroma_in = p->resited.texture;
+     }
+-    if (!target(&p->chroma, GL_RG16UI, cw, 2 * half))
++    /* the rows of 4:2:0 that the filters of the two parities read, relative to row i: one fetch
++     * each in pass 2 */
++    const int lo0 = params->vfirst[0], hi0 = params->vfirst[0] + params->vtaps[0];
++    const int lo1 = params->vfirst[1], hi1 = params->vfirst[1] + params->vtaps[1];
++    const int lo = lo0 < lo1 ? lo0 : lo1, span = (hi0 > hi1 ? hi0 : hi1) - lo;
++    if (span < 1 || span > ROWS_SPAN)
++        return end(&state, false);
++    if (!target(&p->chroma, GL_RGBA16UI, cw, half))
+         return end(&state, false);
+     glUseProgram(p->rows);
+     bind(p, 0, chroma_in);
+@@ -1334,22 +1357,20 @@ bool dvbridge_source_rows(struct dvbridge_source_packer *p,
+     glUniform1i(p->v.last_row, ch - 1);
+     glUniform1i(p->v.code_max, params->code_max);
+     glUniform4i(p->v.needed, needed[0], needed[1], needed[2], needed[3]);
+-    for (int parity = 0; parity < 2; ++parity) {
+-        /* rows parity, 2 + parity ... of the picture: rows parity * half ... of the texture */
+-        glViewport(0, parity * half, cw, half);
+-        glUniform1i(p->v.taps, params->vtaps[parity]);
+-        glUniform1i(p->v.first, params->vfirst[parity]);
+-        glUniform1i(p->v.parity, parity);
+-        glUniform1i(p->v.offset, parity * half);
+-        glUniform1iv(p->v.weights, DVBRIDGE_SOURCE_TAPS, params->vweights[parity]);
+-        glDrawArrays(GL_TRIANGLES, 0, 3);
+-    }
++    glUniform1i(p->v.lo, lo);
++    glUniform1i(p->v.span, span);
++    glUniform1i(p->v.taps0, params->vtaps[0]);
++    glUniform1i(p->v.first0, params->vfirst[0]);
++    glUniform1i(p->v.taps1, params->vtaps[1]);
++    glUniform1i(p->v.first1, params->vfirst[1]);
++    glUniform1iv(p->v.weights0, DVBRIDGE_SOURCE_TAPS, params->vweights[0]);
++    glUniform1iv(p->v.weights1, DVBRIDGE_SOURCE_TAPS, params->vweights[1]);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
+     ok = end(&state, true);
+     if (ok) {
+         const int key[8] = {width, height, x, y, (int)margins[0], (int)margins[1],
+                             (int)margins[2], (int)margins[3]};
+         memcpy(p->rows_of, key, sizeof(key));
+-        p->rows_half = half;
+         p->rows_made = true;
+     }
+     return ok;
+@@ -1369,7 +1390,6 @@ static void set_common(struct dvbridge_source_packer *p, const struct common_uni
+                 2160 - (int)margins[3]);
+     glUniform3i(u->black, params->black[0], params->black[1], params->black[2]);
+     glUniform1f(u->code_scale, (float)(1 << params->bits));
+-    glUniform1i(u->half, p->rows_half);
+     /* GLSL matrices are column-major */
+     float yf[9], lf[9];
+     for (int i = 0; i < 3; ++i)
+-- 
+2.53.0
+

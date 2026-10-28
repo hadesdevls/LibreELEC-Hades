@@ -1,0 +1,181 @@
+From f90d6223f809044927e7e2dc689b11b12a4a5d61 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:25:53 +0000
+Subject: [PATCH] [windowing/gbm] Set the output again after a wake seen from
+ the frames themselves
+
+After a suspend nvidia-drm resets its DRM state and leaves the mode to its client;
+CWinSystemGbm::OnSystemWake() sets it again with the next frame (DRMWAKE::AfterWake()). It runs
+only from CPowerManager::OnWake(). In the first diagnostic of issue #4 (Quadro RTX 4000, a real S3)
+no "Wake:" line came at all: the flip pending at the suspend did not come in 2 s, every commit after
+the wake was refused with "Invalid argument" for 5 to 6 s a pass, and the mode was never set again.
+
+The output now also sees a wake by itself: CLOCK_BOOTTIME counts the time of a suspend and
+CLOCK_MONOTONIC does not, so their difference grows by the time slept and by nothing else. Every
+frame that Kodi presents looks at it first (two clock reads), and when it grew by a second or more
+since the last look the output is looked at as OnSystemWake() does, before the frame is committed:
+
+  Wake: the system slept N.N s, as the output sees before it presents the next frame (Kodi's own
+  wake may come later, or not at all): the output is looked at now
+
+followed by the line of OnSystemWake() that says what the kernel has. A wake that OnSystemWake()
+handles first is not handled again (it looks too), and one that the output handled first is found
+kept when OnWake() comes. Native Dolby Vision needs nothing more: its next frame stages the
+whole transport again and carries the modeset that AllowModeset() asks for.
+
+Host test: drmwake_test, 8 checks; with the header before, the check of CSleepWatch fails. That it
+brings the picture back after an S3 can only be seen on a GPU (nvidia-drm), with OnWake() late.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 34 ++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.h             |  6 ++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  3 ++
+ xbmc/windowing/gbm/drm/DRMWake.h              | 36 +++++++++++++++++++
+ 4 files changed, 79 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 21b8bfa..089f99a 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -55,6 +55,7 @@
+ #include <cmath>
+ #include <cstdlib>
+ #include <string.h>
++#include <time.h>
+ #include <tuple>
+ #include <utility>
+ 
+@@ -403,8 +404,41 @@ bool CWinSystemGbm::ResizeWindow(int newWidth, int newHeight, int newLeft, int n
+   return true;
+ }
+ 
++namespace
++{
++// Hades: CLOCK_BOOTTIME - CLOCK_MONOTONIC, the time the system slept since it started (-1: not
++// known)
++int64_t AsleepNs()
++{
++  timespec boot{};
++  timespec mono{};
++  if (clock_gettime(CLOCK_BOOTTIME, &boot) != 0 || clock_gettime(CLOCK_MONOTONIC, &mono) != 0)
++    return -1;
++  return (static_cast<int64_t>(boot.tv_sec) - mono.tv_sec) * 1000000000 +
++         (static_cast<int64_t>(boot.tv_nsec) - mono.tv_nsec);
++}
++} // namespace
++
++void CWinSystemGbm::LookForWake()
++{
++  const int64_t asleep = AsleepNs();
++  if (asleep < 0)
++    return;
++  const int64_t slept = m_sleepWatch.Look(asleep);
++  if (slept <= 0)
++    return;
++  CLog::Log(LOGINFO,
++            "Wake: the system slept {:.1f} s, as the output sees before it presents the next frame "
++            "(Kodi's own wake may come later, or not at all): the output is looked at now",
++            static_cast<double>(slept) / 1e9);
++  OnSystemWake();
++}
++
+ void CWinSystemGbm::OnSystemWake()
+ {
++  // Hades: (a wake handled here is not handled again by the output: LookForWake())
++  if (const int64_t asleep = AsleepNs(); asleep >= 0)
++    m_sleepWatch.Look(asleep);
+   auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   auto* crtc = drm ? drm->GetCrtc() : nullptr;
+   if (!crtc)
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index 6b9e33f..ce1f51b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -17,6 +17,7 @@
+ #endif
+ #include "drm/DRMObject.h"
+ #include "drm/DRMUtils.h"
++#include "drm/DRMWake.h"
+ #include "threads/CriticalSection.h"
+ #include "threads/SystemClock.h"
+ #include "utils/DisplayInfo.h"
+@@ -66,6 +67,9 @@ public:
+   //! Hades: after a wake from suspend, the mode is set again with the next frame where the
+   //! kernel has the output off while Kodi had it on (DRMWake.h); the log says which case
+   void OnSystemWake() override;
++  //! Hades: ... and the same as soon as a frame is presented after the system slept, by its clocks
++  //! (DRMWAKE::CSleepWatch), when OnSystemWake() has not come before it
++  void LookForWake();
+ 
+   void FlipPage(bool rendered, bool videoLayer, bool async);
+   //! Tells the user that the TV input is in its HDMI 1.4 compatibility mode
+@@ -403,6 +407,8 @@ protected:
+   //! the setting for it is shown (SupportsHDRYCbCr420Choice()); read when the output is chosen
+   std::atomic<bool> m_hdrYCbCr420Choice{false};
+   XbmcThreads::EndTime<> m_dispResetTimer;
++  //! Hades: see LookForWake()
++  DRMWAKE::CSleepWatch m_sleepWatch;
+   std::unique_ptr<CLibInputHandler> m_libinput;
+   //! Follows the displays that are connected after Kodi has started
+   std::unique_ptr<CDRMDisplayWatch> m_displayWatch;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 993858b..54200fc 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -342,6 +342,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ 
+   NotifyLimitedInput();
+   PublishPlayerInfo();
++  // Hades: the system slept since the last frame, and the output has not been looked at for it: set
++  // again before this frame is committed, if the kernel left it off (CSleepWatch)
++  LookForWake();
+ 
+ #ifdef HAVE_DVBRIDGE
+   PublishDVInfo(false);
+diff --git a/xbmc/windowing/gbm/drm/DRMWake.h b/xbmc/windowing/gbm/drm/DRMWake.h
+index 5163b33..cbaadcc 100644
+--- a/xbmc/windowing/gbm/drm/DRMWake.h
++++ b/xbmc/windowing/gbm/drm/DRMWake.h
+@@ -46,4 +46,40 @@ inline Output AfterWake(bool kodiActive, std::optional<uint64_t> kernelActive)
+     return Output::UNKNOWN;
+   return *kernelActive != 0 ? Output::KEPT : Output::SET_AGAIN;
+ }
++
++/*!
++ * Hades: whether the system slept since the output was last looked at, by its clocks.
++ * CLOCK_BOOTTIME counts the time of a suspend and CLOCK_MONOTONIC does not: the difference between
++ * them grows by the time slept, and by nothing else (both are slewed alike). It is looked at with
++ * every frame that Kodi presents (CWinSystemGbm::LookForWake()), so that the output is set again
++ * before the first commit after a wake even when CPowerManager::OnWake() comes late or not at all:
++ * in the first diagnostic of issue #4 (Quadro RTX 4000, a real S3) no "Wake:" line came, every
++ * commit after the wake was refused with "Invalid argument" for 5 to 6 s a pass, and the mode was
++ * never set again. A wake that OnWake() handles first is not handled twice (it looks too).
++ */
++class CSleepWatch
++{
++public:
++  //! (no suspend is shorter: the slewing of the clocks is far below it)
++  static constexpr int64_t SLEPT_NS = 1000000000;
++
++  //! \param asleepNs CLOCK_BOOTTIME - CLOCK_MONOTONIC now
++  //! \return the time slept since the last look (ns) when it is SLEPT_NS or more, else 0
++  int64_t Look(int64_t asleepNs)
++  {
++    if (!m_known)
++    {
++      m_known = true;
++      m_asleepNs = asleepNs;
++      return 0;
++    }
++    const int64_t slept = asleepNs - m_asleepNs;
++    m_asleepNs = asleepNs;
++    return slept >= SLEPT_NS ? slept : 0;
++  }
++
++private:
++  int64_t m_asleepNs = 0;
++  bool m_known = false;
++};
+ } // namespace DRMWAKE
+-- 
+2.53.0
+

@@ -1,0 +1,528 @@
+From 826d7fe7908c173e0c94bd6fcc3b32a7ffe8c6b0 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:05:58 +0000
+Subject: [PATCH] tools/dvbridge: the GPU time of each pass of a frame, where
+ it is asked for
+
+What a native Dolby Vision frame costs on a GPU was known only whole (the
+GL timestamps of the window system around its work): not what each part
+of it takes, the composer's planes, the scaling of the enhancement layer,
+the rows of 4:2:2 chroma, the packing. Without that, what a change to one
+of them saves on an integrated GPU cannot be measured.
+
+dvbridge_render_time_passes() turns on, for a renderer, the timing of
+every pass that draws its frames:
+- libplacebo's passes, by its own timer queries, read through the info
+  callback of the three renders (pl_render_params.info_callback). On
+  OpenGL ES libplacebo makes those timers only where its pl_opengl was
+  made with gles_timer_queries (libplacebo-9944); the count of a pass's
+  times that libplacebo-9944 adds tells which of its last 256 are new;
+- the bridge's own passes (the rows of 4:2:2 and the picture drawn over
+  of the source transport, the packing of either transport), with
+  GL_TIME_ELAPSED_EXT queries of their own, eight in flight each.
+A time is read once it has come back, on a later frame: nothing waits for
+the GPU, and the query that was just ended is not asked for (its result
+cannot be there yet, and asking for it costs time for nothing).
+dvbridge_render_take_pass_times() gives the passes of the window since the
+last call, merged by name, the most time first; dvbridge_passtime.h holds
+that arithmetic, without GL, so that a host test runs it. A window whose
+times the GL says it lost (GL_GPU_DISJOINT_EXT) is dropped
+(dvbridge_render_pass_times_lost()).
+
+Off, which is how a renderer is made, nothing of it is made or called: no
+callback is set and no query is begun.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe), the render test
+(the converted transport, 36 drawings) and the measured-bridge test (the
+source transport, 22 frames), timing off and on alternated: the same bytes
+in every drawing and frame; with it on, every pass of the composer and of
+libplacebo's rendering has its times, and the bridge's packing that of
+every packing but the last one, still in flight. What it costs there, in
+the measured-bridge test (three rounds of the timing off, on, and on
+asking for the query just ended as well), is not small: its renders take
+19.4 ms instead of 16.4 of wall time (median), with 1.3 % more CPU time
+(the software GPU waits for the queries; asking for the query just ended
+too made it 20.6 ms). What it costs on a GPU is not measured: that is for
+the first test with it on hardware, against the GPU time of the frame
+that the window system already measures. It is off by default for that.
+---
+ tools/dvbridge/dvbridge_passtime.h | 188 +++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_render.c   | 146 +++++++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h   |  20 +++
+ 3 files changed, 353 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_passtime.h
+
+diff --git a/tools/dvbridge/dvbridge_passtime.h b/tools/dvbridge/dvbridge_passtime.h
+new file mode 100644
+index 0000000..7bb3f34
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_passtime.h
+@@ -0,0 +1,188 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-3.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: the GPU time of each pass that draws the frames of native Dolby Vision output, gathered over
++ * a window (dvbridge_render_time_passes(), dvbridge_render_take_pass_times()). Two kinds of timing
++ * come in:
++ *  - libplacebo's: a pass of a render keeps the times of its last 256 runs that have come back from
++ *    the GPU, oldest first, with the count of all the times taken (pl_dispatch_info.samples,
++ *    num_samples, num_total, libplacebo-9944), and hands them over after each run
++ *    (pl_render_params.info_callback): the new ones are the last of the list, as many as the count
++ *    grew;
++ *  - the bridge's own passes (the rows of 4:2:2, the packing), one time each as it comes back.
++ * Nothing here calls the GL: it is the arithmetic over what the timers gave, which a test runs on
++ * the host. */
++#ifndef DVBRIDGE_PASSTIME_H
++#define DVBRIDGE_PASSTIME_H
++
++#include <stdint.h>
++#include <string.h>
++
++#define DVBRIDGE_PASS_NAME 64
++#define DVBRIDGE_PASSTIME_ENTRIES 64
++/* a pass of either kind that had no time for this many windows in a row is forgotten (a picture
++ * format, a level or a transport of an earlier video): its place serves a new one */
++#define DVBRIDGE_PASSTIME_IDLE 3
++
++/* what a pass took in a window: its name (libplacebo's description of the pass, or the bridge's),
++ * how many times came back, their sum and the longest */
++struct dvbridge_pass_time {
++    char name[DVBRIDGE_PASS_NAME];
++    unsigned count;
++    double sum_ms, max_ms;
++};
++
++struct dvbridge_passtime_entry {
++    uint64_t key;      /* libplacebo's signature of the pass, or the bridge's own key */
++    struct dvbridge_pass_time t;
++    uint64_t total;    /* the count of libplacebo's times at the last call */
++    int known;         /* total holds a count */
++    unsigned idle;     /* windows in a row without a time */
++};
++
++struct dvbridge_passtime {
++    struct dvbridge_passtime_entry e[DVBRIDGE_PASSTIME_ENTRIES];
++    unsigned n;
++    unsigned unplaced; /* times of passes that found no place (more than ENTRIES at once) */
++};
++
++static inline void dvbridge_passtime_name(char *to, const char *name)
++{
++    strncpy(to, name ? name : "(no name)", DVBRIDGE_PASS_NAME - 1);
++    to[DVBRIDGE_PASS_NAME - 1] = 0;
++}
++
++static inline struct dvbridge_passtime_entry *dvbridge_passtime_find(struct dvbridge_passtime *t,
++                                                                     uint64_t key, const char *name)
++{
++    for (unsigned i = 0; i < t->n; i++)
++        if (t->e[i].key == key)
++            return &t->e[i];
++    if (t->n >= DVBRIDGE_PASSTIME_ENTRIES)
++        return NULL;
++    struct dvbridge_passtime_entry *e = &t->e[t->n++];
++    memset(e, 0, sizeof(*e));
++    e->key = key;
++    dvbridge_passtime_name(e->t.name, name);
++    return e;
++}
++
++static inline void dvbridge_passtime_put(struct dvbridge_passtime_entry *e, uint64_t ns)
++{
++    const double ms = (double)ns / 1e6;
++    e->t.count++;
++    e->t.sum_ms += ms;
++    if (ms > e->t.max_ms)
++        e->t.max_ms = ms;
++    e->idle = 0;
++}
++
++/* one time of a pass of the bridge's own */
++static inline void dvbridge_passtime_add(struct dvbridge_passtime *t, uint64_t key, const char *name,
++                                         uint64_t ns)
++{
++    struct dvbridge_passtime_entry *e = dvbridge_passtime_find(t, key, name);
++    if (!e) {
++        t->unplaced++;
++        return;
++    }
++    dvbridge_passtime_put(e, ns);
++}
++
++/* the list of a pass of libplacebo after one of its runs: samples[0 .. num) oldest first, and the
++ * count of all its times (total). The new ones are the last total - (the count at the last call)
++ * of the list; the list holds at most its own length of them. A pass seen for the first time is
++ * new (its first run has at most the few times of the runs that its timer can have in flight,
++ * DVBRIDGE_PASSTIME_FIRST): those are taken. One with more had its place given to another
++ * (dvbridge_passtime_take()): its list is of earlier windows, and only its count is taken. */
++#define DVBRIDGE_PASSTIME_FIRST 8
++static inline void dvbridge_passtime_ring(struct dvbridge_passtime *t, uint64_t key, const char *name,
++                                          const uint64_t *samples, int num, uint64_t total)
++{
++    if (num < 0)
++        return;
++    struct dvbridge_passtime_entry *e = dvbridge_passtime_find(t, key, name);
++    if (!e) {
++        t->unplaced++;
++        return;
++    }
++    uint64_t fresh = e->known ? (total >= e->total ? total - e->total : 0)
++                              : (total <= DVBRIDGE_PASSTIME_FIRST ? total : 0);
++    if (fresh > (uint64_t)num)
++        fresh = (uint64_t)num;
++    for (int i = num - (int)fresh; i < num; i++)
++        dvbridge_passtime_put(e, samples[i]);
++    e->total = total;
++    e->known = 1;
++}
++
++/* the passes of the window, merged by name (passes of one kind in several variants), the most time
++ * first; up to max of them in out. The window starts again; passes idle for long are forgotten.
++ * Returns how many there are in all. */
++static inline unsigned dvbridge_passtime_take(struct dvbridge_passtime *t, struct dvbridge_pass_time *out,
++                                              unsigned max)
++{
++    struct dvbridge_pass_time merged[DVBRIDGE_PASSTIME_ENTRIES];
++    unsigned m = 0;
++    for (unsigned i = 0; i < t->n; i++) {
++        const struct dvbridge_pass_time *p = &t->e[i].t;
++        if (!p->count)
++            continue;
++        unsigned j = 0;
++        while (j < m && strcmp(merged[j].name, p->name))
++            j++;
++        if (j == m)
++            merged[m++] = *p;
++        else {
++            merged[j].count += p->count;
++            merged[j].sum_ms += p->sum_ms;
++            if (p->max_ms > merged[j].max_ms)
++                merged[j].max_ms = p->max_ms;
++        }
++    }
++    /* the most time first (insertion sort: a few dozen at most) */
++    for (unsigned i = 1; i < m; i++) {
++        struct dvbridge_pass_time v = merged[i];
++        unsigned j = i;
++        while (j > 0 && merged[j - 1].sum_ms < v.sum_ms) {
++            merged[j] = merged[j - 1];
++            j--;
++        }
++        merged[j] = v;
++    }
++    for (unsigned i = 0; i < m && i < max && out; i++)
++        out[i] = merged[i];
++    /* the next window: counts kept (libplacebo's), sums and times dropped; where the places are
++     * running out, the passes idle for long are forgotten */
++    const int crowded = t->n > DVBRIDGE_PASSTIME_ENTRIES * 3 / 4;
++    unsigned kept = 0;
++    for (unsigned i = 0; i < t->n; i++) {
++        struct dvbridge_passtime_entry e = t->e[i];
++        if (!e.t.count && ++e.idle >= DVBRIDGE_PASSTIME_IDLE && crowded)
++            continue;
++        if (e.t.count)
++            e.idle = 0;
++        e.t.count = 0;
++        e.t.sum_ms = e.t.max_ms = 0;
++        t->e[kept++] = e;
++    }
++    t->n = kept;
++    t->unplaced = 0;
++    return m;
++}
++
++/* the times of the window are not to be trusted (GL_GPU_DISJOINT_EXT: the GPU lost the time between
++ * them): dropped; the counts stay, so that what comes after is told apart as before */
++static inline void dvbridge_passtime_drop(struct dvbridge_passtime *t)
++{
++    for (unsigned i = 0; i < t->n; i++) {
++        t->e[i].t.count = 0;
++        t->e[i].t.sum_ms = t->e[i].t.max_ms = 0;
++    }
++}
++
++#endif
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 214a050..0db36e5 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -22,6 +22,24 @@ enum {
+     NOTE_CM40_DROPPED = 32,
+ };
+ 
++/* Hades: the bridge's own passes that are timed (dvbridge_render_time_passes()), each with a few
++ * queries in flight, read when they have come back (as libplacebo does with its own) */
++enum { TIMER_ROWS, TIMER_PICTURE, TIMER_PACK_SOURCE, TIMER_PACK_CONVERTED, PASS_TIMERS };
++static const char *const TIMER_NAMES[PASS_TIMERS] = {
++    "bridge: 4:2:2 rows (source transport)",
++    "bridge: picture drawn over (source transport)",
++    "bridge: packing (source transport)",
++    "bridge: packing (converted transport)"};
++#define TIMER_QUERIES 8
++#ifndef GL_TIME_ELAPSED_EXT
++#define GL_TIME_ELAPSED_EXT 0x88BF
++#endif
++struct pass_timer {
++    GLuint q[TIMER_QUERIES];
++    unsigned begun, read; /* queries begun and read, counted from the first */
++    bool made, open;
++};
++
+ struct dvbridge_renderer {
+     pl_gpu gpu;
+     pl_renderer renderer;
+@@ -95,6 +113,11 @@ struct dvbridge_renderer {
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+     struct dvbridge_hdr10_mapping ll_mapping;
++    /* Hades: the GPU time of each pass (dvbridge_render_time_passes()): passtime while it is on; the
++     * bridge's own passes timed where the GL has the timer queries (gl_timers) */
++    struct dvbridge_passtime *passtime;
++    bool gl_timers;
++    struct pass_timer timers[PASS_TIMERS];
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -457,6 +480,10 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     pl_tex_destroy(r->gpu, &r->hdr10[1]);
+     pl_tex_destroy(r->gpu, &r->rgb);
+     pl_renderer_destroy(&r->renderer);
++    for (int i = 0; i < PASS_TIMERS; ++i)
++        if (r->timers[i].made)
++            glDeleteQueries(TIMER_QUERIES, r->timers[i].q);
++    free(r->passtime);
+     free(r);
+ }
+ 
+@@ -681,6 +708,66 @@ static bool source_planes(struct dvbridge_renderer *r, const struct pl_frame *so
+     return true;
+ }
+ 
++/* Hades: libplacebo's times of a pass, after each of its runs (pl_render_params.info_callback) */
++static void pass_info(void *priv, const struct pl_render_info *info)
++{
++    struct dvbridge_renderer *r = priv;
++    const struct pl_dispatch_info *d = info ? info->pass : NULL;
++    if (r->passtime && d)
++        dvbridge_passtime_ring(r->passtime, d->signature, d->shader ? d->shader->description : NULL,
++                               d->samples, d->num_samples, d->num_total);
++}
++
++/* Hades: the passes of a render timed, while the passes are (nothing set otherwise) */
++static void time_render(struct dvbridge_renderer *r, struct pl_render_params *params)
++{
++    if (r->passtime) {
++        params->info_callback = pass_info;
++        params->info_priv = r;
++    }
++}
++
++/* Hades: a pass of the bridge's own begins and ends: its time is read on a later frame, never waited
++ * for. A query whose time has not come back by the time its place is needed again is dropped. */
++static void timer_begin(struct dvbridge_renderer *r, int which)
++{
++    struct pass_timer *t = &r->timers[which];
++    if (!r->passtime || !r->gl_timers || t->open)
++        return;
++    if (!t->made) {
++        glGenQueries(TIMER_QUERIES, t->q);
++        t->made = true;
++    }
++    if (t->begun - t->read >= TIMER_QUERIES)
++        t->read++;
++    glBeginQuery(GL_TIME_ELAPSED_EXT, t->q[t->begun % TIMER_QUERIES]);
++    t->open = true;
++}
++
++static void timer_end(struct dvbridge_renderer *r, int which)
++{
++    struct pass_timer *t = &r->timers[which];
++    if (!t->open)
++        return;
++    glEndQuery(GL_TIME_ELAPSED_EXT);
++    t->open = false;
++    t->begun++;
++    /* (the query just ended is left for the next time: its result cannot have come back yet, and
++     * asking for it costs time for nothing) */
++    while (t->read + 1 < t->begun) {
++        const GLuint q = t->q[t->read % TIMER_QUERIES];
++        GLuint available = 0, ns = 0;
++        glGetQueryObjectuiv(q, GL_QUERY_RESULT_AVAILABLE, &available);
++        if (!available)
++            break;
++        glGetQueryObjectuiv(q, GL_QUERY_RESULT, &ns);
++        t->read++;
++        if (r->passtime)
++            dvbridge_passtime_add(r->passtime, 0x4456425000000000ULL | (unsigned)which, TIMER_NAMES[which],
++                                  ns);
++    }
++}
++
+ /* Hades: the transport of the composed planes (and of the picture drawn over, layer) into a framebuffer */
+ static bool source_pack(struct dvbridge_renderer *r, unsigned layer, unsigned framebuffer, bool flip)
+ {
+@@ -689,11 +776,14 @@ static bool source_pack(struct dvbridge_renderer *r, unsigned layer, unsigned fr
+     if (!packets || !dvbridge_active_area(r->pending, margins))
+         return false;
+     const unsigned luma = pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL);
++    if (luma)
++        timer_begin(r, TIMER_PACK_SOURCE);
+     const bool packed = luma && dvbridge_source_pack(r->source_packer, &r->source_params, luma,
+                                                      r->geometry.source_width,
+                                                      r->geometry.source_height, r->geometry.x,
+                                                      r->geometry.y, layer, margins, framebuffer,
+                                                      packets, count, flip);
++    timer_end(r, TIMER_PACK_SOURCE);
+     /* Hades: the pixels drawn over a profile 5 picture converted by the transport itself */
+     if (packed && dvbridge_source_pairs_missed(r->source_packer))
+         note(r, NOTE_PAIRS_MISSED);
+@@ -772,15 +862,19 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         params.active_rows[1] = 2160 - (int)margins[3];
+         r->early_mask = true;
+     }
++    time_render(r, &params);
+     bool ok = pl_render_image(r->renderer, &image, &frame, &params) && *composed;
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     ok = ok && !errors.errors && !errors.num_disabled_hooks;
+     const unsigned luma = ok ? pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL) : 0;
+     const unsigned chroma = ok ? pl_opengl_unwrap(r->gpu, r->planes[1], NULL, NULL, NULL) : 0;
++    if (luma && chroma)
++        timer_begin(r, TIMER_ROWS);
+     ok = luma && chroma &&
+          dvbridge_source_rows(r->source_packer, &r->source_params, chroma, geometry.source_width,
+                               geometry.source_height, geometry.x, geometry.y, margins,
+                               r->all_rows);
++    timer_end(r, TIMER_ROWS);
+     unsigned fbo = 0;
+     if (ok && target) {
+         /* the framebuffer of the target. Hades: the window, the default framebuffer that Kodi wraps
+@@ -797,9 +891,12 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         /* Hades: in the tiles that what will be drawn over it may reach, where the caller said what
+          * that is (dvbridge_render_set_drawn()) */
+         dvbridge_source_drawn(r->source_packer, r->drawn_gui, r->drawn_w, r->drawn_h);
++        if (fbo)
++            timer_begin(r, TIMER_PICTURE);
+         ok = fbo && dvbridge_source_picture(r->source_packer, &r->source_params, luma,
+                                             geometry.source_width, geometry.source_height,
+                                             geometry.x, geometry.y, margins, fbo);
++        timer_end(r, TIMER_PICTURE);
+         /* it writes the whole raster, and outside the place of the picture the alpha is 2: not
+          * the black that a converted picture at that place leaves */
+         r->rgb_clean = false;
+@@ -986,6 +1083,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         r->clean_place[2] = geometry.width;
+         r->clean_place[3] = geometry.height;
+     }
++    time_render(r, &params);
+     r->ready = pl_render_image(r->renderer, &image, &target, &params) && mask.called && !mask.failed;
+     /* An EL sampling failure can otherwise return a successfully rendered BL-only frame. A composer of
+      * ETSI GS CCM 001 that failed on this GPU is not one: libplacebo composed the picture by its own
+@@ -1378,6 +1476,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+      * one shown keeps its picture unless it is that texture */
+     if (into == r->hdr10_shown)
+         r->hdr10_whole = false;
++    time_render(r, &params);
+     bool ok = pl_render_image(r->renderer, &image, &target, &params) &&
+               (peak_hook ? to_display.called : clamped) && (!plain || signal_clamped);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+@@ -1935,7 +2034,10 @@ bool dvbridge_render_pack(struct dvbridge_renderer *r, struct dvbridge_gl_packer
+     if (!r->source) {
+         unsigned count = 0;
+         const uint32_t *packets = dvbridge_packets(r->pending, &count);
+-        return dvbridge_gl_pack(packer, rgb, framebuffer, width, height, packets, count, flip);
++        timer_begin(r, TIMER_PACK_CONVERTED);
++        const bool packed = dvbridge_gl_pack(packer, rgb, framebuffer, width, height, packets, count, flip);
++        timer_end(r, TIMER_PACK_CONVERTED);
++        return packed;
+     }
+     return width == 3840 && height == 2160 && source_pack(r, rgb, framebuffer, flip);
+ }
+@@ -1962,3 +2064,45 @@ void dvbridge_render_set_ll_pattern(struct dvbridge_renderer *r, bool pattern)
+     if (r)
+         r->ll_pattern = pattern;
+ }
++
++/* Hades: the GPU time of each pass (dvbridge_render.h) */
++void dvbridge_render_time_passes(struct dvbridge_renderer *r, bool on)
++{
++    if (!r)
++        return;
++    if (on && !r->passtime) {
++        r->passtime = calloc(1, sizeof(*r->passtime));
++        pl_opengl gl = pl_opengl_get(r->gpu);
++        r->gl_timers = r->passtime && gl && pl_opengl_has_ext(gl, "GL_EXT_disjoint_timer_query");
++    } else if (!on && r->passtime) {
++        free(r->passtime);
++        r->passtime = NULL;
++    }
++}
++
++bool dvbridge_render_passes_timed(const struct dvbridge_renderer *r, bool *placebo, bool *own)
++{
++    if (!r || !r->passtime)
++        return false;
++    if (placebo) {
++        /* libplacebo makes a timer for each of its passes where its GPU has them */
++        pl_timer timer = pl_timer_create(r->gpu);
++        *placebo = timer != NULL;
++        pl_timer_destroy(r->gpu, &timer);
++    }
++    if (own)
++        *own = r->gl_timers;
++    return true;
++}
++
++unsigned dvbridge_render_take_pass_times(struct dvbridge_renderer *r, struct dvbridge_pass_time *out,
++                                         unsigned max)
++{
++    return r && r->passtime ? dvbridge_passtime_take(r->passtime, out, max) : 0;
++}
++
++void dvbridge_render_pass_times_lost(struct dvbridge_renderer *r)
++{
++    if (r && r->passtime)
++        dvbridge_passtime_drop(r->passtime);
++}
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 661b245..1494083 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -3,6 +3,7 @@
+ #define DVBRIDGE_RENDER_H
+ #include <libplacebo/renderer.h>
+ #include "dvbridge_core.h"
++#include "dvbridge_passtime.h"
+ 
+ struct dvbridge_renderer;
+ /* log: where libplacebo reports why a render or a GPU object failed (may be NULL). */
+@@ -362,4 +363,23 @@ bool dvbridge_render_direct_fits(const struct dvbridge_renderer *renderer,
+ struct dvbridge_gl_packer;
+ bool dvbridge_render_pack(struct dvbridge_renderer *renderer, struct dvbridge_gl_packer *packer,
+                           unsigned framebuffer, int width, int height, bool flip_y, int cover);
++/* Hades: the GPU time of each pass that draws the frames, to measure on a GPU what each part of a
++ * frame costs. libplacebo's passes are timed by its own timer queries, read through the info callback
++ * of every render; it has them on OpenGL ES only where the pl_opengl was made with
++ * gles_timer_queries (libplacebo-9944) and the GL has GL_EXT_disjoint_timer_query. The bridge's own
++ * passes (the rows of 4:2:2 and the picture drawn over of the source transport, and the packing of
++ * either transport) take queries of their own, with that extension. Every time is read back when it
++ * has come, on a later frame: nothing waits for the GPU. Off, nothing of it is made or called: off is
++ * how a renderer is made. */
++#define DVBRIDGE_RENDER_PASS_TIMES 1
++void dvbridge_render_time_passes(struct dvbridge_renderer *renderer, bool on);
++/* while on: whether libplacebo's passes are timed (its GPU has timers) and the bridge's own */
++bool dvbridge_render_passes_timed(const struct dvbridge_renderer *renderer, bool *placebo, bool *own);
++/* the passes of the window since the last call, the most time first and merged by name
++ * (dvbridge_passtime_take()), up to max of them in out; the window starts again. Returns how many
++ * there were in all (0 while off). */
++unsigned dvbridge_render_take_pass_times(struct dvbridge_renderer *renderer, struct dvbridge_pass_time *out,
++                                         unsigned max);
++/* the times of the window are not to be trusted (the GL said GL_GPU_DISJOINT_EXT): dropped */
++void dvbridge_render_pass_times_lost(struct dvbridge_renderer *renderer);
+ #endif
+-- 
+2.53.0
+

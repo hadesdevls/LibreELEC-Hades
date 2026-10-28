@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Hades diagnostics: the diagnostics of a start on real hardware, written to the boot partition (FAT,
 # readable in Windows) as hades-diag/start-N/1-minute/ and hades-diag/start-N/4-minutes/, about 1 and 4
 # minutes after Kodi is started, at every start. Each snapshot is copied to the FAT as soon as it is taken,
@@ -7,8 +10,9 @@
 # and the journal pass through the filter for logs (redact.sh) where they are taken, and every file of a
 # snapshot through the filter that fits it (redact.sh tree: addresses, serial numbers, UUIDs, SSH keys,
 # network names and the name of the system become markers) before it is copied; without the filter nothing
-# is copied. Nothing is written once the switch is off, or with little room left on the partition. Nothing
-# is powered off or reconfigured.
+# is copied. Nothing is written once the switch is off, or with little room left on the partition, and the
+# folder of the start is made this start's before anything goes into it (folder.sh). Nothing is powered off or
+# reconfigured.
 # Arguments: the build (VERSION of os-release), written to build.txt in each snapshot, and the number of
 # this start (start.sh).
 # All of it only reads what the system is doing, but for what the first snapshot does for a display that is
@@ -23,6 +27,7 @@
 D=/flash/hades-diag
 T=/tmp/hades-diag
 R=/usr/lib/hades-diag/redact.sh
+. /usr/lib/hades-diag/folder.sh
 B=$1
 H=start-${2:-0}
 # The level of the kernel's display messages, and where what it was is kept while this has it turned up
@@ -75,10 +80,12 @@ to_flash() {
   sh $R tree $T/$1 $T/$1.filtered
   flash_lock || return 0
   if mount -o remount,rw /flash; then
-    # (without room for a new copy, the one that is there stays)
+    # (without room for a new copy, the one that is there stays; the folder is this start's first: folder.sh)
     if room_left; then
-      rm -rf $D/$H/$1 $D/NO-ROOM.txt
-      mkdir -p $D/$H/$1 && cp -r $T/$1.filtered/. $D/$H/$1/ && : > $D/$H/.filtered
+      if own_start $H; then
+        rm -rf $D/$H/$1 $D/NO-ROOM.txt
+        mkdir -p $D/$H/$1 && cp -r $T/$1.filtered/. $D/$H/$1/ && echo $FILTERED > $D/$H/.filtered
+      fi
     else
       no_room
     fi
@@ -88,20 +95,22 @@ to_flash() {
 }
 
 # What versions of the diagnostics before 15 left on the partition went there without the filter of
-# identifiers: each of their folders (of a start, or of the layout before the folders of starts) is put
-# through the filter once, file by file, in RAM, and written back with an empty file .filtered in it, which
-# this version puts in every folder of a start that it writes to. A file that the filter fails on is not
-# written back. The folder is written beside the old one first, and the old one goes only when it is there.
-# (Run in the background before the first snapshot: start.sh is waited for by Kodi.)
+# identifiers, and what versions before this one left went through it without the names of Bluetooth devices:
+# each of their folders (of a start, or of the layout before the folders of starts) is put through the filter
+# once, file by file, in RAM, and written back with a file .filtered in it that says which filter it went
+# through ($FILTERED, folder.sh), as this version writes it in every folder of a start that it writes to. A
+# file that the filter fails on is not written back. The folder is written beside the old one first, and the
+# old one goes only when it is there. (Run in the background before the first snapshot: start.sh is waited for
+# by Kodi.)
 refilter() {
   [ -f $R ] || return 0
   for d in $D/*/; do
     d=${d%/}
-    [ -d "$d" ] && [ ! -e "$d/.filtered" ] && [ "${d##*/}" != "$H" ] || continue
+    [ -d "$d" ] && [ "$(cat "$d/.filtered" 2>/dev/null)" != "$FILTERED" ] && [ "${d##*/}" != "$H" ] || continue
     case ${d##*/} in *.part) continue ;; esac
     rm -rf $T.refilter
     sh $R tree "$d" $T.refilter
-    mkdir -p $T.refilter && : > $T.refilter/.filtered
+    mkdir -p $T.refilter && echo $FILTERED > $T.refilter/.filtered
     switch_on || break
     flash_lock || break
     # (with less than 128 MiB free, nothing is written: an update needs room there; the next start tries again)
@@ -157,6 +166,79 @@ modetest_all() {
 }
 
 video_opened() { grep -qs 'VideoPlayer::OpenFile' /storage/.kodi/temp/kodi.log; }
+# Bluetooth (bluetooth.txt): what tells why a device keeps losing its connection. Only read, nothing is asked of
+# a device or paired: the kernel's lines on the controllers (the firmware each loaded, or that it kept the one
+# that the system before this start had loaded: a restart from Windows), whether a USB controller may sleep, the
+# band of the Wi-Fi beside it, the settings that BlueZ runs with, the standby of the settings add-on, and of each
+# paired device its kind, its state, which keys the store has (never a key) and the connection parameters that
+# it asked for. Its name and alias only as the markers that the filter puts wherever a log names the device
+# (redact.sh btname): a name is often a person's ("Magic Keyboard de Juan"). Why each one disconnected is in
+# kodi.log ("Bluetooth: ... disconnected").
+# (busctl gives up after 5 s by itself, and its exit status tells whether the property was there)
+bt_get() { busctl --timeout=5 get-property org.bluez $1 org.bluez.Device1 $2 2>/dev/null; }
+bluetooth() {
+  echo "== controllers (kernel log)"
+  dmesg | grep -E 'Bluetooth: |btusb|btintel' | tail -60
+  dmesg | grep -q 'Intel device is already patched' &&
+    echo "(an Intel controller kept the firmware patch of the system that ran before this start, a restart from Windows for example: this system did not load its own; after a full power-off it does)"
+  for h in /sys/class/bluetooth/hci*; do
+    case ${h##*/} in *:*) continue ;; esac
+    [ -e "$h/device" ] || continue
+    i=$(readlink -f $h/device); u=${i%/*}
+    echo "${h##*/}: driver $(basename "$(readlink $i/driver 2>/dev/null)") on ${i##*/}"
+    [ -r $u/idVendor ] && echo "    usb $(cat $u/idVendor):$(cat $u/idProduct) power/control=$(cat $u/power/control 2>/dev/null) runtime_status=$(cat $u/power/runtime_status 2>/dev/null) autosuspend_delay_ms=$(cat $u/power/autosuspend_delay_ms 2>/dev/null) wakeup=$(cat $u/power/wakeup 2>/dev/null) suspended_ms=$(cat $u/power/runtime_suspended_time 2>/dev/null) active_ms=$(cat $u/power/runtime_active_time 2>/dev/null)"
+  done
+  echo "btusb: enable_autosuspend=$(cat /sys/module/btusb/parameters/enable_autosuspend 2>/dev/null) (Y: a USB controller may sleep while no device is connected to it)"
+  echo "iwlwifi: bt_coex_active=$(cat /sys/module/iwlwifi/parameters/bt_coex_active 2>/dev/null)"
+  for n in /sys/class/net/*; do
+    [ -d $n/wireless ] || continue
+    echo "${n##*/}: $(lim iw dev ${n##*/} link | grep -E 'freq:|signal:|Not connected' | tr -s ' \t\n' ' ')"
+  done
+  echo "== rfkill"; lim rfkill list
+  echo "== the service and the settings that BlueZ runs with"
+  echo "bluetooth: $(lim systemctl is-active bluetooth)"
+  grep -h '^BLUEZ_' /storage/.cache/services/bluez.conf 2>/dev/null
+  for f in /run/libreelec/bluetooth/main.conf /run/libreelec/bluetooth/input.conf; do
+    echo "--- $f (what is set in it; for the rest, BlueZ's default)"
+    grep -E '^[[:space:]]*[^#[:space:]]' $f 2>/dev/null
+  done
+  o=/storage/.kodi/userdata/addon_data/service.libreelec.settings/oe_settings.xml
+  echo "--- the standby of the settings add-on (it disconnects these devices with the screensaver, and after idle_timeout minutes without input)"
+  echo "idle_timeout: $(tr -d ' \t\r\n' 2>/dev/null < $o | sed -n 's|.*<idle_timeout>\([^<]*\)</idle_timeout>.*|\1|p')"
+  for d in $(grep -o 'dev_[0-9A-F]\{2\}\(_[0-9A-F]\{2\}\)\{5\}' $o 2>/dev/null | sort -u); do echo "standby: $(echo ${d#dev_} | tr _ :)"; done
+  echo "== paired devices (a device that is known and not paired is only counted)"
+  np=0
+  for p in $(busctl --timeout=5 --list tree org.bluez 2>/dev/null | grep -E '^/org/bluez/hci[0-9]+/dev_[0-9A-F]{2}(_[0-9A-F]{2}){5}$'); do
+    [ "$(bt_get $p Paired)" = "b true" ] || { np=$((np + 1)); continue; }
+    a=$(echo ${p##*/dev_} | tr _ :)
+    echo "--- $a (${p%/*})"
+    for k in AddressType Bonded Trusted Blocked Connected WakeAllowed LegacyPairing Icon Appearance Class Modalias; do
+      v=$(bt_get $p $k) && echo "    $k: ${v#* }"
+    done
+    for f in /storage/.cache/bluetooth/*/$a/info; do
+      [ -f "$f" ] || continue
+      echo "    stored in $f:"
+      # (the name and the alias as markers: never the name itself, not even here in RAM)
+      sh $R btname "$f" 2>/dev/null | sed 's/^/        /'
+      awk '
+        /^\[/ { s = $0; print "      " s; next }
+        { k = $0; sub(/=.*/, "", k); v = substr($0, length(k) + 2) }
+        s == "[General]" && k ~ /^(AddressType|SupportedTechnologies|Trusted|Blocked|WakeAllowed|CablePairing|PreferredBearer|Appearance|Class)$/ { print "        " $0 }
+        s == "[General]" && k == "Services" { print "        HID over GATT (LE): " (v ~ /00001812-/ ? "yes" : "no") ", HID (BR/EDR): " (v ~ /00001124-/ ? "yes" : "no") }
+        s == "[ConnectionParameters]" && (k == "MinInterval" || k == "MaxInterval") { printf "        %s=%s (%.2f ms)\n", k, v, v * 1.25 }
+        s == "[ConnectionParameters]" && k == "Latency" { print "        " $0 " (connection events that the device may skip)" }
+        s == "[ConnectionParameters]" && k == "Timeout" { printf "        %s=%s (%d ms: the link is given up after that long without a packet)\n", k, v, v * 10 }
+        s ~ /^\[(LongTermKey|PeripheralLongTermKey|SlaveLongTermKey)\]$/ && (k == "Authenticated" || k == "EncSize") { print "        " $0 }
+        s ~ /^\[(LongTermKey|PeripheralLongTermKey|SlaveLongTermKey)\]$/ && (k == "EDiv" || k == "Rand") { print "        " k (v + 0 == 0 ? " is 0 (LE Secure Connections)" : " is not 0 (legacy pairing)") }
+        s == "[LinkKey]" && (k == "Type" || k == "PINLength") { print "        " $0 }
+        s == "[DeviceID]" && k != "" { print "        " $0 }
+      ' "$f"
+    done
+  done
+  echo "($np known device(s) that are not paired)"
+  echo "== bluetoothd (journal)"
+  lim journalctl -b -u bluetooth --no-pager | tail -60 | clean
+}
 # The kernel's display messages go back to what they were before this turned them up (whoever gets here
 # first does it: the second snapshot, listen() at its end, or the next start of this after one that was
 # killed).
@@ -225,7 +307,13 @@ redetect() {
   cat $A $A.late 2>/dev/null; rm -f $A $A.late
   echo "drm.debug is back at $(cat $G 2>/dev/null)"
   echo "== kernel messages since then"
-  dmesg | awk -F'[][]' -v t="$t0" '$2 + 0 > t + 0'
+  dmesg | awk -F'[][]' -v t="$t0" '$2 + 0 > t + 0' > $A.k
+  cat $A.k
+  # (modetest-connectors.txt of the same snapshot runs meanwhile, on the devices that Kodi is the DRM
+  # master of: the kernel tells it that it is not, and answers from what it has)
+  grep -q 'is not the DRM master, demoting to read-only probe' $A.k &&
+    echo "(the lines \"... is not the DRM master, demoting to read-only probe\" are modetest's, which this snapshot runs meanwhile for modetest-connectors.txt: it is not the DRM master, so the kernel answers it from what it has and asks no display again; the outputs above that were asked again were asked by this, as root, through their status file)"
+  rm -f $A.k
 }
 # Whether a TV or a monitor is seen on any socket
 external_seen() {
@@ -277,7 +365,7 @@ snapshot() {
   echo "== os-release"; cat /etc/os-release
   echo "== uname"; uname -a
   echo "== cmdline"; cat /proc/cmdline
-  echo "== kernel lockdown and module signatures (Run and Live: lockdown=integrity; internal: none)"
+  echo "== kernel lockdown and module signatures (Run and Live: lockdown=integrity; internal: none, or integrity from the init while internal disks are kept away)"
   echo "lockdown: $(cat /sys/kernel/security/lockdown 2>&1)"
   echo "tainted: $(cat /proc/sys/kernel/tainted 2>&1)"
   for m in nvidia nvidia_modeset nvidia_drm nvidia_uvm snd_hda_intel; do
@@ -310,6 +398,8 @@ snapshot() {
   ls -l /dev/dri /dev/dri/by-path 2>&1
   echo "== framebuffers"; cat /proc/fb
   echo "== nvidia"; cat /proc/driver/nvidia/version 2>&1
+  # Hades: which of the two NVIDIA drivers the boot chose (kernel-overlays-setup, stack-select)
+  echo "driver chosen at boot: $(cat /run/nvidia/driver 2>&1)"
   echo "nvidia_drm modeset=$(cat /sys/module/nvidia_drm/parameters/modeset 2>&1) fbdev=$(cat /sys/module/nvidia_drm/parameters/fbdev 2>&1)"
   echo "amdgpu dvbridge=$(cat /sys/module/amdgpu/parameters/dvbridge 2>&1)"
   echo "kernel display messages: drm.debug=$(cat $G 2>&1)"
@@ -346,6 +436,7 @@ snapshot() {
   echo "== alsa"; aplay -l 2>&1; for e in /proc/asound/card*/eld#*; do [ -r "$e" ] && { echo "--- $e"; cat "$e"; }; done
   echo "== journal warnings and errors"; lim journalctl -b -p warning --no-pager | tail -300 | clean
   } > $S/results.txt 2>&1
+  [ -d /sys/class/bluetooth ] && bluetooth > $S/bluetooth.txt 2>&1
   [ -r /sys/kernel/debug/gpio ] && lim cat /sys/kernel/debug/gpio > $S/gpio.txt
   if [ "$1" = 1-minute ]; then
     # The firmware's description of the machine: its ACPI tables DSDT and SSDT, also the ones it loads while

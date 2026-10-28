@@ -26,7 +26,10 @@ PKG_CONFIGURE_OPTS_HOST="${PKG_CONFIGURE_OPTS_COMMON} \
                          --disable-csharp \
                          --without-emacs"
 
+# No Java part (libintl.jar): the image has no Java to run it, and configure builds it wherever the build
+# host has a javac, which the JDK 8 of libbluray-bdj puts there
 PKG_CONFIGURE_OPTS_TARGET="${PKG_CONFIGURE_OPTS_COMMON} \
+                           --disable-java \
                            --disable-curses \
                            --disable-xattr \
                            --with-libxml2-prefix=${SYSROOT_PREFIX}/usr \

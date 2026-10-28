@@ -1,0 +1,799 @@
+From ee8b10f10db68d5806766dbc1de9d2e358ada815 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:49:46 +0000
+Subject: [PATCH] tools/dvbridge, windowing/gbm: a scaled picture goes out in
+ the source transport, scaled as it is composed
+
+A picture drawn at another size than its own (an HD stream on the 3840x2160 raster: the common case of
+streaming) went out in the converted transport: decoded to BT.2020 R'G'B', scaled there, sent as BT.2020
+YCbCr. That is three resamplings of the chroma, the colours outside BT.2020 lost (a profile 5 picture in
+IPT has them), and the decoding of profile 5 off its reference by up to 39 codes of 4095. ETSI GS CCM 001
+has the DM header describe the picture that is sent (clause 6.2.2: YCCtoRGB, signal_color_space), and
+nothing in clause 6 ties that picture to the composer's size (clause 4, note 1, and annex B resample only
+the layers, before composing): a certified source device scales the composer's output in its own
+representation.
+
+The source transport now does that. The packer (dvbridge_source_scale()) scales the composed planes
+from the composer's integer codes: the luma by Lanczos 3 (the filter of libplacebo's main scaler, which
+the converted transport scales with), the 4:2:0 chroma straight to the 4:2:2 of the raster by Lanczos 3,
+separably, with integer weights for each output position (dvbridge_source_axis(): an RGBA32I texture
+per axis, each sum 2^14) and 2 fractional bits between the passes, the planes' edges repeated; then the
+transport is packed from that luma and those rows as from a picture composed at that size. Only scaling
+up or not at all on each axis (dvbridge_source_scale_covers()); the rest, and a GPU on which the passes
+cannot be made, goes converted as before. Kodi draws such a picture the way of the source transport
+(directly whenever nothing is over it), as one at its own size.
+
+Measured on Mesa's software OpenGL ES (zink on lavapipe): 1920x1080 renditions of six 4K base layers
+(three of profile 5 in IPT, three of a profile 7 stream in YCbCr), each plane brought to half size by
+Lanczos 3 widened, drawn on the raster and compared with the composed 4K master, Delta E ITP of what a
+display decodes from each transport. Mean, converted against now: 1.312 / 1.170 (the profile 5 chart),
+0.349 / 0.266, 0.382 / 0.312, 0.199 / 0.150, 0.667 / 0.661, 0.699 / 0.691; the median lower in all
+six; the 99th percentile from 1.5 % above (the chart's edges) to 0.7 % below. With renditions made by
+FFmpeg's bicubic, the same for four of them (the chart's 99th percentile 2.8 % above). Against the
+band-limited interpolation of the composed planes, in their own representation or in R'G'B', nearer in
+every picture. The transport of every scaled picture is the CPU's integer reference code by code (the
+same tables, other arithmetic: 7.8 and 6.2 million pixels each), and reads as CCM 001 says it is sent
+(an independent reader: copies, CRC, header, blocks, black outside the active area). Pictures drawn at
+their own size: every output of the fidelity bench the same bytes (the source transport at levels 0 to
+3, the converted transport, a GUI over the composed way: 98, 56 and 85 files), and the measured-bridge
+test's drawings the same. Lanczos 6 for the chroma (the transport's filter where the picture is not
+scaled, chosen against the band-limited interpolation) came out further from the master in all six;
+Lanczos 2 nearer in the mean, further in the chart's tail.
+
+Not seen on a display: what a television does with a scaled picture sent in its own representation (a
+profile 5 picture in IPT, as certified source devices send it) is for the LG C5 to show.
+---
+ tools/dvbridge/dvbridge_render.c              |  86 ++--
+ tools/dvbridge/dvbridge_render.h              |   9 +-
+ tools/dvbridge/dvbridge_source.c              | 368 +++++++++++++++++-
+ tools/dvbridge/dvbridge_source.h              |  66 ++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   8 +-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |   7 +-
+ 6 files changed, 516 insertions(+), 28 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 5d340d6..0867f4f 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -100,6 +100,11 @@ struct dvbridge_renderer {
+     pl_tex planes[2];
+     struct dvbridge_source_packer *source_packer;
+     struct dvbridge_source_params source_params;
++    /* Hades: the luma that the packer takes for the last picture of the source transport, and the
++     * size it takes it at: the composed luma at the picture's own size, or the packer's luma of a
++     * picture that is scaled (dvbridge_source_scale()) at the size it is drawn at */
++    unsigned pack_luma;
++    int pack_w, pack_h;
+     /* Hades: the level of the conversion under the GUI that the last frame packed was drawn at
+      * (dvbridge_render_gui_drawn()) */
+     int gui_drawn;
+@@ -669,10 +674,17 @@ static bool chroma_shift(const struct pl_frame *f, float *sx, float *sy)
+     return false;
+ }
+ 
++/* Hades: a picture drawn at another size than its own */
++static bool scaled(struct dvbridge_geometry g)
++{
++    return g.width != g.source_width || g.height != g.source_height;
++}
++
+ /* Hades: whether a picture goes out in the source transport: it is asked for, the composer of
+  * CCM 001 composes the picture (libplacebo may still decline it, see render()), the picture is
+- * drawn at its own size (the composer's picture is the one sent), and dvbridge_source_setup()
+- * covers its metadata. Sets source_why where it is asked for and is not. */
++ * drawn at its own size or scaled up (Hades: in the composer's representation,
++ * dvbridge_source_scale()), and dvbridge_source_setup() covers its metadata. Sets source_why where it
++ * is asked for and is not. */
+ static bool source_possible(struct dvbridge_renderer *r, const struct pl_frame *source,
+                             const void *metadata, size_t bytes, struct dvbridge_geometry g)
+ {
+@@ -684,8 +696,11 @@ static bool source_possible(struct dvbridge_renderer *r, const struct pl_frame *
+         r->source_why = "the packer of the transport could not be made on this GPU";
+     else if (r->legacy_composer)
+         r->source_why = "the composer of ETSI GS CCM 001 is turned off";
+-    else if (g.width != g.source_width || g.height != g.source_height)
+-        r->source_why = "the picture is scaled";
++    else if (scaled(g) && !dvbridge_source_can_scale(r->source_packer))
++        r->source_why = "the passes that scale a picture could not be made on this GPU";
++    else if (scaled(g) && !dvbridge_source_scale_covers(g.source_width, g.source_height, NULL,
++                                                         g.width, g.height, &r->source_why))
++        ; /* (source_why says why) */
+     else if (!chroma_shift(source, &sx, &sy))
+         r->source_why = "the picture has no chroma plane";
+     else
+@@ -787,12 +802,12 @@ static bool source_pack(struct dvbridge_renderer *r, unsigned layer, unsigned fr
+     const uint32_t *packets = dvbridge_packets(r->pending, &count);
+     if (!packets || !dvbridge_active_area(r->pending, margins))
+         return false;
+-    const unsigned luma = pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL);
++    /* (Hades: the luma of the picture at the size it is packed at, render_source()) */
++    const unsigned luma = r->pack_luma;
+     if (luma)
+         timer_begin(r, TIMER_PACK_SOURCE);
+     const bool packed = luma && dvbridge_source_pack(r->source_packer, &r->source_params, luma,
+-                                                     r->geometry.source_width,
+-                                                     r->geometry.source_height, r->geometry.x,
++                                                     r->pack_w, r->pack_h, r->geometry.x,
+                                                      r->geometry.y, layer, margins, framebuffer,
+                                                      packets, count, flip);
+     timer_end(r, TIMER_PACK_SOURCE);
+@@ -881,15 +896,31 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+     r->base_sdr_refused = r->base_sdr && !*composed;
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     ok = ok && !errors.errors && !errors.num_disabled_hooks;
+-    const unsigned luma = ok ? pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL) : 0;
++    const unsigned composed_luma = ok ? pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL) : 0;
+     const unsigned chroma = ok ? pl_opengl_unwrap(r->gpu, r->planes[1], NULL, NULL, NULL) : 0;
+-    if (luma && chroma)
++    r->pack_luma = 0;
++    r->pack_w = geometry.source_width;
++    r->pack_h = geometry.source_height;
++    if (composed_luma && chroma)
+         timer_begin(r, TIMER_ROWS);
+-    ok = luma && chroma &&
+-         dvbridge_source_rows(r->source_packer, &r->source_params, chroma, geometry.source_width,
+-                              geometry.source_height, geometry.x, geometry.y, margins,
+-                              r->all_rows);
++    /* Hades: a picture that is scaled is scaled here, in the composer's representation: its luma
++     * at the size it is drawn at, and its rows of 4:2:2 chroma at that size, every one of them */
++    unsigned luma = composed_luma;
++    if (composed_luma && chroma && scaled(geometry)) {
++        ok = dvbridge_source_scale(r->source_packer, &r->source_params, composed_luma, chroma,
++                                   geometry.source_width, geometry.source_height, NULL,
++                                   geometry.width, geometry.height, geometry.x, geometry.y,
++                                   margins, &luma);
++        r->pack_w = geometry.width;
++        r->pack_h = geometry.height;
++    } else
++        ok = composed_luma && chroma &&
++             dvbridge_source_rows(r->source_packer, &r->source_params, chroma,
++                                  geometry.source_width, geometry.source_height, geometry.x,
++                                  geometry.y, margins, r->all_rows);
+     timer_end(r, TIMER_ROWS);
++    if (ok)
++        r->pack_luma = luma;
+     unsigned fbo = 0;
+     if (ok && target) {
+         /* the framebuffer of the target. Hades: the window, the default framebuffer that Kodi wraps
+@@ -908,9 +939,9 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         dvbridge_source_drawn(r->source_packer, r->drawn_gui, r->drawn_w, r->drawn_h);
+         if (fbo)
+             timer_begin(r, TIMER_PICTURE);
+-        ok = fbo && dvbridge_source_picture(r->source_packer, &r->source_params, luma,
+-                                            geometry.source_width, geometry.source_height,
+-                                            geometry.x, geometry.y, margins, fbo);
++        ok = fbo && dvbridge_source_picture(r->source_packer, &r->source_params, r->pack_luma,
++                                            r->pack_w, r->pack_h, geometry.x, geometry.y,
++                                            margins, fbo);
+         timer_end(r, TIMER_PICTURE);
+         /* it writes the whole raster, and outside the place of the picture the alpha is 2: not
+          * the black that a converted picture at that place leaves */
+@@ -2114,11 +2145,11 @@ bool dvbridge_render_complete(struct dvbridge_renderer *r)
+     if (!r->pending || !dvbridge_active_area(r->pending, margins))
+         return false;
+     pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, &fbo);
+-    const unsigned luma = pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL);
+-    return fbo && luma &&
+-           dvbridge_source_complete(r->source_packer, &r->source_params, luma,
+-                                    r->geometry.source_width, r->geometry.source_height,
+-                                    r->geometry.x, r->geometry.y, margins, fbo);
++    /* (Hades: the luma at the size it is packed at, render_source()) */
++    return fbo && r->pack_luma &&
++           dvbridge_source_complete(r->source_packer, &r->source_params, r->pack_luma,
++                                    r->pack_w, r->pack_h, r->geometry.x, r->geometry.y, margins,
++                                    fbo);
+ }
+ 
+ bool dvbridge_render_source(const struct dvbridge_renderer *r, const char **why)
+@@ -2173,9 +2204,18 @@ bool dvbridge_render_direct_fits(const struct dvbridge_renderer *r, struct dvbri
+         return false;
+     if (!g.x && !g.y && g.width == 3840 && g.height == 2160)
+         return true;
+-    /* the source transport packs a picture drawn at its own size anywhere on the raster */
++    /* the source transport packs a picture drawn at its own size anywhere on the raster (Hades: or
++     * scaled up, where it scales it) */
+     return r->source_wanted && r->source_packer && !r->legacy_composer &&
+-           g.width == g.source_width && g.height == g.source_height;
++           (!scaled(g) || dvbridge_render_source_scales(r, g));
++}
++
++bool dvbridge_render_source_scales(const struct dvbridge_renderer *r, struct dvbridge_geometry g)
++{
++    return r && r->source_wanted && r->source_packer && !r->legacy_composer && scaled(g) &&
++           dvbridge_source_can_scale(r->source_packer) &&
++           dvbridge_source_scale_covers(g.source_width, g.source_height, NULL, g.width, g.height,
++                                        NULL);
+ }
+ 
+ bool dvbridge_render_pack(struct dvbridge_renderer *r, struct dvbridge_gl_packer *packer,
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 0427756..3b1ceca 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -383,9 +383,16 @@ void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui,
+  * that could not be done (the picture is then whole only in those tiles) */
+ bool dvbridge_render_complete(struct dvbridge_renderer *renderer);
+ /* Whether dvbridge_render_packed() may draw a picture of this geometry: full raster, or, with the
+- * source transport, a picture drawn at its own size anywhere */
++ * source transport, a picture drawn at its own size anywhere (Hades: or one that it scales,
++ * dvbridge_render_source_scales()) */
+ bool dvbridge_render_direct_fits(const struct dvbridge_renderer *renderer,
+                                  struct dvbridge_geometry geometry);
++/* Hades: whether the source transport, where it is asked for, would take a picture of this geometry
++ * that is not drawn at its own size: scaled up in the composer's representation
++ * (dvbridge_source_scale(); the passes made on this GPU, the composer of CCM 001 on). Its metadata
++ * may still keep it out (dvbridge_render_source() says, once it is drawn). */
++bool dvbridge_render_source_scales(const struct dvbridge_renderer *renderer,
++                                   struct dvbridge_geometry geometry);
+ /* Packs the last picture of dvbridge_render_rgb() (and what was drawn over it in its texture)
+  * into a 3840x2160 framebuffer, in its transport: packer is the one of the converted transport.
+  * cover: whether something was drawn over the picture, and so how the level 5 block that the
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index c76e6c3..22b93c8 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -21,6 +21,12 @@ static double sinc(double x)
+ }
+ 
+ void dvbridge_source_filter(double phase, int weights[DVBRIDGE_SOURCE_TAPS], int *first, int *taps)
++{
++    dvbridge_source_filter_a(phase, DVBRIDGE_SOURCE_LANCZOS, weights, first, taps);
++}
++
++void dvbridge_source_filter_a(double phase, int a, int weights[DVBRIDGE_SOURCE_TAPS], int *first,
++                              int *taps)
+ {
+     memset(weights, 0, DVBRIDGE_SOURCE_TAPS * sizeof(*weights));
+     const int one = 1 << DVBRIDGE_SOURCE_WEIGHT_BITS;
+@@ -31,7 +37,8 @@ void dvbridge_source_filter(double phase, int weights[DVBRIDGE_SOURCE_TAPS], int
+         *taps = 1;
+         return;
+     }
+-    const int a = DVBRIDGE_SOURCE_LANCZOS;
++    /* (the windows that the arrays hold: 1 to DVBRIDGE_SOURCE_TAPS / 2 lobes) */
++    a = a < 1 ? 1 : 2 * a > DVBRIDGE_SOURCE_TAPS ? DVBRIDGE_SOURCE_TAPS / 2 : a;
+     double w[DVBRIDGE_SOURCE_TAPS], sum = 0.0;
+     for (int i = 0; i < 2 * a; ++i) {
+         const double d = (i - a + 1) - phase; /* samples j - a + 1 .. j + a */
+@@ -61,6 +68,49 @@ static void place(int parity, double shift, int weights[DVBRIDGE_SOURCE_TAPS], i
+     *first += (int)base;
+ }
+ 
++bool dvbridge_source_axis(int *table, int n, double start, double step, int stride, double centre,
++                          int sub, int a)
++{
++    if (!table || n < 1 || sub < 1 || !isfinite(start) || !isfinite(step) || !isfinite(centre))
++        return false;
++    for (int o = 0; o < n; ++o) {
++        int *e = table + (size_t)o * DVBRIDGE_SOURCE_ENTRY;
++        memset(e, 0, DVBRIDGE_SOURCE_ENTRY * sizeof(*e));
++        const double u = start + ((double)stride * o + 0.5) * step - 0.5;
++        const double t = (u - centre) / sub;
++        if (!isfinite(t) || fabs(t) > 1e6)
++            return false;
++        /* (as place(): a position a hair below a sample is that sample) */
++        const double base = floor(t + 1e-9);
++        int first = 0, taps = 0;
++        dvbridge_source_filter_a(t - base, a, e + 2, &first, &taps);
++        e[0] = first + (int)base;
++        e[1] = taps;
++    }
++    return true;
++}
++
++bool dvbridge_source_scale_covers(int source_width, int source_height, const float view[4],
++                                  int width, int height, const char **why)
++{
++    const float v[4] = {view ? view[0] : 0.0f, view ? view[1] : 0.0f,
++                        view ? view[2] : (float)source_width, view ? view[3] : (float)source_height};
++    const char *no = NULL;
++    if (source_width < 2 || source_height < 2 || source_width > 3840 || source_height > 2160 ||
++        width < 2 || height < 2 || width > 3840 || height > 2160 || (width & 1))
++        no = "the picture is drawn at a size that the transport does not take";
++    else if (!isfinite(v[0]) || !isfinite(v[1]) || !isfinite(v[2]) || !isfinite(v[3]) ||
++             v[0] < 0.0f || v[1] < 0.0f || v[2] > source_width || v[3] > source_height ||
++             v[2] - v[0] < 1.0f || v[3] - v[1] < 1.0f)
++        no = "the part of the picture shown is not within the picture";
++    /* (a hundredth of a pixel of slack: a picture placed with its edges moved to even columns) */
++    else if (width < v[2] - v[0] - 0.01f || height < v[3] - v[1] - 0.01f)
++        no = "the picture is scaled down";
++    if (why)
++        *why = no;
++    return !no;
++}
++
+ static bool invert3(const double m[9], double out[9])
+ {
+     const double c0 = m[4] * m[8] - m[5] * m[7], c1 = m[5] * m[6] - m[3] * m[8],
+@@ -172,6 +222,8 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+         WHY("the filter of the chroma would overflow");
+     out->bits = 12;
+     out->code_max = 4095;
++    out->shift_x = shift_x;
++    out->shift_y = shift_y;
+     return true;
+ }
+ 
+@@ -303,6 +355,99 @@ static const char ROWS[] =
+     "    color = uvec4(c0, c1);\n"
+     "}\n";
+ 
++/* Hades: the passes of a picture that is scaled (dvbridge_source_scale()), in place of 1 and 2. The
++ * weights of each output position (dvbridge_source_axis()) are four texels of an integer texture:
++ * first, taps, w0, w1 / w2 .. w5 / w6 .. w9 / w10, w11. */
++#define SCALE_ENTRY                                                                               \
++    "void entry(highp isampler2D t, int o, out int first, out int taps, out int w[12])\n"        \
++    "{\n"                                                                                         \
++    "    ivec4 a = texelFetch(t, ivec2(0, o), 0), b = texelFetch(t, ivec2(1, o), 0);\n"          \
++    "    ivec4 c = texelFetch(t, ivec2(2, o), 0), d = texelFetch(t, ivec2(3, o), 0);\n"          \
++    "    first = a.x; taps = a.y;\n"                                                             \
++    "    w[0] = a.z; w[1] = a.w; w[2] = b.x; w[3] = b.y; w[4] = b.z; w[5] = b.w;\n"               \
++    "    w[6] = c.x; w[7] = c.y; w[8] = c.z; w[9] = c.w; w[10] = d.x; w[11] = d.y;\n"             \
++    "}\n"
++
++/* 1s. The columns of the raster from a composed plane (luma, or the two of the chroma): the codes
++ * (plane * 2^bits) by the weights of the output column, kept with 2 fractional bits (an integer in a
++ * float: exact). Fragment (x, y): column x of the output, row y of the plane. */
++static const char SCALE_COLUMNS[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D plane;\n"
++    "uniform highp isampler2D table;\n"
++    "uniform float code_scale;\n"
++    "uniform int last_col;\n"
++    "out vec4 color;\n"
++    SCALE_ENTRY
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    int first, taps, w[12];\n"
++    "    entry(table, p.x, first, taps, w);\n"
++    "    ivec2 acc = ivec2(0);\n"
++    "    for (int i = 0; i < taps; i++) {\n"
++    "        vec2 v = texelFetch(plane, ivec2(clamp(first + i, 0, last_col), p.y), 0).rg;\n"
++    "        acc += w[i] * ivec2(floor(v * code_scale + 0.5));\n"
++    "    }\n"
++    "    acc = (acc + (1 << 11)) >> 12;\n" /* 14 - DVBRIDGE_SOURCE_FRAC_BITS */
++    "    color = vec4(vec2(acc), 0.0, 1.0);\n"
++    "}\n";
++
++/* 2s. The rows of the luma: from those columns, by the weights of the output row, rounded to a code
++ * (the 14 bits of the weights and the 2 fractional ones), within [0, code_max], as the composed luma
++ * holds it (code / 2^bits). */
++static const char SCALE_LUMA_ROWS[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D columns;\n"
++    "uniform highp isampler2D table;\n"
++    "uniform float code_scale;\n"
++    "uniform int last_row, code_max;\n"
++    "out vec4 color;\n"
++    SCALE_ENTRY
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    int first, taps, w[12];\n"
++    "    entry(table, p.y, first, taps, w);\n"
++    "    int acc = 0;\n"
++    "    for (int i = 0; i < taps; i++)\n"
++    "        acc += w[i] * int(texelFetch(columns, ivec2(p.x, clamp(first + i, 0, last_row)), 0).r);\n"
++    "    int code = clamp((acc + (1 << 15)) >> 16, 0, code_max);\n"
++    "    color = vec4(float(code) / code_scale, 0.0, 0.0, 1.0);\n"
++    "}\n";
++
++/* 3s. The rows of 4:2:2 chroma, as pass 2 lays them out (fragment row i: rows 2 i in rg and
++ * 2 i + 1 in ba), each by the weights of its own row from the chroma columns of 1s. */
++static const char SCALE_CHROMA_ROWS[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D columns;\n"
++    "uniform highp isampler2D table;\n"
++    "uniform int last_row, code_max, rows;\n"
++    "out uvec4 color;\n"
++    SCALE_ENTRY
++    "uvec2 row_at(int x, int r)\n"
++    "{\n"
++    "    int first, taps, w[12];\n"
++    "    entry(table, r, first, taps, w);\n"
++    "    ivec2 acc = ivec2(0);\n"
++    "    for (int i = 0; i < taps; i++)\n"
++    "        acc += w[i] * ivec2(texelFetch(columns, ivec2(x, clamp(first + i, 0, last_row)), 0).rg);\n"
++    "    return uvec2(clamp((acc + (1 << 15)) >> 16, ivec2(0), ivec2(code_max)));\n"
++    "}\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 q = ivec2(gl_FragCoord.xy);\n"
++    "    uvec2 c0 = row_at(q.x, 2 * q.y);\n"
++    "    uvec2 c1 = 2 * q.y + 1 < rows ? row_at(q.x, 2 * q.y + 1) : uvec2(0u);\n"
++    "    color = uvec4(c0, c1);\n"
++    "}\n";
++
+ /* What passes 3 and 4 share, the same code in both: the codes of the transport at a pixel and the
+  * chain of the DM header from them to PQ BT.2020 RGB. Pass 4 recomputes the picture of pass 3 where
+  * something was drawn over it, so they must compute it alike. */
+@@ -997,6 +1142,26 @@ struct dvbridge_source_packer {
+         GLint chroma, chroma_read, chroma_shift, lo, span, taps0, first0, taps1, first1, last_row,
+             code_max, weights0, weights1, needed;
+     } v;
++    /* Hades: a picture that is scaled (dvbridge_source_scale()): passes 1s, 2s and 3s and their
++     * uniforms (all three or none: without them a scaled picture goes converted, as before); the
++     * tables of the luma columns, the luma rows, the chroma columns and the chroma rows, and what they
++     * were made for (scale_of); the columns of the luma and of the chroma, and the luma scaled */
++    GLuint scale_columns, scale_luma_rows, scale_chroma_rows;
++    struct {
++        GLint plane, table, code_scale, last_col;
++    } sc_cols;
++    struct {
++        GLint columns, table, code_scale, last_row, code_max;
++    } sc_luma;
++    struct {
++        GLint columns, table, last_row, code_max, rows;
++    } sc_chroma;
++    GLuint tables[4];
++    int table_rows[4];
++    bool scale_made;
++    float scale_of[12];
++    int *table_data;
++    struct texture luma_columns, chroma_columns, scaled_luma;
+ };
+ 
+ static GLuint compile(GLenum type, const char *source)
+@@ -1185,6 +1350,31 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+                             "be made; the rounding is the exact one\n");
+         }
+     }
++    /* Hades: the passes of a picture that is scaled, all three or none (then such a picture is not
++     * covered: it goes converted, as before them) */
++    {
++        static const char *const cols[] = {"plane", "table", "code_scale", "last_col"};
++        static const char *const lrows[] = {"columns", "table", "code_scale", "last_row",
++                                            "code_max"};
++        static const char *const crows[] = {"columns", "table", "last_row", "code_max", "rows"};
++        _Static_assert(sizeof(p->sc_cols) == COUNT(cols) * sizeof(GLint), "scale uniforms");
++        _Static_assert(sizeof(p->sc_luma) == COUNT(lrows) * sizeof(GLint), "scale uniforms");
++        _Static_assert(sizeof(p->sc_chroma) == COUNT(crows) * sizeof(GLint), "scale uniforms");
++        p->scale_columns = link(SCALE_COLUMNS);
++        p->scale_luma_rows = link(SCALE_LUMA_ROWS);
++        p->scale_chroma_rows = link(SCALE_CHROMA_ROWS);
++        if (!p->scale_columns || !p->scale_luma_rows || !p->scale_chroma_rows ||
++            !locate(p->scale_columns, &p->sc_cols.plane, cols, COUNT(cols)) ||
++            !locate(p->scale_luma_rows, &p->sc_luma.columns, lrows, COUNT(lrows)) ||
++            !locate(p->scale_chroma_rows, &p->sc_chroma.columns, crows, COUNT(crows))) {
++            glDeleteProgram(p->scale_columns);
++            glDeleteProgram(p->scale_luma_rows);
++            glDeleteProgram(p->scale_chroma_rows);
++            p->scale_columns = p->scale_luma_rows = p->scale_chroma_rows = 0;
++            fprintf(stderr, "DV source transport: the passes that scale a picture could not be "
++                            "made; a scaled picture goes converted, as before\n");
++        }
++    }
+     glGenVertexArrays(1, &p->vao);
+     glGenSamplers(1, &p->sampler);
+     glSamplerParameteri(p->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+@@ -1231,6 +1421,15 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteProgram(p->picture_flag);
+     glDeleteProgram(p->pairs_simple);
+     glDeleteProgram(p->pairs_corr);
++    /* Hades: those of a scaled picture */
++    texture_destroy(&p->luma_columns);
++    texture_destroy(&p->chroma_columns);
++    texture_destroy(&p->scaled_luma);
++    glDeleteTextures(4, p->tables);
++    free(p->table_data);
++    glDeleteProgram(p->scale_columns);
++    glDeleteProgram(p->scale_luma_rows);
++    glDeleteProgram(p->scale_chroma_rows);
+     free(p);
+ }
+ 
+@@ -1376,6 +1575,173 @@ bool dvbridge_source_rows(struct dvbridge_source_packer *p,
+     return ok;
+ }
+ 
++/* Hades: the largest sum of the magnitudes of the weights of a table (the bound of its sums) */
++static double table_gain(const int *table, int n)
++{
++    double most = 0.0;
++    for (int o = 0; o < n; ++o) {
++        const int *e = table + (size_t)o * DVBRIDGE_SOURCE_ENTRY;
++        double s = 0.0;
++        for (int i = 0; i < e[1]; ++i)
++            s += abs(e[2 + i]);
++        most = fmax(most, s);
++    }
++    return most;
++}
++
++/* Hades: the tables of a scaled picture, made where they are not those of the last one */
++static bool scale_tables(struct dvbridge_source_packer *p,
++                         const struct dvbridge_source_params *params, int sw, int sh,
++                         const float v[4], int width, int height)
++{
++    const float key[12] = {(float)sw, (float)sh, v[0], v[1], v[2], v[3], (float)width,
++                           (float)height, params->shift_x, params->shift_y,
++                           (float)DVBRIDGE_SOURCE_LUMA_LANCZOS,
++                           (float)DVBRIDGE_SOURCE_SCALE_CHROMA_LANCZOS};
++    if (p->scale_made && !memcmp(p->scale_of, key, sizeof(key)))
++        return true;
++    p->scale_made = false;
++    const int n[4] = {width, height, width / 2, height};
++    if (!p->table_data &&
++        !(p->table_data = malloc((size_t)(3840 + 2160 + 1920 + 2160) * DVBRIDGE_SOURCE_ENTRY *
++                                 sizeof(int))))
++        return false;
++    int *t[4];
++    t[0] = p->table_data;
++    for (int i = 1; i < 4; ++i)
++        t[i] = t[i - 1] + (size_t)n[i - 1] * DVBRIDGE_SOURCE_ENTRY;
++    const double sx = ((double)v[2] - (double)v[0]) / width;
++    const double sy = ((double)v[3] - (double)v[1]) / height;
++    if (!dvbridge_source_axis(t[0], n[0], v[0], sx, 1, 0.0, 1, DVBRIDGE_SOURCE_LUMA_LANCZOS) ||
++        !dvbridge_source_axis(t[1], n[1], v[1], sy, 1, 0.0, 1, DVBRIDGE_SOURCE_LUMA_LANCZOS) ||
++        !dvbridge_source_axis(t[2], n[2], v[0], sx, 2, 0.5 + (double)params->shift_x, 2,
++                              DVBRIDGE_SOURCE_SCALE_CHROMA_LANCZOS) ||
++        !dvbridge_source_axis(t[3], n[3], v[1], sy, 1, 0.5 + (double)params->shift_y, 2,
++                              DVBRIDGE_SOURCE_SCALE_CHROMA_LANCZOS))
++        return false;
++    /* the sums stay within 31 bits: of the columns over codes, and of the rows over the columns
++     * (2 fractional bits) */
++    for (int k = 0; k < 2; ++k) {
++        const double cols = table_gain(t[k ? 2 : 0], n[k ? 2 : 0]);
++        const double rows = table_gain(t[k ? 3 : 1], n[k ? 3 : 1]);
++        const double read = params->code_max * cols / (1 << (DVBRIDGE_SOURCE_WEIGHT_BITS -
++                                                             DVBRIDGE_SOURCE_FRAC_BITS)) + 1.0;
++        if (params->code_max * cols >= 2147483647.0 || rows * read >= 2147483647.0)
++            return false;
++    }
++    /* (the pixel store as it is by default, from no buffer, for the uploads; then as it was) */
++    GLint unpack_buffer = 0, row_length = 0, skip_rows = 0, skip_pixels = 0;
++    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_buffer);
++    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    bool ok = true;
++    for (int i = 0; i < 4 && ok; ++i) {
++        if (!p->tables[i] || p->table_rows[i] != n[i]) {
++            glDeleteTextures(1, &p->tables[i]);
++            glGenTextures(1, &p->tables[i]);
++            glBindTexture(GL_TEXTURE_2D, p->tables[i]);
++            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32I, DVBRIDGE_SOURCE_ENTRY / 4, n[i]);
++            p->table_rows[i] = n[i];
++        }
++        glBindTexture(GL_TEXTURE_2D, p->tables[i]);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DVBRIDGE_SOURCE_ENTRY / 4, n[i], GL_RGBA_INTEGER,
++                        GL_INT, t[i]);
++        ok = glGetError() == GL_NO_ERROR;
++        if (!ok)
++            p->table_rows[i] = 0;
++    }
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack_buffer);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++    if (!ok)
++        return false;
++    memcpy(p->scale_of, key, sizeof(key));
++    p->scale_made = true;
++    return true;
++}
++
++bool dvbridge_source_can_scale(const struct dvbridge_source_packer *p)
++{
++    return p && p->scale_columns;
++}
++
++bool dvbridge_source_scale(struct dvbridge_source_packer *p,
++                           const struct dvbridge_source_params *params, unsigned luma,
++                           unsigned chroma, int sw, int sh, const float view[4], int width,
++                           int height, int x, int y, const unsigned margins[4],
++                           unsigned *scaled_luma)
++{
++    if (scaled_luma)
++        *scaled_luma = 0;
++    if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !chroma ||
++        !scaled_luma || !p->scale_columns ||
++        !dvbridge_source_scale_covers(sw, sh, view, width, height, NULL))
++        return false;
++    p->rows_made = false;
++    const float v[4] = {view ? view[0] : 0.0f, view ? view[1] : 0.0f,
++                        view ? view[2] : (float)sw, view ? view[3] : (float)sh};
++    const int scw = (sw + 1) / 2, sch = (sh + 1) / 2;
++    struct dvbridge_gl_state state;
++    begin(p, &state);
++    if (!scale_tables(p, params, sw, sh, v, width, height))
++        return end(&state, false);
++    /* 1s: the columns of the luma (width x sh) and of the chroma (width / 2 x the chroma's rows) */
++    const float code_scale = (float)(1 << params->bits);
++    for (int k = 0; k < 2; ++k) {
++        struct texture *into = k ? &p->chroma_columns : &p->luma_columns;
++        if (!target(into, k ? GL_RG32F : GL_R32F, k ? width / 2 : width, k ? sch : sh))
++            return end(&state, false);
++        glUseProgram(p->scale_columns);
++        bind(p, 0, k ? chroma : luma);
++        bind(p, 1, p->tables[k ? 2 : 0]);
++        glUniform1i(p->sc_cols.plane, 0);
++        glUniform1i(p->sc_cols.table, 1);
++        glUniform1f(p->sc_cols.code_scale, code_scale);
++        glUniform1i(p->sc_cols.last_col, (k ? scw : sw) - 1);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++    }
++    /* 2s: the luma at its size */
++    if (!target(&p->scaled_luma, GL_R32F, width, height))
++        return end(&state, false);
++    glUseProgram(p->scale_luma_rows);
++    bind(p, 0, p->luma_columns.texture);
++    bind(p, 1, p->tables[1]);
++    glUniform1i(p->sc_luma.columns, 0);
++    glUniform1i(p->sc_luma.table, 1);
++    glUniform1f(p->sc_luma.code_scale, code_scale);
++    glUniform1i(p->sc_luma.last_row, sh - 1);
++    glUniform1i(p->sc_luma.code_max, params->code_max);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    /* 3s: the rows of 4:2:2 chroma, two to a texel as pass 2 makes them */
++    if (!target(&p->chroma, GL_RGBA16UI, width / 2, (height + 1) / 2))
++        return end(&state, false);
++    glUseProgram(p->scale_chroma_rows);
++    bind(p, 0, p->chroma_columns.texture);
++    bind(p, 1, p->tables[3]);
++    glUniform1i(p->sc_chroma.columns, 0);
++    glUniform1i(p->sc_chroma.table, 1);
++    glUniform1i(p->sc_chroma.last_row, sch - 1);
++    glUniform1i(p->sc_chroma.code_max, params->code_max);
++    glUniform1i(p->sc_chroma.rows, height);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    const bool ok = end(&state, true);
++    if (ok) {
++        const int key[8] = {width, height, x, y, (int)margins[0], (int)margins[1],
++                            (int)margins[2], (int)margins[3]};
++        memcpy(p->rows_of, key, sizeof(key));
++        p->rows_made = true;
++        *scaled_luma = p->scaled_luma.texture;
++    }
++    return ok;
++}
++
+ /* the uniforms of COMMON; the luma on unit 0, the rows on unit 1 */
+ static void set_common(struct dvbridge_source_packer *p, const struct common_uniforms *u,
+                        const struct dvbridge_source_params *params, unsigned luma, int width,
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 556a33a..12e8afd 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -75,6 +75,9 @@ struct dvbridge_source_params {
+     int vtaps[2], vfirst[2], vweights[2][DVBRIDGE_SOURCE_TAPS];
+     /* the horizontal one, for chroma that is not on the even luma column (htaps 0: it is) */
+     int htaps, hfirst, hweights[DVBRIDGE_SOURCE_TAPS];
++    /* Hades: the shift of the chroma planes that the filters were made for (luma samples, as given
++     * to dvbridge_source_setup()), which dvbridge_source_scale() places its chroma by */
++    float shift_x, shift_y;
+ };
+ 
+ /* For a picture with this metadata (an AVDOVIMetadata the caller has checked, as for the renderer)
+@@ -87,6 +90,57 @@ bool dvbridge_source_setup(struct dvbridge_source_params *out, const void *metad
+ /* The filter at a phase in [0, 1) of a chroma sample: the sample at j + phase is
+  * sum weights[i] * c[j + first + i] / 2^14, i < *taps (for tests) */
+ void dvbridge_source_filter(double phase, int weights[DVBRIDGE_SOURCE_TAPS], int *first, int *taps);
++/* Hades: the same with a Lanczos window of a lobes (2 a taps, a at most DVBRIDGE_SOURCE_TAPS / 2) */
++void dvbridge_source_filter_a(double phase, int a, int weights[DVBRIDGE_SOURCE_TAPS], int *first,
++                              int *taps);
++
++/* Hades: a picture drawn at another size than its own (an HD stream on the 3840x2160 raster), or a
++ * part of it drawn (the view of dvbridge_geometry: zoom, a shift out of the raster, stretching), is
++ * scaled in the representation of the composer's planes, as a certified source device scales the
++ * composer's output picture: clause 6.2.2 has the DM header describe the picture that is sent (its
++ * YCCtoRGB, signal_color_space), and nothing in clause 6 ties that picture to the composer's size
++ * (clause 4, note 1, and annex B resample only the layers before composing). The converted
++ * transport decodes the picture to BT.2020 R'G'B', scales that, and sends it as BT.2020 YCbCr: three
++ * resamplings of the chroma, the colours outside BT.2020 lost (an IPT picture of profile 5 has
++ * them), and the decoding of profile 5 off its reference by up to 39 codes of 4095.
++ * Here the luma is scaled by Lanczos 3 (the filter of libplacebo's main scaler, which the converted
++ * transport scales its picture with), the 4:2:0 chroma straight to the 4:2:2 of the raster by
++ * Lanczos 3 as well, separably (columns, then rows), from the composer's integer codes with integer
++ * weights (each position's sum 2^14) and 2 fractional bits between the passes, the planes' edges
++ * repeated: every GPU gets the same bytes. Only scaling up or not at all on each axis (a filter that
++ * scales down would have to be widened); the converted transport draws the rest.
++ * The filters by measurement (Mesa's software OpenGL ES): 1920x1080 renditions of 4K base layers
++ * (each plane brought to half its size by Lanczos 3 widened, as an encoder makes the HD rendition
++ * of a master, with the same RPU), drawn on the raster and compared with the composed 4K master,
++ * Delta E ITP of what a display decodes from each transport. Mean, the converted transport against
++ * this one: a profile 5 chart 1.312 against 1.170, two natural profile 5 pictures 0.349 against
++ * 0.266 and 0.382 against 0.312, three of a profile 7 stream without its layer (YCbCr) 0.199
++ * against 0.150, 0.667 against 0.661 and 0.699 against 0.691; the median lower in all six; the 99th
++ * percentile from 1.5 % above (the chart's edges) to 0.7 % below. The same with renditions made by
++ * FFmpeg's bicubic (four pictures): lower means and medians, the chart's 99th percentile 2.8 %
++ * above. Lanczos 6 for the chroma (the transport's filter where the picture is not scaled, chosen
++ * against the band-limited interpolation) came out further from the master in all of them, and in
++ * two YCbCr pictures further than the converted transport; Lanczos 2 nearer in the mean, but the
++ * chart's 99th percentile 4.5 % above the converted transport's. */
++#define DVBRIDGE_SOURCE_LUMA_LANCZOS 3
++#define DVBRIDGE_SOURCE_SCALE_CHROMA_LANCZOS 3
++/* ints for each position of a scaled axis: first, taps, 12 weights, 2 unused (four RGBA32I texels) */
++#define DVBRIDGE_SOURCE_ENTRY 16
++
++/* The table of an axis: n positions. Output sample o is at luma position
++ * u = start + (stride * o + 0.5) * step - 0.5 of the picture (start: the edge of the part shown,
++ * step: the picture's luma samples per sample of the raster; stride 2 for the chroma of the pairs
++ * of 4:2:2, whose chroma is that of their even pixel), and read at t = (u - centre) / sub of the
++ * plane (luma: centre 0, sub 1; 4:2:0 chroma: centre 0.5 + its shift, sub 2), with Lanczos a, its
++ * samples from table[o * DVBRIDGE_SOURCE_ENTRY] (clamped to the plane by the reader). False where a
++ * position is not finite. */
++bool dvbridge_source_axis(int *table, int n, double start, double step, int stride, double centre,
++                          int sub, int a);
++/* Whether the source transport scales the part view (x0, y0, x1, y1 of the picture, in luma
++ * samples; NULL: the whole picture) of a source_width x source_height picture to width x height:
++ * not scaling down on either axis, within 3840x2160. *why: why not. */
++bool dvbridge_source_scale_covers(int source_width, int source_height, const float view[4],
++                                  int width, int height, const char **why);
+ 
+ struct dvbridge_source_packer;
+ struct dvbridge_source_packer *dvbridge_source_packer_create(void);
+@@ -104,6 +158,18 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *packer);
+ bool dvbridge_source_rows(struct dvbridge_source_packer *packer,
+                           const struct dvbridge_source_params *params, unsigned chroma, int width,
+                           int height, int x, int y, const unsigned margins[4], bool all);
++/* Hades: the same for a picture that is scaled (see DVBRIDGE_SOURCE_LUMA_LANCZOS): the composed planes
++ * of a source_width x source_height picture, its part view (NULL: all of it) drawn at width x height
++ * at x, y. Makes the luma of that size in a texture of the packer (*scaled_luma: the luma that the
++ * calls below then take, with width and height as the picture's size) and the rows of 4:2:2 chroma
++ * at that size, every row and column. False where dvbridge_source_scale_covers() does not cover it. */
++/* Hades: whether the passes of a scaled picture were made on this GPU */
++bool dvbridge_source_can_scale(const struct dvbridge_source_packer *packer);
++bool dvbridge_source_scale(struct dvbridge_source_packer *packer,
++                           const struct dvbridge_source_params *params, unsigned luma,
++                           unsigned chroma, int source_width, int source_height,
++                           const float view[4], int width, int height, int x, int y,
++                           const unsigned margins[4], unsigned *scaled_luma);
+ 
+ /* The picture that Kodi draws over, into a 3840x2160 RGBA32F framebuffer: the transport decoded
+  * with the chain of its DM header, PQ BT.2020 RGB within [0, 1] (the chroma of an odd pixel halfway
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 41bb050..da20c18 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -82,9 +82,15 @@ public:
+   bool TriesDirect(const dvbridge_geometry& geometry) const
+   {
+     // (Hades: as Prepare() decides it: a picture that fills the raster, or, with the source
+-    // transport, one drawn at its own size anywhere on it)
++    // transport, one drawn at its own size anywhere on it, or one that it scales)
+     return m_directUsable && m_scanout && dvbridge_render_direct_fits(m_renderer, geometry);
+   }
++  //! Hades: a picture of this geometry, not drawn at its own size, would go out in the source
++  //! transport, scaled in the composer's representation (dvbridge_render_source_scales())
++  bool SourceScales(const dvbridge_geometry& geometry) const
++  {
++    return m_renderer && dvbridge_render_source_scales(m_renderer, geometry);
++  }
+   //! The prepared frame was drawn with the residual of its enhancement layer
+   bool PreparedResidual() const { return m_pendingDetail.fel; }
+   //! Hades: the fidelity step-down level of the frames prepared from now on (see
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 536d8e3..5981316 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -2919,9 +2919,12 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   // setting asks for the composed way): that way is the composition of its planes and their
+   // packing, the other one all of that and the picture that Kodi draws over as well. It is not one
+   // of the ways that are compared (a picture that is not at its own size goes out converted).
++  // (Hades: or one that the bridge scales up in the composer's representation, which goes out in
++  // that transport too: dvbridge_source_scale())
+   const bool sourceWay = m_dvBridge->SourceTransportWanted() &&
+-                         geometry.width == geometry.source_width &&
+-                         geometry.height == geometry.source_height;
++                         ((geometry.width == geometry.source_width &&
++                           geometry.height == geometry.source_height) ||
++                          m_dvBridge->SourceScales(geometry));
+   const bool direct = sourceWay ? m_dvEngine.path != CDVEngineSettings::Path::COMPOSED
+                                 : m_dvPath.Now()[layered].Direct(foreseen);
+   // (the two ways of drawing its load are being compared: its time says nothing of its level)
+-- 
+2.53.0
+

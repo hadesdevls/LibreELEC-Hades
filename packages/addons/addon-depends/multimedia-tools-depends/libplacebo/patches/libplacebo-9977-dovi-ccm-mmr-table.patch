@@ -1,0 +1,504 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:34:27 +0000
+Subject: [PATCH] dovi_ccm: the MMR mapping of the chroma with a table per
+ axis, as an option
+
+The chroma pass of the composer of ETSI GS CCM 001 (libplacebo-9930)
+evaluates the 22 terms of an MMR mapping of order 3 for every chroma
+sample and component, exactly (dovi_ccm.c). Ten of them depend on one of
+the three samples alone: the constant, and s, s^2 and s^3 of the
+down-sampled luma, of Cb and of Cr.
+
+With pl_render_params.dovi_ccm_mmr_table, those are summed on the CPU for
+every code of their sample (pl_dovi_ccm_mmr_table()), split as the shader
+sums every term: the low 32 bits of the q part, the two sums of the r part
+(integers below 2^19), and the float estimate made in doubles. The table is
+a texture of 32-bit unsigned integers, a row for each component, piece and
+axis, uploaded when the composing metadata change. The shader reads three
+entries of it a component and evaluates only the twelve terms of two or
+three samples, with the same expressions as before. Its sums are the same:
+X modulo 2^32 in any grouping, the same integers in rh and rl, and an
+estimate within the bound that dovi_ccm_prepare() checks, so the same v.
+Without a sampleable RGBA32UI format (libplacebo-9976 gives the OpenGL
+backend one), or where the table cannot be made, every term is evaluated
+as before, and that is logged once a stream. The
+chroma pass is named "DV composer: chroma (CCM 001 5.4, MMR table)" then,
+so that the GPU time of each pass tells the two apart.
+
+Whether it is faster depends on the GPU: three reads of a texture against
+products and sums. It is off by default, an option for that measurement.
+
+Measured on Mesa's zink (14 pictures of a profile 7 FEL stream, whose
+chroma is MMR of order 3; fidbench in the source transport at step-down
+levels 0 and 2, the converted transport, with GUI elements, and
+libplacebo's reshaping; the render test with the composer and with the
+reshaping): with the table, every file the same bytes as without it, and
+without it the same as before this. A mutation of the table (one step of v
+added on one axis) changes them.
+
+License: LGPL-2.1-or-later, that of libplacebo and of the files changed,
+whose notices stay as they are.
+---
+ src/dovi_ccm.c                    |  57 ++++++++
+ src/dovi_ccm.h                    |  15 ++
+ src/include/libplacebo/renderer.h |  16 +++
+ src/renderer.c                    | 231 ++++++++++++++++++++++++++----
+ 4 files changed, 289 insertions(+), 30 deletions(-)
+
+diff --git a/src/dovi_ccm.c b/src/dovi_ccm.c
+index 62a239e4..aeb8a9d6 100644
+--- a/src/dovi_ccm.c
++++ b/src/dovi_ccm.c
+@@ -17,6 +17,7 @@
+ 
+ #include <math.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "dovi_ccm.h"
+ #include "hash.h"
+@@ -94,6 +95,62 @@ static int nlq_linear_dz(const struct pl_dovi_ccm *ccm, int cmp, int e)
+     return (int) r;
+ }
+ 
++// Hades: floor(a b / 2^20), as the shader's dv_mul20() has it (exact)
++static uint32_t mul20(uint32_t a, uint32_t b)
++{
++    return (uint32_t) (((uint64_t) a * b) >> 20);
++}
++
++// Hades: see dovi_ccm.h. Each entry is what the shader adds term by term for
++// the same sample, so the shader's sums are the same: q modulo 2^32 (sums of
++// products modulo 2^32 in any grouping), the two r sums as the same integers
++// (every partial sum of them is an integer below 2^22, exact in floats). The
++// estimate differs from the shader's by the rounding of a different order of
++// operations, fewer of them in floats: within the bound that dovi_ccm_prepare()
++// checks below (S < 2^28 keeps it within 785 of the true value, and 2048
++// tells the value).
++void pl_dovi_ccm_mmr_table(const struct pl_dovi_ccm_prep *pp, uint32_t *out)
++{
++    const int w = 1 << pp->bl_depth;
++    const int sh1 = 20 - pp->bl_depth, sh2 = 20 - 2 * pp->bl_depth;
++    memset(out, 0, (size_t) PL_DOVI_CCM_MMRT_ROWS * w * 4 * sizeof(*out));
++    for (int ci = 0; ci < 2; ci++) {
++        const struct pl_dovi_ccm_chroma *ch = &pp->chroma[ci];
++        for (int i = 0; i < ch->num_pieces; i++) {
++            if (!(ch->mmr_mask & (1 << i)))
++                continue;
++            for (int a = 0; a < 3; a++) {
++                uint32_t *row = out + (size_t) ((ci * 8 + i) * 3 + a) * w * 4;
++                for (int s = 0; s < w; s++) {
++                    // the terms of this sample as the shader makes them
++                    // (ccm_chroma(): u << sh1, (u * u) << sh2, and their
++                    // product by dv_mul20()), and the constant term
++                    const uint32_t t1 = (uint32_t) s << sh1;
++                    const uint32_t t2 = ((uint32_t) s * (uint32_t) s) << sh2;
++                    const uint32_t tt[4] = { 1u << 20, t1, t2, mul20(t1, t2) };
++                    const int ks[4] = { a == 0 ? 0 : -1, 1 + a, 8 + a, 15 + a };
++                    uint32_t q = 0;
++                    double rh = 0.0, rl = 0.0, est = 0.0;
++                    for (int n = 0; n < 4; n++) {
++                        const int k = ks[n];
++                        if (k < 0 || k >= ch->terms)
++                            continue;
++                        q += ch->q[i][k] * tt[n];
++                        rh += (double) ch->r[i][k] * (double) (tt[n] >> 10);
++                        rl += (double) ch->r[i][k] * (double) (tt[n] & 1023);
++                        est += (double) ch->f[i][k] * (double) tt[n];
++                    }
++                    const float frh = (float) rh, frl = (float) rl, fest = (float) est;
++                    row[4 * s + 0] = q;
++                    memcpy(&row[4 * s + 1], &frh, sizeof(frh));
++                    memcpy(&row[4 * s + 2], &frl, sizeof(frl));
++                    memcpy(&row[4 * s + 3], &fest, sizeof(fest));
++                }
++            }
++        }
++    }
++}
++
+ #define FAIL(why) do { out->reason = (why); return false; } while (0)
+ 
+ bool pl_dovi_ccm_prepare(struct pl_dovi_ccm_prep *out,
+diff --git a/src/dovi_ccm.h b/src/dovi_ccm.h
+index 7ed5a123..f4385a5d 100644
+--- a/src/dovi_ccm.h
++++ b/src/dovi_ccm.h
+@@ -66,6 +66,21 @@ struct pl_dovi_ccm_prep {
+     } chroma[2];
+ };
+ 
++// Hades: the MMR mappings of the chroma with a table per axis
++// (pl_render_params.dovi_ccm_mmr_table). For chroma component ci, piece i and
++// axis a (0: the down-sampled luma s0, 1: Cb, 2: Cr), row (ci * 8 + i) * 3 + a
++// holds, for every code s of the base layer (column s, 2^BL_bit_depth of them),
++// the terms of the mapping that depend on that sample alone, C'_k tt[k] for tt
++// the sample, its square and its cube as the shader makes them (and, on axis
++// 0, the constant), summed as the shader sums every term: q, the low 32 bits
++// of the sum of floor(C'_k / 2^7) tt[k]; the sums of r_k (tt[k] >> 10) and of
++// r_k (tt[k] & 1023), exact integers below 2^19, as floats; and the float
++// estimate, the sum of f_k tt[k] made in doubles. The three floats are held as
++// their bits. `out` has PL_DOVI_CCM_MMRT_ROWS rows of 2^BL_bit_depth texels of
++// four uint32_t; the rows of a piece that is not an MMR one are zeros.
++#define PL_DOVI_CCM_MMRT_ROWS 48
++void pl_dovi_ccm_mmr_table(const struct pl_dovi_ccm_prep *pp, uint32_t *out);
++
+ // Makes `out` for `ccm`, unless `out->signature` says it already is. Returns
+ // false, with `out->reason` set, when the clause cannot compose this picture
+ // (metadata outside its scope or outside what the shaders evaluate exactly).
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 7f5f33d9..de61eabf 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -147,6 +147,8 @@ struct pl_render_info {
+ // the result.
+ // Hades: `pl_render_params.dovi_ccm_planes` may be of 16-bit normalized formats
+ #define PL_DOVI_CCM_PLANES_UNORM16 1
++// Hades: `pl_render_params.dovi_ccm_mmr_table` exists
++#define PL_DOVI_CCM_MMR_TABLE 1
+ 
+ struct pl_render_params {
+     // Configures the algorithms used for upscaling and downscaling,
+@@ -474,6 +476,20 @@ struct pl_render_params {
+     int dovi_ccm_el_linear;
+     const struct pl_filter_config *dovi_ccm_plane_upscaler;
+ 
++    // With `dovi_ccm`: the MMR mapping of the chroma (clause 5.4.2.3.3) with a
++    // table for each of its three samples. The terms of an MMR mapping that
++    // depend on one sample alone (the constant, and s, s^2, s^3 of each of the
++    // down-sampled luma, Cb and Cr: 10 of the 22 of a mapping of order 3) are
++    // summed on the CPU for every code of that sample, split as the shader
++    // sums every term exactly, into a texture of 32-bit unsigned integers that
++    // the shader reads three times a component; it evaluates only the terms
++    // of two or three samples. The composed planes are the same, bit for bit.
++    // Whether that is faster depends on the GPU (three reads of a texture for
++    // fewer products), so it is off by default. A GPU without a sampleable
++    // RGBA32UI format, or where the table cannot be made, evaluates every
++    // term, as without this, and that is logged. Hades extension.
++    bool dovi_ccm_mmr_table;
++
+     // The transfer characteristics of the base layer of a Dolby Vision image,
+     // as its stream says them (a Dolby Vision configuration record whose base
+     // layer signal compatibility is 2 has an SDR base layer, in Recommendation
+diff --git a/src/renderer.c b/src/renderer.c
+index 914a6b68..58779a4b 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -102,6 +102,13 @@ struct dovi_ccm_state {
+     struct pl_dovi_ccm_prep prep;
+     pl_tex lut;
+     uint64_t lut_signature;
++    // Hades: the table of the MMR terms of one sample
++    // (pl_render_params.dovi_ccm_mmr_table), its data, and whether it was said
++    // that it could not be made
++    pl_tex mmrt;
++    uint64_t mmrt_signature;
++    uint32_t *mmrt_data;
++    bool mmrt_said;
+     // what was logged since the last pl_renderer_flush_cache() (a stream): each
+     // reason not to compose once, and composing once
+     const char *said[32]; // more than there are reasons
+@@ -191,8 +198,10 @@ static void renderer_uninit(pl_renderer rr)
+         sampler_destroy(rr, &rr->samplers_el[i]);
+ 
+     // Hades: the tables of the composer of ETSI GS CCM 001
+-    if (rr->dovi_ccm)
++    if (rr->dovi_ccm) {
+         pl_tex_destroy(rr->gpu, &rr->dovi_ccm->lut);
++        pl_tex_destroy(rr->gpu, &rr->dovi_ccm->mmrt);
++    }
+ 
+     // Free fallback ICC profiles
+     for (int i = 0; i < PL_ARRAY_SIZE(rr->icc_fallback); i++) {
+@@ -250,6 +259,7 @@ void pl_renderer_flush_cache(pl_renderer rr)
+     if (rr->dovi_ccm) {
+         rr->dovi_ccm->num_said = 0;
+         rr->dovi_ccm->said_composed = false;
++        rr->dovi_ccm->mmrt_said = false;
+     }
+ }
+ 
+@@ -1964,6 +1974,9 @@ struct ccm_ctx {
+     // hold it exactly (see ccm_half()), or NULL
+     pl_fmt fmt1h, fmt2h;
+     pl_tex lut;
++    // Hades: the table of the MMR terms of one sample (see
++    // pl_dovi_ccm_mmr_table()), or NULL: every term in the shader
++    pl_tex mmrt;
+     bool rows;              // leave rows out (pl_render_params.active_rows)
+     int el_linear;          // pl_render_params.dovi_ccm_el_linear
+     int luma_rows[2], chroma_rows[2];
+@@ -2237,8 +2250,11 @@ static pl_tex ccm_luma(struct pass_state *pass, const struct ccm_ctx *x,
+ // 5.4.2.3.3 for the chroma component ci (0 = Cb, 1 = Cr), into v[ci]: the
+ // piece of the sample s = sc[ci], then its MMR mapping (exact, see dovi_ccm.c)
+ // or its polynomial mapping (table)
++static void ccm_mmr_table(struct pass_state *pass, pl_shader sh,
++                          const struct ccm_ctx *x, int ci, ident_t mmrt);
++
+ static void ccm_mmr(struct pass_state *pass, pl_shader sh,
+-                    const struct ccm_ctx *x, int ci, ident_t lut)
++                    const struct ccm_ctx *x, int ci, ident_t lut, ident_t mmrt)
+ {
+     const struct pl_dovi_ccm_chroma *ch = &x->prep->chroma[ci];
+     GLSL("{                \n"
+@@ -2266,6 +2282,23 @@ static void ccm_mmr(struct pass_state *pass, pl_shader sh,
+         return;
+     }
+ 
++    // Hades: or with the table of the terms of one sample
++    // (pl_render_params.dovi_ccm_mmr_table)
++    if (mmrt) {
++        bool all_mmr = ch->mmr_mask == (1 << ch->num_pieces) - 1;
++        if (!all_mmr)
++            GLSL("if (((%d >> idx) & 1) != 0) { \n", ch->mmr_mask);
++        ccm_mmr_table(pass, sh, x, ci, mmrt);
++        if (!all_mmr) {
++            GLSL("} else {                                               \n"
++                 "    v[%d] = int(texelFetch("$", ivec2(s, %d), 0).x);   \n"
++                 "}                                                      \n",
++                 ci, lut, 1 + ci);
++        }
++        GLSL("} \n");
++        return;
++    }
++
+     const int nq = ch->terms / 4, n = ch->num_pieces * nq;
+     uint32_t *q = pl_alloc(pass->tmp, n * 4 * sizeof(uint32_t));
+     float *r = pl_alloc(pass->tmp, n * 4 * sizeof(float));
+@@ -2323,11 +2356,78 @@ static void ccm_mmr(struct pass_state *pass, pl_shader sh,
+     GLSL("} \n");
+ }
+ 
++// Hades: the MMR mapping of component ci with the table of the terms of one
++// sample (pl_render_params.dovi_ccm_mmr_table, pl_dovi_ccm_mmr_table()): the
++// three entries of its piece at u.x, u.y and u.z (the samples, clamped as for
++// every term), and the terms of two or three samples, dvc[] of ccm_chroma(),
++// with their coefficients, four a vec4 for each order. Then the same sums as
++// ccm_mmr() makes of all of them: the same X modulo 2^32, the same integers in
++// rh and rl, an estimate within the same bound, so the same v.
++static void ccm_mmr_table(struct pass_state *pass, pl_shader sh,
++                          const struct ccm_ctx *x, int ci, ident_t mmrt)
++{
++    const struct pl_dovi_ccm_chroma *ch = &x->prep->chroma[ci];
++    const int nq = ch->terms / 8, n = ch->num_pieces * nq;
++    uint32_t *q = pl_alloc(pass->tmp, n * 4 * sizeof(uint32_t));
++    float *r = pl_alloc(pass->tmp, n * 4 * sizeof(float));
++    float *f = pl_alloc(pass->tmp, n * 4 * sizeof(float));
++    for (int i = 0; i < ch->num_pieces; i++) {
++        for (int o = 0; o < nq; o++) {
++            // the terms of order o + 1 that are of two or three samples:
++            // (xy)^n, (xz)^n, (yz)^n, (xyz)^n, at k = 4 + 7 o .. 7 + 7 o
++            for (int j = 0; j < 4; j++) {
++                q[(i * nq + o) * 4 + j] = ch->q[i][4 + 7 * o + j];
++                r[(i * nq + o) * 4 + j] = ch->r[i][4 + 7 * o + j];
++                f[(i * nq + o) * 4 + j] = ch->f[i][4 + 7 * o + j];
++            }
++        }
++    }
++    ident_t vq = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmrc_q", .type = PL_VAR_UINT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = q,
++    });
++    ident_t vr = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmrc_r", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = r,
++    });
++    ident_t vf = sh_var(sh, (struct pl_shader_var) {
++        .var = { .name = "dv_mmrc_f", .type = PL_VAR_FLOAT, .dim_v = 4, .dim_m = 1, .dim_a = n },
++        .data = f,
++    });
++    GLSL("{                                                                \n"
++         "int base = idx * %d;                                             \n"
++         "int row = (%d + idx) * 3;                                        \n"
++         "uvec4 ta = texelFetch("$", ivec2(int(u.x), row), 0);             \n"
++         "uvec4 tb = texelFetch("$", ivec2(int(u.y), row + 1), 0);         \n"
++         "uvec4 tz = texelFetch("$", ivec2(int(u.z), row + 2), 0);         \n"
++         "uint X = ta.x + tb.x + tz.x;                                     \n"
++         "float rh = uintBitsToFloat(ta.y) + uintBitsToFloat(tb.y) + uintBitsToFloat(tz.y); \n"
++         "float rl = uintBitsToFloat(ta.z) + uintBitsToFloat(tb.z) + uintBitsToFloat(tz.z); \n"
++         "float est = uintBitsToFloat(ta.w) + uintBitsToFloat(tb.w) + uintBitsToFloat(tz.w); \n"
++         "for (int k = 0; k < %d; k++) {                                   \n"
++         "    uvec4 a = "$"[base + k] * dvc[k];                            \n"
++         "    X += a.x + a.y + a.z + a.w;                                  \n"
++         "    rh += dot("$"[base + k], dvch[k]);                           \n"
++         "    rl += dot("$"[base + k], dvcl[k]);                           \n"
++         "    est += dot("$"[base + k], dvcf[k]);                          \n"
++         "}                                                                \n"
++         "X += ((uint(rh) << 10u) + uint(rl)) >> 7u;                       \n"
++         "int m = int(X >> 20u);                                           \n"
++         "int vv = m + 4096 * int(floor((est - float(m)) * (1.0/4096.0) + 0.5)); \n"
++         "v[%d] = clamp(vv, 0, 65535);                                     \n"
++         "}                                                                \n",
++         nq, ci * 8, mmrt, mmrt, mmrt, nq, vq, vr, vr, vf, ci);
++}
++
+ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+                          pl_tex elv, int w, int h)
+ {
+     const struct pl_dovi_ccm_prep *pp = x->prep;
+-    pl_shader sh = ccm_begin(pass, w, h, "DV composer: chroma (CCM 001 5.4)",
++    // (Hades: named apart with the table of the MMR terms of one sample, so
++    // that a pass's GPU time tells which one it was)
++    pl_shader sh = ccm_begin(pass, w, h, x->mmrt ?
++                             "DV composer: chroma (CCM 001 5.4, MMR table)" :
++                             "DV composer: chroma (CCM 001 5.4)",
+                              x->chroma_rows, x->rows);
+     if (!sh)
+         return NULL;
+@@ -2338,6 +2438,8 @@ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+     ident_t blb = ccm_code(sh, &binds, &x->bl[1], x->kbl, "dv_bl_cb");
+     ident_t blr = ccm_code(sh, &binds, &x->bl[2], x->kbl, "dv_bl_cr");
+     ident_t lut = ccm_tex(sh, &binds, x->lut, "dv_lut");
++    const int terms = PL_MAX(pp->chroma[0].terms, pp->chroma[1].terms);
++    ident_t mmrt = x->mmrt && terms ? ccm_tex(sh, &binds, x->mmrt, "dv_mmrt") : NULL_IDENT;
+ 
+     // 5.4.2.3.3: s*_{i,j} = (((s_{2i-1,2j} + 2 s_{2i,2j} + s_{2i+1,2j} + 2) >> 2)
+     //   + ((s_{2i-1,2j+1} + 2 s_{2i,2j+1} + s_{2i+1,2j+1} + 2) >> 2) + 1) >> 1,
+@@ -2355,7 +2457,6 @@ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+          ly->params.w - 1, ly->params.h - 1, bly, bly, bly, bly, bly, bly,
+          blb, blr, (1 << pp->bl_depth) - 1);
+ 
+-    const int terms = PL_MAX(pp->chroma[0].terms, pp->chroma[1].terms);
+     if (terms) {
+         // The terms tt[] of 5.4.2.3.3, all below 2^20 but tt[0] = 2^20. The
+         // products of two of them are shifted down with
+@@ -2375,36 +2476,67 @@ static pl_tex ccm_chroma(struct pass_state *pass, const struct ccm_ctx *x,
+             .var = pl_var_ivec3("dv_hi"),
+             .data = &(int[3]) { pp->range[0][1], pp->range[1][1], pp->range[2][1] },
+         });
+-        GLSL("uvec3 u = uvec3(clamp(ivec3(s0, sc), "$", "$"));                  \n"
+-             "uvec4 tt[%d];                                                     \n"
+-             "tt[0] = uvec4(1048576u, u << %du);                                \n"
+-             "tt[1] = uvec4(uvec3(u.x*u.y, u.x*u.z, u.y*u.z) << %du, 0u);       \n"
+-             "tt[1].w = "$"(tt[1].x, tt[0].w);                                  \n",
+-             lo, hi, terms / 4, sh1, sh2, mul);
+-        if (terms >= 16) {
+-            GLSL("tt[2] = uvec4((u * u) << %du, "$"(tt[1].x, tt[1].x));         \n"
+-                 "tt[3] = uvec4("$"(tt[1].y, tt[1].y), "$"(tt[1].z, tt[1].z),   \n"
+-                 "              "$"(tt[1].w, tt[1].w), 0u);                     \n",
+-                 sh2, mul, mul, mul, mul);
+-        }
+-        if (terms >= 24) {
+-            GLSL("tt[3].w = "$"(tt[0].y, tt[2].x);                              \n"
+-                 "tt[4] = uvec4("$"(tt[0].z, tt[2].y), "$"(tt[0].w, tt[2].z),   \n"
+-                 "              "$"(tt[1].x, tt[2].w), "$"(tt[1].y, tt[3].x));  \n"
+-                 "tt[5] = uvec4("$"(tt[1].z, tt[3].y), "$"(tt[1].w, tt[3].z), 0u, 0u); \n",
+-                 mul, mul, mul, mul, mul, mul, mul);
++        GLSL("uvec3 u = uvec3(clamp(ivec3(s0, sc), "$", "$"));                  \n",
++             lo, hi);
++        if (mmrt) {
++            // Hades: with the table of the terms of one sample
++            // (pl_render_params.dovi_ccm_mmr_table), the terms of two or three
++            // samples alone, from the expressions that make them in tt[]
++            // below (tt[1], tt[2].w, tt[3].xyz, tt[4].zw, tt[5].xy): dvc[o] =
++            // ((xy)^n, (xz)^n, (yz)^n, (xyz)^n) for the order n = o + 1
++            GLSL("uvec3 t1 = u << %du;                                              \n"
++                 "uvec4 dvc[%d];                                                    \n"
++                 "dvc[0] = uvec4(uvec3(u.x*u.y, u.x*u.z, u.y*u.z) << %du, 0u);      \n"
++                 "dvc[0].w = "$"(dvc[0].x, t1.z);                                   \n",
++                 sh1, terms / 8, sh2, mul);
++            if (terms >= 16) {
++                GLSL("dvc[1] = uvec4("$"(dvc[0].x, dvc[0].x), "$"(dvc[0].y, dvc[0].y), \n"
++                     "               "$"(dvc[0].z, dvc[0].z), "$"(dvc[0].w, dvc[0].w)); \n",
++                     mul, mul, mul, mul);
++            }
++            if (terms >= 24) {
++                GLSL("dvc[2] = uvec4("$"(dvc[0].x, dvc[1].x), "$"(dvc[0].y, dvc[1].y), \n"
++                     "               "$"(dvc[0].z, dvc[1].z), "$"(dvc[0].w, dvc[1].w)); \n",
++                     mul, mul, mul, mul);
++            }
++            GLSL("vec4 dvcf[%d], dvch[%d], dvcl[%d];   \n"
++                 "for (int k = 0; k < %d; k++) {       \n"
++                 "    dvcf[k] = vec4(dvc[k]);          \n"
++                 "    dvch[k] = vec4(dvc[k] >> 10u);   \n"
++                 "    dvcl[k] = vec4(dvc[k] & 1023u);  \n"
++                 "}                                    \n",
++                 terms / 8, terms / 8, terms / 8, terms / 8);
++        } else {
++            GLSL("uvec4 tt[%d];                                                     \n"
++                 "tt[0] = uvec4(1048576u, u << %du);                                \n"
++                 "tt[1] = uvec4(uvec3(u.x*u.y, u.x*u.z, u.y*u.z) << %du, 0u);       \n"
++                 "tt[1].w = "$"(tt[1].x, tt[0].w);                                  \n",
++                 terms / 4, sh1, sh2, mul);
++            if (terms >= 16) {
++                GLSL("tt[2] = uvec4((u * u) << %du, "$"(tt[1].x, tt[1].x));         \n"
++                     "tt[3] = uvec4("$"(tt[1].y, tt[1].y), "$"(tt[1].z, tt[1].z),   \n"
++                     "              "$"(tt[1].w, tt[1].w), 0u);                     \n",
++                     sh2, mul, mul, mul, mul);
++            }
++            if (terms >= 24) {
++                GLSL("tt[3].w = "$"(tt[0].y, tt[2].x);                              \n"
++                     "tt[4] = uvec4("$"(tt[0].z, tt[2].y), "$"(tt[0].w, tt[2].z),   \n"
++                     "              "$"(tt[1].x, tt[2].w), "$"(tt[1].y, tt[3].x));  \n"
++                     "tt[5] = uvec4("$"(tt[1].z, tt[3].y), "$"(tt[1].w, tt[3].z), 0u, 0u); \n",
++                     mul, mul, mul, mul, mul, mul, mul);
++            }
++            GLSL("vec4 ttf[%d], tth[%d], ttl[%d];     \n"
++                 "for (int k = 0; k < %d; k++) {      \n"
++                 "    ttf[k] = vec4(tt[k]);           \n"
++                 "    tth[k] = vec4(tt[k] >> 10u);    \n"
++                 "    ttl[k] = vec4(tt[k] & 1023u);   \n"
++                 "}                                   \n",
++                 terms / 4, terms / 4, terms / 4, terms / 4);
+         }
+-        GLSL("vec4 ttf[%d], tth[%d], ttl[%d];     \n"
+-             "for (int k = 0; k < %d; k++) {      \n"
+-             "    ttf[k] = vec4(tt[k]);           \n"
+-             "    tth[k] = vec4(tt[k] >> 10u);    \n"
+-             "    ttl[k] = vec4(tt[k] & 1023u);   \n"
+-             "}                                   \n",
+-             terms / 4, terms / 4, terms / 4, terms / 4);
+     }
+ 
+     for (int ci = 0; ci < 2; ci++)
+-        ccm_mmr(pass, sh, x, ci, lut);
++        ccm_mmr(pass, sh, x, ci, lut, mmrt);
+ 
+     if (x->el_ratio) {
+         if (x->el_ratio == 2) {
+@@ -2948,6 +3080,45 @@ static bool pass_dovi_ccm(struct pass_state *pass)
+     }
+     x.lut = st->lut;
+ 
++    // Hades: the table of the MMR terms of one sample, where it is asked for
++    // (pl_render_params.dovi_ccm_mmr_table) and a chroma component has an MMR
++    // piece. Without a format for it, or where it cannot be made, every term
++    // is evaluated in the shader, as without it: the same planes.
++    x.mmrt = NULL;
++    if (pass->params->dovi_ccm_mmr_table && (pp->chroma[0].terms || pp->chroma[1].terms)) {
++        pl_fmt fmt = pl_find_fmt(rr->gpu, PL_FMT_UINT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
++        bool ok = fmt && fmt->num_components == 4 && fmt->component_depth[0] == 32;
++        if (ok && (!st->mmrt || st->mmrt_signature != pp->signature)) {
++            st->mmrt_signature = 0;
++            if (!st->mmrt_data) {
++                st->mmrt_data = pl_alloc(st, (size_t) PL_DOVI_CCM_MMRT_ROWS * 1024 * 4 *
++                                             sizeof(uint32_t));
++            }
++            pl_dovi_ccm_mmr_table(pp, st->mmrt_data);
++            ok = pl_tex_recreate(rr->gpu, &st->mmrt, pl_tex_params(
++                .w = 1 << pp->bl_depth,
++                .h = PL_DOVI_CCM_MMRT_ROWS,
++                .format = fmt,
++                .sampleable = true,
++                .host_writable = true,
++                .debug_tag = PL_DEBUG_TAG,
++            ));
++            ok = ok && pl_tex_upload(rr->gpu, pl_tex_transfer_params(
++                .tex = st->mmrt,
++                .ptr = st->mmrt_data,
++            ));
++            if (ok)
++                st->mmrt_signature = pp->signature;
++        }
++        if (ok) {
++            x.mmrt = st->mmrt;
++        } else if (!st->mmrt_said) {
++            PL_WARN(rr, "Dolby Vision: the table of the MMR terms of one sample could not be "
++                    "made on this GPU: every term is evaluated in the shader");
++            st->mmrt_said = true;
++        }
++    }
++
+     if (x.el_ratio == 2) {
+         ev[0] = ccm_el_vertical(pass, &x, true, x.el[0].plane->texture->params.w, y->params.h);
+         ev[1] = ccm_el_vertical(pass, &x, false, x.el[1].plane->texture->params.w, cb->params.h);

@@ -1,0 +1,416 @@
+From 99217bb2d1cdf1456ba4358a04962ff49cdf1e10 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:13:28 +0000
+Subject: [PATCH] tools/dvbridge: Dolby Vision sent as HDR10+, the samples
+ taken on the GPU
+
+The statistics of Dolby Vision sent as HDR10+ (dvbridge_dvplus.h) are of the
+picture that goes out: the one dvbridge_render_hdr10() draws, R'G'B' in PQ
+within [0, 1] in a float texture. One fragment pass writes the samples of a
+grid over the place of the picture (960 columns at most, the rows in
+proportion: one pixel in 16 of a 3840x2160 picture) into a small RGBA8 target,
+each sample the pixel at the middle of its cell as it is (no mean, no filter),
+maxRGB as a 16-bit code in two bytes. It is read back into a buffer and taken
+when its fence has passed, a frame or more later: nothing waits for the GPU
+(four in flight at most). The GL state of the caller is kept, and a sampler of
+its own makes the texture complete whatever its filters. OpenGL ES 3.0: no
+compute shader.
+
+Tested on zink over lavapipe (dvplus_gl_test.c): the samples against the same
+pixels computed on the CPU (407 040 samples, none more than one code off, 594
+one code off by the rounding of float32), the caller's state kept, the order;
+and on eight pictures of a profile 7 stream rebuilt by dvbridge_render_hdr10():
+3 087 360 samples, 2 one code off, and the statistics of the samples within 0
+codes of those of every pixel. Cost on the CPU of a 960 x 540 picture into its
+histogram: 0.31 to 0.37 ms on the build machine.
+---
+ tools/dvbridge/CMakeLists.txt       |   2 +-
+ tools/dvbridge/dvbridge_dvplus_gl.c | 311 ++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_dvplus_gl.h |  44 ++++
+ 3 files changed, 356 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_dvplus_gl.c
+ create mode 100644 tools/dvbridge/dvbridge_dvplus_gl.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 18af4c8..31040b9 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -16,7 +16,7 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_cache.c dvbridge_verify.c
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+                                 dvbridge_measure.c dvbridge_measured.c
+-                                dvbridge_dvplus.c)
++                                dvbridge_dvplus.c dvbridge_dvplus_gl.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_dvplus_gl.c b/tools/dvbridge/dvbridge_dvplus_gl.c
+new file mode 100644
+index 0000000..df6774e
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_dvplus_gl.c
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_dvplus_gl.h. */
++#include "dvbridge_dvplus_gl.h"
++
++#include "dvbridge_gl_pack.h"
++
++#include <GLES3/gl3.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define SLOTS 4
++
++static const char VERTEX[] = "#version 300 es\n"
++                             "void main() {\n"
++                             "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
++                             "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
++                             "}\n";
++
++/* fragment (t, j): the samples of grid columns 2 t and 2 t + 1 of grid row j, each the pixel at the middle of its cell
++ * (integer arithmetic: the same pixel as (i + 1/2) w / columns, floored), maxRGB of its R'G'B' within [0, 1], as a
++ * 16-bit code in two bytes */
++static const char FRAGMENT[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "precision highp sampler2D;\n"
++    "uniform sampler2D picture;\n"
++    "uniform ivec4 place; /* x, y, w, h */\n"
++    "uniform ivec2 grid;  /* columns, rows */\n"
++    "out vec4 o;\n"
++    "vec2 sample_at(int i, int j) {\n"
++    "  ivec2 at = ivec2(place.x + (2 * i + 1) * place.z / (2 * grid.x), place.y + (2 * j + 1) * place.w / (2 * grid.y));\n"
++    "  vec3 c = clamp(texelFetch(picture, at, 0).rgb, 0.0, 1.0);\n"
++    "  float code = floor(max(c.r, max(c.g, c.b)) * 65535.0 + 0.5);\n"
++    "  float hi = floor(code / 256.0);\n"
++    "  return vec2(hi, code - hi * 256.0) / 255.0;\n"
++    "}\n"
++    "void main() {\n"
++    "  int t = int(gl_FragCoord.x), j = int(gl_FragCoord.y);\n"
++    "  o = vec4(sample_at(2 * t, j), sample_at(2 * t + 1, j));\n"
++    "}\n";
++
++struct slot {
++    bool busy;
++    GLuint texture, framebuffer, buffer;
++    GLsync fence;
++    int columns, rows;
++    double pts;
++    unsigned order;
++};
++
++struct dvbridge_dvplus_gl {
++    GLuint program, vertex_array, sampler;
++    GLint picture, place, grid;
++    struct slot slots[SLOTS];
++    unsigned next_order;
++    uint16_t *codes;
++    size_t codes_size;
++};
++
++static GLuint compile(GLenum type, const char *source)
++{
++    GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &source, NULL);
++    glCompileShader(s);
++    GLint ok = 0;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[1024] = "";
++        glGetShaderInfoLog(s, sizeof(log), NULL, log);
++        fprintf(stderr, "dvbridge_dvplus_gl: shader: %s\n", log);
++        glDeleteShader(s);
++        return 0;
++    }
++    return s;
++}
++
++void dvbridge_dvplus_gl_grid(int w, int h, int *columns, int *rows)
++{
++    int c = w < DVBRIDGE_DVPLUS_GL_COLUMNS ? w : DVBRIDGE_DVPLUS_GL_COLUMNS;
++    c &= ~1;
++    if (c < 2)
++        c = 2;
++    int r = (int)(((long long)c * h * 2 + w) / (2LL * w)); /* round(c h / w) */
++    if (r < 1)
++        r = 1;
++    if (r > h)
++        r = h;
++    *columns = c;
++    *rows = r;
++}
++
++static void slot_free(struct slot *s)
++{
++    if (s->fence)
++        glDeleteSync(s->fence);
++    glDeleteFramebuffers(1, &s->framebuffer);
++    glDeleteTextures(1, &s->texture);
++    glDeleteBuffers(1, &s->buffer);
++    memset(s, 0, sizeof(*s));
++}
++
++struct dvbridge_dvplus_gl *dvbridge_dvplus_gl_create(void)
++{
++    struct dvbridge_dvplus_gl *g = calloc(1, sizeof(*g));
++    if (!g)
++        return NULL;
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    GLuint v = compile(GL_VERTEX_SHADER, VERTEX), f = compile(GL_FRAGMENT_SHADER, FRAGMENT);
++    if (v && f) {
++        g->program = glCreateProgram();
++        glAttachShader(g->program, v);
++        glAttachShader(g->program, f);
++        glLinkProgram(g->program);
++        GLint ok = 0;
++        glGetProgramiv(g->program, GL_LINK_STATUS, &ok);
++        if (!ok) {
++            glDeleteProgram(g->program);
++            g->program = 0;
++        }
++    }
++    glDeleteShader(v);
++    glDeleteShader(f);
++    if (g->program) {
++        g->picture = glGetUniformLocation(g->program, "picture");
++        g->place = glGetUniformLocation(g->program, "place");
++        g->grid = glGetUniformLocation(g->program, "grid");
++    }
++    glGenVertexArrays(1, &g->vertex_array);
++    /* (texelFetch reads the base level; a sampler of its own makes the texture complete whatever its filters) */
++    glGenSamplers(1, &g->sampler);
++    if (g->sampler) {
++        glSamplerParameteri(g->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glSamplerParameteri(g->sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    }
++    const bool ok = g->program && g->vertex_array && g->sampler && glGetError() == GL_NO_ERROR;
++    dvbridge_gl_state_restore(&state);
++    if (!ok) {
++        dvbridge_dvplus_gl_destroy(g);
++        return NULL;
++    }
++    return g;
++}
++
++void dvbridge_dvplus_gl_destroy(struct dvbridge_dvplus_gl *g)
++{
++    if (!g)
++        return;
++    for (int i = 0; i < SLOTS; ++i)
++        slot_free(&g->slots[i]);
++    glDeleteProgram(g->program);
++    glDeleteVertexArrays(1, &g->vertex_array);
++    glDeleteSamplers(1, &g->sampler);
++    free(g->codes);
++    free(g);
++}
++
++void dvbridge_dvplus_gl_reset(struct dvbridge_dvplus_gl *g)
++{
++    if (!g)
++        return;
++    for (int i = 0; i < SLOTS; ++i)
++        if (g->slots[i].busy) {
++            glDeleteSync(g->slots[i].fence);
++            g->slots[i].fence = 0;
++            g->slots[i].busy = false;
++        }
++}
++
++static bool slot_make(struct slot *s, int columns, int rows)
++{
++    if (s->texture && s->columns == columns && s->rows == rows)
++        return true;
++    slot_free(s);
++    glGenTextures(1, &s->texture);
++    glGenFramebuffers(1, &s->framebuffer);
++    glGenBuffers(1, &s->buffer);
++    glBindTexture(GL_TEXTURE_2D, s->texture);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, columns / 2, rows);
++    glBindFramebuffer(GL_FRAMEBUFFER, s->framebuffer);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->texture, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        slot_free(s);
++        return false;
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffer);
++    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)columns * rows * 2, NULL, GL_STREAM_READ);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    s->columns = columns;
++    s->rows = rows;
++    return glGetError() == GL_NO_ERROR;
++}
++
++bool dvbridge_dvplus_gl_submit(struct dvbridge_dvplus_gl *g, unsigned texture, int width, int height, int x, int y,
++                               int w, int h, double pts)
++{
++    if (!g || !texture || w < 2 || h < 1 || x < 0 || y < 0 || x + w > width || y + h > height || width > 16384 ||
++        height > 16384)
++        return false;
++    struct slot *s = NULL;
++    for (int i = 0; i < SLOTS && !s; ++i)
++        if (!g->slots[i].busy)
++            s = &g->slots[i];
++    if (!s)
++        return false;
++    int columns, rows;
++    dvbridge_dvplus_gl_grid(w, h, &columns, &rows);
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    GLint pack = 0, pack_alignment = 4;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &pack_alignment);
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {
++    }
++    bool ok = slot_make(s, columns, rows);
++    if (ok) {
++        glDisable(GL_BLEND);
++        glDisable(GL_SCISSOR_TEST);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_STENCIL_TEST);
++        glDisable(GL_CULL_FACE);
++        glDisable(GL_DITHER);
++        glDisable(GL_RASTERIZER_DISCARD);
++        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++        glBindVertexArray(g->vertex_array);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, texture);
++        glBindSampler(0, g->sampler);
++        glUseProgram(g->program);
++        glUniform1i(g->picture, 0);
++        glUniform4i(g->place, x, y, w, h);
++        glUniform2i(g->grid, columns, rows);
++        glBindFramebuffer(GL_FRAMEBUFFER, s->framebuffer);
++        glViewport(0, 0, columns / 2, rows);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffer);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadPixels(0, 0, columns / 2, rows, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        s->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++        ok = s->fence && glGetError() == GL_NO_ERROR;
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
++    dvbridge_gl_state_restore(&state);
++    if (!ok) {
++        if (s->fence)
++            glDeleteSync(s->fence);
++        s->fence = 0;
++        return false;
++    }
++    s->busy = true;
++    s->pts = pts;
++    s->order = g->next_order++;
++    return true;
++}
++
++unsigned dvbridge_dvplus_gl_collect(struct dvbridge_dvplus_gl *g,
++                                    void (*done)(double pts, const uint16_t *codes, size_t count, void *context),
++                                    void *context)
++{
++    if (!g)
++        return 0;
++    for (;;) {
++        struct slot *s = NULL;
++        for (int i = 0; i < SLOTS; ++i)
++            if (g->slots[i].busy && (!s || (int)(g->slots[i].order - s->order) < 0))
++                s = &g->slots[i];
++        if (!s)
++            return 0;
++        const GLenum wait = glClientWaitSync(s->fence, 0, 0);
++        if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED) {
++            if (wait == GL_WAIT_FAILED) {
++                glDeleteSync(s->fence);
++                s->fence = 0;
++                s->busy = false;
++                continue;
++            }
++            unsigned in_flight = 0;
++            for (int i = 0; i < SLOTS; ++i)
++                in_flight += g->slots[i].busy;
++            return in_flight;
++        }
++        glDeleteSync(s->fence);
++        s->fence = 0;
++        s->busy = false;
++        const size_t count = (size_t)s->columns * s->rows;
++        if (g->codes_size < count) {
++            free(g->codes);
++            g->codes = malloc(count * sizeof(*g->codes));
++            g->codes_size = g->codes ? count : 0;
++        }
++        GLint pack = 0;
++        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, s->buffer);
++        const uint8_t *bytes = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)count * 2, GL_MAP_READ_BIT);
++        bool have = false;
++        if (bytes && g->codes) {
++            for (size_t i = 0; i < count; ++i)
++                g->codes[i] = (uint16_t)(bytes[2 * i] << 8 | bytes[2 * i + 1]);
++            have = true;
++        }
++        if (bytes)
++            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++        if (have)
++            done(s->pts, g->codes, count, context);
++    }
++}
+diff --git a/tools/dvbridge/dvbridge_dvplus_gl.h b/tools/dvbridge/dvbridge_dvplus_gl.h
+new file mode 100644
+index 0000000..40c8aa7
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_dvplus_gl.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_DVPLUS_GL_H
++#define DVBRIDGE_DVPLUS_GL_H
++/* Hades: the samples of maxRGB that Dolby Vision sent as HDR10+ measures (dvbridge_dvplus.h), taken on the GPU from
++ * the picture that goes out (dvbridge_render_hdr10(): R'G'B' in PQ, within [0, 1], in a float texture), without
++ * waiting for it: one pass writes the samples of a grid over the place of the picture into a small target, which is
++ * read back into a buffer; the samples of a picture are taken when its fence has passed (dvbridge_dvplus_gl_collect()),
++ * a frame or more later. Every sample is one pixel of the picture as it is (no mean, no filter): the samples are a
++ * subset of its pixels, spread evenly over it. The GL state of the caller is kept. */
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* the columns of the grid at most (an even number), and its rows in the proportion of the place: 960 x 540 of a
++ * 3840x2160 picture, one pixel in 16 (measured on Cosmos Laundromat: the same error as every pixel) */
++#define DVBRIDGE_DVPLUS_GL_COLUMNS 960
++
++struct dvbridge_dvplus_gl;
++/* (a GL ES 3 context current, as the bridge's) */
++struct dvbridge_dvplus_gl *dvbridge_dvplus_gl_create(void);
++void dvbridge_dvplus_gl_destroy(struct dvbridge_dvplus_gl *g);
++/* What is in flight is dropped (a seek, a new stream) */
++void dvbridge_dvplus_gl_reset(struct dvbridge_dvplus_gl *g);
++/* Queues the samples of the picture of pts: the GL texture texture (width x height, a float RGBA one whose first row
++ * is the top of the picture), within the place x, y, w, h (from its top left). false: not queued (every slot is in
++ * flight, the place is not in the texture, or GL failed: the picture is not measured). */
++bool dvbridge_dvplus_gl_submit(struct dvbridge_dvplus_gl *g, unsigned texture, int width, int height, int x, int y,
++                               int w, int h, double pts);
++/* The samples that the GPU has finished, in the order they were queued, each to done(): maxRGB of each, PQ in
++ * 1/65535; one not finished stops it. Returns how many are still in flight. */
++unsigned dvbridge_dvplus_gl_collect(struct dvbridge_dvplus_gl *g,
++                                    void (*done)(double pts, const uint16_t *codes, size_t count, void *context),
++                                    void *context);
++/* The grid of a place: columns and rows (for the tests) */
++void dvbridge_dvplus_gl_grid(int w, int h, int *columns, int *rows);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

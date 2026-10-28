@@ -1,0 +1,457 @@
+From 58b6fb5bdd21d1b9f0694c892d72593b1ba217fd Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:10:00 +0000
+Subject: [PATCH] nvidia-drm: NV_HDMI_VSIF_METADATA, "dithering mode" and "max
+ bpc"
+
+Kodi sends Dolby Vision on NVIDIA through three properties of an HDMI
+connector of nvidia-drm 615: NV_HDMI_VSIF_METADATA (the vendor InfoFrame),
+"dithering mode" (off) and "max bpc" (8), next to HDR_OUTPUT_METADATA and
+"Colorspace", which 580 has. Its backend is chosen by those three
+(CDVBridgeState::GetBackend()), and without them a GTX 10 has no Dolby
+Vision. 580 has none of them.
+
+Give HDMI connectors the three, with the names, types and values of 615:
+NV_HDMI_VSIF_METADATA a blob of 3 to 27 bytes (the IEEE OUI first, 0 for
+none), "dithering mode" the enum of 615 (auto, off, static 2x2, dynamic 2x2,
+temporal, on), "max bpc" the standard range property of DRM (8 to 12, 12 by
+default; below 10 drives the head at 8 bpc, 10 and above keep the driver's
+choice), as Hades' 615 has it. The connector state carries the first two
+(its reset, duplicate and destroy hooks, as 615 has them on kernels without
+atomic_create_state, also putting the blob of a state it resets); its
+atomic check takes the three from the state every time and compares them
+with what the head inherited, so they follow a connector that moves to
+another head, and KAPI makes a change of any of them a mode set, which
+passes them to NVKMS (the previous change).
+
+The initial state of a connector is allocated with room for them.
+---
+ kernel-open/nvidia-drm/nvidia-drm-connector.c | 263 +++++++++++++++++-
+ kernel-open/nvidia-drm/nvidia-drm-connector.h |  36 +++
+ kernel-open/nvidia-drm/nvidia-drm-drv.c       |  39 +++
+ kernel-open/nvidia-drm/nvidia-drm-priv.h      |   5 +
+ 4 files changed, 337 insertions(+), 6 deletions(-)
+
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.c b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+index c90a5d2..1957e98 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+@@ -227,14 +227,160 @@ nv_drm_connector_detect(struct drm_connector *connector, bool force)
+     return __nv_drm_connector_detect_internal(connector);
+ }
+ 
++/*
++ * Hades: the connector state carries the HDMI properties of nvidia-drm 615
++ * ("dithering mode", NV_HDMI_VSIF_METADATA; "max bpc" is a field of DRM's
++ * own state), as 615 does on kernels without atomic_create_state.
++ */
++static void nv_drm_connector_atomic_destroy_state(
++    struct drm_connector *connector,
++    struct drm_connector_state *state)
++{
++    struct nv_drm_connector_state *nv_connector_state =
++        to_nv_drm_connector_state(state);
++
++    __drm_atomic_helper_connector_destroy_state(state);
++    drm_property_blob_put(nv_connector_state->hdmi_vsif_metadata);
++    nv_drm_free(nv_connector_state);
++}
++
++static void nv_drm_connector_reset(struct drm_connector *connector)
++{
++    struct nv_drm_connector_state *nv_connector_state =
++        nv_drm_calloc(1, sizeof(*nv_connector_state));
++
++    if (nv_connector_state == NULL) {
++        return;
++    }
++
++    if (connector->state != NULL) {
++        nv_drm_connector_atomic_destroy_state(connector, connector->state);
++    }
++
++    __drm_atomic_helper_connector_reset(connector, &nv_connector_state->base);
++
++    if (connector->max_bpc_property != NULL) {
++        nv_connector_state->base.max_requested_bpc = NV_DRM_MAX_BPC_DEFAULT;
++        nv_connector_state->base.max_bpc = NV_DRM_MAX_BPC_DEFAULT;
++    }
++}
++
++static struct drm_connector_state *
++nv_drm_connector_atomic_duplicate_state(struct drm_connector *connector)
++{
++    const struct nv_drm_connector_state *nv_old_connector_state =
++        to_nv_drm_connector_state_const(connector->state);
++    struct nv_drm_connector_state *nv_new_connector_state =
++        nv_drm_calloc(1, sizeof(*nv_new_connector_state));
++
++    if (nv_new_connector_state == NULL) {
++        return NULL;
++    }
++
++    __drm_atomic_helper_connector_duplicate_state(connector,
++                                                  &nv_new_connector_state->base);
++
++    nv_new_connector_state->dithering_mode =
++        nv_old_connector_state->dithering_mode;
++    nv_new_connector_state->hdmi_vsif_metadata =
++        nv_old_connector_state->hdmi_vsif_metadata;
++    if (nv_new_connector_state->hdmi_vsif_metadata != NULL) {
++        drm_property_blob_get(nv_new_connector_state->hdmi_vsif_metadata);
++    }
++
++    return &nv_new_connector_state->base;
++}
++
++/*
++ * NV_HDMI_VSIF_METADATA: 3 to 27 bytes, the IEEE OUI first, as on 615
++ * (nv_drm_atomic_replace_property_blob_from_id_size_range()); 0 for none.
++ */
++static int nv_drm_connector_replace_vsif_blob(struct drm_device *dev,
++                                              struct drm_property_blob **blob,
++                                              uint64_t blob_id)
++{
++    struct drm_property_blob *new_blob = NULL;
++
++    if (blob_id != 0) {
++        new_blob = drm_property_lookup_blob(dev, blob_id);
++        if (new_blob == NULL) {
++            return -EINVAL;
++        }
++
++        if ((new_blob->length < NVKMS_HDMI_VSIF_METADATA_MIN_PAYLOAD_SIZE) ||
++            (new_blob->length > NVKMS_HDMI_VSIF_METADATA_MAX_PAYLOAD_SIZE)) {
++            drm_property_blob_put(new_blob);
++            return -EINVAL;
++        }
++    }
++
++    drm_property_replace_blob(blob, new_blob);
++    drm_property_blob_put(new_blob);
++
++    return 0;
++}
++
++static int nv_drm_connector_atomic_set_property(
++    struct drm_connector *connector,
++    struct drm_connector_state *state,
++    struct drm_property *property,
++    uint64_t val)
++{
++    struct nv_drm_device *nv_dev = to_nv_device(connector->dev);
++    struct nv_drm_connector_state *nv_connector_state =
++        to_nv_drm_connector_state(state);
++
++    if (property == nv_dev->nv_connector_dithering_mode_property) {
++        if (val >= NV_DRM_DITHERING_MODE_MAX) {
++            return -EINVAL;
++        }
++        nv_connector_state->dithering_mode = val;
++        return 0;
++    }
++
++    if (property == nv_dev->nv_connector_hdmi_vsif_metadata_property) {
++        return nv_drm_connector_replace_vsif_blob(
++                   connector->dev, &nv_connector_state->hdmi_vsif_metadata, val);
++    }
++
++    /* "max bpc" and the other standard properties: DRM's core */
++    return -EINVAL;
++}
++
++static int nv_drm_connector_atomic_get_property(
++    struct drm_connector *connector,
++    const struct drm_connector_state *state,
++    struct drm_property *property,
++    uint64_t *val)
++{
++    struct nv_drm_device *nv_dev = to_nv_device(connector->dev);
++    const struct nv_drm_connector_state *nv_connector_state =
++        to_nv_drm_connector_state_const(state);
++
++    if (property == nv_dev->nv_connector_dithering_mode_property) {
++        *val = nv_connector_state->dithering_mode;
++        return 0;
++    }
++
++    if (property == nv_dev->nv_connector_hdmi_vsif_metadata_property) {
++        *val = (nv_connector_state->hdmi_vsif_metadata != NULL) ?
++            nv_connector_state->hdmi_vsif_metadata->base.id : 0;
++        return 0;
++    }
++
++    return -EINVAL;
++}
++
+ static struct drm_connector_funcs nv_connector_funcs = {
+     .destroy                = nv_drm_connector_destroy,
+-    .reset                  = drm_atomic_helper_connector_reset,
++    .reset                  = nv_drm_connector_reset,
+     .force                  = __nv_drm_connector_force,
+     .detect                 = nv_drm_connector_detect,
+     .fill_modes             = drm_helper_probe_single_connector_modes,
+-    .atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
+-    .atomic_destroy_state   = drm_atomic_helper_connector_destroy_state,
++    .atomic_duplicate_state = nv_drm_connector_atomic_duplicate_state,
++    .atomic_destroy_state   = nv_drm_connector_atomic_destroy_state,
++    .atomic_set_property    = nv_drm_connector_atomic_set_property,
++    .atomic_get_property    = nv_drm_connector_atomic_get_property,
+ };
+ 
+ static int nv_drm_connector_get_modes(struct drm_connector *connector)
+@@ -357,6 +503,43 @@ static const NvU32 __nv_drm_connector_supported_colorspaces =
+ #endif
+ 
+ #if defined(NV_DRM_CONNECTOR_ATTACH_HDR_OUTPUT_METADATA_PROPERTY_PRESENT)
++/*
++ * Hades: the output depth that "max bpc" asks for: 8 below 10, otherwise 0
++ * (the driver's choice), as Hades' 615 (nvidia-open-kernel-modules-9000). A
++ * zero value (a state reset before the property existed) is also the
++ * driver's choice.
++ */
++static NvU32 nv_drm_connector_requested_bpc(
++    const struct drm_connector_state *connector_state)
++{
++    if ((connector_state->connector->max_bpc_property != NULL) &&
++        (connector_state->max_requested_bpc >= 8) &&
++        (connector_state->max_requested_bpc < 10)) {
++        return 8;
++    }
++    return 0;
++}
++
++static enum NvKmsKapiDitheringMode nv_drm_connector_kapi_dithering(
++    enum nv_drm_dithering_mode mode)
++{
++    switch (mode) {
++    case NV_DRM_DITHERING_MODE_OFF:
++        return NVKMS_KAPI_DITHERING_MODE_OFF;
++    case NV_DRM_DITHERING_MODE_STATIC_2X2:
++        return NVKMS_KAPI_DITHERING_MODE_STATIC_2X2;
++    case NV_DRM_DITHERING_MODE_DYNAMIC_2X2:
++        return NVKMS_KAPI_DITHERING_MODE_DYNAMIC_2X2;
++    case NV_DRM_DITHERING_MODE_TEMPORAL:
++        return NVKMS_KAPI_DITHERING_MODE_TEMPORAL;
++    case NV_DRM_DITHERING_MODE_ON:
++        return NVKMS_KAPI_DITHERING_MODE_ON;
++    case NV_DRM_DITHERING_MODE_AUTO:
++    default:
++        return NVKMS_KAPI_DITHERING_MODE_AUTO;
++    }
++}
++
+ static int
+ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+                                 nv_drm_atomic_state_base_t *state)
+@@ -380,6 +563,48 @@ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+     nv_crtc_state = to_nv_crtc_state(crtc_state);
+     req_config = &nv_crtc_state->req_config;
+ 
++    /*
++     * Hades: the HDMI properties (nvidia-drm-connector.h), taken from the
++     * connector state every time and compared with the configuration that the
++     * head inherited, so that they follow a connector that moves to this
++     * head. A change of any of them is a mode set (KAPI).
++     */
++    {
++        const struct nv_drm_connector_state *nv_new_connector_state =
++            to_nv_drm_connector_state_const(new_connector_state);
++        const struct drm_property_blob *vsif_blob =
++            nv_new_connector_state->hdmi_vsif_metadata;
++        const enum NvKmsKapiDitheringMode dithering =
++            nv_drm_connector_kapi_dithering(nv_new_connector_state->dithering_mode);
++        const NvU32 bpc = nv_drm_connector_requested_bpc(new_connector_state);
++        struct NvKmsHdmiVsifMetadata vsif;
++
++        memset(&vsif, 0, sizeof(vsif));
++        if ((vsif_blob != NULL) && (vsif_blob->data != NULL)) {
++            if ((vsif_blob->length < NVKMS_HDMI_VSIF_METADATA_MIN_PAYLOAD_SIZE) ||
++                (vsif_blob->length > NVKMS_HDMI_VSIF_METADATA_MAX_PAYLOAD_SIZE)) {
++                return -EINVAL;
++            }
++            vsif.payloadSize = vsif_blob->length;
++            memcpy(vsif.payload, vsif_blob->data, vsif_blob->length);
++        }
++        if (memcmp(&req_config->modeSetConfig.hdmiVsifMetadata, &vsif,
++                   sizeof(vsif)) != 0) {
++            req_config->modeSetConfig.hdmiVsifMetadata = vsif;
++            req_config->flags.hdmiVsifMetadataChanged = NV_TRUE;
++        }
++
++        if (req_config->modeSetConfig.dithering != dithering) {
++            req_config->modeSetConfig.dithering = dithering;
++            req_config->flags.ditheringChanged = NV_TRUE;
++        }
++
++        if (req_config->modeSetConfig.colorBpc != bpc) {
++            req_config->modeSetConfig.colorBpc = bpc;
++            req_config->flags.colorBpcChanged = NV_TRUE;
++        }
++    }
++
+     /*
+      * Override metadata for the entire head instead of allowing NVKMS to derive
+      * it from the layers' metadata.
+@@ -493,9 +718,16 @@ nv_drm_connector_new(struct drm_device *dev,
+         goto failed;
+     }
+ 
+-    if ((nv_connector->base.state =
+-            nv_drm_calloc(1, sizeof(*nv_connector->base.state))) == NULL) {
+-        goto failed_state_alloc;
++    /* Hades: the state with the HDMI properties (nvidia-drm-connector.h) */
++    BUILD_BUG_ON(offsetof(struct nv_drm_connector_state, base) != 0);
++    {
++        struct nv_drm_connector_state *nv_connector_state =
++            nv_drm_calloc(1, sizeof(*nv_connector_state));
++
++        if (nv_connector_state == NULL) {
++            goto failed_state_alloc;
++        }
++        nv_connector->base.state = &nv_connector_state->base;
+     }
+     nv_connector->base.state->connector = &nv_connector->base;
+ 
+@@ -541,6 +773,25 @@ nv_drm_connector_new(struct drm_device *dev,
+             drm_connector_attach_colorspace_property(&nv_connector->base);
+         }
+         drm_connector_attach_hdr_output_metadata_property(&nv_connector->base);
++
++        /*
++         * Hades: the HDMI properties that Dolby Vision output uses, on HDMI
++         * connectors, where NVKMS sends a client's vendor InfoFrame
++         * (nvkms-hades.h).
++         */
++        drm_object_attach_property(&nv_connector->base.base,
++                                   nv_dev->nv_connector_hdmi_vsif_metadata_property,
++                                   0);
++        drm_object_attach_property(&nv_connector->base.base,
++                                   nv_dev->nv_connector_dithering_mode_property,
++                                   NV_DRM_DITHERING_MODE_AUTO);
++        nv_connector->base.max_bpc_property =
++            nv_dev->nv_connector_max_bpc_property;
++        drm_object_attach_property(&nv_connector->base.base,
++                                   nv_dev->nv_connector_max_bpc_property,
++                                   NV_DRM_MAX_BPC_DEFAULT);
++        nv_connector->base.state->max_requested_bpc = NV_DRM_MAX_BPC_DEFAULT;
++        nv_connector->base.state->max_bpc = NV_DRM_MAX_BPC_DEFAULT;
+     } else if (nv_connector->type == NVKMS_CONNECTOR_TYPE_DP) {
+ #if defined(NV_DRM_MODE_CREATE_DP_COLORSPACE_PROPERTY_HAS_SUPPORTED_COLORSPACES_ARG)
+         if (drm_mode_create_dp_colorspace_property(
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.h b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+index 282606d..fbf35e1 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+@@ -75,6 +75,42 @@ static inline struct nv_drm_connector *to_nv_connector(
+     return container_of(connector, struct nv_drm_connector, base);
+ }
+ 
++/*
++ * Hades: the HDMI connector properties of nvidia-drm 615 that Dolby Vision
++ * output uses, on 580: "dithering mode" (these are its values, as on 615),
++ * NV_HDMI_VSIF_METADATA and the standard "max bpc".
++ */
++enum nv_drm_dithering_mode {
++    NV_DRM_DITHERING_MODE_AUTO = 0,
++    NV_DRM_DITHERING_MODE_OFF,
++    NV_DRM_DITHERING_MODE_STATIC_2X2,
++    NV_DRM_DITHERING_MODE_DYNAMIC_2X2,
++    NV_DRM_DITHERING_MODE_TEMPORAL,
++    NV_DRM_DITHERING_MODE_ON,
++    NV_DRM_DITHERING_MODE_MAX
++};
++
++/* Initial value of the "max bpc" property: let the driver choose. */
++#define NV_DRM_MAX_BPC_DEFAULT 12
++
++struct nv_drm_connector_state {
++    struct drm_connector_state base; /* first: nv_drm_connector_new() frees it */
++    enum nv_drm_dithering_mode dithering_mode;
++    struct drm_property_blob *hdmi_vsif_metadata;
++};
++
++static inline struct nv_drm_connector_state *to_nv_drm_connector_state(
++    struct drm_connector_state *state)
++{
++    return container_of(state, struct nv_drm_connector_state, base);
++}
++
++static inline const struct nv_drm_connector_state *to_nv_drm_connector_state_const(
++    const struct drm_connector_state *state)
++{
++    return container_of(state, const struct nv_drm_connector_state, base);
++}
++
+ static inline void nv_drm_connector_mark_connection_status_dirty(
+     struct nv_drm_connector *nv_connector)
+ {
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index f8376c4..edeb551 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -644,6 +644,45 @@ static int nv_drm_create_properties(struct nv_drm_device *nv_dev)
+         return -ENOMEM;
+     }
+ 
++    /*
++     * Hades: the HDMI connector properties of nvidia-drm 615 that Dolby
++     * Vision output uses (nvidia-drm-connector.c), with the names, types and
++     * values of 615, and the standard "max bpc" of Hades' 615 (8 to 12: below
++     * 10 drives the head at 8 bpc, 10 and above keep the driver's choice).
++     */
++    {
++        static const struct drm_prop_enum_list dithering_mode_enum_list[] = {
++            { NV_DRM_DITHERING_MODE_AUTO,        "auto" },
++            { NV_DRM_DITHERING_MODE_OFF,         "off" },
++            { NV_DRM_DITHERING_MODE_STATIC_2X2,  "static 2x2" },
++            { NV_DRM_DITHERING_MODE_DYNAMIC_2X2, "dynamic 2x2" },
++            { NV_DRM_DITHERING_MODE_TEMPORAL,    "temporal" },
++            { NV_DRM_DITHERING_MODE_ON,          "on" },
++        };
++
++        nv_dev->nv_connector_dithering_mode_property =
++            drm_property_create_enum(nv_dev->dev, 0, "dithering mode",
++                                     dithering_mode_enum_list,
++                                     ARRAY_SIZE(dithering_mode_enum_list));
++        if (nv_dev->nv_connector_dithering_mode_property == NULL) {
++            return -ENOMEM;
++        }
++    }
++
++    nv_dev->nv_connector_hdmi_vsif_metadata_property =
++        drm_property_create(nv_dev->dev, DRM_MODE_PROP_BLOB,
++                            "NV_HDMI_VSIF_METADATA", 0);
++    if (nv_dev->nv_connector_hdmi_vsif_metadata_property == NULL) {
++        return -ENOMEM;
++    }
++
++    nv_dev->nv_connector_max_bpc_property =
++        drm_property_create_range(nv_dev->dev, 0, "max bpc",
++                                  8, NV_DRM_MAX_BPC_DEFAULT);
++    if (nv_dev->nv_connector_max_bpc_property == NULL) {
++        return -ENOMEM;
++    }
++
+     return 0;
+ }
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index 8480123..42a141c 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -177,6 +177,11 @@ struct nv_drm_device {
+     struct drm_property *nv_crtc_regamma_lut_size_property;
+     struct drm_property *nv_crtc_regamma_divisor_property;
+ 
++    /* Hades: the HDMI connector properties (nvidia-drm-connector.h) */
++    struct drm_property *nv_connector_dithering_mode_property;
++    struct drm_property *nv_connector_hdmi_vsif_metadata_property;
++    struct drm_property *nv_connector_max_bpc_property;
++
+     struct nv_drm_device *next;
+ 
+     NvU64 vtFbBaseAddress;
+-- 
+2.53.0
+

@@ -1,0 +1,172 @@
+From b5773b664c55b2ca4bb63eb70e09528a977be3ba Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:19:14 +0000
+Subject: [PATCH] tools/dvbridge: a picture is imported at its own size, never
+ in a larger texture
+
+The images of a picture of the enhancement layer were made at the size of
+the surface of its decoder's pool (hw_frames_ctx), which FFmpeg sizes as
+the coded picture: a layer coded at 1920x1088 and cropped to 1080 rows has
+eight rows more than its picture in that surface, and they were part of the
+texture. dvbridge_gl_frame_import() took textures larger than their
+pictures. Every pass that reads at an edge of the picture then read samples
+that are not of it: the composer of ETSI GS CCM 001 (libplacebo-9930)
+replicates the edge of a texture, where the clause has the picture's last
+sample; libplacebo's scalers clamp to the texture; and an enhancement layer
+whose texture is not half the base layer's was composed by libplacebo's
+reshaping instead of as the clause does.
+
+Now:
+ - dvbridge_dmabuf.c makes the images at the picture's size, at the top
+   left of the surface with the surface's own layout (as Kodi imports the
+   base layer, CVaapi2Texture::Import()), and keys its cache by that size.
+   A frame that FFmpeg leaves cropped at the top or the left (it applies
+   only the right and bottom crops to hardware frames) is not imported.
+ - dvbridge_gl_frame_import() takes each plane in a texture of that plane's
+   size in the picture, and nothing larger.
+
+Measured on Mesa's zink with fidbench, both layers in textures 64 samples
+wider and 8 rows taller than their pictures, the extra samples holding
+codes that no picture sample near them has: before, the transport of all
+four pictures tried changed, in the source transport, the converted one and
+libplacebo's reshaping, at 4K and with the picture at 1080p, and libplacebo
+logged that the layer was neither the base layer's size nor half of it; now
+such layers are not imported. With textures of their pictures' sizes the
+bytes are those of before: fidbench in five configurations, the measured
+test with the CCM 001 oracle and the render test, file for file.
+
+The streams at hand (a profile 7 FEL in MKV and in two M2TS) code both
+layers at their pictures' sizes; whether any stream codes its layer larger
+is not known. The import of a VAAPI surface runs on hardware only.
+---
+ tools/dvbridge/dvbridge_dmabuf.c   | 35 ++++++++++++++++++++++--------
+ tools/dvbridge/dvbridge_gl_frame.c | 17 ++++++++++-----
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_dmabuf.c b/tools/dvbridge/dvbridge_dmabuf.c
+index 9756e03..08d1eab 100644
+--- a/tools/dvbridge/dvbridge_dmabuf.c
++++ b/tools/dvbridge/dvbridge_dmabuf.c
+@@ -50,7 +50,8 @@ static void describe_layout(const AVDRMFrameDescriptor *desc)
+  * decoder's pool that hold it (hw_frames_ctx, at least the size of the picture) can be larger,
+  * aligned to the blocks of the codec, so the layout of a surface is checked up to 4096x2304, as in
+  * the fork's first version. Written as two numbers each, they looked like two limits for the same
+- * picture. */
++ * picture. The images are made at the picture's size (make_planes()), not the surface's: what of the
++ * surface is outside the picture is not part of any texture. */
+ #define DVBRIDGE_DMABUF_PICTURE_MAX_WIDTH 3840
+ #define DVBRIDGE_DMABUF_PICTURE_MAX_HEIGHT 2160
+ #define DVBRIDGE_DMABUF_SURFACE_MAX_WIDTH 4096
+@@ -110,16 +111,24 @@ static void delete_planes(EGLDisplay display, PFNEGLDESTROYIMAGEKHRPROC destroy,
+     }
+ }
+ 
+-/* The two planes of a mapped surface as EGL images and textures. On failure nothing is left. */
+-static bool make_planes(const struct egl_entry *egl, const AVDRMFrameDescriptor *desc, int pool_width,
+-                        int pool_height, EGLImage images[2], struct dvbridge_gl_plane planes[3])
++/* The two planes of a mapped surface as EGL images and textures, of the picture's size (picture_width x
++ * picture_height, at the top left of the surface; the surface's own layout, its pitch and the offset of each
++ * plane, as the descriptor gives it). On failure nothing is left.
++ * Hades: they were of the size of the surface of the decoder's pool, which can be larger than the picture
++ * (a stream coded at 1920x1088 and cropped to 1080 rows): the rows and columns past the picture were then
++ * part of the textures, and every pass that reads a sample at an edge of the picture read them (filters
++ * that replicate the edge of a texture, libplacebo's scalers). The renderer's import takes a texture of
++ * the picture's size alone (dvbridge_gl_frame_import()); Kodi imports the base layer so already
++ * (CVaapi2Texture::Import()). */
++static bool make_planes(const struct egl_entry *egl, const AVDRMFrameDescriptor *desc, int picture_width,
++                        int picture_height, EGLImage images[2], struct dvbridge_gl_plane planes[3])
+ {
+     for (int i = 0; i < 2; ++i) {
+         const AVDRMLayerDescriptor *layer = &desc->layers[i];
+         const AVDRMPlaneDescriptor *plane = &layer->planes[0];
+         const AVDRMObjectDescriptor *object = &desc->objects[plane->object_index];
+-        int width = i ? (pool_width + 1) / 2 : pool_width;
+-        int height = i ? (pool_height + 1) / 2 : pool_height;
++        int width = i ? (picture_width + 1) / 2 : picture_width;
++        int height = i ? (picture_height + 1) / 2 : picture_height;
+         if (object->format_modifier != DRM_FORMAT_MOD_INVALID &&
+             object->format_modifier != DRM_FORMAT_MOD_LINEAR && !egl->modifiers) {
+             snprintf(last_error, sizeof(last_error), "modifier=0x%llx without EGL_EXT_image_dma_buf_import_modifiers",
+@@ -311,6 +320,14 @@ bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct d
+                  name ? name : "unknown", hw->width, hw->height, source->width, source->height);
+         return false;
+     }
++    /* Hades: the picture at the top left of its surface: FFmpeg leaves a crop at the top or the left of a
++     * hardware frame to its caller (only the right and bottom ones go into its size), and the images are
++     * made from the top left (make_planes()). Such a picture is not imported, as one of another layout. */
++    if (source->crop_top || source->crop_left) {
++        snprintf(last_error, sizeof(last_error), "frame cropped at the top (%zu) or the left (%zu)",
++                 source->crop_top, source->crop_left);
++        return false;
++    }
+     struct dvbridge_dmabuf candidate = {.display = display, .layout = DVBRIDGE_P010};
+     candidate.mapping = av_frame_alloc();
+     if (!candidate.mapping) {
+@@ -345,7 +362,7 @@ bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct d
+         }
+         cache->pool = hw;
+         struct surface_identity identity;
+-        if (identify(&identity, desc, hw->width, hw->height)) {
++        if (identify(&identity, desc, source->width, source->height)) {
+             ++cache->clock;
+             struct cache_entry *found = NULL, *room = NULL;
+             for (int i = 0; i < CACHE_ENTRIES && !found; ++i) {
+@@ -358,7 +375,7 @@ bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct d
+             if (!found) {
+                 /* the least recently used surface, if every entry has one */
+                 cache_drop(cache, room);
+-                if (!make_planes(&egl, desc, hw->width, hw->height, room->images, room->planes))
++                if (!make_planes(&egl, desc, source->width, source->height, room->images, room->planes))
+                     goto fail;
+                 room->identity = identity;
+                 room->used = true;
+@@ -377,7 +394,7 @@ bool dvbridge_dmabuf_import_cached(struct dvbridge_dmabuf_cache *cache, struct d
+         /* (fstat() of a dma-buf does not fail: if it did, the surface is imported for this frame
+          * alone, as without a cache) */
+     }
+-    if (!make_planes(&egl, desc, hw->width, hw->height, candidate.images, candidate.planes))
++    if (!make_planes(&egl, desc, source->width, source->height, candidate.images, candidate.planes))
+         goto fail;
+     *out = candidate;
+     last_error[0] = 0;
+diff --git a/tools/dvbridge/dvbridge_gl_frame.c b/tools/dvbridge/dvbridge_gl_frame.c
+index a84934c..182e0b7 100644
+--- a/tools/dvbridge/dvbridge_gl_frame.c
++++ b/tools/dvbridge/dvbridge_gl_frame.c
+@@ -41,13 +41,20 @@ bool dvbridge_gl_frame_import(struct dvbridge_gl_frame *out, pl_gpu gpu,
+     candidate.frame.crop = (pl_rect2df){0, 0, width, height};
+     candidate.frame.repr.bits = (struct pl_bit_encoding){
+         .sample_depth = storage, .color_depth = depth, .bit_shift = shift};
++    /* Hades: each plane in a texture of its own size in the picture, not a larger one. A texture larger than
++     * its picture (a surface of a decoder's pool, aligned to the blocks of the codec) holds rows and columns
++     * that are not of the picture, and every pass that reads at an edge of it read them: the composer of ETSI
++     * GS CCM 001 and libplacebo's scalers replicate the edge of the texture, where the clause and the picture
++     * have their last sample; and an enhancement layer whose texture was not half the base layer's was
++     * composed by libplacebo's reshaping instead. Measured on Mesa's zink with fidbench, both layers in
++     * textures 64 samples wider and 8 taller than their pictures: the transport of every picture changed,
++     * the source transport, the converted one and the reshaping, at 4K and at 1080p. The layers that Kodi
++     * imports are of their pictures' sizes (CVaapi2Texture::Import(), dvbridge_dmabuf.c); anything else is
++     * not imported. */
+     for (int i = 0; i < candidate.frame.num_planes; ++i) {
+         int pw = i && subsampled ? (width + 1) / 2 : width;
+         int ph = i && subsampled ? (height + 1) / 2 : height;
+-        int tw = i && subsampled ? (planes[0].width + 1) / 2 : planes[0].width;
+-        int th = i && subsampled ? (planes[0].height + 1) / 2 : planes[0].height;
+-        if (!planes[i].texture || planes[i].width < pw || planes[i].height < ph ||
+-            planes[i].width != tw || planes[i].height != th || tw > 4096 || th > 2304)
++        if (!planes[i].texture || planes[i].width != pw || planes[i].height != ph)
+             goto fail;
+         int components = !planar && i == 1 ? 2 : 1;
+         int format = storage == 8 ? (components == 2 ? GL_RG8 : GL_R8) :
+@@ -55,7 +62,7 @@ bool dvbridge_gl_frame_import(struct dvbridge_gl_frame *out, pl_gpu gpu,
+         struct pl_plane *plane = &candidate.frame.planes[i];
+         plane->texture = pl_opengl_wrap(gpu, pl_opengl_wrap_params(
+             .texture = planes[i].texture, .target = GL_TEXTURE_2D,
+-            .iformat = format, .width = tw, .height = th));
++            .iformat = format, .width = pw, .height = ph));
+         if (!plane->texture || !plane->texture->params.sampleable)
+             goto fail;
+         plane->components = components;
+-- 
+2.53.0
+

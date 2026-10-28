@@ -1,0 +1,307 @@
+From a0981a4701085d89825f23f2298e6df30317935f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 01:07:20 +0000
+Subject: [PATCH] settings: the resolutions of the display replaced in one
+ step, under the lock
+
+CDisplaySettings::GetResolutionInfo() holds the lock of the list (m_critical)
+only to find an entry, and gives a reference that its caller reads after the
+lock is let go. Those callers run on other threads too: a JSON-RPC request or
+the options of a setting (the fillers of videoscreen.resolution, screenmode
+and whitelist, GetResolutionFromString(), GetStringFromResolution()), an
+add-on that asks for System.ScreenResolution (CGraphicContext::GetResInfo()).
+A list made again meanwhile the way every window system makes it,
+ClearCustomResolutions() (which took no lock at all) and then
+AddResolutionInfo() for each resolution (which can move the entries to grow
+the vector), frees or moves the entry that such a reference names. On GBM the
+list was made once, at the start; now that it is made again while Kodi runs
+(when the display changed), that can happen.
+
+GBM's UpdateResolutions() makes the list whole and hands it to
+CDisplaySettings::ReplaceCustomResolutions(), which, under the lock, makes the
+new list apart (the entries before RES_CUSTOM as they were, each resolution as
+AddResolutionInfo() keeps it, RES_DESKTOP the copy of its resolution as GBM
+set it), puts it in place of the one before, applies the calibrations, and
+keeps the list before until Kodi ends: a reference into it stays valid (of the
+list before), and no reader sees a list half made
+(settings/ResolutionListReplace.h). The list is the one made the way before,
+entry by entry. ResolutionInfoSize() and ClearCustomResolutions() take the
+lock now too (the other window systems still use the latter).
+
+What stays as it was, in Kodi's code for every platform: an entry written in
+place by the application thread (a calibration, ResetScreenParameters(), the
+"GetResolutionInfo(RES_DESKTOP) = ..." of the other window systems) while
+another thread copies it; and a reader that walks the list
+(ResolutionInfoSize(), then each entry) may see the list before up to some
+entry and the new one after it, now without reading freed memory.
+
+Host test (outside the tree): the list that the header makes is the one of the
+way before in 5000 random cases, and the list before is kept as it was; four
+threads read entries as the callers of GetResolutionInfo() do while one makes
+the list again 20000 times: clean under AddressSanitizer and ThreadSanitizer.
+The way before, in the same test: heap-use-after-free (AddressSanitizer) and
+data races (ThreadSanitizer).
+---
+ xbmc/settings/CMakeLists.txt          |  1 +
+ xbmc/settings/DisplaySettings.cpp     | 32 ++++++++++++-
+ xbmc/settings/DisplaySettings.h       | 19 +++++++-
+ xbmc/settings/ResolutionListReplace.h | 68 +++++++++++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.cpp   | 20 ++++----
+ 5 files changed, 127 insertions(+), 13 deletions(-)
+ create mode 100644 xbmc/settings/ResolutionListReplace.h
+
+diff --git a/xbmc/settings/CMakeLists.txt b/xbmc/settings/CMakeLists.txt
+index 72e0ffd..5afdf47 100644
+--- a/xbmc/settings/CMakeLists.txt
++++ b/xbmc/settings/CMakeLists.txt
+@@ -24,6 +24,7 @@ set(SOURCES AdvancedSettings.cpp
+ set(HEADERS AdvancedSettings.h
+             DiscSettings.h
+             DisplaySettings.h
++            ResolutionListReplace.h
+             GameSettings.h
+             ISubSettings.h
+             LibExportSettings.h
+diff --git a/xbmc/settings/DisplaySettings.cpp b/xbmc/settings/DisplaySettings.cpp
+index 68417df..a0f51bd 100644
+--- a/xbmc/settings/DisplaySettings.cpp
++++ b/xbmc/settings/DisplaySettings.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "DisplaySettings.h"
+ 
++#include "ResolutionListReplace.h"
++
+ #include "ServiceBroker.h"
+ #include "cores/VideoPlayer/VideoRenderers/ColorManager.h"
+ #include "dialogs/GUIDialogFileBrowser.h"
+@@ -536,9 +538,17 @@ RESOLUTION_INFO& CDisplaySettings::GetResolutionInfo(RESOLUTION resolution)
+   return GetResolutionInfo((size_t)resolution);
+ }
+ 
+-void CDisplaySettings::AddResolutionInfo(const RESOLUTION_INFO &resolution)
++size_t CDisplaySettings::ResolutionInfoSize() const
+ {
+   std::unique_lock lock(m_critical);
++  return m_resolutions.size();
++}
++
++namespace
++{
++// The entry that the list keeps of a resolution (AddResolutionInfo())
++RESOLUTION_INFO ListEntryOf(const RESOLUTION_INFO& resolution)
++{
+   RESOLUTION_INFO res(resolution);
+ 
+   if((res.dwFlags & D3DPRESENTFLAG_MODE3DTB) == 0)
+@@ -559,7 +569,23 @@ void CDisplaySettings::AddResolutionInfo(const RESOLUTION_INFO &resolution)
+       res.dwFlags  |= D3DPRESENTFLAG_MODE3DTB;
+     }
+   }
+-  m_resolutions.push_back(res);
++  return res;
++}
++} // unnamed namespace
++
++void CDisplaySettings::AddResolutionInfo(const RESOLUTION_INFO &resolution)
++{
++  std::unique_lock lock(m_critical);
++  m_resolutions.push_back(ListEntryOf(resolution));
++}
++
++void CDisplaySettings::ReplaceCustomResolutions(const std::vector<RESOLUTION_INFO>& resolutions,
++                                                std::optional<size_t> desktop)
++{
++  std::unique_lock lock(m_critical);
++  RESOLUTION_LIST::Replace(m_resolutions, resolutions, desktop, RES_DESKTOP, RES_CUSTOM,
++                           ListEntryOf, m_retired);
++  ApplyCalibrations();
+ }
+ 
+ void CDisplaySettings::ApplyCalibrations()
+@@ -988,6 +1014,8 @@ void CDisplaySettings::SettingOptionsMonitorsFiller(const SettingConstPtr& setti
+ 
+ void CDisplaySettings::ClearCustomResolutions()
+ {
++  // (Hades: under the lock of the list, as AddResolutionInfo())
++  std::unique_lock lock(m_critical);
+   if (m_resolutions.size() > RES_CUSTOM)
+   {
+     std::vector<RESOLUTION_INFO>::iterator firstCustom = m_resolutions.begin()+RES_CUSTOM;
+diff --git a/xbmc/settings/DisplaySettings.h b/xbmc/settings/DisplaySettings.h
+index b44629b..4591e43 100644
+--- a/xbmc/settings/DisplaySettings.h
++++ b/xbmc/settings/DisplaySettings.h
+@@ -15,6 +15,7 @@
+ #include "windowing/Resolution.h"
+ 
+ #include <map>
++#include <optional>
+ #include <set>
+ #include <utility>
+ #include <vector>
+@@ -66,8 +67,22 @@ public:
+   const RESOLUTION_INFO& GetResolutionInfo(RESOLUTION resolution) const;
+   RESOLUTION_INFO& GetResolutionInfo(size_t index);
+   RESOLUTION_INFO& GetResolutionInfo(RESOLUTION resolution);
+-  size_t ResolutionInfoSize() const { return m_resolutions.size(); }
++  //! (Hades: under the lock of the list, as GetResolutionInfo(): it may be replaced meanwhile)
++  size_t ResolutionInfoSize() const;
+   void AddResolutionInfo(const RESOLUTION_INFO &resolution);
++  /*!
++   * \brief Hades: the resolutions of the display (from RES_CUSTOM on) replaced in one step,
++   *        under the lock of the list, with the calibrations applied (ApplyCalibrations())
++   * \param resolutions the resolutions of the display, each as AddResolutionInfo() takes it
++   * \param desktop the one of them that RES_DESKTOP is a copy of; none: it stays as it was
++   *
++   * For a window system that makes its resolutions while Kodi runs (GBM, when the display
++   * changed), while other threads may read them: GetResolutionInfo() gives a reference. The list
++   * before is kept until Kodi ends, not freed, so that such a reference stays valid (of the list
++   * before), and no reader sees a list half made (settings/ResolutionListReplace.h).
++   */
++  void ReplaceCustomResolutions(const std::vector<RESOLUTION_INFO>& resolutions,
++                                std::optional<size_t> desktop);
+ 
+   const RESOLUTION_INFO& GetCurrentResolutionInfo() const { return GetResolutionInfo(m_currentResolution); }
+   RESOLUTION_INFO& GetCurrentResolutionInfo() { return GetResolutionInfo(m_currentResolution); }
+@@ -155,6 +170,8 @@ private:
+   using ResolutionInfos = std::vector<RESOLUTION_INFO>;
+   ResolutionInfos m_resolutions;
+   ResolutionInfos m_calibrations;
++  //! Hades: the lists that ReplaceCustomResolutions() replaced, kept (see there)
++  std::vector<ResolutionInfos> m_retired;
+ 
+   float m_zoomAmount{1.0f}; // current zoom amount
+   float m_pixelRatio{1.0f}; // current pixel ratio
+diff --git a/xbmc/settings/ResolutionListReplace.h b/xbmc/settings/ResolutionListReplace.h
+new file mode 100644
+index 0000000..718c232
+--- /dev/null
++++ b/xbmc/settings/ResolutionListReplace.h
+@@ -0,0 +1,68 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <optional>
++#include <utility>
++#include <vector>
++
++/*!
++ * \brief Hades: the resolutions of the display replaced in one step
++ *        (CDisplaySettings::ReplaceCustomResolutions())
++ *
++ * CDisplaySettings::GetResolutionInfo() takes the lock of the list only to find an entry: it
++ * gives a reference, which its caller reads after the lock is let go. A list made again in place
++ * (ClearCustomResolutions(), then AddResolutionInfo() for each resolution) destroys the entries
++ * that such a reference names, or moves them (a vector that grows), while a reader of another
++ * thread (a JSON-RPC request, an add-on, a setting) may be copying one: the copy reads freed
++ * memory. A window system that makes its resolutions again while Kodi runs (GBM, when the display
++ * changed) does that from the application thread.
++ *
++ * Here the new list is made apart, whole (the entries before firstCustom as they were, then the
++ * resolutions of the display, the desktop entry a copy of one of them), and then takes the place
++ * of the one before, which is kept, not freed: a reference into it stays valid, of the list
++ * before. The caller holds the lock of the list around this.
++ *
++ * Only what is done is here, with nothing of Kodi in it, so that it can be tested by itself.
++ */
++namespace RESOLUTION_LIST
++{
++
++/*!
++ * \param list the list of resolutions
++ * \param resolutions the resolutions of the display, from firstCustom on
++ * \param desktop the one of them that the entry at desktopAt is a copy of (as it is given, before
++ *        correct()); none: that entry stays as it was
++ * \param correct what an entry of the list is made of a resolution (AddResolutionInfo())
++ * \param retired where the list before is kept
++ */
++template<typename Info, typename Correct>
++void Replace(std::vector<Info>& list,
++             const std::vector<Info>& resolutions,
++             std::optional<std::size_t> desktop,
++             std::size_t desktopAt,
++             std::size_t firstCustom,
++             Correct&& correct,
++             std::vector<std::vector<Info>>& retired)
++{
++  std::vector<Info> next(list.begin(), list.begin() + std::min(list.size(), firstCustom));
++  next.resize(firstCustom);
++  next.reserve(firstCustom + resolutions.size());
++  for (const Info& resolution : resolutions)
++    next.push_back(correct(resolution));
++  if (desktop && *desktop < resolutions.size() && desktopAt < next.size())
++    next[desktopAt] = resolutions[*desktop];
++  list.swap(next);
++  // (moved, not copied: the storage that the references name goes with it)
++  retired.emplace_back(std::move(next));
++}
++
++} // namespace RESOLUTION_LIST
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index e061c16..e807be3 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -367,13 +367,15 @@ void CWinSystemGbm::MakeResolutions(const RESOLUTION_INFO* desktop)
+   RESOLUTION_INFO current = desktop ? *desktop : m_DRM->GetCurrentMode();
+ 
+   auto resolutions = m_DRM->GetModes();
++  // Hades: the list is made here, whole, and replaces the one before in one step: other threads
++  // may read it while Kodi runs (CDisplaySettings::ReplaceCustomResolutions(), which applies the
++  // calibrations too). The desktop resolution is a copy of the last one that is the desktop mode.
++  std::optional<size_t> desktopAt;
+   if (resolutions.empty())
+   {
+-    CDisplaySettings::GetInstance().ClearCustomResolutions();
+-
+     CServiceBroker::GetWinSystem()->GetGfxContext().ResetOverscan(current);
+-    CDisplaySettings::GetInstance().AddResolutionInfo(current);
+-    CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = current;
++    resolutions.push_back(current);
++    desktopAt = 0;
+ 
+     CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz", current.iWidth,
+               current.iHeight, current.iScreenWidth, current.iScreenHeight,
+@@ -381,18 +383,16 @@ void CWinSystemGbm::MakeResolutions(const RESOLUTION_INFO* desktop)
+   }
+   else
+   {
+-    CDisplaySettings::GetInstance().ClearCustomResolutions();
+-
+-    for (auto& res : resolutions)
++    for (size_t i = 0; i < resolutions.size(); ++i)
+     {
++      RESOLUTION_INFO& res = resolutions[i];
+       CServiceBroker::GetWinSystem()->GetGfxContext().ResetOverscan(res);
+-      CDisplaySettings::GetInstance().AddResolutionInfo(res);
+ 
+       if (current.iScreenWidth == res.iScreenWidth && current.iScreenHeight == res.iScreenHeight &&
+           current.iWidth == res.iWidth && current.iHeight == res.iHeight &&
+           current.fRefreshRate == res.fRefreshRate && current.dwFlags == res.dwFlags)
+       {
+-        CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP) = res;
++        desktopAt = i;
+       }
+ 
+       CLog::Log(LOGINFO, "Found resolution {}x{} with {}x{}{} @ {:f} Hz", res.iWidth, res.iHeight,
+@@ -401,7 +401,7 @@ void CWinSystemGbm::MakeResolutions(const RESOLUTION_INFO* desktop)
+     }
+   }
+ 
+-  CDisplaySettings::GetInstance().ApplyCalibrations();
++  CDisplaySettings::GetInstance().ReplaceCustomResolutions(resolutions, desktopAt);
+ 
+   // Ensure that scrubbed calibrations are always saved, otherwise would depend on calibration GUI
+   CDisplaySettings::GetInstance().UpdateCalibrations();
+-- 
+2.53.0
+

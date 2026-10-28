@@ -1,0 +1,716 @@
+From aa76a18f4eed8027b670e8742bc5da7b518b572b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 23:39:16 +0000
+Subject: [PATCH] avahi-daemon: limit the clients of the simple protocol server
+
+The simple protocol server (/run/avahi-daemon/socket, used by
+nss-mdns) accepted every connection: CLIENTS_MAX was defined but never
+checked, and a client that never sent a request was kept for ever.
+Any local user could therefore use up the descriptors and the memory
+of the daemon. Once the descriptors were gone, accept() failed with
+EMFILE while the connection stayed queued, so poll() reported it again
+at once: the daemon spun at full CPU and logged "accept(): Too many
+open files" on every turn, D-Bus calls that need a descriptor failed,
+and nss-mdns lookups hung, since the connection was never accepted
+(CVE-2025-59529, GHSA-73wf-3xmj-x82q). There is no fix upstream.
+
+This follows the direction discussed upstream: per-UID limits read
+from the peer credentials together with a global limit (pull request
+808), with the limits derived from RLIMIT_NOFILE, three quarters of
+them for one user and rate limits on a monotonic clock, as suggested
+in the review of pull requests 808, 971 and 975 by evverx, the model
+being the connections_per_uid_max of systemd's sd-varlink. Only Linux
+is covered fully: elsewhere, without SO_PEERCRED, all clients share
+the limits of one unknown user.
+
+- The global limit is RLIMIT_NOFILE minus a reserve of a quarter of
+  it (at least 32 descriptors) for the rest of the daemon, and at most
+  1024 clients. It is computed when the server is set up, after
+  rlimit-nofile from the configuration has been applied. With the
+  default soft limit of systemd services (1024) that is 768 clients.
+- One UID may hold at most three quarters of them (576), and all UIDs
+  but root together at most seven eighths (672): the lookups of root,
+  which runs the system services, always find a place.
+- A client that has not sent a complete request line within 5 seconds
+  is closed. nss-mdns writes its request right after connecting.
+- When a limit is reached, the client that has been idle for the
+  longest is closed to make room: one of the same UID first, otherwise
+  one within the limit that was reached. Before closing it, what it
+  may have sent since the last poll() is read, so that a request that
+  has just arrived is served. Clients that have sent a request are
+  never closed for this: resolvers end after at most 5 seconds, and
+  BROWSE-DNS-SERVERS subscriptions count towards the limits like any
+  other client, so that no user can cancel the subscriptions of
+  another. If nothing can be closed, the new connection is closed
+  without a reply, and nss-mdns falls through to the next module.
+- When accept() fails for lack of descriptors or memory, the listening
+  socket is not watched for 250 ms instead of spinning, and accepting
+  resumes at once when a client goes away.
+- Each kind of message caused by clients is logged at most once in
+  10 seconds, with the number of those left out.
+
+The counts are kept per UID, so a new connection costs a walk over the
+UIDs that have clients, not over the clients.
+---
+ avahi-daemon/simple-protocol.c | 527 +++++++++++++++++++++++++++++++--
+ 1 file changed, 506 insertions(+), 21 deletions(-)
+
+diff --git a/avahi-daemon/simple-protocol.c b/avahi-daemon/simple-protocol.c
+index 663aae0..363267f 100644
+--- a/avahi-daemon/simple-protocol.c
++++ b/avahi-daemon/simple-protocol.c
+@@ -31,10 +31,14 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <sys/resource.h>
++#include <stdint.h>
++#include <time.h>
+ 
+ #include <avahi-common/llist.h>
+ #include <avahi-common/malloc.h>
+ #include <avahi-common/error.h>
++#include <avahi-common/timeval.h>
+ 
+ #include <avahi-core/log.h>
+ #include <avahi-core/lookup.h>
+@@ -57,9 +61,34 @@
+ 
+ #define BUFFER_SIZE (20*1024)
+ 
+-#define CLIENTS_MAX 50
++/* The most clients served at the same time, whatever RLIMIT_NOFILE
++ * allows: each one takes a file descriptor and two buffers of
++ * BUFFER_SIZE */
++#define CLIENTS_MAX 1024
++
++/* File descriptors always left to the rest of the daemon (the D-Bus
++ * connection, the mDNS sockets, netlink, the service and hosts
++ * files): a quarter of RLIMIT_NOFILE, and never fewer than this */
++#define RESERVED_FDS_MIN 32
++
++/* A client that has not sent a complete request line by then is
++ * closed */
++#define IDLE_TIMEOUT_MSEC 5000
++
++/* How long accept() is not tried again after it failed for lack of
++ * file descriptors or memory */
++#define ACCEPT_RETRY_MSEC 250
++
++/* Each kind of message caused by clients is logged at most once in
++ * this interval, together with the number of those left out */
++#define LOG_INTERVAL_USEC ((uint64_t) 10 * 1000000)
++
++/* The peer credentials could not be read: all such clients share the
++ * limits of one unprivileged user */
++#define UID_UNKNOWN ((uid_t) -1)
+ 
+ typedef struct Client Client;
++typedef struct User User;
+ typedef struct Server Server;
+ 
+ typedef enum {
+@@ -70,14 +99,34 @@ typedef enum {
+     CLIENT_DEAD
+ } ClientState;
+ 
++typedef enum {
++    SCOPE_USER,
++    SCOPE_UNPRIVILEGED,
++    SCOPE_ALL
++} Scope;
++
++typedef struct RateLimit {
++    int used;
++    uint64_t last;
++    unsigned suppressed;
++} RateLimit;
++
+ struct Client {
+     Server *server;
++    User *user;
+ 
+     ClientState state;
+ 
+     int fd;
+     AvahiWatch *watch;
+ 
++    /* Order of acceptance, to find the client idle for the longest */
++    uint64_t serial;
++
++    /* Set until the first complete request line has been read */
++    int idle;
++    AvahiTimeout *idle_timeout;
++
+     char inbuf[BUFFER_SIZE], outbuf[BUFFER_SIZE];
+     size_t inbuf_length, outbuf_length;
+ 
+@@ -88,27 +137,157 @@ struct Client {
+     AvahiProtocol afquery;
+ 
+     AVAHI_LLIST_FIELDS(Client, clients);
++    AVAHI_LLIST_FIELDS(Client, idle);
++};
++
++/* The clients of one UID */
++struct User {
++    uid_t uid;
++    unsigned n_clients;
++
++    /* Its idle clients, the newest first */
++    AVAHI_LLIST_HEAD(Client, idle_clients);
++    Client *idle_oldest;
++
++    AVAHI_LLIST_FIELDS(User, users);
+ };
+ 
+ struct Server {
+     const AvahiPoll *poll_api;
+     int fd;
+     AvahiWatch *watch;
++    AvahiTimeout *accept_timeout;
++    int accept_paused;
+     AVAHI_LLIST_HEAD(Client, clients);
++    AVAHI_LLIST_HEAD(User, users);
+ 
+     unsigned n_clients;
++    unsigned n_unprivileged_clients;
++    unsigned clients_max, clients_per_user_max, unprivileged_clients_max;
++    uint64_t serial;
++
++    RateLimit accept_log, refuse_log, evict_log, idle_log;
++
+     int remove_socket;
+ };
+ 
+ static Server *server = NULL;
+ 
+ static void client_work(AvahiWatch *watch, int fd, AvahiWatchEvent events, void *userdata);
++static void server_resume(Server *s);
++
++static uint64_t monotonic_usec(void) {
++    struct timespec ts;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
++        return 0;
++
++    return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
++}
++
++/* Returns non-zero if a message of this kind may be logged now; the
++ * number of them left out since the last one is then stored in
++ * *suppressed. The clock is monotonic so that setting the system time
++ * does not let a flood through. */
++static int rate_limit(RateLimit *r, unsigned *suppressed) {
++    uint64_t now;
++
++    assert(r);
++    assert(suppressed);
++
++    now = monotonic_usec();
++
++    if (r->used && now - r->last < LOG_INTERVAL_USEC) {
++        r->suppressed++;
++        return 0;
++    }
++
++    *suppressed = r->suppressed;
++    r->suppressed = 0;
++    r->last = now;
++    r->used = 1;
++
++    return 1;
++}
++
++static User *user_find(Server *s, uid_t uid) {
++    User *u;
++
++    assert(s);
++
++    for (u = s->users; u; u = u->users_next)
++        if (u->uid == uid)
++            return u;
++
++    return NULL;
++}
++
++static User *user_get(Server *s, uid_t uid) {
++    User *u;
++
++    assert(s);
++
++    if ((u = user_find(s, uid)))
++        return u;
++
++    u = avahi_new(User, 1);
++    u->uid = uid;
++    u->n_clients = 0;
++    AVAHI_LLIST_HEAD_INIT(Client, u->idle_clients);
++    u->idle_oldest = NULL;
++
++    AVAHI_LLIST_PREPEND(User, users, s->users, u);
++
++    return u;
++}
++
++static void client_leave_idle(Client *c) {
++    User *u;
++
++    assert(c);
++
++    if (!c->idle)
++        return;
++
++    u = c->user;
++
++    if (u->idle_oldest == c)
++        u->idle_oldest = c->idle_prev;
++
++    AVAHI_LLIST_REMOVE(Client, idle, u->idle_clients, c);
++    c->idle = 0;
++
++    if (c->idle_timeout) {
++        c->server->poll_api->timeout_free(c->idle_timeout);
++        c->idle_timeout = NULL;
++    }
++}
+ 
+ static void client_free(Client *c) {
++    Server *s;
++    User *u;
++
+     assert(c);
+ 
+-    assert(c->server->n_clients >= 1);
+-    c->server->n_clients--;
++    s = c->server;
++    u = c->user;
++
++    assert(s->n_clients >= 1);
++    s->n_clients--;
++
++    client_leave_idle(c);
++
++    if (u->uid != 0) {
++        assert(s->n_unprivileged_clients >= 1);
++        s->n_unprivileged_clients--;
++    }
++
++    assert(u->n_clients >= 1);
++    if (--u->n_clients == 0) {
++        assert(!u->idle_clients);
++        AVAHI_LLIST_REMOVE(User, users, s->users, u);
++        avahi_free(u);
++    }
+ 
+     if (c->host_name_resolver)
+         avahi_s_host_name_resolver_free(c->host_name_resolver);
+@@ -119,15 +298,23 @@ static void client_free(Client *c) {
+     if (c->dns_server_browser)
+         avahi_s_dns_server_browser_free(c->dns_server_browser);
+ 
+-    c->server->poll_api->watch_free(c->watch);
++    s->poll_api->watch_free(c->watch);
+     close(c->fd);
+ 
+-    AVAHI_LLIST_REMOVE(Client, clients, c->server->clients, c);
++    AVAHI_LLIST_REMOVE(Client, clients, s->clients, c);
+     avahi_free(c);
++
++    /* A file descriptor has been freed: if accept() failed for lack of
++     * them, there is no need to wait for the retry */
++    if (s->accept_paused)
++        server_resume(s);
+ }
+ 
+-static void client_new(Server *s, int fd) {
++static void client_idle_timeout(AvahiTimeout *t, void *userdata);
++
++static void client_new(Server *s, int fd, uid_t uid) {
+     Client *c;
++    struct timeval tv;
+ 
+     assert(fd >= 0);
+ 
+@@ -142,6 +329,18 @@ static void client_new(Server *s, int fd) {
+     c->address_resolver = NULL;
+     c->dns_server_browser = NULL;
+ 
++    c->user = user_get(s, uid);
++    c->user->n_clients++;
++    if (uid != 0)
++        s->n_unprivileged_clients++;
++
++    c->serial = s->serial++;
++    c->idle = 1;
++    AVAHI_LLIST_PREPEND(Client, idle, c->user->idle_clients, c);
++    if (!c->user->idle_oldest)
++        c->user->idle_oldest = c;
++    c->idle_timeout = s->poll_api->timeout_new(s->poll_api, avahi_elapse_time(&tv, IDLE_TIMEOUT_MSEC, 0), client_idle_timeout, c);
++
+     c->watch = s->poll_api->watch_new(s->poll_api, fd, AVAHI_WATCH_IN, client_work, c);
+ 
+     AVAHI_LLIST_PREPEND(Client, clients, s->clients, c);
+@@ -382,25 +581,88 @@ static void handle_input(Client *c) {
+     }
+ }
+ 
+-static void client_work(AvahiWatch *watch, AVAHI_GCC_UNUSED int fd, AvahiWatchEvent events, void *userdata) {
++static void client_update_watch(Client *c) {
++    assert(c);
++
++    c->server->poll_api->watch_update(
++        c->watch,
++        (c->outbuf_length > 0 ? AVAHI_WATCH_OUT : 0) |
++        (c->inbuf_length < sizeof(c->inbuf) ? AVAHI_WATCH_IN : 0));
++}
++
++/* Reads what the client has sent and handles the complete lines in it.
++ * With MSG_DONTWAIT, finding nothing to read is not an error. Returns
++ * -1 if the client has been freed. */
++static int client_read(Client *c, int flags) {
++    ssize_t r;
++
++    assert(c);
++    assert(c->inbuf_length < sizeof(c->inbuf));
++
++    if ((r = recv(c->fd, c->inbuf + c->inbuf_length, sizeof(c->inbuf) - c->inbuf_length, flags)) <= 0) {
++        if (r < 0 && (flags & MSG_DONTWAIT) && (errno == EAGAIN || errno == EWOULDBLOCK))
++            return 0;
++
++        if (r < 0)
++            avahi_log_warn("read(): %s", strerror(errno));
++        client_free(c);
++        return -1;
++    }
++
++    c->inbuf_length += r;
++    assert(c->inbuf_length <= sizeof(c->inbuf));
++
++    handle_input(c);
++
++    if (c->state != CLIENT_IDLE)
++        client_leave_idle(c);
++
++    return 0;
++}
++
++/* Reads what an idle client may have sent since the last poll(), so
++ * that a request that has just arrived is served and not taken for
++ * idleness. Returns 1 if the client is still idle, 0 if it has sent
++ * its request and -1 if it had hung up and has been freed. */
++static int client_check_idle(Client *c) {
++    assert(c);
++    assert(c->idle);
++
++    if (c->inbuf_length < sizeof(c->inbuf)) {
++        if (client_read(c, MSG_DONTWAIT) < 0)
++            return -1;
++
++        client_update_watch(c);
++    }
++
++    return c->idle ? 1 : 0;
++}
++
++static void client_idle_timeout(AVAHI_GCC_UNUSED AvahiTimeout *t, void *userdata) {
+     Client *c = userdata;
++    unsigned n;
+ 
+     assert(c);
++    assert(c->idle_timeout == t);
+ 
+-    if ((events & AVAHI_WATCH_IN) && c->inbuf_length < sizeof(c->inbuf)) {
+-        ssize_t r;
++    if (client_check_idle(c) <= 0)
++        return;
+ 
+-        if ((r = read(c->fd, c->inbuf + c->inbuf_length, sizeof(c->inbuf) - c->inbuf_length)) <= 0) {
+-            if (r < 0)
+-                avahi_log_warn("read(): %s", strerror(errno));
+-            client_free(c);
+-            return;
+-        }
++    if (rate_limit(&c->server->idle_log, &n))
++        avahi_log_info("Closing simple protocol client of UID %u: no complete request line in %u ms (%u similar messages suppressed).",
++                       (unsigned) c->user->uid, (unsigned) IDLE_TIMEOUT_MSEC, n);
++
++    client_free(c);
++}
++
++static void client_work(AvahiWatch *watch, AVAHI_GCC_UNUSED int fd, AvahiWatchEvent events, void *userdata) {
++    Client *c = userdata;
+ 
+-        c->inbuf_length += r;
+-        assert(c->inbuf_length <= sizeof(c->inbuf));
++    assert(c);
+ 
+-        handle_input(c);
++    if ((events & AVAHI_WATCH_IN) && c->inbuf_length < sizeof(c->inbuf)) {
++        if (client_read(c, 0) < 0)
++            return;
+     }
+ 
+     if ((events & AVAHI_WATCH_OUT) && c->outbuf_length > 0) {
+@@ -434,6 +696,165 @@ static void client_work(AvahiWatch *watch, AVAHI_GCC_UNUSED int fd, AvahiWatchEv
+         (c->inbuf_length < sizeof(c->inbuf) ? AVAHI_WATCH_IN : 0));
+ }
+ 
++/* The idle client accepted first among those in the scope */
++static Client *oldest_idle_client(Server *s, uid_t uid, Scope scope) {
++    User *u;
++    Client *oldest = NULL;
++
++    assert(s);
++
++    for (u = s->users; u; u = u->users_next) {
++
++        if (!u->idle_oldest)
++            continue;
++
++        if ((scope == SCOPE_USER && u->uid != uid) ||
++            (scope == SCOPE_UNPRIVILEGED && u->uid == 0))
++            continue;
++
++        if (!oldest || u->idle_oldest->serial < oldest->serial)
++            oldest = u->idle_oldest;
++    }
++
++    return oldest;
++}
++
++/* Frees the place of one client in the scope by closing the client
++ * that has been idle for the longest. Clients that have sent a request
++ * are never closed for this, and neither are the long-lived
++ * BROWSE-DNS-SERVERS subscriptions: they count towards the limits like
++ * any other client. Returns 0 if there was no idle client to close. */
++static int evict_idle_client(Server *s, uid_t uid, Scope scope) {
++    Client *c;
++    unsigned n;
++    int r;
++
++    assert(s);
++
++    while ((c = oldest_idle_client(s, uid, scope))) {
++
++        r = client_check_idle(c);
++
++        /* It had hung up: its place is free */
++        if (r < 0)
++            return 1;
++
++        /* It has sent its request meanwhile and is being served */
++        if (r == 0)
++            continue;
++
++        if (rate_limit(&s->evict_log, &n))
++            avahi_log_warn("Too many simple protocol clients: closing the oldest idle one, of UID %u (%u similar messages suppressed).",
++                           (unsigned) c->user->uid, n);
++
++        client_free(c);
++        return 1;
++    }
++
++    return 0;
++}
++
++static void server_refuse(Server *s, uid_t uid, const char *limit, unsigned max) {
++    unsigned n;
++
++    assert(s);
++    assert(limit);
++
++    if (rate_limit(&s->refuse_log, &n))
++        avahi_log_warn("Refusing simple protocol client of UID %u: %s (%u) has been reached and no idle client can be closed (%u similar messages suppressed).",
++                       (unsigned) uid, limit, max, n);
++}
++
++/* Makes room for a new client of the UID, closing an idle client if a
++ * limit has been reached. Returns 0 if there is no room. */
++static int server_make_room(Server *s, uid_t uid) {
++    User *u;
++
++    assert(s);
++
++    /* No user can take more than three quarters of the places */
++    if ((u = user_find(s, uid)) && u->n_clients >= s->clients_per_user_max &&
++        !evict_idle_client(s, uid, SCOPE_USER)) {
++        server_refuse(s, uid, "the limit per user", s->clients_per_user_max);
++        return 0;
++    }
++
++    /* All users but root together cannot take the last eighth: the
++     * lookups of root, which runs the system services, always find a
++     * place */
++    if (uid != 0 && s->n_unprivileged_clients >= s->unprivileged_clients_max &&
++        !evict_idle_client(s, uid, SCOPE_USER) &&
++        !evict_idle_client(s, uid, SCOPE_UNPRIVILEGED)) {
++        server_refuse(s, uid, "the limit for all users but root", s->unprivileged_clients_max);
++        return 0;
++    }
++
++    if (s->n_clients >= s->clients_max &&
++        !evict_idle_client(s, uid, SCOPE_USER) &&
++        !evict_idle_client(s, uid, SCOPE_ALL)) {
++        server_refuse(s, uid, "the limit for all users", s->clients_max);
++        return 0;
++    }
++
++    return 1;
++}
++
++static uid_t client_uid(AVAHI_GCC_UNUSED int fd) {
++#ifdef SO_PEERCRED
++    struct ucred cred;
++    socklen_t len = sizeof(cred);
++
++    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && len == sizeof(cred))
++        return cred.uid;
++
++    avahi_log_debug(__FILE__": Failed to read the peer credentials of a client.");
++#endif
++
++    return UID_UNKNOWN;
++}
++
++static void server_resume(Server *s) {
++    assert(s);
++
++    if (!s->accept_paused)
++        return;
++
++    s->accept_paused = 0;
++    s->poll_api->timeout_update(s->accept_timeout, NULL);
++    s->poll_api->watch_update(s->watch, AVAHI_WATCH_IN);
++}
++
++static void server_accept_retry(AVAHI_GCC_UNUSED AvahiTimeout *t, void *userdata) {
++    server_resume(userdata);
++}
++
++static void server_accept_failed(Server *s, int error) {
++    struct timeval tv;
++    unsigned n;
++
++    assert(s);
++
++    /* The connection went away before it was accepted, or a signal came
++     * in: the next one may well be accepted */
++    if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK || error == ECONNABORTED || error == EPROTO) {
++        if (rate_limit(&s->accept_log, &n))
++            avahi_log_error("accept(): %s (%u similar messages suppressed).", strerror(error), n);
++        return;
++    }
++
++    /* Out of file descriptors or memory (EMFILE, ENFILE, ENOBUFS,
++     * ENOMEM), or worse: the connection stays queued and poll() would
++     * report it again at once, so stop watching the socket for a while
++     * instead of spinning */
++    if (rate_limit(&s->accept_log, &n))
++        avahi_log_error("accept(): %s; not accepting simple protocol clients for %u ms (%u similar messages suppressed).",
++                        strerror(error), (unsigned) ACCEPT_RETRY_MSEC, n);
++
++    s->accept_paused = 1;
++    s->poll_api->watch_update(s->watch, 0);
++    s->poll_api->timeout_update(s->accept_timeout, avahi_elapse_time(&tv, ACCEPT_RETRY_MSEC, 0));
++}
++
+ static void server_work(AVAHI_GCC_UNUSED AvahiWatch *watch, int fd, AvahiWatchEvent events, void *userdata) {
+     Server *s = userdata;
+ 
+@@ -441,12 +862,56 @@ static void server_work(AVAHI_GCC_UNUSED AvahiWatch *watch, int fd, AvahiWatchEv
+ 
+     if (events & AVAHI_WATCH_IN) {
+         int cfd;
++        uid_t uid;
++
++        if ((cfd = accept(fd, NULL, NULL)) < 0) {
++            server_accept_failed(s, errno);
++            return;
++        }
++
++        uid = client_uid(cfd);
++
++        if (!server_make_room(s, uid)) {
++            /* Closed without a reply: nss-mdns then reports the lookup as
++             * unavailable, and the next NSS module is asked */
++            close(cfd);
++            return;
++        }
+ 
+-        if ((cfd = accept(fd, NULL, NULL)) < 0)
+-            avahi_log_error("accept(): %s", strerror(errno));
++        client_new(s, cfd, uid);
++    }
++}
++
++/* The limits follow from RLIMIT_NOFILE as it is when the daemon starts,
++ * after rlimit-nofile from the configuration has been applied */
++static void server_set_limits(Server *s) {
++    struct rlimit rl;
++    rlim_t reserved;
++    unsigned m;
++
++    assert(s);
++
++    if (getrlimit(RLIMIT_NOFILE, &rl) < 0 || rl.rlim_cur == RLIM_INFINITY)
++        m = CLIENTS_MAX;
++    else {
++        reserved = rl.rlim_cur / 4;
++        if (reserved < RESERVED_FDS_MIN)
++            reserved = RESERVED_FDS_MIN;
++
++        if (rl.rlim_cur <= reserved)
++            m = 1;
++        else if (rl.rlim_cur - reserved > CLIENTS_MAX)
++            m = CLIENTS_MAX;
+         else
+-            client_new(s, cfd);
++            m = (unsigned) (rl.rlim_cur - reserved);
+     }
++
++    s->clients_max = m;
++    s->clients_per_user_max = m / 4 * 3 > 0 ? m / 4 * 3 : 1;
++    s->unprivileged_clients_max = m - m / 8;
++
++    avahi_log_debug(__FILE__": At most %u clients, %u per user, %u for all users but root.",
++                    s->clients_max, s->clients_per_user_max, s->unprivileged_clients_max);
+ }
+ 
+ int simple_protocol_setup(const AvahiPoll *poll_api) {
+@@ -461,8 +926,23 @@ int simple_protocol_setup(const AvahiPoll *poll_api) {
+     server->remove_socket = 0;
+     server->fd = -1;
+     server->n_clients = 0;
++    server->n_unprivileged_clients = 0;
++    server->serial = 0;
+     AVAHI_LLIST_HEAD_INIT(Client, server->clients);
++    AVAHI_LLIST_HEAD_INIT(User, server->users);
+     server->watch = NULL;
++    server->accept_paused = 0;
++    memset(&server->accept_log, 0, sizeof(server->accept_log));
++    memset(&server->refuse_log, 0, sizeof(server->refuse_log));
++    memset(&server->evict_log, 0, sizeof(server->evict_log));
++    memset(&server->idle_log, 0, sizeof(server->idle_log));
++    server_set_limits(server);
++
++    if (!(server->accept_timeout = poll_api->timeout_new(poll_api, NULL, server_accept_retry, server))) {
++        avahi_log_warn("Failed to create timeout for the simple protocol.");
++        simple_protocol_shutdown();
++        return -1;
++    }
+ 
+     u = umask(0000);
+ 
+@@ -545,6 +1025,11 @@ void simple_protocol_shutdown(void) {
+         while (server->clients)
+             client_free(server->clients);
+ 
++        assert(!server->users);
++
++        if (server->accept_timeout)
++            server->poll_api->timeout_free(server->accept_timeout);
++
+         if (server->watch)
+             server->poll_api->watch_free(server->watch);
+ 

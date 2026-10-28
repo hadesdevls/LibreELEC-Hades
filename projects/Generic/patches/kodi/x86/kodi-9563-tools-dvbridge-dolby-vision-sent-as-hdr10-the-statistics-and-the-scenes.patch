@@ -1,0 +1,648 @@
+From 6d8002d7562cfa40f567b62d5420c2525826e927 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:13:28 +0000
+Subject: [PATCH] tools/dvbridge: Dolby Vision sent as HDR10+, the statistics
+ and the scenes
+
+A display that takes HDR10+ and not Dolby Vision (many Samsung TVs) gets a
+Dolby Vision video rebuilt as plain HDR10, with no dynamic metadata at all.
+HDR10+ can carry what it lacks: per scene, the average and the distribution
+of maxRGB (SMPTE ST 2094-40). This is the part that decides what is sent;
+it holds no GL, so a host test runs it.
+
+- The scenes are the stream's own: a picture starts a scene when its level 1
+  block is not that of the picture before, or when its scene refresh flag is
+  set and the one before was not (a stream that sets it on every picture has
+  its scenes in level 1). Nothing is detected in the picture.
+- What is measured of a picture is the maxRGB of its samples (a histogram of
+  4096 bins in PQ and the sum in cd/m2). A scene's statistics are those of all
+  of its pictures measured so far, pooled; the first picture of a scene goes
+  out with the metadata of the scene before, because a picture is measured
+  only after it is drawn (nothing waits for the GPU) and nothing is made up
+  for a scene not yet measured.
+- Within a scene the metadata change only when a value of the InfoFrame (16
+  cd/m2 units) would change and the value itself has moved by more than 32
+  codes of 4095 in PQ: the display's mapping is not moved by every picture,
+  nor by a value that wavers at the edge of a code.
+- What is sent: application version 1, one window, the luminance parameters,
+  no tone mapping curve and a targeted system display maximum luminance of 0,
+  which is profile A (hdr10plus_tool, MIT, read as data, refuses profile A
+  with any other value). The entries at 5 and 10 % carry 0 and 0.00255, as
+  Hades and the fork of CroqueMr read ST 2094-40 8.5.4 (not verified: the
+  specification is not read, and the HDR10+ metadata that FFmpeg's FATE and
+  hdr10plus_tool test with carry other values there).
+- The film's own area is measured: the active area of the level 5 block, read
+  as dvbridge_dv_margins() reads it (as offsets of the picture, and as those
+  of a 3840x2160 master it was cropped or scaled from).
+- A measurement of a scene that has ended is dropped; with no measurement for
+  48 pictures nothing is sent (the frames go out as HDR10) until one comes.
+
+Measured on Cosmos Laundromat (Netflix Open Content, CC BY 4.0; 17 520
+pictures, the 100 shots of its Dolby Vision XML), against the ideal of each
+scene with all of its pictures known, from every pixel, in float64, in
+InfoFrame codes over the eight values sent:
+- this: 2.92 codes off on average, 51 changes within a scene per 1000
+  pictures, p99.98 off by 17.7 % on average;
+- each picture measured on its own (no scenes, the picture waiting for the
+  GPU, as the fork of CroqueMr does, its 16 cd/m2 bins): 4.73 codes, 539
+  changes, 31.4 %;
+- from level 1 alone: 29.4 codes.
+Sampling 960 columns gives the same as every pixel (2.92 against 2.92).
+---
+ tools/dvbridge/CMakeLists.txt    |   3 +-
+ tools/dvbridge/dvbridge_dvplus.c | 403 +++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_dvplus.h | 158 ++++++++++++
+ 3 files changed, 563 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_dvplus.c
+ create mode 100644 tools/dvbridge/dvbridge_dvplus.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 125740b..18af4c8 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -15,7 +15,8 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+-                                dvbridge_measure.c dvbridge_measured.c)
++                                dvbridge_measure.c dvbridge_measured.c
++                                dvbridge_dvplus.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_dvplus.c b/tools/dvbridge/dvbridge_dvplus.c
+new file mode 100644
+index 0000000..3e4a563
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_dvplus.c
+@@ -0,0 +1,403 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/* Hades: see dvbridge_dvplus.h. */
++#include "dvbridge_dvplus.h"
++
++#include <libavutil/dovi_meta.h>
++#include <libavutil/hdr_dynamic_metadata.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++const uint8_t dvbridge_dvplus_percentages[DVBRIDGE_DVPLUS_PLACES] = {1, 5, 10, 25, 50, 75, 90, 95, 99};
++/* the quantile of each place (the one at 99 made at 99.98 percent); 5 and 10 are not measured */
++static const double QUANTILES[DVBRIDGE_DVPLUS_PLACES] = {0.01, 0, 0, 0.25, 0.50, 0.75, 0.90, 0.95, 0.9998};
++
++/* (measured, dvbridge_dvplus.h: of the steps tried, 32 in PQ with no step in codes moved what is sent least for what
++ * it costs against the ideal) */
++const struct dvbridge_dvplus_params dvbridge_dvplus_default_params = {.hysteresis = 0, .pq_step = 32, .lost = 48};
++
++#define RING 64
++
++struct dvbridge_dvplus {
++    struct dvbridge_dvplus_params params;
++    double nits[65536]; /* cd/m2 of each 16-bit PQ code */
++    /* the scene of now: what is measured of it, pooled */
++    bool open;
++    unsigned scene;
++    uint64_t hist[DVBRIDGE_DVPLUS_BINS];
++    uint64_t count;
++    double sum;
++    unsigned pictures;
++    /* the picture presented last */
++    bool presented;
++    double last_pts;
++    struct dvbridge_dvplus_rpu last_rpu;
++    bool last_send, last_refresh;
++    struct dvbridge_dvplus_stats last_stats; /* what it went out with */
++    /* what goes out */
++    bool have;
++    struct dvbridge_dvplus_stats sent;
++    unsigned unmeasured; /* pictures presented since a measurement was taken */
++    /* the pictures presented, to put their measurements in their scene */
++    struct {
++        double pts;
++        unsigned scene;
++        bool used;
++    } ring[RING];
++    unsigned ring_next;
++    struct dvbridge_dvplus_counts counts;
++};
++
++double dvbridge_dvplus_nits(double pq)
++{
++    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32,
++                 c3 = 2392.0 / 4096 * 32;
++    if (!(pq > 0))
++        return 0;
++    if (pq > 1)
++        pq = 1;
++    const double p = pow(pq, 1 / m2);
++    const double n = p - c1 > 0 ? p - c1 : 0;
++    return 10000 * pow(n / (c2 - c3 * p), 1 / m1);
++}
++
++unsigned dvbridge_dvplus_vsif_code(unsigned value)
++{
++    const unsigned v = (value / 10 + 8) >> 4;
++    return v > 255 ? 255 : v;
++}
++
++static unsigned units(double nits)
++{
++    const double u = floor(nits * 10 + 0.5);
++    return u < 0 ? 0 : u > 100000 ? 100000 : (unsigned)u;
++}
++
++void dvbridge_dvplus_stats_of(const uint64_t *hist, unsigned bins, uint64_t count, double sum,
++                              struct dvbridge_dvplus_stats *stats)
++{
++    memset(stats, 0, sizeof(*stats));
++    if (!hist || !bins || !count)
++        return;
++    stats->average = units(sum / (double)count);
++    /* the quantile function through the bins: within a bin, its samples taken as spread evenly over it in PQ */
++    for (unsigned i = 0; i < DVBRIDGE_DVPLUS_PLACES; ++i) {
++        if (!QUANTILES[i])
++            continue;
++        const double target = QUANTILES[i] * (double)count;
++        uint64_t below = 0;
++        unsigned b = 0;
++        for (; b < bins; ++b) {
++            if (hist[b] && (double)(below + hist[b]) >= target)
++                break;
++            below += hist[b];
++        }
++        if (b == bins) { /* (only by rounding) the highest bin that has any */
++            for (b = bins; b-- > 0 && !hist[b];)
++                ;
++            below = count - hist[b];
++        }
++        double frac = (target - (double)below) / (double)hist[b];
++        frac = frac < 0 ? 0 : frac > 1 ? 1 : frac;
++        stats->percentiles[i] = units(dvbridge_dvplus_nits((b + frac) / bins));
++    }
++    stats->percentiles[1] = DVBRIDGE_DVPLUS_AT_5;
++    stats->percentiles[2] = DVBRIDGE_DVPLUS_AT_10;
++    unsigned top = bins;
++    while (top-- > 0 && !hist[top])
++        ;
++    stats->maxrgb = units(dvbridge_dvplus_nits((top + 1.0) / bins));
++}
++
++struct dvbridge_dvplus *dvbridge_dvplus_create(const struct dvbridge_dvplus_params *params)
++{
++    struct dvbridge_dvplus *m = calloc(1, sizeof(*m));
++    if (!m)
++        return NULL;
++    m->params = params ? *params : dvbridge_dvplus_default_params;
++    for (unsigned i = 0; i < 65536; ++i)
++        m->nits[i] = dvbridge_dvplus_nits(i / 65535.0);
++    return m;
++}
++
++void dvbridge_dvplus_destroy(struct dvbridge_dvplus *m)
++{
++    free(m);
++}
++
++void dvbridge_dvplus_reset(struct dvbridge_dvplus *m)
++{
++    if (!m)
++        return;
++    const struct dvbridge_dvplus_counts counts = m->counts;
++    const struct dvbridge_dvplus_params params = m->params;
++    /* (the table of cd/m2 stays as it is) */
++    m->open = false;
++    m->presented = false;
++    m->have = false;
++    m->unmeasured = 0;
++    m->count = 0;
++    m->sum = 0;
++    m->pictures = 0;
++    memset(m->hist, 0, sizeof(m->hist));
++    memset(m->ring, 0, sizeof(m->ring));
++    m->ring_next = 0;
++    m->counts = counts;
++    m->params = params;
++}
++
++bool dvbridge_dvplus_rpu_of(const void *metadata, size_t size, struct dvbridge_dvplus_rpu *rpu)
++{
++    memset(rpu, 0, sizeof(*rpu));
++    const AVDOVIMetadata *m = metadata;
++    if (!m || size < sizeof(*m) || m->color_offset + sizeof(AVDOVIColorMetadata) > size ||
++        m->num_ext_blocks < 0 || m->num_ext_blocks > AV_DOVI_MAX_EXT_BLOCKS ||
++        (m->num_ext_blocks && m->ext_block_offset + (size_t)m->num_ext_blocks * m->ext_block_size > size))
++        return false;
++    rpu->refresh = av_dovi_get_color(m)->scene_refresh_flag != 0;
++    for (int i = 0; i < m->num_ext_blocks; ++i) {
++        const AVDOVIDmData *e = av_dovi_get_ext(m, i);
++        if (e->level == 1) {
++            rpu->level1 = true;
++            rpu->min_pq = e->l1.min_pq;
++            rpu->max_pq = e->l1.max_pq;
++            rpu->avg_pq = e->l1.avg_pq;
++            break;
++        }
++    }
++    return true;
++}
++
++void dvbridge_dvplus_area(const void *metadata, size_t size, int width, int height, const float src[4],
++                          const int dst[4], int area[4])
++{
++    for (int i = 0; i < 4; ++i)
++        area[i] = dst[i];
++    const AVDOVIMetadata *m = metadata;
++    if (!m || size < sizeof(*m) || width < 1 || height < 1 || m->num_ext_blocks < 0 ||
++        m->num_ext_blocks > AV_DOVI_MAX_EXT_BLOCKS ||
++        (m->num_ext_blocks && m->ext_block_offset + (size_t)m->num_ext_blocks * m->ext_block_size > size) ||
++        !(src[2] > src[0]) || !(src[3] > src[1]) || dst[2] < 1 || dst[3] < 1)
++        return;
++    const AVDOVIDmData *l5 = NULL;
++    for (int i = 0; i < m->num_ext_blocks && !l5; ++i)
++        if (av_dovi_get_ext(m, i)->level == 5)
++            l5 = av_dovi_get_ext(m, i);
++    if (!l5)
++        return;
++    const double off[4] = {l5->l5.left_offset, l5->l5.right_offset, l5->l5.top_offset, l5->l5.bottom_offset};
++    const bool fits = off[0] + off[1] < width && off[2] + off[3] < height;
++    const bool raster = width == 3840 && height == 2160;
++    const bool master = !raster && off[0] < 3840 && off[1] < 3840 - off[0] && off[2] < 2160 && off[3] < 2160 - off[2];
++    if (!fits && !master)
++        return;
++    double v[4];
++    const double s = fmin(3840.0 / width, 2160.0 / height);
++    const double removed[2] = {fmax(0.0, 3840.0 - s * width), fmax(0.0, 2160.0 - s * height)};
++    for (int i = 0; i < 4; ++i) {
++        const double given = fits ? off[i] : 0;
++        const double scaled = master ? fmax(0.0, off[i] - removed[i / 2]) / s : 0;
++        v[i] = !master ? given : !fits ? scaled : fmin(given, scaled);
++    }
++    /* the film's samples, within those shown, at their place (inward: no pixel of a bar) */
++    const double x0 = fmax(v[0], src[0]), x1 = fmin(width - v[1], src[2]);
++    const double y0 = fmax(v[2], src[1]), y1 = fmin(height - v[3], src[3]);
++    if (!(x1 > x0) || !(y1 > y0))
++        return;
++    const double sx = dst[2] / (src[2] - src[0]), sy = dst[3] / (src[3] - src[1]);
++    const int ax0 = dst[0] + (int)ceil((x0 - src[0]) * sx - 1e-6), ax1 = dst[0] + (int)floor((x1 - src[0]) * sx + 1e-6);
++    const int ay0 = dst[1] + (int)ceil((y0 - src[1]) * sy - 1e-6), ay1 = dst[1] + (int)floor((y1 - src[1]) * sy + 1e-6);
++    if (ax1 - ax0 < 2 || ay1 - ay0 < 1)
++        return;
++    area[0] = ax0;
++    area[1] = ay0;
++    area[2] = ax1 - ax0;
++    area[3] = ay1 - ay0;
++}
++
++void dvbridge_dvplus_picture_add(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_picture *picture,
++                                 const uint16_t *codes, size_t count)
++{
++    if (!m || !picture || !codes)
++        return;
++    double sum = 0;
++    for (size_t i = 0; i < count; ++i) {
++        const uint16_t c = codes[i];
++        ++picture->hist[c >> 4];
++        sum += m->nits[c];
++    }
++    picture->sum += sum;
++    picture->count += (uint32_t)count;
++}
++
++static bool same_scene(const struct dvbridge_dvplus_rpu *a, const struct dvbridge_dvplus_rpu *b)
++{
++    if (a->level1 != b->level1)
++        return false;
++    if (a->level1 && (a->min_pq != b->min_pq || a->max_pq != b->max_pq || a->avg_pq != b->avg_pq))
++        return false;
++    /* a refresh that the picture before did not have (one on every picture marks nothing) */
++    return !(b->refresh && !a->refresh);
++}
++
++bool dvbridge_dvplus_present(struct dvbridge_dvplus *m, double pts, const struct dvbridge_dvplus_rpu *rpu,
++                             struct dvbridge_dvplus_stats *stats, bool *refresh)
++{
++    if (refresh)
++        *refresh = false;
++    if (!m)
++        return false;
++    const struct dvbridge_dvplus_rpu none = {0};
++    if (!rpu)
++        rpu = &none;
++    if (m->presented && pts == m->last_pts) {
++        /* the picture shown again: what it went out with */
++        if (m->last_send && stats)
++            *stats = m->last_stats;
++        if (refresh)
++            *refresh = m->last_refresh;
++        return m->last_send;
++    }
++    const bool back = m->presented && pts < m->last_pts;
++    const bool cut = !m->open || back || !same_scene(&m->last_rpu, rpu);
++    if (back)
++        memset(m->ring, 0, sizeof(m->ring));
++    if (cut) {
++        ++m->scene;
++        m->open = true;
++        m->count = 0;
++        m->sum = 0;
++        m->pictures = 0;
++        memset(m->hist, 0, sizeof(m->hist));
++        ++m->counts.scenes;
++    }
++    m->ring[m->ring_next].pts = pts;
++    m->ring[m->ring_next].scene = m->scene;
++    m->ring[m->ring_next].used = true;
++    m->ring_next = (m->ring_next + 1) % RING;
++    m->presented = true;
++    m->last_pts = pts;
++    m->last_rpu = *rpu;
++    m->last_refresh = cut;
++    if (m->unmeasured < UINT32_MAX)
++        ++m->unmeasured;
++    /* (what was sent last describes the scene before until this one is measured: nothing is made up for it) */
++    m->last_send = m->have && m->unmeasured <= m->params.lost;
++    if (m->last_send) {
++        ++m->counts.sent;
++        m->last_stats = m->sent;
++        if (stats)
++            *stats = m->sent;
++    } else
++        ++m->counts.unsent;
++    if (refresh)
++        *refresh = cut;
++    return m->last_send;
++}
++
++/* PQ of a value in 1/100000, in 12-bit codes */
++static double pq_code(unsigned value)
++{
++    const double y = value / 1e5; /* of 10000 cd/m2 */
++    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32,
++                 c3 = 2392.0 / 4096 * 32;
++    const double p = pow(y, m1);
++    return 4095 * pow((c1 + c2 * p) / (1 + c3 * p), m2);
++}
++
++/* whether a value moves: its code in the InfoFrame by more than step, and the value itself by more than pq_step in
++ * PQ (12-bit codes; 0 for any move): a value that drifts around the edge of a code does not flip it back and forth */
++static bool value_moves(unsigned a, unsigned b, unsigned step, unsigned pq_step)
++{
++    const int d = (int)dvbridge_dvplus_vsif_code(a) - (int)dvbridge_dvplus_vsif_code(b);
++    if ((unsigned)abs(d) <= step)
++        return false;
++    return !pq_step || fabs(pq_code(a) - pq_code(b)) > pq_step;
++}
++
++static bool moves(const struct dvbridge_dvplus_stats *a, const struct dvbridge_dvplus_stats *b, unsigned step,
++                  unsigned pq_step)
++{
++    if (value_moves(a->average, b->average, step, pq_step))
++        return true;
++    for (unsigned i = 0; i < DVBRIDGE_DVPLUS_PLACES; ++i)
++        if (QUANTILES[i] && value_moves(a->percentiles[i], b->percentiles[i], step, pq_step))
++            return true;
++    return false;
++}
++
++bool dvbridge_dvplus_measured(struct dvbridge_dvplus *m, const struct dvbridge_dvplus_picture *picture)
++{
++    if (!m || !picture || !picture->count)
++        return false;
++    int at = -1;
++    for (unsigned i = 0; i < RING; ++i) {
++        /* (the newest one of that pts) */
++        const unsigned j = (m->ring_next + RING - 1 - i) % RING;
++        if (m->ring[j].used && m->ring[j].pts == picture->pts) {
++            at = (int)j;
++            break;
++        }
++    }
++    if (at < 0 || m->ring[at].scene != m->scene || !m->open) {
++        if (at >= 0)
++            m->ring[at].used = false;
++        ++m->counts.dropped;
++        return false;
++    }
++    m->ring[at].used = false;
++    for (unsigned b = 0; b < DVBRIDGE_DVPLUS_BINS; ++b)
++        m->hist[b] += picture->hist[b];
++    m->count += picture->count;
++    m->sum += picture->sum;
++    ++m->pictures;
++    m->unmeasured = 0;
++    ++m->counts.measured;
++    struct dvbridge_dvplus_stats made;
++    dvbridge_dvplus_stats_of(m->hist, DVBRIDGE_DVPLUS_BINS, m->count, m->sum, &made);
++    if (m->pictures == 1 || !m->have) {
++        /* the scene's own, from its first picture measured */
++        m->sent = made;
++        m->have = true;
++    } else if (moves(&made, &m->sent, m->params.hysteresis, m->params.pq_step)) {
++        m->sent = made;
++        ++m->counts.changes;
++    }
++    return true;
++}
++
++void dvbridge_dvplus_metadata(const struct dvbridge_dvplus_stats *s, AVDynamicHDRPlus *out)
++{
++    memset(out, 0, sizeof(*out));
++    out->itu_t_t35_country_code = 0xB5;
++    out->application_version = 1;
++    out->num_windows = 1;
++    out->targeted_system_display_maximum_luminance = (AVRational){0, 1};
++    AVHDRPlusColorTransformParams *w = &out->params[0];
++    for (int i = 0; i < 3; ++i)
++        w->maxscl[i] = (AVRational){(int)s->maxrgb, 100000};
++    w->average_maxrgb = (AVRational){(int)s->average, 100000};
++    w->num_distribution_maxrgb_percentiles = DVBRIDGE_DVPLUS_PLACES;
++    for (int i = 0; i < DVBRIDGE_DVPLUS_PLACES; ++i) {
++        w->distribution_maxrgb[i].percentage = dvbridge_dvplus_percentages[i];
++        w->distribution_maxrgb[i].percentile = (AVRational){(int)s->percentiles[i], 100000};
++    }
++    w->fraction_bright_pixels = (AVRational){0, 1000};
++    w->tone_mapping_flag = 0;
++    w->color_saturation_mapping_flag = 0;
++}
++
++bool dvbridge_dvplus_sent(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_stats *stats)
++{
++    if (!m || !m->have || m->unmeasured > m->params.lost)
++        return false;
++    if (stats)
++        *stats = m->sent;
++    return true;
++}
++
++void dvbridge_dvplus_get_counts(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_counts *counts)
++{
++    if (m && counts)
++        *counts = m->counts;
++}
+diff --git a/tools/dvbridge/dvbridge_dvplus.h b/tools/dvbridge/dvbridge_dvplus.h
+new file mode 100644
+index 0000000..12caf57
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_dvplus.h
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++#ifndef DVBRIDGE_DVPLUS_H
++#define DVBRIDGE_DVPLUS_H
++/* Hades: Dolby Vision sent as HDR10+, for a display that takes HDR10+ and not Dolby Vision. The picture is the one
++ * of "Dolby Vision as HDR10" (dvbridge_render_hdr10(): the base layer, the RPU and, where it is drawn, the residual
++ * of the enhancement layer, in BT.2020 with PQ and without tone mapping), and with each frame go HDR10+ dynamic
++ * metadata (SMPTE ST 2094-40:2020, application version 1, one processing window: the whole picture) that describe
++ * that picture, measured from it by Hades. Only what HDR10+ calls the luminance parameters is made: the average of
++ * maxRGB and the distribution of maxRGB, in linear light. No tone mapping curve (no Bezier curve, no knee point) is
++ * made: a curve would be a grade that nobody made, and HDR10+ without one is profile A, whose targeted system display
++ * maximum luminance is 0 (hdr10plus_tool, MIT, read as data: hdr10plus/src/metadata.rs, validate(): "Invalid
++ * targeted_system_display_maximum_luminance for profile A, must be zero"; its profile A sample has 0, its profile B
++ * sample 400 with its curve). The display maps the picture with them, as it maps an HDR10+ film.
++ *
++ * Scenes: HDR10+ metadata are made per scene, and a Dolby Vision stream says where its scenes are: each RPU carries
++ * the level 1 block of its scene (the colourist's shots, measured by the studio's tools on the whole shot) and a
++ * scene refresh flag. A picture starts a scene when its level 1 block is not that of the picture before, or when its
++ * scene refresh flag is set and the one before was not (a stream that sets it on every picture has its scenes in
++ * level 1). Nothing is detected in the picture: the cuts are the colourist's.
++ *
++ * Measured, without waiting: the picture of a frame is sampled on the GPU after it is drawn (dvbridge_dvplus_gl.h) and
++ * read back when the GPU has finished it, a frame or more later; the metadata of a frame are decided before it is
++ * drawn, from what was measured of the pictures of its scene before it. So the first picture of a scene goes out with
++ * the metadata of the scene before it (they describe nothing of the new scene yet: nothing is made up for it), and
++ * from the first picture of the scene that is measured on, with those of its own scene: the statistics of all of its
++ * pictures measured so far, pooled (every sample of every picture counts once, as a scene's statistics are those of
++ * all of its pixels). Within a scene they change only when a value that the HDR10+ InfoFrame carries (in units of 16
++ * cd/m2) would change and the value itself has moved by more than params.pq_step in PQ: the display's mapping is not
++ * moved by every picture, nor by a value that wavers at the edge of a code. Measured on Cosmos Laundromat (17 520
++ * pictures, the 100 scenes of its Dolby Vision metadata) against the ideal (each scene's statistics with all of its
++ * pictures known, from every pixel, in float64): 2.9 codes off on average over the eight values, 51 changes within
++ * a scene per 1000 pictures; a picture measured on its own (no scenes, the picture waiting for the GPU, as the fork
++ * of CroqueMr does) 4.7 codes and 539 changes.
++ *
++ * This part decides; it holds no GL, so that a test runs it on the host. */
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The histogram of maxRGB of a picture: PQ in 4096 bins (bin b holds [b / 4096, (b + 1) / 4096)); at 1000 cd/m2 a
++ * bin is about 2 cd/m2 wide, at 4000 cd/m2 about 8, under the 16 cd/m2 of the InfoFrame's values */
++#define DVBRIDGE_DVPLUS_BINS 4096
++/* The nine places of the distribution of maxRGB, as the InfoFrame carries them (KODI::UTILS::HDR10PLUS::
++ * VSIF_PERCENTAGES): 1, 5, 10, 25, 50, 75, 90, 95 and 99 percent, the last one made at 99.98 percent (ST 2094-40
++ * 8.5.3, as dvbridge_hdr10plus.h reads it). In application version 1 the entries at 5 and 10 percent are no
++ * percentiles: they carry 0 and 0.00255 (ST 2094-40 8.5.4, as dvbridge_hdr10plus.h reads it; the fork of CroqueMr
++ * reads it the same way). Not verified: the specification is not read, and the HDR10+ metadata that FFmpeg's FATE
++ * and hdr10plus_tool test with carry 255 (FATE) or other values at 10 percent and a value close to the peak at 5. */
++#define DVBRIDGE_DVPLUS_PLACES 9
++extern const uint8_t dvbridge_dvplus_percentages[DVBRIDGE_DVPLUS_PLACES];
++#define DVBRIDGE_DVPLUS_AT_5 0     /* 1/100000 */
++#define DVBRIDGE_DVPLUS_AT_10 255  /* 1/100000 */
++
++/* What is measured of one picture: the maxRGB of each of its samples */
++struct dvbridge_dvplus_picture {
++    double pts;
++    uint32_t count;
++    double sum; /* of maxRGB, cd/m2 */
++    uint32_t hist[DVBRIDGE_DVPLUS_BINS];
++};
++
++/* The luminance parameters sent with a picture, in the units of ST 2094-40 (1/100000 of 10000 cd/m2: 0.1 cd/m2) */
++struct dvbridge_dvplus_stats {
++    unsigned average;                             /* average_maxrgb */
++    unsigned percentiles[DVBRIDGE_DVPLUS_PLACES]; /* at dvbridge_dvplus_percentages (5 and 10: see above) */
++    unsigned maxrgb; /* the highest maxRGB sampled; the InfoFrame does not carry MaxSCL, this is for the log */
++};
++
++/* What a picture's RPU says of its scene */
++struct dvbridge_dvplus_rpu {
++    bool level1;                   /* it has a level 1 block */
++    unsigned min_pq, max_pq, avg_pq; /* ... its values (12-bit PQ) */
++    bool refresh;                  /* scene_refresh_flag */
++};
++
++struct dvbridge_dvplus_params {
++    /* within a scene, the metadata sent change only when a value of the InfoFrame (16 cd/m2 units) would change by
++     * more than this */
++    unsigned hysteresis;
++    /* ... and only when the value itself moves by more than this in PQ (12-bit codes; 0: any move) */
++    unsigned pq_step;
++    /* pictures presented in a row without a measurement taken: from there on nothing is sent (the display is sent
++     * HDR10) until a measurement comes again */
++    unsigned lost;
++};
++extern const struct dvbridge_dvplus_params dvbridge_dvplus_default_params;
++
++struct dvbridge_dvplus;
++/* params: NULL for the defaults */
++struct dvbridge_dvplus *dvbridge_dvplus_create(const struct dvbridge_dvplus_params *params);
++void dvbridge_dvplus_destroy(struct dvbridge_dvplus *m);
++/* A seek, or a new stream: nothing of before is sent or kept */
++void dvbridge_dvplus_reset(struct dvbridge_dvplus *m);
++
++/* The scene of a picture from its Dolby Vision metadata (an AVDOVIMetadata of FFmpeg, size bytes): false when they
++ * are not that (then the picture counts as one without an RPU: no level 1, no refresh) */
++bool dvbridge_dvplus_rpu_of(const void *metadata, size_t size, struct dvbridge_dvplus_rpu *rpu);
++
++/* The part of the place of a picture that is the film's, where its samples are taken: the active area that the level
++ * 5 block of its Dolby Vision metadata gives (read as dvbridge_dv_margins() reads it: as offsets of the picture of
++ * width x height, and as those of a 3840x2160 master that it was cropped or scaled from, the smaller margin of the two
++ * on each side), within the part of the picture that is shown (src: x0, y0, x1, y1, in its samples) at its place (dst:
++ * x, y, w, h, in pixels of the output); area: x, y, w, h. The bars of a film coded with them are not of the film: the
++ * same film coded without them is shown the same way, and is described the same way. The whole place without a level
++ * 5 block, or where its offsets fit no reading. */
++void dvbridge_dvplus_area(const void *metadata, size_t size, int width, int height, const float src[4],
++                          const int dst[4], int area[4]);
++
++/* A picture into what is measured of it: count samples of maxRGB, each PQ in 1/65535 (a picture starts with count 0:
++ * zero it, and set pts) */
++void dvbridge_dvplus_picture_add(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_picture *picture,
++                                 const uint16_t *codes, size_t count);
++
++/* A picture is presented now (before it is drawn): its pts and what its RPU says of its scene. true: *stats are what
++ * goes out with it; false: nothing (nothing is measured of any scene yet, or measurements stopped coming). The same
++ * pts again (the picture shown again) is given the same. *refresh (may be NULL): the picture starts a scene. */
++bool dvbridge_dvplus_present(struct dvbridge_dvplus *m, double pts, const struct dvbridge_dvplus_rpu *rpu,
++                             struct dvbridge_dvplus_stats *stats, bool *refresh);
++/* What was measured of a picture presented before (by its pts): into its scene, where that is the scene of now (a
++ * picture of a scene that has ended adds nothing). false: it was not taken. */
++bool dvbridge_dvplus_measured(struct dvbridge_dvplus *m, const struct dvbridge_dvplus_picture *picture);
++/* What goes out with the next picture of the scene of now, as it stands (false: nothing): for the log, and for a
++ * test that takes a picture's own measurement before it is presented */
++bool dvbridge_dvplus_sent(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_stats *stats);
++
++/* The HDR10+ metadata of stats, as FFmpeg's AVDynamicHDRPlus (for KODI::UTILS::HDR10PLUS::MakeVsif(), which codes the
++ * InfoFrame of a film's own metadata the same way): application version 1, one processing window, the luminance
++ * parameters, no tone mapping and a targeted system display maximum luminance of 0 (profile A); MaxSCL, which the
++ * InfoFrame does not carry, is the highest maxRGB sampled for all three components, and the fraction of bright pixels
++ * 0 (not measured; nor carried) */
++struct AVDynamicHDRPlus;
++void dvbridge_dvplus_metadata(const struct dvbridge_dvplus_stats *stats, struct AVDynamicHDRPlus *out);
++
++/* The statistics of a histogram, as the module makes them (for the tests): hist of bins entries over [0, 1] in PQ,
++ * count samples, sum of their maxRGB in cd/m2 */
++void dvbridge_dvplus_stats_of(const uint64_t *hist, unsigned bins, uint64_t count, double sum,
++                              struct dvbridge_dvplus_stats *stats);
++/* A value in 1/100000 as the InfoFrame carries it: units of 16 cd/m2, rounded, 255 at most
++ * (KODI::UTILS::HDR10PLUS::CodedMaxRgb()) */
++unsigned dvbridge_dvplus_vsif_code(unsigned value);
++/* cd/m2 of a PQ value (SMPTE ST 2084) */
++double dvbridge_dvplus_nits(double pq);
++
++/* What the module counted, for the log: pictures presented with metadata, without, scenes started, changes of the
++ * metadata within a scene, measurements taken and dropped (of a scene that had ended, or not presented) */
++struct dvbridge_dvplus_counts {
++    unsigned sent, unsent, scenes, changes, measured, dropped;
++};
++void dvbridge_dvplus_get_counts(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_counts *counts);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

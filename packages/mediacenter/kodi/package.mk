@@ -145,7 +145,8 @@ configure_package() {
   fi
 
   if [ "${KODI_BLURAY_SUPPORT}" = yes ]; then
-    PKG_DEPENDS_TARGET+=" libbluray"
+    # Hades: and the Java part of the same libbluray, for BD-J menus with a Java runtime add-on
+    PKG_DEPENDS_TARGET+=" libbluray libbluray-bdj"
     KODI_BLURAY="-DENABLE_BLURAY=ON"
   else
     KODI_BLURAY="-DENABLE_BLURAY=OFF"

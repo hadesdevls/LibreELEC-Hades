@@ -11,5 +11,6 @@ PKG_LONGDESC="Base packages for running on GBM"
 
 # NVIDIA drivers for Linux
 if listcontains "${GRAPHIC_DRIVERS}" "nvidia-ng"; then
-  PKG_DEPENDS_TARGET+=" nvidia"
+  # Hades: and NVIDIA's 580 driver for Maxwell, Pascal and Volta, chosen at boot
+  PKG_DEPENDS_TARGET+=" nvidia nvidia-legacy"
 fi

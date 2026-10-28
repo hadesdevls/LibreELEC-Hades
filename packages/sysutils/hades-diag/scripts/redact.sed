@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Hades diagnostics: remove credentials from logs before they are written to the boot partition (busybox sed -E).
 # redact.sh runs it after redact-ids.awk, which has put markers in the place of the addresses of the network,
 # serial numbers, UUIDs, SSH keys, network names and the name of the system, and has cut down an address or a

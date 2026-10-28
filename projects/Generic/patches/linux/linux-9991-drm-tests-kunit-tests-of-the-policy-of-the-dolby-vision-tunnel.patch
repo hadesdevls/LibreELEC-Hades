@@ -1,0 +1,293 @@
+From 8eb9de5eeba58f648b20a75ae59388cfb1483b35 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:59:29 +0000
+Subject: [PATCH] drm/tests: KUnit tests of the policy of the Dolby Vision
+ tunnel
+
+Linux 7.3 brings KUnit tests of i915's display, but they build only with
+i915, which needs an x86 kernel run in QEMU; the policy of the tunnel that
+i915/xe and amdgpu share is in drm_dvbridge.h and drm_dvbridge_ll.h, and the
+InfoFrames it sends are packed by drivers/video/hdmi.c, which the DRM tests
+build on UML in a minute. drm_dvbridge_test.c tests there, with the kernel's
+packers:
+
+- the Dolby vendor InfoFrame of the tunnel byte for byte (header 81 01 1b,
+  the checksum, the OUI 46 d0 00, PB4 02 for Standard and 03 for
+  Low-Latency, the rest zero), and back through hdmi_infoframe_unpack();
+- the fields of the AVI InfoFrame of the tunnel in the packed bytes (RGB,
+  no colorimetry, full range, the VIC), and those of Low-Latency;
+- the VIC table (the ten CTA VICs of 1080p and 2160p at 24 to 60 Hz) and
+  which of them need 2160p60;
+- the Dolby block rule and QS on EDIDs made by the test: taken with QS,
+  Standard refused without QS but Low-Latency taken, interface 0, two
+  blocks, no EDID, a checksum, and an HDMI Forum EEODB that counts a
+  block the base block does not, with the Dolby block in it: taken from
+  the whole EDID, not from its first 256 bytes.
+
+How i915 puts the vendor InfoFrame in its DIP and amdgpu in a DC packet is
+not here. The host tests of the rule (603 real EDIDs, the three-way test
+with Kodi, mutations) stay as they are.
+---
+ drivers/gpu/drm/tests/Makefile            |   1 +
+ drivers/gpu/drm/tests/drm_dvbridge_test.c | 237 ++++++++++++++++++++++
+ 2 files changed, 238 insertions(+)
+ create mode 100644 drivers/gpu/drm/tests/drm_dvbridge_test.c
+
+diff --git a/drivers/gpu/drm/tests/Makefile b/drivers/gpu/drm/tests/Makefile
+index e7193b4..8de21c6 100644
+--- a/drivers/gpu/drm/tests/Makefile
++++ b/drivers/gpu/drm/tests/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_DRM_KUNIT_TEST) += \
+ 	drm_cmdline_parser_test.o \
+ 	drm_connector_test.o \
+ 	drm_damage_helper_test.o \
++	drm_dvbridge_test.o \
+ 	drm_dp_mst_helper_test.o \
+ 	drm_exec_test.o \
+ 	drm_format_helper_test.o \
+diff --git a/drivers/gpu/drm/tests/drm_dvbridge_test.c b/drivers/gpu/drm/tests/drm_dvbridge_test.c
+new file mode 100644
+index 0000000..4ca547d
+--- /dev/null
++++ b/drivers/gpu/drm/tests/drm_dvbridge_test.c
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Hades: KUnit tests of the policy of the Dolby Vision tunnel that i915/xe and amdgpu share
++ * (drm_dvbridge.h, drm_dvbridge_ll.h) with the kernel's own InfoFrame packers (drivers/video/hdmi.c):
++ * the bytes of the Dolby vendor InfoFrame and of the AVI InfoFrame of the tunnel, the Dolby block
++ * rule on EDIDs made here (an HDMI Forum EEODB among them), QS, and the CTA VIC table. The bytes of
++ * an InfoFrame on the wire also depend on the driver (i915 puts the vendor DIP's hole in the
++ * frame, amdgpu copies it into a DC packet): that part is not here.
++ */
++#include <kunit/test.h>
++#include <linux/hdmi.h>
++#include <drm/drm_dvbridge.h>
++#include <drm/drm_dvbridge_ll.h>
++
++static void dvb_sum(u8 *b)
++{
++	unsigned int i, s = 0;
++
++	for (i = 0; i < 127; i++)
++		s += b[i];
++	b[127] = (u8)(256 - s % 256);
++}
++
++/* An EDID of blocks blocks whose base block counts ext extensions; each block after it is CTA. */
++static void dvb_edid(u8 *e, unsigned int blocks, unsigned int ext)
++{
++	static const u8 magic[8] = {0, 255, 255, 255, 255, 255, 255, 0};
++	unsigned int i;
++
++	memset(e, 0, blocks * 128);
++	memcpy(e, magic, 8);
++	e[18] = 1;
++	e[19] = 3;
++	e[126] = ext;
++	dvb_sum(e);
++	for (i = 1; i < blocks; i++) {
++		e[i * 128] = 2;
++		e[i * 128 + 1] = 3;
++		e[i * 128 + 2] = 4;
++		dvb_sum(e + i * 128);
++	}
++}
++
++/* Appends a data block to CTA block i of e. */
++static void dvb_db(u8 *e, unsigned int i, const u8 *db, size_t len)
++{
++	u8 *b = e + i * 128;
++
++	memcpy(b + b[2], db, len);
++	b[2] += len;
++	dvb_sum(b);
++}
++
++/* A version 2 Dolby VSVDB of 12 bytes with interface 2 (Standard and Low-Latency) */
++static const u8 dvb_vsvdb_v2[12] = {0xeb, 0x01, 0x46, 0xd0, 0x00, 0x40, 0x00, 0x02, 0, 0, 0, 0};
++/* The same with interface 0 (Low-Latency only) */
++static const u8 dvb_vsvdb_v2_ll[12] = {0xeb, 0x01, 0x46, 0xd0, 0x00, 0x40, 0x00, 0x00, 0, 0, 0, 0};
++/* A video capability data block with QS */
++static const u8 dvb_vcdb_qs[3] = {0xe2, 0x00, 0x40};
++
++static void drm_test_dvbridge_vsif(struct kunit *test)
++{
++	struct hdmi_dolby_vendor_infoframe dv;
++	union hdmi_infoframe back;
++	u8 buf[HDMI_INFOFRAME_SIZE(DOLBY_VENDOR)];
++	unsigned int i, sum = 0;
++	ssize_t len;
++
++	drm_dvbridge_tunnel_vsif(&dv);
++	len = hdmi_dolby_vendor_infoframe_pack(&dv, buf, sizeof(buf));
++	KUNIT_ASSERT_EQ(test, len, 31);
++	KUNIT_EXPECT_EQ(test, buf[0], 0x81);
++	KUNIT_EXPECT_EQ(test, buf[1], 0x01);
++	KUNIT_EXPECT_EQ(test, buf[2], 27);
++	for (i = 0; i < len; i++)
++		sum += buf[i];
++	KUNIT_EXPECT_EQ(test, sum % 256, 0);
++	KUNIT_EXPECT_EQ(test, buf[4], 0x46);
++	KUNIT_EXPECT_EQ(test, buf[5], 0xd0);
++	KUNIT_EXPECT_EQ(test, buf[6], 0x00);
++	/* PB4: the Dolby Vision signal (bit 1), Standard (low latency, bit 0, off) */
++	KUNIT_EXPECT_EQ(test, buf[7], 0x02);
++	for (i = 8; i < len; i++)
++		KUNIT_EXPECT_EQ_MSG(test, buf[i], 0, "byte %u", i);
++	KUNIT_ASSERT_EQ(test, hdmi_infoframe_unpack(&back, buf, len), 0);
++	KUNIT_EXPECT_EQ(test, back.any.type, HDMI_INFOFRAME_TYPE_VENDOR);
++	KUNIT_EXPECT_EQ(test, back.vendor.any.oui, HDMI_DOLBY_IEEE_OUI);
++	KUNIT_EXPECT_TRUE(test, back.vendor.dolby.signal);
++	KUNIT_EXPECT_FALSE(test, back.vendor.dolby.low_latency);
++
++	/* Low-Latency over the tunnel */
++	drm_dvbridge_tunnel_vsif(&dv);
++	drm_dvbridge_ll_vsif(&dv);
++	len = hdmi_dolby_vendor_infoframe_pack(&dv, buf, sizeof(buf));
++	KUNIT_ASSERT_EQ(test, len, 31);
++	KUNIT_EXPECT_EQ(test, buf[7], 0x03);
++	KUNIT_ASSERT_EQ(test, hdmi_infoframe_unpack(&back, buf, len), 0);
++	KUNIT_EXPECT_TRUE(test, back.vendor.dolby.low_latency);
++}
++
++static void drm_test_dvbridge_avi(struct kunit *test)
++{
++	struct hdmi_avi_infoframe avi;
++	u8 buf[HDMI_INFOFRAME_SIZE(AVI)];
++	ssize_t len;
++
++	hdmi_avi_infoframe_init(&avi);
++	avi.colorspace = HDMI_COLORSPACE_YUV444;	/* what the tunnel replaces */
++	avi.colorimetry = HDMI_COLORIMETRY_ITU_709;
++	avi.quantization_range = HDMI_QUANTIZATION_RANGE_LIMITED;
++	drm_dvbridge_tunnel_avi(&avi, 93);
++	len = hdmi_avi_infoframe_pack(&avi, buf, sizeof(buf));
++	KUNIT_ASSERT_GT(test, len, 7);
++	KUNIT_EXPECT_EQ(test, buf[0], 0x82);
++	KUNIT_EXPECT_EQ(test, (buf[4] >> 5) & 3, HDMI_COLORSPACE_RGB);	/* Y */
++	KUNIT_EXPECT_EQ(test, buf[5] >> 6, HDMI_COLORIMETRY_NONE);		/* C */
++	KUNIT_EXPECT_EQ(test, (buf[6] >> 4) & 7, 0);				/* EC */
++	KUNIT_EXPECT_EQ(test, (buf[6] >> 2) & 3, HDMI_QUANTIZATION_RANGE_FULL);	/* Q */
++	KUNIT_EXPECT_EQ(test, buf[7], 93);					/* VIC */
++
++	/* Low-Latency: YCbCr 4:2:2, BT.2020, the default RGB range, limited YCC range */
++	drm_dvbridge_ll_avi(&avi);
++	len = hdmi_avi_infoframe_pack(&avi, buf, sizeof(buf));
++	KUNIT_ASSERT_GT(test, len, 7);
++	KUNIT_EXPECT_EQ(test, (buf[4] >> 5) & 3, HDMI_COLORSPACE_YUV422);
++	KUNIT_EXPECT_EQ(test, buf[5] >> 6, HDMI_COLORIMETRY_EXTENDED);
++	KUNIT_EXPECT_EQ(test, (buf[6] >> 4) & 7, HDMI_EXTENDED_COLORIMETRY_BT2020);
++	KUNIT_EXPECT_EQ(test, (buf[6] >> 2) & 3, HDMI_QUANTIZATION_RANGE_DEFAULT);
++	KUNIT_EXPECT_EQ(test, buf[7], 93);
++}
++
++static void drm_test_dvbridge_vic(struct kunit *test)
++{
++	static const u8 taken[] = {16, 31, 32, 33, 34, 93, 94, 95, 96, 97};
++	unsigned int v, n = 0, i;
++
++	for (v = 0; v < 256; v++) {
++		bool in = false;
++
++		for (i = 0; i < ARRAY_SIZE(taken); i++)
++			in |= taken[i] == v;
++		KUNIT_EXPECT_EQ_MSG(test, drm_dvbridge_avi_vic(v), in ? v : 0, "VIC %u", v);
++		KUNIT_EXPECT_EQ_MSG(test, drm_dvbridge_vic_needs_p60(v), v == 96 || v == 97, "VIC %u", v);
++		n += in;
++	}
++	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(taken));
++}
++
++static void drm_test_dvbridge_edid(struct kunit *test)
++{
++	struct drm_dvbridge_sink s;
++	u8 e[384];
++
++	/* one CTA block: the Dolby block and QS */
++	dvb_edid(e, 2, 1);
++	dvb_db(e, 1, dvb_vcdb_qs, sizeof(dvb_vcdb_qs));
++	dvb_db(e, 1, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_EQ(test, s.result, DRM_DVBRIDGE_EDID_TAKEN);
++	KUNIT_EXPECT_TRUE(test, s.standard && s.low_latency && s.p60 && s.qs);
++	KUNIT_EXPECT_TRUE(test, drm_dvbridge_sink_takes(&s, false));
++	KUNIT_EXPECT_TRUE(test, drm_dvbridge_sink_takes(&s, true));
++	KUNIT_EXPECT_NULL(test, drm_dvbridge_sink_takes_why(&s, false));
++
++	/* without QS: Low-Latency only (its AVI InfoFrame says the default range) */
++	dvb_edid(e, 2, 1);
++	dvb_db(e, 1, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_TRUE(test, s.standard && !s.qs);
++	KUNIT_EXPECT_FALSE(test, drm_dvbridge_sink_takes(&s, false));
++	KUNIT_EXPECT_TRUE(test, drm_dvbridge_sink_takes(&s, true));
++	KUNIT_EXPECT_NOT_NULL(test, drm_dvbridge_sink_takes_why(&s, false));
++	KUNIT_EXPECT_NULL(test, drm_dvbridge_sink_why(&s, false));
++
++	/* interface 0: Low-Latency only */
++	dvb_edid(e, 2, 1);
++	dvb_db(e, 1, dvb_vcdb_qs, sizeof(dvb_vcdb_qs));
++	dvb_db(e, 1, dvb_vsvdb_v2_ll, sizeof(dvb_vsvdb_v2_ll));
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_TRUE(test, !s.standard && s.low_latency);
++	KUNIT_EXPECT_STREQ(test, drm_dvbridge_sink_why(&s, false),
++			   "the Dolby Vision block has no Standard interface (Low-Latency only)");
++
++	/* two Dolby blocks: neither */
++	dvb_edid(e, 2, 1);
++	dvb_db(e, 1, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	dvb_db(e, 1, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_EQ(test, s.result, DRM_DVBRIDGE_EDID_SEVERAL);
++	KUNIT_EXPECT_FALSE(test, s.standard || s.low_latency);
++
++	/*
++	 * an HDMI Forum EEODB that counts 2 extensions where the base block counts 1, with the Dolby
++	 * block in the second one: taken from the whole EDID, not from the first 256 bytes
++	 */
++	dvb_edid(e, 3, 1);
++	{
++		static const u8 eeodb[3] = {0xe2, 0x78, 2};
++
++		dvb_db(e, 1, eeodb, sizeof(eeodb));
++	}
++	dvb_db(e, 1, dvb_vcdb_qs, sizeof(dvb_vcdb_qs));
++	dvb_db(e, 2, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	drm_dvbridge_edid_read(e, 384, &s);
++	KUNIT_EXPECT_EQ(test, s.result, DRM_DVBRIDGE_EDID_TAKEN);
++	KUNIT_EXPECT_TRUE(test, drm_dvbridge_sink_takes(&s, false));
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_EQ(test, s.result, DRM_DVBRIDGE_EDID_NO_BLOCK);
++
++	/* no EDID; and a checksum wrong */
++	drm_dvbridge_edid_read(NULL, 0, &s);
++	KUNIT_EXPECT_STREQ(test, drm_dvbridge_sink_why(&s, false), "no EDID");
++	dvb_edid(e, 2, 1);
++	dvb_db(e, 1, dvb_vsvdb_v2, sizeof(dvb_vsvdb_v2));
++	e[200] ^= 1;
++	drm_dvbridge_edid_read(e, 256, &s);
++	KUNIT_EXPECT_EQ(test, s.result, DRM_DVBRIDGE_EDID_CHECKSUM);
++}
++
++static struct kunit_case drm_dvbridge_tests[] = {
++	KUNIT_CASE(drm_test_dvbridge_vsif),
++	KUNIT_CASE(drm_test_dvbridge_avi),
++	KUNIT_CASE(drm_test_dvbridge_vic),
++	KUNIT_CASE(drm_test_dvbridge_edid),
++	{}
++};
++
++static struct kunit_suite drm_dvbridge_test_suite = {
++	.name = "drm_dvbridge",
++	.test_cases = drm_dvbridge_tests,
++};
++
++kunit_test_suite(drm_dvbridge_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests of the policy of the Dolby Vision tunnel (Hades)");
++MODULE_LICENSE("Dual MIT/GPL");
++
+-- 
+2.53.0
+

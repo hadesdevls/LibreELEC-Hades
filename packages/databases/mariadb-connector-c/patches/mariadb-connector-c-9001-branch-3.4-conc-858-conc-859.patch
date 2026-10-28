@@ -1,0 +1,267 @@
+From bc5cab7407d8736ab806dd31576aeb5982968f6c Mon Sep 17 00:00:00 2001
+From: Georg Richter <georg@mariadb.com>
+Date: Wed, 14 Oct 2026 18:09:25 +0200
+Subject: [PATCH 1/5] Branch 3.4 after 3.4.11: Merge branch '3.3' into 3.4
+ (CONC-858, CONC-859)
+
+The change that merge commit ae4495ef07c3bcf57641b977efc10e5f6fc70666 of the 3.4 branch of
+https://github.com/mariadb-corporation/mariadb-connector-c brought,
+taken as it landed on that branch (the diff against its first parent).
+The commits it merges, with their own messages:
+
+----- 71fa0c818711ac29144f0a3fe1b671baa4106e3e
+Author: Daniel Bartholomew <db@dbart.us>
+Date:   Tue, 29 Sep 2026 12:10:28 -0400
+
+bump the VERSION
+
+----- 729008b7981361a9ec9e84cfab46fa5fc10b59b1
+Author: Georg Richter <georg@mariadb.com>
+Date:   Sun, 11 Oct 2026 21:23:46 +0200
+
+CONC-858: Fix integer overflows when decoding dynamic columns
+
+Malformed dynamic column data could make the decoders shift a 64-bit
+value by 64 or more bits (undefined behavior) or read integer data
+wider than 8 bytes into a ulonglong.
+
+- dynamic_column_var_uint_get(): stop after 10 groups of 7 bits, since
+  that is the most a 64-bit value can need. Longer sequences now fall
+  through to the existing error path (*len= 0).
+- dynamic_column_uint_read(): return ER_DYNCOL_FORMAT if the stored
+  length is greater than 8 bytes.
+- dynamic_column_sint_read(): propagate the error from
+  dynamic_column_uint_read() instead of ignoring it and then using a
+  value that was never set.
+
+Add test_int_overflow, which builds a signed and an unsigned integer
+column, widens its data past 8 bytes, and checks that
+mariadb_dyncol_get_num() returns ER_DYNCOL_FORMAT.
+
+----- 62cb5c1d3e8d57135bf4d5a9734a926625da8fc5
+Author: Georg Richter <georg@mariadb.com>
+Date:   Sun, 11 Oct 2026 21:33:12 +0200
+
+CONC-859: Fix out-of-bounds heap read in get_compression_info()
+
+get_compression_info() previously parsed the uncompressed length field
+from event buffers without checking if sufficient bytes remained relative
+to the end of the buffer (ev_end). If a compressed rows event contained
+a row-data payload shorter than the header size, reading via myisam_*korr
+resulted in a heap-buffer-overflow READ before caller-side validation ran.
+
+Fix this by passing buf_end into get_compression_info() and verifying that
+the buffer contains at least (1 + header_size) bytes before attempting
+to read the uncompressed length field.
+---
+ libmariadb/mariadb_dyncol.c  | 11 ++++++--
+ libmariadb/mariadb_rpl.c     | 41 +++++++++++++++++-----------
+ unittest/libmariadb/dyncol.c | 52 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 18 deletions(-)
+
+diff --git a/libmariadb/mariadb_dyncol.c b/libmariadb/mariadb_dyncol.c
+index 92d5b0e..421bab7 100644
+--- a/libmariadb/mariadb_dyncol.c
++++ b/libmariadb/mariadb_dyncol.c
+@@ -789,7 +789,8 @@ dynamic_column_var_uint_get(uchar *data, size_t data_length,
+   uint length;
+   uchar *end= data + data_length;
+ 
+-  for (length=0; data < end ; data++)
++  /* A 64-bit value needs ceil(64/7) = 10 groups of 7 bits */
++  for (length=0; data < end && length < 10; data++)
+   {
+     val+= (((ulonglong)((*data) & 0x7f)) << (length * 7));
+     length++;
+@@ -862,6 +863,10 @@ dynamic_column_uint_read(DYNAMIC_COLUMN_VALUE *store_it_here,
+   ulonglong value= 0;
+   size_t i;
+ 
++  /* make sure length fits into 64-bit */
++  if (length > 8)
++    return ER_DYNCOL_FORMAT;
++
+   for (i= 0; i < length; i++)
+     value+= ((ulonglong)data[i]) << (i*8);
+ 
+@@ -922,8 +927,10 @@ static enum enum_dyncol_func_result
+ dynamic_column_sint_read(DYNAMIC_COLUMN_VALUE *store_it_here,
+                          uchar *data, size_t length)
+ {
++  enum enum_dyncol_func_result rc;
+   ulonglong val;
+-  dynamic_column_uint_read(store_it_here, data, length);
++  if ((rc= dynamic_column_uint_read(store_it_here, data, length)))
++    return rc;
+   val= store_it_here->x.ulong_value;
+   if (val & 1)
+     val= (val >> 1) ^ 0xffffffffffffffffULL;
+diff --git a/libmariadb/mariadb_rpl.c b/libmariadb/mariadb_rpl.c
+index 803eca1..ab78dba 100644
+--- a/libmariadb/mariadb_rpl.c
++++ b/libmariadb/mariadb_rpl.c
+@@ -1248,29 +1248,38 @@ static int ma_set_rpl_filename(MARIADB_RPL *rpl, const unsigned char *filename,
+  *      1  header size  uncompressed length in MyISAM format.
+  */
+ static uint32_t get_compression_info(const unsigned char *buf,
++                                     const unsigned char *buf_end,
+                                      uint8_t *algorithm,
+                                      uint8_t *header_size)
+ {
+   uint8_t alg, header;
+-  uint32 len= 0;
++  uint32_t len = 0;
+ 
+   if (!algorithm)
+-    algorithm= &alg;
++    algorithm = &alg;
+   if (!header_size)
+-    header_size= &header;
++    header_size = &header;
+ 
+-  *header_size= 0;
+-  *algorithm= 0;
++  *header_size = 0;
++  *algorithm = 0;
+ 
+-  if (!buf)
+-    return len;
++  /* Check that we have at least 1 byte for the header marker */
++  if (!buf || !buf_end || buf >= buf_end)
++    return 0;
+ 
+   if ((buf[0] & 0xe0) != 0x80)
+-    return len;
++    return 0;
+ 
+-  *header_size= buf[0] & 0x07;
++  *header_size = buf[0] & 0x07;
+   *algorithm = (buf[0] & 0x07) >> 4;
+ 
++  /* Verify that the payload contains the full declared header size */
++  if ((size_t)(buf_end - buf) <= (size_t)*header_size)
++  {
++    *header_size = 0;
++    return 0;
++  }
++
+   buf++;
+ 
+   /* Attention: we can't use uint*korr, here, we need myisam macros since
+@@ -1278,19 +1287,19 @@ static uint32_t get_compression_info(const unsigned char *buf,
+    */
+   switch(*header_size) {
+   case 1:
+-    len= *buf;
++    len = *buf;
+     break;
+   case 2:
+-    len= myisam_uint2korr(buf);
++    len = myisam_uint2korr(buf);
+     break;
+   case 3:
+-    len= myisam_uint3korr(buf);
++    len = myisam_uint3korr(buf);
+     break;
+   case 4:
+-    len= myisam_uint4korr(buf);
++    len = myisam_uint4korr(buf);
+     break;
+   default:
+-    len= 0;
++    len = 0;
+     break;
+   }
+ 
+@@ -1875,7 +1884,7 @@ MARIADB_RPL_EVENT * STDCALL mariadb_rpl_fetch(MARIADB_RPL *rpl, MARIADB_RPL_EVEN
+                 algorithm= 0;
+         uLongf source_len, dest_len;
+ 
+-        uint32_t uncompressed_len= get_compression_info(ev, &algorithm, &header_size);
++        uint32_t uncompressed_len= get_compression_info(ev, ev_end, &algorithm, &header_size);
+ 
+         if (header_size >= len || len < header_size ||
+             uncompressed_len == 0 ||
+@@ -2570,7 +2579,7 @@ MARIADB_RPL_EVENT * STDCALL mariadb_rpl_fetch(MARIADB_RPL *rpl, MARIADB_RPL_EVEN
+         uint8_t algorithm= 0, header_size= 0;
+         uLongf source_len;
+         uLong dest_len;
+-        uint32_t uncompressed_len= get_compression_info(ev, &algorithm, &header_size);
++        uint32_t uncompressed_len= get_compression_info(ev, ev_end, &algorithm, &header_size);
+ 
+         if (header_size >= (ev_end - ev) ||
+             uncompressed_len == 0 ||
+diff --git a/unittest/libmariadb/dyncol.c b/unittest/libmariadb/dyncol.c
+index 8c709f5..521b741 100644
+--- a/unittest/libmariadb/dyncol.c
++++ b/unittest/libmariadb/dyncol.c
+@@ -313,6 +313,7 @@ static int test_conc844(MYSQL *mysql __attribute__((unused)))
+     0xFF, 0x0F              /* nmpool_size = 4095 bytes (exceeds actual blob length) */
+   };
+ 
++
+   memset(&str, 0, sizeof(str));
+   str.str = (char *)corrupted_blob;
+   str.length = sizeof(corrupted_blob); /* Total buffer length is only 5 bytes */
+@@ -327,7 +328,58 @@ static int test_conc844(MYSQL *mysql __attribute__((unused)))
+   return OK;
+ }
+ 
++static int test_int_overflow(MYSQL *mysql __attribute__((unused)))
++{
++  DYNAMIC_COLUMN str;
++  DYNAMIC_COLUMN bad;
++  DYNAMIC_COLUMN_VALUE val, res;
++  uint column_nr= 1;
++  DYNAMIC_COLUMN_TYPE type[2]= {DYN_COL_INT, DYN_COL_UINT};
++  int rc, i;
++
++  for (i=0; i < 2; i++) {
++    val.type= type[i];
++    if (i)
++      val.x.ulong_value= 1;
++    else
++      val.x.long_value= 1;
++
++    rc= mariadb_dyncol_create_many_num(&str, 1, &column_nr, &val, 1);
++    if (rc != ER_DYNCOL_OK) {
++      diag("failed to create_many_num");
++      return FAIL;
++    }
++
++    /* widen the single column's data interval past 8 bytes */
++    bad.length= str.length + 12;
++    bad.max_length= bad.length;
++    bad.alloc_increment= 0;
++    if (!(bad.str= (char *) malloc(bad.length))) {
++      diag("out of memory");
++      mariadb_dyncol_free(&str);
++      return FAIL;
++    }
++    memcpy(bad.str, str.str, str.length);
++    memset(bad.str + str.length, 0, 12);
++
++    rc= mariadb_dyncol_get_num(&bad, column_nr, &res);
++    if (rc != ER_DYNCOL_FORMAT) {
++      free(bad.str);
++      mariadb_dyncol_free(&str);
++      diag("Format error expected");
++      return FAIL;
++    }
++
++    free(bad.str);
++    mariadb_dyncol_free(&str);
++  }
++
++  return OK;
++}
++
++
+ struct my_tests_st my_tests[] = {
++  {"test_int_overflow", test_int_overflow, TEST_CONNECTION_NEW, 0, NULL, NULL}, 
+   {"test_conc844", test_conc844, TEST_CONNECTION_NEW, 0, NULL, NULL}, 
+   {"mdev_x1", mdev_x1, TEST_CONNECTION_NEW, 0, NULL, NULL}, 
+   {"mdev_4994", mdev_4994, TEST_CONNECTION_NEW, 0, NULL, NULL}, 
+-- 
+2.53.0
+

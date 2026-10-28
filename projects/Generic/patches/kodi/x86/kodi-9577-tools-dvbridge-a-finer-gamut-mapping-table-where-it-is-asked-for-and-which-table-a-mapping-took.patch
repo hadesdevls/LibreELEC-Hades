@@ -1,0 +1,343 @@
+From cfb6bb35fc76a04ac9b0f19f61611bc4161f9e87 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:10:24 +0000
+Subject: [PATCH] tools/dvbridge: a finer gamut mapping table where it is asked
+ for, and which table a mapping took
+
+A picture mapped to the display or to SDR (Dolby Vision or HDR10 on an SDR
+output, Dolby Vision as HDR10 mapped to the display, Low-Latency) has its
+colours outside the display's gamut mapped through libplacebo's table, of
+96x64x512 entries here. Measured on Mesa's software OpenGL ES against a
+table of 384x256x1024 (itself within 0.05 and 0.08 Delta E ITP of the
+mapping computed exactly at 99.9 % on plain PQ and HLG charts), in ten
+mappings that read the table, its error is 0.52 to 0.95 Delta E ITP at
+99.9 % of the pixels and 0.61 to 1.27 at most.
+
+dvbridge_render_set_gamut_table() asks a renderer for a finer table,
+256x192x512 (192 MiB instead of 24 MiB, 310 ms instead of 44 to make on 32
+threads, once for a video): 0.08 to 0.30 at 99.9 % and 0.14 to 0.55 at
+most in the same mappings. That size is what the measurement chose among
+eleven: a table finer in hue as well (192x128x1024, the same memory) is
+farther (0.13 to 0.40, 0.23 to 0.55) and as far as 192x128x512, of half
+the memory; less hue does harm (192x128x256), more intensity alone does
+not help (192x64x512); libplacebo's tricubic lookup is farther from the
+exact mapping than the trilinear one (1.08 instead of 0.67 at 99.9 % on
+the PQ chart) and a tetrahedral one has larger errors at the edges.
+
+Fail closed: a render with the finer table that fails is made again at
+once with the standard one; where that one draws, the finer one is noted
+as not made and not tried again until it is asked for again (where it
+does not, the table was not why, and nothing is noted). This needs
+libplacebo-9951: without it, libplacebo kept the gamut table failed
+after going back to the standard one. dvbridge_render_gamut_table() says
+which table the last mapping took, its size, its format (libplacebo-9950:
+16-bit unorm, else 32-bit or 16-bit floats; none: the saturation mapping)
+and its memory. The reference renderer of <dvverify> takes the table of
+the renderer it checks: it changes the picture on purpose.
+
+Off, which is how a renderer is made, nothing changes, to the bit
+(measured: sixteen pictures of hdrsdr_test, p5sdr_test and fidbench, as
+they are, to SDR and to a projector, and the 157 drawing lines of the
+bridge's render test). A host test of its own (gamut_table_test, from
+hdrsdr_test): the standard and the finer table as reported and to the bit
+again when asked for again; a finer table beyond the largest 3D texture of
+the GPU drawn with the standard one, frame after frame, and tried again
+when asked for again; it fails with the bridge before this change and with
+four mutations of it.
+---
+ tools/dvbridge/dvbridge_render.c | 166 +++++++++++++++++++++++++++++--
+ tools/dvbridge/dvbridge_render.h |  26 +++++
+ 2 files changed, 182 insertions(+), 10 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 0db36e5..aff64f0 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -113,6 +113,11 @@ struct dvbridge_renderer {
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+     struct dvbridge_hdr10_mapping ll_mapping;
++    /* Hades: the table of the gamut mapping (dvbridge_render_set_gamut_table()): asked for, whether the
++     * finer one failed, and what the last render that mapped a picture took (gamut_last) */
++    int gamut_asked;
++    bool gamut_fine_failed, gamut_mapped;
++    struct dvbridge_gamut_table gamut_last;
+     /* Hades: the GPU time of each pass (dvbridge_render_time_passes()): passtime while it is on; the
+      * bridge's own passes timed where the GL has the timer queries (gl_timers) */
+     struct dvbridge_passtime *passtime;
+@@ -346,8 +351,12 @@ static struct pl_hook_res mask_active_area(void *priv, const struct pl_hook_para
+ }
+ 
+ static struct dvbridge_renderer *create_renderer(pl_gpu gpu, pl_log log, bool transport);
+-static void map_to_display(const struct dvbridge_hdr10_mapping *m, struct pl_color_space *source,
+-                           struct pl_color_space *target, struct pl_color_map_params *params);
++static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                           struct pl_color_space *source, struct pl_color_space *target,
++                           struct pl_color_map_params *params);
++static bool fine_gamut_table(const struct dvbridge_renderer *r, bool ll);
++static bool gamut_table_retry(struct dvbridge_renderer *r, bool fine, bool ok);
++static void gamut_table_kept(struct dvbridge_renderer *r, bool ok);
+ 
+ struct dvbridge_renderer *dvbridge_renderer_create(pl_gpu gpu, pl_log log)
+ {
+@@ -1032,7 +1041,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+      * same mapping) and within its peak; the test pattern covers the raster, bars too */
+     struct pl_color_map_params ll_color;
+     if (r->low_latency) {
+-        map_to_display(&r->ll_mapping, &image.color, &target.color, &ll_color);
++        map_to_display(r, &r->ll_mapping, &image.color, &target.color, &ll_color);
+         params.color_map_params = &ll_color;
+         mask.low_latency = true;
+         mask.peak = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->ll_mapping.peak);
+@@ -1142,7 +1151,13 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+         ;
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
++    const bool fine = r && fine_gamut_table(r, true);
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++    /* Hades: with the standard gamut table where the finer one could not be made */
++    if (r && gamut_table_retry(r, fine, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++        gamut_table_kept(r, ok);
++    }
+     restore_gl_state(&state);
+     /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
+     if (r)
+@@ -1179,7 +1194,13 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+         ;
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
++    const bool fine = fine_gamut_table(r, true);
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
++    /* Hades: with the standard gamut table where the finer one could not be made */
++    if (gamut_table_retry(r, fine, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
++        gamut_table_kept(r, ok);
++    }
+     ok = glGetError() == GL_NO_ERROR && ok;
+     restore_gl_state(&state);
+     r->ready = ok && glGetError() == GL_NO_ERROR;
+@@ -1265,8 +1286,68 @@ bool dvbridge_render_hdr10_mapping(struct dvbridge_renderer *r,
+  * picture there instead: BT.709, the BT.1886 EOTF with its white at the peak, black at zero
+  * (the same "infinite contrast": BT.1886 is then a pure 2.4 power). The same curve and gamut
+  * mapping take the picture into it. */
+-static void map_to_display(const struct dvbridge_hdr10_mapping *m, struct pl_color_space *source,
+-                           struct pl_color_space *target, struct pl_color_map_params *params)
++/* Hades: the sizes of the gamut mapping table (map_to_display()): the standard one, and the finer one
++ * (dvbridge_render_set_gamut_table()), finer in intensity and in chroma, not in hue. Measured on Mesa's
++ * software OpenGL ES against a table of 384x256x1024 entries (at 99.9 % of the pixels within 0.05 and
++ * 0.08 Delta E ITP of the mapping computed exactly, on plain HDR10 and HLG charts), in ten mappings that
++ * read the table (four pictures of a profile 7 FEL stream to SDR, three of profile 5 to a projector of
++ * 150 cd/m2 and one to SDR, the two charts to SDR): 99.9 % of the pixels within 0.08 to 0.30 of it
++ * instead of 0.52 to 0.95, the largest error 0.14 to 0.55 instead of 0.61 to 1.27. Of the same memory,
++ * a table finer in hue as well (192x128x1024) is farther: 0.13 to 0.40, and 0.23 to 0.55; half of it
++ * (192x128x512) is as far as that one. Finer in hue does not help (512 entries are enough), less hue
++ * does harm (192x128x256: farther than 192x128x512 in seven of the ten), finer in intensity alone
++ * (192x64x512) leaves it about as far as the standard one. Libplacebo's tricubic lookup is farther from
++ * the exact mapping than the trilinear one (it smooths the folds of the mapping: 1.08 instead of 0.67
++ * at 99.9 % on the PQ chart), and a tetrahedral one has larger errors at the edges (largest 1.59 instead
++ * of 1.27). The finer table is 192 MiB (the standard one 24 MiB), and takes 310 ms to make on the 32
++ * threads of the build machine (44 ms), 5.2 s on one of them (0.6 s), once for a video. */
++static const int GAMUT_STANDARD[3] = {96, 64, 512};
++static const int GAMUT_FINE[3] = {256, 192, 512};
++
++/* Hades: the format libplacebo keeps the gamut mapping table in (libplacebo-9950, gamut_lut_fmt():
++ * the first of these that the GPU filters linearly), and its bytes a texel; NULL without any of
++ * them: libplacebo then maps the gamut by saturation, with no table */
++static const char *gamut_table_format(pl_gpu gpu, unsigned *texel)
++{
++    static const struct {
++        enum pl_fmt_type type;
++        int depth;
++        const char *name;
++    } formats[] = {{PL_FMT_UNORM, 16, "rgba16"}, {PL_FMT_FLOAT, 32, "rgba32f"},
++                   {PL_FMT_FLOAT, 16, "rgba16f"}};
++    for (unsigned i = 0; i < sizeof(formats) / sizeof(*formats); ++i) {
++        pl_fmt fmt = pl_find_fmt(gpu, formats[i].type, 4, formats[i].depth, formats[i].depth,
++                                 PL_FMT_CAP_LINEAR);
++        if (fmt) {
++            *texel = (unsigned)fmt->texel_size;
++            return formats[i].name;
++        }
++    }
++    *texel = 0;
++    return NULL;
++}
++
++/* Hades: the table that the next mapping takes, noted as the last one taken */
++static const int *gamut_table_size(struct dvbridge_renderer *r)
++{
++    const bool fine = r->gamut_asked == DVBRIDGE_GAMUT_TABLE_FINE && !r->gamut_fine_failed;
++    const int *size = fine ? GAMUT_FINE : GAMUT_STANDARD;
++    unsigned texel = 0;
++    r->gamut_last = (struct dvbridge_gamut_table){
++        .asked = r->gamut_asked,
++        .used = fine ? DVBRIDGE_GAMUT_TABLE_FINE : DVBRIDGE_GAMUT_TABLE_STANDARD,
++        .fine_failed = r->gamut_fine_failed,
++        .size = {size[0], size[1], size[2]},
++        .format = gamut_table_format(r->gpu, &texel),
++    };
++    r->gamut_last.bytes = r->gamut_last.format ? (unsigned long long)size[0] * size[1] * size[2] * texel : 0;
++    r->gamut_mapped = true;
++    return size;
++}
++
++static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                           struct pl_color_space *source, struct pl_color_space *target,
++                           struct pl_color_map_params *params)
+ {
+     if (m->source_known)
+         source->hdr.prim = (struct pl_raw_primaries){
+@@ -1302,10 +1383,59 @@ static void map_to_display(const struct dvbridge_hdr10_mapping *m, struct pl_col
+      * profile 5 chart mapped to SDR differed by at most 2.2 Delta E ITP (99.9 %: 1.3); now 1.1
+      * (0.5). The table is 24 MB instead of 3, is made once for a video (on one core of the build
+      * machine, 0.6 s instead of 0.08 s; its work is spread over the cores there is), and a picture
+-     * costs as much to draw as with the smaller one. */
+-    params->lut3d_size[0] = 96;
+-    params->lut3d_size[1] = 64;
+-    params->lut3d_size[2] = 512;
++     * costs as much to draw as with the smaller one. (Hades: GAMUT_STANDARD; the finer one where it
++     * is asked for, gamut_table_size().) */
++    const int *size = gamut_table_size(r);
++    params->lut3d_size[0] = size[0];
++    params->lut3d_size[1] = size[1];
++    params->lut3d_size[2] = size[2];
++}
++
++/* Hades: the render about to be made maps a picture with the finer gamut table: Low-Latency (ll) or
++ * a mapping of the picture for output as HDR10 */
++static bool fine_gamut_table(const struct dvbridge_renderer *r, bool ll)
++{
++    return r->gamut_asked == DVBRIDGE_GAMUT_TABLE_FINE && !r->gamut_fine_failed &&
++           (ll ? r->low_latency : r->hdr10_mapping.enabled);
++}
++
++/* Hades: after a render with the finer gamut table that failed: whether to make it again with the
++ * standard one (the finer one is noted as failed, and the errors that libplacebo keeps reset). The
++ * caller makes it again; if that fails as well, the table was not why (gamut_table_kept()). */
++static bool gamut_table_retry(struct dvbridge_renderer *r, bool fine, bool ok)
++{
++    if (ok || !fine)
++        return false;
++    r->gamut_fine_failed = true;
++    pl_renderer_reset_errors(r->renderer, NULL);
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++    return true;
++}
++
++static void gamut_table_kept(struct dvbridge_renderer *r, bool ok)
++{
++    if (!ok)
++        r->gamut_fine_failed = false;
++}
++
++void dvbridge_render_set_gamut_table(struct dvbridge_renderer *r, int table)
++{
++    if (!r)
++        return;
++    const int asked = table == DVBRIDGE_GAMUT_TABLE_FINE ? DVBRIDGE_GAMUT_TABLE_FINE
++                                                         : DVBRIDGE_GAMUT_TABLE_STANDARD;
++    if (asked != r->gamut_asked)
++        r->gamut_fine_failed = false;
++    r->gamut_asked = asked;
++}
++
++bool dvbridge_render_gamut_table(const struct dvbridge_renderer *r, struct dvbridge_gamut_table *table)
++{
++    if (!r || !table || !r->gamut_mapped)
++        return false;
++    *table = r->gamut_last;
++    return true;
+ }
+ 
+ /* Hades: a texture of the picture for output as HDR10, of that size (made again when it is of another) */
+@@ -1459,7 +1589,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     const bool peak_hook =
+         r->hdr10_mapping.enabled && r->hdr10_mapping.target != DVBRIDGE_HDR10_TARGET_SDR;
+     if (r->hdr10_mapping.enabled) {
+-        map_to_display(&r->hdr10_mapping, &image.color, &target.color, &mapping);
++        map_to_display(r, &r->hdr10_mapping, &image.color, &target.color, &mapping);
+         params.color_map_params = &mapping;
+     }
+     if (peak_hook) {
+@@ -1502,8 +1632,15 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *s
+         ;
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
++    const bool fine = fine_gamut_table(r, false);
+     r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
+                                   NULL);
++    /* Hades: with the standard gamut table where the finer one could not be made */
++    if (gamut_table_retry(r, fine, r->hdr10_ready)) {
++        r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
++                                      NULL);
++        gamut_table_kept(r, r->hdr10_ready);
++    }
+     restore_gl_state(&state);
+     return r->hdr10_ready;
+ }
+@@ -1521,7 +1658,13 @@ bool dvbridge_render_plain(struct dvbridge_renderer *r, const struct pl_frame *s
+         ;
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
++    const bool fine = fine_gamut_table(r, false);
+     r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
++    /* Hades: with the standard gamut table where the finer one could not be made */
++    if (gamut_table_retry(r, fine, r->hdr10_ready)) {
++        r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
++        gamut_table_kept(r, r->hdr10_ready);
++    }
+     restore_gl_state(&state);
+     return r->hdr10_ready;
+ }
+@@ -1666,6 +1809,9 @@ bool dvbridge_render_reference(struct dvbridge_renderer *ref, const struct dvbri
+     ref->low_latency = main->low_latency;
+     ref->ll_pattern = main->ll_pattern;
+     ref->ll_mapping = main->ll_mapping;
++    /* (and the gamut table of its mapping, which changes the picture on purpose) */
++    ref->gamut_asked = main->gamut_asked;
++    ref->gamut_fine_failed = main->gamut_fine_failed;
+     for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
+         ;
+     struct dvbridge_gl_state state;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 1494083..4e5e1d0 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -138,6 +138,32 @@ bool dvbridge_render_hdr10_mapping(struct dvbridge_renderer *renderer,
+  * BT.2020. Nothing else of a render changes (the step-down levels, the composer, the bars written
+  * first). NULL turns it off, the default; a mapping that is not valid, off or not to HDR10 is not
+  * taken: it turns it off, and the call returns false. The renderer keeps it through resets. */
++/* Hades: the table of the gamut mapping that libplacebo makes for a picture mapped to a display or to
++ * SDR (dvbridge_render_hdr10_mapping(), dvbridge_render_set_low_latency()): the standard one
++ * (DVBRIDGE_GAMUT_TABLE_STANDARD, the default), or the finer one (DVBRIDGE_GAMUT_TABLE_FINE), which
++ * is closer to the mapping computed exactly and takes eight times the memory of the GPU. A renderer
++ * whose render with the finer one fails, where it does not with the standard one, uses the standard
++ * one from then on: dvbridge_render_gamut_table() says which one the last mapping took, of what size
++ * and in what format (libplacebo-9950: 16-bit unorm, else 32-bit or 16-bit floats; where the GPU
++ * filters none of them, libplacebo maps the gamut by saturation and there is no table). */
++#define DVBRIDGE_RENDER_GAMUT_TABLE 1
++enum dvbridge_gamut_table_size {
++    DVBRIDGE_GAMUT_TABLE_STANDARD = 0,
++    DVBRIDGE_GAMUT_TABLE_FINE = 1,
++};
++void dvbridge_render_set_gamut_table(struct dvbridge_renderer *renderer, int table);
++struct dvbridge_gamut_table {
++    int asked;              /* DVBRIDGE_GAMUT_TABLE_* */
++    int used;               /* the one the mapping took */
++    bool fine_failed;       /* the finer one was asked for and could not be made */
++    int size[3];            /* of intensity, chroma and hue */
++    const char *format;     /* "rgba16", "rgba32f", "rgba16f"; NULL: no table, the saturation mapping */
++    unsigned long long bytes; /* of the table on the GPU */
++};
++/* false before a render of this renderer mapped a picture */
++bool dvbridge_render_gamut_table(const struct dvbridge_renderer *renderer,
++                                 struct dvbridge_gamut_table *table);
++
+ #define DVBRIDGE_RENDER_LOW_LATENCY 1
+ bool dvbridge_render_set_low_latency(struct dvbridge_renderer *renderer,
+                                      const struct dvbridge_hdr10_mapping *mapping);
+-- 
+2.53.0
+

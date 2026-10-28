@@ -9,8 +9,9 @@
 #     Left as they are: 0.0.0.0/8, loopback, multicast, 240/4 and 255.x (netmasks, broadcast), and a few
 #     public resolvers (they tell which DNS is set, and nobody by it).
 #   - IPv6 addresses likewise (the first part for the /64 network), but ::, ::1 and multicast.
-#   - MAC and Bluetooth addresses (also in the names connman gives its services), but all-zero, broadcast
-#     and group addresses.
+#   - MAC and Bluetooth addresses (also in the names connman gives its services, and in the names BlueZ gives
+#     its devices, dev_AA_BB_CC_DD_EE_FF), but all-zero, broadcast and the group addresses of IPv4 and IPv6
+#     multicast and of IEEE 802.1 (01:00:5e, 33:33, 01:80:c2).
 #   - UUIDs (partitions, the graphics card), and the serial numbers of FAT and NTFS volumes where a UUID
 #     goes; the Bluetooth base UUIDs stay (they name profiles, not devices).
 #   - Serial numbers that hardware reports (displays, graphics cards, USB devices), the GPU PDI of NVIDIA,
@@ -19,12 +20,20 @@
 #   - Network names (SSID) as iwd, connman and wpa_supplicant write them.
 #   - Names of computers of the home network in addresses (no dot, or .local, .lan, .home and the like),
 #     and the name of this system (HOST) wherever it stands as a word.
+#   - The names of the Bluetooth devices that BlueZ keeps (NAMES), [bt-name-...]: macOS names the keyboard of
+#     a Mac "Magic Keyboard de Juan", and the kernel, systemd-logind and Kodi write that name in their logs.
+#     Each is found by its bytes, never as a regular expression, as a word of its own, the longest first. One
+#     that would take ordinary words of the logs with it (shorter than 6 bytes, or one word of the letters A to
+#     Z alone, such as "TV", "K" or "Keyboard"), or that a marker could hold, is taken only where a line names
+#     an input device (btctx()).
 # What stays, because it says what the machine is and not whose: makes and models, the names that devices
 # and drivers give themselves, public server names, ports, prefix lengths, and the time zone.
 # Variables: KEYFILE (its first line is the secret; without it a marker has no second part), TMP (a file
-# for the hashing, that nobody else writes), HOST (this system's network name), MODE ("edid": the input is
-# an EDID as `od -An -v -tx1` prints it, and what comes out is that EDID without its serial numbers, as
-# octal escapes for printf).
+# for the hashing, that nobody else writes), HOST (this system's network name), NAMES (a file with the names
+# of the Bluetooth devices, one a line, as MODE "btlist" prints them), MODE ("edid": the input is an EDID as
+# `od -An -v -tx1` prints it, and what comes out is that EDID without its serial numbers, as octal escapes
+# for printf; "btlist": the input is files of BlueZ, and what comes out is the names in them, one a line;
+# "btmark": the same, as "Name: <marker>" and "Alias: <marker>").
 # The time stays linear in the length of a line: each rule looks for its next match after the last one.
 # A line of 32767 characters or more is left out, as redact.sed leaves it out (and says so in its place).
 
@@ -41,6 +50,13 @@ BEGIN {
 	split("1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220", P4, " ")
 	for (i in P4) KEEP4[P4[i]] = 1
 	NROWS = 0; NB = 0; ND = 0
+	# (the names of Bluetooth devices: 256 at most, of which 64 are looked for in every line)
+	NBC = 0; NBS = 0; NBW = 0
+	if (NAMES != "") {
+		while (NBC < 256 && (getline v < NAMES) > 0) btadd(v)
+		close(NAMES)
+		btsort()
+	}
 }
 
 # ---- markers
@@ -224,14 +240,34 @@ function macs(s,   out, m, prv, left, right, n, w, j) {
 function macmark(m,   l) {
 	l = tolower(m)
 	if (l == "00:00:00:00:00:00" || l == "ff:ff:ff:ff:ff:ff") return m
-	# (a group address: of a multicast, not of a device)
-	if ((("0x" substr(l, 1, 2)) + 0) % 2 == 1) return m
+	# (the group addresses of IPv4 and IPv6 multicast and of IEEE 802.1 bridges: of a multicast, not of a device.
+	# Not every address with the group bit: a Bluetooth address is written with its most significant byte
+	# first, and half of the random addresses of Bluetooth LE devices would look like a group address)
+	if (l ~ /^(01:00:5e|33:33|01:80:c2):/) return m
 	return mark("mac", l, 6)
 }
 function colons(h,   i, r) {
 	r = ""
 	for (i = 1; i <= 11; i += 2) r = r (i > 1 ? ":" : "") substr(h, i, 2)
 	return r
+}
+
+# ---- BlueZ's names of its devices (on D-Bus, and in its log and in the log of the settings add-on), the
+# address with "_" for ":" (/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF): the marker of the address
+function bluez(s,   out, m) {
+	if (s !~ /dev_[0-9A-Fa-f][0-9A-Fa-f]_[0-9A-Fa-f][0-9A-Fa-f]_/) return s
+	out = ""
+	while (more() && match(s, /dev_[0-9A-Fa-f][0-9A-Fa-f](_[0-9A-Fa-f][0-9A-Fa-f])+/)) {
+		out = out substr(s, 1, RSTART - 1)
+		m = substr(s, RSTART, RLENGTH)
+		s = substr(s, RSTART + RLENGTH)
+		# (six groups, not the end of a longer word nor a part of a longer run of hex digits)
+		if (lastc(out) ~ /[A-Za-z0-9]/ || length(m) != 21 || substr(s, 1, 1) ~ /[0-9A-Fa-f]/) { out = out m; continue }
+		m = substr(m, 5)
+		gsub(/_/, ":", m)
+		out = out "dev_" macmark(m)
+	}
+	return out s
 }
 
 # ---- UUIDs
@@ -473,8 +509,142 @@ function pathpart(g,   l, x, e, c, u, k, t, h, rest) {
 	return substr(g, 1, c - 1) "{/}" substr(g, c + 1, t - c) "[redacted]." substr(g, x + 1, e - x) rest
 }
 
+# ---- the names of the Bluetooth devices that BlueZ keeps
+# A byte of a word: a letter or a digit of ASCII, "_", or a byte of a character beyond ASCII (UTF-8).
+function wordc(c) { return c != "" && (c ~ /[A-Za-z0-9_]/ || ORD[c] >= 128) }
+function bttrim(v) { sub(/^[ \t]+/, "", v); sub(/[ \t\r]+$/, "", v); return v }
+# Whether a name is looked for wherever it stands as a word: what is left of it without the signs at its two
+# ends ("(null)" is "null") has 6 bytes or more, a letter (of ASCII, or beyond it), and is not one word of the
+# letters A to Z alone. Shorter names ("TV", "K", "LG TV", "K380") and plain words ("Keyboard", "Remote",
+# "Controller", "Television") stand in the logs for other things: such a name is taken where a line names an
+# input device by it (btctx()), and nowhere else. So is a name that a marker could hold, whole or at one of its
+# ends (only the characters of markers, "[" and those after it at its end, "]" and those before it at its start):
+# a second pass of the filter, over its own markers, would find it in them ("bt-name", "Foo [lan").
+function btfree(v,   i, j) {
+	if (v ~ /^[][a-z0-9.-]+$/ || v ~ /\[[a-z0-9.-]*$/ || v ~ /^[a-z0-9.-]*\]/) return 0
+	i = 1; j = length(v)
+	while (i <= j && !alnum(substr(v, i, 1))) i++
+	while (j >= i && !alnum(substr(v, j, 1))) j--
+	v = substr(v, i, j - i + 1)
+	if (length(v) < 6 || v ~ /^[A-Za-z]+$/) return 0
+	if (v ~ /[A-Za-z]/) return 1
+	for (i = 1; i <= length(v); i++) if (ORD[substr(v, i, 1)] >= 128) return 1
+	return 0
+}
+function alnum(c) { return c ~ /[A-Za-z0-9]/ || ORD[c] >= 128 }
+# A name of the list (NAMES): BTN[k] is the name, and its marker the one of that name. The kernel gives a
+# Bluetooth input device the first 127 bytes of its name (BlueZ hands it over in a field of 128): those are
+# looked for as well, with the marker of the whole name.
+function btadd(v) {
+	v = bttrim(v)
+	if (v == "" || (v in BTK) || length(v) > 1024) return
+	BTK[v] = ++NBC; BTN[NBC] = v
+	btvar(v, NBC)
+	if (length(v) > 127) btvar(substr(v, 1, 127), NBC)
+}
+# BS[1..NBS]: what is looked for in every line (64 at most; the rest goes to BW). BW[1..NBW]: what is taken
+# where a line names an input device. BSK and BWK: the number of the name of each.
+function btvar(x, k) {
+	if (x in BTV) return
+	BTV[x] = k
+	if (btfree(x) && NBS < 64) { BS[++NBS] = x; BSK[NBS] = k }
+	else { BW[++NBW] = x; BWK[NBW] = k }
+}
+# The longest first (a name that holds another one is taken whole), and at each end whether the name starts or
+# ends with a byte of a word: there, the byte beside it in a line must be none, or the name is a part of a
+# longer word ("Juan" in "Juana").
+function btsort(   i, j, x, k) {
+	for (i = 2; i <= NBS; i++) {
+		x = BS[i]; k = BSK[i]
+		for (j = i - 1; j >= 1 && length(BS[j]) < length(x); j--) { BS[j + 1] = BS[j]; BSK[j + 1] = BSK[j] }
+		BS[j + 1] = x; BSK[j + 1] = k
+	}
+	for (i = 2; i <= NBW; i++) {
+		x = BW[i]; k = BWK[i]
+		for (j = i - 1; j >= 1 && length(BW[j]) < length(x); j--) { BW[j + 1] = BW[j]; BWK[j + 1] = BWK[j] }
+		BW[j + 1] = x; BWK[j + 1] = k
+	}
+	for (i = 1; i <= NBS; i++) { BSL[i] = wordc(substr(BS[i], 1, 1)); BSR[i] = wordc(lastc(BS[i])) }
+}
+# The names in a line. Each one that is found becomes "\n<its number>\n" first, and its marker at the end: no
+# line has a line end in it and no name has one, so that a shorter name is never found inside the marker of a
+# longer one, nor across two of them. Each look goes on from where the last one ended, as in the other rules.
+function btnames(s,   j, v, L, out, i, pre) {
+	# (a line that the filter left out, and says so, as a second pass gets it)
+	if (substr(s, 1, 10) == "[left out,") return s
+	for (j = 1; j <= NBS; j++) {
+		v = BS[j]
+		if (!index(s, v)) continue
+		L = length(v); out = ""
+		while (more() && (i = index(s, v)) > 0) {
+			pre = out substr(s, 1, i - 1)
+			# (a part of a longer word: the look goes on from its next byte)
+			if ((BSL[j] && wordc(lastc(pre))) || (BSR[j] && wordc(substr(s, i + L, 1)))) { out = pre substr(s, i, 1); s = substr(s, i + 1) }
+			else { out = pre "\n" BSK[j] "\n"; s = substr(s, i + L) }
+		}
+		s = out s
+	}
+	if (NBW) s = btctx(s)
+	if (index(s, "\n")) s = btmarks(s)
+	return s
+}
+# The other names, where a line names an input device by them: the kernel's "input: NAME as /devices/..." and
+# "... HID v1.11 Keyboard [NAME] on ...", systemd-logind's "Watching system buttons on /dev/input/event5
+# (NAME)" and Kodi's "... device added: NAME (event5)" (and "removed"). An input device of the kernel may have
+# a word after the name of its device ("NAME Consumer Control"): the name is taken there too.
+function btctx(s,   i, j, a) {
+	if ((i = index(s, "input: ")) > 0 && (j = index(substr(s, i + 7), " as /")) > 1) s = btput(s, i + 7, substr(s, i + 7, j - 1))
+	if ((i = index(s, " HID v")) > 0 && (j = index(substr(s, i), " [")) > 0) {
+		a = i + j + 1
+		if ((j = index(substr(s, a), "] on ")) > 1) s = btput(s, a, substr(s, a, j - 1))
+	}
+	if ((i = index(s, "Watching system buttons on /dev/input/event")) > 0 && lastc(s) == ")" && (j = index(substr(s, i), " (")) > 0) {
+		a = i + j + 1
+		if (a < length(s)) s = btput(s, a, substr(s, a, length(s) - a))
+	}
+	a = 0
+	if ((i = index(s, " device added: ")) > 0) a = i + 15
+	else if ((i = index(s, " device removed: ")) > 0) a = i + 17
+	if (a && (j = index(substr(s, a), " (event")) > 1) s = btput(s, a, substr(s, a, j - 1))
+	return s
+}
+# x, the text at a of s: where it is a name of BW, or starts with one and a space, that name becomes its number
+function btput(s, a, x,   m, v) {
+	for (m = 1; m <= NBW; m++) {
+		v = BW[m]
+		if (x == v || substr(x, 1, length(v) + 1) == v " ") return substr(s, 1, a - 1) "\n" BWK[m] "\n" substr(s, a + length(v))
+	}
+	return s
+}
+function btmarks(s,   out, k) {
+	out = ""
+	while (match(s, /\n[0-9]+\n/)) {
+		k = substr(s, RSTART + 1, RLENGTH - 2) + 0
+		if (!(k in BTM)) BTM[k] = mark("bt-name", BTN[k], 6)
+		out = out substr(s, 1, RSTART - 1) BTM[k]
+		s = substr(s, RSTART + RLENGTH)
+	}
+	return out s
+}
+# GLib's key files, in which BlueZ keeps its devices: "\s" a space (at the start of a value), "\n", "\t", "\r",
+# and "\\" a backslash
+function gkey(v,   out, i, c, d) {
+	out = ""
+	for (i = 1; i <= length(v); i++) {
+		c = substr(v, i, 1)
+		if (c == "\\" && i < length(v)) {
+			d = substr(v, ++i, 1)
+			if (d == "s") c = " "; else if (d == "n") c = "\n"; else if (d == "t") c = "\t"; else if (d == "r") c = "\r"; else if (d == "\\") c = "\\"; else c = c d
+		}
+		out = out c
+	}
+	return out
+}
+
 # ---- one line
 function ids(s) {
+	# (the names first: a name may hold what another rule takes, a part of it then)
+	if (NBC) s = btnames(s)
 	NETSTAT = s ~ /^(tcp|udp|raw|udpl)6? +[0-9]+ +[0-9]+ /
 	if (index(s, "SHA256:") || index(s, "MD5:") || index(s, " AAAA") || index(s, "|")) s = ssh(s)
 	if (index(s, ":")) {
@@ -487,6 +657,7 @@ function ids(s) {
 	if (index(s, "x2duuid-") || index(s, "x2dpartuuid-")) s = escuuids(s)
 	if (s ~ / (vfat|exfat|ntfs3?|fuseblk) /) s = lsblk(s)
 	if (s ~ /[Ss][Ee][Rr][Ii][Aa][Ll]|PDI/) s = serials(s)
+	if (index(s, "dev_")) s = bluez(s)
 	if (index(s, "_")) s = connman(s)
 	if (index(s, "ssid: ") || index(s, "SSID ")) s = ssids(s)
 	if (index(s, "://")) s = lannames(s)
@@ -562,6 +733,22 @@ function emit(s) {
 
 MODE == "edid" {
 	for (i = 1; i <= NF; i++) E[NB++] = HX[tolower($i)]
+	next
+}
+# Files of BlueZ (<adapter>/<device>/info, <adapter>/cache/<device>): the name and the alias in the part
+# [General] of each (redact.sh gives them one after another, each after a line [hades-file]: a part of its own)
+MODE == "btlist" || MODE == "btmark" {
+	if (FNR == 1) SEC = ""
+	if ($0 ~ /^[ \t]*\[/) { SEC = bttrim($0); next }
+	if (SEC == "[General]" && match($0, /^[ \t]*(Name|Alias)[ \t]*=/)) {
+		n = RLENGTH
+		k = $0; sub(/^[ \t]+/, "", k); sub(/[ \t]*=.*$/, "", k)
+		v = bttrim(substr($0, n + 1))
+		if (length(v) <= 1024) v = bttrim(gkey(v))
+		# (a name with a line end in it would be two names of the list: no log writes it as one line anyway)
+		if (MODE == "btlist") { if (v != "" && !index(v, "\n") && length(v) <= 1024) print v }
+		else if (v != "") print k ": " mark("bt-name", v, 6)
+	}
 	next
 }
 LAST != "" && $0 == LAST { ENDED = 1; next }

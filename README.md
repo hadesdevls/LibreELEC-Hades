@@ -8,18 +8,19 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 **Why the screen says "LibreELEC Hades".** The media centre of this build is Kodi with changes that the XBMC Foundation has not approved, and Kodi's trademark policy asks such a build not to use Kodi's name and logos as its own. Underneath, it is Kodi: add-ons, skins and remote-control apps work as with Kodi, its log is still `kodi.log`, and other programs still see Kodi. The page "About this build" of the system information says what it is and how to support Kodi and LibreELEC.
 
-**Version 1.0 RC3 (October 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
+**Version 1.0 RC4 (October 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
 
 ## What it adds to LibreELEC
 
 - **Native Dolby Vision over HDMI.** Each picture is rebuilt as the Dolby Vision specification defines it, including the full enhancement layer (FEL) of profile 7, and sent with its metadata for every frame. The TV does its own Dolby Vision processing, as with a certified player (its "Standard" or "TV-led" mode). Profiles 5, 7 (FEL and MEL) and 8.1.
-- **NVIDIA, AMD and Intel graphics,** graphics cards and integrated graphics alike (NVIDIA with its open kernel modules).
+- **NVIDIA, AMD and Intel graphics,** graphics cards and integrated graphics alike (NVIDIA with its open kernel modules, and the GeForce GTX 900 and GTX 10 cards and the TITAN V with NVIDIA's driver 580).
 - **A safe fallback.** Dolby Vision is used only when the video, the TV, the HDMI link and the graphics driver all qualify. Otherwise the video plays the ordinary way, as HDR10 or SDR, and the Dolby Vision page of the player information says why.
 - **The refresh rate Kodi would choose,** exact for progressive video (25 fps at 25 Hz, 29.97 fps at 29.97 Hz). On NVIDIA, the modes at exactly 24, 30, 60 and 120 Hz that the driver did not offer are added.
 - **Made for integrated graphics too.** A frame that takes most of a refresh period is prepared one refresh ahead, and the picture under menus and subtitles is redrawn only where they are.
 - **HDR10+** with the dynamic metadata of each frame, where the graphics driver can send it.
-- **Dolby Vision shown as HDR10** where native output is not possible: by default for profile 5, whose base picture cannot be watched on its own, and for profile 7 if you turn it on. A display without HDR gets HDR mapped to SDR with the reference method of ITU-R BT.2390.
-- **Options, off by default:** Dolby Vision Low-Latency for a TV input that offers only that, mapped to the TV by Hades; HDR10+ or HDR10 sent as Dolby Vision; Dolby Vision without its trims, for projectors.
+- **Zoom, vertical shift and stretching** keep native Dolby Vision.
+- **Dolby Vision shown as HDR10** where native output is not possible: always for profile 5, whose base picture cannot be watched on its own, and for profile 7 if you turn it on. A display without HDR gets HDR mapped to SDR with the reference method of ITU-R BT.2390.
+- **Options, off by default:** Dolby Vision Low-Latency for a TV input that offers only that, mapped to the TV by Hades; Dolby Vision with the older HDMI 1.4b signalling, for the TVs of 2016 that ask for it; HDR10+ or HDR10 sent as Dolby Vision; Dolby Vision without its trims, for projectors.
 - **3D Blu-ray video** (H.264 MVC): both views are decoded, and a 3D display is switched to 3D over HDMI.
 - **PCs with two graphics chips, and laptops:** Kodi starts on the TV, whichever chip it is connected to, and offers to move to a TV connected later.
 - **Notices that say what is happening** (a TV input that offers only low-latency Dolby Vision, an input in HDMI 1.4 mode, no TV found), and, in the player information, a Dolby Vision page and the use and temperature of the graphics.
@@ -31,64 +32,78 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 - A USB drive of 8 GB or more. A USB SSD runs much more smoothly than a stick.
 - For Dolby Vision:
   - **A TV that offers Dolby Vision "Standard" on the HDMI input you use.** Many TVs offer only low-latency Dolby Vision on an input set up for games or a PC; Hades says so and sends that input HDR10, or low-latency Dolby Vision if you turn that on. On an LG C5, "Quick Frame Transport" has to be off on that input.
-  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series (not the older DCE hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
+  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer, and with NVIDIA's driver 580 the GeForce GTX 900 and GTX 10 cards and the TITAN V; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series (not the older DCE hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
   - **The PC connected by HDMI straight to the TV** is best. A sound bar or AV receiver in between has to pass Dolby Vision through.
 - Your own videos or add-ons: Hades comes with no films, add-ons or media sources.
 
 ## What has been tested
 
-The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count.
+The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below are those of 1.0 RC3 and earlier versions; what 1.0 RC4 adds is under "Not tried yet".
 
 ### Graphics
 
 | Graphics | Tried on |
 | --- | --- |
-| NVIDIA GeForce RTX 50 series | RTX 5060 (author), RTX 5090 (user) |
+| NVIDIA GeForce RTX 50 series | RTX 5060 (author), RTX 5080 and RTX 5090 (users) |
 | NVIDIA GeForce RTX 40 series | RTX 4080 SUPER (author), RTX 4080 Laptop GPU (user) |
-| NVIDIA GeForce RTX 30 series | RTX 3070 (user) |
+| NVIDIA GeForce RTX 30 series | RTX 3070 and RTX 3090 (users) |
 | NVIDIA GeForce GTX 16 and RTX 20 series | Not tried yet |
+| NVIDIA GeForce GTX 900 and GTX 10 series, TITAN V (driver 580) | Not tried yet |
 | AMD Radeon RX 7000 series | RX 7600 (user) |
 | AMD Radeon RX 5000, RX 6000 and RX 9000 series | Not tried yet |
-| AMD Ryzen integrated graphics | Ryzen 9 7950X3D (author), Ryzen 7 5800H (user) |
+| AMD Ryzen integrated graphics | Ryzen 9 7950X3D (author), Ryzen 7 5800H and Ryzen 3200G (users) |
 | Intel integrated graphics | Core i5-12450H (author), Core i3-1005G1, Core 5 255H and N100 (users) |
 | Intel UHD 6xx graphics | Not tried yet |
+| Intel graphics that use the `xe` driver (Arc B-series, Core Ultra 200V and newer) | Not tried yet |
 
-TVs: LG C5 (author); LG G5, LG C2 and a Panasonic TV with native Dolby Vision, a Samsung S90H with HDR10+, and a Sony TV that offers Dolby Vision only as low-latency (users).
+TVs: LG C5 (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H and a Samsung S95B with HDR10+, an LG C3 with Dolby Atmos passed through, and a Sony TV that offers Dolby Vision only as low-latency (users).
 
 ### Features
 
 | What | Seen working on |
 | --- | --- |
-| Dolby Vision profile 7 with FEL | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author); RTX 4080 Laptop GPU, RX 7600, Ryzen 7 5800H and Core 5 255H (users) |
+| Dolby Vision profile 7 with FEL | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author); RTX 4080 Laptop GPU, RTX 5080, RX 7600, Ryzen 7 5800H and Core 5 255H (users) |
 | Dolby Vision profile 7 with MEL | Ryzen 9 7950X3D (author); RX 7600 (user) |
 | Dolby Vision profiles 8.1 and 5 | RTX 4080 SUPER and Ryzen 9 7950X3D (author); RX 7600 (user) |
-| Dolby Vision in two video tracks | `.m2ts` on the RTX 4080 SUPER (author); MKV on an RTX 3070 (user) |
+| Dolby Vision in two video tracks | `.m2ts` on the RTX 4080 SUPER (author); MKV on an RTX 3070, and MP4 on a laptop with RTX graphics (users) |
 | Menus and subtitles over Dolby Vision at full frame rate | Profiles 7 FEL and 8.1 on the RTX 4080 SUPER and the Ryzen 9 7950X3D (author); profile 7 FEL on an RX 7600 (user) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, through an HDMI sync box that offers only low-latency Dolby Vision (author) |
 | Dolby Vision shown as HDR10 | Profile 5 on the RTX 4080 SUPER (author); profiles 5 and 7 FEL on a Core i3-1005G1 (user) |
-| HDR10+ | Core i3-1005G1 with a Samsung S90H, and Ryzen 7 5800H (users) |
+| HDR10+ | Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, and Ryzen 7 5800H (users) |
 | HDR10+ as Dolby Vision | Ryzen 7 5800H (user) |
 | HDR10 with more than 8 bits on NVIDIA | RTX 4080 SUPER (author) |
 | A 24 fps video at exactly 24 Hz on NVIDIA | RTX 4080 SUPER (author) |
-| Dolby TrueHD with Atmos, passed through | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author) |
+| Dolby TrueHD with Atmos, passed through | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author); RTX 3090 (user) |
 | Dolby Digital Plus with Atmos and DTS-HD Master Audio, passed through | RTX 4080 SUPER (author) |
 | 3D: both views decoded, the display switched to 3D | Ryzen 7 5800H, with a display that was not named (user) |
+| The use and temperature of the graphics in the player information | A laptop with RTX graphics (user) |
 | Kodi on the TV in a PC with two graphics chips | The author's PC, with the TV on the NVIDIA card |
 | Started from USB with the internal disks hidden | The author's PC |
 | Windows installer | "Update" on a real USB drive (author); every other operation only on a virtual disk |
 
 Not tried yet:
 
-- Dolby Vision in AV1 video, and in two-track MP4 files.
+- Dolby Vision in AV1 video.
 - HDR10+ from NVIDIA graphics on a display.
 - HDR10 sent as Dolby Vision, and Dolby Vision without its trims.
 - HDR, HLG and Dolby Vision mapped to SDR on a display without HDR.
 - Native Dolby Vision on a TV with an older Dolby Vision block (version 1) or with display management 2 or 3.
 - Dolby Vision through a sound bar or AV receiver.
 - 3D from a Blu-ray disc, a disc image or a disc folder.
-- A TV connected after Kodi started, and moving Kodi to another display from *System > Display > Monitor*.
+- A TV connected after Kodi started, new modes of a TV taken while Kodi runs (Deep Colour turned on at the TV, for example), and moving Kodi to another display from *System > Display > Monitor*.
 - Hades installed on an internal disk of a real PC (only in a virtual machine).
-- The smaller additions of 1.0 RC3 listed in the changelog.
+- New in 1.0 RC4:
+  - the GeForce GTX 900 and GTX 10 cards and the TITAN V with driver 580, and Intel graphics that use the `xe` driver;
+  - zoom, vertical shift and stretching with native Dolby Vision;
+  - profile 8.4 (HLG base layer, as iPhones record it);
+  - on NVIDIA, HDR10 to a TV that declares HDMI 3D, and HDR10 at 3840x2160 at 24, 25 and 30 Hz to a TV that takes those modes by their HDMI VIC;
+  - SDR at 8 bits over HDMI on NVIDIA and Intel, and "HDR output depth (NVIDIA)" at 8 bits;
+  - Blu-ray Java (BD-J) menus with the add-on "JRE for BD-J menus";
+  - the audio output of the display that Kodi uses, chosen by itself;
+  - "Dolby Vision measured from the HDR10 picture" for one video;
+  - Dolby Vision with the older HDMI 1.4b signalling, on a TV that asks for it (TVs of 2016, the LG OLEDs of that year among them), and Low-Latency on a dual-mode DisplayPort connector of NVIDIA;
+  - *Internal disks that are shown* and *Internal partitions that are shown*, in the LibreELEC settings;
+  - the other additions of 1.0 RC4 listed in the changelog.
 
 SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's own code and behave as in LibreELEC, apart from the additions above.
 
@@ -97,9 +112,10 @@ SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's 
 - **Dolby Vision needs an untouched HDMI signal** from an HDMI port of the graphics (on NVIDIA, also from a DisplayPort port that the graphics drive as HDMI, as the HDMI port of some laptops). Variable refresh rate, scaling and colour adjustments in the graphics driver are not compatible with it, and a converter between DisplayPort or USB-C and HDMI does not carry it.
 - Native Dolby Vision goes out at 3840x2160, up to 60 Hz. On Intel UHD 6xx graphics, up to 30 Hz and only from an HDMI port of the graphics itself.
 - On AMD integrated graphics, the first Dolby Vision video after installing a new build may stutter briefly while Hades measures which of two ways of drawing is faster there.
-- On integrated graphics, profile 5 with the player information open dropped frames in testing. What 1.0 RC3 changes for it is not tried yet.
+- On integrated graphics, profile 5 with the player information open dropped frames in testing. What 1.0 RC3 and 1.0 RC4 change for it is not tried yet.
+- **GeForce GTX 900 and GTX 10 cards and the TITAN V** use NVIDIA's driver 580, which Hades chooses at start by the card. A PC with one of them and a newer NVIDIA card at once gets the newer driver, and the older card gets none. On GTX 900 and GTX 10 cards, HDR10 goes out at 8 bits over HDMI: driver 580 has no deeper HDMI output for them.
 - **Dolby Vision Low-Latency is mapped by Hades, not by Dolby's display management**, which is not public. The TV is in its Dolby Vision mode and shows Hades' mapping to the brightness and colours its Dolby Vision block gives.
-- **HDR10+ goes out only where the graphics driver can send it with each frame,** otherwise as HDR10; [docs/how-it-works.md](docs/how-it-works.md#hdr10) says where. The player information shows an HDR10+ video as HDR10: the display's own menu tells whether it gets HDR10+.
+- **HDR10+ goes out only where the graphics driver can send it with each frame,** otherwise as HDR10; [docs/how-it-works.md](docs/how-it-works.md#hdr10) says where. The player information says "HDR10+" while its metadata go out.
 - **HDR10 sent as Dolby Vision** carries metadata measured from the picture as it plays, not the studio's: scene cuts are found from the picture, and a few are missed or found where there is none. **HDR10+ sent as Dolby Vision** keeps the brightness of each scene, not the studio's tone curve, target display or windows.
 - **3D is new.** The author has not seen it on a 3D display, and no 3D disc has been tried. If a 3D video shows a black or broken picture, turn off *System > Display > Switch the display to 3D (HDMI)*. More in [docs/how-it-works.md](docs/how-it-works.md#stereoscopic-3d).
 - No Secure Boot.
@@ -109,9 +125,9 @@ SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's 
 
 Nothing from LibreELEC is removed. What is unsafe by default on a PC that also holds your other disks is set to a safe value and can be turned back on.
 
-- **Your PC's disks.** Started from USB (the "Run" and "Live" entries), Hades does not start the NVMe and SATA controllers, so the internal disks do not exist for it. The "Run (internal disks read-only)" entry shows them, read-only. Installed on an internal disk, Hades does not see the PC's other NVMe and SATA disks either, nor mount the other partitions of its own disk. USB drives and SD cards are mounted as usual.
-- **Showing the internal disks.** In the LibreELEC settings, *System > Internal disks* can make the read-only entry the one that starts by default. It is off, and it explains what it means before it is turned on: shown disks can be read by everything that runs in Kodi, add-ons included; "read-only" is how they are mounted, not a lock; and that entry starts the kernel without lock-down. Choosing "Run" once in the boot menu, a reset to defaults or an update with the installer turns it off again.
-- **Kernel lock-down.** The entries that hide the disks start the kernel in "integrity" lock-down: it loads only the modules signed for that build.
+- **Your PC's disks.** Started from USB (the "Run" and "Live" entries), the internal disks do not exist for Hades: no internal storage controller is started or kept, whatever its kind, until the next start ([how](docs/settings.md#outside-the-settings-screens)). The "Run (internal disks read-only)" entry shows them, read-only. Installed on an internal disk, Hades does not see the PC's other NVMe and SATA disks either, nor mount the other partitions of its own disk. USB drives and SD cards are mounted as usual.
+- **Showing the internal disks.** In the LibreELEC settings, *System > Internal disks* can make the read-only entry the one that starts by default. It is off, and it explains what it means before it is turned on: shown disks can be read by everything that runs in Kodi, add-ons included; "read-only" is how they are mounted, not a lock; and that entry starts the kernel without lock-down. Choosing "Run" once in the boot menu, a reset to defaults or an update with the installer turns it off again. Under it, *Internal disks that are shown* keeps the NVMe and SATA disks that you untick (the one of Windows, a disk of personal files) away from the kernel: at each start that shows the internal disks they are let go of before anything else runs, and the kernel attaches no other internal disk until the next start and runs in its lock-down, so that not even a program with full rights reaches them. Disks are told by their model and serial number; one that cannot be told apart is kept away too while any is, and so is every disk if the list cannot be read. Under that, *Internal partitions that are shown* keeps the partitions that you untick from being mounted, by the serial number of their disk; a partition that is not mounted is still on its disk, where such a program could read it.
+- **Kernel lock-down.** The entries that hide the disks start the kernel in "integrity" lock-down, and a start that keeps internal disks away locks it down before the system starts: it loads only the modules signed for that build.
 - **The installer entry** of the boot menu is there, but Hades starts in "Run".
 - **Samba (file sharing) is off.** Turned on, it asks for a password that Hades generates and shows in the settings; sharing without a password can still be chosen.
 - **SSH is off,** as in LibreELEC, and while the root password is the default one it accepts only keys.
@@ -127,7 +143,7 @@ Nothing from LibreELEC is removed. What is unsafe by default on a PC that also h
 ## What is not included
 
 - **No third-party add-ons and no media sources.** Like LibreELEC, the image has Kodi's standard add-ons, the Kodi and LibreELEC add-on repositories, and LibreELEC's empty local folders. What you install is up to you.
-- **No Dolby software.** There is no Dolby code, library or licence key in Hades, and no code or specification of HDR10+ Technologies (the layout of the HDR10+ InfoFrame comes from GPL code; see "Credits").
+- **No Dolby software.** There is no Dolby code, library or licence key in Hades, and no code or specification of HDR10+ Technologies (the layouts of the HDR10+ InfoFrame and of the Dolby vendor InfoFrame come from GPL code; see "Credits").
 - **No telemetry.** Hades adds none and, by default, sends no usage statistics and no identifier of your PC. Like LibreELEC and Kodi, it contacts the services they use (add-on repositories, time servers and the like), which the page "Privacy policy" of the system information lists. The diagnostics stay on your drive.
 
 ## Installing and starting
@@ -157,9 +173,9 @@ In outline; LibreELEC's own documentation covers the rest.
 Good to know:
 
 - Every source is downloaded from the address in its recipe (`package.mk`) and checked against the SHA-256 written there. No recipe has an empty hash, and prebuilt "reusable" toolchain packages are not used (`USE_REUSABLE="no"`).
-- The NVIDIA driver package is downloaded from NVIDIA and unpacked without being run. Only its user-space libraries and firmware are used, unchanged; the kernel modules and the GBM library of its EGL (egl-gbm) are compiled from NVIDIA's open source code. By building, you accept NVIDIA's licence for those files.
+- The NVIDIA driver packages (615 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, 580) are downloaded from NVIDIA and unpacked without being run. Only their user-space libraries and firmware are used, unchanged; the kernel modules of 615 and the GBM library of their EGL (egl-gbm) are compiled from NVIDIA's open source code. The kernel module of 580 is built as NVIDIA ships it, with its closed core (`nv-kernel.o_binary`), and its modesetting core and `nvidia-drm` are compiled from NVIDIA's open source of the same version. By building, you accept NVIDIA's licence for those files. Driver 580 makes the image about 120 MB larger.
 - A clean build takes 20 to 45 minutes on a 32-thread machine, much longer on a small one. The author's builds run without network access, from sources fetched and verified beforehand.
-- **If you change the tree and share your build, give it your own name** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one, the build calls itself "Hades 1.0 RC3".
+- **If you change the tree and share your build, give it your own name** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one, the build calls itself "Hades 1.0 RC4".
 - The Windows installer is a separate small C# program in `tools/hades-installer/`; `build.ps1` builds it with the compiler that Windows already has.
 
 ## Documentation
@@ -168,20 +184,21 @@ Good to know:
 - [Settings](docs/settings.md): every setting of this build.
 - [Diagnostics and logs](docs/diagnostics.md): how to get them, and what to look for.
 
-Versions in 1.0 RC3: Linux 7.2.12, Kodi 22 (the `Piers` branch after 22.0rc1, up to de8192b4200c), FFmpeg 9.0.2, Mesa 26.2.5, libplacebo from its main branch (285d1cc8af2a) and NVIDIA 615.78.08, on LibreELEC `master` (13.0 development, up to fb1edf29eb07). LibreELEC has not released version 13.
+Versions in 1.0 RC4: Linux 7.3, Kodi 22 (the `Piers` branch after 22.0rc1, up to 7f485d6bcbc4), FFmpeg 9.0.2, Mesa 26.2.5, libplacebo 7.387.0 (275f7dea2792), NVIDIA 615.78.08 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.07, on LibreELEC `master` (13.0 development, up to db99cd88ef44). LibreELEC has not released version 13.
 
 ## Credits
 
 What this build adds to LibreELEC was written for it, except what is named here, which is the work of others and is used with thanks:
 
-- **CroqueMr's Dolby Vision fork of LibreELEC, and its contributors** ([CroqueMr/libreelec-x86-DV](https://github.com/CroqueMr/libreelec-x86-DV)), where this work began: its Dolby Vision module for Kodi (`dvbridge`), from which this build's Dolby Vision output grew, its Dolby Vision output for Intel graphics in the Linux kernel, and its changes to FFmpeg and libplacebo, among them a faster scaler for profile 7. A few features follow ideas from its later releases and were written anew here.
+- **CroqueMr's Dolby Vision fork of LibreELEC, and its contributors** ([CroqueMr/libreelec-x86-DV](https://github.com/CroqueMr/libreelec-x86-DV)), where this work began: its Dolby Vision module for Kodi (`dvbridge`), from which this build's Dolby Vision output grew, its Dolby Vision output for Intel graphics in the Linux kernel (the Dolby vendor InfoFrame that its patches added to `drivers/video/hdmi.c`, with the same interface, was written again for this build, under the licence of that file), and its changes to FFmpeg and libplacebo, among them a faster scaler for profile 7. A few features follow ideas from its later releases and were written anew here.
 - **Dom Cobley (popcornmix)**: the decoding of 3D Blu-ray video (his changes to FFmpeg's H.264 decoder) and how Kodi reads 3D discs.
 - **cinemaONE** ([cinema-ONE/LibreELEC.tv](https://github.com/cinema-ONE/LibreELEC.tv)): the changes to AMD's kernel driver for 3D over HDMI, and Kodi pull request 29463 (opaque menus over HDR video).
-- **Adrian Betschart**: the change to AMD's kernel driver that sends HDMI RGB in limited range on CTA modes.
+- **Adrian Betschart**: the change to AMD's kernel driver that sends HDMI RGB in limited range on CTA modes, which is part of Linux 7.3 and which two patches of this build build on.
 - **quietvoid** ([dovi_tool](https://github.com/quietvoid/dovi_tool) and [hdr10plus_tool](https://github.com/quietvoid/hdr10plus_tool), MIT): references for the Dolby Vision and HDR10+ metadata.
-- **CoreELEC** and the GPL kernel code of Amlogic that it carries, read as data: the layout of the HDR10+ InfoFrame, and which Dolby Vision displays are sent which InfoFrame.
+- **CoreELEC** and the GPL kernel code of Amlogic that it carries, read as data: the layouts of the HDR10+ InfoFrame and of the Dolby vendor InfoFrames, the Low-Latency signal, and which Dolby Vision displays are sent which InfoFrame.
 - **YBLOD** ([dangerouslaser/libreelec-yblod](https://github.com/dangerouslaser/libreelec-yblod)): ideas for a few features, written anew here.
-- **Team LibreELEC and Team Kodi**, and the authors of every program in the image. Patches taken from other projects keep their authors in their headers, and Rudi Heitbaum's OpenSSL 4 commit from LibreELEC keeps its author in this repository's history.
+- **Fixes from other projects, taken as patches with their authors:** among them, in this version, avahi, expat, OpenSSL, glibc, FFmpeg, BlueZ, BusyBox, libdvdcss (Saifelden Mohamed Ismail's change for CPXM discs), the commits of Kodi's `Piers` branch, and User65k's fix to Kodi's UPnP from CoreELEC's Kodi.
+- **Team LibreELEC and Team Kodi**, and the authors of every program in the image. Patches taken from other projects keep their authors in their headers (the sixteen files of CroqueMr's fork that have none are named in [NOTICE.md](NOTICE.md)), and Rudi Heitbaum's OpenSSL 4 commit from LibreELEC keeps its author in this repository's history.
 
 [NOTICE.md](NOTICE.md) lists them with their licences.
 
@@ -189,7 +206,7 @@ What this build adds to LibreELEC was written for it, except what is named here,
 
 - LibreELEC's build system is under the GNU General Public License, version 2; each file says whether "only" or "or later". Each patch has the licence of the program it changes. Kodi is GPL-2.0-or-later; the Dolby Vision module added to it is GPL-3.0-or-later, so the Kodi built here is distributed under GPL-3.0-or-later.
 - The texts of the licences are in `licenses/`, and the licence of each package is in its recipe (`PKG_LICENSE`).
-- The NVIDIA user-space libraries and firmware are proprietary and come under the NVIDIA Driver License Agreement, not under a free licence. Some firmware files for other hardware have their own licences.
+- The NVIDIA user-space libraries and firmware, and the closed core of the kernel module of driver 580 (loaded only for the GeForce GTX 900 and GTX 10 cards and the TITAN V), are proprietary and come under the NVIDIA Driver License Agreement, not under a free licence. Some firmware files for other hardware have their own licences.
 - The complete source of a build is this repository at the commit named in `BUILD_ID` in `/etc/os-release` of the running system, plus the source archives that its recipes name. See [NOTICE.md](NOTICE.md) for credits, trademarks and how to obtain the source.
 - LibreELEC's own README, with its licence and copyright statement, is kept as [README.LibreELEC.md](README.LibreELEC.md), and its guide to contributing to LibreELEC as [CONTRIBUTING.LibreELEC.md](CONTRIBUTING.LibreELEC.md).
 

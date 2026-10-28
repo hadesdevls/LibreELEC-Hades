@@ -4,6 +4,258 @@ The versions of LibreELEC Hades. Before 1.0 RC1 there were only private test bui
 
 *Las versiones de LibreELEC Hades, cada una también en español. Antes de 1.0 RC1 solo hubo compilaciones de prueba privadas.*
 
+## 1.0 RC4
+
+### What's new for you
+
+- **NVIDIA GeForce GTX 900 and GTX 10 cards, and the TITAN V.** NVIDIA's driver 615 does not drive them. Hades now also carries NVIDIA's driver 580 for them, with native Dolby Vision, Low-Latency, HDR10+, 3D frame packing and the other properties that it uses on newer cards, from patches of its own to the open part of that driver; Kodi uses them as with driver 615. The driver is chosen at start from the PCI IDs of the cards. The kernel module of driver 580 holds NVIDIA's closed core, as NVIDIA ships it, and the image is about 120 MB larger.
+- **Zoom, vertical shift and stretching keep native Dolby Vision.** The part of the picture that is shown is scaled as a certified player scales it, in the colour representation of the video, and the metadata describe it. A 1080p video scaled up to the screen goes out the same way.
+- **Profile 5 is always rebuilt where it cannot go natively** (issue #2): also with "Dolby Vision as HDR10 when needed" off, since its base picture would come out with wrong colours. That setting now covers the other profiles.
+- **Profile 8.4** (an HLG base layer, as iPhones record it) is sent as native Dolby Vision where its RPU declares a PQ picture, and otherwise plays as HLG, as Kodi plays it.
+- **The sound goes to the TV** (issue #6). Until you choose an audio output, Kodi takes the HDMI output of the display that it shows its picture on, instead of the first output it finds (often the analogue one of the board). An output that you choose is never changed.
+- **Dolby Vision measured from the HDR10 picture, for one video** (issue #6). In the player's video settings, a profile 7 or 8.1 video whose own Dolby Vision metadata are flat can be sent with metadata that Hades measures from its HDR10 picture as it plays.
+- **Blu-ray Java (BD-J) menus** (issue #1). The image now carries the Java part of libbluray that the menus need; with the add-on "JRE for BD-J menus" of the LibreELEC repository installed and Kodi restarted, they can run, and where they cannot Kodi says what is missing.
+- **New modes of the TV without a restart.** When the TV offers other modes (Deep Colour turned on at the TV, for example), Kodi takes them a few seconds later, while nothing plays.
+- **HDR10 on NVIDIA to more TVs:** to a TV that declares HDMI 3D (the LG OLEDs of 2016 among them), which NVIDIA's driver sent no HDR10 at all; and at 3840x2160 at 24, 25 and 30 Hz to a TV that takes those modes by their HDMI VIC, which with HDR10 was told no mode.
+- **SDR at 8 bits over HDMI on NVIDIA and Intel,** as Windows sends it: the menus at 2160p60 go over TMDS instead of FRL. On NVIDIA, "HDR output depth (NVIDIA)" can hold HDR10 and HLG at 8 bits as well, for TVs with an 8-bit panel that show less banding that way (issue #4).
+- **Choose which internal partitions are shown** (issue #9). While the internal disks are shown, *Internal partitions that are shown* keeps the ones you untick (those of Windows, a disk of personal files) from being mounted.
+- **Choose which internal disks are shown** (issue #9). *Internal disks that are shown* keeps the NVMe and SATA disks that you untick away from the kernel at each start that shows the internal disks, with the kernel locked down, so that not even a program with full rights reaches them ([settings](docs/settings.md#libreelec-settings)).
+- **Smoother where the graphics struggle:** frames are presented a frame ahead also where they miss their refresh again and again (issue #4); frames with menus over a profile 7 FEL picture step down on their own, only while the menus are there, on graphics that cannot keep up; the windows that open over a video are loaded ahead while the menus are idle (issue #3); and the decoder of the enhancement layer waits for a free surface instead of starting the layer again.
+- **Intel Arc B-series and Core Ultra 200V graphics:** the firmware of their `xe` driver is now in the system, without which they give no picture.
+- **Fewer ways to lose Dolby Vision:** a content mapping v4.0 part that cannot be carried no longer takes native output away; NVIDIA's driver now gives Kodi every block of the EDID; the console takes the display back without the tunnel if Kodi stops during Dolby Vision; and after a wake from suspend the output is set again even where Kodi learns of the wake late.
+- **Up to date and safer:** Linux 7.3, LibreELEC and Kodi at their latest commits, libplacebo 7.387.0, OpenSSL 4.1.0 and Python 3.14.10, and fixes for known security issues in avahi (17 CVEs, and one more fixed by Hades), expat, connman, OpenSSL, glibc, BlueZ, BusyBox, FFmpeg and MariaDB Connector/C.
+- **Dolby Vision for the TVs of 2016** (the LG OLEDs of that year among them), which ask for the older HDMI 1.4b signalling: "Dolby Vision with the older signalling (HDMI 1.4b)" sends it to them, on Intel, AMD and NVIDIA graphics. Off by default, and offered only for a display that asks for that signalling.
+
+### Before you update
+
+- **Profile 5 with "Dolby Vision as HDR10 when needed" off.** It is now rebuilt and sent as HDR10 anyway; turning the setting off only leaves the other profiles on their base picture.
+- **NVIDIA and Intel over HDMI.** Because SDR now goes out at 8 bits, the TV may change its signal once more when Kodi starts, where the console had left the link at more bits.
+- **The first Dolby Vision video after the update** makes again the GPU programs that Kodi keeps, since libplacebo changed.
+- **Server certificates with the name only in their common name.** OpenSSL 4.1, like web browsers, no longer accepts a server name that is only in the common name (CN) of a certificate. A MySQL or MariaDB library on a server that is not on a local address, with a certificate authority set for it, and streams that FFmpeg opens over HTTPS itself (HLS, for example) need the name in the certificate's subject alternative names. Certificates from public authorities always have it there.
+
+### Details
+
+**Dolby Vision picture and metadata**
+
+- A picture that is zoomed, shifted vertically or stretched, or scaled up to the screen, is scaled in the representation of the composer's picture with Lanczos 3 from its integer codes, the luma and the chroma (from 4:2:0 straight to the 4:2:2 of the tunnel), with the same bytes on any graphics, and level 5 describes the part shown. A picture drawn smaller than its own size is still rebuilt in RGB and converted to BT.2020.
+- Profile 5, and AV1 profile 10 with a base layer compatible with nothing, are rebuilt for output as HDR10 wherever native output is not possible, whatever "Dolby Vision as HDR10 when needed" says; HDR10+ and "map to the display" follow that setting as their help says.
+- Profile 8.4: composed by the composer of the specification, or by libplacebo's reshaping, where the RPU of the picture declares its HDR picture in PQ (signal_eotf 0xFFFF), decided picture by picture; otherwise it plays as HLG (`libplacebo-9975`).
+- Profile 8.2 (an SDR base layer): composed at 14 bits and converted to PQ as clause 5.5 of ETSI GS CCM 001 says (`libplacebo-9955`); never by libplacebo's reshaping, which would take its base layer for PQ. Where the composer does not take it, it plays as Kodi plays it, and `kodi.log` says why.
+- An enhancement layer coded larger than its picture (1088 rows for 1080, for example) is imported at the size of the picture: the rows beyond it were read by the resampling.
+- A content mapping v4.0 part that cannot be carried (a block of a length or value that dovi_tool does not know, or one that would take the metadata of a frame past 512 bytes) is left out for the rest of the stream, which keeps native output with the v2.9 part; `kodi.log` says which block and why. Before, every frame was refused, and native output stopped.
+- The metadata of a frame that cannot be sent say why in `kodi.log`.
+- Where an RPU has no level 5 block but has a content mapping v4.0 part, the level 5 block that Hades makes goes at the end of the v2.9 part, where an RPU carries its own.
+- The enhancement layer: a paired picture whose enhancement picture brought no RPU takes the base decoder's reading of the RPU; the layer starts by picture order only where that can be known; the start codes of a packet are found once.
+- Dolby Vision shown as HDR10 in a 10-bit window is kept as the codes of that window (`libplacebo-9946`): the same bytes, with less GPU memory and bandwidth.
+- libplacebo's own reshaping (the expert setting "Composition", and the pictures that the composer of the specification does not take) dequantizes the enhancement layer on its value as the scaler gives it, without the rounding to an integer that libplacebo 7.387.0 brought (`libplacebo-9978`). Measured against the reference of the specification, the rounding took the decoded picture further from it at every step-down level (61.0 % of its pixels a code or more off instead of 56.7 %), and at levels 2 and 3 it made the two ways of drawing a frame differ in 5.5 % of their chroma codes, by up to 2, instead of 0.3 %, by 1. The composer of the specification, the default, does not use it.
+- The expert setting "Finer gamut mapping" (*System > Display > Dolby Vision engine*) maps through a table of 256x192x512 entries instead of 96x64x512; where 16-bit unorm textures cannot be filtered, the table is kept in floats.
+
+**Performance**
+
+- Frames presented the way that waits that miss their refresh again and again (two of the last three runs of 240 frames without GUI elements with three late or more) are presented a frame ahead, whatever their average GPU time.
+- Frames with menus, the OSD or a window over a picture that draws the residual of an enhancement layer step down on their own, by the same rule as the frames without them, only while the GUI is over the picture.
+- In the enhancement layer's resampling, the vertical passes read only the rows they use (`libplacebo-9970`) and use half floats where those are exact (`libplacebo-9971`); the planes composed for the transport are 16-bit (`libplacebo-9960`); the two rows of 4:2:2 of a row of 4:2:0 are made in one fragment. The same bytes.
+- On nvidia-drm, which has no vertical blank to wait for with its defaults, a repeated picture is kept by committing it again with a commit that waits for its flip, instead of drawn again every refresh.
+- The GPU work of a frame of the way that waits is finished after its buffer swap, as in the other ways, and a native frame is committed without a test commit first.
+- The windows that open over a video (the OSD, the player information, Settings, the player's video, audio and subtitle settings, and the full-screen information) are loaded one at a time while the menus are idle, so that their first opening over a video does not take a refresh.
+- The decoder of the enhancement layer keeps a fixed pool of 32 surfaces with NVIDIA's VAAPI driver, and FFmpeg's pool, which grows as needed, with any other; while the layer holds 32, its next access unit waits instead of finding no surface.
+
+**Display and HDMI**
+
+- New modes of a display while Kodi runs: the resolutions are made again of them a few seconds after the change, while nothing plays, with the choices a start would make (Desktop at the preferred mode, a chosen resolution that is still offered kept). The notice of an input in HDMI 1.4 mode no longer asks for a restart.
+- When Kodi reads a connector again, what it read before stays valid for those that still hold it, and the mode lists that a reading replaces are let go of once nothing can read them: the 16 newest stay, and an older one goes a minute after it was replaced.
+- SDR at 8 bits over HDMI on NVIDIA and Intel; HDR10, HLG, HDR10+ and SDR video of more than 8 bits keep the depth the driver chooses, and Dolby Vision its 8 bits. The depth changes only with a change of mode, of the HDR signalling or the end of Dolby Vision. AMD keeps its own choice.
+- "HDR output depth (NVIDIA)" (`videoscreen.hadeshdrdepth`, Expert, Automatic): "8 bits" holds HDR10 and HLG at 8 bits per component.
+- The Standard tunnel goes only to a display that lets the source select the RGB range (QS), on every graphics driver, as NVIDIA's backend already asked (`linux-9987`).
+- Intel and AMD: the rule of the tunnel in one header (`include/drm/drm_dvbridge.h`, `linux-9984`), read on Intel when the display is detected instead of from the connector's EDID in the atomic check (`linux-9985`); on AMD, a colour format that is not RGB refuses the tunnel with its own reason (`linux-9988`); on Intel from display version 11, the scanout check reads what the pipe programs (`linux-9989`); KUnit tests of the rule and of the Dolby vendor InfoFrame (`linux-9991`); on AMD, no 3D layout for a connector state without its connector (`linux-9992`).
+- If Kodi stops during native output, the console takes the display back without the Dolby Vision properties (`linux-9986`, `nvidia-open-kernel-modules-9040`).
+- The Dolby vendor InfoFrame of `drivers/video/hdmi.c` and `include/linux/hdmi.h` is written for this build with the same interface and the same bytes, under the permission notice of those files (`linux-9899`, in place of `linux-9900-08` and `-09`).
+- NVIDIA: the EDID that nvidia-drm gives Kodi has every block, also those that only an HF-EEODB counts (`nvidia-open-kernel-modules-9041`, issue #7); a display that declares HDMI 3D gets HDR10, decided by what the output sends (`9042`); at 3840x2160 at 24, 25 and 30 Hz and 4096x2160 at 24 Hz, a display without UHD_VIC gets the HDMI vendor InfoFrame with HDR10, in the generic InfoFrame slot where it is free (`9043`), and the LG C5 the same bytes as before; the kernel log says how each HDMI mode set goes out (`9044`); the eglChooseConfig and eglCreatePbufferSurface hooks of egl-gbm made safe (`nvidia_egl-gbm-9000`); Kodi does not reach them.
+- NVIDIA, on a dual-mode DisplayPort connector driven as HDMI: the video's mode goes out first, and native output starts only in the mode on the output, turning the output off and on so that the link starts from scratch (issue #4).
+- After a wake from suspend, the frames themselves see that the system slept and have the output set again before they are committed.
+- The player information says "HDR10+" while HDR10+ goes out, with what was sent of it; the percentiles of the HDR10+ InfoFrame are placed by their percentage, and no HDR10+ is sent where they do not fit.
+- `kodi.log` says without debug logging which mode Kodi starts in, and where it comes from.
+- Dolby Vision with the HDMI 1.4b signalling (`videoscreen.hadesdvhdmi14b`, off): to a display whose Dolby Vision block asks for it (42 of the 603 EDIDs of this project's host tests, 41 of them with QS), the tunnel goes with the HDMI vendor InfoFrame of 24 bytes, which carries the HDMI VIC at 3840x2160 at 24, 25 and 30 Hz with VIC 0 in the AVI InfoFrame, and the part of the metadata that its display management version reads (`linux-9993` to `linux-9996` for i915, xe and amdgpu; `nvidia-open-kernel-modules-9045`, `nvidia-legacy-open-9058`). Whether a TV takes it cannot be checked from the player: [how it works](docs/how-it-works.md#dolby-vision-with-the-hdmi-14b-signalling).
+- NVIDIA: Dolby Vision Low-Latency on a dual-mode DisplayPort connector driven as HDMI, where nvidia-drm gave the other HDMI properties but not `NV_HDMI_DV_LOW_LATENCY`, so Low-Latency was refused there (`nvidia-open-kernel-modules-9046`; driver 580 had it already).
+- NVIDIA: the InfoFrames that NVIDIA's driver writes for Turing, Ampere and Ada cards, and driver 580 for its cards, lost their last byte (a fault of the driver itself): HDR10 now gets its MaxFALL whole where it is 256 or more, Kodi's top-and-bottom 3D is signalled as top-and-bottom instead of frame packing, and the HDR10+ InfoFrame of driver 580 keeps its last byte (`nvidia-open-kernel-modules-9047`, `nvidia-legacy-open-9059`). Dolby Vision, SDR and the other InfoFrames keep the same bytes.
+- NVIDIA: the HDMI vendor InfoFrame that NVIDIA's driver builds itself for 3D frame packing no longer carries a 3D metadata bit left over in memory: the frame is built on zeroes, and that bit's mask is the one of HDMI 1.4b (`nvidia-open-kernel-modules-9048`, `nvidia-legacy-open-9061`). Nothing else that the driver sends changes.
+- With `<dveos>`, the frame that marks the end of Dolby Vision goes out in the mode on the output, before the mode changes, and only where it can go out as a transport frame.
+
+**Files and streams**
+
+- A Matroska file of two video tracks with the Dolby Vision record only in its base track, which FFmpeg groups the wrong way round, is joined as a file without a group.
+- Blu-ray Java menus: libbluray looks for the Java part of its own version in its built-in places where `LIBBLURAY_CP` has none (`libbluray-9036`); the image carries `libbluray-j2se-1.5.1.jar` and `libbluray-awt-j2se-1.5.1.jar`, built from libbluray's source (`libbluray-bdj`); Kodi tells apart five states and says what to do in a dialog and in `kodi.log`. No Java runtime comes with the image.
+- DVDs: libdvdcss reads CPXM discs that have no decryption set up.
+
+**Audio**
+
+- The audio output of the display that Kodi uses, known by the maker, product and name that its EDID and its audio data both give, for PCM and for passthrough, while no output has been chosen; where that cannot be told for sure, nothing changes.
+- A sound of the interface is mixed only into an audio packet of its own format.
+- The list of audio outputs is read from a whole copy that each new listing replaces: a part of Kodi that read it while the outputs were listed again, as happens when a display comes or goes, could find it half made or already freed.
+
+**Player information and skins**
+
+- The Dolby Vision page says which composer made each picture, and with `<dvpasstimes>` the passes that took the most GPU time; the overview page gives the step-down level of frames with GUI elements where it differs.
+- Hades' player information for any skin is made again from Estuary's pages.
+
+**Interface**
+
+- Scrolling text is drawn at the depth of the pass it is drawn in, so it is no longer cut.
+- With a video playing, the line of the minute in `kodi.log` counts the passes of the interface that took more than 1.5 refresh periods, and in which window.
+
+**Diagnostics and logs**
+
+- The number of a start goes on across an update, a folder `start-N` holds that start only, and every capture says which build wrote it.
+- With NVIDIA graphics, each Dolby Vision capture begins with one `nvidia-smi` query (clocks and what holds them down, power and temperatures), at the lowest priority.
+- Bluetooth: `bluetooth.txt` in every capture, and Bluetooth addresses that the filter let through (random ones, and those in BlueZ's object paths) are filtered. See [docs/bluetooth.md](docs/bluetooth.md).
+- `redetect.txt` says whose its "demoting to read-only probe" lines are, and the diagnostics say which NVIDIA driver was chosen at start.
+- The names of the Bluetooth devices that BlueZ keeps become markers in everything that the filter of the diagnostics and Submit Log let out, and folders that went through an earlier filter are filtered again ([docs/bluetooth.md](docs/bluetooth.md)).
+
+**System**
+
+- *Internal partitions that are shown*, under *System > Internal disks* of the LibreELEC settings: partitions are told by the WWN and serial number of their disk and their identifier in the partition table; where the list cannot be read, no internal partition is mounted.
+- *Internal disks that are shown*, in the same place: the NVMe and SATA disks that are not ticked are let go of by the init before anything else runs, the kernel attaches no other internal disk until the next start and is locked down (integrity); disks are told by their model and serial number, and every disk is kept away where the list cannot be read. The disk the system is on is never kept away ([settings](docs/settings.md#libreelec-settings)).
+- A disk that the list keeps away but that stays attached (its driver did not let it go, or the disk that the system starts from could not be told for certain) is named when Kodi starts and in the list, and no partition of an internal disk is mounted in that start; two disks with the same model and serial number are both kept away while there is a list; Run and Live leave the mark of the hidden disks before anything else.
+- A list of the disks that cannot be read when the init looks again, after the system's storage is mounted, keeps every internal disk away, as one that cannot be read at the first look, and the settings say so.
+- Bluetooth: the LibreELEC settings write why each device disconnected to `kodi.log`, and say once on screen when a device refused the key saved for it.
+- The firmware of Intel's `xe` driver (`xe/` of linux-firmware) is in the system; the licence texts of the firmware built into the kernel are in `licenses/`, and the system has linux-firmware's `WHENCE` and licence texts in `/usr/share/licenses/kernel-firmware`.
+- Expert switches for comparisons on a display, off by default: `<dvmmrtable>` (the MMR mapping of the composer through a table, the same bytes) and `<dveos>` (one black transport frame that marks the end of the signal), in `advancedsettings.xml`; see [the settings](docs/settings.md#advancedsettingsxml).
+
+**Updates and security**
+
+- Linux 7.3, with this build's kernel patches carried over (23 of them, all for AMD, written again for the files that 7.3 splits); LibreELEC `master` up to 5c35a73c10b4 (Samba 4.25.1, NSS 3.132, HarfBuzz 15.0.0, Intel media-driver 26.4.1, strace 7.3, usbutils 020, pycryptodome 4.2.0, Intel Wi-Fi firmware, the CA bundle of 2026-10-22, 7-Zip 26.05); Kodi `Piers` up to 7f485d6bcbc4 (68 commits; the last one so that a DTS-HD MA stream is no longer taken for DTS-HD in the middle of its playback); libplacebo 7.387.0, which now has eight of this build's patches; OpenSSL 4.1.0; Python 3.14.10; CMake 4.4.5.
+- Fixes taken from upstream: avahi (42 changes: 17 CVEs and 10 other faults), expat (CVE-2026-115506, CVE-2026-113351), OpenSSL (its 4.1 branch after 4.1.0, and its 3.5 branch after 3.5.9 for the OpenSSL 3 that add-ons use), Python (CVE-2026-115557, in 3.14.10), glibc (10), FFmpeg (3), BlueZ (1), BusyBox (1), MariaDB Connector/C (its 3.4 branch after 3.4.11: CONC-858, CONC-859, CONC-861, CONC-863, CONC-864 and CONC-865, bounds checks of what a server sends and its certificate checks); Samba 4.25.1 has the six fixes that this build carried for it.
+- Fixed by Hades where upstream has no fix yet: connman (CVE-2026-115863); avahi (CVE-2025-59529: the simple protocol server limits its clients, in all, for each user and for all users but root, closes those that send nothing for 5 seconds, and no longer loops when it runs out of file descriptors; avahi's tests give the same results with it, and it was run under a flood of idle clients, 72 subscriptions at once, no file descriptors left and a request cut in half, with the address, undefined behaviour and leak sanitizers: the daemon kept answering and no fault was found; its limits for each user were not run, since that needs two user accounts).
+- NVIDIA driver 580: its modesetting core, built from NVIDIA's open source, returns through the kernel's return thunk, as driver 615 does (`nvidia-legacy-open-9060`).
+
+What has been seen on a TV is in the [README](README.md), under "What has been tested". Some ideas came from other builds and were written again for Hades; the README credits them.
+
+### En español
+
+#### Novedades
+
+- **Tarjetas NVIDIA GeForce GTX 900 y GTX 10, y la TITAN V.** El controlador 615 de NVIDIA no las maneja. Hades lleva ahora también el controlador 580 de NVIDIA para ellas, con Dolby Vision nativo, Low-Latency, HDR10+, 3D en *frame packing* y las demás propiedades que usa en las tarjetas más nuevas, gracias a parches propios a la parte abierta de ese controlador; Kodi las usa como con el controlador 615. El controlador se elige al arrancar por los identificadores PCI de las tarjetas. El módulo del kernel del controlador 580 lleva el núcleo cerrado de NVIDIA, tal como lo entrega NVIDIA, y la imagen ocupa unos 120 MB más.
+- **El zoom, el desplazamiento vertical y el estiramiento conservan el Dolby Vision nativo.** La parte de la imagen que se ve se escala como la escala un reproductor certificado, en la representación de color del vídeo, y los metadatos la describen. Un vídeo de 1080p ampliado a la pantalla sale de la misma forma.
+- **El perfil 5 se reconstruye siempre donde no puede ir nativo** (issue #2): también con "Dolby Vision como HDR10 cuando hace falta" desactivado, porque su imagen base saldría con los colores mal. Ese ajuste cubre ahora los demás perfiles.
+- **El perfil 8.4** (una capa base HLG, como graban los iPhone) se envía como Dolby Vision nativo donde su RPU declara una imagen PQ, y si no se reproduce como HLG, como lo reproduce Kodi.
+- **El sonido va a la tele** (issue #6). Mientras no elijas una salida de audio, Kodi toma la salida HDMI de la pantalla en la que muestra su imagen, en vez de la primera salida que encuentra (a menudo la analógica de la placa). Una salida que elijas no se cambia nunca.
+- **Dolby Vision medido de la imagen HDR10, para un vídeo** (issue #6). En los ajustes de vídeo del reproductor, un vídeo de perfil 7 u 8.1 cuyos metadatos Dolby Vision propios son planos se puede enviar con metadatos que Hades mide de su imagen HDR10 mientras se reproduce.
+- **Menús Java de Blu-ray (BD-J)** (issue #1). La imagen trae ahora la parte Java de libbluray que necesitan los menús; con el complemento "JRE for BD-J menus" del repositorio de LibreELEC instalado y Kodi reiniciado, pueden funcionar, y donde no pueden Kodi dice qué falta.
+- **Modos nuevos de la tele sin reiniciar.** Cuando la tele ofrece otros modos (por ejemplo, al activar Deep Colour en la tele), Kodi los toma unos segundos después, mientras no se reproduce nada.
+- **HDR10 en NVIDIA a más teles:** a una tele que declara 3D por HDMI (entre ellas las LG OLED de 2016), a la que el controlador de NVIDIA no enviaba HDR10 en absoluto; y a 3840x2160 a 24, 25 y 30 Hz a una tele que toma esos modos por su VIC de HDMI, a la que con HDR10 no se le decía ningún modo.
+- **SDR a 8 bits por HDMI en NVIDIA e Intel,** como lo envía Windows: los menús a 2160p60 van por TMDS en vez de FRL. En NVIDIA, "Profundidad de la salida HDR (NVIDIA)" puede dejar también HDR10 y HLG a 8 bits, para teles con un panel de 8 bits que así muestran menos bandas (issue #4).
+- **Elegir qué particiones internas se muestran** (issue #9). Mientras se muestran los discos internos, *Particiones internas que se muestran* hace que las que desmarques (las de Windows, un disco de archivos personales) no se monten.
+- **Elegir qué discos internos se muestran** (issue #9). *Discos internos que se muestran* aparta del kernel los discos NVMe y SATA que desmarques en cada arranque que muestra los discos internos, con el kernel bloqueado, para que ni siquiera un programa con todos los permisos llegue a ellos ([ajustes](docs/settings.md#libreelec-settings), en inglés).
+- **Más fluido donde la gráfica no da para más:** los fotogramas se presentan un fotograma por adelantado también donde pierden su refresco una y otra vez (issue #4); los fotogramas con menús sobre una imagen de perfil 7 FEL bajan de nivel por su cuenta, solo mientras están los menús, en las gráficas que no llegan a tiempo; las ventanas que se abren sobre un vídeo se cargan antes, mientras los menús están en reposo (issue #3); y el decodificador de la capa de mejora espera a una superficie libre en vez de reiniciar la capa.
+- **Gráficas Intel Arc B y Core Ultra 200V:** el firmware de su controlador `xe` está ahora en el sistema; sin él no dan imagen.
+- **Menos formas de perder el Dolby Vision:** una parte de mapeo de contenido v4.0 que no se puede llevar ya no quita la salida nativa; el controlador de NVIDIA le da ahora a Kodi todos los bloques del EDID; la consola recupera la pantalla sin el túnel si Kodi se detiene durante el Dolby Vision; y al despertar de la suspensión la salida se vuelve a poner aunque Kodi se entere tarde del despertar.
+- **Al día y más seguro:** Linux 7.3, LibreELEC y Kodi en sus últimos commits, libplacebo 7.387.0, OpenSSL 4.1.0 y Python 3.14.10, y arreglos de fallos de seguridad conocidos en avahi (17 CVE, y uno más que arregla Hades), expat, connman, OpenSSL, glibc, BlueZ, BusyBox, FFmpeg y MariaDB Connector/C.
+- **Dolby Vision para las teles de 2016** (entre ellas las LG OLED de ese año), que piden la señalización antigua de HDMI 1.4b: "Dolby Vision con la señalización antigua (HDMI 1.4b)" se la envía, en gráficas Intel, AMD y NVIDIA. Apagado por defecto, y solo se ofrece para una pantalla que pide esa señalización.
+
+#### Antes de actualizar
+
+- **El perfil 5 con "Dolby Vision como HDR10 cuando hace falta" desactivado.** Ahora se reconstruye y se envía como HDR10 de todos modos; desactivar el ajuste solo deja los demás perfiles con su imagen base.
+- **NVIDIA e Intel por HDMI.** Como el SDR sale ahora a 8 bits, la tele puede cambiar de señal una vez más al arrancar Kodi, donde la consola había dejado el enlace a más bits.
+- **El primer vídeo Dolby Vision tras actualizar** vuelve a preparar los programas de GPU que Kodi guarda, porque libplacebo cambió.
+- **Certificados de servidor con el nombre solo en el nombre común.** OpenSSL 4.1, como los navegadores, ya no acepta el nombre de un servidor que solo está en el nombre común (CN) de un certificado. Una biblioteca MySQL o MariaDB en un servidor que no está en una dirección local, con una autoridad de certificación configurada para ella, y los vídeos que FFmpeg abre él mismo por HTTPS (HLS, por ejemplo) necesitan el nombre entre los nombres alternativos del certificado. Los certificados de las autoridades públicas siempre lo llevan ahí.
+
+#### Detalles
+
+**Imagen y metadatos Dolby Vision**
+
+- Una imagen con zoom, desplazada en vertical o estirada, o ampliada a la pantalla, se escala en la representación de la imagen del compositor con Lanczos 3 desde sus códigos enteros, la luma y la croma (de 4:2:0 directamente al 4:2:2 del túnel), con los mismos bytes en cualquier gráfica, y el nivel 5 describe la parte que se ve. Una imagen dibujada más pequeña que su propio tamaño se sigue reconstruyendo en RGB y convirtiendo a BT.2020.
+- El perfil 5, y el perfil 10 de AV1 con una capa base compatible con nada, se reconstruyen para salir como HDR10 donde no es posible la salida nativa, diga lo que diga "Dolby Vision como HDR10 cuando hace falta"; HDR10+ y "Dolby Vision como HDR10: ajustar a la pantalla" siguen a ese ajuste como dice su ayuda.
+- Perfil 8.4: lo compone el compositor de la especificación, o el reshaping de libplacebo, donde el RPU de la imagen declara su imagen HDR en PQ (signal_eotf 0xFFFF), decidido imagen a imagen; si no, se reproduce como HLG (`libplacebo-9975`).
+- Perfil 8.2 (una capa base SDR): se compone a 14 bits y se convierte a PQ como dice la cláusula 5.5 de ETSI GS CCM 001 (`libplacebo-9955`); nunca con el reshaping de libplacebo, que tomaría su capa base por PQ. Donde el compositor no lo toma, se reproduce como lo reproduce Kodi, y `kodi.log` dice por qué.
+- Una capa de mejora codificada más grande que su imagen (1088 filas para 1080, por ejemplo) se importa al tamaño de la imagen: el remuestreo leía las filas de más.
+- Una parte de mapeo de contenido v4.0 que no se puede llevar (un bloque de una longitud o un valor que dovi_tool no conoce, o uno que haría pasar los metadatos de un fotograma de 512 bytes) se deja fuera durante el resto del flujo, que conserva la salida nativa con la parte v2.9; `kodi.log` dice qué bloque y por qué. Antes se rechazaba cada fotograma y la salida nativa se detenía.
+- Los metadatos de un fotograma que no se pueden enviar dicen por qué en `kodi.log`.
+- Donde un RPU no tiene bloque de nivel 5 pero sí una parte de mapeo de contenido v4.0, el bloque de nivel 5 que hace Hades va al final de la parte v2.9, donde un RPU lleva el suyo.
+- La capa de mejora: una imagen emparejada cuya imagen de mejora no trajo RPU toma la lectura del RPU del decodificador base; la capa arranca por orden de imagen solo donde eso se puede saber; los códigos de inicio de un paquete se buscan una sola vez.
+- Dolby Vision mostrado como HDR10 en una ventana de 10 bits se guarda como los códigos de esa ventana (`libplacebo-9946`): los mismos bytes, con menos memoria y ancho de banda de la GPU.
+- El reshaping propio de libplacebo (el ajuste experto "Composición", y las imágenes que no toma el compositor de la especificación) descuantiza la capa de mejora sobre su valor tal como lo da el escalador, sin el redondeo a un entero que trajo libplacebo 7.387.0 (`libplacebo-9978`). Medido frente a la referencia de la especificación, el redondeo alejaba de ella la imagen decodificada en todos los niveles de la reducción (el 61,0 % de sus píxeles a un código o más, en vez del 56,7 %), y en los niveles 2 y 3 hacía que las dos formas de dibujar un fotograma difirieran en el 5,5 % de sus códigos de croma, hasta en 2, en vez del 0,3 %, en 1. El compositor de la especificación, el de por defecto, no lo usa.
+- El ajuste experto "Mapeo de gama más fino" (*Sistema > Pantalla > Motor de Dolby Vision*) mapea con una tabla de 256x192x512 entradas en vez de 96x64x512; donde no se pueden filtrar texturas unorm de 16 bits, la tabla se guarda en coma flotante.
+
+**Rendimiento**
+
+- Los fotogramas presentados de la forma que espera que pierden su refresco una y otra vez (dos de las tres últimas tandas de 240 fotogramas sin elementos de la interfaz con tres tardíos o más) se presentan un fotograma por adelantado, sea cual sea su tiempo medio de GPU.
+- Los fotogramas con menús, el OSD o una ventana sobre una imagen que dibuja el residuo de una capa de mejora bajan de nivel por su cuenta, con la misma regla que los fotogramas sin ellos, solo mientras la interfaz está sobre la imagen.
+- En el remuestreo de la capa de mejora, las pasadas verticales leen solo las filas que usan (`libplacebo-9970`) y usan coma flotante de 16 bits donde es exacta (`libplacebo-9971`); los planos compuestos para el transporte son de 16 bits (`libplacebo-9960`); las dos filas de 4:2:2 de una fila de 4:2:0 se hacen en un solo fragmento. Los mismos bytes.
+- En nvidia-drm, que con sus valores por defecto no tiene borrado vertical que esperar, una imagen repetida se conserva volviendo a hacer su commit con un commit que espera su cambio de página, en vez de dibujarse otra vez en cada refresco.
+- El trabajo de GPU de un fotograma de la forma que espera se termina después de su intercambio de búferes, como en las otras formas, y un fotograma nativo se confirma sin un commit de prueba antes.
+- Las ventanas que se abren sobre un vídeo (el OSD, la información del reproductor, Ajustes, los ajustes de vídeo, audio y subtítulos del reproductor, y la información a pantalla completa) se cargan de una en una mientras los menús están en reposo, para que la primera vez que se abren sobre un vídeo no tarden un refresco.
+- El decodificador de la capa de mejora tiene un conjunto fijo de 32 superficies con el controlador VAAPI de NVIDIA, y el de FFmpeg, que crece según hace falta, con cualquier otro; mientras la capa retiene 32, su siguiente unidad de acceso espera en vez de quedarse sin superficie.
+
+**Pantalla y HDMI**
+
+- Modos nuevos de una pantalla mientras Kodi funciona: las resoluciones se rehacen con ellos unos segundos después del cambio, mientras no se reproduce nada, con las elecciones que haría un arranque (Escritorio en el modo preferido, y una resolución elegida que se sigue ofreciendo, conservada). El aviso de una entrada en modo HDMI 1.4 ya no pide reiniciar.
+- Cuando Kodi vuelve a leer un conector, lo que leyó antes sigue valiendo para quien todavía lo tiene, y las listas de modos que una lectura sustituye se sueltan cuando ya nada puede leerlas: se quedan las 16 más nuevas, y una más vieja se va un minuto después de ser sustituida.
+- SDR a 8 bits por HDMI en NVIDIA e Intel; HDR10, HLG, HDR10+ y el vídeo SDR de más de 8 bits conservan la profundidad que elige el controlador, y Dolby Vision sus 8 bits. La profundidad solo cambia con un cambio de modo, de la señalización HDR o con el final del Dolby Vision. AMD conserva su propia elección.
+- "Profundidad de la salida HDR (NVIDIA)" (`videoscreen.hadeshdrdepth`, Experto, Automático): "8 bits" deja HDR10 y HLG a 8 bits por componente.
+- El túnel Standard va solo a una pantalla que deja a la fuente elegir el rango RGB (QS), con todos los controladores de gráfica, como ya pedía el de NVIDIA (`linux-9987`).
+- Intel y AMD: la regla del túnel en una sola cabecera (`include/drm/drm_dvbridge.h`, `linux-9984`), que en Intel se lee al detectar la pantalla en vez de leer el EDID del conector en la comprobación atómica (`linux-9985`); en AMD, un formato de color que no es RGB rechaza el túnel con su propio motivo (`linux-9988`); en Intel desde la versión de pantalla 11, la comprobación del barrido lee lo que programa la tubería (`linux-9989`); pruebas KUnit de la regla y del InfoFrame del fabricante de Dolby (`linux-9991`); en AMD, ninguna disposición 3D para un estado de conector sin su conector (`linux-9992`).
+- Si Kodi se detiene durante la salida nativa, la consola recupera la pantalla sin las propiedades de Dolby Vision (`linux-9986`, `nvidia-open-kernel-modules-9040`).
+- El InfoFrame del fabricante de Dolby de `drivers/video/hdmi.c` y de `include/linux/hdmi.h` está escrito para esta compilación con la misma interfaz y los mismos bytes, bajo el aviso de permiso de esos archivos (`linux-9899`, en lugar de `linux-9900-08` y `-09`).
+- NVIDIA: el EDID que nvidia-drm le da a Kodi tiene todos los bloques, también los que solo cuenta un HF-EEODB (`nvidia-open-kernel-modules-9041`, issue #7); una pantalla que declara 3D por HDMI recibe HDR10, decidido por lo que envía la salida (`9042`); a 3840x2160 a 24, 25 y 30 Hz y a 4096x2160 a 24 Hz, una pantalla sin UHD_VIC recibe el InfoFrame del fabricante de HDMI junto con HDR10, en la ranura genérica de InfoFrame donde está libre (`9043`), y la LG C5 los mismos bytes que antes; el registro del kernel dice cómo sale cada cambio de modo HDMI (`9044`); los ganchos eglChooseConfig y eglCreatePbufferSurface de egl-gbm, hechos seguros (`nvidia_egl-gbm-9000`); Kodi no llega a ellos.
+- NVIDIA, en un conector DisplayPort de doble modo manejado como HDMI: el modo del vídeo sale primero, y la salida nativa solo empieza en el modo que tiene la salida, apagando y encendiendo la salida para que el enlace empiece desde cero (issue #4).
+- Al despertar de la suspensión, los propios fotogramas ven que el sistema durmió y hacen que la salida se vuelva a poner antes de confirmarse.
+- La información del reproductor dice "HDR10+" mientras sale HDR10+, con lo que se envió de él; los percentiles del InfoFrame HDR10+ se colocan por su porcentaje, y no se envía HDR10+ donde no encajan.
+- `kodi.log` dice sin el registro de depuración en qué modo arranca Kodi y de dónde lo toma.
+- Dolby Vision con la señalización de HDMI 1.4b (`videoscreen.hadesdvhdmi14b`, apagado): a una pantalla cuyo bloque Dolby Vision la pide (42 de los 603 EDID de las pruebas de anfitrión del proyecto, 41 de ellos con QS), el túnel va con el InfoFrame del fabricante de HDMI de 24 bytes, que lleva el VIC de HDMI a 3840x2160 a 24, 25 y 30 Hz con el VIC 0 en el InfoFrame AVI, y la parte de los metadatos que lee su versión de gestión de pantalla (`linux-9993` a `linux-9996` para i915, xe y amdgpu; `nvidia-open-kernel-modules-9045`, `nvidia-legacy-open-9058`). Si una tele la acepta no se puede comprobar desde el reproductor: [cómo funciona](docs/how-it-works.md#dolby-vision-with-the-hdmi-14b-signalling), en inglés.
+- NVIDIA: Dolby Vision Low-Latency en un conector DisplayPort de doble modo manejado como HDMI, al que nvidia-drm daba las demás propiedades HDMI pero no `NV_HDMI_DV_LOW_LATENCY`, así que ahí se rechazaba el Low-Latency (`nvidia-open-kernel-modules-9046`; el controlador 580 ya la tenía).
+- NVIDIA: los InfoFrame que escribe el controlador de NVIDIA para las tarjetas Turing, Ampere y Ada, y el controlador 580 para las suyas, perdían su último byte (un fallo del propio controlador): el HDR10 recibe ahora su MaxFALL entero cuando es 256 o más, el 3D arriba y abajo de Kodi se señala como arriba y abajo en lugar de *frame packing*, y el InfoFrame HDR10+ del controlador 580 conserva su último byte (`nvidia-open-kernel-modules-9047`, `nvidia-legacy-open-9059`). Dolby Vision, el SDR y los demás InfoFrame conservan los mismos bytes.
+- NVIDIA: el InfoFrame de fabricante de HDMI que el controlador de NVIDIA arma él mismo para el 3D *frame packing* ya no lleva un bit de metadatos 3D que quedaba en la memoria: se arma sobre ceros, y la máscara de ese bit es la de HDMI 1.4b (`nvidia-open-kernel-modules-9048`, `nvidia-legacy-open-9061`). Nada más de lo que envía el controlador cambia.
+- Con `<dveos>`, el fotograma que marca el final de Dolby Vision sale en el modo de la salida, antes de que cambie el modo, y solo donde puede salir como un fotograma de transporte.
+
+**Archivos y flujos**
+
+- Un archivo Matroska de dos pistas de vídeo con el registro Dolby Vision solo en su pista base, que FFmpeg agrupa al revés, se une como un archivo sin grupo.
+- Menús Java de Blu-ray: libbluray busca la parte Java de su propia versión en sus sitios de siempre donde `LIBBLURAY_CP` no tiene ninguna (`libbluray-9036`); la imagen trae `libbluray-j2se-1.5.1.jar` y `libbluray-awt-j2se-1.5.1.jar`, compilados del código fuente de libbluray (`libbluray-bdj`); Kodi distingue cinco estados y dice qué hacer en un diálogo y en `kodi.log`. La imagen no trae ningún entorno de ejecución de Java.
+- DVD: libdvdcss lee los discos CPXM que no tienen preparado el descifrado.
+
+**Audio**
+
+- La salida de audio de la pantalla que usa Kodi, reconocida por el fabricante, el producto y el nombre que dan a la vez su EDID y sus datos de audio, para PCM y para paso directo, mientras no se haya elegido ninguna salida; donde no se puede saber con seguridad, no cambia nada.
+- Un sonido de la interfaz solo se mezcla en un paquete de audio de su propio formato.
+- La lista de salidas de audio se lee de una copia entera que cada lista nueva sustituye: una parte de Kodi que la leía mientras se volvían a listar las salidas, como pasa cuando aparece o desaparece una pantalla, podía encontrarla a medio hacer o ya liberada.
+
+**Información del reproductor y skins**
+
+- La página Dolby Vision dice qué compositor hizo cada imagen y, con `<dvpasstimes>`, las pasadas que más tiempo de GPU tardaron; la página de resumen da el nivel de los fotogramas con elementos de la interfaz donde es otro.
+- La información del reproductor de Hades para cualquier skin se rehace a partir de las páginas de Estuary.
+
+**Interfaz**
+
+- El texto que se desplaza se dibuja con la profundidad de la pasada en la que se dibuja, así que ya no se corta.
+- Con un vídeo en marcha, la línea de cada minuto de `kodi.log` cuenta las pasadas de la interfaz que tardaron más de 1,5 periodos de refresco, y en qué ventana.
+
+**Diagnóstico y registros**
+
+- El número de un arranque sigue tras una actualización, una carpeta `start-N` guarda solo ese arranque, y cada captura dice qué compilación la escribió.
+- Con una gráfica NVIDIA, cada captura de Dolby Vision empieza con una consulta de `nvidia-smi` (los relojes y lo que los frena, el consumo y las temperaturas), con la prioridad más baja.
+- Bluetooth: `bluetooth.txt` en cada captura, y se filtran las direcciones Bluetooth que el filtro dejaba pasar (las aleatorias y las de las rutas de objeto de BlueZ). Ver [docs/bluetooth.md](docs/bluetooth.md) (en inglés).
+- `redetect.txt` dice de quién son sus líneas "demoting to read-only probe", y el diagnóstico dice qué controlador NVIDIA se eligió al arrancar.
+- Los nombres de los dispositivos Bluetooth que guarda BlueZ se cambian por marcas en todo lo que dejan salir el filtro del diagnóstico y "Enviar registro", y las carpetas que pasaron por un filtro anterior se vuelven a filtrar ([docs/bluetooth.md](docs/bluetooth.md), en inglés).
+
+**Sistema**
+
+- *Particiones internas que se muestran*, en *Sistema > Discos internos* de los ajustes de LibreELEC: las particiones se reconocen por el WWN y el número de serie de su disco y su identificador en la tabla de particiones; donde la lista no se puede leer, no se monta ninguna partición interna.
+- *Discos internos que se muestran*, en el mismo sitio: el init suelta los discos NVMe y SATA que no están marcados antes de que se ejecute nada más, el kernel no conecta ningún otro disco interno hasta el siguiente arranque y queda bloqueado (integrity); los discos se reconocen por su modelo y su número de serie, y donde la lista no se puede leer se apartan todos. El disco en el que está el sistema no se aparta nunca ([ajustes](docs/settings.md#libreelec-settings), en inglés).
+- Un disco que la lista aparta pero que se queda conectado (su controlador no lo soltó, o no se pudo saber con certeza desde qué disco arranca el sistema) se nombra al arrancar Kodi y en la lista, y en ese arranque no se monta ninguna partición de un disco interno; dos discos con el mismo modelo y el mismo número de serie se apartan los dos mientras haya lista; Run y Live dejan la marca de los discos ocultos antes que nada.
+- Una lista de los discos que no se puede leer cuando el init vuelve a mirar, con el almacenamiento del sistema ya montado, aparta todos los discos internos, igual que una que no se puede leer la primera vez, y los ajustes lo dicen.
+- Bluetooth: los ajustes de LibreELEC escriben en `kodi.log` por qué se desconectó cada dispositivo, y dicen una vez en pantalla cuándo un dispositivo rechazó la clave guardada para él.
+- El firmware del controlador `xe` de Intel (`xe/` de linux-firmware) está en el sistema; los textos de licencia del firmware que va dentro del kernel están en `licenses/`, y el sistema tiene el `WHENCE` y los textos de licencia de linux-firmware en `/usr/share/licenses/kernel-firmware`.
+- Interruptores expertos para comparar en una pantalla, apagados por defecto: `<dvmmrtable>` (el mapeo MMR del compositor con una tabla, los mismos bytes) y `<dveos>` (un fotograma de transporte negro que marca el final de la señal), en `advancedsettings.xml`; ver [los ajustes](docs/settings.md#advancedsettingsxml) (en inglés).
+
+**Actualizaciones y seguridad**
+
+- Linux 7.3, con los parches del kernel de esta compilación trasladados (23 de ellos, todos de AMD, escritos de nuevo para los archivos en los que 7.3 los reparte); LibreELEC `master` hasta 5c35a73c10b4 (Samba 4.25.1, NSS 3.132, HarfBuzz 15.0.0, media-driver 26.4.1 de Intel, strace 7.3, usbutils 020, pycryptodome 4.2.0, firmware Wi-Fi de Intel, los certificados raíz del 2026-10-22, 7-Zip 26.05); Kodi `Piers` hasta 7f485d6bcbc4 (68 commits; el último, para que un flujo DTS-HD MA ya no se tome por DTS-HD a mitad de su reproducción); libplacebo 7.387.0, que ya tiene ocho de los parches de esta compilación; OpenSSL 4.1.0; Python 3.14.10; CMake 4.4.5.
+- Arreglos tomados de los proyectos originales: avahi (42 cambios: 17 CVE y 10 fallos más), expat (CVE-2026-115506, CVE-2026-113351), OpenSSL (su rama 4.1 después de 4.1.0, y su rama 3.5 después de 3.5.9 para el OpenSSL 3 que usan los complementos), Python (CVE-2026-115557, en 3.14.10), glibc (10), FFmpeg (3), BlueZ (1), BusyBox (1), MariaDB Connector/C (su rama 3.4 después de 3.4.11: CONC-858, CONC-859, CONC-861, CONC-863, CONC-864 y CONC-865, comprobación de los límites de lo que envía un servidor y de su certificado); Samba 4.25.1 trae los seis arreglos que esta compilación llevaba para él.
+- Arreglados por Hades donde el proyecto original aún no tiene arreglo: connman (CVE-2026-115863); avahi (CVE-2025-59529: el servidor del protocolo simple limita sus clientes, en total, por usuario y para todos los usuarios salvo root, cierra los que no envían nada en 5 segundos y ya no entra en un bucle cuando se queda sin descriptores de archivo; las pruebas de avahi dan lo mismo con él, y se ejecutó con una inundación de clientes que no envían nada, 72 suscripciones a la vez, sin descriptores de archivo libres y con una petición cortada a la mitad, con los comprobadores de direcciones, de comportamiento indefinido y de fugas: el demonio siguió respondiendo y no se encontró ningún fallo; sus límites por usuario no se ejecutaron, porque hacen falta dos cuentas de usuario).
+- Controlador 580 de NVIDIA: su núcleo de modos, compilado del código abierto de NVIDIA, vuelve por el *return thunk* del kernel, como el controlador 615 (`nvidia-legacy-open-9060`).
+
+Lo que se ha visto en una tele está en el [README en español](README.es.md), en "Qué se ha probado". Algunas ideas vinieron de otras compilaciones y se escribieron de nuevo para Hades; el README las acredita.
+
 ## 1.0 RC3
 
 ### What's new for you

@@ -122,6 +122,8 @@ What the installer never does
   disks of your PC: delete it before you pass this folder on to someone else.
 
 Licences
+  This installer is free software under the GNU General Public License, version 2 or (at your option)
+  any later version: COPYING.txt, next to it, is the text of that licence. It comes with no warranty.
   LibreELEC Hades is LibreELEC (https://libreelec.tv) with changes, under the GPL-2.0 licence. Its media
   centre is Kodi (https://kodi.tv), modified: that is why it shows itself as LibreELEC Hades and not as
   Kodi, which is a registered trademark of the XBMC Foundation. It includes other free software as well,

@@ -1,0 +1,171 @@
+From 1c0533a10e66451ea6854ab581e9a0b19062cb69 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 03:37:38 +0000
+Subject: [PATCH] block, PCI, mmc: a second level of
+ kernel.internal_disk_attach_disabled
+
+A system that is started from a USB drive and must not reach the disks
+inside the computer keeps the NVMe and AHCI drivers from starting
+(initcall_blacklist). The kernel has other drivers of such disks built in:
+libata's for SATA in IDE mode and for older controllers, RAID and SAS
+controllers, UFS, the virtual disks of a virtual machine, eMMC. Their disks
+are attached. Its init can detach them, but whoever is root later binds the
+driver again, rescans the bus or loads a driver of the same class.
+
+At 2, kernel.internal_disk_attach_disabled refuses those too: no driver
+takes a PCI device of the class "mass storage" any more (pci_device_probe,
+whatever the driver), and the MMC block driver gives no disk for an eMMC; an
+SD card is not concerned. NVMe and libata refuse at 1 and 2 as they did.
+The level goes up only: from 0 to 1 or 2, from 1 to 2; 1 means what it
+meant. A system installed on an internal disk sets 1 and is not changed.
+
+The init of a start from a USB drive sets 2, then detaches the storage
+controllers and the eMMC cards that its own disk is not on. The virtual
+disks of a virtual machine and the eMMC are kept from the kernel this way
+and not by initcall_blacklist: the start may be on a virtual disk, and the
+host of an eMMC is also the host of an SD card reader.
+---
+ block/genhd.c            | 43 +++++++++++++++++++++++++++++++++++++---
+ drivers/mmc/core/block.c | 11 ++++++++++
+ drivers/pci/pci-driver.c | 13 ++++++++++++
+ include/linux/blkdev.h   |  1 +
+ 4 files changed, 65 insertions(+), 3 deletions(-)
+
+diff --git a/block/genhd.c b/block/genhd.c
+index ec2488b..32bf000 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -1010,8 +1010,16 @@ static const struct seq_operations partitions_op = {
+  * system that has detached the disks it must not reach and means that to hold
+  * against whoever becomes root later; with the kernel locked down (integrity)
+  * and without the means to load a driver of one's own, they stay out of reach.
++ *
++ * At 2, which a system started from a USB drive asks for, every other disk
++ * that a computer has inside is refused as well: no driver takes a storage
++ * controller on PCI any more (the class "mass storage": SCSI, IDE, RAID, SATA,
++ * SAS, NVMe, UFS and the virtual disks of a virtual machine, whatever their
++ * driver), and an eMMC gives no disk (an SD card does). The level goes from 0
++ * to 1 or 2, and from 1 to 2, never down.
+  */
+ static int internal_disk_attach_disabled;
++static DEFINE_MUTEX(internal_disk_attach_lock);
+ 
+ bool blk_internal_disk_attach_disabled(void)
+ {
+@@ -1019,16 +1027,45 @@ bool blk_internal_disk_attach_disabled(void)
+ }
+ EXPORT_SYMBOL_GPL(blk_internal_disk_attach_disabled);
+ 
++bool blk_internal_storage_attach_disabled(void)
++{
++	return READ_ONCE(internal_disk_attach_disabled) >= 2;
++}
++EXPORT_SYMBOL_GPL(blk_internal_storage_attach_disabled);
++
++/* 1 or 2, and not below what it is */
++static int disk_attach_sysctl(const struct ctl_table *table, int write,
++			      void *buffer, size_t *lenp, loff_t *ppos)
++{
++	struct ctl_table t;
++	int value, err;
++
++	if (!write)
++		return proc_dointvec(table, write, buffer, lenp, ppos);
++
++	mutex_lock(&internal_disk_attach_lock);
++	value = internal_disk_attach_disabled;
++	t = *table;
++	t.data = &value;
++	err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
++	if (!err && value < internal_disk_attach_disabled)
++		err = -EINVAL;
++	if (!err)
++		WRITE_ONCE(internal_disk_attach_disabled, value);
++	mutex_unlock(&internal_disk_attach_lock);
++	return err;
++}
++
+ static const struct ctl_table disk_attach_sysctl_table[] = {
+ 	{
+ 		.procname	= "internal_disk_attach_disabled",
+ 		.data		= &internal_disk_attach_disabled,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		/* only a transition from "0" to "1" */
+-		.proc_handler	= proc_dointvec_minmax,
++		/* only up: from "0" to "1" or "2", from "1" to "2" */
++		.proc_handler	= disk_attach_sysctl,
+ 		.extra1		= SYSCTL_ONE,
+-		.extra2		= SYSCTL_ONE,
++		.extra2		= SYSCTL_TWO,
+ 	},
+ };
+ 
+diff --git a/drivers/mmc/core/block.c b/drivers/mmc/core/block.c
+index e760d13..12835ac 100644
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -3210,6 +3210,17 @@ static int mmc_blk_probe(struct mmc_card *card)
+ 	if (!(card->csd.cmdclass & CCC_BLOCK_READ))
+ 		return -ENODEV;
+ 
++	/*
++	 * kernel.internal_disk_attach_disabled at 2 (block/genhd.c): an eMMC,
++	 * which is part of the computer, gives no disk any more; SD cards are not
++	 * concerned.
++	 */
++	if (mmc_card_mmc(card) && blk_internal_storage_attach_disabled()) {
++		pr_info("%s: not attached: kernel.internal_disk_attach_disabled is 2\n",
++			mmc_hostname(card->host));
++		return -ENODEV;
++	}
++
+ 	mmc_fixup_device(card, mmc_blk_fixups);
+ 
+ 	card->complete_wq = alloc_workqueue("mmc_complete",
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index e16aa59..b852f89 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -21,6 +21,7 @@
+ #include <linux/acpi.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/iommu.h>
++#include <linux/blkdev.h>
+ #include "pci.h"
+ #include "pcie/portdrv.h"
+ 
+@@ -502,6 +503,18 @@ static int pci_device_probe(struct device *dev)
+ 	if (!pci_device_can_probe(pci_dev))
+ 		return -ENODEV;
+ 
++	/*
++	 * kernel.internal_disk_attach_disabled at 2 (block/genhd.c): no driver
++	 * takes a storage controller any more, whichever driver it is: a bind
++	 * through sysfs, a rescan of the bus and a new device id find nothing.
++	 */
++	if (IS_ENABLED(CONFIG_BLOCK) &&
++	    (pci_dev->class >> 16) == PCI_BASE_CLASS_STORAGE &&
++	    blk_internal_storage_attach_disabled()) {
++		pci_info(pci_dev, "not attached: kernel.internal_disk_attach_disabled is 2\n");
++		return -ENODEV;
++	}
++
+ 	pci_assign_irq(pci_dev);
+ 
+ 	error = pcibios_alloc_irq(pci_dev);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 700851c..011c3e5 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1704,6 +1704,7 @@ struct block_device *I_BDEV(struct inode *inode);
+ struct block_device *file_bdev(struct file *bdev_file);
+ bool disk_live(struct gendisk *disk);
+ bool blk_internal_disk_attach_disabled(void);
++bool blk_internal_storage_attach_disabled(void);
+ unsigned int block_size(struct block_device *bdev);
+ 
+ #ifdef CONFIG_BLOCK
+-- 
+2.53.0
+

@@ -1,0 +1,542 @@
+From 91692e614a85d875e15ec740368f0d9e822f2aa7 Mon Sep 17 00:00:00 2001
+From: Georg Richter <georg@mariadb.com>
+Date: Tue, 27 Oct 2026 13:34:51 +0100
+Subject: [PATCH 3/5] Branch 3.4 after 3.4.11: Merge branch '3.4-tls' into 3.4
+ (CONC-865)
+
+The change that merge commit f583dfe4d2dd3eeceb889049fb0ce549cb4f5c05 of the 3.4 branch of
+https://github.com/mariadb-corporation/mariadb-connector-c brought,
+taken as it landed on that branch (the diff against its first parent).
+The commits it merges, with their own messages:
+
+----- b1895c06e0e682edec20b0e54ba94142a8bed899
+Author: Georg Richter <georg@mariadb.com>
+Date:   Mon, 26 Oct 2026 08:26:23 +0100
+
+CONC-865: Treat a server certificate without CA as MARIADB_TLS_VERIFY_TRUST
+
+A server may legitimately send only its leaf certificate (RFC 8446,
+4.4.2 allows omitting the trust anchor). MariaDB servers built with
+wolfSSL do this, while OpenSSL-based servers append the CA from ssl_ca.
+A client without that CA reported the chain differently per backend:
+OpenSSL failed with MARIADB_TLS_VERIFY_UNKNOWN, GnuTLS accepted it only
+if the leaf itself was self-signed.
+
+Both backends now report a chain that cannot be anchored in the
+client's trust store as MARIADB_TLS_VERIFY_TRUST, i.e. the same way as a
+self-signed certificate:
+
+- OpenSSL: X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT (2),
+  X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY (20) and
+  X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE (21) are mapped to TRUST,
+  in addition to the self-signed errors (18, 19).
+- GnuTLS: GNUTLS_CERT_SIGNER_NOT_FOUND is reported as TRUST. The
+  ma_gnutls_is_self_signed() check on the leaf is removed, since
+  GnuTLS uses this flag for several different situations.
+
+A leaf without CA therefore no longer produces a verification error.
+Whether the connection is accepted is decided as before:
+ - if ssl_ca/ssl_capath is set, my_auth.c aborts the connection;
+ - on local connections TRUST is not requested, so nothing is checked;
+ - otherwise verification is deferred to the password based proof.
+Unmapped errors (e.g. unknown critical extensions) still give
+MARIADB_TLS_VERIFY_UNKNOWN.
+
+Related fixes:
+- ma_pvio_tls_verify_server_cert(): the status was masked with the
+  requested flags, which dropped PERIOD, REVOKED and UNKNOWN. Only
+  soft findings (TRUST, HOST, FINGERPRINT) that were not requested are
+  dropped now. The unmasked result stays in extension->tls_validation.
+- my_auth.c: clear the verification error once verification passed or
+  was deferred, so a stale CR_SSL_CONNECTION_ERROR is not reported.
+- ma_get_cert() (GnuTLS): fix certificate leak on import failure.
+
+Tests: add leaf-without-CA and OpenSSL error 2 tests, and an
+"intermediate" mode in the dummy TLS server. Results no longer depend
+on whether the dummy server host is considered local.
+---
+ libmariadb/ma_tls.c               |  10 +-
+ libmariadb/secure/gnutls.c        |  31 ++----
+ libmariadb/secure/openssl.c       |   6 +-
+ plugins/auth/my_auth.c            |   2 +
+ unittest/libmariadb/tls.c.in      | 157 ++++++++++++++++--------------
+ unittest/libmariadb/tls_server.py |  46 +++++++++
+ 6 files changed, 152 insertions(+), 100 deletions(-)
+
+diff --git a/libmariadb/ma_tls.c b/libmariadb/ma_tls.c
+index 7bbd28e..1e74549 100644
+--- a/libmariadb/ma_tls.c
++++ b/libmariadb/ma_tls.c
+@@ -178,8 +178,14 @@ int ma_pvio_tls_verify_server_cert(MARIADB_TLS *ctls, unsigned int flags)
+   /* Save original validation */
+   mysql->extension->tls_validation= mysql->net.tls_verify_status;
+ 
+-  /* Retain requested flags AND preserve UNKNOWN status if set */
+-  mysql->net.tls_verify_status&= (flags | MARIADB_TLS_VERIFY_UNKNOWN);
++#define MA_TLS_SOFT_FLAGS (MARIADB_TLS_VERIFY_TRUST | \
++                           MARIADB_TLS_VERIFY_HOST | \
++                           MARIADB_TLS_VERIFY_FINGERPRINT)
++
++  /* Drop only the soft findings the caller didn't ask for */
++  mysql->net.tls_verify_status&= ~(MA_TLS_SOFT_FLAGS & ~flags);
++
++#undef MA_TLS_SOFT_FLAGS
+ 
+   return rc;
+ }
+diff --git a/libmariadb/secure/gnutls.c b/libmariadb/secure/gnutls.c
+index 16e3c04..244de74 100644
+--- a/libmariadb/secure/gnutls.c
++++ b/libmariadb/secure/gnutls.c
+@@ -1268,7 +1268,7 @@ static gnutls_x509_crt_t ma_get_cert(MARIADB_TLS *ctls)
+   const gnutls_datum_t *cert_list;
+   unsigned int cert_list_size;
+   gnutls_x509_crt_t cert;
+-    
++
+   if (!ctls || !ctls->ssl)
+     return 0;
+ 
+@@ -1278,17 +1278,19 @@ static gnutls_x509_crt_t ma_get_cert(MARIADB_TLS *ctls)
+   if (cert_list == NULL)
+   {
+     my_set_error(mysql, CR_SSL_CONNECTION_ERROR, SQLSTATE_UNKNOWN,
+-                        ER(CR_SSL_CONNECTION_ERROR), 
++                        ER(CR_SSL_CONNECTION_ERROR),
+                         "Unable to get server certificate");
+     return NULL;
+   }
+ 
+-  /* Check expiration */
+-  gnutls_x509_crt_init(&cert);
++  if (gnutls_x509_crt_init(&cert))
++    return NULL;
+ 
+   if (!gnutls_x509_crt_import(cert, &cert_list[0], GNUTLS_X509_FMT_DER))
+     return cert;
+ 
++  gnutls_x509_crt_deinit(cert);
++
+   return NULL;
+ }
+ 
+@@ -1458,15 +1460,6 @@ static void set_verification_error(MYSQL *mysql, int status)
+   gnutls_free(out.data);
+ }
+ 
+-static my_bool ma_gnutls_is_self_signed(gnutls_x509_crt_t cert)
+-{
+-  if (!cert)
+-    return FALSE;
+-
+-  /* Returns 1 if cert was issued by cert (self-issued) */
+-  return (gnutls_x509_crt_check_issuer(cert, cert) == 1);
+-}
+-
+ int ma_tls_verify_server_cert(MARIADB_TLS *ctls, unsigned int flags)
+ {
+   unsigned int status= 0;
+@@ -1497,15 +1490,7 @@ int ma_tls_verify_server_cert(MARIADB_TLS *ctls, unsigned int flags)
+ 
+     if (status & GNUTLS_CERT_SIGNER_NOT_FOUND)
+     {
+-      gnutls_x509_crt_t cert = ma_get_cert(ctls);
+-      my_bool self_signed = ma_gnutls_is_self_signed(cert);
+-      if (cert)
+-        gnutls_x509_crt_deinit(cert);
+-
+-      if (self_signed)
+-        mysql->net.tls_verify_status |= MARIADB_TLS_VERIFY_TRUST;
+-      else
+-        mysql->net.tls_verify_status |= MARIADB_TLS_VERIFY_UNKNOWN;
++      mysql->net.tls_verify_status |= MARIADB_TLS_VERIFY_TRUST;
+     }
+ 
+     /* Fallback for unhandled GnuTLS bits (e.g. INSECURE_ALGORITHM, SIGNATURE_FAILURE) */
+@@ -1531,7 +1516,7 @@ int ma_tls_verify_server_cert(MARIADB_TLS *ctls, unsigned int flags)
+     if (!cert)
+     {
+       my_set_error(mysql, CR_SSL_CONNECTION_ERROR, SQLSTATE_UNKNOWN,
+-                   ER(CR_SSL_CONNECTION_ERROR), 
++                   ER(CR_SSL_CONNECTION_ERROR),
+                    "Can't access peer certificate");
+       mysql->net.tls_verify_status|= MARIADB_TLS_VERIFY_HOST;
+       goto end;
+diff --git a/libmariadb/secure/openssl.c b/libmariadb/secure/openssl.c
+index 68f6b60..7b45625 100644
+--- a/libmariadb/secure/openssl.c
++++ b/libmariadb/secure/openssl.c
+@@ -811,7 +811,9 @@ static int ma_verification_callback(int preverify_ok __attribute__((unused)), X5
+ 
+     if ((x509_err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT ||
+          x509_err == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN ||
+-         x509_err == X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE)) 
++         x509_err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT ||
++         x509_err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY ||
++         x509_err == X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE))
+       verify_status= MARIADB_TLS_VERIFY_TRUST;
+     else if (x509_err == X509_V_ERR_CERT_REVOKED)
+       verify_status= MARIADB_TLS_VERIFY_REVOKED;
+@@ -819,9 +821,7 @@ static int ma_verification_callback(int preverify_ok __attribute__((unused)), X5
+             x509_err == X509_V_ERR_CERT_HAS_EXPIRED)
+       verify_status= MARIADB_TLS_VERIFY_PERIOD;
+     else if (x509_err != X509_V_OK)
+-    {
+       verify_status= MARIADB_TLS_VERIFY_UNKNOWN;
+-    }
+ 
+     if (verify_status)
+     {
+diff --git a/plugins/auth/my_auth.c b/plugins/auth/my_auth.c
+index 34fdf72..339b747 100644
+--- a/plugins/auth/my_auth.c
++++ b/plugins/auth/my_auth.c
+@@ -487,6 +487,8 @@ static int send_client_reply_packet(MCPVIO_EXT *mpvio,
+       if (!password_and_hashing(mysql, mpvio->plugin))
+         goto error;
+     }
++    /* verification passed or was deferred to the password based proof */
++    CLEAR_CLIENT_ERROR(mysql);
+   }
+ #endif /* HAVE_TLS */
+ 
+diff --git a/unittest/libmariadb/tls.c.in b/unittest/libmariadb/tls.c.in
+index c5aa330..9d54dd0 100644
+--- a/unittest/libmariadb/tls.c.in
++++ b/unittest/libmariadb/tls.c.in
+@@ -43,6 +43,9 @@ if (!have_dummy_server) {\
+   return SKIP;\
+ }
+ 
++#define CHECK_TLS_VALIDATION(m, flag, text) \
++  FAIL_IF(!((m)->extension->tls_validation & (flag)), (text))
++
+ static my_bool is_local_connection(const char *hostname)
+ {
+   const char *local_host_names[]= {
+@@ -384,12 +387,9 @@ static int test_conc712(MYSQL *my __attribute__((unused)))
+   mysql_ssl_set(mysql, NULL, NULL, "./selfsigned.pem", NULL, NULL);
+   mysql_optionsv(mysql, MARIADB_OPT_TLS_VERIFICATION_CALLBACK, tls_abort_after_handshake);
+ 
+-  if (my_test_connect(mysql, tls_dummy_host, username, password, schema,
+-                      tls_dummy_port, socketname, 0, 0))
+-  {
+-    diag("Error: %s", mysql_error(mysql));
+-    goto end;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host, username, password, schema,
++                      tls_dummy_port, socketname, 0, 0);
+   if (is_local_connection(tls_dummy_host))
+   {
+     CHECK_NO_TLS_FLAG(mysql, MARIADB_TLS_VERIFY_HOST, "Hostname verification didn't pass for secure connection");
+@@ -397,7 +397,7 @@ static int test_conc712(MYSQL *my __attribute__((unused)))
+     CHECK_TLS_FLAGS(mysql, MARIADB_TLS_VERIFY_HOST, "Hostname verification passed");
+   }
+   rc= OK;
+-end:
++
+   mysql_close(mysql);
+   return rc;
+ }
+@@ -656,11 +656,8 @@ static int test_cert_expired(MYSQL *my __attribute__((unused)))
+   mysql_ssl_set(mysql, NULL, NULL, NULL, NULL, NULL);
+   set_verify(mysql, 1);
+ 
+-  if (my_test_connect(mysql, tls_dummy_host,  "tlsuser", "foo", NULL,  tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Error expected since cert is not valid yet");
+-    return FAIL;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host,  "tlsuser", "foo", NULL,  tls_dummy_port, NULL, 0, 0);
+   mysql_close(mysql);
+ 
+   /* Set cert expired */
+@@ -675,11 +672,8 @@ static int test_cert_expired(MYSQL *my __attribute__((unused)))
+ 
+   mysql_ssl_set(mysql, NULL, NULL, NULL, NULL, NULL);
+ 
+-  if (my_test_connect(mysql, tls_dummy_host,  "tlsuser", "foo", NULL,  tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Error expected since cert is not valid yet");
+-    return FAIL;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host,  "tlsuser", "foo", NULL,  tls_dummy_port, NULL, 0, 0);
+   CHECK_TLS_FLAGS(mysql, MARIADB_TLS_VERIFY_PERIOD, "NotBefore/NotAfter flag not set")
+   mysql_close(mysql);
+ 
+@@ -734,11 +728,9 @@ static int test_crl(MYSQL *my __attribute__((unused)))
+   mysql_optionsv(mysql, MYSQL_OPT_SSL_CRL, "@CC_BINARY_DIR@/unittest/libmariadb/certs/server-cert.crl");
+   mysql_ssl_set(mysql, NULL, NULL, "@CC_BINARY_DIR@/unittest/libmariadb/certs/cacert.pem", NULL, NULL);
+ 
+-  if (my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Error expected since cert revoked");
+-    goto end;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0);
++
+   /* Revocation check can require a network round-trip that is unreachable in CI;
+      a connection/timeout error here is not a test failure. */
+   if (mysql_errno(mysql) == CR_SSL_CONNECTION_ERROR)
+@@ -785,11 +777,9 @@ static int test_crl_with_fp(MYSQL *my __attribute__((unused)))
+   mysql_optionsv(mysql, MYSQL_OPT_SSL_CRL, "@CC_BINARY_DIR@/unittest/libmariadb/certs/server-cert.crl");
+   mysql_ssl_set(mysql, NULL, NULL, "@CC_BINARY_DIR@/unittest/libmariadb/certs/cacert.pem", NULL, NULL);
+ 
+-  if (my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Error expected since cert revoked");
+-    goto end;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0);
++
+   /* Revocation check can require a network round-trip that is unreachable in CI;
+      a connection/timeout error here is not a test failure. */
+   if (mysql_errno(mysql) == CR_SSL_CONNECTION_ERROR)
+@@ -943,7 +933,6 @@ static int test_fp_and_verify(MYSQL *my __attribute__((unused)))
+     diag("error: %s", mysql_error(mysql));
+     goto end;
+   }
+-
+ /* Schannel aborts on first error, if fingerprint was specified,
+    MARIADB_TLS_VERIFY_TRUST is unset */
+ #ifndef HAVE_SCHANNEL
+@@ -976,16 +965,14 @@ static int test_cert_ip(MYSQL *my __attribute((unused)))
+   }
+   mysql_ssl_set(mysql, NULL, NULL, NULL, NULL, NULL);
+   set_verify(mysql, 1);
+-  mysql_optionsv(mysql, MARIADB_OPT_TLS_VERIFICATION_CALLBACK, tls_abort_after_handshake);
+ 
+-  if (!my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0))
+-  {
+-    CHECK_NO_TLS_FLAG(mysql, MARIADB_TLS_VERIFY_HOST, "Hostname verification didn't pass");
+-    mysql_close(mysql);
+-  } else {
+-    mysql_close(mysql);
+-    return FAIL;
+-  }
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL, tls_dummy_port, NULL, 0, 0);
++
++  FAIL_IF(mysql_errno(mysql) == CR_SSL_CONNECTION_ERROR, "expected successfull TLS handshake");
++
++  mysql_close(mysql);
++
++
+ 
+   return OK;
+ }
+@@ -1081,13 +1068,8 @@ static int test_auth_switch_hostname_mismatch(MYSQL *my __attribute__((unused)))
+     The client MUST fail immediately upon hostname verification failure during TLS.
+     It MUST NOT proceed to send authentication credentials.
+   */
+-  if (my_test_connect(mysql, tls_dummy_host, "tlsuser", strong_pwd, NULL, 
+-                      tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Error: Connection succeeded despite hostname mismatch!");
+-    mysql_close(mysql);
+-    return FAIL;
+-  }
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", strong_pwd, NULL, 
++                      tls_dummy_port, NULL, 0, 0);
+   {
+     unsigned int status;
+     mariadb_get_infov(mysql, MARIADB_TLS_VERIFY_STATUS, &status);
+@@ -1106,13 +1088,13 @@ static int test_auth_switch_hostname_mismatch(MYSQL *my __attribute__((unused)))
+ }
+ 
+ #ifndef HAVE_SCHANNEL
+-static int test_tls_verify_unknown(MYSQL *my __attribute__((unused)))
++static int test_tls_verify_leaf_without_ca(MYSQL *my __attribute__((unused)))
+ {
+   MYSQL *mysql= mysql_init(NULL);
+   int rc= FAIL;
+ 
+-  /* 
+-    Configure dummy server to present a leaf certificate signed by an 
++  /*
++    Configure dummy server to present a leaf certificate signed by an
+     untrusted CA without sending the CA certificate in the handshake chain.
+   */
+   CHECK_DUMMY_SERVER();
+@@ -1126,30 +1108,20 @@ static int test_tls_verify_unknown(MYSQL *my __attribute__((unused)))
+   mysql_ssl_set(mysql, NULL, NULL, NULL, NULL, NULL);
+   set_verify(mysql, 1);
+ 
+-  /* Connection should fail during handshake */
+-  if (my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL,
+-                      tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Connection unexpectedly succeeded despite missing CA cert!");
+-    goto end;
+-  }
++  /* Connection to fake server will be aborted, so ignore return value */
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL,
++                      tls_dummy_port, NULL, 0, 0);
+ 
+-  /* 
+-    Verify that MARIADB_TLS_VERIFY_UNKNOWN was set and survived bitwise masking.
+-    Prior to the fix, status would be masked to 0 (MARIADB_TLS_VERIFY_OK).
+-  */
+-  CHECK_TLS_FLAGS(mysql, MARIADB_TLS_VERIFY_UNKNOWN,
+-                  "MARIADB_TLS_VERIFY_UNKNOWN flag was expected for unhandled OpenSSL error");
++  CHECK_TLS_VALIDATION(mysql, MARIADB_TLS_VERIFY_TRUST, "MARIADB_TLS_VERIFY_TRUST flag was expected.");
+ 
+-  FAIL_IF(mysql_errno(mysql) != CR_SSL_CONNECTION_ERROR,
+-          "Expected CR_SSL_CONNECTION_ERROR on unknown CA error");
++  FAIL_IF(mysql_errno(mysql) == CR_SSL_CONNECTION_ERROR, "TLS error was not cleared after handshake succeeded");
+ 
+   rc= OK;
+ 
+-end:
+   mysql_close(mysql);
+   return rc;
+ }
++
+ #endif
+ 
+ static int test_tls_verify_critical_ext(MYSQL *my __attribute__((unused)))
+@@ -1169,15 +1141,10 @@ static int test_tls_verify_critical_ext(MYSQL *my __attribute__((unused)))
+   mysql_ssl_set(mysql, NULL, NULL, NULL, NULL, NULL);
+   set_verify(mysql, 1); /* Default / Local mode: standard self-signed would pass */
+ 
+-  /* Connection MUST fail due to the critical extension, even on localhost/local connections */
+-  if (my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL,
+-                      tls_dummy_port, NULL, 0, 0))
+-  {
+-    diag("Connection unexpectedly succeeded on a certificate with an unhandled critical extension!");
+-    goto end;
+-  }
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL,
++                      tls_dummy_port, NULL, 0, 0);
+ 
+-  /* 
++  /*
+     Verify MARIADB_TLS_VERIFY_UNKNOWN was set.
+     Status should be MARIADB_TLS_VERIFY_UNKNOWN (32) or 33 (TRUST | UNKNOWN).
+   */
+@@ -1198,6 +1165,49 @@ end:
+   return rc;
+ }
+ 
++#ifdef HAVE_OPENSSL
++/*
++  The client trusts the intermediate but not the root. The chain reaches the
++  trust store but can't be completed: X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT (2),
++  because ctx->num_untrusted < num.
++*/
++static int test_tls_openssl_err2(MYSQL *my __attribute__((unused)))
++{
++  MYSQL *mysql= mysql_init(NULL);
++  int rc= FAIL;
++
++  CHECK_DUMMY_SERVER();
++  if (set_tls_dummy_options("CMD:create_new=True cert_mode='intermediate'"))
++  {
++    diag("Error when setting TLS options");
++    mysql_close(mysql);
++    return FAIL;
++  }
++
++  mysql_ssl_set(mysql, NULL, NULL, "@CC_BINARY_DIR@/unittest/libmariadb/ca.pem", NULL, NULL);
++  set_verify(mysql, 1);
++
++  (void)my_test_connect(mysql, tls_dummy_host, "tlsuser", "foo", NULL,
++                      tls_dummy_port, NULL, 0, 0);
++
++
++  diag("error after connect: %s", mysql_error(mysql));
++  /* error 2 reads "unable to get issuer certificate",
++     error 20 reads "unable to get local issuer certificate" */
++  if (!strstr(mysql_error(mysql), "unable to get issuer certificate"))
++  {
++    diag("expected the text of error 2");
++    goto end;
++  }
++
++  CHECK_TLS_FLAGS(mysql, MARIADB_TLS_VERIFY_TRUST, "TRUST expected");
++  rc= OK;
++end:
++  mysql_close(mysql);
++  return rc;
++}
++#endif
++
+ struct my_tests_st my_tests[] = {
+   /* Don't add test above, test_init needs to be run first */
+   {"test_conc795", test_conc795, TEST_CONNECTION_NEW, 0, NULL, NULL},
+@@ -1221,7 +1231,10 @@ struct my_tests_st my_tests[] = {
+   {"test_crl", test_crl, TEST_CONNECTION_NONE, 0, NULL, NULL},
+   {"test_crl_with_fp", test_crl_with_fp, TEST_CONNECTION_NONE, 0, NULL, NULL},
+ #ifndef HAVE_SCHANNEL
+-  {"test_tls_verify_unknown", test_tls_verify_unknown, TEST_CONNECTION_NEW, 0, NULL, NULL},
++  {"test_tls_verify_leaf_without_ca", test_tls_verify_leaf_without_ca, TEST_CONNECTION_NEW, 0, NULL, NULL},
++#endif
++#ifdef HAVE_OPENSSL
++  {"test_tls_openssl_err2", test_tls_openssl_err2, TEST_CONNECTION_NEW, 0, NULL, NULL},
+ #endif
+   {"test_tls_verify_critical_ext", test_tls_verify_critical_ext, TEST_CONNECTION_NEW, 0, NULL, NULL},
+   {"stop_tls_server", stop_tls_server, TEST_CONNECTION_NONE, 0, NULL, NULL},
+diff --git a/unittest/libmariadb/tls_server.py b/unittest/libmariadb/tls_server.py
+index 176bf4a..d37b6e0 100755
+--- a/unittest/libmariadb/tls_server.py
++++ b/unittest/libmariadb/tls_server.py
+@@ -154,6 +154,52 @@ class TlsServer():
+                         ))
+                     return 1
+ 
++                if cert_mode == "intermediate":
++                    root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++                    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test root")])
++                    int_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++                    int_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test intermediate")])
++
++                    int_builder = (
++                        x509.CertificateBuilder()
++                        .subject_name(int_name)
++                        .issuer_name(root_name)
++                        .public_key(int_key.public_key())
++                        .serial_number(2)
++                        .add_extension(x509.BasicConstraints(ca=True, path_length=None),
++                                       critical=True)
++                    )
++                    int_builder._not_valid_before = not_before
++                    int_builder._not_valid_after = not_after
++                    int_cert = int_builder.sign(root_key, hashes.SHA256())
++
++                    leaf_builder = (
++                        x509.CertificateBuilder()
++                        .subject_name(x509.Name([
++                            x509.NameAttribute(NameOID.COMMON_NAME, commonName)]))
++                        .issuer_name(int_name)
++                        .public_key(k.public_key())
++                        .serial_number(serialNumber)
++                        .add_extension(san_ext, critical=False)
++                    )
++                    leaf_builder._not_valid_before = not_before
++                    leaf_builder._not_valid_after = not_after
++                    leaf_cert = leaf_builder.sign(int_key, hashes.SHA256())
++
++                    # client trust file: intermediate only, the root is deliberately missing
++                    with open(CA_FILE, "wb") as f:
++                        f.write(int_cert.public_bytes(serialization.Encoding.PEM))
++                    # server sends leaf only
++                    with open(CERT_FILE, "wb") as f:
++                        f.write(leaf_cert.public_bytes(serialization.Encoding.PEM))
++                    with open(KEY_FILE, "wb") as f:
++                        f.write(k.private_bytes(
++                            encoding=serialization.Encoding.PEM,
++                            format=serialization.PrivateFormat.TraditionalOpenSSL,
++                            encryption_algorithm=serialization.NoEncryption()))
++                    return 1
++
++
+                 # Branch B: CA-Signed Leaf Certificate
+                 ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+                 ca_subject = x509.Name([
+-- 
+2.53.0
+

@@ -1,0 +1,337 @@
+From 35c437129f0b08eb4cb17815c0634b8d8aa33841 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:52:44 +0000
+Subject: [PATCH] tools/dvbridge: a paired picture without its RPU takes the
+ base decoder's reading of it
+
+The RPU of an enhancement picture is the one of its access unit, which the
+decoder of the layer reads. FFmpeg's decoder gives a picture without the
+coded RPU when it could not read it, or when the RPU uses a mapping that
+an earlier one sent and that decoder did not see: the layer's decoder
+starts again after every seek and failure, and is not given the access
+units the module does not decode. It then attaches the last mapping it
+read again, without the coded RPU, and the picture kept the RPU carried
+with its base picture, which is another picture's where the layers are
+coded in different picture order (the FEL test stream). The base decoder
+reads every RPU of the stream, in order, and the module already keeps its
+reading of them for the pictures whose access unit it does not decode.
+
+A paired picture that comes without its coded RPU now takes that
+reading of the RPU of its own access unit, as those pictures do; while the
+base picture that brought that RPU is still to come, it waits for it as a
+picture whose enhancement picture is late. A paired picture that has its
+own coded RPU keeps its decoder's reading, and the two readings are
+compared, for the log.
+
+The module's own reader of the RPUs (dvbridge_mel.h) stops after the NLQ.
+FFmpeg reads on, and when what follows fails (the metadata, its extension
+blocks, the CRC or the terminator: "Unexpected RPU format", which
+ffmpeg-9910 was made for) it forgets every mapping it had. The module did
+not, and went on deciding which access units of a MEL stream to decode
+with mappings FFmpeg no longer had. Kodi now tells the module whether
+each base picture came with its coded RPU (dvbridge_fel_base_picture_rpu());
+one whose packet brought an RPU the module read, and that came without it,
+makes the reader forget its mappings, and the layer is decoded for good in
+that stream (more decoding, never less).
+
+Kodi logs, when a stream closes, how many RPUs use a mapping an earlier
+one sent or have compressed metadata (what makes the metadata of a picture
+depend on earlier RPUs), how many paired pictures took the base decoder's
+reading and how many could not, how many the two decoders read
+differently, and how many RPUs the base decoder could not read.
+
+Measured on the host: of the RPUs of the two real streams at hand (the FEL
+test stream, 2876, and the file of issue 1, 2908), none uses a mapping
+sent before, and all send mapping 0; in every run of the test stream the
+two decoders read every paired picture's RPU alike. With an RPU taken out
+of one access unit in seven before the layer's decoder (fel_rpu_test
+elnorpu=7, as Kodi), 363 paired pictures had another picture's RPU
+before; now none (410 took the base decoder's reading). In one in two: 1258
+before, none now. With the terminator of one RPU made one FFmpeg refuses
+(badterm=1000), the module now forgets and decodes the layer for good, as
+it did not before; that picture itself has no readable RPU either way.
+The pictures of the whole file, a seek, the file with its layers swapped,
+the two-track file and four MEL schedules (mel_test) are byte for byte
+those of before.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 118 +++++++++++++++++-
+ tools/dvbridge/dvbridge_fel.h                 |  20 +++
+ tools/dvbridge/dvbridge_mel.h                 |  12 +-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  19 ++-
+ 4 files changed, 161 insertions(+), 8 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index e4604ed..d0efa22 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -236,7 +236,9 @@ struct dvbridge_fel {
+     bool packet_residual[QUEUE_MAX];
+     struct { int64_t pts, carrier; struct dvbridge_fel_rpu rpu; } own[OWN_MAX];
+     unsigned num_own;
+-    struct { int64_t pts; uint64_t seq; } recent[BASE_TIMES_MAX];
++    /* (Hades: rpu, whether the packet brought an RPU that the module read as far as its NLQ:
++     * dvbridge_fel_base_picture_rpu()) */
++    struct { int64_t pts; uint64_t seq; bool rpu; } recent[BASE_TIMES_MAX];
+     uint64_t submitted;
+     int64_t last_base;
+     unsigned own_given; /* base pictures that went out without their enhancement picture, with its RPU */
+@@ -282,6 +284,11 @@ struct dvbridge_fel {
+      * and whether the first one queued waits now (pump()) */
+     unsigned surface_limit, surface_waits;
+     bool surface_waiting;
++    /* Hades: the RPU of a paired enhancement picture (own_metadata()): pictures whose decoder did not attach the RPU of
++     * their access unit and that took the base decoder's reading of it, those that could not, and those whose RPU the
++     * two decoders read differently; and the RPUs that the base decoder could not read and this module did
++     * (dvbridge_fel_base_picture_rpu()) */
++    unsigned layer_rpu_base, layer_rpu_none, layer_rpu_differ, rpu_lost;
+     char reason_text[320]; /* a reason made for this failure (surface_reason()) */
+ };
+ 
+@@ -1350,6 +1357,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+     ++f->submitted;
+     f->recent[f->submitted % BASE_TIMES_MAX].pts = packet->pts;
+     f->recent[f->submitted % BASE_TIMES_MAX].seq = f->submitted;
++    f->recent[f->submitted % BASE_TIMES_MAX].rpu = rpu == DVBRIDGE_RPU_NO_RESIDUAL || rpu == DVBRIDGE_RPU_RESIDUAL;
+     if (f->failed || f->draining)
+         return false;
+     /* By picture order every base packet needs its time, which an enhancement picture takes.
+@@ -1755,6 +1763,99 @@ static int without_layer(struct dvbridge_fel *f, int64_t pts, int64_t slack, boo
+     return 4;
+ }
+ 
++/* Hades: an enhancement picture's own RPU is the one of its access unit, which its decoder reads. FFmpeg's decoder gives
++ * a picture without the coded RPU when it could not read it, or when it did not see the earlier RPU whose mapping it
++ * uses (the layer's decoder starts again after a seek or a failure, and does not see the access units it is not
++ * given): it attaches the last mapping it read again, without the coded RPU, and the picture would keep the RPU
++ * carried with its base picture, which is another picture's where the layers are coded in different picture order.
++ * The base decoder reads every RPU of the stream, in order (dvbridge_fel_base_metadata()): such a picture waits for
++ * the base picture that brought its RPU, if that is still to come, ... */
++static bool own_rpu_pending(const struct dvbridge_fel *f, const AVFrame *picture, int own)
++{
++    const struct dvbridge_fel_rpu *rpu = &f->own[own].rpu;
++    return rpu->size && !av_frame_get_side_data(picture, AV_FRAME_DATA_DOVI_RPU_BUFFER) && !ring_find(f, rpu) &&
++           f->own[own].carrier != AV_NOPTS_VALUE && f->last_base != AV_NOPTS_VALUE &&
++           f->own[own].carrier > f->last_base;
++}
++
++/* ... and takes the base decoder's reading of it, as a picture whose access unit was not decoded does. A picture that
++ * has its own coded RPU keeps its decoder's reading, which is compared with the base decoder's, for the log (the two
++ * differ only where an RPU uses what an earlier one sent, which the layer's decoder may not have seen). */
++static void own_metadata(struct dvbridge_fel *f, AVFrame *picture, int own)
++{
++    const struct dvbridge_fel_rpu *rpu = &f->own[own].rpu;
++    if (!rpu->size)
++        return; /* (an access unit without an RPU of its own: its picture keeps the one before) */
++    const AVBufferRef *parsed = ring_find(f, rpu);
++    const AVFrameSideData *coded = av_frame_get_side_data(picture, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    const AVFrameSideData *read = av_frame_get_side_data(picture, AV_FRAME_DATA_DOVI_METADATA);
++    if (coded && read) {
++        f->layer_rpu_differ +=
++            parsed && (parsed->size != read->size || memcmp(parsed->data, read->data, read->size) != 0);
++        return;
++    }
++    if (!parsed) {
++        ++f->layer_rpu_none;
++        return;
++    }
++    AVBufferRef *metadata = av_buffer_ref(parsed);
++    av_frame_remove_side_data(picture, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++    av_frame_remove_side_data(picture, AV_FRAME_DATA_DOVI_METADATA);
++    AVFrameSideData *made = metadata ? av_frame_new_side_data(picture, AV_FRAME_DATA_DOVI_RPU_BUFFER, rpu->size)
++                                     : NULL;
++    if (!made || !av_frame_new_side_data_from_buf(picture, AV_FRAME_DATA_DOVI_METADATA, metadata)) {
++        av_buffer_unref(&metadata);
++        av_frame_remove_side_data(picture, AV_FRAME_DATA_DOVI_RPU_BUFFER);
++        ++f->layer_rpu_none;
++        return;
++    }
++    memcpy(made->data, rpu->data, rpu->size);
++    ++f->layer_rpu_base;
++}
++
++void dvbridge_fel_base_picture_rpu(struct dvbridge_fel *f, int64_t pts, bool coded)
++{
++    dvbridge_fel_base_picture(f, pts);
++    if (!f || coded || pts == AV_NOPTS_VALUE)
++        return;
++    /* Hades: the packet of this picture brought an RPU that the module read as far as its NLQ, and the base decoder
++     * gave the picture without it: FFmpeg could not read the rest of it (ff_dovi_rpu_parse() fails after the NLQ on
++     * the metadata, its extension blocks, the CRC or the terminator) and forgot every mapping it had
++     * (ff_dovi_ctx_unref()). So does the module's reader. The RPUs it read after this one, in decoding order, may
++     * have used a mapping that FFmpeg no longer has: the layer is decoded for good in this stream (more decoding,
++     * never less: dvbridge_mel.h). */
++    const int64_t slack = f->timed ? f->tolerance : 0;
++    for (unsigned i = 0; i < BASE_TIMES_MAX; ++i) {
++        if (!f->recent[i].rpu || f->recent[i].pts == AV_NOPTS_VALUE || !same_time(f->recent[i].pts, pts, slack))
++            continue;
++        f->recent[i].rpu = false;
++        dvbridge_rpu_nlq_forget(&f->rpu);
++        ++f->rpu_lost;
++        if (!f->need.kept) {
++            f->need.kept = true;
++            f->need.kept_why = "the base decoder could not read an RPU that this module read as far as its NLQ, "
++                               "and forgot the mappings that later RPUs may use";
++        }
++        return;
++    }
++}
++
++void dvbridge_fel_rpu_counts(const struct dvbridge_fel *f, struct dvbridge_fel_rpus *out)
++{
++    if (!out)
++        return;
++    *out = (struct dvbridge_fel_rpus){0};
++    if (!f)
++        return;
++    out->read = f->rpu.read;
++    out->use_prev = f->rpu.use_prev;
++    out->compressed = f->rpu.compressed;
++    out->layer_from_base = f->layer_rpu_base;
++    out->layer_none = f->layer_rpu_none;
++    out->layer_differ = f->layer_rpu_differ;
++    out->lost = f->rpu_lost;
++}
++
+ int dvbridge_fel_layer_rpu(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+ {
+     if (!f || !frame || *frame || pts == AV_NOPTS_VALUE)
+@@ -1837,16 +1938,21 @@ int dvbridge_fel_take(struct dvbridge_fel *f, int64_t pts, AVFrame **frame)
+             ++i;
+             continue;
+         }
++        const bool pair = !ambiguous && (candidate->pts >= pts || pts - candidate->pts <= slack);
++        /* Hades: (its RPU comes with its enhancement picture: own_metadata()) */
++        const int own = pair ? own_find(f, pts, slack) : -1;
++        if (own >= 0 && own_rpu_pending(f, candidate, own))
++            return 0;
+         --f->num_frames;
+         memmove(f->frames + i, f->frames + i + 1,
+                 (f->num_frames - i) * sizeof(*f->frames));
+-        if (!ambiguous && (candidate->pts >= pts || pts - candidate->pts <= slack)) {
++        if (pair) {
+             candidate->pts = pts;
+-            *frame = candidate;
+-            /* Hades: (its RPU comes with its enhancement picture) */
+-            const int own = own_find(f, pts, slack);
+-            if (own >= 0)
++            if (own >= 0) {
++                own_metadata(f, candidate, own);
+                 own_remove(f, (unsigned)own);
++            }
++            *frame = candidate;
+             return 1;
+         }
+         av_frame_free(&candidate);
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index b7cf86a..edad934 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -150,6 +150,26 @@ void dvbridge_fel_base_metadata(struct dvbridge_fel *fel, const uint8_t *coded,
+  * dvbridge_fel_base_metadata() for it): the base decoder gives its pictures in the order they are
+  * presented, so the module knows which base pictures are still to come. */
+ void dvbridge_fel_base_picture(struct dvbridge_fel *fel, int64_t pts);
++/* Hades: the same, saying whether the base picture came with its coded RPU (AV_FRAME_DATA_DOVI_RPU_BUFFER, which
++ * FFmpeg attaches only with an RPU it read). One whose packet brought an RPU that the module read as far as its NLQ,
++ * and that came without it, says that FFmpeg could not read the rest of that RPU, and forgot every mapping it had:
++ * the module's reader forgets them too, and the layer is decoded for good in that stream (dvbridge_mel.h). */
++void dvbridge_fel_base_picture_rpu(struct dvbridge_fel *fel, int64_t pts, bool coded);
++/* Hades: an enhancement picture that comes without the coded RPU of its access unit (its decoder could not read it,
++ * or did not see the earlier RPU whose mapping it uses) takes the base decoder's reading of that RPU
++ * (dvbridge_fel_base_metadata()), and dvbridge_fel_take() waits (0) while the base picture that brought it is still
++ * to come. For the log: */
++#define DVBRIDGE_FEL_RPUS 1
++struct dvbridge_fel_rpus {
++    unsigned read;            /* RPUs of the base packets that the module read */
++    unsigned use_prev;        /* of them, those that use a mapping an earlier one sent */
++    unsigned compressed;      /* and those with compressed metadata */
++    unsigned layer_from_base; /* paired enhancement pictures that took the base decoder's reading of their RPU */
++    unsigned layer_none;      /* ... that could not (it had none): they keep the RPU carried with their base picture */
++    unsigned layer_differ;    /* paired pictures whose RPU the two decoders read differently */
++    unsigned lost;            /* RPUs that the module read and the base decoder could not */
++};
++void dvbridge_fel_rpu_counts(const struct dvbridge_fel *fel, struct dvbridge_fel_rpus *out);
+ /* Hades: for a base picture that goes out without its enhancement picture for a reason of the
+  * caller (it is late, the base layer ended, the layer starts again): 1, with a frame such as an
+  * answer 4 of dvbridge_fel_take() carries, when the module knows the enhancement access unit of
+diff --git a/tools/dvbridge/dvbridge_mel.h b/tools/dvbridge/dvbridge_mel.h
+index 0651e14..b16d728 100644
+--- a/tools/dvbridge/dvbridge_mel.h
++++ b/tools/dvbridge/dvbridge_mel.h
+@@ -82,6 +82,11 @@ struct dvbridge_rpu_nlq {
+         uint16_t offset[3];
+         uint64_t vdr_in_max[3], slope[3], threshold[3];
+     } mapping[DVBRIDGE_RPU_IDS];
++    /* Hades, for the log: the RPUs read (as far as their compression), those of them that use a mapping an earlier
++     * one sent (use_prev_vdr_rpu_flag) and those with compressed metadata: what makes the metadata of a picture
++     * depend on RPUs before it, which a decoder that did not see them (the enhancement layer's, after it starts
++     * again) parses otherwise. dvbridge_rpu_nlq_forget() leaves them. */
++    unsigned read, use_prev, compressed;
+ };
+ 
+ /* For a test that rewrites an RPU: where, in bits of what dvbridge_rpu_nlq_read() was given, its
+@@ -152,7 +157,7 @@ static inline void dvbridge_rpu_se_coef(struct dvbridge_rpu_bits *b, bool fixed,
+  * that fails there, and a flush of the base decoder) */
+ static inline void dvbridge_rpu_nlq_forget(struct dvbridge_rpu_nlq *s)
+ {
+-    memset(s, 0, sizeof(*s));
++    memset(s->mapping, 0, sizeof(s->mapping));
+ }
+ 
+ /* The reading failed where ff_dovi_rpu_parse() forgets the mappings (VALIDATE and the other
+@@ -224,10 +229,15 @@ static inline enum dvbridge_rpu_residual dvbridge_rpu_nlq_read(struct dvbridge_r
+     w.disable_bit = b.bit;
+     const bool disabled = dvbridge_rpu_bits_get(&b, 1);
+     w.dm_present = dvbridge_rpu_bits_get(&b, 1);
++    if (!b.over) {
++        ++s->read;
++        s->compressed += dm_compression != 0;
++    }
+     /* (FFmpeg gives up without forgetting the mappings) */
+     if (b.over || dm_compression > 1 || (dm_compression && !w.dm_present))
+         return DVBRIDGE_RPU_UNREAD;
+     const bool use_prev = dvbridge_rpu_bits_get(&b, 1);
++    s->use_prev += use_prev && !b.over;
+     const struct dvbridge_rpu_mapping *mapping;
+     if (use_prev) {
+         uint64_t id = dvbridge_rpu_bits_ue(&b);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 265ce2c..5ddc0d6 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -815,6 +815,20 @@ void CDVDVideoCodecFFmpeg::Dispose()
+               skip.decoded, skip.not_decoded, skip.not_needed, skip.wanted, skip.stops,
+               skip.resumes, skip.kept ? "; it is decoded for good in this stream: " : "",
+               skip.kept ? skip.kept : "");
++  // Hades: the RPUs of the stream: those whose metadata depends on earlier ones (which the decoder of the layer may not
++  // have seen), the paired pictures that took the base decoder's reading of the RPU of their access unit because their
++  // own decoder gave none, those whose RPU the two decoders read differently, and the RPUs that the base decoder could
++  // not read
++  dvbridge_fel_rpus rpus{};
++  dvbridge_fel_rpu_counts(m_dvFel.get(), &rpus);
++  if (rpus.read)
++    CLog::Log(LOGINFO,
++              "DV FEL: {} RPUs read, {} of them using a mapping an earlier one sent and {} with compressed "
++              "metadata; {} paired pictures took the base decoder's reading of the RPU of their enhancement access "
++              "unit (its decoder gave none) and {} could not; {} were read differently by the two decoders; {} "
++              "RPUs the base decoder could not read",
++              rpus.read, rpus.use_prev, rpus.compressed, rpus.layer_from_base, rpus.layer_none,
++              rpus.layer_differ, rpus.lost);
+   // Hades: the surfaces of the enhancement layer: the most that its decoder, the module's queue and the pictures on
+   // their way to the screen held at once, of what pool, and how many pictures of the layer found none free (each
+   // time the layer started again, and the line of the resynchronization says why)
+@@ -1480,8 +1494,11 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPairedPicture(VideoPicture* pV
+       // Hades: that it came (a picture that waits for the RPU it brought waits no longer than that),
+       // and its RPU and metadata, for a picture whose enhancement access unit brought the same RPU
+       // and was not decoded (MEL), or whose enhancement picture does not come
+-      if (base->doviSourceTimed)
++      // (Hades: and whether it came with its coded RPU, which FFmpeg attaches only with an RPU it read)
++      if (base->doviSourceTimed && m_dvSoftware)
+         dvbridge_fel_base_picture(m_dvFel.get(), base->doviSourcePts);
++      else if (base->doviSourceTimed)
++        dvbridge_fel_base_picture_rpu(m_dvFel.get(), base->doviSourcePts, base->doviRpu.Size() > 0);
+       if (base->doviRpu.Size() && base->doviMetadata.Data())
+         dvbridge_fel_base_metadata(m_dvFel.get(), base->doviRpu.Data(), base->doviRpu.Size(),
+                                    base->doviMetadata.Data(), base->doviMetadata.Size());
+-- 
+2.53.0
+

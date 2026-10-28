@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Builds LibreELEC-Hades-Installer.exe with the C# compiler that Windows itself brings (.NET Framework 4): nothing
 # is installed or downloaded. Usage: build.ps1 [-Out <directory>]   (-Salida, its first name, still works)
 param([Alias('Salida')][string]$Out = (Join-Path $PSScriptRoot 'bin'))
@@ -10,6 +13,9 @@ $sources = 'Model.cs', 'Image.cs', 'Diagnostics.cs', 'Disks.cs', 'Operations.cs'
   ForEach-Object { Join-Path $PSScriptRoot $_ }
 # The sources are UTF-8 without a byte order mark: /codepage says so, or the accents and quotes of the texts
 # would depend on what the compiler guesses.
+# There is no /deterministic: the compiler that Windows brings is the one of C# 5 (.NET Framework 4), which does
+# not have that option (nor /pathmap: they came with the Roslyn compiler), and an option that it does not know
+# stops the build. Two builds of the same sources can therefore differ in their bytes.
 & $csc /nologo /target:winexe /platform:anycpu /optimize+ /warn:4 /warnaserror+ /codepage:65001 `
   "/win32manifest:$(Join-Path $PSScriptRoot 'app.manifest')" "/out:$exe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll $sources

@@ -1,0 +1,398 @@
+From f02b920e76e68cfdc38dd32117f9cbad672f38b2 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:15:43 +0000
+Subject: [PATCH] tools/dvbridge: keep a queued access unit of the layer in one
+ entry
+
+An access unit of the layer that waited to be given to its decoder was
+kept in seven arrays side by side (its packet, picture order, time from
+the stream, verdict, RPU, carrier and whether its RPU can carry a
+residual), moved one by one in three places: every new field had to be
+remembered in each of them. It is now one entry (struct queued_au), moved
+once. The marks of access units that are not decoded take the base
+decoder's reading of their RPU with ring_find() and metadata_frame(), as
+the other answers do, instead of a copy of both; the RPU of a queued access
+unit is taken with layer_rpu(), which also took it written out in place;
+the ring is looked up with ring_find() when a base picture brings its RPU.
+The decoder context that dvbridge_fel_create() prepares says why it stays
+(the host tests open it in software; Kodi opens one of its own on the
+device of the base decoder).
+
+Nothing that the module does changes: on the host, the pictures (and the
+metadata each one goes out with) of fel_rpu_test (as Kodi: the whole FEL
+test stream, with start codes, with a seek, two starts in the middle, a
+switch to another display, an RPU taken out of one access unit in seven,
+an RPU that FFmpeg refuses, a fixed pool smaller than the layer needs; the
+file with its layers swapped, whole and from packet 20), of mel_test (five
+schedules, one with a seek, and the two-track transport stream) and of
+fel_tracks_test (the two-track Matroska and transport stream files, and
+the starts at each random-access picture) are byte for byte those of
+before, with the sanitizers of address and undefined behaviour.
+---
+ tools/dvbridge/dvbridge_fel.c | 163 +++++++++++++---------------------
+ 1 file changed, 64 insertions(+), 99 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index b231837..c866ac6 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -163,20 +163,33 @@ bool dvbridge_fel_layer_metadata(const AVFrame *enhancement, const uint8_t *base
+     return own != layer || (own && memcmp(base_rpu, c->data, own) != 0);
+ }
+ 
++/* An access unit of the layer that waits to be given to its decoder (Hades: one entry for what was seven arrays
++ * moved by hand, side by side) */
++struct queued_au {
++    AVPacket *packet;
++    int64_t order; /* its picture order: the identity of the base picture it is paired with */
++    /* Hades: DVBRIDGE_FEL_LAYER_TIME, the time that the stream gave it, or AV_NOPTS_VALUE; and the time of the base
++     * packet that brought it (carrier) */
++    int64_t time, carrier;
++    /* Hades: whether it is decoded, by its RPU (dvbridge_layer_need_take()); whether its RPU can carry a residual
++     * (its own, or the one before it); and the RPU that the enhancement decoder would attach to its picture, as
++     * coded (dvbridge_mel.h) */
++    uint8_t need;
++    bool residual;
++    struct dvbridge_fel_rpu rpu;
++};
++
+ struct dvbridge_fel {
+     AVBSFContext *split;
+     int layer_length_size; /* unit_length_size() of the packets split gives */
+     AVCodecContext *decoder;
+-    AVPacket *packets[QUEUE_MAX];
++    struct queued_au queue[QUEUE_MAX];
+     AVFrame *frames[QUEUE_MAX];
+     unsigned num_packets, num_frames;
+     size_t packet_bytes;
+     bool opened, failed, draining, sent_eof, eof;
+     struct picture_order base_order, enhancement_order;
+-    int64_t packet_order[QUEUE_MAX];
+-    /* Hades: DVBRIDGE_FEL_LAYER_TIME. The time that the stream gave each queued access unit,
+-     * and whether the pictures are paired by those times. */
+-    int64_t packet_time[QUEUE_MAX];
++    /* Hades: whether the pictures are paired by the times the stream gives (struct queued_au) */
+     bool timed;
+     bool order_only;   /* too many access units came without a time: by picture order for good */
+     int64_t tolerance; /* of a time that was converted on its way here */
+@@ -207,16 +220,14 @@ struct dvbridge_fel {
+     /* Hades: the layer is not decoded while the RPUs say that it carries no residual (MEL;
+      * dvbridge_mel.h). The RPU of each base packet is read as the base decoder reads it
+      * (base_length_size: its framing, as unit_length_size()), and each enhancement access unit
+-     * that is queued has a verdict (packet_need) and the RPU that the enhancement decoder would
+-     * attach to its picture, as coded (packet_rpu). One that is not decoded leaves a mark of its
++     * that is queued has a verdict and the RPU that the enhancement decoder would attach to its
++     * picture, as coded (struct queued_au: need, rpu). One that is not decoded leaves a mark of its
+      * time with that RPU (skipped), which answers for its base picture (dvbridge_fel_take()) with
+      * what the base decoder made of the same RPU (ring: the RPUs of the last base pictures, as
+      * coded, with their metadata; dvbridge_fel_base_metadata()). */
+     int base_length_size;
+     struct dvbridge_rpu_nlq rpu;
+     struct dvbridge_layer_need need;
+-    uint8_t packet_need[QUEUE_MAX];
+-    struct dvbridge_fel_rpu packet_rpu[QUEUE_MAX];
+     struct { int64_t pts; uint8_t need; struct dvbridge_fel_rpu rpu; } skipped[MAP_MAX];
+     unsigned num_skipped;
+     struct { struct dvbridge_fel_rpu coded; AVBufferRef *parsed; } ring[RING_MAX];
+@@ -233,14 +244,10 @@ struct dvbridge_fel {
+      * enhancement picture. own: the RPU of each access unit whose time is known (it was given to the decoder, or
+      * passed over in a stream paired by its times, or placed once the layer started), with the time of the base
+      * packet that brought it (carrier), whose base picture the base decoder gives with the same RPU parsed (the
+-     * ring). packet_carrier: that time, for each queued access unit. recent: the last base packets, by when they
++     * ring); a queued access unit has it too (struct queued_au). recent: the last base packets, by when they
+      * came (submitted counts them), to know how long a picture may wait for its access unit; last_base: the time
+      * of the last base picture the base decoder gave (dvbridge_fel_base_picture()), to know whether a carrier is
+      * still to come. */
+-    int64_t packet_carrier[QUEUE_MAX];
+-    /* Hades: the RPU of each queued access unit can carry a residual (dvbridge_mel.h: its own, or the one
+-     * before it) */
+-    bool packet_residual[QUEUE_MAX];
+     struct { int64_t pts, carrier; struct dvbridge_fel_rpu rpu; } own[OWN_MAX];
+     unsigned num_own;
+     /* (Hades: rpu, whether the packet brought an RPU that the module read as far as its NLQ:
+@@ -764,8 +771,8 @@ static bool layer_rpu(const struct dvbridge_fel *f, const AVPacket *packet, stru
+ static void clear_queues(struct dvbridge_fel *f)
+ {
+     for (unsigned i = 0; i < f->num_packets; ++i) {
+-        av_packet_free(&f->packets[i]);
+-        av_freep(&f->packet_rpu[i].data);
++        av_packet_free(&f->queue[i].packet);
++        av_freep(&f->queue[i].rpu.data);
+     }
+     for (unsigned i = 0; i < f->num_skipped; ++i)
+         av_freep(&f->skipped[i].rpu.data);
+@@ -789,8 +796,8 @@ static void rank_cancel(struct dvbridge_fel *f)
+     if (!f->rank.pending)
+         return;
+     for (unsigned i = 0; i < f->num_packets; ++i) {
+-        early_add(f, f->packet_order[i], f->packet_carrier[i], &f->packet_rpu[i]);
+-        av_packet_free(&f->packets[i]);
++        early_add(f, f->queue[i].order, f->queue[i].carrier, &f->queue[i].rpu);
++        av_packet_free(&f->queue[i].packet);
+     }
+     f->preroll_packets += f->num_packets;
+     f->num_packets = 0;
+@@ -910,27 +917,15 @@ static void rank_try(struct dvbridge_fel *f)
+     }
+     const int64_t delta = identity - f->rank.layer_id;
+     for (unsigned i = 0; i < f->num_packets; ++i)
+-        f->packet_order[i] += delta;
++        f->queue[i].order += delta;
+     for (unsigned i = 1; i <= f->rank.layer_leading; ++i) {
+-        own_identity(f, f->packet_order[i], f->packet_carrier[i], &f->packet_rpu[i]);
+-        f->packet_bytes -= f->packets[i]->size;
+-        av_packet_free(&f->packets[i]);
++        own_identity(f, f->queue[i].order, f->queue[i].carrier, &f->queue[i].rpu);
++        f->packet_bytes -= f->queue[i].packet->size;
++        av_packet_free(&f->queue[i].packet);
+     }
+     const unsigned leading = f->rank.layer_leading;
+     f->num_packets -= leading;
+-    memmove(f->packets + 1, f->packets + 1 + leading, (f->num_packets - 1) * sizeof(*f->packets));
+-    memmove(f->packet_order + 1, f->packet_order + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_order));
+-    memmove(f->packet_time + 1, f->packet_time + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_time));
+-    memmove(f->packet_need + 1, f->packet_need + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_need));
+-    memmove(f->packet_rpu + 1, f->packet_rpu + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_rpu));
+-    memmove(f->packet_carrier + 1, f->packet_carrier + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_carrier));
+-    memmove(f->packet_residual + 1, f->packet_residual + 1 + leading,
+-            (f->num_packets - 1) * sizeof(*f->packet_residual));
++    memmove(f->queue + 1, f->queue + 1 + leading, (f->num_packets - 1) * sizeof(*f->queue));
+     for (unsigned i = 0; i < f->num_early; ++i)
+         own_identity(f, f->early[i].identity + delta, f->early[i].carrier, &f->early[i].rpu);
+     early_forget(f);
+@@ -1054,6 +1049,8 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+         goto fail;
+     atomic_init(&((struct surface_count *)f->surfaces->data)->live, 0);
+     f->surface_limit = SURFACES_MAX;
++    /* (Hades: Kodi opens a decoder context of its own on the device of the base decoder, open_decoder(), in place of
++     * this one, which is never opened there; the host tests open this one, in software) */
+     f->decoder = avcodec_alloc_context3(codec);
+     if (!prepare_decoder(f, f->decoder))
+         goto fail;
+@@ -1141,12 +1138,12 @@ static bool pump(struct dvbridge_fel *f)
+     /* Hades: (while the place of a random-access picture of the layer is being counted, what is queued from it on
+      * waits: it has no identities of base pictures yet; rank_try()) */
+     while (f->num_packets && f->num_frames < QUEUE_MAX && !f->rank.pending) {
+-        AVPacket *packet = f->packets[0];
++        AVPacket *packet = f->queue[0].packet;
+         unsigned match = 0;
+         /* Hades: an access unit that the stream gave its time has it; any other one takes the
+          * time of the base picture of its picture order. */
+-        const bool timed = f->packet_time[0] != AV_NOPTS_VALUE;
+-        while (!timed && match < f->num_times && f->times[match].order != f->packet_order[0])
++        const bool timed = f->queue[0].time != AV_NOPTS_VALUE;
++        while (!timed && match < f->num_times && f->times[match].order != f->queue[0].order)
+             ++match;
+         if (!timed && match == f->num_times) {
+             if (f->draining) {
+@@ -1155,8 +1152,8 @@ static bool pump(struct dvbridge_fel *f)
+             }
+             break; /* A reference EL picture can precede its corresponding BL. */
+         }
+-        const int64_t pts = timed ? f->packet_time[0] : f->times[match].pts;
+-        if (f->packet_need[0] != DVBRIDGE_LAYER_DECODE) {
++        const int64_t pts = timed ? f->queue[0].time : f->times[match].pts;
++        if (f->queue[0].need != DVBRIDGE_LAYER_DECODE) {
+             /* Hades: not decoded (dvbridge_mel.h). What the decoder holds comes out first: it
+              * was given access units that come before this random-access picture in decoding
+              * order, whose pictures are presented before it, and nothing else will make it give
+@@ -1175,7 +1172,7 @@ static bool pump(struct dvbridge_fel *f)
+                 if (!f->stopped)
+                     break; /* its pictures fill the queue: once they are taken */
+             }
+-            add_mark(f, pts, f->packet_need[0], &f->packet_rpu[0]);
++            add_mark(f, pts, f->queue[0].need, &f->queue[0].rpu);
+             f->resume = true;
+             f->marked = true;
+             ++f->not_decoded;
+@@ -1217,10 +1214,10 @@ static bool pump(struct dvbridge_fel *f)
+                  * again at: it refers to pictures that were not decoded, so its picture does not
+                  * come (as after a seek) and it goes out without the layer; with the metadata of
+                  * its own access unit (a mark, which answers before that). */
+-                if (f->packet_rpu[0].size) {
+-                    struct dvbridge_fel_rpu copy = {av_memdup(f->packet_rpu[0].data,
+-                                                              f->packet_rpu[0].size),
+-                                                    f->packet_rpu[0].size};
++                if (f->queue[0].rpu.size) {
++                    struct dvbridge_fel_rpu copy = {av_memdup(f->queue[0].rpu.data,
++                                                              f->queue[0].rpu.size),
++                                                    f->queue[0].rpu.size};
+                     if (copy.data)
+                         add_mark(f, pts, DVBRIDGE_LAYER_WANTED, &copy);
+                 }
+@@ -1228,7 +1225,7 @@ static bool pump(struct dvbridge_fel *f)
+                  * again at every random-access picture the layer starts again at: the layer is
+                  * decoded for good in this stream from here on (dvbridge_mel.h), so that this
+                  * happens once a stream at most. */
+-                if (f->packet_residual[0] && !f->need.kept) {
++                if (f->queue[0].residual && !f->need.kept) {
+                     f->need.kept = true;
+                     f->need.kept_why = "a leading picture of a random-access picture that the layer "
+                                        "started again at can carry a residual, and refers to pictures "
+@@ -1246,7 +1243,7 @@ static bool pump(struct dvbridge_fel *f)
+             ++f->decoded;
+             /* Hades: its RPU stays for its base picture, should that go out without its enhancement picture
+              * (a picture that refers to one that was not decoded does not come, nor one that is late) */
+-            own_add(f, pts, f->packet_carrier[0], &f->packet_rpu[0]);
++            own_add(f, pts, f->queue[0].carrier, &f->queue[0].rpu);
+         }
+         if (!timed) {
+             --f->num_times;
+@@ -1256,13 +1253,7 @@ static bool pump(struct dvbridge_fel *f)
+         f->packet_bytes -= packet->size;
+         av_packet_free(&packet);
+         --f->num_packets;
+-        memmove(f->packets, f->packets + 1, f->num_packets * sizeof(*f->packets));
+-        memmove(f->packet_order, f->packet_order + 1, f->num_packets * sizeof(*f->packet_order));
+-        memmove(f->packet_time, f->packet_time + 1, f->num_packets * sizeof(*f->packet_time));
+-        memmove(f->packet_need, f->packet_need + 1, f->num_packets * sizeof(*f->packet_need));
+-        memmove(f->packet_rpu, f->packet_rpu + 1, f->num_packets * sizeof(*f->packet_rpu));
+-        memmove(f->packet_carrier, f->packet_carrier + 1, f->num_packets * sizeof(*f->packet_carrier));
+-        memmove(f->packet_residual, f->packet_residual + 1, f->num_packets * sizeof(*f->packet_residual));
++        memmove(f->queue, f->queue + 1, f->num_packets * sizeof(*f->queue));
+         if (!receive_frames(f))
+             goto fail;
+     }
+@@ -1486,7 +1477,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             f->reason = "the enhancement queue is full";
+             goto fail;
+         }
+-        if (!picture_identity(&f->enhancement_order, copy, &f->packet_order[f->num_packets])) {
++        if (!picture_identity(&f->enhancement_order, copy, &f->queue[f->num_packets].order)) {
+             /* Hades: while the layer waits for a picture to start at, an access unit that cannot
+              * be read is one that cannot start it, like any other. After a seek the parser may
+              * have the parameter sets of the layer only from its next random-access picture on:
+@@ -1574,14 +1565,14 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+                 /* Hades: a random-access picture of the layer whose place was being counted gives way
+                  * to this one; the access units passed over since the last IDR picture of the layer
+                  * take the identities of their base pictures from here, for their RPUs. */
+-                const int64_t layer_identity = f->packet_order[f->num_packets];
++                const int64_t layer_identity = f->queue[f->num_packets].order;
+                 rank_cancel(f);
+                 const int64_t delta = base_identity - layer_identity;
+                 /* (an IDR picture: what came before it is of another picture order) */
+                 const bool idr = ep->key_frame == 1 && ep->output_picture_number == 0;
+                 f->enhancement_order.offset = base_identity - ep->output_picture_number;
+                 f->enhancement_order.maximum = base_identity;
+-                f->packet_order[f->num_packets] = base_identity;
++                f->queue[f->num_packets].order = base_identity;
+                 f->anchor_pts = packet->pts;
+                 f->synchronizing = false;
+                 for (unsigned i = 0; !idr && i < f->num_early; ++i)
+@@ -1598,7 +1589,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+                     ++f->wait.counted;
+                     f->rank.pending = true;
+                     f->rank.at = f->rank.since;
+-                    f->rank.layer_id = f->packet_order[f->num_packets];
++                    f->rank.layer_id = f->queue[f->num_packets].order;
+                     f->rank.layer_leading = 0;
+                     f->rank.layer_leading_done = false;
+                 } else if (!f->rank.layer_leading_done && leading_type(layer_type)) {
+@@ -1610,7 +1601,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+                 /* Hades: its RPU stays, for its base picture once the layer has started */
+                 struct dvbridge_fel_rpu own;
+                 if (f->rank.valid && own_sets && layer_rpu(f, copy, &own))
+-                    early_add(f, f->packet_order[f->num_packets], packet->pts, &own);
++                    early_add(f, f->queue[f->num_packets].order, packet->pts, &own);
+                 av_packet_free(&copy);
+                 if (!f->rank.valid)
+                     f->num_times = 0;
+@@ -1620,7 +1611,7 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+             }
+         }
+         else if (f->timed ? !same_time(time, packet->pts, f->tolerance)
+-                          : f->packet_order[f->num_packets] != base_identity) {
++                          : f->queue[f->num_packets].order != base_identity) {
+             /* evidence for the log: the layers are not coded in the same picture order */
+             if (!f->order_mismatches++)
+                 f->first_mismatch_pts = packet->pts;
+@@ -1628,27 +1619,18 @@ bool dvbridge_fel_submit(struct dvbridge_fel *f, const AVPacket *packet)
+         /* Hades: whether the access unit is decoded, by its RPU (dvbridge_mel.h); and the RPU that
+          * the enhancement decoder takes from it, as FFmpeg's HEVC decoder takes one, for its
+          * picture should it not be decoded */
+-        f->packet_need[f->num_packets] = (uint8_t)dvbridge_layer_need_take(
++        f->queue[f->num_packets].need = (uint8_t)dvbridge_layer_need_take(
+             &f->need, rpu, f->enhancement_order.parser->key_frame == 1);
+-        f->packet_residual[f->num_packets] =
++        f->queue[f->num_packets].residual =
+             f->need.last == DVBRIDGE_RPU_RESIDUAL || f->need.last == DVBRIDGE_RPU_UNREAD;
+-        struct dvbridge_rpu_find find = {0};
+-        dvbridge_rpu_units(copy->data, (size_t)copy->size, f->layer_length_size,
+-                           dvbridge_rpu_find_unit, &find);
+-        f->packet_rpu[f->num_packets] = (struct dvbridge_fel_rpu){0};
+-        if (find.rpu) {
+-            const size_t size = rpu_length(find.rpu + 2, find.size - 2);
+-            f->packet_rpu[f->num_packets].data = av_memdup(find.rpu + 2, size);
+-            if (size && !f->packet_rpu[f->num_packets].data) {
+-                av_packet_free(&copy);
+-                goto fail;
+-            }
+-            f->packet_rpu[f->num_packets].size = size;
++        if (!layer_rpu(f, copy, &f->queue[f->num_packets].rpu)) {
++            av_packet_free(&copy);
++            goto fail;
+         }
+-        f->packet_time[f->num_packets] = time;
+-        f->packet_carrier[f->num_packets] = packet->pts;
++        f->queue[f->num_packets].time = time;
++        f->queue[f->num_packets].carrier = packet->pts;
+         f->packet_bytes += copy->size;
+-        f->packets[f->num_packets++] = copy;
++        f->queue[f->num_packets++].packet = copy;
+     }
+ fail:
+     if (!f->reason)
+@@ -1680,29 +1662,14 @@ static int take_mark(struct dvbridge_fel *f, unsigned i, int64_t pts, AVFrame **
+ {
+     const bool wanted = f->skipped[i].need == DVBRIDGE_LAYER_WANTED;
+     const struct dvbridge_fel_rpu *rpu = &f->skipped[i].rpu;
+-    const AVBufferRef *parsed = NULL;
+-    for (unsigned k = 0; rpu->size && k < RING_MAX && !parsed; ++k)
+-        if (f->ring[k].parsed && f->ring[k].coded.size == rpu->size &&
+-            !memcmp(f->ring[k].coded.data, rpu->data, rpu->size))
+-            parsed = f->ring[k].parsed;
++    const AVBufferRef *parsed = ring_find(f, rpu);
+     if (rpu->size && !parsed)
+         return 0;
+-    AVFrame *mark = av_frame_alloc();
++    /* (an access unit without an RPU of its own: a frame without side data) */
++    AVFrame *mark = parsed ? metadata_frame(pts, rpu, parsed) : av_frame_alloc();
+     if (!mark)
+         return -1;
+     mark->pts = pts;
+-    if (parsed) {
+-        AVBufferRef *metadata = av_buffer_ref(parsed);
+-        AVFrameSideData *coded = av_frame_new_side_data(mark, AV_FRAME_DATA_DOVI_RPU_BUFFER,
+-                                                        rpu->size);
+-        if (!metadata || !coded ||
+-            !av_frame_new_side_data_from_buf(mark, AV_FRAME_DATA_DOVI_METADATA, metadata)) {
+-            av_buffer_unref(&metadata);
+-            av_frame_free(&mark);
+-            return -1;
+-        }
+-        memcpy(coded->data, rpu->data, rpu->size);
+-    }
+     ++*(wanted ? &f->wanted : &f->not_needed);
+     *frame = mark;
+     av_freep(&f->skipped[i].rpu.data);
+@@ -1720,10 +1687,8 @@ void dvbridge_fel_base_metadata(struct dvbridge_fel *f, const uint8_t *coded, si
+     if (!size)
+         return;
+     /* (the same RPU again: its metadata is there) */
+-    for (unsigned k = 0; k < RING_MAX; ++k)
+-        if (f->ring[k].parsed && f->ring[k].coded.size == size &&
+-            !memcmp(f->ring[k].coded.data, coded, size))
+-            return;
++    if (ring_find(f, &(const struct dvbridge_fel_rpu){(uint8_t *)coded, size}))
++        return;
+     const unsigned k = f->next_ring++ % RING_MAX;
+     av_freep(&f->ring[k].coded.data);
+     av_buffer_unref(&f->ring[k].parsed);
+-- 
+2.53.0
+

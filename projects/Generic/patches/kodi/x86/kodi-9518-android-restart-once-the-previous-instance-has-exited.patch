@@ -1,0 +1,283 @@
+From 84c157781a1e459aaaa67efbedcdfdd34ef1ff35 Mon Sep 17 00:00:00 2001
+From: ksooo <kai.sommerfeld@gmx.com>
+Date: Thu, 22 Oct 2026 06:32:22 +0200
+Subject: [PATCH] [Android] Restart once the previous instance has exited
+
+After quitting, the activity is gone but the process keeps shutting down
+for several seconds with its UI thread blocked. Launching the app in that
+window showed a grey screen until the process exited and then dropped
+back to the launcher.
+
+Once shutdown begins, watch for such launches from a background thread
+and hand them over to a helper activity in its own process. It shows a
+notice, waits for the main process to exit and then relaunches the app
+with the original intent.
+---
+ cmake/scripts/android/Install.cmake           |   1 +
+ .../packaging/xbmc/AndroidManifest.xml.in     |   9 ++
+ tools/android/packaging/xbmc/src/Main.java.in |  24 +++
+ .../xbmc/src/RestartActivity.java.in          | 149 ++++++++++++++++++
+ .../android/packaging/xbmc/src/Splash.java.in |   7 +
+ 5 files changed, 190 insertions(+)
+ create mode 100644 tools/android/packaging/xbmc/src/RestartActivity.java.in
+
+diff --git a/cmake/scripts/android/Install.cmake b/cmake/scripts/android/Install.cmake
+index 1d31d65..cf77e44 100644
+--- a/cmake/scripts/android/Install.cmake
++++ b/cmake/scripts/android/Install.cmake
+@@ -51,6 +51,7 @@ set(package_files strings.xml
+                   src/XBMCTextureCache.java
+                   src/XBMCURIUtils.java
+                   src/KodiDeepLinkActivity.java
++                  src/RestartActivity.java
+                   src/channels/SyncChannelJobService.java
+                   src/channels/SyncProgramsJobService.java
+                   src/channels/model/XBMCDatabase.java
+diff --git a/tools/android/packaging/xbmc/AndroidManifest.xml.in b/tools/android/packaging/xbmc/AndroidManifest.xml.in
+index 8039801..fca9432 100644
+--- a/tools/android/packaging/xbmc/AndroidManifest.xml.in
++++ b/tools/android/packaging/xbmc/AndroidManifest.xml.in
+@@ -92,6 +92,15 @@
+             </intent-filter>
+         </activity>
+ 
++        <activity
++            android:name=".RestartActivity"
++            android:configChanges="orientation|keyboard|keyboardHidden|navigation|touchscreen|screenLayout|screenSize|colorMode"
++            android:exported="false"
++            android:launchMode="singleInstance"
++            android:process=":restart"
++            android:screenOrientation="sensorLandscape"
++            android:theme="@style/AppTheme" />
++
+         <!--
+              Our activity is the built-in NativeActivity framework class.
+              This will take care of integrating with our NDK code.
+diff --git a/tools/android/packaging/xbmc/src/Main.java.in b/tools/android/packaging/xbmc/src/Main.java.in
+index 8d59c92..6d4ff75 100644
+--- a/tools/android/packaging/xbmc/src/Main.java.in
++++ b/tools/android/packaging/xbmc/src/Main.java.in
+@@ -52,6 +52,8 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
+   private ArrayList<DelayedIntent> mDelayedIntents = new ArrayList<>();
+   private boolean mPaused = true;
+   private static boolean mActivityRunning = false;
++  // Never reset: once the activity goes away, the native side exits the process.
++  private static boolean mShuttingDown = false;
+ 
+   // Launchers that support the Recommended Content API
+   private final Set<String> mRecommendedLaunchers = new HashSet<String>() {{
+@@ -300,9 +302,18 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
+     _onActivityResult(requestCode, resultCode, resultData);
+   }
+ 
++  @Override
++  public void finish()
++  {
++    beginShutdown();
++    super.finish();
++  }
++
+   @Override
+   public void onDestroy()
+   {
++    beginShutdown();
++
+     TvUtil.cancelAllScheduledJobs(this);
+ 
+     // unregister the InputDeviceListener implementation
+@@ -318,6 +329,19 @@ public class Main extends NativeActivity implements Choreographer.FrameCallback
+     return mActivityRunning;
+   }
+ 
++  public static boolean isShuttingDown() {
++    return mShuttingDown;
++  }
++
++  private void beginShutdown()
++  {
++    if (mShuttingDown)
++      return;
++
++    mShuttingDown = true;
++    RestartActivity.watchForRelaunch(getApplicationContext());
++  }
++
+   @Override
+   @SuppressWarnings("deprecation")
+   public void onVisibleBehindCanceled()
+diff --git a/tools/android/packaging/xbmc/src/RestartActivity.java.in b/tools/android/packaging/xbmc/src/RestartActivity.java.in
+new file mode 100644
+index 0000000..8b31d28
+--- /dev/null
++++ b/tools/android/packaging/xbmc/src/RestartActivity.java.in
+@@ -0,0 +1,149 @@
++package @APP_PACKAGE@;
++
++import android.app.Activity;
++import android.app.ActivityManager;
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
++import android.os.Process;
++import android.util.Log;
++import android.view.View;
++import android.widget.TextView;
++
++import java.util.List;
++
++// RestartActivity
++//
++// Runs in its own process. Started when the app is launched while the main
++// process is still shutting down; waits for that process to exit and then
++// launches the app again with the original intent.
++
++public class RestartActivity extends Activity
++{
++  private static final String TAG = "@APP_NAME@";
++  private static final int POLL_INTERVAL_MS = 200;
++  private static final String EXTRA_PID = "pid";
++
++  private final Handler mHandler = new Handler(Looper.getMainLooper());
++
++  // Called in the main process. A later launch replaces the one handed over before.
++  public static void handOver(Context context, Intent launchIntent)
++  {
++    Log.d(TAG, "@APP_NAME@ still shutting down; restart once it has exited");
++    Intent intent = new Intent(context, RestartActivity.class);
++    intent.putExtra(Intent.EXTRA_INTENT, launchIntent);
++    // Android may start a new main process meanwhile, e.g. for a content provider query, so wait
++    // for this very process
++    intent.putExtra(EXTRA_PID, Process.myPid());
++    // Temporary URI permissions end with the original launch, so pass them on
++    intent.setData(launchIntent.getData());
++    intent.setClipData(launchIntent.getClipData());
++    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK |
++                    (launchIntent.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION |
++                                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION)));
++    context.startActivity(intent);
++  }
++
++  // The main process' UI thread is blocked while the native side shuts down,
++  // so a new launch of Splash would hang until the process exits. Watch for
++  // such launches from a background thread and hand them over.
++  public static void watchForRelaunch(Context context)
++  {
++    Thread watcher = new Thread(() -> {
++      ActivityManager am = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
++      String splash = Splash.class.getName();
++      while (true)
++      {
++        for (ActivityManager.AppTask task : am.getAppTasks())
++        {
++          try
++          {
++            ActivityManager.RecentTaskInfo info = task.getTaskInfo();
++            ComponentName base = info.baseIntent.getComponent();
++            if (info.numActivities > 0 && base != null && splash.equals(base.getClassName()))
++            {
++              handOver(context, info.baseIntent);
++              task.finishAndRemoveTask();
++            }
++          }
++          catch (IllegalArgumentException e)
++          {
++            // The task was removed in the meantime
++          }
++        }
++
++        try
++        {
++          Thread.sleep(POLL_INTERVAL_MS);
++        }
++        catch (InterruptedException e)
++        {
++          return;
++        }
++      }
++    }, "RelaunchWatcher");
++    watcher.setDaemon(true);
++    watcher.start();
++  }
++
++  @Override
++  protected void onCreate(Bundle savedInstanceState)
++  {
++    super.onCreate(savedInstanceState);
++
++    setContentView(R.layout.activity_splash);
++    findViewById(R.id.progressBar1).setVisibility(View.INVISIBLE);
++    TextView textView = findViewById(R.id.textView1);
++    textView.setText(getString(R.string.starting, "@APP_NAME@"));
++
++    mHandler.post(this::restartWhenMainProcessExited);
++  }
++
++  @Override
++  protected void onNewIntent(Intent intent)
++  {
++    super.onNewIntent(intent);
++    setIntent(intent);
++  }
++
++  @Override
++  protected void onDestroy()
++  {
++    mHandler.removeCallbacksAndMessages(null);
++    super.onDestroy();
++  }
++
++  private void restartWhenMainProcessExited()
++  {
++    if (isProcessRunning(getIntent().getIntExtra(EXTRA_PID, 0)))
++    {
++      mHandler.postDelayed(this::restartWhenMainProcessExited, POLL_INTERVAL_MS);
++      return;
++    }
++
++    Log.d(TAG, "RestartActivity: main process exited; restarting");
++    @SuppressWarnings("deprecation")
++    Intent intent = getIntent().getParcelableExtra(Intent.EXTRA_INTENT);
++    intent.setClass(this, Splash.class);
++    startActivity(intent);
++    finish();
++  }
++
++  private boolean isProcessRunning(int pid)
++  {
++    ActivityManager am = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
++    List<ActivityManager.RunningAppProcessInfo> processes = am.getRunningAppProcesses();
++    if (processes == null)
++      return false;
++
++    for (ActivityManager.RunningAppProcessInfo process : processes)
++    {
++      if (process.pid == pid)
++        return true;
++    }
++    return false;
++  }
++}
+diff --git a/tools/android/packaging/xbmc/src/Splash.java.in b/tools/android/packaging/xbmc/src/Splash.java.in
+index 7d12eac..2ac584f 100644
+--- a/tools/android/packaging/xbmc/src/Splash.java.in
++++ b/tools/android/packaging/xbmc/src/Splash.java.in
+@@ -724,6 +724,13 @@ public class Splash extends Activity
+     // Be sure properties are initialized for native
+     XBMCProperties.initialize(getApplicationContext());
+ 
++    if (Main.isShuttingDown())
++    {
++      RestartActivity.handOver(this, getIntent());
++      finish();
++      return;
++    }
++
+     if (Main.isActivityRunning()) {
+       Log.d(TAG, "@APP_NAME@ already running; just activate it");
+       startXBMC();
+-- 
+2.53.0
+

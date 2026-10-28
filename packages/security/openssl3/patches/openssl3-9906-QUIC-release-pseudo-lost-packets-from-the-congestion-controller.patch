@@ -1,0 +1,166 @@
+From f6d3c8f738fa0e526263da66d657d04bc84b9b85 Mon Sep 17 00:00:00 2001
+From: Nikolas Gauder <nikolas.gauder@tum.de>
+Date: Wed, 21 Oct 2026 18:40:34 +0200
+Subject: [PATCH] QUIC: release pseudo-lost packets from the congestion
+ controller
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+On a Retry, and after version negotiation, the client marks Initial
+packets it has sent as pseudo-lost, so that their CRYPTO data is sent
+again.  The ACK manager then stops counting them as in flight, but on
+purpose does not report them to the congestion controller as lost,
+since the network lost nothing.  The congestion controller is not told
+about them at all, so NewReno kept counting their bytes as in flight
+for the rest of the connection, and allowed that much less to be sent.
+
+Release them with on_data_invalidated(), as when a packet number space
+is discarded.  The congestion window is left alone.  This follows the
+approach proposed in #33099.
+
+Fixes: 90699176b074 "QUIC CC: Major revisions to CC abstract interface"
+Fixes #33079
+Assisted-by: Claude:claude-opus-5-5
+
+Reviewed-by: Mounir Idrassi <mounir.idrassi@idrix.fr>
+Reviewed-by: Saša Nedvědický <sashan@openssl.org>
+Merge-date: Fri Oct 23 12:53:54 2026
+Merged-from: https://github.com/openssl/openssl/pull/33298
+(cherry picked from commit a87db42e4647d36fb82464d9493145ccc9bd21ed)
+---
+ ssl/quic/quic_ackm.c  |  7 ++++
+ test/quic_ackm_test.c | 96 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+diff --git a/ssl/quic/quic_ackm.c b/ssl/quic/quic_ackm.c
+index 5da8af88..2ba67343 100644
+--- a/ssl/quic/quic_ackm.c
++++ b/ssl/quic/quic_ackm.c
+@@ -980,6 +980,13 @@ static void ackm_on_pkts_lost(OSSL_ACKM *ackm, int pkt_space,
+                 loss_info.tx_size = p->num_bytes;
+ 
+                 ackm->cc_method->on_data_lost(ackm->cc_data, &loss_info);
++            } else {
++                /*
++                 * The packet is no longer in flight all the same, so the CC
++                 * must stop counting it.
++                 */
++                ackm->cc_method->on_data_invalidated(ackm->cc_data,
++                    p->num_bytes);
+             }
+         }
+ 
+diff --git a/test/quic_ackm_test.c b/test/quic_ackm_test.c
+index a23ea28a..a49727e0 100644
+--- a/test/quic_ackm_test.c
++++ b/test/quic_ackm_test.c
+@@ -1136,6 +1136,101 @@ err:
+     return testresult;
+ }
+ 
++/*
++ * Pseudo-loss
++ * ******************************************************************
++ */
++
++/*
++ * Pseudo-lost packets (e.g. the Initial packets of a ClientHello sent before a
++ * Retry) are no longer in flight, so the congestion controller must stop
++ * counting them. They were not lost on the network, so the congestion window
++ * must not shrink.
++ */
++static int test_tx_pseudo_loss(void)
++{
++    int testresult = 0, have_statm = 0;
++    OSSL_STATM statm;
++    OSSL_CC_DATA *ccdata = NULL;
++    OSSL_ACKM *ackm = NULL;
++    OSSL_ACKM_TX_PKT *tx[2] = { NULL, NULL };
++    struct pkt_info info[2] = { { 0 } };
++    OSSL_PARAM params[3], *p = params;
++    uint64_t cwnd = 0, bytes_in_flight = 0, init_cwnd;
++    size_t i;
++
++    fake_time = TIME_BASE;
++
++    if (!TEST_int_eq(ossl_statm_init(&statm), 1))
++        goto err;
++
++    have_statm = 1;
++
++    *p++ = OSSL_PARAM_construct_uint64(OSSL_CC_OPTION_CUR_BYTES_IN_FLIGHT,
++        &bytes_in_flight);
++    *p++ = OSSL_PARAM_construct_uint64(OSSL_CC_OPTION_CUR_CWND_SIZE,
++        &cwnd);
++    *p++ = OSSL_PARAM_construct_end();
++
++    ccdata = ossl_cc_newreno_method.new(fake_now, NULL);
++    if (!TEST_ptr(ccdata)
++        || !TEST_true(ossl_cc_newreno_method.bind_diagnostics(ccdata, params)))
++        goto err;
++
++    ackm = ossl_ackm_new(fake_now, NULL, &statm,
++        &ossl_cc_newreno_method, ccdata,
++        /* is_server */ 0);
++    if (!TEST_ptr(ackm))
++        goto err;
++
++    init_cwnd = cwnd;
++
++    for (i = 0; i < OSSL_NELEM(tx); ++i) {
++        if (!TEST_ptr(tx[i] = OPENSSL_zalloc(sizeof(*tx[i]))))
++            goto err;
++
++        tx[i]->pkt_num = i;
++        tx[i]->pkt_space = QUIC_PN_SPACE_INITIAL;
++        tx[i]->is_inflight = 1;
++        tx[i]->is_ack_eliciting = 1;
++        tx[i]->num_bytes = 1200;
++        tx[i]->largest_acked = QUIC_PN_INVALID;
++        tx[i]->on_lost = on_lost;
++        tx[i]->on_acked = on_acked;
++        tx[i]->on_discarded = on_discarded;
++        tx[i]->cb_arg = &info[i];
++        tx[i]->time = fake_time;
++
++        if (!TEST_int_eq(ossl_ackm_on_tx_packet(ackm, tx[i]), 1))
++            goto err;
++    }
++
++    if (!TEST_uint64_t_eq(bytes_in_flight, 2400))
++        goto err;
++
++    if (!TEST_true(ossl_ackm_mark_packet_pseudo_lost(ackm,
++            QUIC_PN_SPACE_INITIAL, 0))
++        || !TEST_uint64_t_eq(bytes_in_flight, 1200)
++        || !TEST_true(ossl_ackm_mark_packet_pseudo_lost(ackm,
++            QUIC_PN_SPACE_INITIAL, 1))
++        || !TEST_uint64_t_eq(bytes_in_flight, 0)
++        || !TEST_int_eq(info[0].lost, 1)
++        || !TEST_int_eq(info[1].lost, 1)
++        || !TEST_uint64_t_eq(cwnd, init_cwnd))
++        goto err;
++
++    testresult = 1;
++err:
++    ossl_ackm_free(ackm);
++    if (ccdata != NULL)
++        ossl_cc_newreno_method.free(ccdata);
++    if (have_statm)
++        ossl_statm_destroy(&statm);
++    for (i = 0; i < OSSL_NELEM(tx); ++i)
++        OPENSSL_free(tx[i]);
++    return testresult;
++}
++
+ /*
+  * Driver
+  * ******************************************************************
+@@ -1169,5 +1264,6 @@ int setup_tests(void)
+         OSSL_NELEM(tx_ack_cases) * MODE_NUM * QUIC_PN_SPACE_NUM);
+     ADD_ALL_TESTS(test_tx_ack_time_script, OSSL_NELEM(tx_ack_time_scripts));
+     ADD_ALL_TESTS(test_rx_ack, OSSL_NELEM(rx_test_scripts) * QUIC_PN_SPACE_NUM);
++    ADD_TEST(test_tx_pseudo_loss);
+     return 1;
+ }

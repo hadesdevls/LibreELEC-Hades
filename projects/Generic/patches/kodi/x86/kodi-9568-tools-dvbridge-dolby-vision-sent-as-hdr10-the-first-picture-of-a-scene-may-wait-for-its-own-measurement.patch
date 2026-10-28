@@ -1,0 +1,187 @@
+From 4ddb63fb781644a6e33232232316c6653a56287e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 22:30:50 +0000
+Subject: [PATCH] tools/dvbridge: Dolby Vision sent as HDR10+, the first
+ picture of a scene may wait for its own measurement
+
+The first picture of a scene went out with the metadata of the scene before:
+nothing of it is measured when its metadata are decided. At a cut from a
+dark scene to a bright one the display may then map that picture wrongly. It
+may now wait for its own measurement, once it is drawn, and go out with it:
+- dvbridge_dvplus_gl_wait(): waits, for at most a given time, for the samples
+  of one picture;
+- dvbridge_dvplus_present_again(): what the picture presented last goes out
+  with from then on, made again from what is measured now, also when it is
+  shown again (the repeat of a picture kept what it first went out with);
+- dvbridge_dvplus_wait_budget(): how long, so that no refresh is missed: until
+  4 ms before the next vblank. The flip of a frame waits for its GPU work
+  anyway (its in-fence); what waiting adds is the time from the end of that
+  work to the commit, which the margin covers. Nothing without a vblank of
+  the last second.
+
+Measured against the ideal of each scene, in InfoFrame codes over the eight
+values sent (first pictures of scenes / all pictures):
+- Cosmos Laundromat, 100 scenes: the scene before 14.75 / 2.916; waited for
+  6.16 / 2.868; seeded from level 1, as the level 1 baseline makes it,
+  31.91 / 3.015; the scene before moved by the change of level 1, 20.53 /
+  2.949; waited for in every other scene and the scene before otherwise,
+  11.53 / 2.898. At the 35 cuts to a scene at least 1.33 times brighter:
+  17.26 with the scene before, 12.40 waited for; p99.98 sent 1.33 times
+  above the ideal at 35 first pictures, 5 waited for.
+- The base layer of a profile 7 test stream, 21 scenes: 8.16 / 3.878 the
+  scene before, 3.80 / 3.848 waited for, 23.64 and 23.95 the two seeds.
+A seed from level 1 is worse than the scene before in both: where the wait
+does not come in time, the scene before stays.
+
+On a software renderer (zink over lavapipe), a picture of a profile 7
+stream rebuilt at 3840x2160: the wait 28.1 ms on average (the rest of its
+GPU work on a CPU), the samples taken 0.29 ms; the statistics 0.01 ms.
+Host test: 57 checks, 20 mutations caught.
+---
+ tools/dvbridge/dvbridge_dvplus.c    | 24 ++++++++++++++++++
+ tools/dvbridge/dvbridge_dvplus.h    | 38 ++++++++++++++++++++---------
+ tools/dvbridge/dvbridge_dvplus_gl.c | 14 +++++++++++
+ tools/dvbridge/dvbridge_dvplus_gl.h |  4 +++
+ 4 files changed, 69 insertions(+), 11 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_dvplus.c b/tools/dvbridge/dvbridge_dvplus.c
+index cd6af46..1fce68c 100644
+--- a/tools/dvbridge/dvbridge_dvplus.c
++++ b/tools/dvbridge/dvbridge_dvplus.c
+@@ -396,6 +396,30 @@ void dvbridge_dvplus_metadata(const struct dvbridge_dvplus_stats *s, AVDynamicHD
+     w->color_saturation_mapping_flag = 0;
+ }
+ 
++bool dvbridge_dvplus_present_again(struct dvbridge_dvplus *m, double pts, struct dvbridge_dvplus_stats *stats)
++{
++    if (!m || !m->presented || pts != m->last_pts || !m->have || m->unmeasured > m->params.lost)
++        return false;
++    if (!m->last_send) {
++        ++m->counts.sent;
++        if (m->counts.unsent)
++            --m->counts.unsent;
++    }
++    m->last_send = true;
++    m->last_stats = m->sent;
++    if (stats)
++        *stats = m->sent;
++    return true;
++}
++
++int64_t dvbridge_dvplus_wait_budget(int64_t now, int64_t last_vblank, int64_t period, int64_t margin)
++{
++    if (period <= 0 || last_vblank <= 0 || now < last_vblank || now - last_vblank > 1000000000 || margin < 0)
++        return 0;
++    const int64_t next = last_vblank + ((now - last_vblank) / period + 1) * period;
++    return next - margin - now;
++}
++
+ bool dvbridge_dvplus_sent(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_stats *stats)
+ {
+     if (!m || !m->have || m->unmeasured > m->params.lost)
+diff --git a/tools/dvbridge/dvbridge_dvplus.h b/tools/dvbridge/dvbridge_dvplus.h
+index f181b9b..de37643 100644
+--- a/tools/dvbridge/dvbridge_dvplus.h
++++ b/tools/dvbridge/dvbridge_dvplus.h
+@@ -20,17 +20,19 @@
+  *
+  * Measured, without waiting: the picture of a frame is sampled on the GPU after it is drawn (dvbridge_dvplus_gl.h) and
+  * read back when the GPU has finished it, a frame or more later; the metadata of a frame are decided before it is
+- * drawn, from what was measured of the pictures of its scene before it. So the first picture of a scene goes out with
+- * the metadata of the scene before it (they describe nothing of the new scene yet: nothing is made up for it), and
+- * from the first picture of the scene that is measured on, with those of its own scene: the statistics of all of its
+- * pictures measured so far, pooled (every sample of every picture counts once, as a scene's statistics are those of
+- * all of its pixels). Within a scene they change only when a value that the HDR10+ InfoFrame carries (in units of 16
+- * cd/m2) would change and the value itself has moved by more than params.pq_step in PQ: the display's mapping is not
+- * moved by every picture, nor by a value that wavers at the edge of a code. Measured on Cosmos Laundromat (17 520
+- * pictures, the 100 scenes of its Dolby Vision metadata) against the ideal (each scene's statistics with all of its
+- * pictures known, from every pixel, in float64): 2.9 codes off on average over the eight values, 51 changes within
+- * a scene per 1000 pictures; a picture measured on its own (no scenes, the picture waiting for the GPU, as the fork
+- * of CroqueMr does) 4.7 codes and 539 changes.
++ * drawn, from what was measured of the pictures of its scene before it: the statistics of all of its pictures measured
++ * so far, pooled (every sample of every picture counts once, as a scene's statistics are those of all of its pixels).
++ * The first picture of a scene, of which nothing is measured yet, waits for its own measurement where that comes before
++ * the next vblank (dvbridge_dvplus_wait_budget(), dvbridge_dvplus_present_again()); where it does not, it goes out with
++ * the metadata of the scene before (nothing is made up for it: an estimate from its level 1 block was measured worse).
++ * Within a scene they change only when a value that the HDR10+ InfoFrame carries (in units of 16 cd/m2) would change
++ * and the value itself has moved by more than params.pq_step in PQ, and then only params.interval measured pictures
++ * after the last change, unless a value moves by more than params.big_step: the display's mapping is not moved by every
++ * picture, nor by a value that wavers at the edge of a code. Measured on Cosmos Laundromat (17 520 pictures, the 100
++ * scenes of its Dolby Vision metadata) against the ideal (each scene's statistics with all of its pictures known, from
++ * every pixel, in float64): 2.9 codes off on average over the eight values, the first pictures of scenes 6.2 (14.8 with
++ * the scene before, 31.9 from level 1), 31 changes within a scene per 1000 pictures; a picture measured on its own (no
++ * scenes, the picture waiting for the GPU, as the fork of CroqueMr does) 4.7 codes and 539 changes.
+  *
+  * This part decides; it holds no GL, so that a test runs it on the host. */
+ #include <stdbool.h>
+@@ -126,6 +128,10 @@ bool dvbridge_dvplus_present(struct dvbridge_dvplus *m, double pts, const struct
+ /* What was measured of a picture presented before (by its pts): into its scene, where that is the scene of now (a
+  * picture of a scene that has ended adds nothing). false: it was not taken. */
+ bool dvbridge_dvplus_measured(struct dvbridge_dvplus *m, const struct dvbridge_dvplus_picture *picture);
++/* The picture presented last (pts), once its own measurement was taken after it was presented (the first picture of
++ * a scene that waited for it): what goes out with it from now on, made again from what is measured now, also when it is
++ * shown again. false: nothing (it is not the picture presented last, or nothing is to be sent). */
++bool dvbridge_dvplus_present_again(struct dvbridge_dvplus *m, double pts, struct dvbridge_dvplus_stats *stats);
+ /* What goes out with the next picture of the scene of now, as it stands (false: nothing): for the log, and for a
+  * test that takes a picture's own measurement before it is presented */
+ bool dvbridge_dvplus_sent(const struct dvbridge_dvplus *m, struct dvbridge_dvplus_stats *stats);
+@@ -148,6 +154,16 @@ unsigned dvbridge_dvplus_vsif_code(unsigned value);
+ /* cd/m2 of a PQ value (SMPTE ST 2084) */
+ double dvbridge_dvplus_nits(double pq);
+ 
++/* How long the first picture of a scene may wait for its own measurement (ns; 0 or less: not at all): until margin
++ * before the next vblank, the one after now of those of period from the last one (last_vblank, both on the clock of
++ * now). Its commit is then made by that vblank, as without waiting, where the GPU has finished the frame in time: the
++ * flip of a frame waits for its GPU work anyway (its in-fence), and what waiting adds is the time from the end of that
++ * work to the commit (the samples read, the statistics, the InfoFrame), which margin covers. The vblank the frame flips
++ * at may be a later one (its flip waits for the one of the frame before): then this is less than it could wait,
++ * never more. Nothing without a vblank of the last second or a period. */
++int64_t dvbridge_dvplus_wait_budget(int64_t now, int64_t last_vblank, int64_t period, int64_t margin);
++#define DVBRIDGE_DVPLUS_WAIT_MARGIN 4000000 /* ns */
++
+ /* What the module counted, for the log: pictures presented with metadata, without, scenes started, changes of the
+  * metadata within a scene, measurements taken and dropped (of a scene that had ended, or not presented) */
+ struct dvbridge_dvplus_counts {
+diff --git a/tools/dvbridge/dvbridge_dvplus_gl.c b/tools/dvbridge/dvbridge_dvplus_gl.c
+index df6774e..dcf5f3e 100644
+--- a/tools/dvbridge/dvbridge_dvplus_gl.c
++++ b/tools/dvbridge/dvbridge_dvplus_gl.c
+@@ -257,6 +257,20 @@ bool dvbridge_dvplus_gl_submit(struct dvbridge_dvplus_gl *g, unsigned texture, i
+     return true;
+ }
+ 
++bool dvbridge_dvplus_gl_wait(struct dvbridge_dvplus_gl *g, double pts, uint64_t timeout)
++{
++    if (!g)
++        return false;
++    for (int i = 0; i < SLOTS; ++i) {
++        struct slot *s = &g->slots[i];
++        if (!s->busy || s->pts != pts || !s->fence)
++            continue;
++        const GLenum wait = glClientWaitSync(s->fence, GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)timeout);
++        return wait == GL_ALREADY_SIGNALED || wait == GL_CONDITION_SATISFIED;
++    }
++    return false;
++}
++
+ unsigned dvbridge_dvplus_gl_collect(struct dvbridge_dvplus_gl *g,
+                                     void (*done)(double pts, const uint16_t *codes, size_t count, void *context),
+                                     void *context)
+diff --git a/tools/dvbridge/dvbridge_dvplus_gl.h b/tools/dvbridge/dvbridge_dvplus_gl.h
+index 40c8aa7..e3c8b9f 100644
+--- a/tools/dvbridge/dvbridge_dvplus_gl.h
++++ b/tools/dvbridge/dvbridge_dvplus_gl.h
+@@ -30,6 +30,10 @@ void dvbridge_dvplus_gl_reset(struct dvbridge_dvplus_gl *g);
+  * flight, the place is not in the texture, or GL failed: the picture is not measured). */
+ bool dvbridge_dvplus_gl_submit(struct dvbridge_dvplus_gl *g, unsigned texture, int width, int height, int x, int y,
+                                int w, int h, double pts);
++/* Waits, for at most timeout ns, for the GPU to finish the samples of the picture of pts (queued and not taken):
++ * true when they are finished (dvbridge_dvplus_gl_collect() then gives them), false when they are not by then, or
++ * there are none of that picture. */
++bool dvbridge_dvplus_gl_wait(struct dvbridge_dvplus_gl *g, double pts, uint64_t timeout);
+ /* The samples that the GPU has finished, in the order they were queued, each to done(): maxRGB of each, PQ in
+  * 1/65535; one not finished stops it. Returns how many are still in flight. */
+ unsigned dvbridge_dvplus_gl_collect(struct dvbridge_dvplus_gl *g,
+-- 
+2.53.0
+

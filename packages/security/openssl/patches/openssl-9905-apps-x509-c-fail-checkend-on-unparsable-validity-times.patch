@@ -1,0 +1,182 @@
+From cce37c40ea15104bbbbd46fc5fa17067b7b7aae3 Mon Sep 17 00:00:00 2001
+From: Daniel Kubec <kubec@openssl.foundation>
+Date: Mon, 5 Oct 2026 17:00:57 +0200
+Subject: [PATCH] apps/x509.c: fail -checkend on unparsable validity times
+
+When the notBefore or notAfter field of a certificate cannot be parsed,
+X509_check_certificate_times() fails with an error other than
+X509_V_ERR_CERT_HAS_EXPIRED. The -checkend handling only reacted
+to that one error, so a certificate with a corrupt validity period
+printed nothing and exited with status zero, i.e. was treated
+as not expiring.  The same silent success happened for a certificate
+that is not yet valid at the check time.
+
+Report an unparsable validity period as an error with a failing exit
+status. Report a certificate that only becomes valid after the check
+time as not expiring, which is what -checkend did before the switch
+to X509_check_certificate_times(), as it cannot expire
+before it is valid.
+
+Add regression tests with corrupted notBefore and notAfter fields,
+including with -multi, and with a not yet valid certificate.
+Document the behaviour.
+
+Resolves: https://github.com/openssl/openssl/issues/11772
+Assisted-by: Claude:claude-fable-5-1
+Reviewed-by: Dmitry Belyavskiy <beldmit@gmail.com>
+Reviewed-by: Tomas Mraz <tomas@openssl.foundation>
+Reviewed-by: Eugene Syromiatnikov <esyr@openssl.org>
+Merge-date: Tue Oct 27 16:19:04 2026
+Merged-from: https://github.com/openssl/openssl/pull/33105
+(cherry picked from commit 4a5704abc6d261c66e7fcdb0fc072f4f83a44c65)
+---
+ apps/x509.c                  | 25 +++++++++---
+ doc/man1/openssl-x509.pod.in |  4 ++
+ test/recipes/25-test_x509.t  | 75 +++++++++++++++++++++++++++++++++++-
+ 3 files changed, 97 insertions(+), 7 deletions(-)
+
+diff --git a/apps/x509.c b/apps/x509.c
+index c8cd922..77ed03c 100644
+--- a/apps/x509.c
++++ b/apps/x509.c
+@@ -1221,13 +1221,26 @@ cert_loop:
+         X509_VERIFY_PARAM_set_flags(vpm, X509_V_FLAG_USE_CHECK_TIME);
+         X509_VERIFY_PARAM_set_time(vpm, tcheck);
+ 
+-        if (!X509_check_certificate_times(vpm, x, &error)) {
+-            if (error == X509_V_ERR_CERT_HAS_EXPIRED) {
+-                BIO_puts(out, "Certificate will expire\n");
+-                expired = 1;
+-            }
+-        } else {
++        if (X509_check_certificate_times(vpm, x, &error)) {
++            BIO_puts(out, "Certificate will not expire\n");
++        } else if (error == X509_V_ERR_CERT_HAS_EXPIRED) {
++            BIO_puts(out, "Certificate will expire\n");
++            expired = 1;
++        } else if (error == X509_V_ERR_CERT_NOT_YET_VALID) {
++            /*
++             * The certificate only becomes valid after the check time,
++             * so it cannot expire before it.
++             */
+             BIO_puts(out, "Certificate will not expire\n");
++        } else {
++            /*
++             * A notBefore or notAfter field that cannot be parsed must not
++             * be reported as "will not expire", see issue #11772.
++             */
++            BIO_printf(bio_err, "Cannot check certificate expiry: %s\n",
++                X509_verify_cert_error_string(error));
++            X509_VERIFY_PARAM_free(vpm);
++            goto err;
+         }
+         if (multi && k > 0)
+             ret |= expired;
+diff --git a/doc/man1/openssl-x509.pod.in b/doc/man1/openssl-x509.pod.in
+index cbb2ab2..4589850 100644
+--- a/doc/man1/openssl-x509.pod.in
++++ b/doc/man1/openssl-x509.pod.in
+@@ -367,6 +367,10 @@ With B<-multi> checks if any certificate in the input will expire
+ within the next I<arg> seconds and exits nonzero if any will expire
+ or zero if none will.
+ 
++A certificate that only becomes valid after the next I<arg> seconds is
++reported as not expiring.  If the validity period of a certificate cannot
++be parsed, an error is reported and the exit status is nonzero.
++
+ =item B<-checkhost> I<host>
+ 
+ Check that the certificate matches the specified host.
+diff --git a/test/recipes/25-test_x509.t b/test/recipes/25-test_x509.t
+index 9a75043..6d8f2ca 100644
+--- a/test/recipes/25-test_x509.t
++++ b/test/recipes/25-test_x509.t
+@@ -17,7 +17,7 @@ use File::Compare qw/compare_text/;
+ 
+ setup("test_x509");
+ 
+-plan tests => 157;
++plan tests => 158;
+ 
+ # Prevent MSys2 filename munging for arguments that look like file paths but
+ # aren't
+@@ -839,6 +839,79 @@ ok(!run(app(["openssl", "x509", "-multi", "-checkend",
+ ok(!run(app(["openssl", "x509", "-checkend", "60", "-in", $c_key])),
+     "Bad parse with -checkend returns non-zero");
+ 
++# Regression test: -checkend must not report a certificate whose validity
++# times cannot be parsed as "will not expire" with a zero exit status.
++# A certificate that is not yet valid at the check time is not expiring.
++# See https://github.com/openssl/openssl/issues/11772
++subtest "x509 -checkend with invalid or future validity times" => sub {
++    plan tests => 7;
++
++    my $c_der = "c-early.der";
++    my $c_bad_after = "c-bad-notafter.pem";
++    my $c_bad_before = "c-bad-notbefore.pem";
++    my $c_future = "c-future.pem";
++    my $c_mixed = "c-mixed.pem";
++
++    # Overwrite the first digit of the notBefore ($which == 0) or notAfter
++    # ($which == 1) UTCTime of a DER certificate with a non-digit, which
++    # keeps the certificate decodable but makes that time unparsable.
++    sub corrupt_time {
++        my ($in, $out, $which) = @_;
++        my $n = 0;
++
++        open(my $fh, "<:raw", $in) or die;
++        local $/;
++        my $der = <$fh>;
++        close($fh);
++        $der =~ s/(\x17\x0d)(\d)(\d{11}Z)/$n++ == $which ? "$1X$3" : "$1$2$3"/ge
++            or die "no UTCTime found in $in";
++        die "only $n UTCTime(s) found in $in" if $n < 2;
++        open($fh, ">:raw", $out) or die;
++        print {$fh} $der;
++        close($fh);
++        return 1;
++    }
++
++    ok(run(app(["openssl", "x509", "-in", $c_early, "-outform", "DER",
++                "-out", $c_der]))
++       && corrupt_time($c_der, "c-bad-notafter.der", 1)
++       && corrupt_time($c_der, "c-bad-notbefore.der", 0)
++       && run(app(["openssl", "x509", "-inform", "DER",
++                   "-in", "c-bad-notafter.der", "-out", $c_bad_after]))
++       && run(app(["openssl", "x509", "-inform", "DER",
++                   "-in", "c-bad-notbefore.der", "-out", $c_bad_before])),
++       "Create certificates with unparsable validity times");
++
++    ok(!run(app(["openssl", "x509", "-checkend", "60", "-in", $c_bad_after])),
++       "Invalid notAfter with -checkend returns non-zero");
++    ok(!run(app(["openssl", "x509", "-checkend", "60", "-in", $c_bad_before])),
++       "Invalid notBefore with -checkend returns non-zero");
++
++    mkchain($c_late, $c_bad_after);
++    ok(!run(app(["openssl", "x509", "-multi", "-checkend", "60",
++                 "-in", $c_chain])),
++       "Multi cert + invalid notAfter in 2nd cert returns non-zero");
++
++    my $not_before = Time::Piece->gmtime(time() + 2 * 366 * 86400)
++                         ->strftime("%Y%m%d%H%M%SZ");
++    my $not_after = Time::Piece->gmtime(time() + 3 * 366 * 86400)
++                        ->strftime("%Y%m%d%H%M%SZ");
++    ok(run(app(["openssl", "x509", "-new", "-key", $c_key, "-subj",
++                "/CN=FUTURE", "-not_before", $not_before,
++                "-not_after", $not_after, "-out", $c_future])),
++       "Create not yet valid certificate");
++
++    my @out = run(app(["openssl", "x509", "-checkend", "60",
++                       "-in", $c_future]), capture => 1, statusvar => \my $ok);
++    ok($ok && grep(/^Certificate will not expire/, @out),
++       "Not yet valid cert with -checkend returns zero and is reported");
++
++    mkchain($c_future, $c_early);
++    ok(!run(app(["openssl", "x509", "-multi", "-checkend",
++                 $delta_early + 3600, "-in", $c_chain])),
++       "Multi cert + not yet valid 1st + expiring 2nd returns non-zero");
++};
++
+ # Regression test: with -multi, a failure on a later certificate must set
+ # a failing exit status even after an earlier certificate succeeded, i.e.
+ # the per-certificate success status must not leak into the final result.

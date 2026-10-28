@@ -179,6 +179,38 @@ pre_make_target() {
 
     cp -a $(get_build_dir intel-ucode)/intel-ucode ${PKG_BUILD}/external-firmware
 
+    # Hades: licences of the firmware and the microcode built into the kernel ask for their text to
+    # go with it ("in the documentation and/or other materials provided with the distribution").
+    # licenses/, which the release .tar and the boot partition carry next to the kernel, has the
+    # text of each licence that WHENCE names for the folders copied above, and the licence of the
+    # microcode, as these sources have them: the build stops if one is missing or different.
+    local fw_dirs fw_licences licence
+    fw_dirs=$(cd ${PKG_BUILD}/external-firmware && find . -mindepth 1 -maxdepth 1 -type d ! -name intel-ucode -printf "%f\n" | sort | xargs)
+    fw_licences=$(awk -v dirs="${fw_dirs}" '
+      function flush(  s) {
+        if (hit) {
+          s = stanza
+          while (match(s, /(LICEN[CS]E|NOTICE)\.[A-Za-z0-9_.+-]*[A-Za-z0-9_+-]/)) {
+            print substr(s, RSTART, RLENGTH)
+            s = substr(s, RSTART + RLENGTH)
+          }
+        }
+        hit = 0; stanza = ""
+      }
+      BEGIN { n = split(dirs, d, " ") }
+      /^-----/ { flush(); next }
+      /^(File|RawFile|Link):/ { for (i = 1; i <= n; i++) if (index($2, d[i] "/") == 1) hit = 1 }
+      { stanza = stanza " " $0 }
+      END { flush() }
+    ' $(get_build_dir kernel-firmware)/WHENCE | sort -u)
+    [ -n "${fw_dirs}" -a -n "${fw_licences}" ] || die "linux: WHENCE names no licence for the firmware built into the kernel"
+    for licence in ${fw_licences}; do
+      cmp -s $(get_build_dir kernel-firmware)/LICENSES/${licence} ${ROOT}/licenses/LicenseRef-${licence%.txt}.txt ||
+        die "linux: licenses/LicenseRef-${licence%.txt}.txt is not ${licence} of $(get_build_dir kernel-firmware)"
+    done
+    cmp -s $(get_build_dir intel-ucode)/license ${ROOT}/licenses/LicenseRef-intel-ucode.txt ||
+      die "linux: licenses/LicenseRef-intel-ucode.txt is not the licence of $(get_build_dir intel-ucode)"
+
     FW_LIST="$(find ${PKG_BUILD}/external-firmware \( -type f -o -type l \) \( -iname '*.bin' -o -iname '*.fw' -o -path '*/intel-ucode/*' \) | sed 's|.*external-firmware/||' | sort | xargs)"
 
     ${PKG_BUILD}/scripts/config --set-str CONFIG_EXTRA_FIRMWARE "${FW_LIST}"

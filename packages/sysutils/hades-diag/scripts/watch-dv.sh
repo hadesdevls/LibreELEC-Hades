@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Hades diagnostics: for up to 4 hours after boot, capture the output state about 15 s after each time Kodi logs
 # "DVBridge: native Dolby Vision output started", into during-dv-K/ (K = 1 to 6) of the folder of this start
 # (hades-diag/start-N; N is the argument, from start.sh): the HDMI
@@ -15,11 +18,16 @@
 # also records the GPU performance state, clocks and load (nvidia-smi, when present).
 # The same for an AMD GPU (amdgpu: load and current core clock, every 10 s in the timeline), and during
 # Dolby Vision a file gpu-amd.txt with five readings a second apart of its load, clocks, temperature, power
-# and power policy.
+# and power policy. With the NVIDIA driver loaded, the capture during Dolby Vision starts with one query of
+# nvidia-smi (nvidia-smi.txt: performance state, clocks, what holds them down, power and its limits,
+# temperatures), at the lowest processor and disk priority, stopped after 10 s, and state.txt says when it
+# began and ended; the rest of that capture waits 12 s after it, so that the 10-s lines of kodi.log tell
+# what the query cost the video, if anything, apart from what the rest of the capture costs.
+# Each capture has build.txt, the build that made it (folder.sh).
 # Every file of a capture goes through the filter of the diagnostics (redact.sh tree: addresses, serial
 # numbers, UUIDs, SSH keys, network names and the name of the system become markers) before it is copied,
 # and the end of Kodi's log through the filter for logs where it is taken; without the filter nothing is
-# copied.
+# copied. The folder of the start is made this start's before anything goes into it (folder.sh).
 (
 dev=$(awk '$2 == "/storage" { print $1 }' /proc/mounts)
 part=${dev#/dev/}
@@ -59,6 +67,7 @@ D=/flash/hades-diag
 H=start-${1:-0}
 K=/storage/.kodi/temp/kodi.log
 R=/usr/lib/hades-diag/redact.sh
+. /usr/lib/hades-diag/folder.sh
 # Run a command for at most 20 s (the image has no timeout command).
 lim() {
   "$@" 2>&1 &
@@ -137,8 +146,10 @@ to_flash() {
   flash_lock || return 1
   if mount -o remount,rw /flash; then
     if room_left; then
-      rm -f $D/NO-ROOM.txt
-      mkdir -p $D/$H/$2 && cp $1.filtered/* $D/$H/$2/ && : > $D/$H/.filtered
+      if own_start $H; then
+        rm -f $D/NO-ROOM.txt
+        mkdir -p $D/$H/$2 && cp $1.filtered/* $D/$H/$2/ && echo $FILTERED > $D/$H/.filtered
+      fi
     else
       no_room
     fi
@@ -156,6 +167,7 @@ output_state() {
 after_dv() {
   S=/tmp/hades-after-dv-$1
   rm -rf $S $S.filtered; mkdir -p $S
+  this_build > $S/build.txt
   for w in 5 30; do
     if [ $w = 5 ]; then sleep 5; else sleep 25; fi
     {
@@ -175,16 +187,49 @@ after_dv() {
   done
   rm -rf $S $S.filtered
 }
+# How an NVIDIA GPU is clocked and held back while it draws Dolby Vision, into $1/nvidia-smi.txt: one query
+# for the performance state, the clocks (with the least, the most and the average of the samples that the
+# driver keeps), the reasons that hold the clocks down and how long each has held them so far, the power
+# drawn and its limits, and the temperatures. The timeline has only the performance state and two clocks,
+# every 10 s. Only where the NVIDIA driver is loaded (an image has nvidia-smi on every PC). Its first 400
+# lines are kept, as of the other tails of a capture (one GPU gives about a hundred). The query is run
+# at the lowest priority of the processor and of the disk and stopped after 10 s, and when it began and
+# ended goes into $1/state.txt, to the millisecond in the local time of the system (with its offset from
+# UTC; the lines of kodi.log that state.txt has above it show which clock Kodi writes in) and in uptime,
+# so that a refresh that the video missed meanwhile can be found in Kodi's 10-s lines. Returns whether it
+# was run.
+nvidia_during() {
+  command -v nvidia-smi >/dev/null && [ -d /sys/module/nvidia ] || return 1
+  na=$(cut -d' ' -f1 /proc/uptime); ta=$(date '+%F %T.%N')
+  nice -n 19 ionice -c 3 nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE > $1/nvidia-smi.all 2>&1 &
+  np=$!
+  ( sleep 10; kill $np 2>/dev/null ) >/dev/null 2>&1 &
+  nw=$!
+  wait $np
+  nr=$?
+  nb=$(cut -d' ' -f1 /proc/uptime); tb=$(date '+%F %T.%N')
+  kill $nw 2>/dev/null
+  head -n 400 $1/nvidia-smi.all > $1/nvidia-smi.txt
+  rm -f $1/nvidia-smi.all
+  nt=$(awk -v a="$na" -v b="$nb" 'BEGIN { printf "%.2f", b - a }')
+  ns=""
+  [ $nr -gt 128 ] && ns=", stopped after 10 s"
+  echo "== nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE (nice 19, disk idle): from ${ta%??????} to ${tb%??????} (local time, UTC$(date +%z)), uptime $na s to $nb s, $nt s, exit status $nr$ns" >> $1/state.txt
+  return 0
+}
 # The capture about 15 s into Dolby Vision ($1 = slot).
 during_dv() {
   sleep 15
   S=/tmp/hades-dv-$1
   rm -rf $S $S.filtered; mkdir -p $S
+  this_build > $S/build.txt
   {
     echo "== $(date -u '+%F %T') UTC, uptime $(cut -d' ' -f1 /proc/uptime) s"
     echo "== last DVBridge lines of kodi.log"; grep -h 'DVBridge' $K | tail -5 | clean
     output_state
   } > $S/state.txt 2>&1
+  # (first, and on its own: 12 s go by before the rest, a little more than one 10-s line of kodi.log)
+  nvidia_during $S && sleep 12
   modetest_all > $S/modetest-connectors.txt
   for f in /sys/kernel/debug/dri/*/state; do
     [ -r "$f" ] && { echo "--- $f"; cat "$f"; }
@@ -217,11 +262,12 @@ during_dv() {
 }
 # The first free slot of $1 (during-dv or after-dv) in this start, taken at once with a directory in RAM, so
 # that a capture still running (not yet on the boot partition) keeps its slot. Prints nothing when all 6 are
-# used.
+# used. (What a folder of that name holds that is of another start takes no slot: it is emptied before this start
+# writes there.)
 take_slot() {
   k=1
   while [ $k -le 6 ]; do
-    if [ ! -e $D/$H/$1-$k ] && mkdir /run/hades-$1-$k 2>/dev/null; then
+    if { [ ! -e $D/$H/$1-$k ] || ! mine $H; } && mkdir /run/hades-$1-$k 2>/dev/null; then
       echo $k
       return
     fi

@@ -1,0 +1,464 @@
+From c0d54840fd33fbed83c2491b2264b167a89c746c Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:42:29 +0000
+Subject: [PATCH] [windowing/gbm] Measure when the frames flip against the
+ player's clock, per way
+
+The render manager chooses a frame for the display latency that Kodi takes, the same for every way
+of presenting it: (buffers + 1) refresh periods, less GetFrameLatencyAdjustment(). Read in the code,
+the ways do not take the same time to put a frame on the screen: the ordinary output waits for the
+flip of the frame before and commits without waiting (about two periods); native Dolby Vision
+presented the way that waits commits and returns with its flip (about one); a frame ahead is chosen
+a period earlier and flipped about two later. If that holds, the way that waits shows a picture a
+refresh early against the same sound. Nothing is changed for it until it is measured.
+
+What is measured, per way (CPresentLag), is the time from when the player's clock calls for a frame
+to its flip, by the kernel's monotonic clock:
+ - when the clock calls for it: CRenderManager::PrepareNextRender() tells the window system, for the
+   frame it chooses, now + (its pts - the clock), only while the clock runs at the video's speed;
+ - its flip: for a frame of native output that waits, the return of its commit, which returns with
+   the flip; for a frame ahead, the time of its out-fence (DVAheadFlipped()); for the ordinary
+   output, the time of the out-fence of its commit, read from a copy of it once EGL has waited for
+   it (it is not waited for again), or the return of a commit that waits.
+Times more than 2 s apart say nothing of the sync and are left out. The line of every 10 s of
+native output gains, and a line once a minute does it for the ordinary output while a video plays:
+
+  the flips came after the times that the player's clock called for their frames by A ms (min to
+  max) over N frames presented the way that waits, ... (Kodi chooses the frames L ms ahead of their
+  flips)
+
+A negative time is a picture before its time. Read with an HDR10 video and a native Dolby Vision
+one of the same title, it says whether the ways differ by a refresh; what the TV adds is not seen
+from here. Only times are read: no commit, fence or wait changes.
+
+Host test: presentlag_test, 7 checks; with nothing measured (before), 4 fail.
+---
+ .../VideoRenderers/RenderManager.cpp          |  25 ++++
+ xbmc/windowing/gbm/PresentLag.h               | 125 ++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  86 ++++++++++++
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  33 +++++
+ 4 files changed, 269 insertions(+)
+ create mode 100644 xbmc/windowing/gbm/PresentLag.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 09adb4d..49eebf2 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -1265,6 +1265,25 @@ void CRenderManager::PrepareNextRender()
+     combined = true;
+   }
+ 
++#ifdef HAVE_DVBRIDGE
++  // Hades: when the player's clock calls for the frame chosen, by the steady clock, for the window
++  // system to tell how long after it the frame was flipped (CPresentLag). Only while the clock runs
++  // at the speed of the video: paused, or fast, there is no such time.
++  const auto chosen = [&](double pts)
++  {
++    const double speed = m_dvdClock.GetClockSpeed();
++    if (isPaused || pts == DVD_NOPTS_VALUE || speed < 0.9 || speed > 1.1)
++      return;
++    if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++            CServiceBroker::GetWinSystem()))
++      dvWindow->VideoFrameChosen(
++          std::chrono::duration_cast<std::chrono::nanoseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count() +
++          static_cast<int64_t>((pts - frameOnScreen) / DVD_TIME_BASE * 1e9));
++  };
++#endif
++
+   if (renderPts >= nextFramePts || m_forceNext)
+   {
+     // see if any future queued frames are already due
+@@ -1308,6 +1327,9 @@ void CRenderManager::PrepareNextRender()
+     m_presentsource = idx;
+     m_queued.pop_front();
+     m_presentpts = m_Queue[idx].pts - m_displayLatency;
++#ifdef HAVE_DVBRIDGE
++    chosen(m_Queue[idx].pts);
++#endif
+     m_presentevent.notifyAll();
+ 
+     m_playerPort->UpdateRenderBuffers(m_queued.size(), m_discard.size(), m_free.size());
+@@ -1320,6 +1342,9 @@ void CRenderManager::PrepareNextRender()
+     m_presentsource = m_queued.front();
+     m_queued.pop_front();
+     m_presentpts = m_Queue[m_presentsource].pts - m_displayLatency - frametime / 2;
++#ifdef HAVE_DVBRIDGE
++    chosen(m_Queue[m_presentsource].pts);
++#endif
+     m_presentevent.notifyAll();
+   }
+ }
+diff --git a/xbmc/windowing/gbm/PresentLag.h b/xbmc/windowing/gbm/PresentLag.h
+new file mode 100644
+index 0000000..ea4e69e
+--- /dev/null
++++ b/xbmc/windowing/gbm/PresentLag.h
+@@ -0,0 +1,125 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: how long after the time that the player's clock calls for a frame its flip comes,
++ *        by the way it was presented: what the source adds to the sync of the picture with the
++ *        sound
++ *
++ * The render manager chooses a frame for the display latency that Kodi takes (the buffers, plus
++ * one, in refresh periods, less GetFrameLatencyAdjustment()), the same for every way of presenting
++ * it. Read in the code, the ways do not take the same time to put a frame on the screen: the
++ * ordinary output waits for the flip of the frame before it and commits without waiting (about two
++ * periods); native Dolby Vision presented the way that waits commits and returns with its flip
++ * (about one); a frame ahead is chosen a period earlier and flipped about two later. If so, a
++ * picture presented the way that waits would come a refresh earlier than the others, against the
++ * same sound. Nothing is changed for it until it is measured: the time the clock calls for a frame
++ * (its pts, from the clock when it was chosen, CRenderManager::PrepareNextRender()) and the time of
++ * its flip, by the kernel's clock (the out-fence of its commit, or the return of a commit that
++ * waits for it) are told here, per way, for the log. A positive time: the picture after its time;
++ * negative: before.
++ *
++ * This class only counts; a test builds it on the host.
++ */
++class CPresentLag
++{
++public:
++  enum class Way
++  {
++    WAITING, //!< native Dolby Vision, a commit that returns with its flip
++    AHEAD, //!< native Dolby Vision presented a frame ahead
++    ORDINARY, //!< the ordinary output of Kodi
++    COUNT
++  };
++
++  //! A frame whose clock time was dueNs was flipped at flipNs (the same monotonic clock). Times
++  //! more than two seconds apart say nothing of the sync (a pause, a stalled flip): left out.
++  void Add(Way way, int64_t dueNs, int64_t flipNs)
++  {
++    if (dueNs <= 0 || flipNs <= 0)
++      return;
++    const double ms = static_cast<double>(flipNs - dueNs) / 1e6;
++    if (ms > 2000.0 || ms < -2000.0)
++      return;
++    auto& w = m_ways[static_cast<size_t>(way)];
++    if (w.count == 0)
++    {
++      w.minMs = ms;
++      w.maxMs = ms;
++    }
++    w.count++;
++    w.sumMs += ms;
++    w.minMs = std::min(w.minMs, ms);
++    w.maxMs = std::max(w.maxMs, ms);
++  }
++
++  unsigned int Count(Way way) const { return m_ways[static_cast<size_t>(way)].count; }
++  double AverageMs(Way way) const
++  {
++    const auto& w = m_ways[static_cast<size_t>(way)];
++    return w.count ? w.sumMs / w.count : 0.0;
++  }
++
++  //! "the flips came A ms after the clock's time of their frames (min .. max) over N presented the
++  //! way that waits, ...", empty without any; latencyMs: the display latency that Kodi takes now
++  std::string Text(double latencyMs) const
++  {
++    std::string text;
++    static constexpr const char* NAMES[] = {"presented the way that waits",
++                                            "presented a frame ahead", "of the ordinary output"};
++    for (size_t i = 0; i < m_ways.size(); ++i)
++    {
++      const auto& w = m_ways[i];
++      if (!w.count)
++        continue;
++      char part[160];
++      std::snprintf(part, sizeof(part), "%s%.1f ms (%.1f to %.1f) over %u frames %s",
++                    text.empty() ? "" : ", ", w.sumMs / w.count, w.minMs, w.maxMs, w.count,
++                    NAMES[i]);
++      text += part;
++    }
++    if (text.empty())
++      return text;
++    char tail[96];
++    std::snprintf(tail, sizeof(tail), " (Kodi chooses the frames %.1f ms ahead of their flips)",
++                  latencyMs);
++    return "the flips came after the times that the player's clock called for their frames by " +
++           text + tail;
++  }
++
++  void Reset() { m_ways = {}; }
++
++private:
++  struct Stats
++  {
++    unsigned int count = 0;
++    double sumMs = 0.0;
++    double minMs = 0.0;
++    double maxMs = 0.0;
++  };
++  std::array<Stats, static_cast<size_t>(Way::COUNT)> m_ways{};
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 060ee89..81ee444 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -161,6 +161,14 @@ bool WaitFence(int fd, int timeoutMs, int64_t* signalledNs = nullptr)
+   close(fd);
+   return signalled;
+ }
++
++// Hades: now by the steady clock (CLOCK_MONOTONIC on Linux, the kernel's clock of the flips), in ns
++int64_t SteadyNowNs()
++{
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
+ #endif
+ } // namespace
+ 
+@@ -347,6 +355,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+   LookForWake();
+ 
+ #ifdef HAVE_DVBRIDGE
++  // Hades: the frame that the render manager chose for this pass, if it chose one (CPresentLag)
++  m_lagFrameNs = TakeChosenFrame();
+   PublishDVInfo(false);
+   if (m_dvState.Captured() && m_dvRepeat)
+   {
+@@ -359,6 +369,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+   m_dvRepeat = false;
+   if (m_dvState.Captured())
+   {
++    m_videoLagPendingNs = 0; // (Hades: the ordinary output has no commit whose flip is to come)
+     const bool attempted = m_dvFrame && m_dvBridge;
+     const auto presentStart = std::chrono::steady_clock::now();
+     bool presented = false;
+@@ -499,6 +510,21 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         AnnounceHeldModeChange(true);
+         presented = FlipDVBridgePage(m_dvState, false, &flip);
+         presentedAhead = presented && flip.ahead;
++        // Hades: when its flip came against the player's clock (CPresentLag): a commit that waits
++        // returned with it; a frame ahead is told with its flip (DVAheadFlipped())
++        // (a frame presented the way that waits comes after the flip of any frame ahead before it
++        // was told, or known lost: nothing ahead is left to tell)
++        if (presented && !presentedAhead)
++          m_dvLagAheadNs = 0;
++        // (not a frame whose commit carried more than the picture, a modeset: it says nothing of
++        // the frames after it)
++        if (presented && m_lagFrameNs > 0)
++        {
++          if (presentedAhead)
++            m_dvLagAheadNs = m_lagFrameNs;
++          else if (plainFrame)
++            m_dvLag.Add(CPresentLag::Way::WAITING, m_lagFrameNs, SteadyNowNs());
++        }
+         if (presented)
+         {
+           // (Hades: a mode that native output moved into went out with it: CDVModeMove)
+@@ -728,6 +754,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     AnnounceHeldModeChange(false);
+ #endif
+     bool async = !videoLayer && m_eglFence;
++    int lagFd = -1; // (Hades: the out-fence of the frame before, to read when it flipped)
+     if (rendered)
+     {
+ #if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+@@ -736,6 +763,11 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         int fd = m_DRM->TakeOutFenceFd();
+         if (fd != -1)
+         {
++#ifdef HAVE_DVBRIDGE
++          // Hades: (EGL takes this fence; a copy of it says when that flip came, CPresentLag)
++          if (m_videoLagPendingNs > 0)
++            lagFd = dup(fd);
++#endif
+           m_eglFence->CreateKMSFence(fd);
+           m_eglFence->WaitSyncGPU();
+         }
+@@ -760,19 +792,41 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         // frame goes to its own commit, after that: a commit that FlipStalled() makes would
+         // take it (and close it).
+         if (m_eglFence->WaitSyncCPU(FLIP_STALL_WAIT))
++        {
+           FlipCame();
++#ifdef HAVE_DVBRIDGE
++          // Hades: when the flip of the frame before came, against the player's clock (it has
++          // come: the copy of its fence is read at once, and closed)
++          if (int64_t flippedNs = 0;
++              lagFd >= 0 && WaitFence(std::exchange(lagFd, -1), 0, &flippedNs) && flippedNs > 0)
++            m_videoLag.Add(CPresentLag::Way::ORDINARY, m_videoLagPendingNs, flippedNs);
++#endif
++        }
+         else if (FlipStalled())
+           async = false;
+         m_DRM->SetInFenceFd(fd);
+       }
+ #endif
+     }
++    if (lagFd >= 0)
++      close(lagFd);
+ 
+     // Hades: an output that FlipStalled() turned off and could not turn on again
+     if (m_flipOutputOff)
+       FlipOutputOn();
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
+ #ifdef HAVE_DVBRIDGE
++    // Hades: the frame of this commit, whose flip comes before the next commit (async), or came
++    // with this one, which waited for it (CPresentLag); a line a minute while a video plays
++    m_videoLagPendingNs = 0;
++    if (m_lagFrameNs > 0)
++    {
++      if (async)
++        m_videoLagPendingNs = m_lagFrameNs;
++      else
++        m_videoLag.Add(CPresentLag::Way::ORDINARY, m_lagFrameNs, SteadyNowNs());
++    }
++    VideoLagReport();
+     // (Hades: a commit that the driver refused went out as the one before it, without the change
+     // of mode that it may carry)
+     {
+@@ -3035,6 +3089,7 @@ bool CWinSystemGbmGLESContext::EndDVBridge(bool tellModeset)
+   DVAheadForgetFlip();
+   m_dvAheadShown = false;
+   m_dvAheadLatencyMs = 0.0f;
++  m_dvLagAheadNs = 0; // (Hades: CPresentLag)
+   m_dvAheadModeRead = false;
+   m_dvAheadGui = -1;
+   m_dvStepRead = false;
+@@ -4013,6 +4068,10 @@ void CWinSystemGbmGLESContext::DVAheadFlipped(int64_t ns)
+ {
+   // Hades: that frame reached the display in time (CDVPresentStall)
+   m_dvPresentStall.Flipped();
++  // Hades: ... and when, against the player's clock (CPresentLag)
++  if (m_dvLagAheadNs > 0 && ns > 0)
++    m_dvLag.Add(CPresentLag::Way::AHEAD, m_dvLagAheadNs, ns);
++  m_dvLagAheadNs = 0;
+   // The time between the flips of two frames in a row, as the kernel tells them: what says
+   // whether a refresh was missed while frames are presented a frame ahead, where the time that
+   // a presentation takes says little.
+@@ -4092,6 +4151,29 @@ void CWinSystemGbmGLESContext::DVAheadFailed(const char* what, bool forGood)
+                       : ", and so are the frames after it in this video");
+ }
+ 
++double CWinSystemGbmGLESContext::LagLatencyMs()
++{
++  return static_cast<double>(GetGfxContext().GetDisplayLatency()) -
++         static_cast<double>(GetFrameLatencyAdjustment());
++}
++
++void CWinSystemGbmGLESContext::VideoLagReport()
++{
++  const auto now = std::chrono::steady_clock::now();
++  if (m_videoLag.Count(CPresentLag::Way::ORDINARY) == 0)
++  {
++    m_videoLagSince = now;
++    return;
++  }
++  if (now - m_videoLagSince < std::chrono::seconds(60))
++    return;
++  CLog::Log(LOGINFO, "Video: in the last {} s, {}",
++            std::chrono::duration_cast<std::chrono::seconds>(now - m_videoLagSince).count(),
++            m_videoLag.Text(LagLatencyMs()));
++  m_videoLag.Reset();
++  m_videoLagSince = now;
++}
++
+ void CWinSystemGbmGLESContext::DVAheadWaited(bool late, double periodMs)
+ {
+ #if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
+@@ -4488,6 +4570,10 @@ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+                                     "the longest {:.2f} ms)",
+                                     io.quick, io.quickSumMs / io.quick, io.quickMaxMs);
+   }
++  // Hades: when the flips came against the player's clock, per way (CPresentLag)
++  if (const std::string lag = m_dvLag.Text(LagLatencyMs()); !lag.empty())
++    ioctls += "; " + lag;
++  m_dvLag.Reset();
+   CLog::Log(LOGINFO,
+             "DVBridge: {}: {} frames shown ({} of them keeping the picture on the screen, which "
+             "was not drawn again), {} not shown, {} composed with GUI elements; "
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index f9f221f..9de5069 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -25,6 +25,7 @@
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "DVAhead.h"
+ #include "DVEngineSettings.h"
++#include "PresentLag.h"
+ #include "DVGuiLevel.h"
+ #include "DVModeMove.h"
+ #include "DVPathChoice.h"
+@@ -240,6 +241,13 @@ public:
+     m_dvDiscards.fetch_add(1, std::memory_order_relaxed);
+     m_dvStepSeeks.fetch_add(1, std::memory_order_relaxed);
+   }
++  //! Hades: the render manager chose a frame for the screen, whose time by the player's clock is
++  //! dueNs (steady clock, CPresentLag). Main thread, before the pass that presents it.
++  void VideoFrameChosen(int64_t dueNs)
++  {
++    m_lagChosenNs = dueNs;
++    m_lagChosenSerial++;
++  }
+   bool SetVideoOutput(const VideoPicture* picture) override;
+   bool DestroyWindowSystem() override;
+   //! A frame that is presented a frame ahead (see CDVAhead) is on the screen one refresh period
+@@ -632,6 +640,31 @@ private:
+   //! Hades: a frame presented the way that waits that tells whether such frames miss their refresh
+   //! (CDVAhead::PresentedWaiting()), and whether it missed its own
+   void DVAheadWaited(bool late, double periodMs);
++  //! Hades: when the flips of the frames come against the player's clock, per way (CPresentLag):
++  //! the frame chosen last (VideoFrameChosen()) ...
++  std::atomic<int64_t> m_lagChosenNs{0};
++  std::atomic<uint64_t> m_lagChosenSerial{0};
++  uint64_t m_lagTakenSerial = 0;
++  //! ... taken by the pass that presents it: its time by the clock, 0 when no frame was chosen
++  //! for this pass (a repeat of the picture, the GUI)
++  int64_t TakeChosenFrame()
++  {
++    const uint64_t serial = m_lagChosenSerial.load();
++    if (serial == m_lagTakenSerial)
++      return 0;
++    m_lagTakenSerial = serial;
++    return m_lagChosenNs.load();
++  }
++  int64_t m_lagFrameNs = 0; //!< ... of the frame of this pass
++  CPresentLag m_dvLag; //!< ... of native output, for the line of every 10 s
++  int64_t m_dvLagAheadNs = 0; //!< ... of the frame presented a frame ahead whose flip is to come
++  CPresentLag m_videoLag; //!< ... of the ordinary output while a video plays, a line a minute
++  int64_t m_videoLagPendingNs = 0; //!< ... of the frame of its last commit, whose flip is to come
++  std::chrono::steady_clock::time_point m_videoLagSince;
++  //! The display latency that Kodi takes now, in ms (as CRenderManager::PrepareNextRender())
++  double LagLatencyMs();
++  //! ... and the line of the ordinary output, once a minute while there is something to tell
++  void VideoLagReport();
+   //! Hades: the fidelity step-down level of the next native Dolby Vision frame (see
+   //! dvbridge_render_set_step()), of that kind of stream and that format (see CDVFrameLoad; 0: not
+   //! known), with those levels that change anything for it: the one that the setting or
+-- 
+2.53.0
+

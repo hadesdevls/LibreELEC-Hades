@@ -1,0 +1,364 @@
+#!/bin/sh
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+
+# Hades: which internal partitions are shown while the internal disks are shown.
+#
+# With the setting "show the internal disks (read-only)" on (internal-disks), 95-udevil-mount.rules mounts
+# every partition of an internal disk that has a file system, read-only. With this, some of them can be kept
+# out of that: before the rule mounts one it runs "decide", and it mounts it only when the answer is "mount".
+# What goes for each partition is in $LIST, which the settings add-on writes with "save":
+#
+#   others shown|hidden                        for a partition that is not on the list
+#   shown|hidden wwn=W serial=S part=P desc=D  one partition. W and S are the WWN and the serial number of its
+#                                              disk as udev gives them (ID_WWN, ID_SERIAL; one of the two may
+#                                              be empty), P is its identifier in the partition table
+#                                              (ID_PART_ENTRY_UUID, of GPT or of MBR), or "whole" for a file
+#                                              system on a whole disk, and D is what the settings show of it
+#
+# Every value is written with the bytes other than letters, digits and . _ : - as %XX (an NVMe disk has spaces
+# in its ID_SERIAL). A partition is told by the three together, never by the name of its device (sda1), which
+# can change from one start to the next. One whose disk has neither a WWN nor a serial number, or that has no
+# identifier, cannot be told apart from others: it goes by "others". Two lines for one partition that do not
+# say the same keep it hidden.
+#
+# All this can do is take a partition away from what the rule mounts: it never mounts anything, it is never
+# asked about a disk on USB or a removable one, and with the setting off it is not asked at all (the boot
+# menus and the kernel keep the internal disks away: internal-disks, the init). Wherever it cannot answer
+# "mount" for certain (the list damaged or unreadable, this script missing or failing) the rule mounts
+# nothing internal, and the kernel log says why. It does not hide a disk: a partition that is not mounted is
+# still there, and a program that runs with full rights can read it.
+#
+# Usage:
+#   internal-partitions decide  for udev: what goes for the device of the event, from its environment
+#                               (DEVNAME, DEVTYPE, ID_WWN, ID_SERIAL, ID_PART_ENTRY_UUID). Prints "mount" or
+#                               "keep"; a partition that is kept is told in the kernel log ("hades-disks: ...")
+#   internal-partitions list    for the settings: "start shows|hides" (whether this start shows the internal
+#                               disks), "list none|ok|damaged N" (N: the first line that cannot be read),
+#                               "others shown|hidden" (what goes for them now), then "here STATE id=yes|no
+#                               wwn= serial= part= dev= size= type= label= model= short= number=" for each
+#                               internal partition of this start that the rule would mount, and "gone STATE
+#                               wwn= serial= part= desc=" for each one of the list that is not here (values
+#                               written as in the list; label is udev's ID_FS_LABEL_ENC, size is in bytes)
+#   internal-partitions save    for the settings: the new list on standard input ("others" and the lines of
+#                               the partitions, nothing else), checked and written whole. Where it hides
+#                               nothing, the list is taken away: that is what a system without one does
+# Exit status: 0 done; 1 wrong usage; 2 (save) what came in is not a list that this reads, and nothing was
+# written; 3 (save) the list could not be written, and it is as it was, or it could not be told for certain
+# that it is as asked ("list" tells); 4 (list) what udev knows of the devices could not be read
+
+# Run from Kodi or from udev: only what the system has, in the C locale, without the variables that the loader
+# and the C library take from the environment (the list of internal-disks).
+PATH=/usr/bin:/usr/sbin
+export PATH
+LC_ALL=C
+export LC_ALL
+unset GCONV_PATH GETCONF_DIR GLIBC_TUNABLES HOSTALIASES LD_AUDIT LD_BIND_NOT LD_BIND_NOW LD_DEBUG \
+  LD_DEBUG_OUTPUT LD_DYNAMIC_WEAK LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD LD_PROFILE LD_PROFILE_OUTPUT \
+  LD_SHOW_AUXV LD_VERBOSE LD_WARN LOCALDOMAIN LOCPATH MALLOC_ARENA_MAX MALLOC_ARENA_TEST MALLOC_MMAP_MAX_ \
+  MALLOC_MMAP_THRESHOLD_ MALLOC_PERTURB_ MALLOC_TOP_PAD_ MALLOC_TRACE MALLOC_TRIM_THRESHOLD_ NIS_PATH NLSPATH \
+  RESOLV_HOST_CONF RES_OPTIONS TMPDIR TZDIR
+
+LIST=/storage/.config/hades-internal-partitions.conf
+KMSG=/dev/kmsg
+MOUNTS=/proc/mounts
+CMDLINE=/proc/cmdline
+MARK=/dev/.hades_other_disks_hidden
+# (what hide_chosen_disks of the init leaves: internal-disk-choice)
+STATE=/dev/.hades_internal_disks
+SYSBLOCK=/sys/class/block
+UDEVADM=/usr/bin/udevadm
+RUNDIR=/run
+# (how many partitions a list may name, how long a line of it may be, and how much "save" reads)
+MAX=512
+LINE=2048
+INMAX=1048576
+
+# One program for the four uses (MODE), so that the list is read and a device is told by the same lines:
+#   check   the file given: prints "ok", or "damaged N" for the first line N that is not of a known kind
+#           (INPUT=1: it is the input of "save", which has no comments or empty lines)
+#   decide  the list given, for the device of the event (its values from ENVIRON): "mount", "keep hidden",
+#           "keep others" (and "unknown" when it cannot be told apart), or "damaged N"
+#   list    the list (when HASLIST=1) and then udev's database: the lines "here" and "gone" of "list"
+PROG='
+BEGIN { for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i }
+# a value as the list has it: the bytes other than letters, digits and . _ : - as %XX
+function enc(v,    o, i, c) {
+  o = ""
+  for (i = 1; i <= length(v); i++) {
+    c = substr(v, i, 1)
+    if (c ~ /[A-Za-z0-9._:-]/) o = o c
+    else o = o sprintf("%%%02X", ord[c])
+  }
+  return o
+}
+function bad() { if (!damaged) damaged = FNR }
+# the value of a field "name=value" of a line, or "\001" where it is not one
+function field(f, name,    v) {
+  if (substr(f, 1, length(name) + 1) != name "=") return "\001"
+  v = substr(f, length(name) + 2)
+  if (v !~ /^[A-Za-z0-9._:%-]*$/ || v ~ /%([^0-9A-F]|.[^0-9A-F]|.?$)/) return "\001"
+  return v
+}
+# the key of a device: its encoded WWN, serial number and partition; tellable: whether it can be told apart
+function keyof(wwn, serial, type, part) {
+  if (type == "disk") part = "whole"; else if (type != "partition") part = ""
+  kw = enc(wwn); ks = enc(serial); kp = enc(part)
+  tellable = (kp != "" && (kw != "" || ks != ""))
+  return kw " " ks " " kp
+}
+# what goes for a key: shown or hidden (FORCE: what goes for all, in "list" without a list that can be read)
+function verdict(k, t) {
+  if (FORCE != "") return FORCE
+  if (damaged) return "hidden"
+  if (t && (k in hid)) return "hidden"
+  if (t && (k in sho)) return "shown"
+  return others
+}
+# a line of a list
+function listline() {
+  if (length($0) > LINE || $0 ~ /[[:cntrl:]]/) { bad(); return }
+  if (!INPUT && ($0 ~ /^#/ || $0 ~ /^[ \t]*$/)) return
+  if ($1 == "others") {
+    if (NF != 2 || ($2 != "shown" && $2 != "hidden") || others != "") bad()
+    else others = $2
+    return
+  }
+  if ($1 == "shown" || $1 == "hidden") {
+    w = field($2, "wwn"); s = field($3, "serial"); p = field($4, "part"); d = field($5, "desc")
+    if (NF != 5 || w == "\001" || s == "\001" || p == "\001" || d == "\001" || (w == "" && s == "") || p == "") { bad(); return }
+    if (++n > MAX) { bad(); return }
+    k = w " " s " " p
+    if ($1 == "hidden") hid[k] = 1; else sho[k] = 1
+    if (!(k in seen)) { seen[k] = 1; order[++norder] = k }
+    if (!(k in line) || $1 == "hidden") line[k] = $0
+    return
+  }
+  bad()
+}
+function endlist() {
+  if (!damaged && others == "") damaged = FNR + 1
+  listdone = 1
+}
+# a device of udev s database, when it is one that 95-udevil-mount.rules would mount as internal
+function device(    k, sz, l) {
+  if (name != "" && e["SUBSYSTEM"] == "block" && e["HADES_INTERNAL"] == "1" && e["ID_FS_USAGE"] == "filesystem" &&
+      (e["DEVTYPE"] == "partition" || e["DEVTYPE"] == "disk") && name ~ /^(sd|mmc|nvme)/ &&
+      e["ID_FS_LABEL"] !~ /^(EFI|BOOT|Recovery|RECOVERY|SETTINGS|boot|root0|share0)$/ && !(("/dev/" name) in own)) {
+    k = keyof(e["ID_WWN"], e["ID_SERIAL"], e["DEVTYPE"], e["ID_PART_ENTRY_UUID"])
+    if (tellable) here[k] = 1
+    sz = 0
+    if ((getline l < (SYSBLOCK "/" name "/size")) > 0 && l ~ /^[0-9]+$/) sz = l * 512
+    close(SYSBLOCK "/" name "/size")
+    printf "here %s id=%s wwn=%s serial=%s part=%s dev=%s size=%.0f type=%s label=%s model=%s short=%s number=%s\n",
+      verdict(k, tellable), tellable ? "yes" : "no", kw, ks, kp, enc(name), sz, enc(e["ID_FS_TYPE"]),
+      enc(e["ID_FS_LABEL_ENC"]), enc(e["ID_MODEL"]), enc(e["ID_SERIAL_SHORT"]), enc(e["ID_PART_ENTRY_NUMBER"])
+  }
+  name = ""
+  split("", e)
+}
+MODE == "list" && FILENAME == MOUNTS { if ($2 == "/flash" || $2 == "/storage") own[$1] = 1; next }
+MODE == "list" && FILENAME == DB {
+  if (HASLIST && !listdone) endlist()
+  if ($0 ~ /^P: /) { device(); next }
+  if ($0 ~ /^N: /) { name = substr($0, 4); next }
+  if ($0 ~ /^E: /) { kv = substr($0, 4); i = index(kv, "="); if (i > 1) e[substr(kv, 1, i - 1)] = substr(kv, i + 1); next }
+  if ($0 == "") device()
+  next
+}
+{ listline() }
+END {
+  if (MODE == "check") {
+    endlist()
+    print damaged ? "damaged " damaged : "ok"
+  } else if (MODE == "decide") {
+    endlist()
+    if (damaged) { print "damaged " damaged; exit }
+    k = keyof(ENVIRON["ID_WWN"], ENVIRON["ID_SERIAL"], ENVIRON["DEVTYPE"], ENVIRON["ID_PART_ENTRY_UUID"])
+    v = verdict(k, tellable)
+    if (v == "shown") print "mount"
+    else if (tellable && (k in hid)) print "keep hidden"
+    else print "keep others" (tellable ? "" : " unknown")
+  } else if (MODE == "list") {
+    device()
+    if (HASLIST && !damaged)
+      for (i = 1; i <= norder; i++) if (!(order[i] in here)) print "gone " line[order[i]]
+  }
+}
+'
+
+log_kmsg() {
+  echo "hades-disks: $1" 2>/dev/null >"$KMSG"
+}
+
+# Whether the entry of this start keeps the internal disks away (what the init knows: HADES_ENTRY_HIDES,
+# hide_other_disks, hide_from_usb). Their mark tells it where the kernel command line cannot be read; not where
+# hide_chosen_disks of the init left it, with its state beside it (STATE: a list of the disks that are kept away
+# could not be done in full, and no internal partition is mounted): the entry showed the disks then, and their
+# partitions are listed for the next start.
+start_hides() {
+  local a
+  [ -e "$MARK" ] && [ ! -e "$STATE" ] && return 0
+  for a in $(cat "$CMDLINE" 2>/dev/null); do
+    case "$a" in
+      hades.otherdisks=hide) return 0 ;;
+      initcall_blacklist=*)
+        case ",${a#*=}," in *,nvme_init,*|*,ahci_pci_driver_init,*) return 0 ;; esac
+        ;;
+    esac
+  done
+  return 1
+}
+
+has_list() {
+  [ -e "$LIST" ] || [ -L "$LIST" ]
+}
+
+# Whether the list is a file that can be read at all: a file of its own (not a link, not a folder or a device)
+# of at most what "save" takes
+list_readable() {
+  local sz
+  [ -f "$LIST" ] && [ ! -L "$LIST" ] && [ -r "$LIST" ] || return 1
+  sz=$(wc -c < "$LIST" 2>/dev/null | tr -d ' ')
+  case "$sz" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$sz" -le $INMAX ]
+}
+
+do_decide() {
+  local r dev=${DEVNAME:-a device}
+  if ! has_list; then
+    echo mount
+    exit 0
+  fi
+  # (the values of udev are read by awk from the environment: awk -v would take a backslash in them for an
+  # escape)
+  if list_readable; then
+    r=$(awk -v MODE=decide -v LINE=$LINE -v MAX=$MAX -v INPUT=0 "$PROG" "$LIST" 2>/dev/null) || r=unreadable
+  else
+    r=unreadable
+  fi
+  case "$r" in
+    mount)
+      echo mount
+      exit 0
+      ;;
+    "keep hidden")
+      log_kmsg "$dev is not mounted: it is hidden in $LIST"
+      ;;
+    "keep others")
+      log_kmsg "$dev is not mounted: $LIST hides the partitions that it does not name"
+      ;;
+    "keep others unknown")
+      log_kmsg "$dev is not mounted: it cannot be told apart from other partitions (its disk has no WWN or serial number, or it has no identifier), and $LIST hides the partitions that it does not name"
+      ;;
+    damaged*)
+      log_kmsg "$dev is not mounted: line ${r#damaged } of $LIST cannot be read, so no internal partition is mounted"
+      ;;
+    *)
+      log_kmsg "$dev is not mounted: $LIST cannot be read, so no internal partition is mounted"
+      ;;
+  esac
+  echo keep
+  exit 0
+}
+
+# W: a folder of this run in RAM
+W=""
+leave() {
+  [ -n "$W" ] && rm -rf "$W"
+}
+
+do_list() {
+  local st others has=0
+  trap leave EXIT
+  W=$(mktemp -d "$RUNDIR/internal-partitions.XXXXXX" 2>/dev/null) || exit 4
+  "$UDEVADM" info --export-db > "$W/db" 2>/dev/null || exit 4
+  if start_hides; then echo "start hides"; else echo "start shows"; fi
+  if ! has_list; then
+    st=none
+  elif list_readable; then
+    has=1
+    st=$(awk -v MODE=check -v LINE=$LINE -v MAX=$MAX -v INPUT=0 "$PROG" "$LIST" 2>/dev/null) || st="damaged 1"
+  else
+    st="damaged 1"
+  fi
+  echo "list $st"
+  case "$st" in
+    none) others=shown ;;
+    ok) others=$(awk '$1 == "others" { print $2 }' "$LIST" 2>/dev/null) ;;
+    *) others=hidden ;;
+  esac
+  echo "others $others"
+  # (the list is read first, so that what goes for each device is known when it comes; without a list that
+  # can be read, what goes for all is what "decide" does: shown without a list, hidden with a damaged one)
+  if [ $has = 1 ] && [ "$st" = ok ]; then
+    awk -v MODE=list -v HASLIST=1 -v FORCE= -v MOUNTS="$MOUNTS" -v DB="$W/db" -v SYSBLOCK="$SYSBLOCK" -v LINE=$LINE \
+      -v MAX=$MAX -v INPUT=0 "$PROG" "$LIST" "$MOUNTS" "$W/db"
+  else
+    awk -v MODE=list -v HASLIST=0 -v FORCE=$others -v MOUNTS="$MOUNTS" -v DB="$W/db" -v SYSBLOCK="$SYSBLOCK" -v LINE=$LINE \
+      -v MAX=$MAX -v INPUT=0 "$PROG" "$MOUNTS" "$W/db"
+  fi || exit 4
+  exit 0
+}
+
+# Whether two files have the same content
+same() {
+  local a b
+  a=$(sha256sum 2>/dev/null < "$1") || return 1
+  b=$(sha256sum 2>/dev/null < "$2") || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+do_save() {
+  local r dir=${LIST%/*} new n=0
+  trap leave EXIT
+  W=$(mktemp -d "$RUNDIR/internal-partitions.XXXXXX" 2>/dev/null) || exit 3
+  head -c $((INMAX + 1)) > "$W/in" 2>/dev/null || exit 2
+  [ "$(wc -c < "$W/in")" -le $INMAX ] || exit 2
+  r=$(awk -v MODE=check -v LINE=$LINE -v MAX=$MAX -v INPUT=1 "$PROG" "$W/in" 2>/dev/null)
+  [ "$r" = ok ] || exit 2
+  # (one writer at a time)
+  while ! mkdir "$RUNDIR/internal-partitions.lock" 2>/dev/null; do
+    n=$((n + 1))
+    [ $n -le 10 ] || exit 3
+    sleep 1
+  done
+  trap 'rmdir "$RUNDIR/internal-partitions.lock" 2>/dev/null; leave' EXIT
+  # (a list that hides nothing says what no list says: it is taken away)
+  if grep -qx 'others shown' "$W/in" && ! grep -q '^hidden ' "$W/in"; then
+    has_list || exit 0
+    rm -f "$LIST" 2>/dev/null
+    sync "$dir" 2>/dev/null
+    has_list && exit 3
+    exit 0
+  fi
+  {
+    echo "# The internal partitions that are shown while the internal disks are shown (LibreELEC settings > System"
+    echo "# > Internal disks). Written by /usr/lib/libreelec/internal-partitions, which reads it before each"
+    echo "# internal partition is mounted; a line that it cannot read keeps them all unmounted."
+    cat "$W/in"
+  } > "$W/list" || exit 3
+  mkdir -p "$dir" 2>/dev/null
+  new="$LIST.new"
+  rm -f "$new" 2>/dev/null
+  # (written through, read back, put in the place of the list by a rename, and the folder written through)
+  if cp "$W/list" "$new" 2>/dev/null && sync "$new" 2>/dev/null && same "$W/list" "$new" &&
+     mv -f "$new" "$LIST" 2>/dev/null && sync "$LIST" "$dir" 2>/dev/null && same "$W/list" "$LIST"; then
+    exit 0
+  fi
+  rm -f "$new" 2>/dev/null
+  exit 3
+}
+
+if [ $# -eq 1 ]; then
+  case "$1" in
+    decide) do_decide ;;
+    list) do_list ;;
+    save) do_save ;;
+  esac
+fi
+echo "usage: internal-partitions decide|list|save" >&2
+exit 1

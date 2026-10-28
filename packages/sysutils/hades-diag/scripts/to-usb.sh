@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
 # Hades diagnostics: what they saved on the boot partition (/flash/hades-diag, every file of it through their
 # filter already) copied to a USB drive. It is the way to get them from a system on a disk inside the PC, whose
 # boot partition Windows does not show:
@@ -10,12 +13,15 @@
 # The folder is read into RAM while nothing of the diagnostics writes to the boot partition (their lock), written
 # beside its final name, read back from the drive and compared with the SHA-256 of every file, and only then given
 # its name, with those sums in it (SHA256SUMS.txt). Nothing that is on the drive is written over. Folders that a
-# version before 15 wrote without the filter, and that the start of this one has not put through it yet (they
-# have no file .filtered), are left out.
+# version before 15 wrote without the filter, or that a version before this one put through the filter without
+# the names of Bluetooth devices, and that a start of this one has not put through it yet (their file .filtered
+# is not there, or does not say $FILTERED), are left out.
 # Exit status: 0 copied; 10 nothing to copy; 11 not a drive that it is copied to; 12 no room on the drive; 13 what
 # is read back from the drive is not what was written; 14 it cannot be written; 15 the boot partition, or the
 # drive, was busy for too long; 16 not enough free memory; 2 not a command of this script.
 D=/flash/hades-diag
+# (the filter that a folder went through, as its file .filtered says it: the FILTERED of folder.sh)
+FILTERED=2
 MOUNTS=/proc/mounts
 BLOCK=/sys/class/block
 RUN=/run
@@ -64,7 +70,7 @@ something() {
   for f in "$D"/*; do
     [ -f "$f" ] && return 0
     case "$f" in *.part) continue ;; esac
-    [ -d "$f" ] && [ -e "$f/.filtered" ] && return 0
+    [ -d "$f" ] && [ "$(cat "$f/.filtered" 2>/dev/null)" = "$FILTERED" ] && return 0
   done
   return 1
 }
@@ -114,7 +120,7 @@ copy() {
     b=${f##*/}
     if [ -d "$f" ]; then
       case "$b" in *.part) continue ;; esac
-      [ -e "$f/.filtered" ] || continue
+      [ "$(cat "$f/.filtered" 2>/dev/null)" = "$FILTERED" ] || continue
       cp -r "$f" "$S/" || exit 16
     elif [ -f "$f" ]; then
       cp "$f" "$S/" || exit 16
@@ -123,7 +129,7 @@ copy() {
   rmdir "$RUN/hades-flash.lock" 2>/dev/null
   HELD=
   # (the copy has been through the filter as well: a drive with Hades of its own does not put it through again)
-  : > "$S/.filtered"
+  echo $FILTERED > "$S/.filtered"
   (cd "$S" && find . -type f | sort | while read -r f; do sha256sum "$f" || exit 1; done) > "$S.sums" || exit 16
   files=$(wc -l < "$S.sums")
   bytes=$(find "$S" -type f | while read -r f; do wc -c < "$f"; done | awk '{ s += $1 } END { print s + 0 }')

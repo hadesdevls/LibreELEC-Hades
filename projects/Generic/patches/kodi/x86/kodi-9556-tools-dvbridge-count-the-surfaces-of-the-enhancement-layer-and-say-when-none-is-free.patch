@@ -1,0 +1,333 @@
+From 0ff5601c1ba348979a83337d6f74488f54da6fb6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:15:54 +0000
+Subject: [PATCH] tools/dvbridge: count the surfaces of the enhancement layer
+ and say when none is free
+
+The decoder of the enhancement layer has a fixed pool of 32 surfaces with
+every driver: FFmpeg gives a pool of 0 (one that grows) with VAAPI 1, the
+module added the queue to it and cut that to 32. A picture of the layer
+for which every surface is held cannot be decoded, and that showed in the
+log as "enhancement decoder error" and a resynchronization: the layer
+left until its next random-access picture, with nothing to tell it from a
+damaged stream. How many surfaces the layer holds was never known.
+
+The module now takes the surface of each picture of its decoder itself
+(get_buffer2), from the same pool (avcodec_default_get_buffer2()), and
+gives each picture a reference of its own (opaque_ref) to a count that is
+given back with the surface: when nothing holds the picture any more (the
+decoder, the module's queue, the pictures on their way to the screen).
+The count is a buffer of its own, since the renderer can release a
+picture after the module is gone. A picture that finds no free surface
+makes the layer stop with a reason that says so, with what holds them;
+Kodi logs that reason as before, and, when a stream closes, the most
+surfaces the layer held at once, of what pool, and how many pictures
+found none free.
+
+Nothing else changes: the pool, its size and the pairing are as before.
+
+Measured on the host (fel_rpu_test, BL_EL.mkv, as Kodi; the pictures
+the screen holds stood for by FEL_HOLD): the layer holds at most 8
+surfaces, 16 when 8 paired pictures are held, 22 with 14. With an
+emulated fixed pool of 12 and 8 held, the layer stopped 90 times: before,
+all of them "enhancement decoder error"; now, all of them "no free
+surface for the enhancement layer", and the module's count is the test's,
+at most and at the end. The pictures of every run without a limit are the
+same as before, byte for byte.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 145 ++++++++++++++++--
+ tools/dvbridge/dvbridge_fel.h                 |  20 ++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  13 ++
+ 3 files changed, 167 insertions(+), 11 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index cce8c0e..1dcb71a 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -8,6 +8,8 @@
+ #include <libavutil/hwcontext_vaapi.h>
+ #include <libavutil/mathematics.h>
+ #include <limits.h>
++#include <stdatomic.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -16,7 +18,7 @@
+ #define MAP_MAX (QUEUE_MAX * 2)
+ /* nvidia-vaapi-driver gives a decoder context at most 32 surfaces and fails the decode of any
+  * further surface for the rest of the context; a larger pool is never used safely. */
+-#define SURFACES_MAX 32
++#define SURFACES_MAX DVBRIDGE_FEL_SURFACES_MAX
+ /* Base pictures between two attempts to open an enhancement decoder that failed to open. */
+ #define OPEN_RETRY_PICTURES 240
+ /* Hades: in a stream that gives the times of its enhancement access units, more of them without
+@@ -269,6 +271,14 @@ struct dvbridge_fel {
+      * wrong; no count is made of it (rank_try()), nor is an access unit placed by it. */
+     bool layer_config;
+     unsigned layer_sets; /* 1: a sequence parameter set came, 2: a picture one */
++    /* Hades: the surfaces of the layer (counted_buffer(), dvbridge_fel_surface_counts()): the count of those held
++     * (struct surface_count, which every picture of the layer holds too), the most held at once, the size of the
++     * fixed pool of the decoder (0: one that grows, or none yet), the pictures that found none free, and those whose
++     * surface could not be counted. surface_failed: a picture found none free since the layer last started. */
++    AVBufferRef *surfaces;
++    unsigned surfaces_peak, surfaces_pool, surfaces_none_free, surfaces_uncounted;
++    bool surface_failed;
++    char reason_text[320]; /* a reason made for this failure (surface_reason()) */
+ };
+ 
+ /* Hades: whether two times are the same but for what a time may lose on its way here. */
+@@ -379,6 +389,95 @@ static int64_t layer_time(const struct dvbridge_fel *f, const AVPacket *packet,
+     return time;
+ }
+ 
++/* Hades: the count of the surfaces of the layer that are held. A picture can be released after the module is gone
++ * (the renderer still holds it when the stream closes), so the count is a buffer of its own, which every counted
++ * picture holds a reference to. */
++struct surface_count {
++    atomic_uint live;
++};
++
++static unsigned surfaces_live(const struct dvbridge_fel *f)
++{
++    return f->surfaces ? atomic_load_explicit(&((struct surface_count *)f->surfaces->data)->live,
++                                              memory_order_relaxed)
++                       : 0;
++}
++
++/* Hades: the surface of a picture of the layer goes back to its pool: nothing holds the picture any more */
++static void surface_released(void *opaque, uint8_t *data)
++{
++    AVBufferRef *count = opaque;
++    (void)data;
++    atomic_fetch_sub_explicit(&((struct surface_count *)count->data)->live, 1, memory_order_relaxed);
++    av_buffer_unref(&count);
++}
++
++/* Hades: the decoder of the layer takes the surface of each of its pictures here, from the pool of its frames context
++ * as it would without this (avcodec_default_get_buffer2()). Each picture carries a reference of its own (opaque_ref,
++ * which no other part of this decoder sets) that goes with its buffers wherever the picture is referenced or copied
++ * (av_frame_ref(), av_hwframe_map()), and is given back when the last of them is released: when the surface goes back
++ * to its pool. So the count is of the surfaces that the decoder, the module's queue and the pictures on their way to
++ * the screen hold, at once. A picture for which a fixed pool has no surface left (FFmpeg's vaapi_pool_alloc() gives
++ * none while all of them are held), or a pool that grows could not make one, cannot be decoded: that is said
++ * (surface_reason()), as it is, instead of a decoder error. */
++static int counted_buffer(AVCodecContext *ctx, AVFrame *frame, int flags)
++{
++    struct dvbridge_fel *f = ctx->opaque;
++    const int result = avcodec_default_get_buffer2(ctx, frame, flags);
++    if (!f || !f->surfaces)
++        return result;
++    if (result < 0) {
++        ++f->surfaces_none_free;
++        f->surface_failed = true;
++        return result;
++    }
++    AVBufferRef *count = frame->opaque_ref ? NULL : av_buffer_ref(f->surfaces);
++    AVBufferRef *held = count ? av_buffer_create(f->surfaces->data, f->surfaces->size, surface_released, count, 0)
++                              : NULL;
++    if (!held) {
++        av_buffer_unref(&count);
++        ++f->surfaces_uncounted;
++        return result;
++    }
++    frame->opaque_ref = held;
++    const unsigned live = atomic_fetch_add_explicit(&((struct surface_count *)f->surfaces->data)->live, 1,
++                                                    memory_order_relaxed) + 1;
++    if (live > f->surfaces_peak)
++        f->surfaces_peak = live;
++    return result;
++}
++
++/* Hades: why the layer stops when one of its pictures found no free surface */
++static const char *surface_reason(struct dvbridge_fel *f)
++{
++    if (f->surfaces_pool)
++        snprintf(f->reason_text, sizeof(f->reason_text),
++                 "no free surface for the enhancement layer: the fixed pool of %u surfaces of its decoder has %u "
++                 "held (%u decoded pictures wait for their base pictures; its decoder and the pictures on their way "
++                 "to the screen hold the others)",
++                 f->surfaces_pool, surfaces_live(f), f->num_frames);
++    else
++        snprintf(f->reason_text, sizeof(f->reason_text),
++                 "no free surface for the enhancement layer: none could be made with %u held (%u decoded pictures "
++                 "wait for their base pictures)",
++                 surfaces_live(f), f->num_frames);
++    return f->reason_text;
++}
++
++void dvbridge_fel_surface_counts(const struct dvbridge_fel *f, struct dvbridge_fel_surfaces *out)
++{
++    if (!out)
++        return;
++    *out = (struct dvbridge_fel_surfaces){0};
++    if (!f)
++        return;
++    out->live = surfaces_live(f);
++    out->peak = f->surfaces_peak;
++    out->pool = f->surfaces_pool;
++    out->none_free = f->surfaces_none_free;
++    out->uncounted = f->surfaces_uncounted;
++}
++
+ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+ {
+     bool found = false;
+@@ -397,6 +496,10 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
+         av_buffer_unref(&frames);
+         return AV_PIX_FMT_NONE;
+     }
++    /* Hades: (for the log, and for what a picture that finds no surface says) */
++    struct dvbridge_fel *f = ctx->opaque;
++    if (f)
++        f->surfaces_pool = hw->initial_pool_size > 0 ? (unsigned)hw->initial_pool_size : 0;
+     av_buffer_unref(&ctx->hw_frames_ctx);
+     ctx->hw_frames_ctx = frames;
+     return AV_PIX_FMT_VAAPI;
+@@ -628,6 +731,7 @@ static void clear_queues(struct dvbridge_fel *f)
+     f->reason = NULL;
+     f->num_skipped = 0;
+     f->fed = f->stopping = f->stopped = f->resume = f->marked = false;
++    f->surface_failed = false;
+ }
+ 
+ /* Hades: the random-access picture of the layer whose place was being counted gives way: the access units queued
+@@ -840,9 +944,25 @@ void dvbridge_fel_destroy(struct dvbridge_fel *f)
+     avcodec_free_context(&f->enhancement_order.context);
+     avcodec_free_context(&f->decoder);
+     av_bsf_free(&f->split);
++    /* (the pictures of the layer that are still held hold the count too) */
++    av_buffer_unref(&f->surfaces);
+     free(f);
+ }
+ 
++/* The decoder context of the layer, as the module opens it (open_decoder()). Hades: its pictures take their surfaces
++ * through the module, which counts them (counted_buffer()). */
++static bool prepare_decoder(struct dvbridge_fel *f, AVCodecContext *decoder)
++{
++    if (!decoder || avcodec_parameters_to_context(decoder, f->split->par_out) < 0)
++        return false;
++    decoder->pkt_timebase = f->time_base;
++    decoder->get_format = hardware_format;
++    decoder->thread_count = 1;
++    decoder->get_buffer2 = counted_buffer;
++    decoder->opaque = f;
++    return true;
++}
++
+ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational time_base)
+ {
+     if (!p || p->codec_id != AV_CODEC_ID_HEVC || time_base.num <= 0 || time_base.den <= 0)
+@@ -881,12 +1001,13 @@ struct dvbridge_fel *dvbridge_fel_create(const AVCodecParameters *p, AVRational
+     /* Hades: the framing of the base packets, which the filter and the base decoder read from
+      * the same configuration */
+     f->base_length_size = unit_length_size(p->extradata, p->extradata_size);
++    f->surfaces = av_buffer_allocz(sizeof(struct surface_count));
++    if (!f->surfaces)
++        goto fail;
++    atomic_init(&((struct surface_count *)f->surfaces->data)->live, 0);
+     f->decoder = avcodec_alloc_context3(codec);
+-    if (!f->decoder || avcodec_parameters_to_context(f->decoder, f->split->par_out) < 0)
++    if (!prepare_decoder(f, f->decoder))
+         goto fail;
+-    f->decoder->pkt_timebase = time_base;
+-    f->decoder->get_format = hardware_format;
+-    f->decoder->thread_count = 1;
+     struct picture_order *orders[] = {&f->base_order, &f->enhancement_order};
+     const AVCodecParameters *parameters[] = {p, f->split->par_out};
+     for (unsigned i = 0; i < 2; ++i) {
+@@ -905,6 +1026,10 @@ fail:
+ 
+ static bool receive_frames(struct dvbridge_fel *f)
+ {
++    /* Hades: a picture that found no free surface was not decoded, whatever the decoder answered for it (pump()
++     * says why) */
++    if (f->surface_failed)
++        return false;
+     while (f->num_frames < QUEUE_MAX) {
+         AVFrame *frame = av_frame_alloc();
+         if (!frame)
+@@ -1088,7 +1213,10 @@ static bool pump(struct dvbridge_fel *f)
+     }
+     return true;
+ fail:
+-    if (!f->reason)
++    /* Hades: a picture of the layer found no free surface: that is why */
++    if (f->surface_failed)
++        f->reason = surface_reason(f);
++    else if (!f->reason)
+         f->reason = "enhancement decoder error";
+     f->failed = true;
+     return false;
+@@ -1100,11 +1228,8 @@ static bool open_decoder(struct dvbridge_fel *f, AVBufferRef *device)
+     const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+     avcodec_free_context(&f->decoder);
+     f->decoder = codec ? avcodec_alloc_context3(codec) : NULL;
+-    if (!f->decoder || avcodec_parameters_to_context(f->decoder, f->split->par_out) < 0)
++    if (!prepare_decoder(f, f->decoder))
+         return false;
+-    f->decoder->pkt_timebase = f->time_base;
+-    f->decoder->get_format = hardware_format;
+-    f->decoder->thread_count = 1;
+     f->decoder->hw_device_ctx = av_buffer_ref(device);
+     return f->decoder->hw_device_ctx && avcodec_open2(f->decoder, codec, NULL) >= 0;
+ }
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 8f59870..3f11647 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -60,8 +60,26 @@ bool dvbridge_fel_layer_metadata(const AVFrame *enhancement, const uint8_t *base
+ bool dvbridge_fel_failed(const struct dvbridge_fel *fel);
+ /* Decoder reached EOF and no enhancement surface remains to pair. */
+ bool dvbridge_fel_exhausted(const struct dvbridge_fel *fel);
+-/* Why the enhancement layer failed (static string), for the log. */
++/* Why the enhancement layer failed, for the log: a static string, or (Hades) one of the module's own that stays until
++ * the module is next reset or destroyed. */
+ const char *dvbridge_fel_reason(const struct dvbridge_fel *fel);
++/* Hades: the surfaces of the enhancement layer. Each picture its decoder makes holds a surface of the pool of that
++ * decoder until nothing holds the picture any more: the decoder (its reference pictures, and those it has not given
++ * yet), the module's queue (pictures that wait for their base pictures) and the pictures on their way to the screen
++ * with their base pictures (the renderer holds a few). A fixed pool whose surfaces are all held has none for the next
++ * picture, which then cannot be decoded: the module says so (dvbridge_fel_reason(): "no free surface for the
++ * enhancement layer: ..."), and the layer starts again as after any failure. The most surfaces any pool of the layer
++ * may have (nvidia-vaapi-driver's limit for a decoder context). */
++#define DVBRIDGE_FEL_SURFACES_MAX 32
++struct dvbridge_fel_surfaces {
++    unsigned live;      /* held now */
++    unsigned peak;      /* held at most at once, since the stream was opened */
++    unsigned pool;      /* the size of the fixed pool of the decoder; 0 for a pool that grows as surfaces are
++                           needed, or none yet */
++    unsigned none_free; /* pictures of the layer that found no free surface */
++    unsigned uncounted; /* pictures whose surface could not be counted (live and peak are low by as many) */
++};
++void dvbridge_fel_surface_counts(const struct dvbridge_fel *fel, struct dvbridge_fel_surfaces *out);
+ /* Enhancement packets discarded while waiting for a random-access point since the last reset. */
+ unsigned dvbridge_fel_preroll_packets(const struct dvbridge_fel *fel);
+ /* Enhancement pictures whose picture order differed from the base picture carrying them, and
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 7b6e23c..cfc37f6 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -815,6 +815,19 @@ void CDVDVideoCodecFFmpeg::Dispose()
+               skip.decoded, skip.not_decoded, skip.not_needed, skip.wanted, skip.stops,
+               skip.resumes, skip.kept ? "; it is decoded for good in this stream: " : "",
+               skip.kept ? skip.kept : "");
++  // Hades: the surfaces of the enhancement layer: the most that its decoder, the module's queue and the pictures on
++  // their way to the screen held at once, of what pool, and how many pictures of the layer found none free (each
++  // time the layer started again, and the line of the resynchronization says why)
++  dvbridge_fel_surfaces surfaces{};
++  dvbridge_fel_surface_counts(m_dvFel.get(), &surfaces);
++  if (surfaces.peak || surfaces.none_free)
++    CLog::Log(LOGINFO,
++              "DV FEL: at most {} surfaces of the enhancement layer were held at once ({}{}); {} pictures of the "
++              "layer found none free{}",
++              surfaces.peak,
++              surfaces.pool ? "of the fixed pool of its decoder, " : "its decoder's pool grows as they are needed",
++              surfaces.pool ? std::to_string(surfaces.pool) : std::string(), surfaces.none_free,
++              surfaces.uncounted ? "; some pictures could not be counted" : "");
+   m_dvNotDecoded = 0;
+   m_dvNotDecodedLogged = false;
+   m_dvDecodedAgain = 0;
+-- 
+2.53.0
+
