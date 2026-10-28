@@ -20,7 +20,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 - **HDR10+** with the dynamic metadata of each frame, where the graphics driver can send it.
 - **Zoom, vertical shift and stretching** keep native Dolby Vision.
 - **Dolby Vision shown as HDR10** where native output is not possible: always for profile 5, whose base picture cannot be watched on its own, and for profile 7 if you turn it on. A display without HDR gets HDR mapped to SDR with the reference method of ITU-R BT.2390.
-- **Options, off by default:** Dolby Vision Low-Latency for a TV input that offers only that, mapped to the TV by Hades; Dolby Vision with the older HDMI 1.4b signalling, for the TVs of 2016 that ask for it; HDR10+ or HDR10 sent as Dolby Vision; Dolby Vision without its trims, for projectors.
+- **Options, off by default:** Dolby Vision Low-Latency for a TV input that offers only that, mapped to the TV by Hades; Dolby Vision with the older HDMI 1.4b signalling, for the TVs of 2016 that ask for it; HDR10+ or HDR10 sent as Dolby Vision, and Dolby Vision sent as HDR10+; Dolby Vision without its trims, for projectors.
 - **3D Blu-ray video** (H.264 MVC): both views are decoded, and a 3D display is switched to 3D over HDMI.
 - **PCs with two graphics chips, and laptops:** Kodi starts on the TV, whichever chip it is connected to, and offers to move to a TV connected later.
 - **Notices that say what is happening** (a TV input that offers only low-latency Dolby Vision, an input in HDMI 1.4 mode, no TV found), and, in the player information, a Dolby Vision page and the use and temperature of the graphics.
