@@ -38,7 +38,7 @@ LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.
 
 ## Qué se ha probado
 
-El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER, tanto en la tarjeta como en la gráfica integrada del procesador, con una tele LG C5, una barra de sonido TCL Q85H Pro en el eARC de la tele y un SSD USB HIKSEMI HS-USB-SYNC C PRO de 128 GB; y en un portátil con un Intel Core i5-12450H. Lo marcado "usuario" lo contaron personas que lo probaron en su propio hardware, en los issues de este repositorio y en los foros de LibreELEC y de Kodi. Visto funcionar quiere decir con colores correctos y con una vuelta limpia a los menús; el logotipo Dolby Vision de la tele, por sí solo, no cuenta. Los resultados de abajo son de 1.0 RC3 y de versiones anteriores; lo que añade 1.0 RC4 está en "Sin probar todavía".
+El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER, tanto en la tarjeta como en la gráfica integrada del procesador, con una tele LG C5, un monitor Samsung Odyssey OLED G6 (LS27DG600SLXPE), una barra de sonido TCL Q85H Pro en el eARC de la tele y un SSD USB HIKSEMI HS-USB-SYNC C PRO de 128 GB; y en un portátil con un Intel Core i5-12450H. Lo marcado "usuario" lo contaron personas que lo probaron en su propio hardware, en los issues de este repositorio y en los foros de LibreELEC y de Kodi. Visto funcionar quiere decir con colores correctos y con una vuelta limpia a los menús; el logotipo Dolby Vision de la tele, por sí solo, no cuenta. Los resultados de abajo son de 1.0 RC4 y de versiones anteriores; lo que añade 1.0 RC4 y no se ha probado todavía está en "Sin probar todavía".
 
 ### Gráficas
 
@@ -56,7 +56,7 @@ El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER,
 | Gráficas Intel UHD 6xx | Sin probar todavía |
 | Gráficas Intel que usan el controlador `xe` (Arc serie B, Core Ultra 200V y posteriores) | Sin probar todavía |
 
-Teles: LG C5 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II con Dolby Vision nativo (con su entrada HDMI en "Enhanced format"), una Samsung S90H y una Samsung S95B con HDR10+, una LG C3 con Dolby Atmos en paso directo y una tele Sony que solo ofrece Dolby Vision de baja latencia (usuarios).
+Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II con Dolby Vision nativo (con su entrada HDMI en "Enhanced format"), una Samsung S90H y una Samsung S95B con HDR10+, una LG C3 con Dolby Atmos en paso directo y una tele Sony que solo ofrece Dolby Vision de baja latencia (usuarios).
 
 ### Funciones
 
@@ -69,7 +69,8 @@ Teles: LG C5 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II co
 | Menús y subtítulos sobre Dolby Vision sin perder fotogramas | Perfiles 7 FEL y 8.1 en la RTX 4080 SUPER y el Ryzen 9 7950X3D (autor); perfil 7 FEL en una RX 7600 (usuario) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, a través de una caja de sincronización HDMI que solo ofrece Dolby Vision de baja latencia (autor) |
 | Dolby Vision mostrado como HDR10 | Perfil 5 en la RTX 4080 SUPER (autor); perfiles 5 y 7 FEL en un Core i3-1005G1 (usuario) |
-| HDR10+ | Core i3-1005G1 con una Samsung S90H, Ryzen 3200G con una Samsung S95B, y Ryzen 7 5800H (usuarios) |
+| Dolby Vision mostrado como HDR10+ | Perfil 7 FEL en la RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor) |
+| HDR10+ | RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); Core i3-1005G1 con una Samsung S90H, Ryzen 3200G con una Samsung S95B, y Ryzen 7 5800H (usuarios) |
 | HDR10+ como Dolby Vision | Ryzen 7 5800H (usuario) |
 | HDR10 a más de 8 bits en NVIDIA | RTX 4080 SUPER (autor) |
 | Un vídeo a 24 fps a 24 Hz exactos en NVIDIA | RTX 4080 SUPER (autor) |
@@ -84,7 +85,6 @@ Teles: LG C5 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II co
 Sin probar todavía:
 
 - Dolby Vision en vídeo AV1.
-- HDR10+ desde gráficas NVIDIA en una pantalla.
 - HDR10 enviado como Dolby Vision, y Dolby Vision sin sus *trims*.
 - HDR, HLG y Dolby Vision adaptados a SDR en una pantalla sin HDR.
 - Dolby Vision nativo en una tele con un bloque Dolby Vision antiguo (versión 1) o con gestión de pantalla 2 o 3.

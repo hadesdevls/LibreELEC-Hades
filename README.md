@@ -38,7 +38,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 ## What has been tested
 
-The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below are those of 1.0 RC3 and earlier versions; what 1.0 RC4 adds is under "Not tried yet".
+The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below are those of 1.0 RC4 and earlier versions; what 1.0 RC4 adds and has not been tried yet is under "Not tried yet".
 
 ### Graphics
 
@@ -56,7 +56,7 @@ The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER
 | Intel UHD 6xx graphics | Not tried yet |
 | Intel graphics that use the `xe` driver (Arc B-series, Core Ultra 200V and newer) | Not tried yet |
 
-TVs: LG C5 (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H and a Samsung S95B with HDR10+, an LG C3 with Dolby Atmos passed through, and a Sony TV that offers Dolby Vision only as low-latency (users).
+TVs and monitors: an LG C5 TV and a Samsung Odyssey OLED G6 monitor (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H and a Samsung S95B with HDR10+, an LG C3 with Dolby Atmos passed through, and a Sony TV that offers Dolby Vision only as low-latency (users).
 
 ### Features
 
@@ -69,7 +69,8 @@ TVs: LG C5 (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with na
 | Menus and subtitles over Dolby Vision at full frame rate | Profiles 7 FEL and 8.1 on the RTX 4080 SUPER and the Ryzen 9 7950X3D (author); profile 7 FEL on an RX 7600 (user) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, through an HDMI sync box that offers only low-latency Dolby Vision (author) |
 | Dolby Vision shown as HDR10 | Profile 5 on the RTX 4080 SUPER (author); profiles 5 and 7 FEL on a Core i3-1005G1 (user) |
-| HDR10+ | Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, and Ryzen 7 5800H (users) |
+| Dolby Vision shown as HDR10+ | Profile 7 FEL on the RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author) |
+| HDR10+ | RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, and Ryzen 7 5800H (users) |
 | HDR10+ as Dolby Vision | Ryzen 7 5800H (user) |
 | HDR10 with more than 8 bits on NVIDIA | RTX 4080 SUPER (author) |
 | A 24 fps video at exactly 24 Hz on NVIDIA | RTX 4080 SUPER (author) |
@@ -84,7 +85,6 @@ TVs: LG C5 (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with na
 Not tried yet:
 
 - Dolby Vision in AV1 video.
-- HDR10+ from NVIDIA graphics on a display.
 - HDR10 sent as Dolby Vision, and Dolby Vision without its trims.
 - HDR, HLG and Dolby Vision mapped to SDR on a display without HDR.
 - Native Dolby Vision on a TV with an older Dolby Vision block (version 1) or with display management 2 or 3.
