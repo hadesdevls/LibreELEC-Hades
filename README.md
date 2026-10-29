@@ -8,7 +8,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 **Why the screen says "LibreELEC Hades".** The media centre of this build is Kodi with changes that the XBMC Foundation has not approved, and Kodi's trademark policy asks such a build not to use Kodi's name and logos as its own. Underneath, it is Kodi: add-ons, skins and remote-control apps work as with Kodi, its log is still `kodi.log`, and other programs still see Kodi. The page "About this build" of the system information says what it is and how to support Kodi and LibreELEC.
 
-**Version 1.0 RC4 (October 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
+**Version 1.0 RC5 (October 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through; what 1.0 RC5 adds has not been tried on hardware yet. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
 
 ## What it adds to LibreELEC
 
@@ -32,7 +32,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 - A USB drive of 8 GB or more. A USB SSD runs much more smoothly than a stick.
 - For Dolby Vision:
   - **A TV that offers Dolby Vision "Standard" on the HDMI input you use.** Many TVs offer only low-latency Dolby Vision on an input set up for games or a PC; Hades says so and sends that input HDR10, or low-latency Dolby Vision if you turn that on. On an LG C5, "Quick Frame Transport" has to be off on that input.
-  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer, and with NVIDIA's driver 580 the GeForce GTX 900 and GTX 10 cards and the TITAN V; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series, and, new in 1.0 RC5, the Radeon RX 400 and 500 series, the Radeon RX Vega M, the Radeon RX Vega 56 and 64 and the Radeon VII (display hardware DCE 11.2 and 12; not older AMD hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
+  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer, and with NVIDIA's driver 580 the GeForce GTX 900 and GTX 10 cards and the TITAN V; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series, and, new in 1.0 RC5 and not tried on hardware yet, the Radeon RX 400 and 500 series, the Radeon RX Vega M, the Radeon RX Vega 56 and 64 and the Radeon VII (display hardware DCE 11.2 and 12; not older AMD hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
   - **The PC connected by HDMI straight to the TV** is best. A sound bar or AV receiver in between has to pass Dolby Vision through.
 - Your own videos or add-ons: Hades comes with no films, add-ons or media sources.
 
@@ -111,7 +111,7 @@ Not tried yet:
   - Dolby Vision for the menus, the GUI over HDR converted exactly, and the GUI cache over native Dolby Vision;
   - seeks that no longer stop the drawing, and a stream that runs dry for a moment and keeps its group of pictures and its FEL layer;
   - native Dolby Vision in sync with the sound as the ordinary output;
-  - the "Installer" boot entry, which now gives the installed system the boot menus and the GRUB of Hades;
+  - the "Installer" boot entry, which now gives the installed system the boot menus and the GRUB of Hades, starts an MBR disk in UEFI too and checks each step of the install;
   - native Dolby Vision on AMD graphics with display hardware DCE 11.2 and 12 (Radeon RX 400 and 500 series, RX Vega M, RX Vega 56 and 64, Radeon VII), and through an HDMI port that NVIDIA drives through a DisplayPort output;
   - Dolby Vision sent as HDR10+ on Intel at 2160p24, 25 and 30, and HDR10+ on RTX 50 graphics, beside HDMI variable refresh on GTX 16 to RTX 30, and to displays of application version 0;
   - dual-track MP4 files whose enhancement track is an ordinary HEVC track, and 3D subtitles at the depth of the disc;

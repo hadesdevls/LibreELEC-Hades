@@ -8,7 +8,7 @@ LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.
 
 **Por qué la pantalla dice "LibreELEC Hades".** El centro multimedia de esta compilación es Kodi con cambios que la XBMC Foundation no ha aprobado, y la política de marca de Kodi pide a una compilación así que no use como suyos el nombre y los logos de Kodi. Por debajo es Kodi: complementos, skins y aplicaciones de mando a distancia funcionan como con Kodi, su registro sigue siendo `kodi.log` y los demás programas siguen viendo Kodi. La página "Acerca de esta compilación" de la información del sistema dice qué es y cómo apoyar a Kodi y a LibreELEC.
 
-**Versión 1.0 RC4 (octubre de 2026).** El Dolby Vision nativo, con el perfil 7 y su capa de mejora completa, ya se ha visto funcionar en gráficas NVIDIA, AMD e Intel, con el Dolby Atmos en paso directo. Como versión candidata, necesita más hardware: si la pruebas, cuenta lo que veas en los issues. El [registro de cambios](CHANGELOG.md) dice qué cambió en cada versión.
+**Versión 1.0 RC5 (octubre de 2026).** El Dolby Vision nativo, con el perfil 7 y su capa de mejora completa, ya se ha visto funcionar en gráficas NVIDIA, AMD e Intel, con el Dolby Atmos en paso directo; lo que añade 1.0 RC5 no se ha probado todavía en hardware. Como versión candidata, necesita más hardware: si la pruebas, cuenta lo que veas en los issues. El [registro de cambios](CHANGELOG.md) dice qué cambió en cada versión.
 
 ## Qué añade a LibreELEC
 
@@ -32,7 +32,7 @@ LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.
 - Una unidad USB de 8 GB o más. Con un SSD por USB va mucho más fluido que con una memoria.
 - Para Dolby Vision:
   - **Una tele que ofrezca Dolby Vision "Standard" en la entrada HDMI que uses.** Muchas teles solo ofrecen Dolby Vision de baja latencia en una entrada preparada para juegos o para un PC; Hades lo dice y envía a esa entrada HDR10, o Dolby Vision de baja latencia si lo activas. En una LG C5, "Quick Frame Transport" tiene que estar desactivado en esa entrada.
-  - **Una gráfica compatible:** NVIDIA GeForce GTX 16, RTX 20 o posterior, y con el controlador 580 de NVIDIA las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V; gráficas AMD Radeon con hardware de pantalla DCN 1.0 o posterior, de Raven, Picasso y Navi 1x a la serie RX 9000, y, nuevo en 1.0 RC5, las Radeon series RX 400 y RX 500, la Radeon RX Vega M, las Radeon RX Vega 56 y 64 y la Radeon VII (hardware de pantalla DCE 11.2 y 12; no el hardware AMD más antiguo, ni las pocas versiones que nombra [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers), en inglés); gráficas Intel de versión de pantalla 9 o posterior (UHD 6xx y posteriores).
+  - **Una gráfica compatible:** NVIDIA GeForce GTX 16, RTX 20 o posterior, y con el controlador 580 de NVIDIA las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V; gráficas AMD Radeon con hardware de pantalla DCN 1.0 o posterior, de Raven, Picasso y Navi 1x a la serie RX 9000, y, nuevo en 1.0 RC5 y sin probar todavía en hardware, las Radeon series RX 400 y RX 500, la Radeon RX Vega M, las Radeon RX Vega 56 y 64 y la Radeon VII (hardware de pantalla DCE 11.2 y 12; no el hardware AMD más antiguo, ni las pocas versiones que nombra [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers), en inglés); gráficas Intel de versión de pantalla 9 o posterior (UHD 6xx y posteriores).
   - **El PC conectado por HDMI directamente a la tele** es lo mejor. Una barra de sonido o un receptor AV en medio tiene que dejar pasar Dolby Vision.
 - Tus propios vídeos o complementos: Hades no trae películas, complementos ni fuentes de contenido.
 
@@ -111,7 +111,7 @@ Sin probar todavía:
   - Dolby Vision para los menús, la interfaz sobre HDR convertida exactamente, y la caché de la interfaz sobre Dolby Vision nativo;
   - los saltos que ya no detienen el dibujo, y un flujo que se queda sin datos un momento y conserva su grupo de imágenes y su capa FEL;
   - el Dolby Vision nativo en sincronía con el sonido como la salida normal;
-  - la entrada de arranque «Installer», que ahora da al sistema instalado los menús de arranque y el GRUB de Hades;
+  - la entrada de arranque «Installer», que ahora da al sistema instalado los menús de arranque y el GRUB de Hades, arranca también un disco MBR en UEFI y comprueba cada paso de la instalación;
   - el Dolby Vision nativo en las gráficas AMD con hardware de pantalla DCE 11.2 y 12 (Radeon series RX 400 y RX 500, RX Vega M, RX Vega 56 y 64, Radeon VII), y por un HDMI que NVIDIA saca por una salida DisplayPort;
   - Dolby Vision enviado como HDR10+ en Intel a 2160p24, 25 y 30, y HDR10+ en las RTX 50, junto a la frecuencia variable por HDMI en las GTX 16 a RTX 30, y a pantallas de versión de aplicación 0;
   - los MP4 de doble pista cuya pista de mejora es una pista HEVC corriente, y los subtítulos 3D a la profundidad del disco;
