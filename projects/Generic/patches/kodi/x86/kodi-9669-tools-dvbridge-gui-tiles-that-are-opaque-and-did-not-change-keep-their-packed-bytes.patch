@@ -1,0 +1,1226 @@
+From b3f6b8a04cad6fb5335cb7bfa2fd41184282aee4 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:20:14 +0000
+Subject: [PATCH] tools/dvbridge: GUI tiles that are opaque and did not change
+ keep their packed bytes
+
+Under a GUI that stays over a playing Dolby Vision video (Home, a dialog, the player
+information), the source transport made the picture under every tile that the GUI reaches,
+Kodi composited the GUI over it, and the packer converted every pixel drawn over back to codes,
+at every frame. Where the GUI is opaque the result depends on the GUI alone: the composite leaves
+a colour + (1 - a) picture, the colour where a = 1, and the conversion back adds (1 - a) times a
+finite value, 0. For profile 5 that conversion takes three PQ round trips a pixel.
+
+The packer now keeps a copy of the GUI texture and compares it with the texture, in blocks,
+where the texture is opaque (pass 6c, in place of 6, with the same flag of what is drawn; 6p
+copies the blocks that changed). A tile of the raster whose GUI texels, all those that its
+pixels may sample (the footprint of pass 7), are opaque and the same as at the frame before is
+packed once more as before, by the same program with the same uniforms, into a texture of the
+packer's, and a pass checks that every one of its pixels came out of the composite with an alpha
+of exactly 1; from the next frame its bytes are copied from there: passes 3, 8 and 4 are not
+drawn in it. Translucent pixels are composed and converted at every frame, as before. What the
+bytes were made with is the key of the cache: the metadata's representation
+(dvbridge_source_params), the level of the conversion under the GUI of profile 5, the size of
+the GUI, and the key of Kodi's composite (CWinSystemGbmGLESContext counts the programs and the
+tables of its GUI composite: another GUI white, another key). The first row of tiles, which holds
+the metadata, is never kept. A frame over which something else is drawn (PQ subtitles, a
+capture: dvbridge_render_complete()) makes the tiles copied too and packs as before. Its passes
+not made, or failing, the GUI is converted at every frame, as before, and the bridge says so.
+
+On by default, as Kodi turns it on: <video><dvguicache>false</dvguicache></video> turns it off,
+to measure what it saves, and <video><dvguicachecheck>true</dvguicachecheck></video> packs the
+tiles copied again on those frames and compares them (kodi.log every 240 frames, and at once on
+a difference).
+
+Measured with the software bridge (Mesa's zink on lavapipe), against 1.0 RC4 with the same
+libplacebo: the same bytes in every configuration of the bench (fidbench, 14 pictures of a
+profile 7 FEL stream, with and without a GUI, at every fidelity step-down level, without the
+enhancement layer, scaled, converted transport, reshaping; the measured test with the CCM 001
+reader; the render test; the profile 5, FEL and 8.1 GUI test in its 162 frames and in sequences
+of twelve frames under one GUI, at the three levels of the conversion under the GUI, with the
+check). Mutations that keep a GUI that changed, leave the composite's key or the metadata's
+representation out of the key, keep translucent tiles, keep the first row, or copy or keep the
+rows the other way up change the bytes; see the notes of the front.
+
+Idea from YBLOD 0.3.0 (its exact GUI pixel cache), written again for the tiles of this bridge.
+---
+ tools/dvbridge/dvbridge_render.c              |  39 +-
+ tools/dvbridge/dvbridge_render.h              |  19 +
+ tools/dvbridge/dvbridge_source.c              | 695 +++++++++++++++++-
+ tools/dvbridge/dvbridge_source.h              |  35 +
+ .../VideoRenderers/DVBridgeGLES.cpp           |  47 +-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  12 +-
+ xbmc/settings/AdvancedSettings.cpp            |   4 +
+ xbmc/settings/AdvancedSettings.h              |   5 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |   6 +-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   3 +
+ 10 files changed, 842 insertions(+), 23 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index a0c6cea..23f9a73 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -124,9 +124,11 @@ struct dvbridge_renderer {
+     struct dvbridge_geometry geometry; /* of the last picture prepared */
+     /* Hades: the target that wraps the window (dvbridge_render_set_window()), or NULL */
+     pl_tex window;
+-    /* Hades: what will be drawn over the next composed picture (dvbridge_render_set_drawn()) */
++    /* Hades: what will be drawn over the next composed picture (dvbridge_render_set_drawn()), and
++     * the key of its composite (dvbridge_render_set_drawn_key()) */
+     unsigned drawn_gui;
+     int drawn_w, drawn_h;
++    uint64_t drawn_key;
+     /* Hades: Dolby Vision Low-Latency (dvbridge_render_set_low_latency()): the picture mapped to
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+@@ -1032,6 +1034,8 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         /* Hades: in the tiles that what will be drawn over it may reach, where the caller said what
+          * that is (dvbridge_render_set_drawn()) */
+         dvbridge_source_drawn(r->source_packer, r->drawn_gui, r->drawn_w, r->drawn_h);
++        /* (Hades: and the key of its composite, for the GUI cache) */
++        dvbridge_source_drawn_key(r->source_packer, r->drawn_gui ? r->drawn_key : 0);
+         if (fbo)
+             timer_begin(r, TIMER_PICTURE);
+         ok = fbo && dvbridge_source_picture(r->source_packer, &r->source_params, r->pack_luma,
+@@ -2311,6 +2315,39 @@ void dvbridge_render_set_drawn(struct dvbridge_renderer *r, unsigned gui, int wi
+     r->drawn_h = height;
+ }
+ 
++void dvbridge_render_use_gui_cache(struct dvbridge_renderer *r, bool use)
++{
++    if (r)
++        dvbridge_source_gui_cache(r->source_packer, use);
++}
++
++bool dvbridge_render_gui_cache_usable(const struct dvbridge_renderer *r)
++{
++    return r && dvbridge_source_gui_cache_usable(r->source_packer);
++}
++
++void dvbridge_render_set_drawn_key(struct dvbridge_renderer *r, uint64_t key)
++{
++    if (r)
++        r->drawn_key = key;
++}
++
++void dvbridge_render_gui_cache_check(struct dvbridge_renderer *r, bool check)
++{
++    if (r)
++        dvbridge_source_gui_cache_check(r->source_packer, check);
++}
++
++bool dvbridge_render_gui_cache_tiles(struct dvbridge_renderer *r, unsigned counts[4])
++{
++    return r && dvbridge_source_gui_cache_tiles(r->source_packer, counts);
++}
++
++bool dvbridge_render_gui_cache_read(struct dvbridge_renderer *r, unsigned counts[2])
++{
++    return r && dvbridge_source_gui_cache_read(r->source_packer, counts);
++}
++
+ bool dvbridge_render_complete(struct dvbridge_renderer *r)
+ {
+     /* only the composed way of the source transport makes its picture in tiles */
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index b6bd09e..7492e7a 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -441,6 +441,25 @@ void dvbridge_render_set_window(struct dvbridge_renderer *renderer, pl_tex windo
+ #define DVBRIDGE_RENDER_DRAWN 1
+ void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui, int width,
+                                int height);
++/* Hades: the GUI cache of the source transport (dvbridge_source_gui_cache(): the bytes of the
++ * tiles where the GUI is opaque and did not change are copied from the frame before that packed
++ * them, not converted again; the same bytes). Off until asked for; it takes the frames whose
++ * composite's key is given (dvbridge_render_set_drawn_key(), as dvbridge_render_set_drawn(): for
++ * the next frame). check: those frames also pack the tiles copied again and compare them
++ * (dvbridge_render_gui_cache_tiles(): each such frame waits for the GPU). usable: its passes were
++ * made on this GPU. */
++#define DVBRIDGE_RENDER_GUI_CACHE 1
++void dvbridge_render_use_gui_cache(struct dvbridge_renderer *renderer, bool use);
++bool dvbridge_render_gui_cache_usable(const struct dvbridge_renderer *renderer);
++void dvbridge_render_set_drawn_key(struct dvbridge_renderer *renderer, uint64_t key);
++void dvbridge_render_gui_cache_check(struct dvbridge_renderer *renderer, bool check);
++/* of the last dvbridge_render_pack(): tiles copied, packed into the cache, (check) copied and not
++ * the same as packed again, whether the check ran; false where that frame did not take the cache
++ * or there is no check */
++bool dvbridge_render_gui_cache_tiles(struct dvbridge_renderer *renderer, unsigned counts[4]);
++/* (for tests) the tiles that the last picture's passes decided to copy [0] and to pack into the
++ * cache [1], read back (waits for the GPU) */
++bool dvbridge_render_gui_cache_read(struct dvbridge_renderer *renderer, unsigned counts[2]);
+ /* Hades: the picture of the last dvbridge_render_rgb() whole, if it was made in tiles; false where
+  * that could not be done (the picture is then whole only in those tiles) */
+ bool dvbridge_render_complete(struct dvbridge_renderer *renderer);
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index df141b8..a18fe11 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -531,7 +531,12 @@ static const char SCALE_CHROMA_ROWS[] =
+  * tiles with the flag only, 2 those without it only, 3 all of them. A tile that is not drawn has its
+  * vertices outside the clip volume: it has no fragments. The quads meet at the edges of the pixels,
+  * so every pixel of a tile drawn is drawn once. tiles_flip: the rows of the framebuffer are those of
+- * the raster the other way up (a window). */
++ * the raster the other way up (a window).
++ * Hades: with the GUI cache (dvbridge_source_gui_cache()) the tiles hold, besides that flag (red),
++ * whether the tile is copied from the cache this frame (green) and whether it is packed into it
++ * (blue), and modes 4 to 9 draw: 4 the tiles with the flag but those copied; 5 those without the
++ * flag and those copied (the rest of the picture); 6 every tile but those copied or packed into the
++ * cache; 7 those packed into it; 8 those copied or packed into it; 9 those copied. */
+ static const char TILED_VERTEX[] =
+     "#version 300 es\n"
+     "precision highp float;\n"
+@@ -553,7 +558,19 @@ static const char TILED_VERTEX[] =
+     "    int quad = gl_VertexID / 6, corner = gl_VertexID - quad * 6;\n"
+     "    ivec2 t = ivec2(quad % " DRAWN_STRING(DRAWN_COLUMNS) ", quad / " DRAWN_STRING(DRAWN_COLUMNS) ");\n"
+     "    tile_drawn = texelFetch(drawn_tiles, t, 0).r > 0.5 ? 1 : 0;\n"
+-    "    if ((tiles_mode == 1 && tile_drawn == 0) || (tiles_mode == 2 && tile_drawn != 0)) {\n"
++    "    if (tiles_mode >= 4) {\n"
++    "        vec4 f = texelFetch(drawn_tiles, t, 0);\n"
++    "        bool use = f.g > 0.5, fill = f.b > 0.5;\n"
++    "        bool keep = tiles_mode == 4 ? tile_drawn != 0 && !use :\n"
++    "                    tiles_mode == 5 ? tile_drawn == 0 || use :\n"
++    "                    tiles_mode == 6 ? !use && !fill :\n"
++    "                    tiles_mode == 7 ? fill :\n"
++    "                    tiles_mode == 8 ? use || fill : use;\n"
++    "        if (!keep) {\n"
++    "            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
++    "            return;\n"
++    "        }\n"
++    "    } else if ((tiles_mode == 1 && tile_drawn == 0) || (tiles_mode == 2 && tile_drawn != 0)) {\n"
+     "        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
+     "        return;\n"
+     "    }\n"
+@@ -1044,6 +1061,221 @@ static const char DRAWN[] =
+     "    color = vec4(drawn);\n"
+     "}\n";
+ 
++/* Hades: the GUI cache (dvbridge_source_gui_cache(), dvbridge_source.h). 6c, in place of 6 where it
++ * is asked for: the blocks of the GUI texture, in two draws as 6 (4 x 4 texels, then 4 x 4 of those),
++ * with in red what 6 writes (anything drawn), in green whether every texel is opaque (alpha 1), and
++ * in blue whether one of them is not the texel it was at the frame before (prev, a copy that 6p
++ * keeps): read for an opaque 4 x 4 only (only those are kept). A texel beyond the texture read is
++ * the last one of its row or column, as for 6. */
++static const char GUI_BLOCKS[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui;\n"
++    "uniform highp sampler2D prev;\n"
++    "uniform ivec2 gui_size;\n" /* of the texture read */
++    "uniform int from_gui;\n"   /* 1: from the GUI texture and prev; 0: from the draw before */
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 b0 = ivec2(gl_FragCoord.xy) * 4;\n"
++    "    ivec2 last = gui_size - 1;\n"
++    "    float most = 0.0;\n"
++    "    if (from_gui == 0) {\n"
++    "        float opaque = 1.0, changed = 0.0;\n"
++    "        for (int y = 0; y < 4; ++y)\n"
++    "            for (int x = 0; x < 4; ++x) {\n"
++    "                vec4 t = texelFetch(gui, min(b0 + ivec2(x, y), last), 0);\n"
++    "                most = max(most, t.r);\n"
++    "                opaque = min(opaque, t.g);\n"
++    "                changed = max(changed, t.b);\n"
++    "            }\n"
++    "        color = vec4(most > 0.0 ? 1.0 : 0.0, opaque, changed, 0.0);\n"
++    "        return;\n"
++    "    }\n"
++    "    bool opaque = true;\n"
++    "    for (int y = 0; y < 4; ++y)\n"
++    "        for (int x = 0; x < 4; ++x) {\n"
++    "            float a = texelFetch(gui, min(b0 + ivec2(x, y), last), 0).a;\n"
++    "            most = max(most, a);\n"
++    "            opaque = opaque && a == 1.0;\n"
++    "        }\n"
++    "    bool changed = false;\n"
++    "    if (opaque)\n"
++    "        for (int y = 0; y < 4; ++y)\n"
++    "            for (int x = 0; x < 4; ++x) {\n"
++    "                ivec2 q = min(b0 + ivec2(x, y), last);\n"
++    "                changed = changed || texelFetch(gui, q, 0) != texelFetch(prev, q, 0);\n"
++    "            }\n"
++    "    color = vec4(most > 0.0 ? 1.0 : 0.0, opaque ? 1.0 : 0.0, changed ? 1.0 : 0.0, 0.0);\n"
++    "}\n";
++
++/* Hades: 6p. prev made the GUI texture again where a block of 16 x 16 texels changed (a quad for
++ * each block, outside the clip volume where it did not): the texels compared at the next frame */
++static const char PREV_VERTEX[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui_tiles;\n"
++    "uniform ivec2 gui_size;\n"
++    "const int corner_x[6] = int[6](0, 1, 0, 0, 1, 1);\n"
++    "const int corner_y[6] = int[6](0, 0, 1, 1, 0, 1);\n"
++    "void main()\n"
++    "{\n"
++    "    int columns = (gui_size.x + " DRAWN_STRING(DRAWN_TILE) " - 1) / " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    int quad = gl_VertexID / 6, corner = gl_VertexID - quad * 6;\n"
++    "    ivec2 t = ivec2(quad % columns, quad / columns);\n"
++    "    if (texelFetch(gui_tiles, t, 0).b < 0.5) {\n"
++    "        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);\n"
++    "        return;\n"
++    "    }\n"
++    "    ivec2 a = t * " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    ivec2 b = min(a + " DRAWN_STRING(DRAWN_TILE) ", gui_size);\n"
++    "    ivec2 q = ivec2(corner_x[corner] != 0 ? b.x : a.x, corner_y[corner] != 0 ? b.y : a.y);\n"
++    "    gl_Position = vec4(vec2(q) / vec2(gui_size) * 2.0 - 1.0, 0.0, 1.0);\n"
++    "}\n";
++static const char PREV_COPY[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform highp sampler2D gui;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    color = texelFetch(gui, ivec2(gl_FragCoord.xy), 0);\n"
++    "}\n";
++
++/* Hades: 7c, in place of 7 where the cache is asked for: the flag of 7 (red, the same expressions),
++ * and of the tiles that may be kept (allowed, not in the first row of the raster, every block they
++ * may read opaque and unchanged) those whose kept bytes hold (state) are copied (green) and the
++ * others are packed into the cache (blue); and in a second target the state after the changes of
++ * this frame (a tile that may read a block that changed holds nothing) */
++static const char DECIDE[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui_tiles;\n"
++    "uniform highp sampler2D state;\n"
++    "uniform ivec2 gui_size;\n"
++    "uniform int allowed;\n"
++    "layout(location = 0) out vec4 color;\n"
++    "layout(location = 1) out vec4 kept;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 t = ivec2(gl_FragCoord.xy);\n"
++    "    vec2 scale = vec2(gui_size) / vec2(3840.0, 2160.0);\n"
++    "    float x0 = float(t.x * " DRAWN_STRING(DRAWN_TILE) ") + 0.5;\n"
++    "    float x1 = float(min(t.x * " DRAWN_STRING(DRAWN_TILE) " + " DRAWN_STRING(DRAWN_TILE) ", 3840) - 1) + 0.5;\n"
++    "    float y0 = float(t.y * " DRAWN_STRING(DRAWN_TILE) ") + 0.5;\n"
++    "    float y1 = float(min(t.y * " DRAWN_STRING(DRAWN_TILE) " + " DRAWN_STRING(DRAWN_TILE) ", 2160) - 1) + 0.5;\n"
++    "    int c0 = int(floor(x0 * scale.x - 0.5)) - " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int c1 = int(floor(x1 * scale.x - 0.5)) + 1 + " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int r0 = int(floor(float(gui_size.y) - 0.5 - y1 * scale.y)) - " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    int r1 = int(floor(float(gui_size.y) - 0.5 - y0 * scale.y)) + 1 + " DRAWN_STRING(DRAWN_MARGIN) ";\n"
++    "    ivec2 last = gui_size - 1;\n"
++    "    ivec2 g0 = clamp(ivec2(c0, r0), ivec2(0), last) / " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    ivec2 g1 = clamp(ivec2(c1, r1), ivec2(0), last) / " DRAWN_STRING(DRAWN_TILE) ";\n"
++    "    float drawn = 0.0, opaque = 1.0, changed = 0.0;\n"
++    "    for (int y = g0.y; y <= g1.y; ++y)\n"
++    "        for (int x = g0.x; x <= g1.x; ++x) {\n"
++    "            vec4 f = texelFetch(gui_tiles, ivec2(x, y), 0);\n"
++    "            drawn = max(drawn, f.r);\n"
++    "            opaque = min(opaque, f.g);\n"
++    "            changed = max(changed, f.b);\n"
++    "        }\n"
++    "    bool valid = texelFetch(state, t, 0).r > 0.5 && changed < 0.5;\n"
++    "    bool can = allowed != 0 && t.y > 0 && opaque > 0.5 && changed < 0.5;\n"
++    "    color = vec4(drawn, can && valid ? 1.0 : 0.0, can && !valid ? 1.0 : 0.0, 0.0);\n"
++    "    kept = vec4(valid ? 1.0 : 0.0);\n"
++    "}\n";
++
++/* Hades: 9. Of the tiles packed into the cache (drawn as the tiled passes, mode 7, into a quarter of
++ * the raster: a fragment for each 4 x 4 pixels), whether every pixel came out of the composite with
++ * an alpha of exactly 1 (2 - a, a = 1: what was drawn over it is opaque), from the picture drawn over
++ * (rows of the raster, as pass 4 reads it) */
++static const char OPAQUE[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D drawn;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 b0 = ivec2(gl_FragCoord.xy) * 4;\n"
++    "    bool opaque = true;\n"
++    "    for (int y = 0; y < 4; ++y)\n"
++    "        for (int x = 0; x < 4; ++x)\n"
++    "            opaque = opaque && texelFetch(drawn, b0 + ivec2(x, y), 0).a == 1.0;\n"
++    "    color = vec4(opaque ? 1.0 : 0.0);\n"
++    "}\n";
++/* ... and the state of each tile after this frame: a tile packed into the cache holds its bytes
++ * where all of its 16 x 16 were; every other tile, as 7c left it */
++static const char STATE[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D quarter;\n"
++    "uniform highp sampler2D drawn_tiles;\n"
++    "uniform highp sampler2D state;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 t = ivec2(gl_FragCoord.xy);\n"
++    "    bool valid = texelFetch(state, t, 0).r > 0.5;\n"
++    "    if (texelFetch(drawn_tiles, t, 0).b > 0.5) {\n"
++    "        valid = true;\n"
++    "        for (int y = 0; y < 4; ++y)\n"
++    "            for (int x = 0; x < 4; ++x)\n"
++    "                valid = valid && texelFetch(quarter, t * 4 + ivec2(x, y), 0).r > 0.5;\n"
++    "    }\n"
++    "    color = vec4(valid ? 1.0 : 0.0);\n"
++    "}\n";
++/* Hades: 10. The kept bytes, into the framebuffer (drawn as the tiled passes, mode 8): the cache holds
++ * the rows of the raster */
++static const char COPY[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D cache;\n"
++    "uniform uint flip_y;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    if (flip_y != 0u) p.y = 2159 - p.y;\n"
++    "    color = texelFetch(cache, p, 0);\n"
++    "}\n";
++/* Hades: the check of the cache (dvbridge_source_gui_cache_check()): a tile copied whose bytes are
++ * not those packed again (a fragment for each tile) */
++static const char CHECK[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D cache;\n"
++    "uniform highp sampler2D again;\n"
++    "uniform highp sampler2D drawn_tiles;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 t = ivec2(gl_FragCoord.xy);\n"
++    "    bool differ = false;\n"
++    "    if (texelFetch(drawn_tiles, t, 0).g > 0.5)\n"
++    "        for (int y = 0; y < " DRAWN_STRING(DRAWN_TILE) "; ++y)\n"
++    "            for (int x = 0; x < " DRAWN_STRING(DRAWN_TILE) "; ++x) {\n"
++    "                ivec2 p = t * " DRAWN_STRING(DRAWN_TILE) " + ivec2(x, y);\n"
++    "                differ = differ || texelFetch(cache, p, 0).rgb != texelFetch(again, p, 0).rgb;\n"
++    "            }\n"
++    "    color = vec4(differ ? 1.0 : 0.0);\n"
++    "}\n";
++_Static_assert(DRAWN_TILE == 16 && 3840 % DRAWN_TILE == 0 && 2160 % DRAWN_TILE == 0,
++               "the passes of the cache take tiles of 16 x 16 of the whole raster, 4 x 4 twice");
++
++/* what the bytes kept in the cache were made with (see dvbridge_source.h) */
++struct cache_key {
++    struct dvbridge_source_params params;
++    int level, gui_w, gui_h;
++    uint64_t composite;
++};
++
+ struct texture {
+     GLuint texture, framebuffer;
+     int w, h;
+@@ -1162,6 +1394,33 @@ struct dvbridge_source_packer {
+     float scale_of[12];
+     int *table_data;
+     struct texture luma_columns, chroma_columns, scaled_luma;
++    /* Hades: the GUI cache (dvbridge_source_gui_cache()): asked for, its programs made (none of them
++     * or all), the key of the composite of the next picture, and check. ctiles: the tiles with what
++     * 7c decided (in place of tiles, of which it holds the flag); tiles_texture: the tiles that the
++     * tiled passes read this frame. state[state_now]: the tiles whose bytes the cache holds, the
++     * other one a target of the passes that change it. key: what those bytes were made with
++     * (key_valid). cache_frame: the passes of this frame's picture took the cache (and skipped the
++     * tiles copied, unless check). cache_level: the level of the conversion under the GUI that its
++     * picture was drawn at. stats: of the last pack (dvbridge_source_gui_cache_tiles()). */
++    bool cache_wanted, cache_usable, cache_check, cache_frame, key_valid, stats_valid;
++    uint64_t drawn_key;
++    GLuint blocks_program, prev_program, decide_program, opaque_program, state_program, copy_program,
++        check_program, decide_fbo[2];
++    struct {
++        GLint gui, prev, size, from_gui;
++    } bk;
++    struct {
++        GLint tiles, size;
++    } pv;
++    GLint pv_gui, dc_tiles, dc_state, dc_size, dc_allowed, op_drawn, op_tiles, op_mode, op_flip,
++        st_quarter, st_tiles, st_state, cp_cache, cp_flip, cp_tiles, cp_mode, cp_tflip, ck_cache,
++        ck_again, ck_tiles;
++    struct texture gui_prev, blocks_quarter, blocks, ctiles, state[2], opaque_quarter, cache, again,
++        differ;
++    GLuint tiles_texture;
++    int state_now, cache_level;
++    struct cache_key key;
++    unsigned stats[4];
+ };
+ 
+ static GLuint compile(GLenum type, const char *source)
+@@ -1375,6 +1634,64 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+                             "made; a scaled picture goes converted, as before\n");
+         }
+     }
++    /* Hades: the programs of the GUI cache, all of them or none (then it is not made: as before) */
++    {
++        p->blocks_program = link(GUI_BLOCKS);
++        p->prev_program = link_with(PREV_VERTEX, PREV_COPY);
++        p->decide_program = link(DECIDE);
++        p->opaque_program = link_with(TILED_VERTEX, OPAQUE);
++        p->state_program = link(STATE);
++        p->copy_program = link_with(TILED_VERTEX, COPY);
++        p->check_program = link(CHECK);
++        static const char *const bk[] = {"gui", "prev", "gui_size", "from_gui"};
++        static const char *const pv[] = {"gui_tiles", "gui_size"};
++        _Static_assert(sizeof(p->bk) == COUNT(bk) * sizeof(GLint), "blocks uniforms");
++        _Static_assert(sizeof(p->pv) == COUNT(pv) * sizeof(GLint), "prev uniforms");
++        bool made = p->blocks_program && p->prev_program && p->decide_program &&
++                    p->opaque_program && p->state_program && p->copy_program && p->check_program &&
++                    locate(p->blocks_program, &p->bk.gui, bk, COUNT(bk)) &&
++                    locate(p->prev_program, &p->pv.tiles, pv, COUNT(pv));
++        if (made) {
++            const struct {
++                GLuint program;
++                GLint *location;
++                const char *name;
++            } more[] = {{p->prev_program, &p->pv_gui, "gui"},
++                        {p->decide_program, &p->dc_tiles, "gui_tiles"},
++                        {p->decide_program, &p->dc_state, "state"},
++                        {p->decide_program, &p->dc_size, "gui_size"},
++                        {p->decide_program, &p->dc_allowed, "allowed"},
++                        {p->opaque_program, &p->op_drawn, "drawn"},
++                        {p->opaque_program, &p->op_tiles, "drawn_tiles"},
++                        {p->opaque_program, &p->op_mode, "tiles_mode"},
++                        {p->opaque_program, &p->op_flip, "tiles_flip"},
++                        {p->state_program, &p->st_quarter, "quarter"},
++                        {p->state_program, &p->st_tiles, "drawn_tiles"},
++                        {p->state_program, &p->st_state, "state"},
++                        {p->copy_program, &p->cp_cache, "cache"},
++                        {p->copy_program, &p->cp_flip, "flip_y"},
++                        {p->copy_program, &p->cp_tiles, "drawn_tiles"},
++                        {p->copy_program, &p->cp_mode, "tiles_mode"},
++                        {p->copy_program, &p->cp_tflip, "tiles_flip"},
++                        {p->check_program, &p->ck_cache, "cache"},
++                        {p->check_program, &p->ck_again, "again"},
++                        {p->check_program, &p->ck_tiles, "drawn_tiles"}};
++            for (unsigned i = 0; made && i < COUNT(more); ++i)
++                made = (*more[i].location = glGetUniformLocation(more[i].program, more[i].name)) >= 0;
++        }
++        if (!made) {
++            const GLuint programs[] = {p->blocks_program, p->prev_program, p->decide_program,
++                                       p->opaque_program, p->state_program, p->copy_program,
++                                       p->check_program};
++            for (unsigned i = 0; i < COUNT(programs); ++i)
++                glDeleteProgram(programs[i]);
++            p->blocks_program = p->prev_program = p->decide_program = p->opaque_program = 0;
++            p->state_program = p->copy_program = p->check_program = 0;
++            fprintf(stderr, "DV source transport: the passes of the GUI cache could not be made; the "
++                            "GUI is converted at every frame, as before\n");
++        }
++        p->cache_usable = made && p->drawn_usable;
++    }
+     glGenVertexArrays(1, &p->vao);
+     glGenSamplers(1, &p->sampler);
+     glSamplerParameteri(p->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+@@ -1425,6 +1742,20 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->luma_columns);
+     texture_destroy(&p->chroma_columns);
+     texture_destroy(&p->scaled_luma);
++    /* Hades: those of the GUI cache */
++    {
++        struct texture *const all[] = {&p->gui_prev, &p->blocks_quarter, &p->blocks, &p->ctiles,
++                                       &p->state[0], &p->state[1], &p->opaque_quarter, &p->cache,
++                                       &p->again, &p->differ};
++        for (unsigned i = 0; i < COUNT(all); ++i)
++            texture_destroy(all[i]);
++        glDeleteFramebuffers(2, p->decide_fbo);
++        const GLuint programs[] = {p->blocks_program, p->prev_program, p->decide_program,
++                                   p->opaque_program, p->state_program, p->copy_program,
++                                   p->check_program};
++        for (unsigned i = 0; i < COUNT(programs); ++i)
++            glDeleteProgram(programs[i]);
++    }
+     glDeleteTextures(4, p->tables);
+     free(p->table_data);
+     glDeleteProgram(p->scale_columns);
+@@ -1790,7 +2121,8 @@ static void set_inverse(GLint ycc, GLint lms, GLint code_max,
+ /* Hades: the tiles of what is drawn over, on unit 3, and how a pass takes them (tiles_mode) */
+ static void set_tiles(struct dvbridge_source_packer *p, GLint tiles, GLint mode, int how)
+ {
+-    bind(p, 3, how ? p->tiles.texture : 0);
++    /* (Hades: those that 7c made where the cache took this frame's picture, else those of 7) */
++    bind(p, 3, how ? p->tiles_texture : 0);
+     glUniform1i(tiles, 3);
+     glUniform1i(mode, how);
+ }
+@@ -1819,14 +2151,179 @@ void dvbridge_source_forget(struct dvbridge_source_packer *p)
+     p->gui = 0;
+     p->tiles_mode = 0;
+     p->picture_level = 0;
++    /* (Hades: and the cache, which this frame does not take) */
++    p->drawn_key = 0;
++    p->cache_frame = false;
++}
++
++void dvbridge_source_gui_cache(struct dvbridge_source_packer *p, bool use)
++{
++    if (!p)
++        return;
++    p->cache_wanted = use;
++    if (!use)
++        p->key_valid = false; /* (what it holds is not kept up to date while it is off) */
++}
++
++bool dvbridge_source_gui_cache_usable(const struct dvbridge_source_packer *p)
++{
++    return p && p->cache_usable;
++}
++
++void dvbridge_source_drawn_key(struct dvbridge_source_packer *p, uint64_t key)
++{
++    if (p)
++        p->drawn_key = key;
++}
++
++void dvbridge_source_gui_cache_check(struct dvbridge_source_packer *p, bool check)
++{
++    if (p)
++        p->cache_check = check;
++}
++
++bool dvbridge_source_gui_cache_tiles(struct dvbridge_source_packer *p, unsigned counts[4])
++{
++    if (!p || !counts || !p->stats_valid)
++        return false;
++    memcpy(counts, p->stats, sizeof(p->stats));
++    return true;
++}
++
++/* Hades: the state of the cache cleared: no tile holds kept bytes */
++static void cache_clear(struct dvbridge_source_packer *p)
++{
++    for (int i = 0; i < 2; ++i)
++        if (target(&p->state[i], GL_R8, DRAWN_COLUMNS, DRAWN_ROWS)) {
++            glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++            glClear(GL_COLOR_BUFFER_BIT);
++        }
++}
++
++/* Hades: the level that draw_picture() draws the picture of a frame with the GUI at, as it chooses
++ * it (but for a target that cannot be made: see make_cached_tiles()) */
++static int predicted_level(const struct dvbridge_source_packer *p,
++                           const struct dvbridge_source_params *params)
++{
++    if (params->affine || p->gui_level < 1 || !p->picture_corr)
++        return 0;
++    return p->gui_level >= 2 && p->picture_flag ? 2 : 1;
++}
++
++/* Hades: passes 6c, 6p and 7c (the GUI cache, dvbridge_source.h), in place of 6 and 7: false where
++ * they could not be made (then the cache is no longer used, and 6 and 7 are drawn) */
++static bool make_cached_tiles(struct dvbridge_source_packer *p,
++                              const struct dvbridge_source_params *params)
++{
++    struct cache_key key;
++    memset(&key, 0, sizeof(key));
++    key.params = *params;
++    key.level = predicted_level(p, params);
++    key.gui_w = p->gui_w;
++    key.gui_h = p->gui_h;
++    key.composite = p->drawn_key;
++    /* the copy of the GUI texture that its texels are compared with, of its size (made: every texel
++     * transparent, which no opaque texel is) */
++    const bool fresh = !p->gui_prev.texture || p->gui_prev.w != p->gui_w || p->gui_prev.h != p->gui_h;
++    if (!target(&p->gui_prev, GL_RGBA8, p->gui_w, p->gui_h))
++        return false;
++    if (fresh) {
++        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++        glClear(GL_COLOR_BUFFER_BIT);
++    }
++    if (fresh || !p->key_valid || memcmp(&key, &p->key, sizeof(key))) {
++        cache_clear(p);
++        memcpy(&p->key, &key, sizeof(key)); /* (its padding too: memset above) */
++        p->key_valid = true;
++    }
++    const int qw = (p->gui_w + 3) / 4, qh = (p->gui_h + 3) / 4;
++    const int gw = (qw + 3) / 4, gh = (qh + 3) / 4;
++    /* 6c */
++    if (!target(&p->blocks_quarter, GL_RGBA8, qw, qh))
++        return false;
++    glUseProgram(p->blocks_program);
++    bind(p, 0, p->gui);
++    bind(p, 1, p->gui_prev.texture);
++    glUniform1i(p->bk.gui, 0);
++    glUniform1i(p->bk.prev, 1);
++    glUniform2i(p->bk.size, p->gui_w, p->gui_h);
++    glUniform1i(p->bk.from_gui, 1);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    if (!target(&p->blocks, GL_RGBA8, gw, gh))
++        return false;
++    bind(p, 0, p->blocks_quarter.texture);
++    bind(p, 1, 0);
++    glUniform2i(p->bk.size, qw, qh);
++    glUniform1i(p->bk.from_gui, 0);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    /* 6p: the blocks that changed, into the copy */
++    if (!target(&p->gui_prev, GL_RGBA8, p->gui_w, p->gui_h))
++        return false;
++    glUseProgram(p->prev_program);
++    bind(p, 0, p->blocks.texture);
++    bind(p, 1, p->gui);
++    glUniform1i(p->pv.tiles, 0);
++    glUniform1i(p->pv_gui, 1);
++    glUniform2i(p->pv.size, p->gui_w, p->gui_h);
++    glDrawArrays(GL_TRIANGLES, 0, 6 * gw * gh);
++    /* 7c, into the tiles and the other state */
++    const int next = 1 - p->state_now;
++    if (!target(&p->ctiles, GL_RGBA8, DRAWN_COLUMNS, DRAWN_ROWS) ||
++        !target(&p->state[next], GL_R8, DRAWN_COLUMNS, DRAWN_ROWS) ||
++        !target(&p->state[p->state_now], GL_R8, DRAWN_COLUMNS, DRAWN_ROWS))
++        return false;
++    if (!p->decide_fbo[next])
++        glGenFramebuffers(1, &p->decide_fbo[next]);
++    glBindFramebuffer(GL_FRAMEBUFFER, p->decide_fbo[next]);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, p->ctiles.texture, 0);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
++                           p->state[next].texture, 0);
++    static const GLenum BUFFERS[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
++    glDrawBuffers(2, BUFFERS);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++        return false;
++    glViewport(0, 0, DRAWN_COLUMNS, DRAWN_ROWS);
++    glUseProgram(p->decide_program);
++    bind(p, 0, p->blocks.texture);
++    bind(p, 1, p->state[p->state_now].texture);
++    glUniform1i(p->dc_tiles, 0);
++    glUniform1i(p->dc_state, 1);
++    glUniform2i(p->dc_size, p->gui_w, p->gui_h);
++    glUniform1i(p->dc_allowed, 1);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++    bind(p, 1, 0);
++    if (glGetError() != GL_NO_ERROR)
++        return false;
++    p->state_now = next;
++    p->tiles_texture = p->ctiles.texture;
++    return true;
+ }
+ 
+ /* Hades: passes 6 and 7, for the texture that dvbridge_source_drawn() gave: false where they could
+- * not be made (then what is drawn over is not known) */
+-static bool make_tiles(struct dvbridge_source_packer *p)
++ * not be made (then what is drawn over is not known). Hades: 6c, 6p and 7c where the GUI cache is
++ * asked for and the composite's key given (*cached: the tiles hold what 7c decided). */
++static bool make_tiles(struct dvbridge_source_packer *p, const struct dvbridge_source_params *params,
++                       bool *cached)
+ {
++    *cached = false;
++    p->tiles_texture = p->tiles.texture;
+     if (!p->drawn_usable || !p->gui)
+         return false;
++    if (p->cache_wanted && p->cache_usable && !p->drawn_key)
++        p->key_valid = false; /* (a composite whose key is not known: what is kept is forgotten) */
++    if (p->cache_wanted && p->cache_usable && p->drawn_key) {
++        if (make_cached_tiles(p, params)) {
++            *cached = true;
++            return true;
++        }
++        /* (the cache is no longer used; 6 and 7 as before, their errors their own) */
++        dvbridge_gl_drain_errors();
++        p->cache_usable = false;
++        p->key_valid = false;
++        p->tiles_texture = p->tiles.texture;
++        fprintf(stderr, "DV source transport: the passes of the GUI cache failed; the GUI is "
++                        "converted at every frame, as before\n");
++    }
+     /* the GUI texture to a quarter of its size, and that to its tiles (ceil(ceil(n / 4) / 4) is
+      * ceil(n / 16)) */
+     const int qw = (p->gui_w + 3) / 4, qh = (p->gui_h + 3) / 4;
+@@ -1852,6 +2349,7 @@ static bool make_tiles(struct dvbridge_source_packer *p)
+     glUniform1i(p->dr_tiles, 0);
+     glUniform2i(p->dr_size, p->gui_w, p->gui_h);
+     glDrawArrays(GL_TRIANGLES, 0, 3);
++    p->tiles_texture = p->tiles.texture;
+     return glGetError() == GL_NO_ERROR;
+ }
+ 
+@@ -1966,29 +2464,49 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+     if (p) {
+         p->tiles_mode = 0;
+         p->picture_level = 0;
++        p->cache_frame = false;
+     }
+     if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
+         !rows_of(p, width, height, x, y, margins)) {
+-        if (p)
++        if (p) {
+             p->gui = 0;
++            p->drawn_key = 0;
++        }
+         return false;
+     }
+     struct dvbridge_gl_state state;
+     begin(p, &state);
+     /* Hades: in the tiles that what is drawn over may reach, where that is known; the whole
+      * picture where it is not, or where the tiles could not be made (whose GL errors are then not
+-     * the picture's) */
+-    const int how = make_tiles(p) ? 1 : 0;
++     * the picture's). Hades: with the GUI cache, not in the tiles copied from it (unless check). */
++    bool cached = false;
++    const int how = make_tiles(p, params, &cached) ? 1 : 0;
+     p->gui = 0;
++    p->drawn_key = 0;
+     if (!how)
+         dvbridge_gl_drain_errors();
+     int level = 0;
+-    const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, how,
+-                                    p->gui_level, &level);
+-    if (!end(&state, drawn))
++    const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer,
++                                    how && cached && !p->cache_check ? 4 : how, p->gui_level,
++                                    &level);
++    /* Hades: a picture drawn at another level than the one the cache's key holds (its target could
++     * not be made): its tiles copied are drawn too, and this frame does not take the cache, whose
++     * bytes are forgotten */
++    bool whole = true;
++    if (drawn && cached && level != p->key.level) {
++        int again = 0;
++        if (!p->cache_check)
++            whole = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, 9, level,
++                                 &again) && again == level;
++        cached = false;
++        p->key_valid = false;
++    }
++    if (!end(&state, drawn && whole))
+         return false;
+     p->tiles_mode = how;
+     p->picture_level = level;
++    p->cache_frame = cached;
++    p->cache_level = level;
+     return true;
+ }
+ 
+@@ -2004,10 +2522,14 @@ bool dvbridge_source_complete(struct dvbridge_source_packer *p,
+         return false;
+     struct dvbridge_gl_state state;
+     begin(p, &state);
+-    /* (Hades: the rest at the level the picture was drawn at) */
++    /* (Hades: the rest at the level the picture was drawn at. Hades: with the GUI cache, the tiles
++     * copied from it too, where they were not drawn, and this frame does not take it: something else
++     * is drawn over the picture) */
+     int level = 0;
+-    if (!draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, 2, p->picture_level,
+-                      &level)) {
++    const int rest = p->cache_frame && !p->cache_check ? 5 : 2;
++    p->cache_frame = false;
++    if (!draw_picture(p, params, luma, width, height, x, y, margins, framebuffer, rest,
++                      p->picture_level, &level)) {
+         p->picture_level = 0;
+         return end(&state, false);
+     }
+@@ -2030,7 +2552,14 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+     if (p) {
+         p->pairs_missed = false;
+         p->drawn_level = 0;
++        p->stats_valid = false;
+     }
++    /* Hades: the GUI cache, where this frame's picture took it (and is packed with what was drawn
++     * over it): its tiles copied are not packed, those packed into it are, into it */
++    const bool cached = p && p->cache_frame && layer && p->tiles_mode && count <= 16 &&
++                        p->picture_level == p->cache_level;
++    if (p)
++        p->cache_frame = false;
+     if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !packets || !count ||
+         count > 16 || !rows_of(p, width, height, x, y, margins))
+         return false;
+@@ -2055,7 +2584,7 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+      * each. Where it is not drawn, pass 4 converts them itself (the same codes, more slowly). */
+     bool pairs = false;
+     if (layer && !params->affine && p->pairs_program) {
+-        const int pairs_how = p->tiles_mode ? 1 : 0;
++        const int pairs_how = p->tiles_mode ? (cached && !p->cache_check ? 4 : 1) : 0;
+         if (target(&p->pairs, GL_RGBA16UI, 1920, 2160)) {
+             /* Hades: at the level pass 3 drew the picture at */
+             const int level = p->picture_level;
+@@ -2114,18 +2643,146 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+         glUniform1i(p->w_more.pairs_made, 1);
+     }
+     /* Hades: the picture drawn over is read in the tiles that what is drawn over may reach: all the
+-     * tiles drawn, each knowing whether something may be drawn over it */
+-    const int how = layer && p->tiles_mode ? 3 : 0;
+-    set_tiles(p, pairs ? p->w_more.tiles : p->pc_tiles, pairs ? p->w_more.mode : p->pc_mode, how);
+-    glUniform1i(pairs ? p->w_more.flip : p->pc_flip, flip_y);
++     * tiles drawn, each knowing whether something may be drawn over it. Hades: with the GUI cache,
++     * all but those copied from it or packed into it */
++    const int how = layer && p->tiles_mode ? (cached ? 6 : 3) : 0;
++    const GLint tiles_mode = pairs ? p->w_more.mode : p->pc_mode;
++    const GLint tiles_flip = pairs ? p->w_more.flip : p->pc_flip;
++    set_tiles(p, pairs ? p->w_more.tiles : p->pc_tiles, tiles_mode, how);
++    glUniform1i(tiles_flip, flip_y);
+     set_inverse(u->ycc_inverse, u->lms_inverse, u->code_max, params);
+     glUniform4uiv(u->words, 128, packets);
+     glUniform1ui(u->count, count);
+     glUniform1ui(u->flip, flip_y);
+     glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(how));
++    if (!cached)
++        return end(&state, true);
++    /* Hades: the tiles packed into the cache, by the same program with the same uniforms, the rows
++     * of the raster the right way up (a pixel's bytes do not depend on where they are written) */
++    bool ok = glGetError() == GL_NO_ERROR && target(&p->cache, GL_RGBA8, 3840, 2160);
++    if (ok) {
++        glUniform1i(tiles_mode, 7);
++        glUniform1i(tiles_flip, 0);
++        glUniform1ui(u->flip, 0);
++        glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(7));
++        /* (the check: the tiles copied packed again, into a texture of their own) */
++        if (p->cache_check && target(&p->again, GL_RGBA8, 3840, 2160)) {
++            glUniform1i(tiles_mode, 9);
++            glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(9));
++        }
++        /* 9: whether the pixels of the tiles packed into it were opaque, and the state after them */
++        ok = glGetError() == GL_NO_ERROR &&
++             target(&p->opaque_quarter, GL_R8, 3840 / 4, 2160 / 4);
++    }
++    if (ok) {
++        glUseProgram(p->opaque_program);
++        bind(p, 2, layer);
++        glUniform1i(p->op_drawn, 2);
++        set_tiles(p, p->op_tiles, p->op_mode, 7);
++        glUniform1i(p->op_flip, 0);
++        glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(7));
++        const int next = 1 - p->state_now;
++        ok = target(&p->state[next], GL_R8, DRAWN_COLUMNS, DRAWN_ROWS);
++        if (ok) {
++            glUseProgram(p->state_program);
++            bind(p, 0, p->opaque_quarter.texture);
++            bind(p, 1, p->state[p->state_now].texture);
++            bind(p, 3, p->tiles_texture);
++            glUniform1i(p->st_quarter, 0);
++            glUniform1i(p->st_state, 1);
++            glUniform1i(p->st_tiles, 3);
++            glDrawArrays(GL_TRIANGLES, 0, 3);
++            ok = glGetError() == GL_NO_ERROR;
++            if (ok)
++                p->state_now = next;
++        }
++    }
++    /* 10: the bytes of the tiles copied or packed into the cache, into the framebuffer */
++    if (ok) {
++        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++        glViewport(0, 0, 3840, 2160);
++        glUseProgram(p->copy_program);
++        bind(p, 0, p->cache.texture);
++        glUniform1i(p->cp_cache, 0);
++        glUniform1ui(p->cp_flip, flip_y);
++        set_tiles(p, p->cp_tiles, p->cp_mode, 8);
++        glUniform1i(p->cp_tflip, flip_y);
++        glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(8));
++        ok = glGetError() == GL_NO_ERROR;
++    }
++    /* (the check, and what the tiles were: read back, for the check only) */
++    if (ok && p->cache_check && p->again.texture && target(&p->differ, GL_R8, DRAWN_COLUMNS, DRAWN_ROWS)) {
++        glUseProgram(p->check_program);
++        bind(p, 0, p->cache.texture);
++        bind(p, 1, p->again.texture);
++        bind(p, 3, p->tiles_texture);
++        glUniform1i(p->ck_cache, 0);
++        glUniform1i(p->ck_again, 1);
++        glUniform1i(p->ck_tiles, 3);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        uint8_t *differ = malloc(DRAWN_COLUMNS * DRAWN_ROWS * 4);
++        uint8_t *tiles = malloc(DRAWN_COLUMNS * DRAWN_ROWS * 4);
++        if (differ && tiles) {
++            GLint alignment = 4, pack_buffer = 0;
++            glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++            glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++            glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            glReadPixels(0, 0, DRAWN_COLUMNS, DRAWN_ROWS, GL_RGBA, GL_UNSIGNED_BYTE, differ);
++            glBindFramebuffer(GL_FRAMEBUFFER, p->ctiles.framebuffer);
++            glReadPixels(0, 0, DRAWN_COLUMNS, DRAWN_ROWS, GL_RGBA, GL_UNSIGNED_BYTE, tiles);
++            glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++            glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack_buffer);
++            memset(p->stats, 0, sizeof(p->stats));
++            for (int i = 0; i < DRAWN_COLUMNS * DRAWN_ROWS; ++i) {
++                p->stats[0] += tiles[i * 4 + 1] >= 128;
++                p->stats[1] += tiles[i * 4 + 2] >= 128;
++                p->stats[2] += differ[i * 4] >= 128;
++            }
++            p->stats[3] = 1;
++            p->stats_valid = glGetError() == GL_NO_ERROR;
++        }
++        free(differ);
++        free(tiles);
++    }
++    if (!ok) {
++        /* (the tiles not packed: the frame is not, and nothing more is kept) */
++        dvbridge_gl_drain_errors();
++        p->key_valid = false;
++        p->cache_usable = false;
++        fprintf(stderr, "DV source transport: the passes of the GUI cache failed; the GUI is "
++                        "converted at every frame, as before\n");
++        return end(&state, false);
++    }
+     return end(&state, true);
+ }
+ 
++/* Hades: (for tests) what the tiles of the last pack that took the cache were, read back from the
++ * tiles of 7c (copied, packed into it) without the check's count */
++bool dvbridge_source_gui_cache_read(struct dvbridge_source_packer *p, unsigned counts[2])
++{
++    if (!p || !counts || !p->ctiles.texture)
++        return false;
++    uint8_t *tiles = malloc(DRAWN_COLUMNS * DRAWN_ROWS * 4);
++    if (!tiles)
++        return false;
++    GLint previous = 0, alignment = 4;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++    glBindFramebuffer(GL_FRAMEBUFFER, p->ctiles.framebuffer);
++    glPixelStorei(GL_PACK_ALIGNMENT, 1);
++    glReadPixels(0, 0, DRAWN_COLUMNS, DRAWN_ROWS, GL_RGBA, GL_UNSIGNED_BYTE, tiles);
++    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)previous);
++    counts[0] = counts[1] = 0;
++    for (int i = 0; i < DRAWN_COLUMNS * DRAWN_ROWS; ++i) {
++        counts[0] += tiles[i * 4 + 1] >= 128;
++        counts[1] += tiles[i * 4 + 2] >= 128;
++    }
++    free(tiles);
++    return glGetError() == GL_NO_ERROR;
++}
++
+ bool dvbridge_source_pairs_missed(const struct dvbridge_source_packer *p)
+ {
+     return p && p->pairs_missed;
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 12e8afd..591683c 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -243,6 +243,41 @@ void dvbridge_source_gui_targets(const struct dvbridge_source_packer *packer, un
+ bool dvbridge_source_cover(struct dvbridge_source_packer *packer, unsigned layer,
+                            const unsigned margins[4], unsigned *edges);
+ 
++/* Hades: the GUI cache. Where every texel of the GUI texture of dvbridge_source_drawn() that a
++ * tile of the raster may read is opaque (alpha 1) and is the texel it was at the frame before, the
++ * pixels of that tile depend on the GUI alone: the composite leaves a colour + (1 - a) picture =
++ * the colour where a = 1, and the conversion back to codes of the transport then takes nothing of
++ * the picture under it (its second term is (1 - a) times a finite value: 0). Such a tile is packed
++ * once as before, into a texture of the packer's (with a check that every one of its pixels came
++ * out of the composite with an alpha of exactly 1), and from the next frame on its bytes are
++ * copied from there: passes 3, 8 and 4 are not drawn in it, until a texel that it may read
++ * changes, or what the codes of those pixels are made with does: the metadata's representation
++ * (dvbridge_source_params), the level of the conversion under the GUI of a picture whose decoding
++ * is not affine, the size of the GUI texture, or the key of its composite. The tiles of the first
++ * row of the raster (that hold the metadata) are never kept. The same bytes as packing them again,
++ * for any picture under them. Off until asked for (use), and only where the caller gives the key
++ * of its composite (dvbridge_source_drawn_key()); without the programs it needs, off. */
++#define DVBRIDGE_SOURCE_GUI_CACHE 1
++void dvbridge_source_gui_cache(struct dvbridge_source_packer *packer, bool use);
++bool dvbridge_source_gui_cache_usable(const struct dvbridge_source_packer *packer);
++/* What decides the colours that the composite of the texture of dvbridge_source_drawn() draws
++ * from its texels (its program, its tables: Kodi's transfer and GUI white), for the next picture
++ * of dvbridge_source_picture(), as dvbridge_source_drawn(): another key, another composite. 0: not
++ * known (nothing is kept, and what was is forgotten). */
++void dvbridge_source_drawn_key(struct dvbridge_source_packer *packer, uint64_t key);
++/* A check of the cache: the frames that copy kept bytes also pack those tiles again into a
++ * texture of the packer's, as without it, and compare the two (each such frame waits for the
++ * GPU). For a check on hardware. */
++void dvbridge_source_gui_cache_check(struct dvbridge_source_packer *packer, bool check);
++/* The tiles of the last dvbridge_source_pack() (each DRAWN_TILE x DRAWN_TILE pixels): [0] copied
++ * from the cache, [1] packed into it, [2] (check) copied and not the same bytes as packed again,
++ * [3] whether the check ran. Reads back what the GPU decided (waits for it): for tests and the
++ * check. False where that frame did not take the cache. */
++bool dvbridge_source_gui_cache_tiles(struct dvbridge_source_packer *packer, unsigned counts[4]);
++/* (for tests) the tiles that the passes of the last picture decided to copy [0] and to pack into
++ * the cache [1], read back */
++bool dvbridge_source_gui_cache_read(struct dvbridge_source_packer *packer, unsigned counts[2]);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 8c76c2e..d1f8f33 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -485,6 +485,27 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+     CLog::Log(LOGINFO, "DVBridge: the area outside the active picture is written after the "
+                        "reconstruction, as advancedsettings.xml asks (dvearlymask)");
+   }
++  // Hades: the GUI cache of the source transport: the packed bytes of the GUI where it is opaque and
++  // did not change are copied from the frame that packed them, not converted again (the same bytes;
++  // dvbridge_source.h). advancedsettings.xml can turn it off, to measure what it saves:
++  // <video><dvguicache>false</dvguicache></video>; and <dvguicachecheck>true</dvguicachecheck>
++  // packs the tiles copied again on those frames and compares them, with a line every 240 frames
++  {
++    const auto settings = CServiceBroker::GetSettingsComponent();
++    const bool guiCache = !settings || settings->GetAdvancedSettings()->m_videoDVGuiCache;
++    m_guiCacheCheck = guiCache && settings && settings->GetAdvancedSettings()->m_videoDVGuiCacheCheck;
++    dvbridge_render_use_gui_cache(m_renderer, guiCache);
++    dvbridge_render_gui_cache_check(m_renderer, m_guiCacheCheck);
++    if (!guiCache)
++      CLog::Log(LOGINFO, "DVBridge: the GUI is converted again at every frame, as advancedsettings.xml "
++                         "asks (dvguicache)");
++    else if (!dvbridge_render_gui_cache_usable(m_renderer))
++      CLog::Log(LOGWARNING, "DVBridge: the GUI cache could not be made on this GPU: the GUI is "
++                            "converted again at every frame (the same bytes, more GPU time)");
++    else if (m_guiCacheCheck)
++      CLog::Log(LOGINFO, "DVBridge: the GUI cache is checked, as advancedsettings.xml asks "
++                         "(dvguicachecheck): the tiles copied are packed again and compared");
++  }
+   UseComposerSetting();
+   UseGamutSetting();
+   UseMmrTableSetting();
+@@ -878,8 +899,9 @@ void CDVBridgeGLES::PQTextureDrawn()
+     dvbridge_render_texture_drawn(m_renderer);
+ }
+ 
+-void CDVBridgeGLES::SetDrawnOver(unsigned int guiTexture, int width, int height)
++void CDVBridgeGLES::SetDrawnOver(unsigned int guiTexture, int width, int height, uint64_t composite)
+ {
++  dvbridge_render_set_drawn_key(m_renderer, guiTexture ? composite : 0);
+   dvbridge_render_set_drawn(m_renderer, guiTexture, width, height);
+ }
+ 
+@@ -1256,6 +1278,29 @@ bool CDVBridgeGLES::Pack(unsigned int framebuffer, int width, int height, bool f
+                                                           : DVBRIDGE_COVER_NONE);
+   if (!m_packed)
+     return Fail("transport-packing");
++  // Hades: the check of the GUI cache (dvguicachecheck): what the frames that took it copied, and
++  // whether every tile copied was the bytes packed again
++  unsigned int cached[4];
++  if (m_guiCacheCheck && dvbridge_render_gui_cache_tiles(m_renderer, cached) && cached[3])
++  {
++    ++m_guiCacheFrames;
++    for (int i = 0; i < 3; ++i)
++      m_guiCacheTiles[i] += cached[i];
++    if (cached[2] && !m_guiCacheDiffered)
++      CLog::Log(LOGERROR,
++                "DVBridge: GUI cache check: {} of {} tiles copied were not the bytes packed again",
++                cached[2], cached[0]);
++    m_guiCacheDiffered = m_guiCacheDiffered || cached[2];
++    if (m_guiCacheFrames >= 240)
++    {
++      CLog::Log(LOGINFO,
++                "DVBridge: GUI cache check: {} frames, {} tiles copied, {} packed into the cache, {} "
++                "copied that were not the bytes packed again",
++                m_guiCacheFrames, m_guiCacheTiles[0], m_guiCacheTiles[1], m_guiCacheTiles[2]);
++      m_guiCacheFrames = 0;
++      m_guiCacheTiles[0] = m_guiCacheTiles[1] = m_guiCacheTiles[2] = 0;
++    }
++  }
+   // Hades: what of the metadata the display is sent, read back again: the level 5 block may have
+   // been taken out to what was drawn over the bars
+   if (cover != Cover::NONE && m_pendingDetail.valid)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 7317520..008bf38 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -245,7 +245,11 @@ public:
+   //! composited from this texture (width x height) as CWinSystemGbmGLESContext::CompositeGui()
+   //! composites it, and nothing else; 0: not known. The picture that it is drawn over is then made
+   //! only where it may reach (dvbridge_render_set_drawn()): the same bytes, less work.
+-  void SetDrawnOver(unsigned int guiTexture, int width, int height);
++  //! Hades: composite, the key of that composite (what decides the colours it draws from the
++  //! texture's texels: its program and tables); a GUI drawn with the same key whose texels did not
++  //! change keeps its packed bytes where it is opaque (the GUI cache: dvbridge_render_use_gui_cache()).
++  //! 0: not known.
++  void SetDrawnOver(unsigned int guiTexture, int width, int height, uint64_t composite = 0);
+   //! Hades: the picture of the prepared frame whole, for what else is drawn into it (PQ subtitles,
+   //! a capture that reads it); false where that could not be done
+   bool CompletePicture();
+@@ -481,6 +485,12 @@ private:
+   unsigned int m_framebuffer = 0;
+   bool m_sourceWanted = false; //!< see UseSourceTransport()
+   bool m_passTimes = false; //!< Hades: the passes are timed (TakePassTimes())
++  //! Hades: the check of the GUI cache (advancedsettings.xml dvguicachecheck): frames, tiles copied,
++  //! tiles packed into it and tiles copied that were not the bytes packed again, since the last line
++  bool m_guiCacheCheck = false;
++  unsigned m_guiCacheFrames = 0;
++  unsigned long long m_guiCacheTiles[3] = {0, 0, 0};
++  bool m_guiCacheDiffered = false;
+   //! Hades: see SetLowLatency()
+   bool m_lowLatencyOn = false;
+   bool m_llPattern = false;
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index c9131b4..4059e02 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -204,6 +204,8 @@ void CAdvancedSettings::Initialize()
+   m_videoDVEarlyMask = true;
+   m_videoDualModeRestart = true;
+   m_videoDVDrawnTiles = true;
++  m_videoDVGuiCache = true;
++  m_videoDVGuiCacheCheck = false;
+   m_videoDVLLPattern = false;
+   m_videoDVCCMComposer = true;
+   m_videoDVAheadAlways = false;
+@@ -713,6 +715,8 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvearlymask", m_videoDVEarlyMask);
+     XMLUtils::GetBoolean(pElement, "dualmoderestart", m_videoDualModeRestart);
+     XMLUtils::GetBoolean(pElement, "dvdrawntiles", m_videoDVDrawnTiles);
++    XMLUtils::GetBoolean(pElement, "dvguicache", m_videoDVGuiCache);
++    XMLUtils::GetBoolean(pElement, "dvguicachecheck", m_videoDVGuiCacheCheck);
+     XMLUtils::GetBoolean(pElement, "dvllpattern", m_videoDVLLPattern);
+     XMLUtils::GetBoolean(pElement, "dvccmcomposer", m_videoDVCCMComposer);
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 0bf5649..1111641 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -170,6 +170,11 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! Hades: the Dolby Vision renderer makes the picture that the GUI is drawn over only where the
+     //! GUI reaches (video/dvdrawntiles; the same bytes). Off for a measurement of what that saves
+     bool m_videoDVDrawnTiles;
++    //! Hades: the Dolby Vision renderer copies the packed bytes of the GUI where it is opaque and
++    //! did not change, instead of converting it again (video/dvguicache; the same bytes). Off for a
++    //! measurement of what that saves; video/dvguicachecheck packs those again and compares them
++    bool m_videoDVGuiCache;
++    bool m_videoDVGuiCacheCheck;
+     //! Hades: native Dolby Vision Low-Latency shows a test pattern in place of the picture
+     //! (video/dvllpattern), for a first look at a display (dvbridge_render_set_ll_pattern())
+     bool m_videoDVLLPattern;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index db5d07b..b605741 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1157,6 +1157,7 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+           )
+         defines += "#define KODI_LIMITED_RANGE 1\n";
+       m_compositeShader = std::make_unique<CGuiCompositeShaderGLES>(defines);
++      ++m_compositeRevision;
+       if (!m_compositeShader->CompileAndLink())
+       {
+         CLog::Log(LOGERROR, "CWinSystemGbmGLESContext: failed to compile GUI composite shader");
+@@ -1168,6 +1169,7 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+ 
+     m_compositeTransfer = colorTransfer;
+     m_compositeWhiteFailed = 0;
++    ++m_compositeRevision;
+     if (!m_compositeShader->CreateLUTs(colorTransfer, GuiReferenceWhite()))
+     {
+       CLog::Log(LOGERROR, "CWinSystemGbmGLESContext: failed to create LUTs");
+@@ -1201,6 +1203,7 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+       m_compositeWhiteFailed = 0; // back to the value in use: a failed one is tried again later
+     else if (white != m_compositeWhiteFailed)
+     {
++      ++m_compositeRevision;
+       if (m_compositeShader->CreateLUTs(m_compositeTransfer, white))
+       {
+         m_compositeWhiteFailed = 0;
+@@ -3224,7 +3227,8 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   const bool drawnTiles =
+       !drawnSettings || drawnSettings->GetAdvancedSettings()->m_videoDVDrawnTiles;
+   if (!overlayFree && !captured && drawnTiles && m_guiFbo.IsValid())
+-    m_dvBridge->SetDrawnOver(m_guiFbo.Texture(), m_guiFboWidth, m_guiFboHeight);
++    m_dvBridge->SetDrawnOver(m_guiFbo.Texture(), m_guiFboWidth, m_guiFboHeight,
++                             m_compositeShader ? m_compositeRevision : 0);
+   else
+     m_dvBridge->SetDrawnOver(0, 0, 0);
+   DVGpuTimerMark(true);
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 7d62d6d..597dc2b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -348,6 +348,9 @@ private:
+   bool m_guiWillRender{true};
+ 
+   std::unique_ptr<CGuiCompositeShaderGLES> m_compositeShader;
++  //! Hades: a new value whenever the program or the tables of the GUI composite are made: the key
++  //! of the composite for the Dolby Vision bridge's GUI cache (CDVBridgeGLES::SetDrawnOver())
++  uint64_t m_compositeRevision{1};
+   //! The transfer function the composite LUTs were created for (SetGuiCompositing())
+   int m_compositeTransfer{0};
+   //! A GUI white setting whose LUTs could not be created: not tried again until the setting returns
+-- 
+2.53.0
+

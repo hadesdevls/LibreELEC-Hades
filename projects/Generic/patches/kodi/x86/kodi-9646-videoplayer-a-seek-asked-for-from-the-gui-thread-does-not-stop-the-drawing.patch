@@ -1,0 +1,268 @@
+From 9fc4077b63e440295f0cd60eb0cd139e5658f053 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 22:02:15 +0000
+Subject: [PATCH] VideoPlayer: a seek asked for from the GUI thread does not
+ stop the drawing
+
+CVideoPlayer::SeekTime() and the big step seeks (ExecuteTimeSeek(), behind
+Seek()) put the seek to the player and then waited, in
+SynchronizeDemuxer(), for the player thread to reach the message after it,
+for up to 500 ms. Asked for from the thread that draws the interface and the
+video (the OSD progress slider, PlayerControl(SeekPercentage), the big
+steps, the bookmarks), that wait kept both from being drawn for as long as the
+player took to seek the stream. Over a network that is longer than 500 ms, so
+every such seek froze the interface and the picture for half a second: the
+hardware test of 1.0 RC4 has "GUI: a pass of the nested loop took 500 ms
+(process 0, frame move 500, render 0); window 12005 under dialog 12901" at
+each seek from the OSD, on the AMD integrated graphics with native Dolby
+Vision (gaps of 500.8 and 542.2 ms in its statistics) and on the RTX 4080
+with the ordinary output alike, and the video thread meanwhile timed out
+waiting for a render buffer that the blocked thread would have freed.
+
+From that thread the seek is now put and not waited for, as the relative
+step seeks of the seek handler already were (SeekTimeRelative()). What the
+wait gave, a time that GetTime() reports at the new position right after the
+call, now comes from CSeekPending: while the seek is on its way GetTime()
+reports its target. Its message holds a ticket, and whatever becomes of the
+message (handled, left out for a later seek, dropped when the player stops)
+the seek is no longer on its way once the message is gone; then the time is
+the player's again, which the handled seek has updated (UpdatePlayState(0)
+in FlushBuffers()). Before, a seek that took longer than 500 ms returned
+early anyway and the interface showed the old time until it was handled; that
+no longer happens either. The player thread itself still reads its own
+time. Seeks asked for from any other thread (Python add-ons, JSON-RPC) wait
+as before. The seek bar is told that a seek is on its way, as for a relative
+seek.
+
+Rapid seeks no longer queue behind each other's waits: the player already
+leaves out a seek message when a newer one is queued, so a run of slider steps
+ends in one seek of the stream instead of one per step.
+---
+ xbmc/cores/VideoPlayer/DVDMessage.h    |  5 ++
+ xbmc/cores/VideoPlayer/SeekPending.h   | 80 ++++++++++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp | 32 +++++++++--
+ xbmc/cores/VideoPlayer/VideoPlayer.h   |  6 ++
+ 4 files changed, 118 insertions(+), 5 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/SeekPending.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDMessage.h b/xbmc/cores/VideoPlayer/DVDMessage.h
+index 8604354..5207610 100644
+--- a/xbmc/cores/VideoPlayer/DVDMessage.h
++++ b/xbmc/cores/VideoPlayer/DVDMessage.h
+@@ -16,6 +16,7 @@
+ #include <memory>
+ #include <string.h>
+ #include <string>
++#include <utility>
+ 
+ struct DemuxPacket;
+ 
+@@ -221,6 +222,9 @@ public:
+ 
+   //! Hades: when the seek was asked for, by the steady clock in ns (CSeekTrace)
+   int64_t AskedNs() const { return m_askedNs; }
++  //! Hades: the ticket of a seek that its asker did not wait for (CSeekPending): it goes with the
++  //! message
++  void SetPending(std::shared_ptr<void> ticket) { m_pending = std::move(ticket); }
+ 
+   double GetTime() { return m_mode.time; }
+   bool GetRelative() { return m_mode.relative; }
+@@ -235,6 +239,7 @@ private:
+   int64_t m_askedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
++  std::shared_ptr<void> m_pending;
+ };
+ 
+ class CDVDMsgPlayerSeekChapter : public CDVDMsg
+diff --git a/xbmc/cores/VideoPlayer/SeekPending.h b/xbmc/cores/VideoPlayer/SeekPending.h
+new file mode 100644
+index 0000000..9c63982
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/SeekPending.h
+@@ -0,0 +1,80 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <memory>
++#include <mutex>
++
++/*!
++ * \brief Hades: the seeks asked for that the player has not handled yet
++ *
++ * A seek asked for from the thread that draws the interface and the video no longer waits there for
++ * the player to handle it (CVideoPlayer::PutSeek()): that wait, of up to 500 ms, kept the interface
++ * and the video from being drawn for as long as the player took to seek the stream, which over a
++ * network takes longer than that. While such a seek is on its way, the time that the player reports
++ * is its target, as it would be once the seek is handled, so that what the interface shows does
++ * not go back to the time before it. The message of the seek holds a ticket (Ticket()): whatever
++ * becomes of the message (handled, left out for a later seek, dropped when the player stops), the
++ * seek is no longer on its way once the message is gone. Any thread.
++ */
++class CSeekPending : public std::enable_shared_from_this<CSeekPending>
++{
++public:
++  //! A seek to targetMs (as the player reports its time) is asked for: the ticket that its message
++  //! holds
++  std::shared_ptr<void> Ticket(double targetMs)
++  {
++    uint64_t number;
++    {
++      std::lock_guard lock(m_mutex);
++      number = ++m_asked;
++      m_target = targetMs;
++    }
++    std::weak_ptr<CSeekPending> self = weak_from_this();
++    return std::shared_ptr<void>(nullptr,
++                                 [self, number](void*)
++                                 {
++                                   if (const auto pending = self.lock())
++                                     pending->Done(number);
++                                 });
++  }
++  //! The time to report: the target of the last seek asked for while one is on its way, timeMs
++  //! otherwise
++  double Time(double timeMs) const
++  {
++    std::lock_guard lock(m_mutex);
++    return m_done < m_asked ? m_target : timeMs;
++  }
++  //! A seek is on its way
++  bool Pending() const
++  {
++    std::lock_guard lock(m_mutex);
++    return m_done < m_asked;
++  }
++  //! No seek is on its way any more (a new file, the player closing)
++  void Clear()
++  {
++    std::lock_guard lock(m_mutex);
++    m_done = m_asked;
++  }
++
++private:
++  void Done(uint64_t number)
++  {
++    std::lock_guard lock(m_mutex);
++    if (number > m_done)
++      m_done = number;
++  }
++
++  mutable std::mutex m_mutex;
++  uint64_t m_asked = 0; //!< seeks asked for
++  uint64_t m_done = 0; //!< the last of them whose message is gone
++  double m_target = 0; //!< the target of the last one asked for
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 459b131..2b99cdc 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -2979,6 +2979,25 @@ void CVideoPlayer::CheckAutoSceneSkip()
+   }
+ }
+ 
++void CVideoPlayer::PutSeek(const CDVDMsgPlayerSeek::CMode& mode, double targetMs)
++{
++  auto message = std::make_shared<CDVDMsgPlayerSeek>(mode);
++  // Hades: the thread that draws the interface and the video does not wait: the wait, of up to
++  // 500 ms, kept both from being drawn for as long as the player took to seek the stream, which
++  // over a network takes longer. While the seek is on its way GetTime() reports its target, as it
++  // would once the seek is handled (CSeekPending), and the seek bar knows that a seek is on its
++  // way, as with a relative seek (SeekTimeRelative()).
++  if (CServiceBroker::GetAppMessenger()->IsProcessThread() && !IsCurrentThread())
++  {
++    message->SetPending(m_seekPending->Ticket(targetMs));
++    m_processInfo->SetStateSeeking(true);
++    m_messenger.Put(message);
++    return;
++  }
++  m_messenger.Put(message);
++  SynchronizeDemuxer();
++}
++
+ void CVideoPlayer::SynchronizeDemuxer()
+ {
+   if(IsCurrentThread())
+@@ -3018,6 +3037,7 @@ void CVideoPlayer::SendPlayerMessage(std::shared_ptr<CDVDMsg> pMsg, unsigned int
+ void CVideoPlayer::OnExit()
+ {
+   CLog::Log(LOGINFO, "CVideoPlayer::OnExit()");
++  m_seekPending->Clear(); // (Hades)
+ 
+   // set event to inform openfile something went wrong in case openfile is still waiting for this event
+   SetCaching(CACHESTATE_DONE);
+@@ -3149,6 +3169,7 @@ void CVideoPlayer::HandleMessages()
+ 
+       m_item = msg.GetItem();
+       m_playerOptions = msg.GetOptions();
++      m_seekPending->Clear(); // (Hades)
+ 
+       m_processInfo->SetPlayTimes(0,0,0,0);
+ 
+@@ -3908,8 +3929,7 @@ void CVideoPlayer::ExecuteTimeSeek(int64_t target, Direction direction, bool acc
+   mode.restore = true;
+   mode.trickplay = false;
+   mode.sync = true;
+-  m_messenger.Put(std::make_shared<CDVDMsgPlayerSeek>(mode));
+-  SynchronizeDemuxer();
++  PutSeek(mode, static_cast<double>(std::max<int64_t>(target, 0))); // (Hades)
+   if (target < 0)
+     target = 0;
+   m_callback.OnPlayBackSeek(target, target - time);
+@@ -4250,8 +4270,7 @@ void CVideoPlayer::SeekTime(int64_t iTime)
+   mode.trickplay = false;
+   mode.sync = true;
+ 
+-  m_messenger.Put(std::make_shared<CDVDMsgPlayerSeek>(mode));
+-  SynchronizeDemuxer();
++  PutSeek(mode, static_cast<double>(iTime)); // (Hades)
+   m_callback.OnPlayBackSeek(iTime, seekOffset);
+   m_processInfo->SeekFinished(seekOffset);
+ }
+@@ -4290,7 +4309,10 @@ bool CVideoPlayer::SeekTimeRelative(int64_t iTime)
+ int64_t CVideoPlayer::GetTime() const
+ {
+   std::unique_lock lock(m_StateSection);
+-  return llrint(m_State.time);
++  // Hades: the target of a seek on its way (CSeekPending), but to the player itself
++  if (IsCurrentThread())
++    return llrint(m_State.time);
++  return llrint(m_seekPending->Time(m_State.time));
+ }
+ 
+ void CVideoPlayer::SetSpeed(float speed)
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 422916e..aa1f65d 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -13,6 +13,7 @@
+ #include "Edl.h"
+ #include "FileItem.h"
+ #include "IVideoPlayer.h"
++#include "SeekPending.h"
+ #include "VideoPlayerAudioID3.h"
+ #include "VideoPlayerRadioRDS.h"
+ #include "VideoPlayerSubtitle.h"
+@@ -495,6 +496,11 @@ protected:
+   void HandlePlaySpeed();
+   bool IsInMenuInternal() const;
+   void SynchronizeDemuxer();
++  //! Hades: puts a seek to targetMs (as GetTime() reports it) to the player. Asked for from the
++  //! thread that draws the interface and the video, it is not waited for (CSeekPending); from any
++  //! other thread, as before, for up to 500 ms (SynchronizeDemuxer()).
++  void PutSeek(const CDVDMsgPlayerSeek::CMode& mode, double targetMs);
++  std::shared_ptr<CSeekPending> m_seekPending = std::make_shared<CSeekPending>();
+   void QueueAutoSceneSkip(std::chrono::milliseconds seekTime);
+   void CheckAutoSceneSkip();
+   bool CheckContinuity(CCurrentStream& current, DemuxPacket* pPacket);
+-- 
+2.53.0
+

@@ -1,0 +1,577 @@
+From d1de36c5df174632144957b1d0c9280e9675e083 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 29 Aug 2026 19:43:40 +0100
+Subject: [PATCH] VideoPlayer: put Blu-ray 3D subtitles at the depth the disc
+ asks for
+
+A Blu-ray 3D subtitle plane is monoscopic, and its depth is a horizontal shift the disc
+varies frame by frame - one way for the left eye, the other for the right. Nothing read
+that, so the same bitmap went to both eyes at the same place and the subtitles sat at
+screen depth for the length of the film, wherever the scene in front of them was. All of
+the depth an author put in was discarded in silence.
+
+The metadata and the sequence a subtitle stream follows are now read; this carries them
+to the overlay. The demuxer already pairs each dependent view access unit with its base
+view partner, so the offsets come out of the dependent one and are stored against the
+base view's timestamp, which is the time the frame they describe will be shown.
+CDVDInputStreamBluray owns the store and the playlist that says which sequence each
+subtitle PID follows, being the one object that outlives both the demuxer and any single
+play item; the player takes a reference to it when the stream opens and remembers the
+sequence of the subtitle it is showing.
+
+Those are the demuxer's timestamps and the ones the player presents are not: ReadPacket()
+takes m_offset_pts off every packet to keep the clock monotonic where a clip restarts its
+timestamps, which on a feature spread over several play items is most of the film. A
+lookup therefore puts it back, or it would find nothing from the first clip change on and
+the subtitles would sit at screen depth for the rest of the film. m_offset_pts is read on
+the render thread for that, so it is atomic.
+
+The render thread asks for the frame it is presenting, through IRenderMsg, because the
+value belongs to a frame rather than to a subtitle - the plane moves while a line of
+dialogue stays on screen. The default implementation answers nothing at all, so only a
+Blu-ray 3D title with a subtitle stream that follows a sequence sees any of this:
+external subtitles, a 2D title and a disc that says nothing all take the same path they
+do today.
+
+Applied where the subtitles.stereoscopicdepth setting already shifts an overlay, and in
+its place rather than beside it. A title placing its own subtitles in depth is answering
+the question that setting exists to answer, and answering it better - frame by frame,
+from what the author put there - so a viewer who has set a depth for the files that carry
+none should not have it added to a disc that does. An offset of 0 from such a title is
+one of its answers, the subtitle belonging at the screen for that frame, rather than an
+absence for the setting to fill. The disc's offset is in the video's own pixels and the
+plane is drawn over the video, so it is scaled by the same ratio the overlay is, and it
+is signed by the eye being drawn either way.
+
+The offsets describe a run of frames from where they were read, so they are dropped
+whenever that ceases to be true: on a seek, when the play item changes, and when the
+playlist is re-read.
+
+Measured on a retail disc: with the disc calling for 7, 8, 9, 10 and 13 pixels at
+various points, each subtitle lands that many pixels from the position its own bitmap
+declares, and moves when the disc says it should.
+
+Hades: adapted to this tree. Here a dependent view access unit that is paired with
+its base view is not always appended (CDVDDemuxBluray3D::Append() lets the second
+view rejoin only at an anchor picture after a picture went on alone), so the offsets
+are read where the pair is offered, before that decision, and not in MergeViews(): the
+depth of the subtitles does not depend on what the decoder gets.
+GetSubtitleOffsetSequence() takes m_playlistInfoLock, under which this tree exchanges
+the playlist, and reads the atomic play item once. UpdatePlaylistInformation() flushes
+the offsets after its early return for a disc whose second view is not read (nothing
+is read, written or locked there for any other disc, and nothing was ever stored). The
+bitmap subtitles that this tree draws with the video (RenderHDROverlays()) are given
+the offset of the frame too.
+---
+ .../DVDDemuxers/DVDDemuxBluray3D.cpp          | 39 ++++++++++++++++
+ .../DVDDemuxers/DVDDemuxBluray3D.h            | 18 ++++++++
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 26 +++++++++++
+ .../DVDInputStreams/DVDInputStreamBluray.h    | 24 ++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 45 +++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h          | 18 +++++++-
+ .../VideoRenderers/OverlayRenderer.cpp        | 25 ++++++++++-
+ .../VideoRenderers/OverlayRenderer.h          | 25 +++++++++++
+ .../VideoRenderers/RenderManager.cpp          |  6 +++
+ .../VideoRenderers/RenderManager.h            | 12 +++++
+ 10 files changed, 236 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+index 26af0e0..12f19bf 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.cpp
+@@ -234,6 +234,7 @@ bool CDVDDemuxBluray3D::OpenDependentView()
+   m_unopenableClip = -1;
+ 
+   CalculatePtsOffset();
++  CalculateFrameDuration();
+ 
+   CLog::Log(LOGINFO,
+             "CDVDDemuxBluray3D - the second view of play item {} is read from clip {:05}, {} ms "
+@@ -284,6 +285,9 @@ void CDVDDemuxBluray3D::CloseDependentView()
+     m_pendingDependent = nullptr;
+   }
+ 
++  // The offsets describe the play item being left behind.
++  m_bluray->GetOffsetMetadata()->Flush();
++
+   {
+     std::unique_lock lock(m_dependentSection);
+     m_dependent.reset();
+@@ -337,6 +341,35 @@ bool CDVDDemuxBluray3D::MarkBaseViewStereoscopic()
+   return true;
+ }
+ 
++void CDVDDemuxBluray3D::CalculateFrameDuration()
++{
++  m_frameDuration = 0.0;
++
++  const auto* stream{
++      dynamic_cast<const CDemuxStreamVideo*>(m_base->GetStream(m_baseVideoStreamId))};
++  if (stream && stream->iFpsRate > 0 && stream->iFpsScale > 0)
++    m_frameDuration = DVD_TIME_BASE * static_cast<double>(stream->iFpsScale) / stream->iFpsRate;
++}
++
++void CDVDDemuxBluray3D::ReadOffsetMetadata(const DemuxPacket& dependent, double pts)
++{
++  if (m_frameDuration <= 0.0 || pts == DVD_NOPTS_VALUE)
++    return;
++
++  KODI::VIDEO::BLURAY::OffsetMetadata metadata;
++  if (!KODI::VIDEO::BLURAY::ParseOffsetMetadata(dependent.pData, dependent.iSize, metadata))
++    return;
++
++  if (!m_loggedOffsetMetadata)
++  {
++    m_loggedOffsetMetadata = true;
++    CLog::Log(LOGDEBUG, "CDVDDemuxBluray3D - dependent view carries plane offsets, {} sequences",
++              metadata.sequences);
++  }
++
++  m_bluray->GetOffsetMetadata()->Add(pts, m_frameDuration, std::move(metadata));
++}
++
+ void CDVDDemuxBluray3D::CalculatePtsOffset()
+ {
+   // Both clips give the same access unit the same timestamp, but each demuxer rebases on
+@@ -465,6 +498,10 @@ DemuxPacket* CDVDDemuxBluray3D::Append(DemuxPacket* base, DemuxPacket* dependent
+     return base;
+   }
+ 
++  // Hades: the plane offsets of the pair, whether or not the second view is appended below
++  // (they place the subtitles, whatever the decoder gets)
++  ReadOffsetMetadata(*dependent, base->pts);
++
+   // Hades: after pictures that went on alone, not before an anchor picture of the second
+   // view, and nothing that is shown before that anchor
+   const bool anchor{KODI::MULTIVIEW::IsAnchorOfSecondView(
+@@ -692,6 +729,7 @@ void CDVDDemuxBluray3D::FlushDependent()
+   }
+ 
+   m_dependentEnded = false;
++  m_bluray->GetOffsetMetadata()->Flush();
+ 
+   if (m_dependent)
+     m_dependent->Flush();
+@@ -725,6 +763,7 @@ void CDVDDemuxBluray3D::PlaceDependent(double targetMs)
+ 
+   m_dependentEnded = false;
+   m_unmergedBase = 0;
++  m_bluray->GetOffsetMetadata()->Flush();
+ 
+   if (!m_dependent)
+     return;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
+index 1f19f99..eeec6aa 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxBluray3D.h
+@@ -117,6 +117,18 @@ private:
+   //! \brief Work out the fixed difference between the two views' timestamps.
+   void CalculatePtsOffset();
+ 
++  //! \brief Note how long a frame lasts, which is what indexes the plane offsets.
++  void CalculateFrameDuration();
++
++  /*!
++   * \brief Keep the plane offsets a dependent view access unit carries, if it has any.
++   *
++   * A "1 plane + offset" title places its subtitles in depth by shifting the plane, and
++   * says by how much once per GOP, in the dependent view. \p pts is the base view's, being
++   * the time the player will present the first of the frames described.
++   */
++  void ReadOffsetMetadata(const DemuxPacket& dependent, double pts);
++
+   //! \brief Read the next access unit of the dependent view, or nullptr at its end.
+   DemuxPacket* ReadDependent();
+ 
+@@ -180,6 +192,12 @@ private:
+   //! or DVD_NOPTS_VALUE. Each placing costs a seek and a re-read, so they are rate limited.
+   double m_lastRealignPts{DVD_NOPTS_VALUE};
+ 
++  //! A frame's worth of presentation time, taken from the base view.
++  double m_frameDuration{0.0};
++
++  //! Whether the title has been said to carry plane offsets, which is said once.
++  bool m_loggedOffsetMetadata{false};
++
+   //! Dependent view packet held back because it is ahead of the base view.
+   DemuxPacket* m_pendingDependent{nullptr};
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index d5420ae..4dfe4d2 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -1287,6 +1287,7 @@ void CDVDInputStreamBluray::UpdatePlaylistInformation()
+     m_playlistInfoValid = false;
+     m_playlistInfo = {};
+   }
++  m_offsetMetadata->Flush();
+   m_playingAngle = bd_get_current_angle(m_bd);
+ 
+   if (m_vfsRoot.empty() || m_playlist > MAX_PLAYLIST_ID)
+@@ -1431,6 +1432,31 @@ bool CDVDInputStreamBluray::IsBaseViewRightEye() const
+   return m_titleInfo && m_titleInfo->mvc_base_view_r_flag != 0;
+ }
+ 
++int CDVDInputStreamBluray::GetSubtitleOffsetSequence(unsigned int pid) const
++{
++  // Hades: the playlist is exchanged under its lock (UpdatePlaylistInformation())
++  std::unique_lock lock(m_playlistInfoLock);
++  if (!m_playlistInfoValid || m_playlistInfo.playItems.empty())
++    return -1;
++
++  const auto& playItems{m_playlistInfo.playItems};
++  const uint32_t item{m_playItem};
++  const auto& playItem{item < playItems.size() ? playItems[item] : playItems.front()};
++
++  for (const auto& stream : playItem.presentationGraphicStreams)
++  {
++    if (stream.packetIdentifier != pid)
++      continue;
++
++    if (stream.offsetSequenceId == XFILE::NO_OFFSET_SEQUENCE)
++      return -1;
++
++    return static_cast<int>(stream.offsetSequenceId);
++  }
++
++  return -1;
++}
++
+ std::shared_ptr<CDVDInputStreamBlurayFile> CDVDInputStreamBluray::OpenClipStream(
+     unsigned int clip, const std::string& codec)
+ {
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index 7e052ca..a877aab 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -10,6 +10,7 @@
+ 
+ #include "BlurayStateSerializer.h"
+ #include "DVDInputStream.h"
++#include "cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h"
+ #include "filesystem/bluray/PlaylistStructure.h"
+ #include "threads/CriticalSection.h"
+ #if defined(HAS_UDFREAD)
+@@ -206,6 +207,24 @@ public:
+    */
+   bool IsBaseViewRightEye() const;
+ 
++  /*!
++   * \brief The plane offsets read out of the dependent view of this title.
++   *
++   * Filled in by the demuxer as the dependent view is read and asked for by the render
++   * thread a moment later, so it is shared rather than owned by either.
++   */
++  const std::shared_ptr<KODI::VIDEO::BLURAY::COffsetMetadataStore>& GetOffsetMetadata() const
++  {
++    return m_offsetMetadata;
++  }
++
++  /*!
++   * \brief The offset sequence a subtitle stream follows, which places it in depth.
++   * \param pid the packet identifier of the subtitle stream
++   * \return the sequence, or -1 when the playlist gives the stream none
++   */
++  int GetSubtitleOffsetSequence(unsigned int pid) const;
++
+   /*!
+    * \brief Open a clip that libbluray is not itself playing.
+    *
+@@ -343,6 +362,11 @@ protected:
+         can be found. */
+     std::atomic<uint32_t> m_playItem{0};
+ 
++    /*! Plane offsets of the GOPs around the current position, as the dependent view gives
++        them. Shared with the player, which reads it as each frame is presented. */
++    std::shared_ptr<KODI::VIDEO::BLURAY::COffsetMetadataStore> m_offsetMetadata{
++        std::make_shared<KODI::VIDEO::BLURAY::COffsetMetadataStore>()};
++
+     /*! Hades: the angle that plays, counted from 0, for a disc whose second view is read. */
+     std::atomic<uint32_t> m_playingAngle{0};
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 2b99cdc..9fb5922 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -76,6 +76,7 @@
+ #include <limits>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <ranges>
+ #include <string_view>
+ #include <utility>
+@@ -983,6 +984,18 @@ bool CVideoPlayer::OpenInputStream()
+     } // end loop over all subtitle files
+   }
+ 
++  // A Blu-ray 3D title says how deep its subtitles sit, once per GOP, in the dependent
++  // view. The input stream owns what the demuxer reads out of it.
++  {
++    std::unique_lock lock(m_offsetMetadataSection);
++    m_offsetMetadata.reset();
++#if defined(HAVE_LIBBLURAY)
++    if (const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream))
++      m_offsetMetadata = bluray->GetOffsetMetadata();
++#endif
++  }
++  m_subtitleOffsetSequence = -1;
++
+   m_clock.Reset();
+   m_dvd.Clear();
+ 
+@@ -4496,6 +4509,8 @@ bool CVideoPlayer::OpenStream(CCurrentStream& current, int64_t demuxerId, int iS
+         hint.colorTransferCharacteristic = m_CurrentVideo.hint.colorTransferCharacteristic;
+       }
+       res = OpenSubtitleStream(hint);
++      if (res)
++        UpdateSubtitleOffsetSequence(stream);
+       break;
+     case StreamType::TELETEXT:
+       res = OpenTeletextStream(hint);
+@@ -4761,6 +4776,36 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+   return true;
+ }
+ 
++void CVideoPlayer::UpdateSubtitleOffsetSequence(const CDemuxStream* stream)
++{
++  int sequence{-1};
++
++#if defined(HAVE_LIBBLURAY)
++  const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream);
++  if (bluray && stream && stream->dvdNavId > 0)
++    sequence = bluray->GetSubtitleOffsetSequence(static_cast<unsigned int>(stream->dvdNavId));
++#endif
++
++  if (sequence != m_subtitleOffsetSequence.exchange(sequence) && sequence >= 0)
++    CLog::Log(LOGDEBUG, "CVideoPlayer::{} - subtitles follow plane offset sequence {}",
++              __FUNCTION__, sequence);
++}
++
++std::optional<int> CVideoPlayer::GetSubtitlePlaneOffset(double pts)
++{
++  const int sequence{m_subtitleOffsetSequence};
++  if (sequence < 0)
++    return std::nullopt;
++
++  std::unique_lock lock(m_offsetMetadataSection);
++  if (!m_offsetMetadata)
++    return std::nullopt;
++
++  // The store is keyed by the demuxer's timestamps and this is a presentation time, which
++  // ReadPacket() has already had m_offset_pts taken off (see UpdateCorrection).
++  return m_offsetMetadata->GetOffset(pts + m_offset_pts, static_cast<unsigned int>(sequence));
++}
++
+ bool CVideoPlayer::OpenSubtitleStream(const CDVDStreamInfo& hint)
+ {
+   IDVDStreamPlayer* player = GetStreamPlayer(m_CurrentSubtitle.player);
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index aa1f65d..37daf3d 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -20,6 +20,7 @@
+ #include "VideoPlayerTeletext.h"
+ #include "cores/IPlayer.h"
+ #include "cores/MenuType.h"
++#include "cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderManager.h"
+ #include "guilib/DispResource.h"
+@@ -408,6 +409,9 @@ public:
+ 
+   void SetUpdateStreamDetails();
+ 
++  //! \brief Note which offset sequence the subtitle stream just opened follows, if any.
++  void UpdateSubtitleOffsetSequence(const CDemuxStream* stream);
++
+ protected:
+   friend class CSelectionStreams;
+ 
+@@ -421,6 +425,7 @@ protected:
+   void UpdateRenderBuffers(int queued, int discard, int free) override;
+   void UpdateGuiRender(bool gui) override;
+   void UpdateVideoRender(bool video) override;
++  std::optional<int> GetSubtitlePlaneOffset(double pts) override;
+ 
+   virtual void CreatePlayers();
+   void DestroyPlayers();
+@@ -631,7 +636,9 @@ protected:
+     }
+   } m_SpeedState;
+ 
+-  double m_offset_pts;
++  /*! What CheckContinuity() has taken off the demuxer's timestamps to keep the player
++      clock monotonic. Read by the render thread (see GetSubtitlePlaneOffset), so atomic. */
++  std::atomic<double> m_offset_pts{0.0};
+ 
+   CDVDMessageQueue m_messenger;
+   std::unique_ptr<CJobQueue> m_outboundEvents;
+@@ -709,4 +716,13 @@ protected:
+   std::atomic<bool> m_displayLost;
+ 
+   double m_messageQueueTimeSize{0.0};
++
++  /*! Blu-ray 3D: the offset sequence the subtitle stream being shown follows, which is
++      what places its plane in depth, or -1 when the title gives it none. */
++  std::atomic<int> m_subtitleOffsetSequence{-1};
++
++  /*! Blu-ray 3D: the plane offsets of the title being played, filled in by the demuxer as
++      the dependent view is read. Asked for by the render thread, so guarded. */
++  std::shared_ptr<KODI::VIDEO::BLURAY::COffsetMetadataStore> m_offsetMetadata;
++  mutable CCriticalSection m_offsetMetadataSection;
+ };
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index f3d63e0..6895930 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -294,11 +294,34 @@ void CRenderer::Render(COverlay* o)
+     }
+   }
+ 
+-  state.x += GetStereoscopicDepth();
++  state.x += SubtitleDepth();
+ 
+   o->Render(state);
+ }
+ 
++float CRenderer::SubtitleDepth() const
++{
++  // The setting is what places a subtitle the title says nothing about - an external file,
++  // a 2D disc, a stream that carries no depth of its own.
++  if (!m_subtitlePlaneOffset)
++    return static_cast<float>(GetStereoscopicDepth());
++
++  if (*m_subtitlePlaneOffset == 0 || m_rs.Width() <= 0.0f)
++    return 0.0f;
++
++  const RenderStereoView view{CServiceBroker::GetWinSystem()->GetGfxContext().GetStereoView()};
++  if (view == RenderStereoView::OFF)
++    return 0.0f;
++
++  // The plane is drawn over the video and the offset is in the video's pixels, so the two
++  // scale alike. Shifting the left eye's copy right and the right eye's left is what puts
++  // the subtitle in front of the screen.
++  const float scale{m_rd.Width() / m_rs.Width()};
++
++  return (view == RenderStereoView::LEFT ? 1.0f : -1.0f) *
++         static_cast<float>(*m_subtitlePlaneOffset) * scale;
++}
++
+ bool CRenderer::HasVisibleOverlay(int idx) const
+ {
+   std::unique_lock lock(m_section);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+index 8977a27..de4d131 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+@@ -19,6 +19,7 @@
+ #include <atomic>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ typedef struct ass_image ASS_Image;
+@@ -111,6 +112,16 @@ namespace OVERLAY {
+     void Notify(const Observable& obs, const ObservableMessage msg) override;
+ 
+     void AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts, int index);
++
++    /*!
++     * \brief Set the shift the disc asks the subtitle plane to carry, in video pixels.
++     *
++     * A Blu-ray 3D title places its subtitles in depth by shifting the plane one way for
++     * the left eye and the other for the right. Set for each frame as it is presented,
++     * since the amount is the title's to vary; nothing where the subtitle being shown
++     * follows no such sequence, which is what leaves the setting in charge.
++     */
++    void SetSubtitlePlaneOffset(std::optional<int> offset) { m_subtitlePlaneOffset = offset; }
+     virtual void Render(int idx, float depth = 0.0f);
+ 
+     // render overlays already in HDR (not sRGB)
+@@ -191,6 +202,16 @@ namespace OVERLAY {
+     };
+ 
+     void Render(COverlay* o);
++
++    /*!
++     * \brief The horizontal shift the current eye's subtitles carry, in screen pixels.
++     *
++     * A title that places its subtitles in depth itself answers for the frame being
++     * presented, in the video's own pixels, so that is scaled the same way the overlay is;
++     * the subtitles.stereoscopicdepth setting answers for everything else. Either way it
++     * is signed by the eye being drawn.
++     */
++    float SubtitleDepth() const;
+     std::shared_ptr<COverlay> Convert(SElement& e);
+     // Build a COverlay (cached or freshly created) from the libass output
+     // already produced by PrepareOverlays. Does not call ass_render_frame.
+@@ -242,6 +263,10 @@ namespace OVERLAY {
+     CRect m_rs; // Source size
+     CRect m_rd; // Video size, may be influenced by video settings (e.g. zoom)
+     std::string m_stereomode;
++
++    //! What the disc asks the subtitle plane to be shifted by, in the video's own pixels,
++    //! or nothing where the title places its subtitles in depth no differently frame to frame.
++    std::optional<int> m_subtitlePlaneOffset;
+     // Current subtitle position
+     int m_subtitlePosition{0};
+     // The calibration line for MANUAL alignment and the frame height otherwise,
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 68139fd..3f85d7c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -714,6 +714,10 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+     CRect src, dst, view;
+     m_pRenderer->GetVideoRect(src, dst, view);
+     m_overlays.SetVideoRect(src, dst, view);
++    // Hades: the bitmap subtitles drawn with the video (RenderHDROverlays()) are placed in depth
++    // as the others are
++    m_overlays.SetSubtitlePlaneOffset(
++        m_playerPort->GetSubtitlePlaneOffset(m_Queue[m_presentsource].pts));
+ #ifdef HAVE_DVBRIDGE
+     // with native Dolby Vision output these overlays go into the DV picture
+     auto* dvWindow =
+@@ -736,6 +740,8 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+     CRect src, dst, view;
+     m_pRenderer->GetVideoRect(src, dst, view);
+     m_overlays.SetVideoRect(src, dst, view);
++    m_overlays.SetSubtitlePlaneOffset(
++        m_playerPort->GetSubtitlePlaneOffset(m_Queue[m_presentsource].pts));
+     m_overlays.Render(m_presentsource);
+ 
+     if (m_renderDebug)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index 235d300..3423abc 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -25,6 +25,7 @@
+ #include <deque>
+ #include <list>
+ #include <memory>
++#include <optional>
+ 
+ #include "PlatformDefs.h"
+ 
+@@ -61,6 +62,17 @@ protected:
+   virtual void UpdateGuiRender(bool gui) = 0;
+   virtual void UpdateVideoRender(bool video) = 0;
+   virtual CVideoSettings GetVideoSettings() const = 0;
++
++  /*!
++   * \brief The shift the disc asks the subtitle plane to carry for the frame at \p pts.
++   *
++   * A Blu-ray 3D title places its subtitles in depth by shifting the plane one way for the
++   * left eye and the other for the right, by an amount it varies as the scene does. The
++   * answer is in the video's own pixels, and 0 is a depth like any other - the subtitle
++   * sitting at the screen for that frame. Anything with no depth of its own answers
++   * nothing, which is what leaves the subtitles.stereoscopicdepth setting in charge.
++   */
++  virtual std::optional<int> GetSubtitlePlaneOffset(double pts) { return std::nullopt; }
+ };
+ 
+ class CRenderManager
+-- 
+2.53.0
+

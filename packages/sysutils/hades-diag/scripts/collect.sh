@@ -389,6 +389,13 @@ snapshot() {
   echo "== system image (toram copies SYSTEM to /dev/SYSTEM)"; grep -E " / |squashfs" /proc/mounts; ls -la /dev/SYSTEM 2>&1; losetup -a 2>&1 | head -5; free -m | head -2
   echo "== machine (as its firmware names it; no serial number is read)"
   for f in sys_vendor product_name board_name bios_version bios_date; do printf '%s: %s\n' $f "$(cat /sys/class/dmi/id/$f 2>/dev/null)"; done
+  # Hades: where the power comes from (a laptop on its charger or its battery); the type, status and charge of each
+  # supply, never its model or serial number
+  echo "== power supplies: type, status (a battery) or online (mains, USB), charge"
+  for p in /sys/class/power_supply/*; do
+    [ -r $p/type ] || continue
+    echo "${p##*/}: type=$(cat $p/type 2>/dev/null) status=$(cat $p/status 2>/dev/null) online=$(cat $p/online 2>/dev/null) capacity=$(cat $p/capacity 2>/dev/null)"
+  done
   echo "== gpus: drm card, pci address, driver, boot_vga, and whether it is awake (a card that sleeps sees no hot-plug)"
   for c in /sys/class/drm/card*; do
     case ${c##*/} in *-*) continue ;; esac

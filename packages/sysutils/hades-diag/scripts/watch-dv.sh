@@ -15,7 +15,9 @@
 # writes completed, ms spent writing, requests in flight, ms busy, flushes and ms flushing of the device that holds
 # /storage (/sys/block/<dev>/stat), and the Kodi threads in uninterruptible sleep (state D) at that moment with
 # the kernel function they wait in (wchan: a vblank wait during Dolby Vision is not storage I/O). Every 10 s it
-# also records the GPU performance state, clocks and load (nvidia-smi, when present).
+# also records the GPU performance state, clocks, load, PCIe link, power and what holds its clocks down
+# (nvidia-smi, when present), and, every 10 s and at once when it changes, where the power comes from: the
+# status of each battery and whether each mains or USB supply is online (power_supply; a laptop on its charger).
 # The same for an AMD GPU (amdgpu: load and current core clock, every 10 s in the timeline), and during
 # Dolby Vision a file gpu-amd.txt with five readings a second apart of its load, clocks, temperature, power
 # and power policy. With the NVIDIA driver loaded, the capture during Dolby Vision starts with one query of
@@ -35,7 +37,23 @@ if [ -e "/sys/block/$part" ]; then blk=$part; else blk=$(basename "$(readlink -f
 st=/sys/block/$blk/stat
 L=/run/hades-io.log
 [ -r "$st" ] || exit 0
-echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%] [amd=load%,coreMHz] (device $blk)" > $L
+echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%,pcie_gen,pcie_width,W,clock_event_reasons] [amd=load%,coreMHz] [pwr=supply:status,...] (device $blk)" > $L
+# Where the power comes from: each battery's status (Charging, Discharging, Full, Not_charging) and each mains or
+# USB supply's online (1 or 0), as "BAT0:Charging,ADP1:1"; empty without any (a desktop)
+pwr() {
+  s=""
+  for p in /sys/class/power_supply/*; do
+    [ -r "$p/type" ] || continue
+    case "$(cat "$p/type" 2>/dev/null)" in
+      Battery) v=$(cat "$p/status" 2>/dev/null | tr ' ' '_') ;;
+      Mains | USB*) v=$(cat "$p/online" 2>/dev/null) ;;
+      *) continue ;;
+    esac
+    s="$s${s:+,}${p##*/}:${v:-?}"
+  done
+  echo "$s"
+}
+lastw=""
 t=0
 while [ $t -lt 14400 ]; do
   p=$(pidof kodi.bin)
@@ -48,8 +66,13 @@ while [ $t -lt 14400 ]; do
   fi
   g=""
   if [ $((t % 10)) -eq 0 ] && command -v nvidia-smi >/dev/null; then
-    g=" gpu=$(nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,utilization.gpu,utilization.decoder --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)"
+    g=" gpu=$(nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,utilization.gpu,utilization.decoder,pcie.link.gen.current,pcie.link.width.current,power.draw,clocks_event_reasons.active --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)"
   fi
+  w=$(pwr)
+  if [ -n "$w" ] && { [ "$w" != "$lastw" ] || [ $((t % 10)) -eq 0 ]; }; then
+    g="$g pwr=$w"
+  fi
+  lastw=$w
   if [ $((t % 10)) -eq 0 ]; then
     for c in /sys/class/drm/card[0-9]; do
       [ -r $c/device/gpu_busy_percent ] || continue

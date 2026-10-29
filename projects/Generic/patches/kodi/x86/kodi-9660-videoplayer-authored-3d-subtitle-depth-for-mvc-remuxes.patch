@@ -1,0 +1,387 @@
+From abe71efb9bd148e9761feb95a443e99fd2944a87 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 20:10:53 +0200
+Subject: [PATCH] VideoPlayer: authored 3D subtitle depth for MVC remuxes
+
+The plane offset metadata a 3D Blu-ray authors for its subtitles
+travels in the SEI of the MVC dependent view, so an MKV remux of the
+disc carries it too; only the playlist's STN-SS table, which says
+which offset sequence each PG stream follows, is lost with the disc
+structure. Read the metadata on the ffmpeg demuxer side as well:
+
+- ParseOffsetMetadataAvcc() walks the length-prefixed (ISO 14496-15)
+  access units a remux carries, beside the Annex-B parser.
+- CDVDDemuxFFmpeg owns a COffsetMetadataStore for an H.264 stream it
+  has detected as multiview, feeds it from each dependent-view access
+  unit with the packet pts and 1/fps, flushes it with the demuxer and
+  clears it with the streams. A one-shot log says whether offsets were
+  found or, after 120 access units, that there are none.
+- CVideoPlayer takes the demuxer's store when the input is not a
+  Blu-ray, and maps PG stream n to offset sequence n, which is how
+  MakeMKV keeps the disc's order: measured on Hugo and Coraline.
+  Only the main demuxer's PGS streams count, so an external subtitle
+  file or a muxed-in text track cannot shift the numbering.
+
+Tested with MakeMKV remuxes on a Radeon RX 7600 driving a JVC
+DLA-RS4100 in frame packing: the Hugo remux reports 32 sequences and
+its subtitles move shot by shot exactly as from the ISO of the same
+disc; a title without dependent-view offsets is unaffected.
+
+Hades: adapted to this tree, which tells an MVC track of a Matroska file by its own
+rule (KODI::MULTIVIEW::TwoViews() in AddStream(): the private data names a second
+view, the videoplayer.hades3dmvc setting allows it, the h264_mvc decoder is built and
+the container names no other layout). The store is configured there, for a track that
+is to be decoded as two views and for no other: a remux whose base view plays alone,
+as with no 3D display, has no store and takes the path it took before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../DVDDemuxers/BlurayOffsetMetadata.cpp      | 31 ++++++++
+ .../DVDDemuxers/BlurayOffsetMetadata.h        | 11 +++
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 77 +++++++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  | 25 ++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 54 +++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h          |  1 +
+ 6 files changed, 199 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp
+index e56b5d1..0556633 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp
+@@ -162,6 +162,37 @@ bool ParseOffsetMetadata(const uint8_t* data, size_t size, OffsetMetadata& metad
+   return false;
+ }
+ 
++bool ParseOffsetMetadataAvcc(const uint8_t* data,
++                             size_t size,
++                             unsigned int nalLengthSize,
++                             OffsetMetadata& metadata)
++{
++  if (!data || nalLengthSize < 1 || nalLengthSize > 4)
++    return false;
++
++  size_t i{0};
++  while (i + nalLengthSize <= size)
++  {
++    size_t length{0};
++    for (unsigned int b = 0; b < nalLengthSize; ++b)
++      length = (length << 8) | data[i + b];
++    i += nalLengthSize;
++
++    if (length == 0 || length > size - i)
++      return false;
++
++    if ((data[i] & NAL_TYPE_MASK) == NAL_TYPE_SEI && length <= MAX_SEI_SIZE)
++    {
++      if (ParseSei(Unescape(data + i + 1, length - 1), metadata))
++        return true;
++    }
++
++    i += length;
++  }
++
++  return false;
++}
++
+ void COffsetMetadataStore::Add(double startPts, double frameDuration, OffsetMetadata&& metadata)
+ {
+   if (frameDuration <= 0.0)
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h b/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h
+index 474d958..27b62f0 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.h
+@@ -54,6 +54,17 @@ struct OffsetMetadata
+  */
+ bool ParseOffsetMetadata(const uint8_t* data, size_t size, OffsetMetadata& metadata);
+ 
++/*!
++ * \brief The same for an access unit whose NAL units are length-prefixed (ISO 14496-15
++ *        avcC), as a matroska or mp4 remux of an MVC disc carries them.
++ *
++ * \param nalLengthSize the size of the length field in bytes, from the avcC box
++ */
++bool ParseOffsetMetadataAvcc(const uint8_t* data,
++                             size_t size,
++                             unsigned int nalLengthSize,
++                             OffsetMetadata& metadata);
++
+ /*!
+  * \brief The offset metadata of the GOPs around the current position.
+  *
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 7b00fb7..6645516 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -838,6 +838,9 @@ void CDVDDemuxFFmpeg::Flush()
+   m_displayTime = 0;
+   m_dtsAtDisplayTime = DVD_NOPTS_VALUE;
+   m_seekToKeyFrame = false;
++
++  if (m_offsetMetadata)
++    m_offsetMetadata->Flush();
+ }
+ 
+ void CDVDDemuxFFmpeg::Abort()
+@@ -1851,6 +1854,13 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+       return pPacket;
+     }
+ 
++    // Both sides of this test are ffmpeg stream indices: it has to run before iStreamId is
++    // rewritten to the Kodi uniqueId below. Not on a seek probe (keep), which hands the
++    // same access unit out again through Read().
++    if (!keep && m_offsetMetadata && pPacket->iStreamId == m_offsetStreamIndex &&
++        pPacket->pts != DVD_NOPTS_VALUE)
++      ReadOffsetMetadata(*pPacket);
++
+     pPacket->iStreamId = stream->uniqueId;
+     pPacket->demuxerId = GetDemuxerId();
+   }
+@@ -2396,6 +2406,7 @@ void CDVDDemuxFFmpeg::DisposeStreams()
+     delete it->second;
+   m_streams.clear();
+   m_parsers.clear();
++  ResetOffsetMetadata();
+ }
+ 
+ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+@@ -2664,6 +2675,7 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+             st->multiview = true;
+             st->multiviewBaseRight = *baseEye == KODI::MULTIVIEW::BaseEye::RIGHT;
+             st->stereo_mode = KODI::MULTIVIEW::PACKED_STEREO_MODE;
++            ConfigureOffsetMetadata(pStream, st);
+             CLog::Log(LOGINFO,
+                       "CDVDDemuxFFmpeg::AddStream - stream {}: H.264 with a second view (MVC); "
+                       "both views are to be decoded, the base view as the {} eye (the container "
+@@ -3206,6 +3218,71 @@ unsigned int CDVDDemuxFFmpeg::HLSSelectProgram()
+   return prog;
+ }
+ 
++void CDVDDemuxFFmpeg::ConfigureOffsetMetadata(const AVStream* pStream,
++                                              const CDemuxStreamVideo* stream)
++{
++  ResetOffsetMetadata();
++
++  // ISO 14496-15 avcC: the low two bits of byte 4 hold lengthSizeMinusOne
++  const uint8_t* extradata = pStream->codecpar->extradata;
++  if (!extradata || pStream->codecpar->extradata_size < 5 || extradata[0] != 1)
++    return;
++  if (stream->iFpsRate <= 0 || stream->iFpsScale <= 0)
++    return;
++
++  if (!m_offsetMetadata)
++    m_offsetMetadata = std::make_shared<KODI::VIDEO::BLURAY::COffsetMetadataStore>();
++  m_offsetStreamIndex = pStream->index;
++  m_offsetNalLengthSize = (extradata[4] & 0x03) + 1;
++  m_offsetFrameDuration = DVD_TIME_BASE * static_cast<double>(stream->iFpsScale) / stream->iFpsRate;
++}
++
++void CDVDDemuxFFmpeg::ReadOffsetMetadata(const DemuxPacket& packet)
++{
++  // Enough access units to cover a couple of GOPs before concluding the stream has none
++  constexpr unsigned int ACCESS_UNITS_BEFORE_GIVING_UP{120};
++
++  KODI::VIDEO::BLURAY::OffsetMetadata metadata;
++  if (!KODI::VIDEO::BLURAY::ParseOffsetMetadataAvcc(packet.pData, packet.iSize,
++                                                    m_offsetNalLengthSize, metadata))
++  {
++    if (!m_loggedOffsetMetadata && !m_loggedOffsetMetadataMissing &&
++        ++m_offsetAccessUnitsWithout == ACCESS_UNITS_BEFORE_GIVING_UP)
++    {
++      m_loggedOffsetMetadataMissing = true;
++      CLog::Log(LOGDEBUG,
++                "CDVDDemuxFFmpeg - expected plane offsets in the MVC dependent view, found none "
++                "in {} access units",
++                m_offsetAccessUnitsWithout);
++    }
++    return;
++  }
++
++  m_offsetAccessUnitsWithout = 0;
++  if (!m_loggedOffsetMetadata)
++  {
++    m_loggedOffsetMetadata = true;
++    CLog::Log(LOGDEBUG,
++              "CDVDDemuxFFmpeg - the MVC dependent view carries plane offsets, {} sequences",
++              metadata.sequences);
++  }
++
++  m_offsetMetadata->Add(packet.pts, m_offsetFrameDuration, std::move(metadata));
++}
++
++void CDVDDemuxFFmpeg::ResetOffsetMetadata()
++{
++  // Keep the store itself: CVideoPlayer holds a reference to it across a stream rebuild
++  if (m_offsetMetadata)
++    m_offsetMetadata->Flush();
++  m_offsetStreamIndex = -1;
++  m_offsetNalLengthSize = 0;
++  m_offsetFrameDuration = 0.0;
++  m_offsetAccessUnitsWithout = 0;
++  m_loggedOffsetMetadata = false;
++  m_loggedOffsetMetadataMissing = false;
++}
++
+ std::string CDVDDemuxFFmpeg::GetStereoModeFromMetadata(AVDictionary* pMetadata)
+ {
+   std::string stereoMode;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 838f19d..3d39a9a 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "BlurayOffsetMetadata.h"
+ #include "DVDDemux.h"
+ #ifdef HAVE_DVBRIDGE
+ #include "DVLayerMerge.h"
+@@ -119,6 +120,17 @@ public:
+ 
+   bool Aborted();
+ 
++  /*!
++   * \brief The plane offset metadata an H.264 MVC stream carries in its dependent view,
++   *        for placing subtitles in depth. Null until such a stream has been added; the
++   *        store then lives as long as the demuxer, so a holder keeps receiving updates
++   *        across a stream rebuild.
++   */
++  const std::shared_ptr<KODI::VIDEO::BLURAY::COffsetMetadataStore>& GetOffsetMetadata() const
++  {
++    return m_offsetMetadata;
++  }
++
+   AVFormatContext* m_pFormatContext;
+   std::shared_ptr<CDVDInputStream> m_pInput;
+ 
+@@ -145,6 +157,9 @@ protected:
+   unsigned int HLSSelectProgram();
+ 
+   std::string GetStereoModeFromMetadata(AVDictionary* pMetadata);
++  void ConfigureOffsetMetadata(const AVStream* pStream, const CDemuxStreamVideo* stream);
++  void ReadOffsetMetadata(const DemuxPacket& packet);
++  void ResetOffsetMetadata();
+   std::string ConvertCodecToInternalStereoMode(const std::string& mode, const StereoModeConversionMap* conversionMap);
+ 
+   void GetL16Parameters(int& channels, int& samplerate);
+@@ -169,6 +184,16 @@ protected:
+   unsigned int m_initialProgramNumber;
+   int m_seekStream;
+ 
++  // An MVC remux carries the disc's plane offsets in the dependent view's SEI, inside
++  // the same length-prefixed access units as the base view
++  std::shared_ptr<KODI::VIDEO::BLURAY::COffsetMetadataStore> m_offsetMetadata;
++  int m_offsetStreamIndex{-1};
++  unsigned int m_offsetNalLengthSize{0};
++  double m_offsetFrameDuration{0.0};
++  unsigned int m_offsetAccessUnitsWithout{0};
++  bool m_loggedOffsetMetadata{false};
++  bool m_loggedOffsetMetadataMissing{false};
++
+   XbmcThreads::EndTime<> m_timeout;
+ 
+   // Due to limitations of ffmpeg, we only can detect a program change
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 9fb5922..c0c4fe0 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -1030,6 +1030,16 @@ bool CVideoPlayer::OpenDemuxStream()
+     return false;
+   }
+ 
++  // A matroska remux of a 3D disc carries the same plane offsets in its dependent view.
++  // The Blu-ray input stream's store wins when there is one; otherwise the demuxer's is
++  // the one to read
++  if (!IsBlurayInput())
++  {
++    std::unique_lock lock(m_offsetMetadataSection);
++    if (const auto* ffmpeg = dynamic_cast<CDVDDemuxFFmpeg*>(m_pDemuxer.get()))
++      m_offsetMetadata = ffmpeg->GetOffsetMetadata();
++  }
++
+   m_SelectionStreams.Clear(StreamType::NONE, STREAM_SOURCE_DEMUX);
+   m_SelectionStreams.Clear(StreamType::NONE, STREAM_SOURCE_NAV);
+   m_SelectionStreams.Update(m_pInputStream, m_pDemuxer.get());
+@@ -1060,6 +1070,14 @@ bool CVideoPlayer::OpenDemuxStream()
+ 
+ void CVideoPlayer::CloseDemuxer()
+ {
++  // the demuxer owns the remux offset store; the Blu-ray one outlives the demuxer
++  if (!IsBlurayInput())
++  {
++    std::unique_lock lock(m_offsetMetadataSection);
++    m_offsetMetadata.reset();
++    m_subtitleOffsetSequence = -1;
++  }
++
+   m_pDemuxer.reset();
+   m_SelectionStreams.Clear(StreamType::NONE, STREAM_SOURCE_DEMUX);
+ 
+@@ -4776,16 +4794,52 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+   return true;
+ }
+ 
++bool CVideoPlayer::IsBlurayInput() const
++{
++#if defined(HAVE_LIBBLURAY)
++  return std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream) != nullptr;
++#else
++  return false;
++#endif
++}
++
+ void CVideoPlayer::UpdateSubtitleOffsetSequence(const CDemuxStream* stream)
+ {
+   int sequence{-1};
++  bool isBluray{false};
+ 
+ #if defined(HAVE_LIBBLURAY)
+   const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream);
++  isBluray = bluray != nullptr;
+   if (bluray && stream && stream->dvdNavId > 0)
+     sequence = bluray->GetSubtitleOffsetSequence(static_cast<unsigned int>(stream->dvdNavId));
+ #endif
+ 
++  // A remux has no playlist to say which sequence a PG stream follows, but it keeps the
++  // disc's stream order, and on the discs measured PG stream n follows sequence n. Only
++  // the main demuxer's PG streams count: an external subtitle file comes from another
++  // demuxer, and a muxed-in text track would shift the numbering
++  if (!isBluray && stream && m_pDemuxer && stream->codec == AV_CODEC_ID_HDMV_PGS_SUBTITLE &&
++      stream->demuxerId == m_pDemuxer->GetDemuxerId())
++  {
++    std::unique_lock lock(m_offsetMetadataSection);
++    if (m_offsetMetadata)
++    {
++      int index{0};
++      for (const CDemuxStream* candidate : m_pDemuxer->GetStreams())
++      {
++        if (candidate->codec != AV_CODEC_ID_HDMV_PGS_SUBTITLE)
++          continue;
++        if (candidate->uniqueId == stream->uniqueId)
++        {
++          sequence = index;
++          break;
++        }
++        ++index;
++      }
++    }
++  }
++
+   if (sequence != m_subtitleOffsetSequence.exchange(sequence) && sequence >= 0)
+     CLog::Log(LOGDEBUG, "CVideoPlayer::{} - subtitles follow plane offset sequence {}",
+               __FUNCTION__, sequence);
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 37daf3d..ca8d20a 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -413,6 +413,7 @@ public:
+   void UpdateSubtitleOffsetSequence(const CDemuxStream* stream);
+ 
+ protected:
++  bool IsBlurayInput() const;
+   friend class CSelectionStreams;
+ 
+   void OnStartup() override;
+-- 
+2.53.0
+

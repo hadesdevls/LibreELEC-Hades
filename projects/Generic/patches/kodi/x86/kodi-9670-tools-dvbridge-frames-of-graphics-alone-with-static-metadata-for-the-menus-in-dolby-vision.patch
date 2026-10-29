@@ -1,0 +1,400 @@
+From 138c5216773b9375a9fb20b3de2ddc98966d9002 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 20:49:33 +0000
+Subject: [PATCH] tools/dvbridge: frames of graphics alone, with static
+ metadata, for the menus in Dolby Vision
+
+A frame of the menus sent in the Dolby Vision tunnel while no video plays has no picture to compose:
+it is Kodi's GUI, made PQ in BT.2020 by the same LUTs that compose it over an HDR video, over black.
+dvbridge_render_graphics() prepares such a frame: the full-precision transport picture is cleared to
+black (and to the alpha of a pixel that nothing is drawn over) for the window system to composite the
+GUI into, as it composites it over a picture, and the candidate is made over the whole raster in the
+converted transport (BT.2020 YCbCr in limited range at 12 bits), which then packs it. Nothing of the
+renderer's composition of pictures is touched: a picture prepared after it clears the texture again.
+
+dvbridge_graphics.c makes the metadata of such a frame, those of a static SDR picture made PQ, and
+nothing measured (ETSI GS CCM 001 V1.1.1, 6.2): the header of the converted transport; the source
+display of the GUI (its white, at least the 2081 that dovi_tool keeps as the floor of a maximum of
+content mapping v2.9, and its black as code 7, as dovi_tool and dvbridge_profile81_metadata() write a
+mastering display of at most 0.001 cd/m2); one level 1 block that is what CCM 001 6.2.2 infers for a
+frame without one (the source range and its midpoint, the average kept within dovi_tool's 819 to
+max - 1); the level 5 block of the whole raster; no trims, no level 4, no content mapping v4.0. The
+same bytes for every frame of the same white, so that the TV maps the menus the same way whatever
+they show. CDVBridgeGLES::PrepareGraphics() keeps them for the white in use and gives the frames
+times a millisecond apart, so that they follow on as one scene with one metadata id.
+
+Checked on the host: the payload as the serializer writes it, field by field against the tables of
+CCM 001 and dovi_tool's constants computed on their own, for every white of the setting; and the first
+video frames after frames of the menus carry the same display-management payload as without them
+(only the metadata id goes on). On a software OpenGL ES (zink on lavapipe) with Kodi's own GUI
+composite shader and LUTs: every pixel that the GUI does not cover is the transport's black, the
+metadata bits in the chroma are the candidate's packets, and the codes of known GUI colours are those
+of a model of the pipeline within 2 codes. The render test of 1.0 RC4 draws its 156 pictures with the
+same bytes before and after this change.
+---
+ tools/dvbridge/CMakeLists.txt                 |  2 +-
+ tools/dvbridge/dvbridge_graphics.c            | 85 +++++++++++++++++++
+ tools/dvbridge/dvbridge_graphics.h            | 61 +++++++++++++
+ tools/dvbridge/dvbridge_render.c              | 41 +++++++++
+ tools/dvbridge/dvbridge_render.h              | 11 +++
+ .../VideoRenderers/DVBridgeGLES.cpp           | 40 +++++++++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h | 19 +++++
+ 7 files changed, 258 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_graphics.c
+ create mode 100644 tools/dvbridge/dvbridge_graphics.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 31040b9..7d81c14 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -16,7 +16,7 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_cache.c dvbridge_verify.c
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+                                 dvbridge_measure.c dvbridge_measured.c
+-                                dvbridge_dvplus.c dvbridge_dvplus_gl.c)
++                                dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_graphics.c b/tools/dvbridge/dvbridge_graphics.c
+new file mode 100644
+index 0000000..f5bce2d
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_graphics.c
+@@ -0,0 +1,85 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-3.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#include "dvbridge_graphics.h"
++
++#include "dvbridge_hdr10plus.h"
++
++#include <libavutil/mastering_display_metadata.h>
++#include <libavutil/mem.h>
++#include <math.h>
++
++/* SMPTE ST 2084, as dvbridge_hdr10plus.c has it */
++#define PQ_M1 (2610.0 / 16384)
++#define PQ_M2 (2523.0 / 4096 * 128)
++#define PQ_C1 (3424.0 / 4096)
++#define PQ_C2 (2413.0 / 4096 * 32)
++#define PQ_C3 (2392.0 / 4096 * 32)
++
++static double pq_from_linear(double y)
++{
++    y = y < 0 ? 0 : y > 1 ? 1 : y;
++    const double p = pow(y, PQ_M1);
++    return pow((PQ_C1 + PQ_C2 * p) / (1 + PQ_C3 * p), PQ_M2);
++}
++
++static unsigned code12(double e)
++{
++    const double c = floor(e * 4095 + 0.5);
++    return c < 0 ? 0 : c > 4095 ? 4095 : (unsigned)c;
++}
++
++/* dovi_tool, dolby_vision/src/rpu/extension_metadata/blocks/level1.rs: L1_MAX_PQ_MIN_VALUE (100 cd/m2) and
++ * L1_AVG_PQ_MIN_VALUE (content mapping v2.9) */
++#define GRAPHICS_MAX_FLOOR 2081u
++#define GRAPHICS_AVG_FLOOR 819u
++/* a black of at most 0.001 cd/m2, as dovi_tool and dvbridge_profile81_metadata() write it */
++#define GRAPHICS_BLACK 7u
++
++bool dvbridge_graphics_range_of(double white_nits, struct dvbridge_graphics_range *range)
++{
++    if (!range || !isfinite(white_nits) || white_nits < DVBRIDGE_GRAPHICS_WHITE_MIN - 1e-9 ||
++        white_nits > DVBRIDGE_GRAPHICS_WHITE_MAX + 1e-9)
++        return false;
++    range->white = code12(pq_from_linear(white_nits / 10000));
++    range->source_min = GRAPHICS_BLACK;
++    range->source_max = range->white > GRAPHICS_MAX_FLOOR ? range->white : GRAPHICS_MAX_FLOOR;
++    /* CCM 001 6.2.2: what a missing level 1 block is inferred to be, from the source display */
++    range->min = range->source_min;
++    range->max = range->source_max;
++    range->avg = (range->source_min + range->source_max) / 2;
++    if (range->avg < GRAPHICS_AVG_FLOOR)
++        range->avg = GRAPHICS_AVG_FLOOR;
++    if (range->avg > range->max - 1)
++        range->avg = range->max - 1;
++    return true;
++}
++
++AVDOVIMetadata *dvbridge_graphics_metadata(double white_nits, bool scene_refresh, size_t *size)
++{
++    struct dvbridge_graphics_range range;
++    if (!size || !dvbridge_graphics_range_of(white_nits, &range))
++        return NULL;
++    /* the source display as dvbridge_profile81_metadata() takes it: its white in cd/m2 is the one whose PQ code
++     * source_max is (the GUI's white, or 100 cd/m2), its black 0 (written as code 7) */
++    const double source_white = range.source_max == range.white ? white_nits : 100.0;
++    AVMasteringDisplayMetadata mastering = {0};
++    mastering.has_luminance = 1;
++    mastering.min_luminance = (AVRational){0, 10000};
++    mastering.max_luminance = (AVRational){(int)floor(source_white * 10000 + 0.5), 10000};
++    AVDOVIMetadata *m = dvbridge_profile81_metadata(range.min, range.max, range.avg, NULL, &mastering, NULL,
++                                                    scene_refresh, size);
++    if (!m)
++        return NULL;
++    /* (dvbridge_profile81_metadata() writes the code of that white again: the same, as the tests check) */
++    if (av_dovi_get_color(m)->source_max_pq != range.source_max ||
++        av_dovi_get_color(m)->source_min_pq != range.source_min) {
++        av_free(m);
++        return NULL;
++    }
++    return m;
++}
+diff --git a/tools/dvbridge/dvbridge_graphics.h b/tools/dvbridge/dvbridge_graphics.h
+new file mode 100644
+index 0000000..5f5d2cf
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_graphics.h
+@@ -0,0 +1,61 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-3.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_GRAPHICS_H
++#define DVBRIDGE_GRAPHICS_H
++/* Hades: the Dolby Vision metadata of a frame of graphics alone, without a picture: Kodi's menus sent in the
++ * Dolby Vision transport while no video plays (videoscreen.hadesdvmenus). The frame is the GUI, an SDR picture
++ * (sRGB, BT.709) made PQ in BT.2020 with its white at white_nits, as Kodi composes its GUI over HDR video (the
++ * same LUTs, GuiCompositeShaderGLES), over black. It goes out in the converted transport (BT.2020 YCbCr, limited
++ * range, 12 bits: dvbridge_dv_metadata() with source false), with metadata that describe that static picture and
++ * nothing else (ETSI GS CCM 001 V1.1.1, 6.2):
++ *  - the colour of the header: that of the converted transport, written by the serializer (BT.2020 YCbCr in
++ *    limited range at 12 bits, PQ, the RGB to LMS of BT.2020): the representation the frame is packed in;
++ *  - the source display (source_min_PQ, source_max_PQ; ST 2086 in 6.2.2): the display the GUI is made for. Its
++ *    white is the GUI's white, at least 100 cd/m2 (L1_MAX_PQ_MIN_VALUE of dovi_tool for content mapping v2.9,
++ *    PQ code 2081: SDR's reference white); its black is that of the GUI, 0 cd/m2, written as dovi_tool and
++ *    dvbridge_profile81_metadata() write a black of at most 0.001 cd/m2: code 7;
++ *  - one level 1 block: CCM 001 6.2.2 infers a missing one from the source display (min_PQ = source_min_PQ,
++ *    max_PQ = source_max_PQ, avg_PQ = (source_min_PQ + source_max_PQ) / 2). The serializer needs one, and that is
++ *    what is written: the range the GUI can take, and nothing measured. The average is then kept within what
++ *    dovi_tool keeps a level 1 block of content mapping v2.9 within (819 to max - 1);
++ *  - the level 5 block of the whole raster, which the serializer makes (offsets 0);
++ *  - no trims (level 2), no level 4, no content mapping v4.0 blocks: the GUI has no grade for a target display.
++ * The same bytes for every frame of the same white: the display maps the menus the same way whatever they show.
++ * Level 6 (the static metadata, which the tunnel does not carry) has the source display and no MaxCLL/MaxFALL. */
++#include <stdbool.h>
++#include <stddef.h>
++
++#include <libavutil/dovi_meta.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The whites the GUI can have: hadesguiwhite from 25 to 300 % of 203 cd/m2 */
++#define DVBRIDGE_GRAPHICS_WHITE_MIN 50.75
++#define DVBRIDGE_GRAPHICS_WHITE_MAX 609.0
++
++/* What dvbridge_graphics_metadata() writes, as 12-bit PQ codes (code12(), as the rest of the bridge: x 4095) */
++struct dvbridge_graphics_range {
++    unsigned source_min, source_max;
++    unsigned min, max, avg; /* the level 1 block */
++    unsigned white;         /* PQ code of the GUI's white itself */
++};
++
++/* false for a white outside [DVBRIDGE_GRAPHICS_WHITE_MIN, DVBRIDGE_GRAPHICS_WHITE_MAX] (or not finite) */
++bool dvbridge_graphics_range_of(double white_nits, struct dvbridge_graphics_range *range);
++
++/* The metadata (av_free() them; *size their bytes), a profile 8.1 RPU as dvbridge_profile81_metadata() makes it
++ * (an identity mapping, which nothing composes: the frame is drawn by the caller), with scene_refresh_flag as
++ * given: 1 for the first frame of graphics with these metadata. NULL where dvbridge_graphics_range_of() is false. */
++AVDOVIMetadata *dvbridge_graphics_metadata(double white_nits, bool scene_refresh, size_t *size);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 23f9a73..d73bff1 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -2469,6 +2469,47 @@ bool dvbridge_render_pack(struct dvbridge_renderer *r, struct dvbridge_gl_packer
+     return width == 3840 && height == 2160 && source_pack(r, rgb, framebuffer, flip);
+ }
+ 
++bool dvbridge_render_graphics(struct dvbridge_renderer *r, const void *metadata, size_t bytes, double pts)
++{
++    if (!r)
++        return false;
++    /* as render() begins: nothing of the frame before is left */
++    r->ready = false;
++    r->refused = NULL;
++    r->early_mask = false;
++    r->residual_omitted = false;
++    r->residual_drawn = false;
++    r->packed = false;
++    r->gui_drawn = 0;
++    dvbridge_candidate_destroy(r->pending);
++    r->pending = NULL;
++    dvbridge_source_forget(r->source_packer);
++    r->source = false;
++    r->scaled_source = false;
++    r->source_why = NULL;
++    r->composed = DVBRIDGE_COMPOSED_NONE;
++    r->base_refused = DVBRIDGE_BASE_PQ;
++    if (!r->rgb || r->low_latency || !metadata || !bytes || !isfinite(pts))
++        return false;
++    const struct dvbridge_geometry whole = {.source_width = 3840, .source_height = 2160,
++                                            .width = 3840, .height = 2160};
++    r->geometry = whole;
++    r->pending = dvbridge_prepare_why(r->serializer ? r->serializer : r->context, metadata, bytes, pts,
++                                      whole, false, false, &r->refused);
++    if (!r->pending)
++        return false;
++    dvbridge_gl_drain_errors();
++    struct dvbridge_gl_state state;
++    save_gl_state(&state);
++    /* (alpha 2: nothing drawn over the pixel, as render() clears it: PICTURE_ALPHA) */
++    pl_tex_clear(r->gpu, r->rgb, (float[4]){0, 0, 0, 2});
++    restore_gl_state(&state);
++    /* (the GUI is drawn into it next: a picture after it clears it again, dvbridge_render_texture_drawn()) */
++    r->rgb_clean = false;
++    r->ready = true;
++    return true;
++}
++
+ bool dvbridge_render_set_low_latency(struct dvbridge_renderer *r,
+                                      const struct dvbridge_hdr10_mapping *mapping)
+ {
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 7492e7a..0cecabe 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -487,6 +487,17 @@ bool dvbridge_render_source_scales(const struct dvbridge_renderer *renderer,
+ struct dvbridge_gl_packer;
+ bool dvbridge_render_pack(struct dvbridge_renderer *renderer, struct dvbridge_gl_packer *packer,
+                           unsigned framebuffer, int width, int height, bool flip_y, int cover);
++/* Hades: a frame of graphics alone, without a picture (Kodi's menus in Dolby Vision, videoscreen.hadesdvmenus):
++ * nothing is composed. The transport picture is made black (PQ 0, and the alpha of a pixel that nothing is drawn
++ * over) for the caller to draw the GUI into (dvbridge_render_texture()), and the frame is made with metadata,
++ * dvbridge_graphics_metadata()'s, over the whole raster, in the converted transport (BT.2020 YCbCr): then
++ * dvbridge_render_pack(), and dvbridge_render_commit() once it is shown, as for a picture. pts: its time in the
++ * units of the pictures' (a frame that follows on from the one before keeps the scene). Not with Low-Latency,
++ * which sends no metadata and a picture mapped to the display. false: nothing is prepared (why, where the
++ * metadata could not be made: dvbridge_render_refused()). The GL state is put back. */
++#define DVBRIDGE_RENDER_GRAPHICS 1
++bool dvbridge_render_graphics(struct dvbridge_renderer *renderer, const void *metadata, size_t bytes,
++                              double pts);
+ /* Hades: the GPU time of each pass that draws the frames, to measure on a GPU what each part of a
+  * frame costs. libplacebo's passes are timed by its own timer queries, read through the info callback
+  * of every render; it has them on OpenGL ES only where the pl_opengl was made with
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index d1f8f33..eae9c05 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -28,6 +28,7 @@ extern "C"
+ #include <libavutil/dovi_meta.h>
+ #include "dvbridge_cache.h"
+ #include "dvbridge_eos.h"
++#include "dvbridge_graphics.h"
+ #include "dvbridge_hdr10plus.h"
+ #include "dvbridge_placebo.h"
+ #include <libavutil/mem.h>
+@@ -273,6 +274,7 @@ CDVBridgeGLES::~CDVBridgeGLES()
+   dvbridge_gl_copier_destroy(m_copier);
+   dvbridge_gl_eos_destroy(m_eos);
+   dvbridge_renderer_destroy(m_renderer);
++  av_free(m_graphics);
+   if (m_gl)
+     pl_tex_destroy(m_gl->gpu, &m_scanout);
+   pl_opengl_destroy(&m_gl);
+@@ -1264,6 +1266,44 @@ void CDVBridgeGLES::StartSignalPresented(bool presented)
+   m_direct = false;
+ }
+ 
++bool CDVBridgeGLES::PrepareGraphics(int whitePercent, bool newScene)
++{
++  m_prepared = m_packed = false;
++  m_direct = false;
++  m_pendingInfo = 0;
++  m_pendingDetail = {};
++  if (!m_renderer || m_lowLatencyOn)
++    return Fail("graphics-unavailable");
++  // the metadata of this white (dvbridge_graphics_metadata()), made again only when it changes; the first frame
++  // of a white starts a scene
++  if (!m_graphics || m_graphicsWhite != whitePercent || m_graphicsScene != newScene)
++  {
++    av_free(m_graphics);
++    m_graphics = dvbridge_graphics_metadata(203.0 * whitePercent / 100.0, newScene, &m_graphicsSize);
++    m_graphicsWhite = m_graphics ? whitePercent : 0;
++    m_graphicsScene = newScene;
++    if (!m_graphics)
++      return Fail("graphics-metadata");
++  }
++  // The frames of the menus follow on from one another (a millisecond apart: the scene goes on, with the same
++  // metadata id); their times are their own, and a video's that follow are another stream's.
++  m_graphicsPts += 1000.0;
++  dvbridge_render_set_frame_period(m_renderer, 0);
++  m_prepared = dvbridge_render_graphics(m_renderer, m_graphics, m_graphicsSize, m_graphicsPts);
++  if (!m_prepared)
++  {
++    if (const char* why = dvbridge_render_refused(m_renderer))
++      LogRefusal(why);
++    return Fail("graphics-prepare");
++  }
++  return true;
++}
++
++bool CDVBridgeGLES::GraphicsRange(int whitePercent, dvbridge_graphics_range& range)
++{
++  return dvbridge_graphics_range_of(203.0 * whitePercent / 100.0, &range);
++}
++
+ bool CDVBridgeGLES::Pack(unsigned int framebuffer, int width, int height, bool flipY, Cover cover)
+ {
+   m_packed = false;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 008bf38..594ff38 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -14,6 +14,7 @@ extern "C"
+ {
+ #include "dvbridge_gl_frame.h"
+ #include "dvbridge_gl_pack.h"
++#include "dvbridge_graphics.h"
+ #include "dvbridge_placebo.h"
+ #include "dvbridge_render.h"
+ #include "dvbridge_dmabuf.h"
+@@ -69,6 +70,17 @@ public:
+   //!        information and the log as a layer that carries no residual, as when it is imported.
+   //! \param layerNotDecoded with layerWithoutResidual: that enhancement picture was not even
+   //!        decoded (VideoPicture::doviLayerNotDecoded). Said so in the player information.
++  /*!
++   * \brief Hades: a frame of graphics alone, without a picture: the menus in Dolby Vision
++   *        (videoscreen.hadesdvmenus, CDVMenus). The transport picture is made black, for the GUI to be drawn
++   *        into it (GetPQFramebuffer()) as it is over a picture, and the frame is packed by Pack() in the
++   *        converted transport (BT.2020 YCbCr) with the static metadata of a GUI whose white is whitePercent of
++   *        203 cd/m2 (dvbridge_graphics.h). Then Presented(), as for a picture.
++   * \param newScene the first frame of graphics with this white: its metadata start a scene
++   */
++  bool PrepareGraphics(int whitePercent, bool newScene);
++  //! ... what those metadata say (for the log)
++  static bool GraphicsRange(int whitePercent, dvbridge_graphics_range& range);
+   bool PrepareHardware(const Layer& base, const AVFrame* enhancement,
+                        const CDVMetadataBuffer& metadata, dvbridge_geometry geometry, bool allowPacked = false,
+                        bool layerWithoutResidual = false, bool layerNotDecoded = false);
+@@ -530,4 +542,11 @@ private:
+   unsigned m_convertInfo = 0; //!< CDVPlaybackInfo of the last picture that was reconstructed
+   unsigned int m_plainMapped = 0; //!< Hades: pictures not reconstructed, mapped (PreparePlain())
+   unsigned int m_plainFailed = 0; //!< ... that could not be
++  //! Hades: the metadata of the frames of graphics (PrepareGraphics()): their white, whether they start a
++  //! scene, and the time of the last frame
++  AVDOVIMetadata* m_graphics = nullptr;
++  size_t m_graphicsSize = 0;
++  int m_graphicsWhite = 0;
++  bool m_graphicsScene = false;
++  double m_graphicsPts = 0;
+ };
+-- 
+2.53.0
+

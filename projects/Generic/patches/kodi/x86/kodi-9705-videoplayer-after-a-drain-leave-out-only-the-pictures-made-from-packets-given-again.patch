@@ -1,0 +1,288 @@
+From 5e08f7d28cfc9cd085fb0ed060793fe95a642c87 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:58:19 +0000
+Subject: [PATCH] VideoPlayer: after a drain, leave out only the pictures made
+ from packets given again
+
+CDrainRestart left out, after a restart, every picture whose time was that of
+a packet given again, and every picture presented up to 2 s before the last
+one that went out before the restart. Where the player moves the times of a
+stream without a flush (live TV, a discontinuity of HLS), and drains happen on
+exactly such streams, up to 2 s of new pictures could be left out.
+
+Now each packet given again carries a mark of its restart (its opaque_ref,
+which the decoder hands on to its picture with AV_CODEC_FLAG_COPY_OPAQUE, as
+Kodi opens it), GetPictureCommon() tells each picture the decoder makes with
+the mark it came with, and only a picture made from a packet given again is
+left out: every such picture went out before the drain, which gave every
+picture the decoder held before the restart. A picture of a packet that came
+after the drain goes out, whatever its time. One that is presented before the
+last picture the drain gave out (a base layer that reorders its pictures, the
+packets of the rest of the group not having come) goes out late, as a late
+picture does in Kodi.
+
+The packets kept are copies (the demuxer's packet is not the decoder's to
+keep): at most 300 packets and 64 MiB, down from 600 and 128 MiB. 300 packets
+are 5 s at 60 frames a second and 12.5 s at 24; 64 MiB are 5 s at 100 Mbit/s.
+A group of pictures of an Ultra HD Blu-ray lasts 1 s at most (about 12 MiB at
+its highest rate) and streaming services make theirs of 2 to 4 s. Past either
+bound nothing is kept until the next random-access point, and a drain then is
+followed by the decoder starting again at the packet that came, as before,
+which the log says.
+
+Host test (fel_drain_test), with a case added: after the drain the times of
+every packet go back by 1 s, without a flush. With the code before, 23 of 60
+pictures are left out; with this code, none, and the nine cases as before
+(none lost or twice, every picture paired as without the drain). In the
+stream whose base layer reorders, the 2 pictures that the code before left out
+go out late. Two mutations (a mark for every picture; no picture left out)
+each make the new case fail. Not run in Kodi; not seen on hardware.
+---
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  22 ++--
+ .../DVDCodecs/Video/DrainRestart.h            | 108 +++++++-----------
+ 2 files changed, 49 insertions(+), 81 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index e30f183..db6e2ee 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -1215,19 +1215,15 @@ void CDVDVideoCodecFFmpeg::RestartAfterDrain()
+   std::deque<CDrainRestart::Kept> kept = m_drainRestart.TakeKept();
+   const double accessTime = m_drainRestart.AccessTime();
+   const size_t count = kept.size();
+-  double lastGiven;
+-  const bool given = m_drainRestart.LastGiven(lastGiven);
+   Reset();
+-  m_drainRestart.GiveAgain(std::move(kept), given, lastGiven);
++  m_drainRestart.GiveAgain(std::move(kept));
+   const unsigned restarts = m_drainRestart.Restarts();
+   if (restarts <= 10 || restarts % 100 == 0)
+     CLog::Log(LOGINFO,
+               "CDVDVideoCodecFFmpeg: the stream goes on after its decoder was drained (it had run "
+               "dry); the decoder starts again at its random-access point of {:.3f} s, with the {} "
+-              "packets since then given again, whose pictures went out before and are left out "
+-              "(and so are those presented before the last one that went out, which cannot go "
+-              "out in their order any more), so that no other picture is lost{} (restart {} of "
+-              "this stream)",
++              "packets since then given again, whose pictures went out before and are left out, "
++              "so that no picture is lost{} (restart {} of this stream)",
+               accessTime / DVD_TIME_BASE, count,
+ #ifdef HAVE_DVBRIDGE
+               m_dvFel ? "; the Dolby Vision enhancement layer starts again with it" : "",
+@@ -1463,13 +1459,9 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+ #endif
+     if (result == VC_EOF)
+       m_drainRestart.Ended();
+-    if (result != VC_PICTURE || pVideoPicture->pts == DVD_NOPTS_VALUE)
++    if (result != VC_PICTURE || pVideoPicture->pts == DVD_NOPTS_VALUE ||
++        !m_drainRestart.Drop(pVideoPicture->pts))
+       break;
+-    if (!m_drainRestart.Drop(pVideoPicture->pts))
+-    {
+-      m_drainRestart.Given(pVideoPicture->pts);
+-      break;
+-    }
+ #ifdef HAVE_DVBRIDGE
+     // (the counts of the enhancement layer are of the pictures that go out)
+     if (m_dvFel && !pVideoPicture->doviLayerNotDecoded)
+@@ -2556,6 +2548,10 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+ 
+   if (pVideoPicture->pts != DVD_NOPTS_VALUE)
+     m_decoderPts = pVideoPicture->pts;
++  // Hades: a picture made from a packet given again after a drain is told by the mark its packet
++  // carried (CDrainRestart: GetPicture() leaves it out)
++  if (pVideoPicture->pts != DVD_NOPTS_VALUE)
++    m_drainRestart.Decoded(m_pFrame->opaque_ref, pVideoPicture->pts);
+ 
+   if (m_requestSkipDeint)
+   {
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
+index b016b23..33524e5 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
+@@ -43,8 +43,12 @@ extern "C"
+  * (RESTART): the caller flushes it (Reset()), takes the kept packets (TakeKept()) and gives them back
+  * here (GiveAgain()), and gives them to the decoder again, one at a time as it takes them (HasAgain(),
+  * Again(), GivenAgain()), before the packet that came. The pictures they make went out before, and
+- * are left out (Drop(), by the time each one has: the decoder gives a picture the time of its
+- * packet). The stream then goes on as if it had not run dry, with both layers of a Dolby Vision
++ * are left out (Drop()): each packet given again carries a mark of this restart (its opaque_ref,
++ * which the decoder hands on to its picture, AV_CODEC_FLAG_COPY_OPAQUE), the caller tells each
++ * picture that the decoder makes (Decoded()), and only a picture made from a packet given again is
++ * left out, whatever its time; a picture of a packet that came after the drain goes out, also when the
++ * times of the stream went back without a flush. The stream then goes on as if it had not run dry,
++ * with both layers of a Dolby Vision
+  * stream: the enhancement layer starts again with the base layer, at the same packet, as after a
+  * seek to it.
+  *
+@@ -84,16 +88,17 @@ public:
+     double time = 0.0;
+   };
+ 
+-  //! The packets kept since a random-access point, and their bytes, at most
+-  static constexpr size_t PACKETS_MAX = 600;
+-  static constexpr size_t BYTES_MAX = size_t{128} << 20;
++  //! The packets kept since a random-access point, and their bytes, at most: every packet is copied
++  //! (the demuxer's packet is not the decoder's to keep). 300 packets are 5 s at 60 frames a second and
++  //! 12.5 s at 24; 64 MiB are 5 s at 100 Mbit/s. A group of pictures of an Ultra HD Blu-ray lasts 1 s at
++  //! most (about 12 MiB at its highest rate), and streaming services make theirs of 2 to 4 s. Past
++  //! either bound nothing is kept until the next random-access point, and a drain in that time is
++  //! followed by the decoder starting again at the packet that came, as before, which the log says
++  //! (Note()).
++  static constexpr size_t PACKETS_MAX = 300;
++  static constexpr size_t BYTES_MAX = size_t{64} << 20;
+   //! How long a packet waits for the decoder to give the pictures it held, at most
+   static constexpr int64_t WAIT_MAX_MS = 3000;
+-  //! Pictures after the last packet given again within which a picture of those packets may still
+-  //! come (the decoder gives its pictures in the order they are presented; an HEVC decoder holds 16
+-  //! at most)
+-  static constexpr unsigned DROP_AFTER = 64;
+-
+   CDrainRestart() = default;
+   CDrainRestart(const CDrainRestart&) = delete;
+   CDrainRestart& operator=(const CDrainRestart&) = delete;
+@@ -101,6 +106,7 @@ public:
+   {
+     Free(m_kept);
+     Free(m_again);
++    av_buffer_unref(&m_mark);
+   }
+ 
+   //! keep: the decoder decodes HEVC; extradata: its configuration, which says how its packets are
+@@ -200,34 +206,19 @@ public:
+   //! The time of the picture of the random-access point kept (for the log)
+   double AccessTime() const { return m_accessTime; }
+ 
+-  //! A picture went out with this time (one that Drop() did not leave out)
+-  void Given(double time)
+-  {
+-    if (!m_haveGiven || time > m_lastGiven)
+-      m_lastGiven = time;
+-    m_haveGiven = true;
+-  }
+-  //! The time of the last picture that went out since the decoder was last flushed (and whether one
+-  //! did)
+-  bool LastGiven(double& time) const
+-  {
+-    time = m_lastGiven;
+-    return m_haveGiven;
+-  }
+-
+-  //! The packets to give the decoder again, before anything else; lastGiven: the time of the last
+-  //! picture that went out before the restart (LastGiven(), taken before the decoder was reset), when
+-  //! one did (haveGiven)
+-  void GiveAgain(std::deque<Kept> kept, bool haveGiven = false, double lastGiven = 0.0)
++  //! The packets to give the decoder again, before anything else, each with the mark of this restart
++  void GiveAgain(std::deque<Kept> kept)
+   {
+     Free(m_again);
+     m_again = std::move(kept);
+-    m_drop.clear();
+-    for (const Kept& k : m_again)
+-      m_drop.push_back(k.time);
+-    m_dropBefore = haveGiven;
+-    m_before = lastGiven;
+-    m_after = 0;
++    m_made.clear();
++    av_buffer_unref(&m_mark);
++    m_mark = av_buffer_allocz(1);
++    for (Kept& k : m_again)
++    {
++      av_buffer_unref(&k.packet->opaque_ref);
++      k.packet->opaque_ref = m_mark ? av_buffer_ref(m_mark) : nullptr;
++    }
+     ++m_restarts;
+     m_givenAgain += m_again.size();
+   }
+@@ -243,36 +234,26 @@ public:
+     m_again.pop_front();
+   }
+ 
+-  //! A picture comes out of the decoder with this time: whether it is left out. A picture of a packet
+-  //! given again went out before. And so is one that is presented before the last picture that went
+-  //! out before the restart, in a stream whose pictures are presented in another order than they are
+-  //! coded: the drain gave that later picture out before the packet of this one came, and the picture
+-  //! cannot go out in its order any more (within LATE_SPAN of it: a time much earlier is of a stream
+-  //! whose times went back, whose pictures go out).
+-  static constexpr double LATE_SPAN = 2000000.0; //!< in the units of the times given (Kodi's: microseconds)
++  //! The decoder made a picture (each one, as it makes it: Kodi's GetPictureCommon()), from a packet
++  //! whose opaque_ref it hands on (mark), with the time it comes out with
++  void Decoded(const AVBufferRef* mark, double time)
++  {
++    if (mark && m_mark && mark->data == m_mark->data)
++      m_made.push_back(time);
++  }
++  //! A picture comes out of the decoder with this time: whether it is left out, a picture made from a
++  //! packet given again (it went out before the drain). Only such a picture is.
+   bool Drop(double time)
+   {
+-    if (m_drop.empty() && !m_dropBefore)
+-      return false;
+-    for (auto it = m_drop.begin(); it != m_drop.end(); ++it)
++    for (auto it = m_made.begin(); it != m_made.end(); ++it)
+     {
+       if (*it == time)
+       {
+-        m_drop.erase(it);
++        m_made.erase(it);
+         ++m_dropped;
+         return true;
+       }
+     }
+-    if (m_dropBefore && time <= m_before && time > m_before - LATE_SPAN)
+-    {
+-      ++m_late;
+-      return true;
+-    }
+-    if (m_again.empty() && ++m_after >= DROP_AFTER)
+-    {
+-      m_drop.clear();
+-      m_dropBefore = false;
+-    }
+     return false;
+   }
+ 
+@@ -281,23 +262,19 @@ public:
+   {
+     Free(m_kept);
+     Free(m_again);
+-    m_drop.clear();
+     m_bytes = 0;
+     m_valid = false;
+     m_why = "no random-access point came since the decoder started";
+     m_drained = m_ended = m_gaveUp = m_noted = false;
+     m_waitSince = -1;
+-    m_after = 0;
+     m_note.clear();
+-    m_haveGiven = m_dropBefore = false;
++    m_made.clear();
+   }
+ 
+   //! For the log: restarts, packets given again, and pictures left out, since the stream opened
+   unsigned Restarts() const { return m_restarts; }
+   size_t GivenAgainCount() const { return m_givenAgain; }
+   size_t DroppedCount() const { return m_dropped; }
+-  //! ... and pictures left out because they could not go out in their order any more
+-  size_t LateCount() const { return m_late; }
+   size_t KeptCount() const { return m_kept.size(); }
+ 
+   //! Whether a packet is a random-access point of HEVC: the first unit of its video coding layer is of
+@@ -373,13 +350,8 @@ private:
+   std::string m_note;
+   int64_t m_waitSince = -1;
+   std::deque<Kept> m_again; //!< to give the decoder again
+-  std::vector<double> m_drop; //!< the times of the pictures of the packets given again, to leave out
+-  bool m_haveGiven = false;
+-  double m_lastGiven = 0.0;
+-  bool m_dropBefore = false; //!< pictures presented before m_before are left out (Drop())
+-  double m_before = 0.0;
+-  size_t m_late = 0;
+-  unsigned m_after = 0;
++  AVBufferRef* m_mark = nullptr; //!< the mark of the packets given again in the last restart
++  std::vector<double> m_made; //!< the times of the pictures made of them, which have not come out yet
+   unsigned m_restarts = 0;
+   size_t m_givenAgain = 0;
+   size_t m_dropped = 0;
+-- 
+2.53.0
+

@@ -1,0 +1,388 @@
+From e492d0c4a748149054f8cc2623846a1c1da3b0c8 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:59:56 +0000
+Subject: [PATCH] VideoPlayer: one line in the log for each seek
+
+Without debug logging Kodi says nothing of a seek, and the gaps that seeks
+leave are read as stalls. In the hardware test of 1.0 RC4 the native Dolby
+Vision statistics of the AMD integrated graphics showed gaps of 500.8 and
+542.2 ms that were the user's seeks; nothing in kodi.log could tell.
+
+The player now tells the render manager of each seek it handled (not the
+seeks of trick play): where the playback was, where it was asked to go, where
+the stream got to, when the player began and when it was done (the stream
+sought and the buffers flushed). Frames carry the number they were added to
+the render queue with; the first frame added after the player was done that
+is chosen for the screen ends the seek, and its line is written then:
+
+  Seek: from 00:41:12.345 to 00:45:00.000: the player began 2 ms after it
+  was asked for and had the stream at 00:44:58.120 642 ms later; the first
+  frame after it went to the screen 1210 ms after it was asked for
+
+A seek without a frame after it is told when the next one is handled or when
+the playback of the file ends. A seek that the player leaves out (a stream
+that cannot seek, an inaccurate seek while the video of the one before is not
+in sync yet) says so. The logic is in SeekTrace.h, with a host test.
+---
+ xbmc/cores/VideoPlayer/DVDMessage.h           |   8 +
+ xbmc/cores/VideoPlayer/SeekTrace.h            | 138 ++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |  24 +++
+ .../VideoRenderers/RenderManager.cpp          |  37 +++++
+ .../VideoRenderers/RenderManager.h            |  12 ++
+ 5 files changed, 219 insertions(+)
+ create mode 100644 xbmc/cores/VideoPlayer/SeekTrace.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDMessage.h b/xbmc/cores/VideoPlayer/DVDMessage.h
+index a13e090..8604354 100644
+--- a/xbmc/cores/VideoPlayer/DVDMessage.h
++++ b/xbmc/cores/VideoPlayer/DVDMessage.h
+@@ -12,6 +12,8 @@
+ #include "cores/IPlayer.h"
+ 
+ #include <atomic>
++#include <chrono>
++#include <memory>
+ #include <string.h>
+ #include <string>
+ 
+@@ -217,6 +219,9 @@ public:
+   {}
+   ~CDVDMsgPlayerSeek() override = default;
+ 
++  //! Hades: when the seek was asked for, by the steady clock in ns (CSeekTrace)
++  int64_t AskedNs() const { return m_askedNs; }
++
+   double GetTime() { return m_mode.time; }
+   bool GetRelative() { return m_mode.relative; }
+   bool GetBackward() { return m_mode.backward; }
+@@ -227,6 +232,9 @@ public:
+ 
+ private:
+   CMode m_mode;
++  int64_t m_askedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                          std::chrono::steady_clock::now().time_since_epoch())
++                          .count();
+ };
+ 
+ class CDVDMsgPlayerSeekChapter : public CDVDMsg
+diff --git a/xbmc/cores/VideoPlayer/SeekTrace.h b/xbmc/cores/VideoPlayer/SeekTrace.h
+new file mode 100644
+index 0000000..641f845
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/SeekTrace.h
+@@ -0,0 +1,138 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++//! Hades: the steady clock, in ns (as the render manager and the window system take it)
++inline int64_t SeekTraceNowNs()
++{
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++/*!
++ * \brief Hades: one line in the log for each seek, with what it took
++ *
++ * Without debug logging Kodi said nothing of a seek, and the gaps that seeks leave were read as
++ * stalls (a gap of 500 ms in the statistics of native Dolby Vision output, the time of a seek over
++ * a network). The player tells of each seek it handled (Handled()): where the playback was, where
++ * it was asked to go, where the stream got to, when the player began and when it was done (the
++ * stream sought and its buffers flushed). The render manager tells of each frame that it chooses
++ * for the screen (Shown()): the first one that was added after the seek was handled ends it, and
++ * its line is written. Frames are told by the number they were added with: those added before the
++ * player was done (before the decoders were flushed) are of before the seek. The render manager
++ * calls it under its lock.
++ */
++class CSeekTrace
++{
++public:
++  struct Seek
++  {
++    int64_t askedNs = 0; //!< steady clock: when the seek was asked for (its message was made)
++    int64_t handledNs = 0; //!< ... when the player began to handle it
++    int64_t doneNs = 0; //!< ... when the player had sought the stream and flushed its buffers
++    double fromMs = 0; //!< the time of the playback when the player began
++    double toMs = 0; //!< where the seek was asked to go
++    double landedMs = NAN; //!< where the stream got to (NAN: the stream could not seek there)
++    bool relative = false; //!< asked for as a step from the time of the playback
++    bool paused = false; //!< the playback was paused
++  };
++
++  //! The player handled a seek; the frames added after number `added` are after it. Returns the
++  //! line of the seek before it if no frame after that one reached the screen ("" otherwise).
++  std::string Handled(const Seek& seek, uint64_t added)
++  {
++    std::string before;
++    if (m_waiting)
++      before = Line(m_seek, 0, "no frame after it went to the screen before the next seek");
++    m_seek = seek;
++    m_boundary = added;
++    m_waiting = true;
++    return before;
++  }
++  //! The frame added as number `serial` is chosen for the screen at nowNs: the line of the seek
++  //! that it ends, if it is the first frame after one ("" otherwise); askedNs, when that seek was
++  //! asked for
++  std::string Shown(uint64_t serial, int64_t nowNs, int64_t* askedNs = nullptr)
++  {
++    if (!m_waiting || serial <= m_boundary)
++      return {};
++    m_waiting = false;
++    if (askedNs)
++      *askedNs = m_seek.askedNs;
++    return Line(m_seek, nowNs, nullptr);
++  }
++  //! The playback of the file ends: the line of a seek still waiting for its first frame
++  std::string Ended()
++  {
++    if (!m_waiting)
++      return {};
++    m_waiting = false;
++    return Line(m_seek, 0, "no frame after it went to the screen before the playback ended");
++  }
++  bool Waiting() const { return m_waiting; }
++
++  //! hh:mm:ss.mmm
++  static std::string Time(double ms)
++  {
++    if (!std::isfinite(ms))
++      return "?";
++    const bool negative = ms < 0;
++    long long t = std::llround(std::fabs(ms));
++    char text[40];
++    std::snprintf(text, sizeof(text), "%s%02lld:%02lld:%02lld.%03lld", negative ? "-" : "",
++                  t / 3600000, t / 60000 % 60, t / 1000 % 60, t % 1000);
++    return text;
++  }
++
++  static std::string Line(const Seek& seek, int64_t shownNs, const char* noFrame)
++  {
++    const auto ms = [](int64_t from, int64_t to)
++    { return static_cast<double>(to - from) / 1e6; };
++    char text[160];
++    std::string line = "Seek: from " + Time(seek.fromMs) + " to " + Time(seek.toMs);
++    if (seek.relative)
++    {
++      std::snprintf(text, sizeof(text), " (a step of %+.1f s)", (seek.toMs - seek.fromMs) / 1000.0);
++      line += text;
++    }
++    if (seek.paused)
++      line += ", paused";
++    std::snprintf(text, sizeof(text), ": the player began %.0f ms after it was asked for and ",
++                  ms(seek.askedNs, seek.handledNs));
++    line += text;
++    if (std::isfinite(seek.landedMs))
++      line += "had the stream at " + Time(seek.landedMs);
++    else
++      line += "found that the stream could not seek there (its end, or a stream that cannot seek)";
++    std::snprintf(text, sizeof(text), " %.0f ms later; ", ms(seek.handledNs, seek.doneNs));
++    line += text;
++    if (noFrame)
++      line += noFrame;
++    else
++    {
++      std::snprintf(text, sizeof(text),
++                    "the first frame after it went to the screen %.0f ms after it was asked for",
++                    ms(seek.askedNs, shownNs));
++      line += text;
++    }
++    return line;
++  }
++
++private:
++  Seek m_seek;
++  uint64_t m_boundary = 0;
++  bool m_waiting = false;
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index fa73944..459b131 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -3176,8 +3176,25 @@ void CVideoPlayer::HandleMessages()
+     {
+       CDVDMsgPlayerSeek& msg(*std::static_pointer_cast<CDVDMsgPlayerSeek>(pMsg));
+ 
++      // Hades: what the seek takes, for its line in the log (CSeekTrace; not the seeks of trick
++      // play, which come with every step of it)
++      CSeekTrace::Seek trace;
++      trace.askedNs = msg.AskedNs();
++      trace.handledNs = SeekTraceNowNs();
++      trace.fromMs = m_State.time;
++      trace.relative = msg.GetRelative();
++      trace.paused = m_playSpeed == DVD_PLAYSPEED_PAUSE;
++      trace.toMs = msg.GetRelative() ? m_State.time + msg.GetTime() : msg.GetTime();
++      const auto leftOut = [&](const char* why)
++      {
++        if (!msg.GetTrickPlay())
++          CLog::Log(LOGINFO, "Seek: from {} to {}: left out, {}", CSeekTrace::Time(trace.fromMs),
++                    CSeekTrace::Time(trace.toMs), why);
++      };
++
+       if (!m_State.canseek)
+       {
++        leftOut("the stream cannot seek");
+         m_processInfo->SetStateSeeking(false);
+         continue;
+       }
+@@ -3191,6 +3208,8 @@ void CVideoPlayer::HandleMessages()
+             (now - m_State.lastSeek)/1000 < 2000 &&
+             !msg.GetAccurate())
+         {
++          leftOut("the video of the seek before it is not in sync yet (an inaccurate seek within "
++                  "2 s of it)");
+           m_processInfo->SetStateSeeking(false);
+           continue;
+         }
+@@ -3237,6 +3256,7 @@ void CVideoPlayer::HandleMessages()
+ 
+         m_State.dts = start;
+         m_State.lastSeek = m_clock.GetAbsoluteClock();
++        trace.landedMs = DVD_TIME_TO_MSEC(start);
+ 
+         FlushBuffers(start, msg.GetAccurate(), msg.GetSync());
+       }
+@@ -3260,6 +3280,10 @@ void CVideoPlayer::HandleMessages()
+       if(!msg.GetTrickPlay())
+       {
+         m_processInfo->SeekFinished(0);
++        // Hades: the stream is sought and the buffers flushed: the frames added from now on are
++        // after the seek (CSeekTrace)
++        trace.doneNs = SeekTraceNowNs();
++        m_renderManager.SeekHandled(trace);
+       }
+ 
+       // dvd's will issue a HOP_CHANNEL that we need to skip
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 49eebf2..87a95f2 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -442,6 +442,8 @@ void CRenderManager::UnInit()
+     }
+   }
+ 
++  SeekTraceEnded();
++
+   std::unique_lock lock(m_statelock);
+ 
+   m_overlays.UnInit();
+@@ -968,8 +970,40 @@ void CRenderManager::TriggerUpdateResolution(float fps, int width, int height, s
+   m_bTriggerUpdateResolution = true;
+ }
+ 
++void CRenderManager::SeekHandled(const CSeekTrace::Seek& seek)
++{
++  std::string before;
++  {
++    std::unique_lock lock(m_presentlock);
++    before = m_seekTrace.Handled(seek, m_addSerial);
++  }
++  if (!before.empty())
++    CLog::Log(LOGINFO, "{}", before);
++}
++
++void CRenderManager::SeekFrameChosen(int idx)
++{
++  int64_t askedNs = 0;
++  const std::string line = m_seekTrace.Shown(m_Queue[idx].serial, SeekTraceNowNs(), &askedNs);
++  if (line.empty())
++    return;
++  CLog::Log(LOGINFO, "{}", line);
++}
++
++void CRenderManager::SeekTraceEnded()
++{
++  std::string line;
++  {
++    std::unique_lock lock(m_presentlock);
++    line = m_seekTrace.Ended();
++  }
++  if (!line.empty())
++    CLog::Log(LOGINFO, "{}", line);
++}
++
+ void CRenderManager::NewFile()
+ {
++  SeekTraceEnded();
+   m_progressiveSet = false;
+   m_fileModeChosen = false;
+   m_nativeDVIntent = -1;
+@@ -1080,6 +1114,7 @@ bool CRenderManager::AddVideoPicture(const VideoPicture& picture, volatile std::
+   m.presentfield = displayField;
+   m.presentmethod = presentmethod;
+   m.pts = picture.pts;
++  m.serial = ++m_addSerial; // (Hades: CSeekTrace)
+   m_queued.push_back(m_free.front());
+   m_free.pop_front();
+   m_playerPort->UpdateRenderBuffers(m_queued.size(), m_discard.size(), m_free.size());
+@@ -1330,6 +1365,7 @@ void CRenderManager::PrepareNextRender()
+ #ifdef HAVE_DVBRIDGE
+     chosen(m_Queue[idx].pts);
+ #endif
++    SeekFrameChosen(idx);
+     m_presentevent.notifyAll();
+ 
+     m_playerPort->UpdateRenderBuffers(m_queued.size(), m_discard.size(), m_free.size());
+@@ -1345,6 +1381,7 @@ void CRenderManager::PrepareNextRender()
+ #ifdef HAVE_DVBRIDGE
+     chosen(m_Queue[m_presentsource].pts);
+ #endif
++    SeekFrameChosen(m_presentsource);
+     m_presentevent.notifyAll();
+   }
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index f85fb5d..235d300 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -11,6 +11,7 @@
+ #include "DVDClock.h"
+ #include "DebugRenderer.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
++#include "cores/VideoPlayer/SeekTrace.h"
+ #include "cores/VideoPlayer/VideoRenderers/BaseRenderer.h"
+ #include "cores/VideoPlayer/VideoRenderers/OverlayRenderer.h"
+ #include "cores/VideoSettings.h"
+@@ -95,6 +96,9 @@ public:
+   //! is not known until its video stream opens (SetNativeDVStream()): until then the size that
+   //! is chosen without the adjustment of the refresh rate is not chosen (UpdateResolution()).
+   void NewFile();
++  //! Hades: the player handled a seek (not one of trick play): its line in the log is written
++  //! with the first frame added after now that is chosen for the screen (CSeekTrace). Player thread.
++  void SeekHandled(const CSeekTrace::Seek& seek);
+   void SetViewMode(int iViewMode);
+   void PreInit();
+   void UnInit();
+@@ -254,7 +258,15 @@ protected:
+     double         pts;
+     EFIELDSYNC     presentfield;
+     EPRESENTMETHOD presentmethod;
++    uint64_t serial; //!< Hades: the number it was added with (CSeekTrace)
+   } m_Queue[NUM_BUFFERS]{};
++  //! Hades: the frames added so far, and the seeks whose first frame is to come (m_presentlock)
++  uint64_t m_addSerial = 0;
++  CSeekTrace m_seekTrace;
++  //! ... the frame in the slot idx is chosen for the screen: the first after a seek ends it
++  void SeekFrameChosen(int idx);
++  //! ... the playback of a file ends: a seek still waiting for its first frame is told
++  void SeekTraceEnded();
+ 
+   std::deque<int> m_free;
+   std::deque<int> m_queued;
+-- 
+2.53.0
+

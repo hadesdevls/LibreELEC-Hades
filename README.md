@@ -32,13 +32,13 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 - A USB drive of 8 GB or more. A USB SSD runs much more smoothly than a stick.
 - For Dolby Vision:
   - **A TV that offers Dolby Vision "Standard" on the HDMI input you use.** Many TVs offer only low-latency Dolby Vision on an input set up for games or a PC; Hades says so and sends that input HDR10, or low-latency Dolby Vision if you turn that on. On an LG C5, "Quick Frame Transport" has to be off on that input.
-  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer, and with NVIDIA's driver 580 the GeForce GTX 900 and GTX 10 cards and the TITAN V; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series (not the older DCE hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
+  - **Supported graphics:** NVIDIA GeForce GTX 16, RTX 20 or newer, and with NVIDIA's driver 580 the GeForce GTX 900 and GTX 10 cards and the TITAN V; AMD Radeon graphics with display hardware DCN 1.0 or newer, from Raven, Picasso and Navi 1x to the RX 9000 series, and, new in 1.0 RC5, the Radeon RX 400 and 500 series, the Radeon RX Vega M, the Radeon RX Vega 56 and 64 and the Radeon VII (display hardware DCE 11.2 and 12; not older AMD hardware, nor the few versions listed in [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers)); Intel graphics of display version 9 or newer (UHD 6xx and later).
   - **The PC connected by HDMI straight to the TV** is best. A sound bar or AV receiver in between has to pass Dolby Vision through.
 - Your own videos or add-ons: Hades comes with no films, add-ons or media sources.
 
 ## What has been tested
 
-The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below are those of 1.0 RC4 and earlier versions; what 1.0 RC4 adds and has not been tried yet is under "Not tried yet".
+The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar on the TV's eARC and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below are those of 1.0 RC4 and earlier versions; what 1.0 RC5 adds and has not been tried yet is under "Not tried yet".
 
 ### Graphics
 
@@ -51,12 +51,13 @@ The author tests on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER
 | NVIDIA GeForce GTX 900 and GTX 10 series, TITAN V (driver 580) | Not tried yet |
 | AMD Radeon RX 7000 series | RX 7600 (user) |
 | AMD Radeon RX 5000, RX 6000 and RX 9000 series | Not tried yet |
+| AMD Radeon RX 400 and 500 series, RX Vega M, RX Vega 56 and 64, Radeon VII (new in 1.0 RC5) | Not tried yet |
 | AMD Ryzen integrated graphics | Ryzen 9 7950X3D (author), Ryzen 7 5800H and Ryzen 3200G (users) |
 | Intel integrated graphics | Core i5-12450H (author), Core i3-1005G1, Core 5 255H and N100 (users) |
 | Intel UHD 6xx graphics | Not tried yet |
 | Intel graphics that use the `xe` driver (Arc B-series, Core Ultra 200V and newer) | Not tried yet |
 
-TVs and monitors: an LG C5 TV and a Samsung Odyssey OLED G6 monitor (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H and a Samsung S95B with HDR10+, an LG C3 with Dolby Atmos passed through, and a Sony TV that offers Dolby Vision only as low-latency (users).
+TVs and monitors: an LG C5 TV and a Samsung Odyssey OLED G6 monitor (author); LG G5, LG C2, a Panasonic TV and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H, a Samsung S95B and a JVC DLA-NZ9 projector with HDR10+, an LG C3 with Dolby Atmos passed through, and a Sony TV that offers Dolby Vision only as low-latency (users).
 
 ### Features
 
@@ -66,11 +67,11 @@ TVs and monitors: an LG C5 TV and a Samsung Odyssey OLED G6 monitor (author); LG
 | Dolby Vision profile 7 with MEL | Ryzen 9 7950X3D (author); RX 7600 (user) |
 | Dolby Vision profiles 8.1 and 5 | RTX 4080 SUPER and Ryzen 9 7950X3D (author); RX 7600 (user) |
 | Dolby Vision in two video tracks | `.m2ts` on the RTX 4080 SUPER (author); MKV on an RTX 3070, and MP4 on a laptop with RTX graphics (users) |
-| Menus and subtitles over Dolby Vision at full frame rate | Profiles 7 FEL and 8.1 on the RTX 4080 SUPER and the Ryzen 9 7950X3D (author); profile 7 FEL on an RX 7600 (user) |
+| Menus and subtitles over Dolby Vision at full frame rate | Profiles 7 FEL and 8.1 on the RTX 4080 SUPER and the Ryzen 9 7950X3D (author); profile 7 FEL on an RX 7600 (user, measured with the menus over the picture: 240 of 240 frames, the largest gap 42.0 ms, issue #3) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, through an HDMI sync box that offers only low-latency Dolby Vision (author) |
 | Dolby Vision shown as HDR10 | Profile 5 on the RTX 4080 SUPER (author); profiles 5 and 7 FEL on a Core i3-1005G1 (user) |
-| Dolby Vision shown as HDR10+ | Profile 7 FEL on the RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author) |
-| HDR10+ | RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, and Ryzen 7 5800H (users) |
+| Dolby Vision shown as HDR10+ | Profile 7 FEL on the RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); profile 7 FEL on an RX 7600 with a JVC DLA-NZ9, shown as HDR10+ with its FEL at full resolution (user, issue #10) |
+| HDR10+ | RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, Ryzen 7 5800H, and RX 7600 with a JVC DLA-NZ9 (users; on the RX 7600, measured: the HDR10+ packets of four HDR10+ films byte for byte those of a licensed player in 10 of 10 samples, issue #10) |
 | HDR10+ as Dolby Vision | Ryzen 7 5800H (user) |
 | HDR10 with more than 8 bits on NVIDIA | RTX 4080 SUPER (author) |
 | A 24 fps video at exactly 24 Hz on NVIDIA | RTX 4080 SUPER (author) |
@@ -104,6 +105,17 @@ Not tried yet:
   - Dolby Vision with the older HDMI 1.4b signalling, on a TV that asks for it (TVs of 2016, the LG OLEDs of that year among them), and Low-Latency on a dual-mode DisplayPort connector of NVIDIA;
   - *Internal disks that are shown* and *Internal partitions that are shown*, in the LibreELEC settings;
   - the other additions of 1.0 RC4 listed in the changelog.
+- New in 1.0 RC5:
+  - Dolby Vision sent in IPT, the default for profiles 7 and 8;
+  - the Dolby Vision signal set up with the change of mode, before the first picture;
+  - Dolby Vision for the menus, the GUI over HDR converted exactly, and the GUI cache over native Dolby Vision;
+  - seeks that no longer stop the drawing, and a stream that runs dry for a moment and keeps its group of pictures and its FEL layer;
+  - native Dolby Vision in sync with the sound as the ordinary output;
+  - the "Installer" boot entry, which now gives the installed system the boot menus and the GRUB of Hades;
+  - native Dolby Vision on AMD graphics with display hardware DCE 11.2 and 12 (Radeon RX 400 and 500 series, RX Vega M, RX Vega 56 and 64, Radeon VII), and through an HDMI port that NVIDIA drives through a DisplayPort output;
+  - Dolby Vision sent as HDR10+ on Intel at 2160p24, 25 and 30, and HDR10+ on RTX 50 graphics, beside HDMI variable refresh on GTX 16 to RTX 30, and to displays of application version 0;
+  - dual-track MP4 files whose enhancement track is an ordinary HEVC track, and 3D subtitles at the depth of the disc;
+  - the other additions of 1.0 RC5 listed in the changelog.
 
 SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's own code and behave as in LibreELEC, apart from the additions above.
 
@@ -184,7 +196,7 @@ Good to know:
 - [Settings](docs/settings.md): every setting of this build.
 - [Diagnostics and logs](docs/diagnostics.md): how to get them, and what to look for.
 
-Versions in 1.0 RC4: Linux 7.3, Kodi 22 (the `Piers` branch after 22.0rc1, up to 7f485d6bcbc4), FFmpeg 9.0.2, Mesa 26.2.5, libplacebo 7.387.0 (275f7dea2792), NVIDIA 615.78.08 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.07, on LibreELEC `master` (13.0 development, up to db99cd88ef44). LibreELEC has not released version 13.
+Versions in 1.0 RC5: Linux 7.3, Kodi 22 (the `Piers` branch after 22.0rc1, up to 7f485d6bcbc4, and nine commits of Kodi's `master`), FFmpeg 9.0.2, Mesa 26.2.6, libplacebo 7.387.0 (275f7dea2792), NVIDIA 615.78.08 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.07, on LibreELEC `master` (13.0 development, up to 0314a6cb55d0). LibreELEC has not released version 13.
 
 ## Credits
 

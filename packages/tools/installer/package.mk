@@ -17,6 +17,11 @@ post_install() {
     sed -e "s/@DISTRONAME@/${DISTRONAME}/g" \
         -i  ${INSTALL}/usr/bin/installer
 
+  # Hades: the boot menus of the installed system, from those of the medium
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+    cp ${PKG_DIR}/scripts/installer-bootmenus ${INSTALL}/usr/lib/libreelec
+    chmod 0755 ${INSTALL}/usr/lib/libreelec/installer-bootmenus
+
   mkdir -p ${INSTALL}/etc
     find_file_path config/installer.conf
     cp ${FOUND_PATH} ${INSTALL}/etc

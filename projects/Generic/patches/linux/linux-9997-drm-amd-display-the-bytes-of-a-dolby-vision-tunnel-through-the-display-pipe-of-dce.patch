@@ -1,0 +1,722 @@
+From 7b5fb5aa5803148799f6684d51c81ef95d55192a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 20:53:24 +0000
+Subject: [PATCH] drm/amd/display: the bytes of a Dolby Vision tunnel through
+ the display pipe of DCE
+
+On DCN, amdgpu_dm carries the Dolby Vision tunnel (DVBRIDGE_DV_STANDARD_LAB,
+linux-9910) through state that it checks: for that plane and stream DC
+programs every colour block in bypass or as the identity. On DCE, with the
+sequencer of DCE 11 and the blocks of the dce112 and dce120 pools (Polaris,
+Vega M, Vega 10, 12 and 20), DC chooses four things by itself that change the
+bytes, and amdgpu_dm can set none of them:
+
+- the line buffer at 30 bpp, with the DCP denormalising to 10 bits before it;
+- the prescale of the input pixel processor, which scales an 8-bit surface
+  by 0x2020 (1 + 1/256) to bring the zero expansion of the memory input to
+  full scale. With the line buffer at 30 bpp, or at 24 bpp if it rounds,
+  some 8-bit values would not come out as they went in; with the prescale in
+  bypass and the line buffer at 24 bpp, every value does, whatever the
+  internal precision (by arithmetic: the review of CroqueMr's linux-9925 for
+  Vega M, whose two changes of that kind are taken here);
+- the graphics input CSC, which DC never programs: it holds whatever the
+  VBIOS, or a driver before DC, left there (amdgpu without DC writes it to
+  bypass with each LUT, dce_v10_0_crtc_load_lut());
+- the output CSC, programmed as the identity matrix in programmable mode,
+  not in its bypass.
+
+A stream gets byte_tunnel, which only amdgpu_dm_dvbridge_fill_stream() sets
+(the next patch), and with it on DCE:
+
+- resource_build_scaling_params() puts the line buffer at 24 bpp, in the
+  branch that DCE takes (the SPL branch is DCN 4 only and is left alone).
+  dce_transform_set_pixel_storage_depth() then programs unity
+  denormalisation and the clamp at 8 bits, and with DITHER_OPTION_TRUN8,
+  truncation to u0.8 without dither;
+- dce110_set_input_transfer_func() puts the graphics input path in bypass
+  through a new IPP function, dce_ipp_set_byte_passthrough(): prescale,
+  legacy input gamma LUT and graphics input CSC (INPUT_CSC_CONTROL, now in
+  the register lists of dce112 and dce120 only). The mode of the input CSC is
+  read when the tunnel takes the pipe and written back when the pipe leaves
+  it, so that a pipe out of the tunnel is programmed as it was before;
+- dce110_program_front_end_for_pipe() programs the input and output transfer
+  functions whenever the pipe carries or leaves the tunnel, whatever the
+  update bits of the plane say: a new plane state on a new stream has none,
+  and after a suspend the registers no longer hold what the IPP last
+  programmed. Relying on those bits, as linux-9925 of the fork does, the
+  prescale could stay as it was, on the way in or on the way out;
+- set_default_colors() asks for the hardware default of the output CSC,
+  which for sRGB is its bypass.
+
+dc_stream_read_byte_tunnel() reads back, for the kernel log, what decides
+the bytes on such a pipe: the prescale, the input gamma LUT, the input CSC
+and the mode it was found in, the degamma, the gamut remap, the regamma, the
+output CSC, the denormalisation, clamp, truncation and dither of the DCP, the
+line buffer, the scaler, and the truncation, dither, clamp, expansion and
+encoding of the formatter. It changes nothing.
+
+Without byte_tunnel nothing changes. A host test builds dce_ipp.c,
+dce_transform.c, dce_opp.c, dce_mem_input.c, dce_stream_encoder.c,
+dce110_hwseq.c, dc_resource.c, dc_hw_sequencer.c and the dce112 and dce120
+pools as they are, on a fake register file. Seven ordinary scenarios (8-bit,
+10-bit, RGB565 and FP16 surfaces, the legacy LUT, scaling, limited range,
+YCbCr output, dither), each with and without update bits, on DCE 11.2, 11.22,
+12.0 and 12.1, make the same 8056 register writes, in the same order and from
+the same functions, before and after this patch. With the tunnel, the
+register image differs from the same stream without it in eight registers
+only (prescale control, input CSC, output CSC, line buffer format,
+denormalisation and the three clamps); it is the same again once the tunnel
+ends, also straight from a desktop with the legacy LUT and after a suspend;
+the Dolby VSIF of 27 bytes is in generic packet 0, its last byte included.
+30 mutations of the two patches make the test fail.
+
+Not verified: that a DCE does what the code and the arithmetic say. The
+read back in the kernel log is there for the first test on a Polaris, a
+Vega M or a Vega with a Dolby Vision TV.
+---
+ drivers/gpu/drm/amd/display/dc/core/dc.c      | 36 +++++++++
+ .../gpu/drm/amd/display/dc/core/dc_resource.c |  8 ++
+ drivers/gpu/drm/amd/display/dc/dc_hw_types.h  | 42 +++++++++++
+ drivers/gpu/drm/amd/display/dc/dc_stream.h    | 19 +++++
+ drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c  | 75 ++++++++++++++++++-
+ drivers/gpu/drm/amd/display/dc/dce/dce_ipp.h  | 25 ++++++-
+ drivers/gpu/drm/amd/display/dc/dce/dce_opp.c  | 27 ++++++-
+ .../drm/amd/display/dc/dce/dce_transform.c    | 31 +++++++-
+ .../amd/display/dc/hwss/dce110/dce110_hwseq.c | 42 +++++++++--
+ drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h   | 19 +++++
+ drivers/gpu/drm/amd/display/dc/inc/hw/opp.h   |  5 ++
+ .../gpu/drm/amd/display/dc/inc/hw/transform.h |  5 ++
+ .../dc/resource/dce112/dce112_resource.c      |  6 +-
+ .../dc/resource/dce120/dce120_resource.c      |  6 +-
+ 14 files changed, 328 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc.c b/drivers/gpu/drm/amd/display/dc/core/dc.c
+index 333ac17..529dbe7 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc.c
+@@ -50,6 +50,7 @@
+ #include "bios/bios_parser_helper.h"
+ #include "include/irq_service_interface.h"
+ #include "transform.h"
++#include "ipp.h" /* Hades: dc_stream_read_byte_tunnel() */
+ #include "dmcu.h"
+ #include "dpp.h"
+ #include "timing_generator.h"
+@@ -872,6 +873,41 @@ bool dc_stream_program_csc_matrix(struct dc *dc, struct dc_stream_state *stream)
+ 	return ret;
+ }
+ 
++/*
++ * Hades: the registers of the pipe of a byte tunnel stream on DCE that decide whether its bytes
++ * reach the encoder as they were scanned out (struct dc_byte_tunnel_readback), read back;
++ * amdgpu_dm writes them to the kernel log each time the tunnel goes on. It changes nothing.
++ */
++bool dc_stream_read_byte_tunnel(struct dc *dc, const struct dc_stream_state *stream,
++				struct dc_byte_tunnel_readback *readback)
++{
++	struct pipe_ctx *pipe = NULL;
++	int i;
++
++	memset(readback, 0, sizeof(*readback));
++	for (i = 0; i < MAX_PIPES; i++) {
++		struct pipe_ctx *p = &dc->current_state->res_ctx.pipe_ctx[i];
++
++		if (p->stream == stream && !p->top_pipe && !p->prev_odm_pipe) {
++			pipe = p;
++			break;
++		}
++	}
++	if (!pipe || !pipe->plane_state)
++		return false;
++
++	dc_exit_ips_for_hw_access(dc);
++
++	if (pipe->plane_res.ipp && pipe->plane_res.ipp->funcs->ipp_read_byte_tunnel)
++		pipe->plane_res.ipp->funcs->ipp_read_byte_tunnel(pipe->plane_res.ipp, readback);
++	if (pipe->plane_res.xfm && pipe->plane_res.xfm->funcs->transform_read_byte_tunnel)
++		pipe->plane_res.xfm->funcs->transform_read_byte_tunnel(pipe->plane_res.xfm,
++								      readback);
++	if (pipe->stream_res.opp && pipe->stream_res.opp->funcs->opp_read_byte_tunnel)
++		pipe->stream_res.opp->funcs->opp_read_byte_tunnel(pipe->stream_res.opp, readback);
++	return readback->ipp_read && readback->xfm_read && readback->opp_read;
++}
++
+ void dc_stream_set_static_screen_params(struct dc *dc,
+ 		struct dc_stream_state **streams,
+ 		int num_streams,
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 0e304a8..3706435 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -1646,6 +1646,14 @@ bool resource_build_scaling_params(struct pipe_ctx *pipe_ctx)
+ 	 */
+ 	if (plane_state->ctx->dce_version > DCE_VERSION_MAX)
+ 		pipe_ctx->plane_res.scl_data.lb_params.depth = LB_PIXEL_DEPTH_36BPP;
++	else if (pipe_ctx->stream->byte_tunnel)
++		/*
++		 * Hades: a byte tunnel (dc_stream_state.byte_tunnel) on DCE: the DCP truncates each
++		 * component to its 8 bits and the line buffer keeps them (dce_transform.c: unity
++		 * denormalisation, the clamp at 8 bits); with the prescale in bypass
++		 * (dce_ipp_set_byte_passthrough()) every 8-bit value goes through unchanged.
++		 */
++		pipe_ctx->plane_res.scl_data.lb_params.depth = LB_PIXEL_DEPTH_24BPP;
+ 	else
+ 		pipe_ctx->plane_res.scl_data.lb_params.depth = LB_PIXEL_DEPTH_30BPP;
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+index aeac5a4..a441392 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_hw_types.h
+@@ -1300,5 +1300,47 @@ enum regam_lut {
+ 	REGAM_20 = 0,
+ 	REGAM_24
+ };
++
++/*
++ * Hades: the register fields of a DCE pipe that decide whether the bytes of a byte tunnel stream
++ * (dc_stream_state.byte_tunnel) reach the encoder as they were scanned out, as
++ * dc_stream_read_byte_tunnel() reads them back; each one as dce_ipp.c, dce_transform.c and
++ * dce_opp.c program it. *_read: the block answered.
++ */
++struct dc_byte_tunnel_readback {
++	bool ipp_read;
++	bool xfm_read;
++	bool opp_read;
++	/* input pixel processor */
++	uint32_t prescale_bypass;	/* PRESCALE_GRPH_CONTROL.GRPH_PRESCALE_BYPASS, 1: bypass */
++	uint32_t input_gamma_mode;	/* INPUT_GAMMA_CONTROL.GRPH_INPUT_GAMMA_MODE, 1: LUT bypass */
++	bool input_csc_read;		/* the block has the graphics input CSC */
++	uint32_t input_csc_mode;	/* INPUT_CSC_CONTROL.INPUT_CSC_GRPH_MODE, 0: bypass */
++	uint32_t input_csc_mode_before;	/* ... as the tunnel found it when it took the pipe */
++	uint32_t degamma_mode;		/* DEGAMMA_CONTROL.GRPH_DEGAMMA_MODE, 0: bypass */
++	/* transform: colour, bit depth reduction, line buffer, scaler */
++	uint32_t gamut_remap_mode;	/* GAMUT_REMAP_CONTROL.GRPH_GAMUT_REMAP_MODE, 0: bypass */
++	uint32_t regamma_mode;		/* REGAMMA_CONTROL.GRPH_REGAMMA_MODE, 0: bypass */
++	uint32_t output_csc_mode;	/* OUTPUT_CSC_CONTROL.OUTPUT_CSC_GRPH_MODE, 0: bypass */
++	uint32_t denorm_mode;		/* DENORM_CONTROL.DENORM_MODE, 0: unity */
++	uint32_t clamp_min[3];		/* OUT_CLAMP_CONTROL_R_CR, _G_Y and _B_CB */
++	uint32_t clamp_max[3];
++	uint32_t round_trunc_mode;	/* OUT_ROUND_CONTROL.OUT_ROUND_TRUNC_MODE, 4: truncate to u0.8 */
++	uint32_t dcp_dither_en;		/* DCP_SPATIAL_DITHER_CNTL.DCP_SPATIAL_DITHER_EN */
++	uint32_t lb_pixel_depth;	/* LB_DATA_FORMAT.PIXEL_DEPTH, 1: 24 bpp */
++	uint32_t lb_expan_mode;		/* LB_DATA_FORMAT.PIXEL_EXPAN_MODE */
++	uint32_t scl_mode;		/* SCL_MODE.SCL_MODE, 0: bypass */
++	/* formatter */
++	uint32_t fmt_truncate_en;	/* FMT_BIT_DEPTH_CONTROL */
++	uint32_t fmt_truncate_depth;
++	uint32_t fmt_truncate_mode;
++	uint32_t fmt_spatial_dither_en;
++	uint32_t fmt_temporal_dither_en;
++	uint32_t fmt_clamp_en;		/* FMT_CLAMP_CNTL */
++	uint32_t fmt_clamp_color_format;
++	uint32_t fmt_dyn_exp_en;	/* FMT_DYNAMIC_EXP_CNTL */
++	uint32_t fmt_dyn_exp_mode;
++	uint32_t fmt_pixel_encoding;	/* FMT_CONTROL */
++};
+ #endif /* DC_HW_TYPES_H */
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/dc_stream.h b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+index f5d6051..1797e32 100644
+--- a/drivers/gpu/drm/amd/display/dc/dc_stream.h
++++ b/drivers/gpu/drm/amd/display/dc/dc_stream.h
+@@ -234,6 +234,17 @@ struct dc_stream_state {
+ 	enum dc_color_space output_color_space;
+ 	enum display_content_type content_type;
+ 	enum dc_dither_option dither_option;
++	/*
++	 * Hades: the stream is a byte tunnel (the Dolby Vision tunnel of amdgpu_dm, drm_dvbridge.h):
++	 * its RGB 8 bpc pixels are a transport, not a picture, and must reach the encoder as they
++	 * were scanned out. On DCN amdgpu_dm gets there with the stream and plane state it checks.
++	 * On DCE, DC chooses by itself the depth of the line buffer, the prescale, the input gamma
++	 * LUT, the graphics input CSC and the output CSC: with this set, it programs them for the
++	 * bytes (resource_build_scaling_params(), dce110_hwseq.c). Only
++	 * amdgpu_dm_dvbridge_fill_stream() sets it, on a new stream: the tunnel goes on and off
++	 * with a modeset.
++	 */
++	bool byte_tunnel;
+ 
+ 	enum view_3d_format view_format;
+ 
+@@ -614,6 +625,14 @@ bool dc_stream_set_gamut_remap(struct dc *dc,
+ bool dc_stream_program_csc_matrix(struct dc *dc,
+ 				  struct dc_stream_state *stream);
+ 
++/*
++ * Hades: what the pipe of a byte tunnel stream holds on DCE, read back from its registers for the
++ * kernel log (struct dc_byte_tunnel_readback). False when the stream has no pipe with a plane in
++ * the current state, or a block of that pipe cannot be read. It changes nothing.
++ */
++bool dc_stream_read_byte_tunnel(struct dc *dc, const struct dc_stream_state *stream,
++				struct dc_byte_tunnel_readback *readback);
++
+ struct dc_rmcm_3dlut *dc_stream_get_3dlut_for_stream(
+ 	const struct dc *dc,
+ 	const struct dc_stream_state *stream,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
+index 72c0950..fea833a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c
+@@ -230,6 +230,72 @@ static void dce_ipp_set_degamma(
+ 		  CURSOR2_DEGAMMA_MODE, degamma_type);
+ }
+ 
++/*
++ * Hades: the graphics input path of a byte tunnel (dc_stream_state.byte_tunnel): the prescale, the
++ * legacy input gamma LUT and the graphics input CSC in bypass, so that each 8-bit component goes
++ * on as it was scanned out (with the line buffer at 24 bpp and the output CSC in bypass, which
++ * resource_build_scaling_params() and set_default_colors() choose for the tunnel).
++ *
++ * dce_ipp_program_prescale() scales an 8-bit surface by 0x2020 (1 + 1/256, to bring the zero
++ * expansion of the memory input to full scale): with the line buffer at 30 bpp, or at 24 bpp if it
++ * rounds, some values would not come out as they went in; the prescale in bypass with the line
++ * buffer at 24 bpp does, whatever the internal precision (by arithmetic, not measured on a DCE).
++ * The input gamma LUT is written from the legacy gamma of the plane, which amdgpu_dm refuses
++ * with the tunnel; it is in bypass here whatever the plane holds. DC never programs the graphics
++ * input CSC: it holds what the VBIOS or a driver before DC left there (amdgpu without DC writes
++ * it to bypass with each LUT, dce_v10_0_crtc_load_lut()). Its mode is kept when the tunnel takes
++ * the pipe and written back when the pipe leaves it, so that a pipe out of the tunnel is
++ * programmed as it was before.
++ */
++static bool dce_ipp_set_byte_passthrough(
++	struct input_pixel_processor *ipp,
++	bool enable)
++{
++	struct dce_ipp *ipp_dce = TO_DCE_IPP(ipp);
++
++	if (!ipp->byte_passthrough_capable)
++		return false;
++
++	if (!enable) {
++		if (ipp_dce->input_csc_held)
++			REG_UPDATE(INPUT_CSC_CONTROL,
++				   INPUT_CSC_GRPH_MODE, ipp_dce->input_csc_before);
++		ipp_dce->input_csc_held = false;
++		ipp->byte_passthrough = false;
++		return true;
++	}
++
++	if (!ipp_dce->input_csc_held) {
++		REG_GET(INPUT_CSC_CONTROL, INPUT_CSC_GRPH_MODE, &ipp_dce->input_csc_before);
++		ipp_dce->input_csc_held = true;
++	}
++	REG_UPDATE(PRESCALE_GRPH_CONTROL, GRPH_PRESCALE_BYPASS, 1);
++	REG_UPDATE(INPUT_GAMMA_CONTROL, GRPH_INPUT_GAMMA_MODE, 1);
++	REG_UPDATE(INPUT_CSC_CONTROL, INPUT_CSC_GRPH_MODE, 0);
++	ipp->byte_passthrough = true;
++	return true;
++}
++
++/* Hades: read back for the kernel log (struct dc_byte_tunnel_readback) */
++static void dce_ipp_read_byte_tunnel(
++	struct input_pixel_processor *ipp,
++	struct dc_byte_tunnel_readback *readback)
++{
++	struct dce_ipp *ipp_dce = TO_DCE_IPP(ipp);
++
++	REG_GET(PRESCALE_GRPH_CONTROL, GRPH_PRESCALE_BYPASS, &readback->prescale_bypass);
++	REG_GET(INPUT_GAMMA_CONTROL, GRPH_INPUT_GAMMA_MODE, &readback->input_gamma_mode);
++	REG_GET(DEGAMMA_CONTROL, GRPH_DEGAMMA_MODE, &readback->degamma_mode);
++	if (ipp->byte_passthrough_capable) {
++		REG_GET(INPUT_CSC_CONTROL, INPUT_CSC_GRPH_MODE, &readback->input_csc_mode);
++		readback->input_csc_mode_before = ipp_dce->input_csc_held ?
++						  ipp_dce->input_csc_before :
++						  readback->input_csc_mode;
++		readback->input_csc_read = true;
++	}
++	readback->ipp_read = true;
++}
++
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+ static void dce60_ipp_set_degamma(
+ 	struct input_pixel_processor *ipp,
+@@ -251,7 +317,10 @@ static const struct ipp_funcs dce_ipp_funcs = {
+ 	.ipp_cursor_set_position = dce_ipp_cursor_set_position,
+ 	.ipp_program_prescale = dce_ipp_program_prescale,
+ 	.ipp_program_input_lut = dce_ipp_program_input_lut,
+-	.ipp_set_degamma = dce_ipp_set_degamma
++	.ipp_set_degamma = dce_ipp_set_degamma,
++	/* Hades: the byte tunnel */
++	.ipp_set_byte_passthrough = dce_ipp_set_byte_passthrough,
++	.ipp_read_byte_tunnel = dce_ipp_read_byte_tunnel
+ };
+ 
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+@@ -284,6 +353,10 @@ void dce_ipp_construct(
+ 	ipp_dce->regs = regs;
+ 	ipp_dce->ipp_shift = ipp_shift;
+ 	ipp_dce->ipp_mask = ipp_mask;
++
++	/* Hades: the graphics input CSC is listed (IPP_DCE112_REG_LIST_DCE_BASE()) */
++	ipp_dce->base.byte_passthrough_capable =
++		regs->INPUT_CSC_CONTROL && ipp_mask->INPUT_CSC_GRPH_MODE;
+ }
+ 
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.h b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.h
+index 0028d4b..e5f8715 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.h
+@@ -61,6 +61,14 @@
+ 	IPP_COMMON_REG_LIST_DCE_BASE(id), \
+ 	SRI(DCFE_MEM_PWR_CTRL, DCFE, id)
+ 
++/*
++ * Hades: ... and the graphics input CSC, which DC does not program otherwise: the byte tunnel puts
++ * it in bypass (dce_ipp_set_byte_passthrough()). DCE 11.2 and 12, where the tunnel is offered.
++ */
++#define IPP_DCE112_REG_LIST_DCE_BASE(id) \
++	IPP_DCE110_REG_LIST_DCE_BASE(id), \
++	SRI(INPUT_CSC_CONTROL, DCP, id)
++
+ #define IPP_SF(reg_name, field_name, post_fix)\
+ 	.field_name = reg_name ## __ ## field_name ## post_fix
+ 
+@@ -107,6 +115,11 @@
+ 	IPP_COMMON_MASK_SH_LIST_DCE_COMMON_BASE(mask_sh), \
+ 	IPP_SF(DCFE_MEM_PWR_CTRL, DCP_LUT_MEM_PWR_DIS, mask_sh)
+ 
++/* Hades: with IPP_DCE112_REG_LIST_DCE_BASE() */
++#define IPP_DCE112_MASK_SH_LIST_DCE_COMMON_BASE(mask_sh) \
++	IPP_DCE100_MASK_SH_LIST_DCE_COMMON_BASE(mask_sh), \
++	IPP_SF(INPUT_CSC_CONTROL, INPUT_CSC_GRPH_MODE, mask_sh)
++
+ #define IPP_DCE120_MASK_SH_LIST_SOC_BASE(mask_sh) \
+ 	IPP_SF(DCP0_CUR_UPDATE, CURSOR_UPDATE_LOCK, mask_sh), \
+ 	IPP_SF(DCP0_CUR_CONTROL, CURSOR_EN, mask_sh), \
+@@ -147,6 +160,11 @@
+ 	IPP_SF(DCP0_DEGAMMA_CONTROL, CURSOR_DEGAMMA_MODE, mask_sh), \
+ 	IPP_SF(DCP0_DEGAMMA_CONTROL, CURSOR2_DEGAMMA_MODE, mask_sh)
+ 
++/* Hades: with IPP_DCE112_REG_LIST_DCE_BASE() */
++#define IPP_DCE120_MASK_SH_LIST_SOC(mask_sh) \
++	IPP_DCE120_MASK_SH_LIST_SOC_BASE(mask_sh), \
++	IPP_SF(DCP0_INPUT_CSC_CONTROL, INPUT_CSC_GRPH_MODE, mask_sh)
++
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+ #define IPP_DCE60_MASK_SH_LIST_DCE_COMMON_BASE(mask_sh) \
+ 	IPP_SF(CUR_UPDATE, CURSOR_UPDATE_LOCK, mask_sh), \
+@@ -225,7 +243,8 @@
+ 	type DC_LUT_SEQ_COLOR; \
+ 	type GRPH_DEGAMMA_MODE; \
+ 	type CURSOR_DEGAMMA_MODE; \
+-	type CURSOR2_DEGAMMA_MODE
++	type CURSOR2_DEGAMMA_MODE; \
++	type INPUT_CSC_GRPH_MODE
+ 
+ struct dce_ipp_shift {
+ 	IPP_REG_FIELD_LIST(uint8_t);
+@@ -257,6 +276,7 @@ struct dce_ipp_registers {
+ 	uint32_t DC_LUT_RW_INDEX;
+ 	uint32_t DC_LUT_SEQ_COLOR;
+ 	uint32_t DEGAMMA_CONTROL;
++	uint32_t INPUT_CSC_CONTROL; /* Hades: IPP_DCE112_REG_LIST_DCE_BASE() */
+ };
+ 
+ struct dce_ipp {
+@@ -264,6 +284,9 @@ struct dce_ipp {
+ 	const struct dce_ipp_registers *regs;
+ 	const struct dce_ipp_shift *ipp_shift;
+ 	const struct dce_ipp_mask *ipp_mask;
++	/* Hades: the mode of the graphics input CSC that a byte tunnel found and will put back */
++	uint32_t input_csc_before;
++	bool input_csc_held;
+ };
+ 
+ void dce_ipp_construct(struct dce_ipp *ipp_dce,
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+index 61d478c..61f991a 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c
+@@ -702,6 +702,30 @@ static void dce60_opp_program_fmt(
+ 
+ 
+ 
++/* Hades: read back for the kernel log (struct dc_byte_tunnel_readback) */
++static void dce110_opp_read_byte_tunnel(
++	struct output_pixel_processor *opp,
++	struct dc_byte_tunnel_readback *readback)
++{
++	struct dce110_opp *opp110 = TO_DCE110_OPP(opp);
++
++	REG_GET_3(FMT_BIT_DEPTH_CONTROL,
++		  FMT_TRUNCATE_EN, &readback->fmt_truncate_en,
++		  FMT_TRUNCATE_DEPTH, &readback->fmt_truncate_depth,
++		  FMT_TRUNCATE_MODE, &readback->fmt_truncate_mode);
++	REG_GET_2(FMT_BIT_DEPTH_CONTROL,
++		  FMT_SPATIAL_DITHER_EN, &readback->fmt_spatial_dither_en,
++		  FMT_TEMPORAL_DITHER_EN, &readback->fmt_temporal_dither_en);
++	REG_GET_2(FMT_CLAMP_CNTL,
++		  FMT_CLAMP_DATA_EN, &readback->fmt_clamp_en,
++		  FMT_CLAMP_COLOR_FORMAT, &readback->fmt_clamp_color_format);
++	REG_GET_2(FMT_DYNAMIC_EXP_CNTL,
++		  FMT_DYNAMIC_EXP_EN, &readback->fmt_dyn_exp_en,
++		  FMT_DYNAMIC_EXP_MODE, &readback->fmt_dyn_exp_mode);
++	REG_GET(FMT_CONTROL, FMT_PIXEL_ENCODING, &readback->fmt_pixel_encoding);
++	readback->opp_read = true;
++}
++
+ /*****************************************/
+ /* Constructor, Destructor               */
+ /*****************************************/
+@@ -710,7 +734,8 @@ static const struct opp_funcs funcs = {
+ 	.opp_set_dyn_expansion = dce110_opp_set_dyn_expansion,
+ 	.opp_destroy = dce110_opp_destroy,
+ 	.opp_program_fmt = dce110_opp_program_fmt,
+-	.opp_program_bit_depth_reduction = dce110_opp_program_bit_depth_reduction
++	.opp_program_bit_depth_reduction = dce110_opp_program_bit_depth_reduction,
++	.opp_read_byte_tunnel = dce110_opp_read_byte_tunnel /* Hades */
+ };
+ 
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+diff --git a/drivers/gpu/drm/amd/display/dc/dce/dce_transform.c b/drivers/gpu/drm/amd/display/dc/dce/dce_transform.c
+index 83f8198..e279ec9 100644
+--- a/drivers/gpu/drm/amd/display/dc/dce/dce_transform.c
++++ b/drivers/gpu/drm/amd/display/dc/dce/dce_transform.c
+@@ -1609,6 +1609,34 @@ void dce110_opp_set_regamma_mode(struct transform *xfm,
+ 		GRPH_REGAMMA_MODE, mode);
+ }
+ 
++/* Hades: read back for the kernel log (struct dc_byte_tunnel_readback) */
++static void dce_transform_read_byte_tunnel(struct transform *xfm,
++					   struct dc_byte_tunnel_readback *readback)
++{
++	struct dce_transform *xfm_dce = TO_DCE_TRANSFORM(xfm);
++
++	REG_GET(GAMUT_REMAP_CONTROL, GRPH_GAMUT_REMAP_MODE, &readback->gamut_remap_mode);
++	REG_GET(REGAMMA_CONTROL, GRPH_REGAMMA_MODE, &readback->regamma_mode);
++	REG_GET(OUTPUT_CSC_CONTROL, OUTPUT_CSC_GRPH_MODE, &readback->output_csc_mode);
++	REG_GET(DENORM_CONTROL, DENORM_MODE, &readback->denorm_mode);
++	REG_GET_2(OUT_CLAMP_CONTROL_R_CR,
++		  OUT_CLAMP_MIN_R_CR, &readback->clamp_min[0],
++		  OUT_CLAMP_MAX_R_CR, &readback->clamp_max[0]);
++	REG_GET_2(OUT_CLAMP_CONTROL_G_Y,
++		  OUT_CLAMP_MIN_G_Y, &readback->clamp_min[1],
++		  OUT_CLAMP_MAX_G_Y, &readback->clamp_max[1]);
++	REG_GET_2(OUT_CLAMP_CONTROL_B_CB,
++		  OUT_CLAMP_MIN_B_CB, &readback->clamp_min[2],
++		  OUT_CLAMP_MAX_B_CB, &readback->clamp_max[2]);
++	REG_GET(OUT_ROUND_CONTROL, OUT_ROUND_TRUNC_MODE, &readback->round_trunc_mode);
++	REG_GET(DCP_SPATIAL_DITHER_CNTL, DCP_SPATIAL_DITHER_EN, &readback->dcp_dither_en);
++	REG_GET_2(LB_DATA_FORMAT,
++		  PIXEL_DEPTH, &readback->lb_pixel_depth,
++		  PIXEL_EXPAN_MODE, &readback->lb_expan_mode);
++	REG_GET(SCL_MODE, SCL_MODE, &readback->scl_mode);
++	readback->xfm_read = true;
++}
++
+ static const struct transform_funcs dce_transform_funcs = {
+ 	.transform_reset = dce_transform_reset,
+ 	.transform_set_scaler = dce_transform_set_scaler,
+@@ -1619,7 +1647,8 @@ static const struct transform_funcs dce_transform_funcs = {
+ 	.opp_program_regamma_pwl = dce110_opp_program_regamma_pwl,
+ 	.opp_set_regamma_mode = dce110_opp_set_regamma_mode,
+ 	.transform_set_pixel_storage_depth = dce_transform_set_pixel_storage_depth,
+-	.transform_get_optimal_number_of_taps = dce_transform_get_optimal_number_of_taps
++	.transform_get_optimal_number_of_taps = dce_transform_get_optimal_number_of_taps,
++	.transform_read_byte_tunnel = dce_transform_read_byte_tunnel /* Hades */
+ };
+ 
+ #if defined(CONFIG_DRM_AMD_DC_SI)
+diff --git a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+index 3283219..bd25ddc 100644
+--- a/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
++++ b/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c
+@@ -297,12 +297,24 @@ dce110_set_input_transfer_func(struct dc *dc, struct pipe_ctx *pipe_ctx,
+ 
+ 	tf = &plane_state->in_transfer_func;
+ 
+-	dce110_prescale_params(&prescale_params, plane_state);
+-	ipp->funcs->ipp_program_prescale(ipp, &prescale_params);
++	/*
++	 * Hades: a byte tunnel (dc_stream_state.byte_tunnel) takes the graphics input path in
++	 * bypass, without prescale or input gamma LUT (dce_ipp.c); a pipe that leaves it gets
++	 * back what the tunnel kept before its prescale is programmed again. Where the block
++	 * cannot, the pipe is programmed as any other: amdgpu_dm refuses the tunnel there.
++	 */
++	if (!(pipe_ctx->stream->byte_tunnel && ipp->funcs->ipp_set_byte_passthrough &&
++	      ipp->funcs->ipp_set_byte_passthrough(ipp, true))) {
++		if (ipp->byte_passthrough && ipp->funcs->ipp_set_byte_passthrough)
++			ipp->funcs->ipp_set_byte_passthrough(ipp, false);
+ 
+-	if (!plane_state->gamma_correction.is_identity &&
+-			dce_use_lut(plane_state->format))
+-		ipp->funcs->ipp_program_input_lut(ipp, &plane_state->gamma_correction);
++		dce110_prescale_params(&prescale_params, plane_state);
++		ipp->funcs->ipp_program_prescale(ipp, &prescale_params);
++
++		if (!plane_state->gamma_correction.is_identity &&
++				dce_use_lut(plane_state->format))
++			ipp->funcs->ipp_program_input_lut(ipp, &plane_state->gamma_correction);
++	}
+ 
+ 	if (tf->type == TF_TYPE_PREDEFINED) {
+ 		switch (tf->tf) {
+@@ -2766,7 +2778,12 @@ static void set_default_colors(struct pipe_ctx *pipe_ctx)
+ {
+ 	struct default_adjustment default_adjust = { 0 };
+ 
+-	default_adjust.force_hw_default = false;
++	/*
++	 * Hades: a byte tunnel (dc_stream_state.byte_tunnel) takes the output CSC in bypass, the
++	 * mode that dce110_opp_set_csc_default() selects for sRGB with the hardware default,
++	 * instead of the identity matrix in programmable mode that it writes otherwise.
++	 */
++	default_adjust.force_hw_default = pipe_ctx->stream->byte_tunnel;
+ 	default_adjust.in_color_space = pipe_ctx->plane_state->color_space;
+ 	default_adjust.out_color_space = pipe_ctx->stream->output_color_space;
+ 	default_adjust.csc_adjust_type = GRAPHICS_CSC_ADJUST_TYPE_SW;
+@@ -3141,6 +3158,14 @@ static void dce110_program_front_end_for_pipe(
+ 	struct out_csc_color_matrix tbl_entry;
+ 	unsigned int i;
+ 	struct dce_hwseq *hws = dc->hwseq;
++	/*
++	 * Hades: the pipe carries a byte tunnel (dc_stream_state.byte_tunnel), or leaves one: its
++	 * input and output transfer functions are programmed whatever the update bits of the plane
++	 * say. A new plane state on a new stream has none, and after a suspend the registers no
++	 * longer hold what the IPP last programmed.
++	 */
++	bool tunnel_moves = pipe_ctx->plane_res.ipp &&
++			    (pipe_ctx->stream->byte_tunnel || pipe_ctx->plane_res.ipp->byte_passthrough);
+ 
+ 	memset(&tbl_entry, 0, sizeof(tbl_entry));
+ 
+@@ -3198,10 +3223,11 @@ static void dce110_program_front_end_for_pipe(
+ 	/* Moved programming gamma from dc to hwss */
+ 	if (pipe_ctx->plane_state->update_bits.full_update ||
+ 			pipe_ctx->plane_state->update_bits.in_transfer_func_change ||
+-			pipe_ctx->plane_state->update_bits.gamma_change)
++			pipe_ctx->plane_state->update_bits.gamma_change ||
++			tunnel_moves)
+ 		hws->funcs.set_input_transfer_func(dc, pipe_ctx, pipe_ctx->plane_state);
+ 
+-	if (pipe_ctx->plane_state->update_bits.full_update)
++	if (pipe_ctx->plane_state->update_bits.full_update || tunnel_moves)
+ 		hwss_set_output_transfer_func(dc, pipe_ctx);
+ 
+ 	DC_LOG_SURFACE(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+index b2fa4c4..3d7e1f4 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/ipp.h
+@@ -38,6 +38,12 @@ struct input_pixel_processor {
+ 	struct  dc_context *ctx;
+ 	unsigned int inst;
+ 	const struct ipp_funcs *funcs;
++	/*
++	 * Hades: DCE: the block has all that the graphics input path of a byte tunnel needs
++	 * (ipp_set_byte_passthrough()), and that path is programmed now.
++	 */
++	bool byte_passthrough_capable;
++	bool byte_passthrough;
+ };
+ 
+ enum ipp_prescale_mode {
+@@ -108,6 +114,19 @@ struct ipp_funcs {
+ 		struct input_pixel_processor *ipp,
+ 		const struct pwl_params *params);
+ 
++	/*
++	 * Hades: DCE: the graphics input path of a byte tunnel (dc_stream_state.byte_tunnel) on,
++	 * or back as it was before it. False where the block cannot (byte_passthrough_capable).
++	 */
++	bool (*ipp_set_byte_passthrough)(
++		struct input_pixel_processor *ipp,
++		bool enable);
++
++	/* Hades: DCE: its part of struct dc_byte_tunnel_readback (dc_stream_read_byte_tunnel()) */
++	void (*ipp_read_byte_tunnel)(
++		struct input_pixel_processor *ipp,
++		struct dc_byte_tunnel_readback *readback);
++
+ 	void (*ipp_destroy)(struct input_pixel_processor **ipp);
+ };
+ 
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+index 73cc34e..6790000 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/opp.h
+@@ -333,6 +333,11 @@ struct opp_funcs {
+ 			enum ovl_csc_adjust_item overlay_adjust_item,
+ 			struct hw_adjustment_range *range);
+ 
++	/* Hades: DCE: its part of struct dc_byte_tunnel_readback (dc_stream_read_byte_tunnel()) */
++	void (*opp_read_byte_tunnel)(
++		struct output_pixel_processor *opp,
++		struct dc_byte_tunnel_readback *readback);
++
+ 	void (*opp_destroy)(struct output_pixel_processor **opp);
+ 
+ 	void (*opp_program_stereo)(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+index d67373e..2ed27aa 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/transform.h
+@@ -246,6 +246,11 @@ struct transform_funcs {
+ 	void (*set_cursor_attributes)(
+ 			struct transform *xfm_base,
+ 			const struct dc_cursor_attributes *attr);
++
++	/* Hades: DCE: its part of struct dc_byte_tunnel_readback (dc_stream_read_byte_tunnel()) */
++	void (*transform_read_byte_tunnel)(
++			struct transform *xfm,
++			struct dc_byte_tunnel_readback *readback);
+ };
+ 
+ const uint16_t *get_filter_2tap_16p(void);
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c
+index 8c4494a..4e5bf35 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c
+@@ -184,7 +184,7 @@ static const struct dce110_aux_registers_mask aux_mask = {
+ 
+ #define ipp_regs(id)\
+ [id] = {\
+-		IPP_DCE110_REG_LIST_DCE_BASE(id)\
++		IPP_DCE112_REG_LIST_DCE_BASE(id)\
+ }
+ 
+ static const struct dce_ipp_registers ipp_regs[] = {
+@@ -197,11 +197,11 @@ static const struct dce_ipp_registers ipp_regs[] = {
+ };
+ 
+ static const struct dce_ipp_shift ipp_shift = {
+-		IPP_DCE100_MASK_SH_LIST_DCE_COMMON_BASE(__SHIFT)
++		IPP_DCE112_MASK_SH_LIST_DCE_COMMON_BASE(__SHIFT)
+ };
+ 
+ static const struct dce_ipp_mask ipp_mask = {
+-		IPP_DCE100_MASK_SH_LIST_DCE_COMMON_BASE(_MASK)
++		IPP_DCE112_MASK_SH_LIST_DCE_COMMON_BASE(_MASK)
+ };
+ 
+ #define transform_regs(id)\
+diff --git a/drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c b/drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c
+index 38d3b87..d136f5c 100644
+--- a/drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c
+@@ -183,7 +183,7 @@ static const struct dce_abm_mask abm_mask = {
+ 
+ #define ipp_regs(id)\
+ [id] = {\
+-		IPP_DCE110_REG_LIST_DCE_BASE(id)\
++		IPP_DCE112_REG_LIST_DCE_BASE(id)\
+ }
+ 
+ static const struct dce_ipp_registers ipp_regs[] = {
+@@ -196,11 +196,11 @@ static const struct dce_ipp_registers ipp_regs[] = {
+ };
+ 
+ static const struct dce_ipp_shift ipp_shift = {
+-		IPP_DCE120_MASK_SH_LIST_SOC_BASE(__SHIFT)
++		IPP_DCE120_MASK_SH_LIST_SOC(__SHIFT)
+ };
+ 
+ static const struct dce_ipp_mask ipp_mask = {
+-		IPP_DCE120_MASK_SH_LIST_SOC_BASE(_MASK)
++		IPP_DCE120_MASK_SH_LIST_SOC(_MASK)
+ };
+ 
+ #define transform_regs(id)\
+-- 
+2.53.0
+
