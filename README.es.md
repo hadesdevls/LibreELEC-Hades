@@ -70,7 +70,7 @@ Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); 
 | Menús y subtítulos sobre Dolby Vision sin perder fotogramas | Perfiles 7 FEL y 8.1 en la RTX 4080 SUPER y el Ryzen 9 7950X3D (autor); perfil 7 FEL en una RX 7600 (usuario, medido con los menús sobre la imagen: 240 de 240 imágenes, el mayor hueco de 42,0 ms, issue #3) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, a través de una caja de sincronización HDMI que solo ofrece Dolby Vision de baja latencia (autor) |
 | Dolby Vision mostrado como HDR10 | Perfil 5 en la RTX 4080 SUPER (autor); perfiles 5 y 7 FEL en un Core i3-1005G1 (usuario) |
-| Dolby Vision mostrado como HDR10+ | Perfil 7 FEL en la RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); perfil 7 FEL en una RX 7600 con un JVC DLA-NZ9, mostrado como HDR10+ con su FEL a resolución completa (usuario, issue #10) |
+| Dolby Vision mostrado como HDR10+ | Perfil 7 FEL en la RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); perfil 7 FEL en una RX 7600 con un JVC DLA-NZ9, mostrado como HDR10+ con su FEL a resolución completa (usuario, issue #10); un Core i3-1005G1 con una Samsung S90H (usuario, issue #2) |
 | HDR10+ | RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); Core i3-1005G1 con una Samsung S90H, Ryzen 3200G con una Samsung S95B, Ryzen 7 5800H, y RX 7600 con un JVC DLA-NZ9 (usuarios; en la RX 7600, medido: los paquetes HDR10+ de cuatro películas HDR10+, byte a byte los de un reproductor con licencia en 10 de 10 muestras, issue #10) |
 | HDR10+ como Dolby Vision | Ryzen 7 5800H (usuario) |
 | HDR10 a más de 8 bits en NVIDIA | RTX 4080 SUPER (autor) |

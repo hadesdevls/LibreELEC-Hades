@@ -42,6 +42,7 @@ Each patch of this build says in its header where it comes from, what it does an
 
 - The licence texts are in the folder `licenses`, next to this file.
 - Because the Dolby Vision module added to Kodi is GPL-3.0-or-later, the Kodi program in this build is distributed under GPL-3.0-or-later.
+- The code that this project wrote is also offered under GPL-2.0-or-later, at the choice of whoever uses it: its own files (those whose copyright line names Hades) and its changes to other files (the patches of this build whose author is Hades). Code of other authors keeps its own terms, also inside the Dolby Vision module, which began as the dvbridge of the fork by CroqueMr (GPL-3.0-or-later).
 - The licence of each package is named in its recipe (`PKG_LICENSE` in its `package.mk`).
 
 ## Parts that are not free software
