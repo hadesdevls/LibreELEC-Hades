@@ -216,7 +216,7 @@ What this build adds to LibreELEC was written for it, except what is named here,
 
 ## Licences and source code
 
-- LibreELEC's build system is under the GNU General Public License, version 2; each file says whether "only" or "or later". Each patch has the licence of the program it changes. Kodi is GPL-2.0-or-later; the Dolby Vision module added to it is GPL-3.0-or-later, so the Kodi built here is distributed under GPL-3.0-or-later.
+- LibreELEC's build system is under the GNU General Public License, version 2; each file says whether "only" or "or later". Each patch has the licence of the program it changes. Kodi is GPL-2.0-or-later. As LibreELEC builds it, it is linked with the Samba client (GPL-3.0-or-later), FFmpeg built under version 3 of the GPL and OpenSSL (Apache-2.0), so the Kodi built here is distributed under GPL-3.0-or-later. The Dolby Vision module added to it is GPL-3.0-or-later, and what this project wrote in it is also offered under GPL-2.0-or-later ([NOTICE](NOTICE.md)).
 - The texts of the licences are in `licenses/`, and the licence of each package is in its recipe (`PKG_LICENSE`).
 - The NVIDIA user-space libraries and firmware, and the closed core of the kernel module of driver 580 (loaded only for the GeForce GTX 900 and GTX 10 cards and the TITAN V), are proprietary and come under the NVIDIA Driver License Agreement, not under a free licence. Some firmware files for other hardware have their own licences.
 - The complete source of a build is this repository at the commit named in `BUILD_ID` in `/etc/os-release` of the running system, plus the source archives that its recipes name. See [NOTICE.md](NOTICE.md) for credits, trademarks and how to obtain the source.
