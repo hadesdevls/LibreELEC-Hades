@@ -16,15 +16,17 @@
 #
 #   make-brand-images.py --jost Jost-VariableFont_wght.ttf --out <folder>
 #
-# writes three folders: kodi/ (what the recipe of Kodi installs), boot/ (the splash screen of the
-# start of the system, distributions/LibreELEC/splash) and settings/ (the two pictures of the settings
-# add-on of LibreELEC that carried its logo).
+# writes four folders: kodi/ (what the recipe of Kodi installs), boot/ (the splash screen of the
+# start of the system, distributions/LibreELEC/splash), settings/ (the two pictures of the settings
+# add-on of LibreELEC that carried its logo) and notice/ (the notice that the start shows where several
+# displays are connected, packages/mediacenter/kodi/brand/notice, which kodi-display-notice draws).
 #
 # Needs Python 3 with Pillow (FreeType) and NumPy. The light is computed in floating point and brought
 # to 8 bits with noise (dither): a soft glow on black shows bands on a good display otherwise. Where
 # there is no light the picture is exactly black, so that an OLED panel stays off.
 import argparse
 import os
+import subprocess
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -40,6 +42,17 @@ SMALL = np.array([0.60, 0.63, 0.69])
 TILE = np.array([8.0, 8.0, 12.0]) / 255.0  # whole steps: a tile without light is one flat colour
 FIRST_LIGHT = -0.72  # radians, where the light breaks through: upper right
 REACH = 3.7  # no light of the mark farther than this from the centre of the disc, in radii
+# The mark and the name stand this much higher than the middle of the screen (in lines of 1080), in
+# every splash screen: the notice "one display" lays its card under them, and nothing moves when it
+# shows (2026-11-03; before, they stood in the middle).
+RAISE = 70
+NOTICE_EN = ("LibreELEC Hades shows on one display: normally the TV connected over HDMI.",
+             "The other displays turn off in a few seconds.")
+NOTICE_ES = ("LibreELEC Hades se muestra en una sola pantalla: normalmente la TV conectada por HDMI.",
+             "Las demás pantallas se apagan en unos segundos.")
+NOTICE_TEXT = np.array([0.90, 0.92, 0.96])
+NOTICE_SOFT = np.array([0.58, 0.61, 0.67])
+PLATE = np.array([0.05, 0.055, 0.07])
 
 # The heights of screen that have a picture of their own for the start of the system. Another height
 # gets the one of 1080 lines, made larger or smaller by the program that draws it.
@@ -221,7 +234,7 @@ def white(alpha):
 def tall(w, h, s=None, middle=None):
     """The mark over the name, on black: the splash screens. s is the size (1 for 1080 lines)."""
     s = h / 1080.0 if s is None else s
-    middle = h / 2.0 if middle is None else middle
+    middle = h / 2.0 - RAISE * s if middle is None else middle
     img = np.zeros((h, w, 3))
     mark_on(img, w / 2.0, middle - 150 * s, 118 * s)
     small = text_mask("LibreELEC", 38 * s, 400, tracking=0.16)
@@ -304,11 +317,86 @@ def boot(h, splash):
     return to8(tall(w, h))
 
 
+def line_mask(text, px, weight, ss=4):
+    """A line of text with descenders as ink from 0 to 1, and the row of its baseline in it."""
+    font = ImageFont.truetype(ARGS.jost, int(round(px * ss)), layout_engine=ImageFont.Layout.BASIC)
+    font.set_variation_by_axes([weight])
+    ascent, descent = font.getmetrics()
+    w = -(-(int(np.ceil(font.getlength(text))) + 4 * ss) // ss) * ss
+    base = -(-(ascent + 2 * ss) // ss) * ss
+    h = -(-(base + descent + 2 * ss) // ss) * ss
+    img = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(img).text((2 * ss, base), text, font=font, fill=255, anchor="ls")
+    a = np.asarray(img, dtype=np.float64).reshape(h // ss, ss, w // ss, ss).mean(axis=(1, 3)) / 255.0
+    return a, base // ss
+
+
+def notice(h):
+    """The splash screen of a screen of h lines with the notice "one display" on a card under the name:
+    a picture of a screen at its left, whose corner has the point of first light, and the notice in
+    English and in Spanish. The rest is the splash screen as it is, so that only the card appears."""
+    w = 2 * int(0.625 * h)
+    s = h / 1080.0
+    img = tall(w, h)
+    x0, y0, pw, ph = 70 * s, 830 * s, w - 140 * s, 190 * s
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64) + 0.5
+    r = 22 * s
+    qx = np.clip(np.abs(xx - (x0 + pw / 2)) - (pw / 2 - r), 0, None)
+    qy = np.clip(np.abs(yy - (y0 + ph / 2)) - (ph / 2 - r), 0, None)
+    d = np.hypot(qx, qy)
+    inside = np.clip(r - d + 0.5, 0, 1)
+    img = img * (1 - inside[..., None]) + inside[..., None] * PLATE
+    # its border, lit from the upper right as the rim of the mark is
+    rim = np.clip(1 - np.abs(d - (r - 0.75)) / 0.9, 0, 1) * (inside > 0)
+    lit = np.clip((xx - x0) / pw, 0, 1) * np.clip(1 - (yy - y0) / ph, 0, 1)
+    a = rim * (0.12 + 0.45 * lit)
+    img = img * (1 - a[..., None]) + SILVER[None, None, :] * a[..., None]
+    # a screen: its frame, its stand, and the point of first light at its upper right corner
+    cx, cy, fw, fh = x0 + 92 * s, y0 + ph / 2 - 6 * s, 92 * s, 58 * s
+    fq = np.hypot(np.clip(np.abs(xx - cx) - (fw / 2 - 6 * s), 0, None), np.clip(np.abs(yy - cy) - (fh / 2 - 6 * s), 0, None))
+    frame = np.clip(1 - np.abs(fq - 6 * s) / (1.6 * s), 0, 1)
+    stand = ((np.abs(xx - cx) < 20 * s) & (np.abs(yy - (cy + fh / 2 + 12 * s)) < 1.4 * s)).astype(float)
+    neck = ((np.abs(xx - cx) < 1.4 * s) & (yy > cy + fh / 2) & (yy < cy + fh / 2 + 12 * s)).astype(float)
+    m = np.maximum(frame, np.maximum(stand, neck)) * 0.85
+    img = img * (1 - m[..., None]) + SILVER[None, None, :] * m[..., None]
+    q = np.hypot(xx - (cx + fw / 2 - 6 * s), yy - (cy - fh / 2 + 6 * s))
+    dot = np.clip(np.clip(4.5 * s - q + 0.5, 0, 1) + 0.5 * np.exp(-q / (6 * s)) * (q > 4.5 * s), 0, 1)
+    img = img * (1 - dot[..., None]) + WARM[None, None, :] * dot[..., None]
+    y = y0 + 58 * s
+    lines = ((NOTICE_EN[0], 23, NOTICE_TEXT, 400), (NOTICE_EN[1], 23, NOTICE_TEXT, 400),
+             (NOTICE_ES[0], 19, NOTICE_SOFT, 340), (NOTICE_ES[1], 19, NOTICE_SOFT, 340))
+    for i, (text, px, colour, weight) in enumerate(lines):
+        ink, base = line_mask(text, px * s, weight)
+        x, top = int(round(x0 + 180 * s)), int(round(y)) - base
+        if x + ink.shape[1] > x0 + pw:
+            raise SystemExit("the notice does not fit its card at %d lines" % h)
+        part = img[top:top + ink.shape[0], x:x + ink.shape[1]]
+        part[:] = part * (1 - ink[..., None]) + colour[None, None, :] * ink[..., None]
+        y += (32 if i != 1 else 44) * s
+    return to8(img)
+
+
+def smaller(path):
+    """A PNG written again by zopflipng, only where it is smaller and every pixel is the same, which is
+    checked here (the notices: they go into the system, 5 MB as Pillow writes them)."""
+    tmp = path + ".z.png"
+    subprocess.run([ARGS.zopflipng, "-y", path, tmp], check=True, stdout=subprocess.DEVNULL)
+    a = np.asarray(Image.open(path).convert("RGBA"))
+    b = np.asarray(Image.open(tmp).convert("RGBA"))
+    if a.shape != b.shape or not (a == b).all():
+        raise SystemExit("zopflipng changed a pixel of " + path)
+    if os.path.getsize(tmp) < os.path.getsize(path):
+        os.replace(tmp, path)
+    else:
+        os.remove(tmp)
+
+
 def main():
     global ARGS
     p = argparse.ArgumentParser()
     p.add_argument("--jost", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--zopflipng", help="zopflipng, to make the notices smaller without changing a pixel")
     ARGS = p.parse_args()
 
     # what Kodi installs in its media folder
@@ -331,6 +419,13 @@ def main():
     # the settings add-on of LibreELEC: the logo at the foot of its window, and the side of its wizard
     save("settings/logo.png", white(wide(440, 128)), optimize=True)
     save("settings/wizard.png", panel(*WIZARD), optimize=True)
+
+    # the notice "one display", for each height of the start (last: the pictures above are the same
+    # whether or not these are made)
+    for h in BOOT_HEIGHTS:
+        save("notice/notice-%d.png" % h, notice(h), optimize=True)
+        if ARGS.zopflipng:
+            smaller(os.path.join(ARGS.out, "notice/notice-%d.png" % h))
 
 
 if __name__ == "__main__":

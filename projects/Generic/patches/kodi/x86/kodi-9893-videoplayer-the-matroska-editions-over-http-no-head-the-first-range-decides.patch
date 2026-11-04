@@ -1,0 +1,357 @@
+From d8007fec7126b8cfa013bdf683abc73de4e46eaa Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:56:39 +0000
+Subject: [PATCH] VideoPlayer: the Matroska editions over HTTP: no HEAD, the
+ first range decides
+
+The reading by byte ranges of the commit before began with a HEAD. It
+now begins with the GET of the first range, "Range: bytes=0-65535":
+
+- A 206 with a Content-Range that gives the length of the file goes on
+  as before; its body is the first range, which the reader takes without
+  asking again. So every Matroska file over HTTP costs one request less
+  (a file with its Chapters at the start, one request in all), and a
+  server that refuses HEAD (405 or 403, as some CDNs) is read as any
+  other.
+- Any other answer of a 2xx status (a 200 with the whole file, with or
+  without Accept-Ranges) is cut at the end of its headers, in the header
+  callback, before curl passes anything of its body: the reading ends
+  and kodi.log says that the server does not send byte ranges. A later
+  range that is not the part asked is cut there too; a redirection is
+  followed, and an HTTP error still ends the transfer by itself.
+
+Measured on the host, against the local server of the test, on its
+loopback and on one made as the internet (MTU 1500, 40 ms of round
+trip): a server that answers the first range of a 43 MB file with a 200
+is cut with no byte of its body passed by curl; about 17 KB crossed the
+network in all, both ways, the request and the packet headers counted
+(17178 and 17338 bytes); the server's kernel took 16 and 96 KiB of its
+writes before the connection closed. The requests of each case are one
+fewer; a server that refuses HEAD is read; a mutation that reads the
+body of a 200 makes the test fail (17 of 17). Not run in Kodi on a
+device.
+---
+ xbmc/cores/VideoPlayer/MatroskaHttpRange.h | 168 +++++++++++----------
+ 1 file changed, 87 insertions(+), 81 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/MatroskaHttpRange.h b/xbmc/cores/VideoPlayer/MatroskaHttpRange.h
+index 873f6ff..85375f3 100644
+--- a/xbmc/cores/VideoPlayer/MatroskaHttpRange.h
++++ b/xbmc/cores/VideoPlayer/MatroskaHttpRange.h
+@@ -13,12 +13,13 @@
+ // player's own opening of the file takes next, DllLibCurlGlobal::easy_acquire(), so that it finds
+ // the connection open in the multi handle). One request at a time, each answered as asked or the
+ // reading ends there: nothing is ever asked again.
+-// - First a HEAD with "Range: bytes=0-N": the server accepts byte ranges if it answers 206 with a
+-//   Content-Range that gives the length of the file, or 200 with "Accept-Ranges: bytes" and a
+-//   Content-Length. Otherwise nothing more is asked: no byte of the file is downloaded.
++// - The first request is the GET of the first range, "Range: bytes=0-65535": the server accepts
++//   byte ranges if it answers 206 with a Content-Range that gives the length of the file. Any other
++//   answer (a 200 with the whole file) is cut at the end of its headers, before its body: nothing
++//   of the file is taken.
+ // - Then GETs of bounded ranges, each of which must be a 206 of exactly that range of a file of
+-//   that length, without a content coding; a body that is anything else is refused at its first
+-//   byte, and one longer than asked where it passes that length.
++//   that length, without a content coding; anything else is cut at the end of its headers, and a
++//   body longer than asked where it passes that length.
+ // - An HTTP error (429, 403...) or a network error ends the reading. stop() (the user, Kodi
+ //   closing) and the deadline end it within 100 ms; the transfer then closes its connection.
+ // Pure but for libcurl, so that a host test runs it against a local server.
+@@ -29,6 +30,7 @@
+ #include <curl/curl.h>
+ #undef CURL
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -43,10 +45,10 @@ namespace MKV_EDITIONS::HTTP
+ enum class Failure
+ {
+   NONE,
+-  NO_RANGES, //!< the server does not say it accepts byte ranges: nothing was downloaded
++  NO_RANGES, //!< the server answered the first range with the whole file: cut at its headers
+   HTTP_ERROR, //!< an HTTP error (429, 403...): not asked again
+   NETWORK, //!< a network error: not tried again
+-  NOT_THE_PART, //!< an answer that is not the range asked: refused at its first byte
++  NOT_THE_PART, //!< not the range asked: cut at its headers, or where it passes the length asked
+   STOPPED, //!< the caller stopped it
+   LATE, //!< the deadline
+ };
+@@ -67,28 +69,17 @@ public:
+   {
+   }
+ 
+-  //! The HEAD: true when the server accepts byte ranges (and Size() is known)
++  //! The first range, [0, firstBytes): true when the server sends it as a part (and Size() is
++  //! known); it is kept, and Fetch() gives it without asking again
+   bool Begin(int64_t firstBytes)
+   {
+-    Transfer t{this, true, 0, firstBytes, nullptr};
++    Transfer t{this, 0, firstBytes, &m_first, true};
+     if (!Perform(t))
+       return false;
+-    if (!Identity(t.response.contentEncoding))
+-      return Fail(Failure::NO_RANGES, "the server sends the file with a content coding");
+-    int64_t from = 0;
+-    int64_t to = 0;
+-    int64_t total = 0;
+-    if (t.response.status == 206 && ContentRange(t.response.contentRange, from, to, total) &&
+-        from == 0 && total > 0)
+-      m_size = total;
+-    else if (t.response.status == 200 && AcceptsBytes(t.response.acceptRanges) &&
+-             t.response.contentLength > 0)
+-      m_size = t.response.contentLength;
+-    else
+-      return Fail(Failure::NO_RANGES,
+-                  "the server does not accept byte ranges (HTTP " +
+-                      std::to_string(t.response.status) +
+-                      ", no part and no Accept-Ranges): nothing was downloaded");
++    if (static_cast<int64_t>(m_first.size()) != t.length)
++      return Fail(Failure::NOT_THE_PART, "the server sent " + std::to_string(m_first.size()) +
++                                             " of the " + std::to_string(t.length) +
++                                             " bytes of the first range");
+     // the place the file is, after redirections, for the ranges (as CCurlFile::Open() keeps it)
+     char* effective = nullptr;
+     if (curl_easy_getinfo(m_easy, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK && effective &&
+@@ -100,9 +91,14 @@ public:
+   bool Fetch(int64_t offset, int64_t length, std::string& out) override
+   {
+     out.clear();
++    if (offset >= 0 && length > 0 && offset + length <= static_cast<int64_t>(m_first.size()))
++    {
++      out = m_first.substr(static_cast<size_t>(offset), static_cast<size_t>(length));
++      return true;
++    }
+     if (length <= 0 || m_size <= 0 || offset < 0 || offset + length > m_size)
+       return Fail(Failure::NOT_THE_PART, "a range outside the file");
+-    Transfer t{this, false, offset, length, &out};
++    Transfer t{this, offset, length, &out, false};
+     if (!Perform(t))
+       return false;
+     if (static_cast<int64_t>(out.size()) != length)
+@@ -113,7 +109,7 @@ public:
+ 
+   int64_t Size() const { return m_size; }
+   int Requests() const { return m_requests; }
+-  int64_t Bytes() const { return m_bytes; } //!< bodies received
++  int64_t Bytes() const { return m_bytes; } //!< bodies taken
+   Failure GetFailure() const { return m_failure; }
+   long Status() const { return m_status; }
+   const std::string& Why() const { return m_why; }
+@@ -122,22 +118,27 @@ private:
+   struct Response
+   {
+     long status = 0;
+-    std::string acceptRanges;
+     std::string contentRange;
+     std::string contentEncoding;
+-    int64_t contentLength = -1;
++  };
++
++  enum class Cut
++  {
++    NONE,
++    HEADERS, //!< not the part asked: cut at the end of its headers
++    LONGER, //!< a body longer than asked: cut where it passed it
+   };
+ 
+   struct Transfer
+   {
+     RangeSource* self;
+-    bool head;
+     int64_t offset;
+-    int64_t length;
+-    std::string* out; // nullptr for the HEAD
++    int64_t length; // of the first range: as much of the file as there is, once it is known
++    std::string* out;
++    bool first;
+     Response response{};
+-    bool checked = false;
+-    bool refused = false;
++    bool accepted = false;
++    Cut cut = Cut::NONE;
+   };
+ 
+   static std::string_view Trim(std::string_view s)
+@@ -155,20 +156,6 @@ private:
+     return coding.empty() || HEADER::DETAIL::SameNoCase(coding, "identity");
+   }
+ 
+-  static bool AcceptsBytes(std::string_view value)
+-  {
+-    while (!value.empty())
+-    {
+-      const size_t comma = value.find(',');
+-      if (HEADER::DETAIL::SameNoCase(Trim(value.substr(0, comma)), "bytes"))
+-        return true;
+-      if (comma == std::string_view::npos)
+-        break;
+-      value.remove_prefix(comma + 1);
+-    }
+-    return false;
+-  }
+-
+   static bool Number(std::string_view s, int64_t& out)
+   {
+     if (s.empty() || s.size() > 18)
+@@ -199,14 +186,27 @@ private:
+            Number(value.substr(slash + 1), total) && from <= to && to < total;
+   }
+ 
+-  bool IsThePart(const Response& r, int64_t offset, int64_t length) const
++  //! At the end of the headers of the answer: a 206 of the range asked, without a content coding.
++  //! For the first range the length of the file is known here: the part is the start of the file,
++  //! as much of it as was asked or as there is.
++  bool IsThePart(Transfer& t)
+   {
++    const Response& r = t.response;
+     int64_t from = 0;
+     int64_t to = 0;
+     int64_t total = 0;
+-    return r.status == 206 && Identity(r.contentEncoding) &&
+-           ContentRange(r.contentRange, from, to, total) && from == offset &&
+-           to == offset + length - 1 && total == m_size;
++    if (r.status != 206 || !Identity(r.contentEncoding) ||
++        !ContentRange(r.contentRange, from, to, total))
++      return false;
++    if (t.first)
++    {
++      if (from != 0 || to != std::min(t.length, total) - 1)
++        return false;
++      m_size = total;
++      t.length = to + 1;
++      return true;
++    }
++    return from == t.offset && to == t.offset + t.length - 1 && total == m_size;
+   }
+ 
+   static size_t OnHeader(char* buffer, size_t size, size_t count, void* user)
+@@ -214,10 +214,27 @@ private:
+     auto* t = static_cast<Transfer*>(user);
+     const size_t n = size * count;
+     const std::string_view line = Trim(std::string_view(buffer, n));
++    if (line.empty())
++    {
++      // the end of the headers of an answer: a redirection is followed and an error ends the
++      // transfer by itself (CURLOPT_FAILONERROR); anything else must be the part asked, or the
++      // transfer is cut here, before its body
++      const long status = t->response.status;
++      if (status < 200 || status >= 300)
++        return n;
++      if (!t->self->IsThePart(*t))
++      {
++        t->cut = Cut::HEADERS;
++        return 0;
++      }
++      t->accepted = true;
++      return n;
++    }
+     if (line.substr(0, 5) == "HTTP/")
+     {
+-      // a new response (after a redirection, or the 206 after nothing): its own headers only
++      // a new answer (after a redirection): its own headers only
+       t->response = Response{};
++      t->accepted = false;
+       const size_t space = line.find(' ');
+       int64_t status = 0;
+       if (space != std::string_view::npos && Number(line.substr(space + 1, 3), status))
+@@ -229,18 +246,10 @@ private:
+       return n;
+     const std::string_view name = Trim(line.substr(0, colon));
+     const std::string_view value = Trim(line.substr(colon + 1));
+-    if (HEADER::DETAIL::SameNoCase(name, "accept-ranges"))
+-      t->response.acceptRanges = std::string(value);
+-    else if (HEADER::DETAIL::SameNoCase(name, "content-range"))
++    if (HEADER::DETAIL::SameNoCase(name, "content-range"))
+       t->response.contentRange = std::string(value);
+     else if (HEADER::DETAIL::SameNoCase(name, "content-encoding"))
+       t->response.contentEncoding = std::string(value);
+-    else if (HEADER::DETAIL::SameNoCase(name, "content-length"))
+-    {
+-      int64_t length = 0;
+-      if (Number(value, length))
+-        t->response.contentLength = length;
+-    }
+     return n;
+   }
+ 
+@@ -250,23 +259,14 @@ private:
+   {
+     auto* t = static_cast<Transfer*>(user);
+     const size_t n = size * count;
+-    if (!t->out)
++    if (!t->out || !t->accepted)
+     {
+-      t->refused = true;
++      t->cut = Cut::HEADERS;
+       return 0;
+     }
+-    if (!t->checked)
+-    {
+-      t->checked = true;
+-      if (!t->self->IsThePart(t->response, t->offset, t->length))
+-      {
+-        t->refused = true;
+-        return 0;
+-      }
+-    }
+     if (static_cast<int64_t>(t->out->size() + n) > t->length)
+     {
+-      t->refused = true;
++      t->cut = Cut::LONGER;
+       return 0;
+     }
+     t->out->append(buffer, n);
+@@ -299,10 +299,7 @@ private:
+     const std::string range =
+         std::to_string(t.offset) + "-" + std::to_string(t.offset + t.length - 1);
+     curl_easy_setopt(m_easy, CURLOPT_URL, m_url.c_str());
+-    if (t.head)
+-      curl_easy_setopt(m_easy, CURLOPT_NOBODY, 1L);
+-    else
+-      curl_easy_setopt(m_easy, CURLOPT_HTTPGET, 1L);
++    curl_easy_setopt(m_easy, CURLOPT_HTTPGET, 1L);
+     curl_easy_setopt(m_easy, CURLOPT_RANGE, range.c_str());
+     curl_easy_setopt(m_easy, CURLOPT_ACCEPT_ENCODING, "identity");
+     curl_easy_setopt(m_easy, CURLOPT_FAILONERROR, 1L);
+@@ -363,9 +360,17 @@ private:
+       return Fail(Failure::LATE, "not within the deadline");
+     if (!done)
+       return Fail(Failure::NETWORK, "curl ended the request without a result");
+-    if (t.refused)
++    if (t.cut == Cut::HEADERS && t.first && status != 206)
++      return Fail(Failure::NO_RANGES,
++                  "the server answered the first range with HTTP " + std::to_string(status) +
++                      ": it does not send byte ranges; cut at its headers, nothing of the file "
++                      "taken");
++    if (t.cut == Cut::HEADERS)
+       return Fail(Failure::NOT_THE_PART, "the server answered HTTP " + std::to_string(status) +
+-                                             " without the range asked: refused at its first byte");
++                                             " without the range asked: cut at its headers");
++    if (t.cut == Cut::LONGER)
++      return Fail(Failure::NOT_THE_PART,
++                  "the server sent more than the range asked: cut where it passed it");
+     if (result == CURLE_OK)
+       return true;
+     if (result == CURLE_HTTP_RETURNED_ERROR)
+@@ -382,6 +387,7 @@ private:
+   std::string m_url;
+   std::function<bool()> m_stop;
+   std::chrono::steady_clock::time_point m_deadline;
++  std::string m_first; //!< the first range, as Begin() read it
+   int64_t m_size = 0;
+   int m_requests = 0;
+   int64_t m_bytes = 0;
+@@ -396,7 +402,7 @@ struct Read
+   Failure failure = Failure::NONE;
+   std::string why; //!< of the failure
+   int requests = 0;
+-  int64_t bytes = 0; //!< bodies received
++  int64_t bytes = 0; //!< bodies taken
+   int64_t size = 0; //!< of the file, as the server gave it
+ };
+ 
+-- 
+2.53.0
+

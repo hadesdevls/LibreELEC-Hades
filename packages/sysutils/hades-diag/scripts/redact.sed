@@ -3,12 +3,14 @@
 #
 # Hades diagnostics: remove credentials from logs before they are written to the boot partition (busybox sed -E).
 # redact.sh runs it after redact-ids.awk, which has put markers in the place of the addresses of the network,
-# serial numbers, UUIDs, SSH keys, network names and the name of the system, and has cut down an address or a
-# path of media that ends with the name of a media file over the spaces in it.
+# serial numbers, UUIDs, SSH keys, network names and the name of the system, has put a marker in the place of
+# each name of a path of a drive, of a media folder of /storage and of a share of the network (with "{/}" or
+# ":{//}" where its first slashes go, so that the rules here leave it as it is), and has cut down another
+# address that ends with the name of a media file over the spaces in it.
 # Network and add-on URLs keep only their scheme and host (also with their slashes escaped, as in JSON; of one
 # that is percent-encoded inside something else, only the scheme); one with a query goes up to the end of its
-# line, or to the first quote or angle bracket (add-ons write a search into a query with its spaces). Paths of
-# media (under /var/media, /media, /mnt, /run/media and the media folders of /storage) keep only that folder.
+# line, or to the first quote or angle bracket (add-ons write a search into a query with its spaces). A path of
+# media that redact-ids.awk has not marked (this file run by itself) keeps only its first folder.
 # E-mail addresses go (but the names of systemd units, as modprobe@drm.service); the users of a configuration
 # of Samba; a line from its authorization or cookie header on, and from anything named like a password on;
 # the values of anything named like a key, a token, a secret, a session or a code (also between tags, and with
@@ -29,8 +31,8 @@
 # go through the rules as they always did.
 /^.{32767}/s~.*~[left out, a line of 32767 characters or more]~
 /[A-Za-z]{256,}/s~.*~[left out, a line with a run of 256 characters or more]~
-# (an address or a path of media that ends with the name of a media file, over the spaces in it, redact-ids.awk
-# has cut down already, with "{//}" or "{/}" where "//" or "/" goes: the rules for other addresses and paths
+# (a path whose names redact-ids.awk has marked, and an address that ends with the name of a media file, over the
+# spaces in it, that it has cut down, have "{//}" or "{/}" where "//" or "/" goes: the rules for other addresses and paths
 # do not take it again, and the last two of these rules put the slashes back. An address with a query goes up
 # to the end of its line, or to the first quote or angle bracket: a query can have spaces in it)
 s~(https?|rtmp[a-z]*|rtsp[a-z]*|mms[a-z]*|smb|nfs|s?ftps?|ssh|davs?|webdavs?|wss?|udp|rtp|upnp|plugin):(\\?/){2}([^/@ "'<>\\]*@)?([^/:? "'<>\\]+)[^ "'<>]*\?[^"'<>]*~\1://\4/[redacted]~Ig

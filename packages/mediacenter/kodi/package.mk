@@ -8,7 +8,7 @@ PKG_SHA256="5fcb34a6541199426522c72bcc211b6e0a78d59e23ca1b4b6b04cd618ee4712d"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="http://www.kodi.tv"
 PKG_URL="https://github.com/xbmc/xbmc/archive/${PKG_VERSION}.tar.gz"
-PKG_DEPENDS_TARGET="toolchain libplacebo JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
+PKG_DEPENDS_TARGET="toolchain plymouth-lite libplacebo JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
 PKG_DEPENDS_UNPACK="commons-lang3 commons-text groovy"
 PKG_DEPENDS_HOST="toolchain"
 PKG_LONGDESC="A free and open source cross-platform media player."
@@ -145,8 +145,9 @@ configure_package() {
   fi
 
   if [ "${KODI_BLURAY_SUPPORT}" = yes ]; then
-    # Hades: and the Java part of the same libbluray, for BD-J menus with a Java runtime add-on
-    PKG_DEPENDS_TARGET+=" libbluray libbluray-bdj"
+    # Hades: and the Java part of the same libbluray, and the isolated service in which the Java
+    # (BD-J) menus of a disc run, with its own Java runtime (hades-bdj)
+    PKG_DEPENDS_TARGET+=" libbluray libbluray-bdj hades-bdj"
     KODI_BLURAY="-DENABLE_BLURAY=ON"
   else
     KODI_BLURAY="-DENABLE_BLURAY=OFF"
@@ -332,6 +333,10 @@ post_patch() {
   # which GNU patch cannot add, packed into Textures.xbt with the rest of the skin media.
   cp ${PKG_DIR}/hades/processinfo.png \
      ${PKG_BUILD}/addons/skin.estuary/media/osd/fullscreen/buttons/processinfo.png
+  # Hades: texture of the button of the Estuary OSD that opens "Dolby Vision output (this video)"
+  # (PlayerControl(HadesDVOutput)), drawn by hades/make-dvoutput-icon.py, the same way
+  cp ${PKG_DIR}/hades/dvoutput.png \
+     ${PKG_BUILD}/addons/skin.estuary/media/osd/fullscreen/buttons/dvoutput.png
 }
 
 pre_configure_target() {
@@ -382,6 +387,9 @@ post_makeinstall_target() {
   mkdir -p ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-config ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-display-notice ${INSTALL}/usr/lib/kodi
+  # Hades: the notice "one display" as a picture (brand/notice), which kodi-display-notice draws
+  mkdir -p ${INSTALL}/usr/lib/kodi/notice
+  cp ${PKG_DIR}/brand/notice/notice-*.png ${INSTALL}/usr/lib/kodi/notice
   cp ${PKG_DIR}/scripts/kodi-safe-mode ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi.sh ${INSTALL}/usr/lib/kodi
 

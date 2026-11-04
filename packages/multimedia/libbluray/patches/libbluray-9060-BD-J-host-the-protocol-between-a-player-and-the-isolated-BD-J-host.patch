@@ -1,0 +1,585 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:52:29 +0000
+Subject: [PATCH] BD-J host: the protocol between a player and the isolated
+ BD-J host
+
+The Java code of a Blu-ray disc (BD-J) is a program the disc brings. libbluray ran it in the
+player's process, kept to the disc by its own security manager, which Java 24 removed (JEP 486)
+and Java 18 to 23 keep only on request: on those, libbluray 1.5's way of installing it leaves
+none in force, and a disc reads the files of the player. A security manager does not keep a disc
+away from the player's memory either (the JVM, its image decoders and libbluray's JNI code run
+in that process). LibreELEC Hades runs BD-J in a process of its own instead, isolated by the
+system, with the Java of the image; the player keeps libbluray for everything else.
+
+This is the protocol between the two (src/libbluray/remote/bdr_protocol.h) and its framing
+(bdr_wire.c): one SOCK_STREAM connection per disc, which is what a systemd socket with Accept=yes
+hands to one host; messages with a header (magic, type, flags, id, length) and at most 256 KiB of
+payload, 128 KiB of stream or file data; the shared memory of the ARGB planes passed with
+SCM_RIGHTS, on the opening message only. Both ends are the same build of libbluray: the hello
+checks the version and the layouts of the messages. Everything that comes from the host is
+treated as hostile by the player: a message the framing does not allow (bad magic, a length over
+the limit, a descriptor where none is expected) ends the connection, and the descriptors that
+come with one are closed.
+---
+ src/libbluray/remote/bdr_protocol.h | 254 ++++++++++++++++++++++++++++
+ src/libbluray/remote/bdr_wire.c     | 227 +++++++++++++++++++++++++
+ src/libbluray/remote/bdr_wire.h     |  51 ++++++
+ 3 files changed, 532 insertions(+)
+ create mode 100644 src/libbluray/remote/bdr_protocol.h
+ create mode 100644 src/libbluray/remote/bdr_wire.c
+ create mode 100644 src/libbluray/remote/bdr_wire.h
+
+diff --git a/src/libbluray/remote/bdr_protocol.h b/src/libbluray/remote/bdr_protocol.h
+new file mode 100644
+index 0000000..577683d
+--- /dev/null
++++ b/src/libbluray/remote/bdr_protocol.h
+@@ -0,0 +1,254 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * The protocol between libbluray in a player (the client) and the isolated BD-J host (the
++ * server, hades-bdj-host), one connection per disc.
++ *
++ * A disc with BD-J titles plays with its menus in the host: at bd_play() the client opens the
++ * disc there too and from then on forwards every call that reads or changes the playback state.
++ * What only reads the disc (titles, playlists, clip information, metadata, sound effects, files)
++ * stays in the client, which parses its own copy as before. The host reads the disc only
++ * through the client: file and directory requests, served read-only from the client's disc with
++ * checked paths. It draws the ARGB (BD-J) planes into a shared memory that the client created
++ * and sealed, sends the HDMV overlays inline, and sends its log lines.
++ *
++ * Everything that comes from the host is hostile to the client: the host runs the Java code of
++ * the disc. Every length, count, plane, command, rectangle and string is checked before use,
++ * and anything the protocol does not allow ends the connection.
++ *
++ * Transport: one SOCK_STREAM connection (what a systemd socket with Accept=yes hands to one
++ * host), messages framed by BDR_HDR, at most BDR_MAX_PAYLOAD bytes each. The shared memory is
++ * passed with SCM_RIGHTS on the BDR_OPEN message, and only there. Both ends are the same build of
++ * libbluray on the same machine: native byte order and the layouts below; BDR_HELLO checks the
++ * version and the layouts.
++ */
++
++#ifndef BDR_PROTOCOL_H_
++#define BDR_PROTOCOL_H_
++
++#include <stdint.h>
++
++#define BDR_MAGIC        0x31524442u   /* "BDR1" */
++#define BDR_VERSION      1
++
++#define BDR_MAX_PAYLOAD  (256 * 1024)  /* bytes after the header, any message */
++#define BDR_MAX_DATA     (128 * 1024)  /* stream or file bytes in one message */
++#define BDR_MAX_PATH     1024          /* a path on the disc, with its terminating NUL */
++#define BDR_MAX_STRING   256           /* a string argument, with its terminating NUL */
++#define BDR_MAX_LOG      512           /* a line of the host's log */
++#define BDR_MAX_HANDLES  256           /* files and directories the host keeps open */
++
++/* ARGB planes in the shared memory: PG, IG (BD-J graphics) and BG (background), each of the
++   largest BD-J graphics plane (1920x1080), rows of BDR_PLANE_W pixels */
++#define BDR_PLANES       3
++#define BDR_PLANE_W      1920
++#define BDR_PLANE_H      1080
++#define BDR_SHM_PLANE    ((uint64_t)BDR_PLANE_W * BDR_PLANE_H * 4)
++#define BDR_SHM_SIZE     (BDR_SHM_PLANE * BDR_PLANES)
++
++/* HDMV overlays: the PG/IG planes of HDMV are at most 1920x1080 */
++#define BDR_OVL_MAX_W    1920
++#define BDR_OVL_MAX_H    1080
++
++typedef struct {
++    uint32_t magic;
++    uint16_t type;
++    uint16_t flags;
++    uint32_t id;
++    uint32_t len;     /* payload bytes after the header */
++} BDR_HDR;
++
++enum {
++    /* client -> host */
++    BDR_HELLO = 1,    /* BDR_HELLO_MSG                       -> BDR_HELLO_OK */
++    BDR_SETTING,      /* BDR_SETTING_MSG, before and after the opening; no answer */
++    BDR_OPEN,         /* BDR_OPEN_MSG + the shared memory    -> BDR_OPEN_OK */
++    BDR_CALL,         /* BDR_CALL_MSG                        -> BDR_REPLY, same id */
++    BDR_FILE_REPLY,   /* BDR_FILE_REPLY_MSG + data, the id of the host's request */
++    BDR_ARGB_ACK,     /* the pixels of a BDR_ARGB were copied, its id */
++    BDR_CLOSE,        /* the disc is closed: the host ends */
++
++    /* host -> client */
++    BDR_HELLO_OK = 0x80, /* BDR_HELLO_MSG */
++    BDR_OPEN_OK,      /* BDR_OPEN_OK_MSG */
++    BDR_REPLY,        /* BDR_REPLY_MSG + data */
++    BDR_FILE_OPEN,    /* BDR_PATH_MSG   -> ret: handle, value: size; ret < 0: not opened */
++    BDR_FILE_READ,    /* BDR_READ_MSG   -> ret: bytes (the data), < 0: error */
++    BDR_FILE_CLOSE,   /* BDR_HANDLE_MSG, no answer */
++    BDR_DIR_OPEN,     /* BDR_PATH_MSG   -> ret: handle; ret < 0: not opened */
++    BDR_DIR_READ,     /* BDR_HANDLE_MSG -> ret 0: an entry (its name is the data), 1: the end, < 0: error */
++    BDR_DIR_CLOSE,    /* BDR_HANDLE_MSG, no answer */
++    BDR_OVERLAY,      /* BDR_OVERLAY_MSG + palette + RLE (HDMV); flags BDR_F_SYNC: drawn during the call id */
++    BDR_ARGB,         /* BDR_ARGB_MSG; DRAW: the pixels in the shared memory -> BDR_ARGB_ACK */
++    BDR_LOG,          /* a line of the host's log (text, no NUL) */
++};
++
++#define BDR_F_SYNC   0x0001
++
++/* calls (BDR_CALL_MSG.op) */
++enum {
++    BDR_OP_SELECT_TITLE = 1,        /* a0 title idx */
++    BDR_OP_SELECT_PLAYLIST,         /* a0 playlist */
++    BDR_OP_GET_CURRENT_TITLE,
++    BDR_OP_READ,                    /* a0 len */
++    BDR_OP_SEEK,                    /* a0 pos */
++    BDR_OP_SEEK_TIME,               /* a0 tick */
++    BDR_OP_SEEK_CHAPTER,            /* a0 chapter */
++    BDR_OP_SEEK_MARK,               /* a0 mark */
++    BDR_OP_SEEK_PLAYITEM,           /* a0 clip ref */
++    BDR_OP_SELECT_ANGLE,            /* a0 angle */
++    BDR_OP_SEAMLESS_ANGLE_CHANGE,   /* a0 angle */
++    BDR_OP_SELECT_STREAM,           /* a0 type, a1 id, a2 enable */
++    BDR_OP_CHAPTER_POS,             /* a0 chapter */
++    BDR_OP_GET_CURRENT_CHAPTER,
++    BDR_OP_GET_TITLE_SIZE,
++    BDR_OP_GET_CURRENT_ANGLE,
++    BDR_OP_TELL,
++    BDR_OP_TELL_TIME,
++    BDR_OP_SET_PLAYER_SETTING,      /* a0 idx, a1 value */
++    BDR_OP_SET_PLAYER_SETTING_STR,  /* a0 idx, string */
++    BDR_OP_GET_EVENT,
++    BDR_OP_PLAY,
++    BDR_OP_PLAY_TITLE,              /* a0 title */
++    BDR_OP_MENU_CALL,               /* a0 pts */
++    BDR_OP_READ_EXT,                /* a0 len */
++    BDR_OP_READ_SKIP_STILL,
++    BDR_OP_SET_SCR,                 /* a0 pts */
++    BDR_OP_SET_RATE,                /* a0 rate */
++    BDR_OP_USER_INPUT,              /* a0 pts, a1 key */
++    BDR_OP_MOUSE_SELECT,            /* a0 pts, a1 x, a2 y */
++    BDR_OP_START_BDJ,               /* string: start object */
++    BDR_OP_STOP_BDJ,
++    BDR_OP_GET_TITLES,              /* a0 flags, a1 min title length */
++    BDR_OP_CLIP_NAME,               /* a0 clip ref -> data: the 5 digits of its clip */
++    BDR_OP_REGISTER_OVERLAYS,       /* a0 HDMV overlay wanted, a1 ARGB overlay wanted */
++    /* SamuriHL's BD-J additions (libbluray-9070...); the host answers ret -1 without them */
++    BDR_OP_BDJ_WAITING_FOR_PLAYBACK,
++    BDR_OP_BDJ_SET_PRESENTATION_TIMING, /* a0 enable */
++    BDR_OP_BDJ_PENDING_SEQ,
++    BDR_OP_BDJ_RELEASE,             /* a0 seq */
++    BDR_OP_BDJ_RELEASE_ALL,
++    BDR_OP_LAST = BDR_OP_BDJ_RELEASE_ALL
++};
++
++typedef struct {
++    uint32_t version;
++    uint32_t layout;      /* BDR_LAYOUT */
++    uint32_t max_payload;
++    uint32_t pid;         /* informative */
++} BDR_HELLO_MSG;
++
++typedef struct {
++    uint32_t idx;
++    uint32_t value;
++    uint32_t is_str;
++    uint32_t slen;        /* bytes of the string that follows, its NUL included */
++    /* char s[slen] */
++} BDR_SETTING_MSG;
++
++typedef struct {
++    uint32_t debug_mask;
++    uint32_t titles_flags;   /* bd_get_titles() of the client, replayed: valid if titles_valid */
++    uint32_t titles_min;
++    uint8_t  titles_valid;
++    uint8_t  want_overlay;
++    uint8_t  want_argb;
++    uint8_t  pad;
++} BDR_OPEN_MSG;
++
++typedef struct {
++    int32_t  bluray_detected;
++    uint8_t  bdj_detected;
++    uint8_t  libjvm_detected;
++    uint8_t  bdj_handled;
++    uint8_t  first_play_supported;
++    uint8_t  top_menu_supported;
++    uint8_t  pad[3];
++    uint32_t num_titles;
++} BDR_OPEN_OK_MSG;
++
++typedef struct {
++    uint32_t op;
++    uint32_t slen;        /* bytes of the string that follows, its NUL included; 0: none */
++    int64_t  a[3];
++    /* char s[slen] */
++} BDR_CALL_MSG;
++
++typedef struct {
++    int64_t  ret;
++    uint32_t has_event;
++    uint32_t event;
++    uint32_t param;
++    uint32_t dlen;        /* bytes of data that follow */
++    /* uint8_t data[dlen] */
++} BDR_REPLY_MSG;
++
++typedef struct {
++    uint32_t plen;        /* bytes of the path that follow, its NUL included */
++    /* char path[plen] */
++} BDR_PATH_MSG;
++
++typedef struct {
++    uint32_t handle;
++} BDR_HANDLE_MSG;
++
++typedef struct {
++    uint32_t handle;
++    uint32_t len;
++    int64_t  offset;
++} BDR_READ_MSG;
++
++typedef struct {
++    int64_t  ret;
++    int64_t  value;
++    uint32_t dlen;
++    uint32_t pad;
++    /* uint8_t data[dlen] */
++} BDR_FILE_REPLY_MSG;
++
++typedef struct {
++    int64_t  pts;
++    uint8_t  null_overlay;        /* the callback was called with NULL */
++    uint8_t  plane;
++    uint8_t  cmd;
++    uint8_t  palette_update_flag;
++    uint16_t x, y, w, h;
++    uint8_t  has_palette;         /* 256 BD_PG_PALETTE_ENTRY (4 bytes each) follow */
++    uint8_t  has_img;             /* n_rle BD_PG_RLE_ELEM (4 bytes each) follow the palette */
++    uint16_t pad;
++    uint32_t n_rle;
++} BDR_OVERLAY_MSG;
++
++typedef struct {
++    int64_t  pts;
++    uint8_t  plane;
++    uint8_t  cmd;
++    uint16_t pad;
++    uint16_t x, y, w, h;   /* INIT: size of the plane; DRAW: the rectangle, in the shared memory */
++} BDR_ARGB_MSG;
++
++/* the layouts both ends must agree on */
++#define BDR_LAYOUT ((uint32_t)(sizeof(BDR_HDR) | (sizeof(BDR_SETTING_MSG) << 5) | \
++                               (sizeof(BDR_OPEN_MSG) << 10) | (sizeof(BDR_CALL_MSG) << 15) | \
++                               (sizeof(BDR_REPLY_MSG) << 20) | (sizeof(BDR_OVERLAY_MSG) << 25)) \
++                    ^ (uint32_t)((sizeof(BDR_FILE_REPLY_MSG) << 3) | (sizeof(BDR_ARGB_MSG) << 11) | \
++                                 (sizeof(BDR_READ_MSG) << 19) | (sizeof(BDR_OPEN_OK_MSG) << 24)))
++
++#endif /* BDR_PROTOCOL_H_ */
+diff --git a/src/libbluray/remote/bdr_wire.c b/src/libbluray/remote/bdr_wire.c
+new file mode 100644
+index 0000000..3a41e08
+--- /dev/null
++++ b/src/libbluray/remote/bdr_wire.c
+@@ -0,0 +1,227 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#if HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "bdr_wire.h"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint32_t id,
++             const void *p1, size_t l1, const void *p2, size_t l2,
++             const void *p3, size_t l3, int pass_fd)
++{
++    BDR_HDR hdr;
++    struct iovec iov[4];
++    int n_iov = 0, cur = 0, result = 0, first = 1;
++    size_t total = l1 + l2 + l3;
++
++    if (fd < 0 || l1 > BDR_MAX_PAYLOAD || l2 > BDR_MAX_PAYLOAD || l3 > BDR_MAX_PAYLOAD ||
++        total > BDR_MAX_PAYLOAD) {
++        return -1;
++    }
++
++    memset(&hdr, 0, sizeof(hdr));
++    hdr.magic = BDR_MAGIC;
++    hdr.type  = type;
++    hdr.flags = flags;
++    hdr.id    = id;
++    hdr.len   = (uint32_t)total;
++
++    iov[n_iov].iov_base = &hdr;
++    iov[n_iov].iov_len  = sizeof(hdr);
++    n_iov++;
++    if (l1) { iov[n_iov].iov_base = (void *)(uintptr_t)p1; iov[n_iov].iov_len = l1; n_iov++; }
++    if (l2) { iov[n_iov].iov_base = (void *)(uintptr_t)p2; iov[n_iov].iov_len = l2; n_iov++; }
++    if (l3) { iov[n_iov].iov_base = (void *)(uintptr_t)p3; iov[n_iov].iov_len = l3; n_iov++; }
++
++    pthread_mutex_lock(lock);
++
++    while (cur < n_iov) {
++        struct msghdr msg;
++        union {
++            struct cmsghdr align;
++            char buf[CMSG_SPACE(sizeof(int))];
++        } control;
++        ssize_t sent;
++
++        memset(&msg, 0, sizeof(msg));
++        msg.msg_iov    = &iov[cur];
++        msg.msg_iovlen = (size_t)(n_iov - cur);
++
++        if (first && pass_fd >= 0) {
++            struct cmsghdr *cmsg;
++            memset(&control, 0, sizeof(control));
++            msg.msg_control    = control.buf;
++            msg.msg_controllen = sizeof(control.buf);
++            cmsg = CMSG_FIRSTHDR(&msg);
++            cmsg->cmsg_level = SOL_SOCKET;
++            cmsg->cmsg_type  = SCM_RIGHTS;
++            cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
++            memcpy(CMSG_DATA(cmsg), &pass_fd, sizeof(int));
++        }
++
++        sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
++        if (sent < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            result = -1;
++            break;
++        }
++        first = 0;
++
++        /* skip what was sent */
++        while (cur < n_iov && sent > 0) {
++            if ((size_t)sent >= iov[cur].iov_len) {
++                sent -= (ssize_t)iov[cur].iov_len;
++                cur++;
++            } else {
++                iov[cur].iov_base = (char *)iov[cur].iov_base + sent;
++                iov[cur].iov_len -= (size_t)sent;
++                sent = 0;
++            }
++        }
++    }
++
++    pthread_mutex_unlock(lock);
++
++    return result;
++}
++
++/* read exactly len bytes; 0, 1 at the end of the connection, -1 on an error */
++static int _read_full(int fd, void *buf, size_t len, int *recv_fd, int *got_fd)
++{
++    size_t done = 0;
++
++    while (done < len) {
++        struct msghdr msg;
++        struct iovec iov;
++        union {
++            struct cmsghdr align;
++            char buf[CMSG_SPACE(sizeof(int))];
++        } control;
++        ssize_t n;
++
++        memset(&msg, 0, sizeof(msg));
++        iov.iov_base = (char *)buf + done;
++        iov.iov_len  = len - done;
++        msg.msg_iov    = &iov;
++        msg.msg_iovlen = 1;
++        memset(&control, 0, sizeof(control));
++        msg.msg_control    = control.buf;
++        msg.msg_controllen = sizeof(control.buf);
++
++        n = recvmsg(fd, &msg, MSG_CMSG_CLOEXEC);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (n == 0) {
++            return done ? -1 : 1;
++        }
++
++        if (msg.msg_controllen > 0) {
++            struct cmsghdr *cmsg;
++            for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++                    cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
++                    size_t i, nfd = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++                    for (i = 0; i < nfd; i++) {
++                        int rfd;
++                        memcpy(&rfd, CMSG_DATA(cmsg) + i * sizeof(int), sizeof(int));
++                        if (recv_fd && *recv_fd < 0 && !*got_fd) {
++                            *recv_fd = rfd;
++                            *got_fd = 1;
++                        } else {
++                            /* not expected here, or more than one */
++                            close(rfd);
++                            *got_fd = 2;
++                        }
++                    }
++                }
++            }
++        }
++        if (msg.msg_flags & MSG_CTRUNC) {
++            /* descriptors that did not fit were closed by the kernel */
++            *got_fd = 2;
++        }
++
++        done += (size_t)n;
++    }
++
++    return 0;
++}
++
++int bdr_recv(int fd, BDR_HDR *hdr, uint8_t **payload, int *recv_fd)
++{
++    int got_fd = 0, r;
++
++    *payload = NULL;
++    if (recv_fd) {
++        *recv_fd = -1;
++    }
++
++    r = _read_full(fd, hdr, sizeof(*hdr), recv_fd, &got_fd);
++    if (r) {
++        goto fail;
++    }
++    if (hdr->magic != BDR_MAGIC || hdr->len > BDR_MAX_PAYLOAD) {
++        r = -1;
++        goto fail;
++    }
++
++    if (hdr->len) {
++        *payload = malloc(hdr->len);
++        if (!*payload) {
++            r = -1;
++            goto fail;
++        }
++        r = _read_full(fd, *payload, hdr->len, recv_fd, &got_fd);
++        if (r) {
++            r = -1;
++            goto fail;
++        }
++    }
++
++    if (got_fd > 1 || (got_fd && !recv_fd)) {
++        r = -1;
++        goto fail;
++    }
++
++    return 0;
++
++ fail:
++    free(*payload);
++    *payload = NULL;
++    if (recv_fd && *recv_fd >= 0) {
++        close(*recv_fd);
++        *recv_fd = -1;
++    }
++    return r;
++}
+diff --git a/src/libbluray/remote/bdr_wire.h b/src/libbluray/remote/bdr_wire.h
+new file mode 100644
+index 0000000..de8fed7
+--- /dev/null
++++ b/src/libbluray/remote/bdr_wire.h
+@@ -0,0 +1,51 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/* Framing of the messages of bdr_protocol.h, for both ends */
++
++#ifndef BDR_WIRE_H_
++#define BDR_WIRE_H_
++
++#include "bdr_protocol.h"
++
++#include "util/attributes.h"
++
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/*
++ * Send one message: the header and up to three parts of payload, in one piece under *lock, so
++ * that messages from several threads never interleave. pass_fd >= 0 goes with SCM_RIGHTS.
++ * Returns 0, or -1 when the connection failed (it is then of no further use).
++ */
++BD_PRIVATE int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint32_t id,
++                        const void *p1, size_t l1, const void *p2, size_t l2,
++                        const void *p3, size_t l3, int pass_fd);
++
++/*
++ * Receive one message. *payload is allocated (free()) when hdr->len > 0, NULL otherwise.
++ * A file descriptor that comes with it is stored in *recv_fd if recv_fd is not NULL (-1 if
++ * none); with recv_fd NULL, any descriptor is closed and the message is refused.
++ * Returns 0, 1 at the end of the connection, -1 on an error or a message the framing does not
++ * allow (bad magic, payload larger than BDR_MAX_PAYLOAD).
++ */
++BD_PRIVATE int bdr_recv(int fd, BDR_HDR *hdr, uint8_t **payload, int *recv_fd);
++
++#endif /* BDR_WIRE_H_ */
+-- 
+2.53.0
+

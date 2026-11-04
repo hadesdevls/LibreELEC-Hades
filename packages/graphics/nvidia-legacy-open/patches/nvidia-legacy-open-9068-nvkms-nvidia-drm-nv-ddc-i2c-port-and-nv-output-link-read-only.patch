@@ -1,0 +1,530 @@
+From 319cc54ad5287c00c29673451795099af4b6cc55 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:04:23 +0000
+Subject: [PATCH] nvkms, nvidia-drm: NV_DDC_I2C_PORT and NV_OUTPUT_LINK,
+ read-only
+
+A client that wants to know whether a display that gave a hot-plug pulse
+lost the scrambling setup of its link (SCDC TMDS_Config, which the source
+writes only when it sets a head up: in NVIDIA's case the closed part of the
+driver) had no way to tell which I2C bus is the DDC of a connector, nor
+whether the link of its head is scrambled at all. It could only guess from
+the mode.
+
+Two read-only connector properties of nvidia-drm, from two Hades dpy
+attributes of NVKMS through KAPI (getDisplayDdcI2cPort(),
+getDisplayOutputLink()):
+
+- NV_DDC_I2C_PORT (0..255): the I2C port of the DDC of the connector's
+  display, ddcPortId - 1 of NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID (ddcPortId
+  counts from 1, 0 for none). That is the index under which the nvidia module
+  registers the adapter of the port, "NVIDIA i2c adapter <index> at
+  <bus>:<slot>.<fn>": one for each implemented and valid port, index = port,
+  and the displays of DisplayPort are added to the one of ddcPortId - 1
+  (RmI2cAddGpuPorts(), rm_i2c_add_adapter(), nv_i2c_add_adapter()). Whether
+  the module registered that one (it keeps MAX_I2C_ADAPTERS) shows in the
+  name of the adapter. Set when a display is detected on the connector, and
+  kept when it goes; 255 before that, for no port, or when RM does not say.
+- NV_OUTPUT_LINK (0..0xffffffff): how NVKMS drives the connector's display,
+  set where NV_OUTPUT_BPC is (after a commit that sets the head again); 0
+  while it drives nothing or when NVKMS does not say. Bits 0-7: 1 TMDS not
+  scrambled, 2 TMDS scrambled (a TMDS character rate above 340 MHz: the
+  pixel clock times bpc / 8 for RGB and YCbCr 4:4:4, the pixel clock for
+  4:2:2, half of it times bpc / 8 for the 4:2:0 of the hardware), 3 HDMI FRL,
+  4 DisplayPort. Bits 8-15: the HDMI_FRL_DATA_RATE of FRL (1..6), 0
+  otherwise. Bits 16-23: the pixel format, 0 RGB, 1 YCbCr 4:4:4, 2 YCbCr
+  4:2:2, 3 YCbCr 4:2:0.
+
+A link at 340 MHz or less goes as 1 even where the display declares
+scrambling at those rates: whether RM enables it there is not known from the
+open part of the driver. Nothing that goes out changes.
+---
+ kernel-open/common/inc/nvkms-kapi.h           |  30 +++++
+ kernel-open/nvidia-drm/nvidia-drm-connector.c |  29 ++++
+ kernel-open/nvidia-drm/nvidia-drm-drv.c       |  26 ++++
+ kernel-open/nvidia-drm/nvidia-drm-modeset.c   |  10 ++
+ kernel-open/nvidia-drm/nvidia-drm-priv.h      |   3 +
+ src/nvidia-modeset/interface/nvkms-api.h      |  20 +++
+ .../kapi/interface/nvkms-kapi.h               |  30 +++++
+ src/nvidia-modeset/kapi/src/nvkms-kapi.c      |  64 +++++++++
+ src/nvidia-modeset/src/nvkms-attributes.c     | 124 ++++++++++++++++++
+ 9 files changed, 336 insertions(+)
+
+diff --git a/kernel-open/common/inc/nvkms-kapi.h b/kernel-open/common/inc/nvkms-kapi.h
+index 400b641..aa2d1b2 100644
+--- a/kernel-open/common/inc/nvkms-kapi.h
++++ b/kernel-open/common/inc/nvkms-kapi.h
+@@ -1698,6 +1698,36 @@ struct NvKmsKapiFunctionsTable {
+         NvU32 *bpc
+     );
+ 
++    /*!
++     * Hades: the I2C port of the DDC of a display's connector
++     * (NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT): the index of the adapter
++     * "NVIDIA i2c adapter <index> at <bus>:<slot>.<fn>" of the nvidia module;
++     * 255 where there is none.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayDdcI2cPort)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *port
++    );
++
++    /*!
++     * Hades: how NVKMS drives a display now
++     * (NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK): 0 where no head drives it;
++     * bits 0-7 1 TMDS, 2 TMDS scrambled, 3 HDMI FRL, 4 DisplayPort; bits 8-15
++     * the FRL rate; bits 16-23 0 RGB, 1 YCbCr 4:4:4, 2 4:2:2, 3 4:2:0.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayOutputLink)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *link
++    );
++
+     /*!
+      * Hades: whether NVKMS can send an HDR10+ VSIF through a display
+      * (HDR10PLUS_VSIF of nvidia-drm): a display driven as HDMI on a GPU whose
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.c b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+index 6c79bb3..f3d8da5 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+@@ -200,6 +200,23 @@ static enum drm_connector_status __nv_drm_connector_detect_internal(
+ 
+     nv_connector->nv_detected_encoder = nv_detected_encoder;
+ 
++    /*
++     * Hades: NV_DDC_I2C_PORT, the I2C port of the DDC of the display found
++     * (NVKMS, from RM); it stays when the display goes
++     */
++    if (nv_dev->nv_connector_ddc_i2c_port_property) {
++        NvU32 port = 255;
++
++        if (!nvKms->getDisplayDdcI2cPort(nv_dev->pDevice,
++                                         nv_detected_encoder->hDisplay, &port) ||
++            (port > 255)) {
++            port = 255;
++        }
++        drm_object_property_set_value(&connector->base,
++                                      nv_dev->nv_connector_ddc_i2c_port_property,
++                                      port);
++    }
++
+     if (nv_connector->type == NVKMS_CONNECTOR_TYPE_DVI_I) {
+         drm_object_property_set_value(
+             &connector->base,
+@@ -1288,6 +1305,18 @@ nv_drm_connector_new(struct drm_device *dev,
+                                    0);
+     }
+ 
++    /* Hades: the I2C port of the DDC (NV_DDC_I2C_PORT), and the link (NV_OUTPUT_LINK) */
++    if (nv_dev->nv_connector_ddc_i2c_port_property) {
++        drm_object_attach_property(&nv_connector->base.base,
++                                   nv_dev->nv_connector_ddc_i2c_port_property,
++                                   255);
++    }
++    if (nv_dev->nv_connector_output_link_property) {
++        drm_object_attach_property(&nv_connector->base.base,
++                                   nv_dev->nv_connector_output_link_property,
++                                   0);
++    }
++
+     /* Register connector with DRM subsystem */
+ 
+     ret = drm_connector_register(&nv_connector->base);
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index ffebdca..d73a97e 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -754,6 +754,32 @@ static int nv_drm_create_properties(struct nv_drm_device *nv_dev)
+         return -ENOMEM;
+     }
+ 
++    /*
++     * Hades: read-only, on every connector. NV_DDC_I2C_PORT: the index of the
++     * I2C adapter of the DDC of its display, "NVIDIA i2c adapter <index> at
++     * <bus>:<slot>.<fn>" of the nvidia module, set when a display is detected
++     * there; 255 for none or not known. NV_OUTPUT_LINK: how NVKMS drives its
++     * display (NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK: bits 0-7 1 TMDS, 2 TMDS
++     * scrambled, 3 HDMI FRL, 4 DisplayPort; bits 8-15 the FRL rate; bits 16-23
++     * 0 RGB, 1 YCbCr 4:4:4, 2 4:2:2, 3 4:2:0), as of the last mode set
++     * committed through this device, as NV_OUTPUT_BPC; 0 while the connector
++     * drives nothing or when NVKMS does not say.
++     */
++    nv_dev->nv_connector_ddc_i2c_port_property =
++        drm_property_create_range(nv_dev->dev, DRM_MODE_PROP_IMMUTABLE,
++                                  "NV_DDC_I2C_PORT", 0, 255);
++    if (nv_dev->nv_connector_ddc_i2c_port_property == NULL) {
++        NV_DRM_LOG_ERR("Failed to create NV_DDC_I2C_PORT property");
++        return -ENOMEM;
++    }
++    nv_dev->nv_connector_output_link_property =
++        drm_property_create_range(nv_dev->dev, DRM_MODE_PROP_IMMUTABLE,
++                                  "NV_OUTPUT_LINK", 0, 0xffffffffULL);
++    if (nv_dev->nv_connector_output_link_property == NULL) {
++        NV_DRM_LOG_ERR("Failed to create NV_OUTPUT_LINK property");
++        return -ENOMEM;
++    }
++
+     return 0;
+ }
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-modeset.c b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+index a7c7994..2e111e5 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-modeset.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+@@ -511,6 +511,7 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
+ 
+         for_each_new_connector_in_state(state, connector, connector_state, j) {
+             NvU32 bpc = 0;
++            NvU32 link = 0; /* Hades: NV_OUTPUT_LINK */
+             struct drm_crtc *head_crtc = connector_state->crtc;
+ 
+             if (head_crtc != NULL && head_crtc->state != NULL &&
+@@ -536,11 +537,20 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
+                                                nv_encoder->hDisplay, &bpc)) {
+                     bpc = 0;
+                 }
++                if (!nvKms->getDisplayOutputLink(nv_dev->pDevice,
++                                                 nv_encoder->hDisplay, &link)) {
++                    link = 0;
++                }
+             }
+ 
+             drm_object_property_set_value(&connector->base,
+                                           nv_dev->nv_connector_output_bpc_property,
+                                           bpc);
++            if (nv_dev->nv_connector_output_link_property) {
++                drm_object_property_set_value(&connector->base,
++                                              nv_dev->nv_connector_output_link_property,
++                                              link);
++            }
+         }
+     }
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index 63d4504..851d084 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -183,6 +183,9 @@ struct nv_drm_device {
+     struct drm_property *nv_connector_max_bpc_property;
+     struct drm_property *nv_connector_dual_mode_tmds_property;
+     struct drm_property *nv_connector_output_bpc_property;
++    /* Hades: NV_DDC_I2C_PORT and NV_OUTPUT_LINK (nvidia-drm-drv.c) */
++    struct drm_property *nv_connector_ddc_i2c_port_property;
++    struct drm_property *nv_connector_output_link_property;
+     struct drm_property *nv_connector_hdr10plus_vsif_property;
+     /* Hades: NV_HDR10PLUS_AVI_CTA_VIC */
+     struct drm_property *nv_connector_hdr10plus_avi_cta_vic_property;
+diff --git a/src/nvidia-modeset/interface/nvkms-api.h b/src/nvidia-modeset/interface/nvkms-api.h
+index 77feb61..a7dedb3 100644
+--- a/src/nvidia-modeset/interface/nvkms-api.h
++++ b/src/nvidia-modeset/interface/nvkms-api.h
+@@ -2757,6 +2757,26 @@ enum NvKmsDpyAttribute {
+     NV_KMS_DPY_ATTRIBUTE_DISPLAYPORT_SINK_IS_AUDIO_CAPABLE,
+ 
+     NV_KMS_DPY_ATTRIBUTE_NUMBER_OF_HARDWARE_HEADS_USED,
++
++    /*
++     * Hades: the I2C port of the DDC of the dpy's connector: ddcPortId - 1 of
++     * NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID (whose ddcPortId counts from 1,
++     * 0 for none), the index under which the nvidia module registers the I2C
++     * adapter of that port, "NVIDIA i2c adapter <index> at <bus>:<slot>.<fn>"
++     * (RmI2cAddGpuPorts(), rm_i2c_add_adapter(), nv_i2c_add_adapter()), where
++     * it registers one. 255 where there is no port or RM does not say.
++     * Read-only.
++     */
++    NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT,
++
++    /*
++     * Hades: how the head that drives the dpy sends it now; 0 where no head
++     * drives it. Bits 0-7: 1 TMDS not scrambled, 2 TMDS scrambled (a TMDS
++     * character rate above 340 MHz), 3 HDMI FRL, 4 DisplayPort; bits 8-15: the
++     * HDMI_FRL_DATA_RATE of FRL (1..6), 0 otherwise; bits 16-23: the pixel
++     * format, 0 RGB, 1 YCbCr 4:4:4, 2 YCbCr 4:2:2, 3 YCbCr 4:2:0. Read-only.
++     */
++    NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK,
+ };
+ 
+ /*! Values for the NV_KMS_DPY_ATTRIBUTE_REQUESTED_DITHERING attribute. */
+diff --git a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+index 400b641..aa2d1b2 100644
+--- a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
++++ b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+@@ -1698,6 +1698,36 @@ struct NvKmsKapiFunctionsTable {
+         NvU32 *bpc
+     );
+ 
++    /*!
++     * Hades: the I2C port of the DDC of a display's connector
++     * (NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT): the index of the adapter
++     * "NVIDIA i2c adapter <index> at <bus>:<slot>.<fn>" of the nvidia module;
++     * 255 where there is none.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayDdcI2cPort)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *port
++    );
++
++    /*!
++     * Hades: how NVKMS drives a display now
++     * (NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK): 0 where no head drives it;
++     * bits 0-7 1 TMDS, 2 TMDS scrambled, 3 HDMI FRL, 4 DisplayPort; bits 8-15
++     * the FRL rate; bits 16-23 0 RGB, 1 YCbCr 4:4:4, 2 4:2:2, 3 4:2:0.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayOutputLink)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *link
++    );
++
+     /*!
+      * Hades: whether NVKMS can send an HDR10+ VSIF through a display
+      * (HDR10PLUS_VSIF of nvidia-drm): a display driven as HDMI on a GPU whose
+diff --git a/src/nvidia-modeset/kapi/src/nvkms-kapi.c b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+index a99b3a0..9234a6c 100644
+--- a/src/nvidia-modeset/kapi/src/nvkms-kapi.c
++++ b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+@@ -1476,6 +1476,68 @@ done:
+     return status;
+ }
+ 
++/*
++ * Hades: a Hades dpy attribute of a display (nvkms-api.h), as a value of 32
++ * bits; NV_FALSE when NVKMS does not answer or the value does not fit.
++ */
++static NvBool GetHadesDpyAttribute(
++    struct NvKmsKapiDevice *device,
++    NvKmsKapiDisplay display,
++    enum NvKmsDpyAttribute attribute,
++    NvU32 *value)
++{
++    struct NvKmsGetDpyAttributeParams params = { };
++
++    if (device == NULL || value == NULL) {
++        return NV_FALSE;
++    }
++
++    params.request.deviceHandle = device->hKmsDevice;
++    params.request.dispHandle   = device->hKmsDisp;
++    params.request.dpyId        = nvNvU32ToDpyId(display);
++    params.request.attribute    = attribute;
++
++    if (!nvkms_ioctl_from_kapi(device->pKmsOpen,
++                               NVKMS_IOCTL_GET_DPY_ATTRIBUTE,
++                               &params, sizeof(params))) {
++        return NV_FALSE;
++    }
++
++    if (params.reply.value < 0 || params.reply.value > 0xffffffffLL) {
++        return NV_FALSE;
++    }
++
++    *value = (NvU32)params.reply.value;
++    return NV_TRUE;
++}
++
++/* Hades: NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT; 255 when NVKMS does not say */
++static NvBool GetDisplayDdcI2cPort(
++    struct NvKmsKapiDevice *device,
++    NvKmsKapiDisplay display,
++    NvU32 *port)
++{
++    if (port != NULL) {
++        *port = 255;
++    }
++    return GetHadesDpyAttribute(device, display,
++                                NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT, port) &&
++           (*port <= 255);
++}
++
++/* Hades: NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK; 0 when NVKMS does not say */
++static NvBool GetDisplayOutputLink(
++    struct NvKmsKapiDevice *device,
++    NvKmsKapiDisplay display,
++    NvU32 *link)
++{
++    if (link != NULL) {
++        *link = 0;
++    }
++    return GetHadesDpyAttribute(device, display,
++                                NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK, link);
++}
++
+ /*
+  * Hades: the bits per component at which NVKMS drives a display now, from
+  * NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_BPC (NvKmsDpyAttributeColorBpcValue is
+@@ -4396,6 +4458,8 @@ NvBool nvKmsKapiGetFunctionsTableInternal
+ 
+ 
+     funcsTable->getDisplayColorBpc = GetDisplayColorBpc;
++    funcsTable->getDisplayDdcI2cPort = GetDisplayDdcI2cPort;
++    funcsTable->getDisplayOutputLink = GetDisplayOutputLink;
+     funcsTable->getHdr10PlusSupported = GetHdr10PlusSupported;
+     return NV_TRUE;
+ }
+diff --git a/src/nvidia-modeset/src/nvkms-attributes.c b/src/nvidia-modeset/src/nvkms-attributes.c
+index 864459f..34f6883 100644
+--- a/src/nvidia-modeset/src/nvkms-attributes.c
++++ b/src/nvidia-modeset/src/nvkms-attributes.c
+@@ -34,6 +34,7 @@
+ #include "nvkms-hdmi.h"
+ #include "dp/nvdp-connector.h"
+ 
++#include <ctrl/ctrl0073/ctrl0073specific.h> /* Hades: NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID */
+ #include <ctrl/ctrl0073/ctrl0073dp.h> // NV0073_CTRL_CMD_DP_GET_LINK_CONFIG_*
+ 
+ /*!
+@@ -1274,6 +1275,117 @@ static NvBool GetNumberOfHardwareHeadsUsed(
+     *pNumHwHeadsUsed = pDpyEvo->currentAttributes.numberOfHardwareHeadsUsed;
+     return TRUE;
+ }
++/*
++ * Hades: NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT (nvkms-api.h). The adapter of
++ * a port: the nvidia module registers one for each implemented and valid port
++ * (index = port) and adds the displays of DisplayPort to the one of
++ * ddcPortId - 1, so the index of the adapter of a connector's DDC is
++ * ddcPortId - 1 of its display; whether the module registered it (it keeps
++ * MAX_I2C_ADAPTERS) is for the reader to see in the adapter's name.
++ */
++static NvBool GetHadesDdcI2cPort(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue)
++{
++    const NVDispEvoRec *pDispEvo = pDpyEvo->pDispEvo;
++    NV0073_CTRL_SPECIFIC_GET_I2C_PORTID_PARAMS params = { 0 };
++
++    *pValue = 255;
++    if (pDpyEvo->pConnectorEvo == NULL) {
++        return TRUE;
++    }
++    params.subDeviceInstance = pDispEvo->displayOwner;
++    params.displayId = nvDpyIdToNvU32(pDpyEvo->pConnectorEvo->displayId);
++    if ((nvRmApiControl(nvEvoGlobal.clientHandle,
++                        pDispEvo->pDevEvo->displayCommonHandle,
++                        NV0073_CTRL_CMD_SPECIFIC_GET_I2C_PORTID,
++                        &params, sizeof(params)) == NVOS_STATUS_SUCCESS) &&
++        (params.ddcPortId != NV0073_CTRL_SPECIFIC_I2C_PORT_NONE) &&
++        (params.ddcPortId <= 255)) {
++        *pValue = params.ddcPortId - 1;
++    }
++    return TRUE;
++}
++
++/*
++ * Hades: the TMDS character rate of an HDMI mode, in kHz: RGB and YCbCr 4:4:4
++ * carry the pixel clock times bpc / 8, YCbCr 4:2:2 the pixel clock at any
++ * depth, the YCbCr 4:2:0 of the hardware half the pixel clock times bpc / 8
++ * (HDMI 2.0, 7.1 and 7.2; the rule of nvHadesLogHdmiLink() in 615). Above 340
++ * MHz the source scrambles the link (HDMI 2.0, 6.1).
++ */
++static NvU32 HadesLinkTmdsRateKHz(NvU32 pixelClockKHz, NvU32 format,
++                                  NvBool hw420, NvU32 bpc)
++{
++    NvU64 clock = pixelClockKHz;
++
++    if (format == 2) {
++        return pixelClockKHz;
++    }
++    if (hw420) {
++        clock /= 2;
++    }
++    return (NvU32)((clock * ((bpc < 8) ? 8 : bpc)) / 8);
++}
++
++/* Hades: NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK (nvkms-api.h) */
++static NvBool GetHadesOutputLink(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue)
++{
++    const NVDispEvoRec *pDispEvo = pDpyEvo->pDispEvo;
++    const NvU32 apiHead = pDpyEvo->apiHead;
++    const NVDispApiHeadStateEvoRec *pApiHeadState;
++    const NVDispHeadStateEvoRec *pHeadState;
++    const NVHwModeTimingsEvo *pTimings;
++    NvU32 head, kind, rate = 0, format, bpc;
++
++    *pValue = 0;
++    if (apiHead == NV_INVALID_HEAD) {
++        return TRUE;
++    }
++    head = nvGetPrimaryHwHead(pDispEvo, apiHead);
++    if (head == NV_INVALID_HEAD) {
++        return TRUE;
++    }
++    pApiHeadState = &pDispEvo->apiHeadState[apiHead];
++    pHeadState = &pDispEvo->headState[head];
++    pTimings = &pHeadState->timings;
++    if (nvDpyIdListIsEmpty(pApiHeadState->activeDpys) ||
++        (pTimings->pixelClock == 0)) {
++        return TRUE;
++    }
++
++    switch (pApiHeadState->attributes.color.format) {
++    case NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE_YCbCr444: format = 1; break;
++    case NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE_YCbCr422: format = 2; break;
++    case NV_KMS_DPY_ATTRIBUTE_CURRENT_COLOR_SPACE_YCbCr420: format = 3; break;
++    default: format = 0; break;
++    }
++    if (pTimings->yuv420Mode != NV_YUV420_MODE_NONE) {
++        format = 3;
++    }
++    bpc = (NvU32)pApiHeadState->attributes.color.bpc;
++
++    switch (pTimings->protocol) {
++    case NVKMS_PROTOCOL_SOR_DP_A:
++    case NVKMS_PROTOCOL_SOR_DP_B:
++        kind = 4;
++        break;
++    case NVKMS_PROTOCOL_SOR_HDMI_FRL:
++        kind = 3;
++        rate = (NvU32)pHeadState->hdmiFrlConfig.frlRate & 0xff;
++        break;
++    case NVKMS_PROTOCOL_SOR_SINGLE_TMDS_A:
++    case NVKMS_PROTOCOL_SOR_SINGLE_TMDS_B:
++    case NVKMS_PROTOCOL_SOR_DUAL_TMDS:
++        kind = (HadesLinkTmdsRateKHz(pTimings->pixelClock, format,
++                                     pTimings->yuv420Mode == NV_YUV420_MODE_HW,
++                                     bpc) > 340000) ? 2 : 1;
++        break;
++    default:
++        return TRUE;
++    }
++    *pValue = (NvS64)(kind | (rate << 8) | (format << 16));
++    return TRUE;
++}
++
+ static const struct {
+     NvBool (*set)(NVDpyEvoPtr pDpyEvo, NvS64 value);
+     NvBool (*get)(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue);
+@@ -1486,6 +1598,18 @@ static const struct {
+         .getValidValues = NULL,
+         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
+     },
++    [NV_KMS_DPY_ATTRIBUTE_HADES_DDC_I2C_PORT] = {
++        .set            = NULL,
++        .get            = GetHadesDdcI2cPort,
++        .getValidValues = NULL,
++        .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
++    },
++    [NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK] = {
++        .set            = NULL,
++        .get            = GetHadesOutputLink,
++        .getValidValues = NULL,
++        .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
++    },
+ };
+ 
+ /*!
+-- 
+2.53.0
+

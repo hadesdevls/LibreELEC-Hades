@@ -1,0 +1,535 @@
+From e2d343693601aa42971c8d9be0c068d2ddc5ccd9 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:08:51 +0000
+Subject: [PATCH] VideoPlayerSubtitle: a text line read before a seek comes
+ back if it is on screen at the target
+
+After a seek the FFmpeg demuxer reads again from the video keyframe at or
+before the target. In Matroska it starts at the cluster of that keyframe, so
+a subtitle line stored before it (it started earlier) is not read again,
+even if it is still on screen at the target. The text codecs (SubRip, plain
+text, WebVTT from FFmpeg's demuxer, MP4 timed text) drop every line in the
+flush of the seek, so that line is missing until the next one starts. Seen
+with FFmpeg 9.0.2 on a Matroska file with a keyframe every 10 s: after seeks
+to 11, 21, 30.5 and 52 s the line on screen had started at 8, 18.5, 29 and
+45 s, and none of them was read again. MP4 seeks every stream on its own and
+does read it.
+
+CSubtitleSeekMemory keeps, for the open text stream, its packets as they
+were read: 2 MiB at most, within 10 minutes of film time around the newest,
+only packets with a start and a duration and without a timestamp correction
+of the player (a correction empties it). After a seek, FlushBuffers() asks
+the subtitle player for those that start at or before the target (less the
+subtitle delay) and end later than 20 s before it, and they are decoded
+again. The packets the demuxer then reads again are recognised by time,
+duration and data and not decoded twice. It holds only what was read from
+the file, so it gives back what a read from the start of the line gives.
+
+ASS keeps its libass track on a flush (CDVDOverlayCodecSSA::Flush() does not
+flush the events) and is left as it was. Image subtitles are not touched.
+Sources that are realtime are left as they were.
+
+Not covered: a seek forward into a part not read yet. Reading the subtitles
+before the target there means reading the file from the cluster of the
+subtitle (FFmpeg reads every block of a cluster, discarded or not): tens of
+MB per seek in the test file.
+
+kodi.log, info level, once per seek that gives something back:
+"CVideoPlayerSubtitle: after the seek to T s, N subtitle packet(s) read
+before it given back (...)".
+---
+ xbmc/cores/VideoPlayer/CMakeLists.txt         |   1 +
+ xbmc/cores/VideoPlayer/SubtitleSeekMemory.h   | 207 ++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |   7 +
+ .../cores/VideoPlayer/VideoPlayerSubtitle.cpp | 118 ++++++++--
+ xbmc/cores/VideoPlayer/VideoPlayerSubtitle.h  |  21 ++
+ 5 files changed, 334 insertions(+), 20 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
+
+diff --git a/xbmc/cores/VideoPlayer/CMakeLists.txt b/xbmc/cores/VideoPlayer/CMakeLists.txt
+index 18060b6..2e88528 100644
+--- a/xbmc/cores/VideoPlayer/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/CMakeLists.txt
+@@ -49,6 +49,7 @@ set(HEADERS AudioSinkAE.h
+             MultiviewChoice.h
+             MultiviewDisc.h
+             PTSTracker.h
++            SubtitleSeekMemory.h
+             VideoPlayer.h
+             VideoPlayerAudio.h
+             VideoPlayerAudioID3.h
+diff --git a/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h b/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
+new file mode 100644
+index 0000000..92df8a6
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
+@@ -0,0 +1,207 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/VideoPlayer/Interface/TimingConstants.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++/*!
++ * \brief The text subtitle packets of one stream as they were read, to give back after a seek.
++ *
++ * A seek of the FFmpeg demuxer lands on the video keyframe at or before the target, and in
++ * Matroska it starts reading at the cluster of that keyframe: a subtitle line stored before it
++ * (it started earlier) is not read again, even if it is still on screen at the target. The text
++ * codecs flush every line they had on a seek, so that line only comes back if it was read again.
++ *
++ * This memory keeps the packets of one stream as they are read, bounded in bytes and in time
++ * around the newest one. After a seek, Recall() gives back the packets whose line is on screen
++ * at the target (or ended shortly before it: a seek that is not accurate starts on the keyframe),
++ * and remembers them: when the demuxer reads one of them again, TakeRecalled() says so and it is
++ * not decoded twice. It holds only packets read from the file, so what it gives back is what a
++ * read from the start of the line would have given.
++ *
++ * Only a packet with a known start and a duration is kept. A packet with a timestamp correction
++ * of the player (a discontinuity) empties the memory and is not kept: the seek target and the
++ * remembered times could then be on different timelines.
++ */
++class CSubtitleSeekMemory
++{
++public:
++  struct Packet
++  {
++    double pts{DVD_NOPTS_VALUE};
++    double dts{DVD_NOPTS_VALUE};
++    double duration{0.0};
++    std::vector<uint8_t> data;
++    uint64_t order{0}; //!< insertion order, the oldest is dropped first
++
++    double Start() const { return pts != DVD_NOPTS_VALUE ? pts : dts; }
++    double End() const { return Start() + duration; }
++    bool Same(double p, double d, double dur, const uint8_t* bytes, size_t size) const
++    {
++      return pts == p && dts == d && duration == dur && data.size() == size &&
++             (size == 0 || std::memcmp(data.data(), bytes, size) == 0);
++    }
++  };
++
++  static constexpr size_t MAX_BYTES = 2 * 1024 * 1024;
++  static constexpr size_t PACKET_OVERHEAD = 64; //!< counted for each packet besides its data
++  //! packets further than this from the newest one (film time) are dropped
++  static constexpr double MAX_SPAN = 10.0 * 60.0 * DVD_TIME_BASE;
++  //! lines that ended up to this long before the target are given back too
++  static constexpr double RECALL_LEAD = 20.0 * DVD_TIME_BASE;
++
++  /*!
++   * \brief Keep a packet as it was read
++   * \return true if it is kept now; false if it has no start or duration, is too big, has a
++   *         timestamp correction, or is kept already (read again after a seek back)
++   */
++  bool Remember(
++      double pts, double dts, double duration, double ptsOffset, const uint8_t* data, size_t size)
++  {
++    if (ptsOffset != 0.0)
++    {
++      Clear();
++      return false;
++    }
++    const double start = pts != DVD_NOPTS_VALUE ? pts : dts;
++    if (start == DVD_NOPTS_VALUE || duration == DVD_NOPTS_VALUE || !(duration > 0.0) ||
++        size == 0 || data == nullptr || size + PACKET_OVERHEAD > MAX_BYTES)
++      return false;
++
++    auto it = std::lower_bound(m_packets.begin(), m_packets.end(), start,
++                               [](const Packet& p, double t) { return p.Start() < t; });
++    for (auto same = it; same != m_packets.end() && same->Start() == start; ++same)
++    {
++      if (same->Same(pts, dts, duration, data, size))
++        return false;
++    }
++
++    Packet packet;
++    packet.pts = pts;
++    packet.dts = dts;
++    packet.duration = duration;
++    packet.data.assign(data, data + size);
++    packet.order = m_order++;
++    auto at = std::upper_bound(m_packets.begin(), m_packets.end(), start,
++                               [](double t, const Packet& p) { return t < p.Start(); });
++    m_packets.insert(at, std::move(packet));
++    m_bytes += size + PACKET_OVERHEAD;
++    Trim(start);
++    return true;
++  }
++
++  /*!
++   * \brief The packets to give back after a seek to target, in time order
++   *
++   * Those that start at or before target and end after target - RECALL_LEAD. They are kept as
++   * given back until EndRecall(), for TakeRecalled().
++   */
++  std::vector<Packet> Recall(double target)
++  {
++    m_recalled.clear();
++    m_recalledLast = DVD_NOPTS_VALUE;
++    if (target == DVD_NOPTS_VALUE)
++      return {};
++    for (const Packet& p : m_packets)
++    {
++      if (p.Start() > target)
++        break;
++      if (p.End() > target - RECALL_LEAD)
++        m_recalled.push_back(p);
++    }
++    if (!m_recalled.empty())
++      m_recalledLast = m_recalled.back().Start();
++    return m_recalled;
++  }
++
++  /*!
++   * \brief A packet read after a seek: true if Recall() gave it back already
++   *
++   * Packets of one stream come in time order: once one starts after the last given back,
++   * nothing more is expected.
++   */
++  bool TakeRecalled(double pts, double dts, double duration, const uint8_t* data, size_t size)
++  {
++    if (m_recalled.empty())
++      return false;
++    const double start = pts != DVD_NOPTS_VALUE ? pts : dts;
++    for (auto it = m_recalled.begin(); it != m_recalled.end(); ++it)
++    {
++      if (it->Same(pts, dts, duration, data, size))
++      {
++        m_recalled.erase(it);
++        return true;
++      }
++    }
++    if (start != DVD_NOPTS_VALUE && m_recalledLast != DVD_NOPTS_VALUE && start > m_recalledLast)
++      EndRecall();
++    return false;
++  }
++
++  void EndRecall()
++  {
++    m_recalled.clear();
++    m_recalledLast = DVD_NOPTS_VALUE;
++  }
++
++  void Clear()
++  {
++    m_packets.clear();
++    m_bytes = 0;
++    EndRecall();
++  }
++
++  size_t Size() const { return m_packets.size(); }
++  size_t Bytes() const { return m_bytes; }
++  size_t Expected() const { return m_recalled.size(); }
++
++private:
++  void Trim(double newest)
++  {
++    // further than MAX_SPAN from the newest packet, on either side (a seek far back starts anew)
++    const size_t before = m_packets.size();
++    m_packets.erase(std::remove_if(m_packets.begin(), m_packets.end(),
++                                   [newest](const Packet& p)
++                                   {
++                                     return p.Start() < newest - MAX_SPAN ||
++                                            p.Start() > newest + MAX_SPAN;
++                                   }),
++                    m_packets.end());
++    if (m_packets.size() != before)
++      Recount();
++
++    while (m_bytes > MAX_BYTES && !m_packets.empty())
++    {
++      auto oldest = std::min_element(m_packets.begin(), m_packets.end(),
++                                     [](const Packet& a, const Packet& b)
++                                     { return a.order < b.order; });
++      m_bytes -= oldest->data.size() + PACKET_OVERHEAD;
++      m_packets.erase(oldest);
++    }
++  }
++
++  void Recount()
++  {
++    m_bytes = 0;
++    for (const Packet& p : m_packets)
++      m_bytes += p.data.size() + PACKET_OVERHEAD;
++  }
++
++  std::vector<Packet> m_packets; //!< in order of start
++  size_t m_bytes{0};
++  uint64_t m_order{0};
++  std::vector<Packet> m_recalled;
++  double m_recalledLast{DVD_NOPTS_VALUE};
++};
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index cee3881..74b62b8 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -5195,6 +5195,9 @@ bool CVideoPlayer::OpenSubtitleStream(const CDVDStreamInfo& hint)
+   if(m_CurrentSubtitle.id < 0 ||
+      m_CurrentSubtitle.hint != hint)
+   {
++    // Hades: a text stream of a source that is not realtime remembers its lines, to give back
++    // after a seek those read before it (CSubtitleSeekMemory)
++    m_VideoPlayerSubtitle->AllowSeekMemory(m_pInputStream && !m_pInputStream->IsRealtime());
+     if (!player->OpenStream(hint))
+       return false;
+   }
+@@ -5377,6 +5380,10 @@ void CVideoPlayer::FlushBuffers(double pts, bool accurate, bool sync)
+   m_VideoPlayerAudio->Flush(sync);
+   m_VideoPlayerVideo->Flush(sync);
+   m_VideoPlayerSubtitle->Flush();
++  // Hades: the text lines read before the seek that are on screen at its target; the demuxer only
++  // reads again from the video keyframe, and the text codecs dropped them all in the flush
++  if (pts != DVD_NOPTS_VALUE)
++    m_VideoPlayerSubtitle->RecallAfterSeek(pts - m_VideoPlayerVideo->GetSubtitleDelay());
+   m_VideoPlayerTeletext->Flush();
+   m_VideoPlayerRadioRDS->Flush();
+   m_VideoPlayerAudioID3->Flush();
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+index 419994d..def2efc 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.cpp
+@@ -12,11 +12,13 @@
+ #include "DVDCodecs/Overlay/DVDOverlay.h"
+ #include "DVDCodecs/Overlay/DVDOverlayCodec.h"
+ #include "DVDCodecs/Overlay/DVDOverlaySpu.h"
++#include "DVDDemuxers/DVDDemuxUtils.h"
+ #include "DVDSubtitles/DVDSubtitleParser.h"
+ #include "cores/VideoPlayer/Interface/DemuxPacket.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "utils/log.h"
+ 
++#include <cstring>
+ #include <mutex>
+ 
+ CVideoPlayerSubtitle::CVideoPlayerSubtitle(CDVDOverlayContainer* pOverlayContainer, CProcessInfo &processInfo)
+@@ -50,6 +52,27 @@ std::shared_ptr<CDVDOverlayGroup> InitialiseNewOverlayGroup(std::shared_ptr<CDVD
+   group->m_overlays.emplace_back(overlay);
+   return group;
+ }
++
++// Hades: the codecs whose Flush() drops every line they were given (CSubtitlesAdapter), so a line
++// read before a seek is lost. The ASS codec keeps its libass track on a flush (its Flush() does not
++// flush the events, and libass drops a packet read again by its ReadOrder): it does not need this.
++// Image subtitles (PGS, VobSub) are not text: a display set can depend on the ones before it.
++bool KeepsLinesForSeek(const CDVDStreamInfo& hints)
++{
++  switch (hints.codec)
++  {
++    case AV_CODEC_ID_SUBRIP:
++    case AV_CODEC_ID_TEXT:
++    case AV_CODEC_ID_MOV_TEXT:
++      return true;
++    case AV_CODEC_ID_WEBVTT:
++      // the cues of FFmpeg's demuxer (it alone sets the flag), timed by their packet; not WebVTT
++      // that an add-on sends as one file or as segments (its own timing, maybe never flushed)
++      return (hints.flags & FLAG_WEBVTT_DATA_PACKETS) != 0;
++    default:
++      return false;
++  }
++}
+ } // namespace
+ 
+ void CVideoPlayerSubtitle::SendMessage(std::shared_ptr<CDVDMsg> pMsg, int priority)
+@@ -63,28 +86,16 @@ void CVideoPlayerSubtitle::SendMessage(std::shared_ptr<CDVDMsg> pMsg, int priori
+ 
+     if (m_pOverlayCodec)
+     {
+-      OverlayMessage result = m_pOverlayCodec->Decode(pPacket);
+-
+-      if (result == OverlayMessage::OC_OVERLAY)
++      if (m_seekMemoryOn)
+       {
+-        if (std::shared_ptr<CDVDOverlay> overlay{m_pOverlayCodec->GetOverlay()}; overlay != nullptr)
+-        {
+-          overlay->SetSubtitleStream(m_subtitleStream);
+-          auto group{InitialiseNewOverlayGroup(overlay)};
+-          while ((overlay = m_pOverlayCodec->GetOverlay()) != nullptr)
+-          {
+-            overlay->SetSubtitleStream(m_subtitleStream);
+-            if (*group->m_overlays.back() == *overlay)
+-              group->m_overlays.emplace_back(overlay);
+-            else
+-            {
+-              m_pOverlayContainer->ProcessAndAddOverlayIfValid(group);
+-              group = InitialiseNewOverlayGroup(overlay);
+-            }
+-          }
+-          m_pOverlayContainer->ProcessAndAddOverlayIfValid(group);
+-        }
++        // given back after the seek already: read again from the file, it is the same line
++        if (m_seekMemory.TakeRecalled(pPacket->pts, pPacket->dts, pPacket->duration,
++                                      pPacket->pData, static_cast<size_t>(pPacket->iSize)))
++          return;
++        m_seekMemory.Remember(pPacket->pts, pPacket->dts, pPacket->duration, pPacket->m_ptsOffset,
++                              pPacket->pData, static_cast<size_t>(pPacket->iSize));
+       }
++      DecodePacket(pPacket);
+     }
+     else if (m_streaminfo.codec == AV_CODEC_ID_DVD_SUBTITLE)
+     {
+@@ -130,6 +141,10 @@ void CVideoPlayerSubtitle::SendMessage(std::shared_ptr<CDVDMsg> pMsg, int priori
+     if (m_pSubtitleFileParser)
+       m_pSubtitleFileParser->Reset();
+ 
++    // the lines read are kept for RecallAfterSeek(); what the last one gave back is no longer
++    // expected from the demuxer
++    m_seekMemory.EndRecall();
++
+     if (m_pOverlayCodec)
+       m_pOverlayCodec->Flush();
+ 
+@@ -150,6 +165,8 @@ bool CVideoPlayerSubtitle::OpenStream(CDVDStreamInfo &hints, std::string &filena
+   CloseStream(false);
+   m_streaminfo = hints;
+   ++m_subtitleStream;
++  m_seekMemory.Clear();
++  m_seekMemoryOn = false;
+ 
+   // okey check if this is a filesubtitle
+   if (!filename.empty() && filename != "dvd")
+@@ -184,6 +201,7 @@ bool CVideoPlayerSubtitle::OpenStream(CDVDStreamInfo &hints, std::string &filena
+     const std::string& name = m_pOverlayCodec->GetName();
+     CLog::Log(LOGDEBUG, "Created subtitles overlay codec: {}", name);
+     m_processInfo.SetSubtitleDecoderName(name);
++    m_seekMemoryOn = m_seekMemoryAllowed && KeepsLinesForSeek(hints);
+     return true;
+   }
+ 
+@@ -197,6 +215,8 @@ void CVideoPlayerSubtitle::CloseStream(bool bWaitForBuffers)
+ 
+   m_pSubtitleFileParser.reset();
+   m_pOverlayCodec.reset();
++  m_seekMemory.Clear();
++  m_seekMemoryOn = false;
+ 
+   m_dvdspus.FlushCurrentPacket();
+ 
+@@ -238,6 +258,64 @@ void CVideoPlayerSubtitle::Process(double pts, double offset)
+   }
+ }
+ 
++void CVideoPlayerSubtitle::DecodePacket(DemuxPacket* pPacket)
++{
++  OverlayMessage result = m_pOverlayCodec->Decode(pPacket);
++
++  if (result == OverlayMessage::OC_OVERLAY)
++  {
++    if (std::shared_ptr<CDVDOverlay> overlay{m_pOverlayCodec->GetOverlay()}; overlay != nullptr)
++    {
++      overlay->SetSubtitleStream(m_subtitleStream);
++      auto group{InitialiseNewOverlayGroup(overlay)};
++      while ((overlay = m_pOverlayCodec->GetOverlay()) != nullptr)
++      {
++        overlay->SetSubtitleStream(m_subtitleStream);
++        if (*group->m_overlays.back() == *overlay)
++          group->m_overlays.emplace_back(overlay);
++        else
++        {
++          m_pOverlayContainer->ProcessAndAddOverlayIfValid(group);
++          group = InitialiseNewOverlayGroup(overlay);
++        }
++      }
++      m_pOverlayContainer->ProcessAndAddOverlayIfValid(group);
++    }
++  }
++}
++
++void CVideoPlayerSubtitle::RecallAfterSeek(double pts)
++{
++  std::unique_lock lock(m_section);
++
++  if (!m_pOverlayCodec || !m_seekMemoryOn || pts == DVD_NOPTS_VALUE)
++    return;
++
++  const std::vector<CSubtitleSeekMemory::Packet> packets{m_seekMemory.Recall(pts)};
++  if (packets.empty())
++    return;
++
++  for (const CSubtitleSeekMemory::Packet& packet : packets)
++  {
++    DemuxPacket* pkt = CDVDDemuxUtils::AllocateDemuxPacket(static_cast<int>(packet.data.size()));
++    if (!pkt)
++      break;
++    std::memcpy(pkt->pData, packet.data.data(), packet.data.size());
++    pkt->iSize = static_cast<int>(packet.data.size());
++    pkt->pts = packet.pts;
++    pkt->dts = packet.dts;
++    pkt->duration = packet.duration;
++    DecodePacket(pkt);
++    CDVDDemuxUtils::FreeDemuxPacket(pkt);
++  }
++
++  CLog::Log(LOGINFO,
++            "CVideoPlayerSubtitle: after the seek to {:.3f} s, {} subtitle packet(s) read before "
++            "it given back (they start from {:.3f} s to {:.3f} s; {} kept, {} bytes)",
++            pts / DVD_TIME_BASE, packets.size(), packets.front().Start() / DVD_TIME_BASE,
++            packets.back().Start() / DVD_TIME_BASE, m_seekMemory.Size(), m_seekMemory.Bytes());
++}
++
+ bool CVideoPlayerSubtitle::AcceptsData() const
+ {
+   // FIXME : This may still be causing problems + magic number :(
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.h b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.h
+index 4605477..51218f4 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayerSubtitle.h
+@@ -14,6 +14,7 @@
+ #include "DVDStreamInfo.h"
+ #include "DVDSubtitles/DVDFactorySubtitle.h"
+ #include "IVideoPlayer.h"
++#include "SubtitleSeekMemory.h"
+ 
+ class CDVDInputStream;
+ class CDVDSubtitleStream;
+@@ -44,9 +45,24 @@ public:
+   bool OpenStream(CDVDStreamInfo &hints, std::string& filename);
+   void CloseStream(bool bWaitForBuffers) override;
+ 
++  /*!
++   * \brief Hades: after a seek, give back the lines read before it that are on screen at pts
++   *
++   * pts is the time the subtitles are looked up at (the video time less the subtitle delay).
++   */
++  void RecallAfterSeek(double pts);
++  /*!
++   * \brief Hades: whether the next stream opened may remember its packets (CSubtitleSeekMemory)
++   *
++   * VideoPlayer allows it for sources that are not realtime.
++   */
++  void AllowSeekMemory(bool allow) { m_seekMemoryAllowed = allow; }
++
+   bool IsInited() const override { return true; }
+   bool IsStalled() const override { return m_pOverlayContainer->GetSize() == 0; }
+ private:
++  void DecodePacket(DemuxPacket* pPacket);
++
+   CDVDOverlayContainer* m_pOverlayContainer;
+ 
+   std::unique_ptr<CDVDSubtitleParser> m_pSubtitleFileParser;
+@@ -56,6 +72,11 @@ private:
+   CDVDStreamInfo      m_streaminfo;
+   double              m_lastPts;
+ 
++  // Hades: the text lines read, to give back after a seek (only the codecs that flush them)
++  CSubtitleSeekMemory m_seekMemory;
++  bool m_seekMemoryAllowed{false};
++  bool m_seekMemoryOn{false};
++
+ 
+   CCriticalSection    m_section;
+   unsigned int m_subtitleStream{0};
+-- 
+2.53.0
+

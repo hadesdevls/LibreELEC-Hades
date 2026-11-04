@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 03 Nov 2026 21:09:29 +0000
+Subject: [PATCH] avformat/matroskadec: export the editions and their chapters
+
+A Matroska file can carry several editions (a theatrical and an extended
+cut, for example), each with its own chapters; in an ordered edition the
+chapters are the parts of the file that play, in that order. The demuxer
+read every ChapterAtom into one list and threw the edition away, so a
+player could not offer the editions nor play an ordered one.
+
+Keep each EditionEntry with its flags (EditionUID, EditionFlagDefault,
+EditionFlagHidden, EditionFlagOrdered) and its name (EditionString, or
+the TITLE of a tag whose TagEditionUID targets it), and each top-level
+chapter with ChapterFlagHidden, ChapterFlagEnabled and ChapterSegmentUUID;
+read the SegmentUUID of the file. All of it is exported, as it is in the
+file, in the new read-only "editions" option of the demuxer, an
+AVDictionary that av_opt_get_dict_val() returns:
+
+  count, segment_uid (hex, if any)
+  N.uid N.default N.hidden N.ordered N.chapters N.name (if any)
+  N.M.start N.M.end (ns; no end if the file has none) N.M.uid N.M.hidden
+  N.M.enabled N.M.segment_uid (hex, if the chapter names a segment)
+  N.M.title (if any)
+
+Nothing that is demuxed changes. The AVChapters are made from the chapters
+of all editions in the order of the file, with the same rule as before
+(a chapter is kept only if it starts after the last one kept), so they are
+the same; tags that target a chapter still go to that AVChapter; a tag that
+targets only an edition still goes to the file's metadata, as before; no
+key is added to any metadata, and packets and seeking are untouched.
+Choosing an edition, and how to play it, is left to the player.
+
+The element IDs are those of RFC 9559 (EditionDisplay 0x4520,
+EditionString 0x4521, EditionLanguageIETF 0x45E4, ChapterSegmentUUID
+0x6E67, TagEditionUID 0x63C9). Nested ChapterAtoms are still not read.
+
+An earlier take on editions in the Matroska demuxer, by Sebastiii for
+CoreELEC (an "edition" option that limits and rebases the timeline to the
+selected edition), was read; this export does not change the timeline.
+---
+  libavformat/matroska.h    |    5 +
+  libavformat/matroskadec.c |  209 ++++++++++++++++++++++++++++++++++++++-------
+  2 files changed, 183 insertions(+), 31 deletions(-)
+
+--- a/libavformat/matroska.h
++++ b/libavformat/matroska.h
+@@ -223,6 +223,7 @@
+ #define MATROSKA_ID_TAGTARGETS_TRACKUID   0x63C5
+ #define MATROSKA_ID_TAGTARGETS_CHAPTERUID 0x63C4
+ #define MATROSKA_ID_TAGTARGETS_ATTACHUID  0x63C6
++#define MATROSKA_ID_TAGTARGETS_EDITIONUID 0x63C9
+ 
+ /* IDs in the seekhead master */
+ #define MATROSKA_ID_SEEKENTRY  0x4DBB
+@@ -274,6 +275,10 @@
+ #define MATROSKA_ID_CHAPTERFLAGHIDDEN   0x98
+ #define MATROSKA_ID_CHAPTERFLAGENABLED  0x4598
+ #define MATROSKA_ID_CHAPTERPHYSEQUIV    0x63C3
++#define MATROSKA_ID_CHAPTERSEGMENTUID   0x6E67
++#define MATROSKA_ID_EDITIONDISPLAY      0x4520
++#define MATROSKA_ID_EDITIONSTRING       0x4521
++#define MATROSKA_ID_EDITIONLANGUAGEIETF 0x45E4
+ 
+ typedef enum {
+   MATROSKA_TRACK_TYPE_NONE     = 0x0,
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -313,10 +313,22 @@
+     uint64_t end;
+     uint64_t uid;
+     char    *title;
++    uint64_t hidden;
++    uint64_t enabled;
++    EbmlBin  segment_uid;
+ 
+     AVChapter *chapter;
+ } MatroskaChapter;
+ 
++typedef struct MatroskaEdition {
++    uint64_t uid;
++    uint64_t hidden;
++    uint64_t is_default;
++    uint64_t ordered;
++    char    *title;
++    EbmlList chapters;
++} MatroskaEdition;
++
+ typedef struct MatroskaIndexPos {
+     uint64_t track;
+     uint64_t pos;
+@@ -341,6 +353,7 @@
+     uint64_t trackuid;
+     uint64_t chapteruid;
+     uint64_t attachuid;
++    uint64_t editionuid;
+ } MatroskaTagTarget;
+ 
+ typedef struct MatroskaTags {
+@@ -400,9 +413,10 @@
+     char    *title;
+     char    *muxingapp;
+     EbmlBin  date_utc;
++    EbmlBin  segment_uid;
+     EbmlList tracks;
+     EbmlList attachments;
+-    EbmlList chapters;
++    EbmlList editions;
+     EbmlList index;
+     EbmlList tags;
+     EbmlList seekhead;
+@@ -439,6 +453,9 @@
+ 
+     /* Bandwidth value for WebM DASH Manifest */
+     int bandwidth;
++
++    /* Every edition and its chapters, exported read-only (see export_editions()) */
++    AVDictionary *editions_info;
+ } MatroskaDemuxContext;
+ 
+ #define CHILD_OF(parent) { .def = { .n = parent } }
+@@ -450,7 +467,7 @@
+ static EbmlSyntax ebml_syntax[3], matroska_segment[9], matroska_track_video_color[15], matroska_track_video[19],
+                   matroska_track[33], matroska_track_encoding[6], matroska_track_encodings[2],
+                   matroska_track_combine_planes[2], matroska_track_operation[2], matroska_block_addition_mapping[5], matroska_tracks[2],
+-                  matroska_attachments[2], matroska_chapter_entry[9], matroska_chapter[6], matroska_chapters[2],
++                  matroska_attachments[2], matroska_chapter_entry[10], matroska_chapter[7], matroska_chapters[2],
+                   matroska_index_entry[3], matroska_index[2], matroska_tag[3], matroska_tags[2], matroska_seekhead[2],
+                   matroska_blockadditions[2], matroska_blockgroup[8], matroska_cluster_parsing[8];
+ 
+@@ -478,7 +495,7 @@
+     { MATROSKA_ID_WRITINGAPP,    EBML_NONE },
+     { MATROSKA_ID_MUXINGAPP,     EBML_UTF8, 0, 0, offsetof(MatroskaDemuxContext, muxingapp) },
+     { MATROSKA_ID_DATEUTC,       EBML_BIN,  0, 0, offsetof(MatroskaDemuxContext, date_utc) },
+-    { MATROSKA_ID_SEGMENTUID,    EBML_NONE },
++    { MATROSKA_ID_SEGMENTUID,    EBML_BIN,  0, 0, offsetof(MatroskaDemuxContext, segment_uid) },
+     CHILD_OF(matroska_segment)
+ };
+ 
+@@ -674,24 +691,32 @@
+     { MATROSKA_ID_CHAPTERTIMEEND,     EBML_UINT, 0, 0, offsetof(MatroskaChapter, end),   { .u = AV_NOPTS_VALUE } },
+     { MATROSKA_ID_CHAPTERUID,         EBML_UINT, 0, 0, offsetof(MatroskaChapter, uid) },
+     { MATROSKA_ID_CHAPTERDISPLAY,     EBML_NEST, 0, 0,                        0,         { .n = matroska_chapter_display } },
+-    { MATROSKA_ID_CHAPTERFLAGHIDDEN,  EBML_NONE },
+-    { MATROSKA_ID_CHAPTERFLAGENABLED, EBML_NONE },
++    { MATROSKA_ID_CHAPTERFLAGHIDDEN,  EBML_UINT, 0, 0, offsetof(MatroskaChapter, hidden),  { .u = 0 } },
++    { MATROSKA_ID_CHAPTERFLAGENABLED, EBML_UINT, 0, 0, offsetof(MatroskaChapter, enabled), { .u = 1 } },
++    { MATROSKA_ID_CHAPTERSEGMENTUID,  EBML_BIN,  0, 0, offsetof(MatroskaChapter, segment_uid) },
+     { MATROSKA_ID_CHAPTERPHYSEQUIV,   EBML_NONE },
+     { MATROSKA_ID_CHAPTERATOM,        EBML_NONE },
+     CHILD_OF(matroska_chapter)
+ };
+ 
++static EbmlSyntax matroska_edition_display[] = {
++    { MATROSKA_ID_EDITIONSTRING,       EBML_UTF8, 0, 0, offsetof(MatroskaEdition, title) },
++    { MATROSKA_ID_EDITIONLANGUAGEIETF, EBML_NONE },
++    CHILD_OF(matroska_chapter)
++};
++
+ static EbmlSyntax matroska_chapter[] = {
+-    { MATROSKA_ID_CHAPTERATOM,        EBML_NEST, 0, sizeof(MatroskaChapter), offsetof(MatroskaDemuxContext, chapters), { .n = matroska_chapter_entry } },
+-    { MATROSKA_ID_EDITIONUID,         EBML_NONE },
+-    { MATROSKA_ID_EDITIONFLAGHIDDEN,  EBML_NONE },
+-    { MATROSKA_ID_EDITIONFLAGDEFAULT, EBML_NONE },
+-    { MATROSKA_ID_EDITIONFLAGORDERED, EBML_NONE },
++    { MATROSKA_ID_CHAPTERATOM,        EBML_NEST, 0, sizeof(MatroskaChapter), offsetof(MatroskaEdition, chapters), { .n = matroska_chapter_entry } },
++    { MATROSKA_ID_EDITIONUID,         EBML_UINT, 0, 0, offsetof(MatroskaEdition, uid) },
++    { MATROSKA_ID_EDITIONFLAGHIDDEN,  EBML_UINT, 0, 0, offsetof(MatroskaEdition, hidden),     { .u = 0 } },
++    { MATROSKA_ID_EDITIONFLAGDEFAULT, EBML_UINT, 0, 0, offsetof(MatroskaEdition, is_default), { .u = 0 } },
++    { MATROSKA_ID_EDITIONFLAGORDERED, EBML_UINT, 0, 0, offsetof(MatroskaEdition, ordered),    { .u = 0 } },
++    { MATROSKA_ID_EDITIONDISPLAY,     EBML_NEST, 0, 0, 0, { .n = matroska_edition_display } },
+     CHILD_OF(matroska_chapters)
+ };
+ 
+ static EbmlSyntax matroska_chapters[] = {
+-    { MATROSKA_ID_EDITIONENTRY, EBML_NEST, 0, 0, 0, { .n = matroska_chapter } },
++    { MATROSKA_ID_EDITIONENTRY, EBML_NEST, 0, sizeof(MatroskaEdition), offsetof(MatroskaDemuxContext, editions), { .n = matroska_chapter } },
+     CHILD_OF(matroska_segment)
+ };
+ 
+@@ -731,6 +756,7 @@
+     { MATROSKA_ID_TAGTARGETS_TRACKUID,   EBML_UINT, 0, 0, offsetof(MatroskaTagTarget, trackuid),   { .u = 0 } },
+     { MATROSKA_ID_TAGTARGETS_CHAPTERUID, EBML_UINT, 0, 0, offsetof(MatroskaTagTarget, chapteruid), { .u = 0 } },
+     { MATROSKA_ID_TAGTARGETS_ATTACHUID,  EBML_UINT, 0, 0, offsetof(MatroskaTagTarget, attachuid),  { .u = 0 } },
++    { MATROSKA_ID_TAGTARGETS_EDITIONUID, EBML_UINT, 0, 0, offsetof(MatroskaTagTarget, editionuid), { .u = 0 } },
+     CHILD_OF(matroska_tag)
+ };
+ 
+@@ -1879,14 +1905,17 @@
+                        i, tags[i].target.attachuid);
+             }
+         } else if (tags[i].target.chapteruid) {
+-            MatroskaChapter *chapter = matroska->chapters.elem;
++            MatroskaEdition *edition = matroska->editions.elem;
+             int found = 0;
+-            for (j = 0; j < matroska->chapters.nb_elem; j++) {
+-                if (chapter[j].uid == tags[i].target.chapteruid &&
+-                    chapter[j].chapter) {
+-                    matroska_convert_tag(s, &tags[i].tag,
+-                                         &chapter[j].chapter->metadata, NULL);
+-                    found = 1;
++            for (int e = 0; e < matroska->editions.nb_elem; e++) {
++                MatroskaChapter *chapter = edition[e].chapters.elem;
++                for (j = 0; j < edition[e].chapters.nb_elem; j++) {
++                    if (chapter[j].uid == tags[i].target.chapteruid &&
++                        chapter[j].chapter) {
++                        matroska_convert_tag(s, &tags[i].tag,
++                                             &chapter[j].chapter->metadata, NULL);
++                        found = 1;
++                    }
+                 }
+             }
+             if (!found) {
+@@ -3417,14 +3446,109 @@
+     return 0;
+ }
+ 
++static const char *edition_tag_title(MatroskaDemuxContext *matroska, uint64_t uid)
++{
++    MatroskaTags *tags = matroska->tags.elem;
++
++    for (int i = 0; uid && i < matroska->tags.nb_elem; i++) {
++        MatroskaTag *tag = tags[i].tag.elem;
++        if (tags[i].target.editionuid != uid)
++            continue;
++        for (int j = 0; j < tags[i].tag.nb_elem; j++)
++            if (tag[j].name && tag[j].string && !av_strcasecmp(tag[j].name, "TITLE"))
++                return tag[j].string;
++    }
++    return NULL;
++}
++
++static int set_u64(AVDictionary **d, const char *key, uint64_t value)
++{
++    char buf[24];
++    snprintf(buf, sizeof(buf), "%"PRIu64, value);
++    return av_dict_set(d, key, buf, 0);
++}
++
++static int set_hex(AVDictionary **d, const char *key, const EbmlBin *bin)
++{
++    char buf[2 * 64 + 1];
++    if (bin->size <= 0 || bin->size > 64)
++        return 0;
++    ff_data_to_hex(buf, bin->data, bin->size, 1);
++    buf[2 * bin->size] = 0;
++    return av_dict_set(d, key, buf, 0);
++}
++
++/* Every edition and every top-level chapter of each, as they are in the file, in the
++ * read-only "editions" option of the demuxer, so that a player can offer the editions.
++ * Nothing that is demuxed changes: not the packets, not the AVChapters, not the metadata.
++ * Keys: "count", "segment_uid" (hex, if the file has one), and for edition N (from 0):
++ * "N.uid", "N.default", "N.hidden", "N.ordered", "N.name" (EditionString, or the TITLE
++ * of a tag that targets the edition, if any), "N.chapters"; for its chapter M (from 0):
++ * "N.M.start" and "N.M.end" (ns; no end if the file has none), "N.M.uid", "N.M.hidden",
++ * "N.M.enabled", "N.M.segment_uid" (hex, only if the chapter names a segment) and
++ * "N.M.title" (if any). */
++static void matroska_export_editions(AVFormatContext *s)
++{
++    MatroskaDemuxContext *matroska = s->priv_data;
++    MatroskaEdition *editions = matroska->editions.elem;
++    AVDictionary *d = NULL;
++    char key[64];
++    int ret = 0;
++
++    if (!matroska->editions.nb_elem)
++        return;
++
++    ret |= av_dict_set_int(&d, "count", matroska->editions.nb_elem, 0);
++    ret |= set_hex(&d, "segment_uid", &matroska->segment_uid);
++    for (int e = 0; e < matroska->editions.nb_elem && ret >= 0; e++) {
++        MatroskaChapter *chapters = editions[e].chapters.elem;
++        const char *name = editions[e].title ? editions[e].title
++                                             : edition_tag_title(matroska, editions[e].uid);
++
++#define EKEY(field) (snprintf(key, sizeof(key), "%d." field, e), key)
++        ret |= set_u64(&d, EKEY("uid"), editions[e].uid);
++        ret |= av_dict_set_int(&d, EKEY("default"), !!editions[e].is_default, 0);
++        ret |= av_dict_set_int(&d, EKEY("hidden"), !!editions[e].hidden, 0);
++        ret |= av_dict_set_int(&d, EKEY("ordered"), !!editions[e].ordered, 0);
++        ret |= av_dict_set_int(&d, EKEY("chapters"), editions[e].chapters.nb_elem, 0);
++        if (name && *name)
++            ret |= av_dict_set(&d, EKEY("name"), name, 0);
++#undef EKEY
++
++        for (int c = 0; c < editions[e].chapters.nb_elem && ret >= 0; c++) {
++            MatroskaChapter *ch = &chapters[c];
++#define CKEY(field) (snprintf(key, sizeof(key), "%d.%d." field, e, c), key)
++            if (ch->start != AV_NOPTS_VALUE)
++                ret |= set_u64(&d, CKEY("start"), ch->start);
++            if (ch->end != AV_NOPTS_VALUE)
++                ret |= set_u64(&d, CKEY("end"), ch->end);
++            ret |= set_u64(&d, CKEY("uid"), ch->uid);
++            ret |= av_dict_set_int(&d, CKEY("hidden"), !!ch->hidden, 0);
++            ret |= av_dict_set_int(&d, CKEY("enabled"), !!ch->enabled, 0);
++            ret |= set_hex(&d, CKEY("segment_uid"), &ch->segment_uid);
++            if (ch->title && *ch->title)
++                ret |= av_dict_set(&d, CKEY("title"), ch->title, 0);
++#undef CKEY
++        }
++    }
++
++    if (ret < 0) {
++        /* Not needed to demux: say so and export nothing. */
++        av_log(s, AV_LOG_WARNING, "Could not export the editions of the file\n");
++        av_dict_free(&d);
++        return;
++    }
++    av_dict_free(&matroska->editions_info);
++    matroska->editions_info = d;
++}
++
+ static int matroska_read_header(AVFormatContext *s)
+ {
+     FFFormatContext *const si = ffformatcontext(s);
+     MatroskaDemuxContext *matroska = s->priv_data;
+     EbmlList *attachments_list = &matroska->attachments;
+-    EbmlList *chapters_list    = &matroska->chapters;
++    MatroskaEdition *editions;
+     MatroskaAttachment *attachments;
+-    MatroskaChapter *chapters;
+     uint64_t max_start = 0;
+     int64_t pos;
+     Ebml ebml = { 0 };
+@@ -3551,22 +3675,29 @@
+         }
+     }
+ 
+-    chapters = chapters_list->elem;
+-    for (i = 0; i < chapters_list->nb_elem; i++)
+-        if (chapters[i].start != AV_NOPTS_VALUE && chapters[i].uid &&
+-            (max_start == 0 || chapters[i].start > max_start)) {
+-            chapters[i].chapter =
+-                avpriv_new_chapter(s, chapters[i].uid,
+-                                   (AVRational) { 1, 1000000000 },
+-                                   chapters[i].start, chapters[i].end,
+-                                   chapters[i].title);
+-            max_start = chapters[i].start;
+-        }
++    /* The chapters of all editions, in the order of the file, as one list:
++     * the AVChapters are the same as when the editions were not kept apart. */
++    editions = matroska->editions.elem;
++    for (int e = 0; e < matroska->editions.nb_elem; e++) {
++        MatroskaChapter *chapters = editions[e].chapters.elem;
++        for (i = 0; i < editions[e].chapters.nb_elem; i++)
++            if (chapters[i].start != AV_NOPTS_VALUE && chapters[i].uid &&
++                (max_start == 0 || chapters[i].start > max_start)) {
++                chapters[i].chapter =
++                    avpriv_new_chapter(s, chapters[i].uid,
++                                       (AVRational) { 1, 1000000000 },
++                                       chapters[i].start, chapters[i].end,
++                                       chapters[i].title);
++                max_start = chapters[i].start;
++            }
++    }
+ 
+     matroska_add_index_entries(matroska);
+ 
+     matroska_convert_tags(s);
+ 
++    matroska_export_editions(s);
++
+     res = matroska_parse_dovi_streams(s);
+     if (res < 0)
+         return res;
+@@ -4577,6 +4708,7 @@
+         if (tracks[n].type == MATROSKA_TRACK_TYPE_AUDIO)
+             av_freep(&tracks[n].audio.buf);
+     ebml_free(matroska_segment, matroska);
++    av_dict_free(&matroska->editions_info);
+ 
+     return 0;
+ }
+@@ -5034,11 +5166,26 @@
+ };
+ #endif
+ 
++static const AVOption matroska_options[] = {
++    { "editions", "every edition of the file and its chapters (read-only)",
++      offsetof(MatroskaDemuxContext, editions_info), AV_OPT_TYPE_DICT, { .str = NULL }, 0, 0,
++      AV_OPT_FLAG_DECODING_PARAM | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
++    { NULL },
++};
++
++static const AVClass matroska_class = {
++    .class_name = "Matroska demuxer",
++    .item_name  = av_default_item_name,
++    .option     = matroska_options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
+ const FFInputFormat ff_matroska_demuxer = {
+     .p.name         = "matroska,webm",
+     .p.long_name    = NULL_IF_CONFIG_SMALL("Matroska / WebM"),
+     .p.extensions   = "mkv,mk3d,mka,mks,webm",
+     .p.mime_type    = "audio/webm,audio/x-matroska,video/webm,video/x-matroska",
++    .p.priv_class   = &matroska_class,
+     .priv_data_size = sizeof(MatroskaDemuxContext),
+     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+     .read_probe     = matroska_probe,
+-- 
+2.53.0
+

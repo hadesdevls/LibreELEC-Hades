@@ -1,0 +1,939 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:50:01 +0000
+Subject: [PATCH 1/3] BD-J: BD-Live setting, Internet addresses only, sockets
+ on every Java
+
+BD-Live, the network for the Java code of a disc, as a player setting that is off by default:
+BLURAY_PLAYER_SETTING_BDJ_NETWORK (0x1100), BLURAY_BDJ_NETWORK_NONE or _INTERNET,
+BD_HAVE_BDJ_NETWORK_SETTING. It is kept in BDJ_CONFIG.network_internet and taken when the JVM
+is created; with it off a disc is told bluray.network.connected=NO and every connection is
+refused.
+
+Which addresses: IPv4 of the Internet only. bdlive_net.c and org.videolan.NetAddress hold the same
+table: the IPv4 ranges that are not globally reachable (IANA's special-purpose registry: this
+network, RFC 1918, carrier-grade NAT, loopback, link-local, IETF assignments, documentation, 6to4
+relays, benchmarking), multicast, reserved and broadcast; and the addresses and on-link subnets of
+this system's own interfaces. No IPv6: on a home network every device has global IPv6 addresses
+in the prefix of this system, so no rule on an address tells the network (or this system, where
+the player listens) from the Internet.
+
+libbluray's sockets did not work from Java 13 on: BDJSocketFactory built java.net.SocksSocketImpl
+through reflection with a constructor those versions do not have (NoSuchMethodException on 17, 21
+and 26; libbluray master too). BDJSocketImpl is a SocketImpl on a SocketChannel and the Socket it
+adapts, with public API only, the same on every Java from 1.4 on. Each connection is checked on
+the address it goes to, after its name is resolved, and said in the log (on the critical path, so
+that the player shows it): "BD-Live: connection to <name>:<port> (<address>) allowed", "refused:
+<why>" or "failed". It binds, listens and accepts nothing; datagram sockets do not come through
+the factory and are refused below (the server's filter). BDJSockets closes these sockets when the
+Xlet ends, which its reflection on SocketImpl.getSocket() no longer could.
+---
+ src/libbluray/bdj/bdj.h                       |   1 +
+ src/libbluray/bdj/bdlive_net.c                | 162 +++++++++
+ src/libbluray/bdj/bdlive_net.h                |  69 ++++
+ .../java/org/videolan/BDJSocketFactory.java   |  23 +-
+ .../bdj/java/org/videolan/BDJSocketImpl.java  | 307 ++++++++++++++++++
+ .../bdj/java/org/videolan/BDJSockets.java     |  12 +
+ .../bdj/java/org/videolan/Libbluray.java      |  15 +-
+ .../bdj/java/org/videolan/NetAddress.java     | 149 +++++++++
+ src/libbluray/bluray.c                        |   9 +
+ src/libbluray/bluray.h                        |   9 +
+ src/meson.build                               |   1 +
+ 11 files changed, 736 insertions(+), 21 deletions(-)
+ create mode 100644 src/libbluray/bdj/bdlive_net.c
+ create mode 100644 src/libbluray/bdj/bdlive_net.h
+ create mode 100644 src/libbluray/bdj/java/org/videolan/BDJSocketImpl.java
+ create mode 100644 src/libbluray/bdj/java/org/videolan/NetAddress.java
+
+diff --git a/src/libbluray/bdj/bdj.h b/src/libbluray/bdj/bdj.h
+index 34af91f..d7353a3 100644
+--- a/src/libbluray/bdj/bdj.h
++++ b/src/libbluray/bdj/bdj.h
+@@ -71,6 +71,7 @@ typedef struct {
+     char *classpath[2];      /* BD-J implementation class path (location of libbluray.jar) */
+ 
+     uint8_t no_persistent_storage; /* disable persistent storage (remove files at close) */
++    uint8_t network_internet;      /* Hades, BD-Live (BLURAY_PLAYER_SETTING_BDJ_NETWORK) */
+ } BDJ_CONFIG;
+ 
+ typedef struct bdjava_s BDJAVA;
+diff --git a/src/libbluray/bdj/bdlive_net.c b/src/libbluray/bdj/bdlive_net.c
+new file mode 100644
+index 0000000..a2405fd
+--- /dev/null
++++ b/src/libbluray/bdj/bdlive_net.c
+@@ -0,0 +1,162 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#if HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "bdlive_net.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#ifdef __linux__
++#include <arpa/inet.h>
++#include <ifaddrs.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#endif
++
++/* IPv4 that is not globally reachable (IANA's IPv4 Special-Purpose Address Registry, and RFC 1918,
++   6598, 1122, 3927, 5737, 2544, 7526, 5771, 1112); the same table as NetAddress.java and as the
++   IPAddressDeny= of hades-bdj-net@.service */
++static const struct {
++    uint32_t    net;
++    unsigned    len;
++    const char *why;
++} refused4[] = {
++    { 0x00000000u,  8, "\"this network\" (0.0.0.0/8)" },
++    { 0x0a000000u,  8, "a private network (10.0.0.0/8)" },
++    { 0x64400000u, 10, "carrier-grade NAT (100.64.0.0/10)" },
++    { 0x7f000000u,  8, "loopback (127.0.0.0/8)" },
++    { 0xa9fe0000u, 16, "link-local (169.254.0.0/16)" },
++    { 0xac100000u, 12, "a private network (172.16.0.0/12)" },
++    { 0xc0000000u, 24, "IETF protocol assignments (192.0.0.0/24)" },
++    { 0xc0000200u, 24, "documentation (192.0.2.0/24)" },
++    { 0xc0586300u, 24, "6to4 relays (192.88.99.0/24)" },
++    { 0xc0a80000u, 16, "a private network (192.168.0.0/16)" },
++    { 0xc6120000u, 15, "benchmarking (198.18.0.0/15)" },
++    { 0xc6336400u, 24, "documentation (198.51.100.0/24)" },
++    { 0xcb007100u, 24, "documentation (203.0.113.0/24)" },
++    { 0xe0000000u,  4, "multicast (224.0.0.0/4)" },
++    { 0xf0000000u,  4, "reserved or broadcast (240.0.0.0/4)" },
++};
++
++static uint32_t _mask(unsigned len)
++{
++    return len ? 0xffffffffu << (32 - len) : 0;
++}
++
++const char *bdlive_ipv4_refusal(uint32_t addr, const BDLIVE_LOCAL *local)
++{
++    unsigned i;
++
++    for (i = 0; i < sizeof(refused4) / sizeof(refused4[0]); i++) {
++        if ((addr & _mask(refused4[i].len)) == refused4[i].net) {
++            return refused4[i].why;
++        }
++    }
++    if (local) {
++        for (i = 0; i < local->count && i < BDLIVE_MAX_LOCAL; i++) {
++            if (addr == local->net[i].addr) {
++                return "an address of this system";
++            }
++            if ((addr & local->net[i].mask) == (local->net[i].addr & local->net[i].mask)) {
++                return "a network this system is on";
++            }
++        }
++    }
++    return NULL;
++}
++
++const char *bdlive_addr_refusal(int family, const uint8_t *a, const BDLIVE_LOCAL *local)
++{
++#ifdef __linux__
++    if (family == AF_INET) {
++        uint32_t addr = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) | ((uint32_t)a[2] << 8) | a[3];
++        return bdlive_ipv4_refusal(addr, local);
++    }
++    if (family == AF_INET6) {
++        return "IPv6 (BD-Live uses IPv4 only)";
++    }
++#else
++    (void)family; (void)a; (void)local;
++#endif
++    return "not an Internet address";
++}
++
++int bdlive_local_read(BDLIVE_LOCAL *local)
++{
++    memset(local, 0, sizeof(*local));
++#ifdef __linux__
++    {
++        struct ifaddrs *ifa, *p;
++
++        if (getifaddrs(&ifa) != 0) {
++            return -1;
++        }
++        for (p = ifa; p; p = p->ifa_next) {
++            const struct sockaddr_in *sa = (const struct sockaddr_in *)p->ifa_addr;
++            const struct sockaddr_in *nm = (const struct sockaddr_in *)p->ifa_netmask;
++            if (!sa || sa->sin_family != AF_INET) {
++                continue;
++            }
++            if (local->count >= BDLIVE_MAX_LOCAL) {
++                /* more subnets than kept: a subnet that is not kept would be reachable */
++                freeifaddrs(ifa);
++                return -1;
++            }
++            local->net[local->count].addr = ntohl(sa->sin_addr.s_addr);
++            local->net[local->count].mask = (nm && nm->sin_family == AF_INET) ? ntohl(nm->sin_addr.s_addr)
++                                                                              : 0xffffffffu;
++            local->count++;
++        }
++        freeifaddrs(ifa);
++        return 0;
++    }
++#else
++    return -1;
++#endif
++}
++
++void bdlive_local_format(const BDLIVE_LOCAL *local, char *buf, unsigned len)
++{
++    unsigned i, used = 0;
++
++    if (!len) {
++        return;
++    }
++    buf[0] = 0;
++    for (i = 0; i < local->count && i < BDLIVE_MAX_LOCAL; i++) {
++        uint32_t a = local->net[i].addr, m = local->net[i].mask;
++        unsigned bits = 0;
++        int n;
++        while (bits < 32 && (m & (0x80000000u >> bits))) {
++            bits++;
++        }
++        n = snprintf(buf + used, len - used, "%s%u.%u.%u.%u/%u", used ? "," : "",
++                     (a >> 24) & 255, (a >> 16) & 255, (a >> 8) & 255, a & 255, bits);
++        if (n < 0 || (unsigned)n >= len - used) {
++            buf[used] = 0;
++            return;
++        }
++        used += (unsigned)n;
++    }
++}
+diff --git a/src/libbluray/bdj/bdlive_net.h b/src/libbluray/bdj/bdlive_net.h
+new file mode 100644
+index 0000000..decc265
+--- /dev/null
++++ b/src/libbluray/bdj/bdlive_net.h
+@@ -0,0 +1,69 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * BD-Live (BLURAY_PLAYER_SETTING_BDJ_NETWORK = BLURAY_BDJ_NETWORK_INTERNET): which addresses the
++ * Java code of a disc may reach. Only addresses of the Internet: IPv4 outside every range that is
++ * not globally reachable (this network, RFC 1918, carrier-grade NAT, loopback, link-local, IETF
++ * assignments, documentation, 6to4 relays, benchmarking, multicast, reserved and broadcast), and
++ * outside the addresses and on-link subnets of this system's own interfaces. No IPv6 at all: on a
++ * home network every device has global IPv6 addresses in the prefix of this system, so no rule
++ * on the address can tell the devices of the network (or this system, where the player listens)
++ * from the Internet.
++ *
++ * The same rule is written in Java (org.videolan.NetAddress) and, its fixed part, in the units of
++ * the service (IPAddressDeny=); the tests check the three against one table.
++ */
++
++#ifndef BDLIVE_NET_H_
++#define BDLIVE_NET_H_
++
++#include "util/attributes.h"
++
++#include <stdint.h>
++
++#define BDLIVE_MAX_LOCAL 32
++
++/* an IPv4 subnet of this system: its address and mask, in host byte order */
++typedef struct {
++    uint32_t addr;
++    uint32_t mask;
++} BDLIVE_SUBNET;
++
++typedef struct {
++    unsigned      count;
++    BDLIVE_SUBNET net[BDLIVE_MAX_LOCAL];
++} BDLIVE_LOCAL;
++
++/*
++ * NULL if the IPv4 address (host byte order) may be reached by BD-Live, or why not. local: the
++ * subnets of this system's interfaces (may be NULL).
++ */
++BD_PRIVATE const char *bdlive_ipv4_refusal(uint32_t addr, const BDLIVE_LOCAL *local);
++
++/* the same for an address of a family (AF_INET: 4 bytes, AF_INET6: 16 bytes, network order) */
++BD_PRIVATE const char *bdlive_addr_refusal(int family, const uint8_t *addr, const BDLIVE_LOCAL *local);
++
++/* the IPv4 subnets of this system's interfaces, from getifaddrs(): 0, or -1 if they cannot be read */
++BD_PRIVATE int bdlive_local_read(BDLIVE_LOCAL *local);
++
++/* "a.b.c.d/n,..." for the environment of the JVM (HADES_BDJ_BDLIVE_LOCAL); buf of len bytes */
++BD_PRIVATE void bdlive_local_format(const BDLIVE_LOCAL *local, char *buf, unsigned len);
++
++#endif /* BDLIVE_NET_H_ */
+diff --git a/src/libbluray/bdj/java/org/videolan/BDJSocketFactory.java b/src/libbluray/bdj/java/org/videolan/BDJSocketFactory.java
+index 5d1efde..e65a915 100644
+--- a/src/libbluray/bdj/java/org/videolan/BDJSocketFactory.java
++++ b/src/libbluray/bdj/java/org/videolan/BDJSocketFactory.java
+@@ -21,17 +21,11 @@ package org.videolan;
+ 
+ import java.io.IOException;
+ 
+-import java.lang.reflect.Constructor;
+-
+ import java.net.ServerSocket;
+ import java.net.Socket;
+ import java.net.SocketImpl;
+ import java.net.SocketImplFactory;
+ 
+-import java.security.AccessController;
+-import java.security.PrivilegedActionException;
+-import java.security.PrivilegedExceptionAction;
+-
+ class BDJSocketFactory implements SocketImplFactory {
+ 
+     protected static void init() {
+@@ -47,21 +41,10 @@ class BDJSocketFactory implements SocketImplFactory {
+         this.server = server;
+     }
+ 
++    /* Hades: a socket of BD-Live (BDJSocketImpl), on every Java; java.net.SocksSocketImpl, which this
++       built through reflection, has no such constructor from Java 13 on */
+     private SocketImpl newSocket() {
+-        try {
+-            return (SocketImpl)AccessController.doPrivileged(
+-                new PrivilegedExceptionAction() {
+-                    public Object run() throws Exception {
+-                        Class defaultSocketImpl = Class.forName("java.net.SocksSocketImpl");
+-                        Constructor constructor = defaultSocketImpl.getDeclaredConstructor/*s*/(new Class[0])/*[0]*/;
+-                        constructor.setAccessible(true);
+-                        return constructor.newInstance(new Object[0]);
+-                    }
+-                });
+-        } catch (PrivilegedActionException e) {
+-            logger.error("Failed to create socket: " + e.getException() + " at " + Logger.dumpStack());
+-            throw new RuntimeException(e.getException());
+-        }
++        return new BDJSocketImpl();
+     }
+ 
+     public SocketImpl createSocketImpl() {
+diff --git a/src/libbluray/bdj/java/org/videolan/BDJSocketImpl.java b/src/libbluray/bdj/java/org/videolan/BDJSocketImpl.java
+new file mode 100644
+index 0000000..68e893f
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/BDJSocketImpl.java
+@@ -0,0 +1,307 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.net.SocketAddress;
++import java.net.SocketException;
++import java.net.SocketImpl;
++import java.net.SocketOptions;
++import java.net.UnknownHostException;
++
++import java.nio.channels.SocketChannel;
++
++/*
++ * The socket of a disc's Xlet: a TCP connection to an address that BD-Live may reach
++ * (NetAddress), and only while BD-Live is on. Built on a SocketChannel and the Socket it
++ * adapts, with public API only: it is the same on every Java from 1.4 on, where libbluray's
++ * old way (java.net.SocksSocketImpl through reflection) only worked up to Java 12.
++ *
++ * The check is made on the address that is connected to, after any name is resolved (by the
++ * player, through the BD-J host: org.videolan.hades.bdlive). The system checks again, below
++ * this: the service of BD-Live reaches only those addresses (IPAddressDeny=), and only by TCP
++ * (the seccomp filter of the server).
++ */
++class BDJSocketImpl extends SocketImpl {
++
++    private SocketChannel channel;
++    private Socket        socket;     /* the channel's own socket */
++    private int           timeout;    /* SO_TIMEOUT, before the channel exists */
++    private boolean       closed;
++
++    BDJSocketImpl() {
++    }
++
++    static boolean enabled() {
++        return "YES".equals(System.getProperty("bluray.network.connected"));
++    }
++
++    private static void report(String msg) {
++        /* a line of kodi.log: on the critical path of libbluray's log, which the player shows */
++        logger.error("BD-Live: " + msg);
++    }
++
++    protected void create(boolean stream) throws IOException {
++        if (!stream) {
++            throw new IOException("datagram sockets are not available");
++        }
++    }
++
++    protected void connect(String host, int port) throws IOException {
++        connect(new InetSocketAddress(host, port), 0);
++    }
++
++    protected void connect(InetAddress address, int port) throws IOException {
++        connect(new InetSocketAddress(address, port), 0);
++    }
++
++    protected synchronized void connect(SocketAddress endpoint, int t) throws IOException {
++        if (!(endpoint instanceof InetSocketAddress)) {
++            throw new IllegalArgumentException("Unsupported address type");
++        }
++        InetSocketAddress ep = (InetSocketAddress)endpoint;
++        String what = (ep.isUnresolved() ? ep.getHostName() : ep.getAddress().getHostAddress()) +
++            ":" + ep.getPort();
++
++        if (closed) {
++            throw new SocketException("Socket is closed");
++        }
++        if (channel != null) {
++            throw new SocketException("Already connected");
++        }
++        if (!enabled()) {
++            report("connection to " + what + " refused: BD-Live is off");
++            throw new SocketException("BD-Live is off");
++        }
++
++        InetAddress address = ep.getAddress();
++        if (ep.isUnresolved()) {
++            try {
++                address = InetAddress.getByName(ep.getHostName());
++            } catch (UnknownHostException e) {
++                report("connection to " + what + " refused: the name was not resolved");
++                throw e;
++            }
++            ep = new InetSocketAddress(address, ep.getPort());
++        }
++
++        String refusal = NetAddress.refusal(address);
++        if (refusal != null) {
++            report("connection to " + what + " (" + address.getHostAddress() + ") refused: " + refusal);
++            throw new SocketException("BD-Live: " + address.getHostAddress() + " is not an address of the Internet");
++        }
++
++        SocketChannel ch = SocketChannel.open();
++        try {
++            Socket s = ch.socket();
++            if (timeout > 0) {
++                s.setSoTimeout(timeout);
++            }
++            s.connect(ep, t);
++            channel = ch;
++            socket  = s;
++            this.address   = ep.getAddress();
++            this.port      = ep.getPort();
++            this.localport = s.getLocalPort();
++            report("connection to " + what + " (" + address.getHostAddress() + ") allowed");
++        } catch (IOException e) {
++            try {
++                ch.close();
++            } catch (IOException ignore) {
++            }
++            report("connection to " + what + " (" + address.getHostAddress() + ") failed: " + e);
++            throw e;
++        }
++    }
++
++    protected void bind(InetAddress host, int port) throws IOException {
++        throw new SocketException("BD-Live: a disc does not bind sockets");
++    }
++
++    protected void listen(int backlog) throws IOException {
++        throw new SocketException("BD-Live: a disc does not listen");
++    }
++
++    protected void accept(SocketImpl s) throws IOException {
++        throw new SocketException("BD-Live: a disc does not accept connections");
++    }
++
++    private synchronized Socket connected() throws IOException {
++        if (closed) {
++            throw new SocketException("Socket is closed");
++        }
++        if (socket == null) {
++            throw new SocketException("Socket is not connected");
++        }
++        return socket;
++    }
++
++    protected InputStream getInputStream() throws IOException {
++        return connected().getInputStream();
++    }
++
++    protected OutputStream getOutputStream() throws IOException {
++        return connected().getOutputStream();
++    }
++
++    protected int available() throws IOException {
++        return connected().getInputStream().available();
++    }
++
++    protected void close() throws IOException {
++        SocketChannel ch;
++        synchronized (this) {
++            closed = true;
++            ch = channel;
++        }
++        if (ch != null) {
++            ch.close();
++        }
++    }
++
++    /* the Xlet ends (BDJSockets): its connections end with it */
++    void closeFromXlet() {
++        try {
++            close();
++        } catch (IOException e) {
++            logger.error("Failed to close socket: " + e);
++        }
++    }
++
++    synchronized boolean isClosed() {
++        return closed;
++    }
++
++    protected void shutdownInput() throws IOException {
++        connected().shutdownInput();
++    }
++
++    protected void shutdownOutput() throws IOException {
++        connected().shutdownOutput();
++    }
++
++    protected boolean supportsUrgentData() {
++        return true;
++    }
++
++    protected void sendUrgentData(int data) throws IOException {
++        connected().sendUrgentData(data);
++    }
++
++    public void setOption(int optID, Object value) throws SocketException {
++        Socket s;
++        synchronized (this) {
++            if (closed) {
++                throw new SocketException("Socket is closed");
++            }
++            s = socket;
++            if (s == null) {
++                /* before the connection: only the timeout is kept for it */
++                if (optID == SocketOptions.SO_TIMEOUT) {
++                    timeout = ((Integer)value).intValue();
++                    return;
++                }
++                if (optID == SocketOptions.TCP_NODELAY || optID == SocketOptions.SO_KEEPALIVE ||
++                    optID == SocketOptions.SO_LINGER || optID == SocketOptions.SO_RCVBUF ||
++                    optID == SocketOptions.SO_SNDBUF || optID == SocketOptions.IP_TOS ||
++                    optID == SocketOptions.SO_OOBINLINE || optID == SocketOptions.SO_REUSEADDR) {
++                    return;
++                }
++                throw new SocketException("option " + optID + " not supported");
++            }
++        }
++        switch (optID) {
++        case SocketOptions.SO_TIMEOUT:
++            s.setSoTimeout(((Integer)value).intValue());
++            break;
++        case SocketOptions.TCP_NODELAY:
++            s.setTcpNoDelay(((Boolean)value).booleanValue());
++            break;
++        case SocketOptions.SO_KEEPALIVE:
++            s.setKeepAlive(((Boolean)value).booleanValue());
++            break;
++        case SocketOptions.SO_OOBINLINE:
++            s.setOOBInline(((Boolean)value).booleanValue());
++            break;
++        case SocketOptions.SO_REUSEADDR:
++            s.setReuseAddress(((Boolean)value).booleanValue());
++            break;
++        case SocketOptions.SO_RCVBUF:
++            s.setReceiveBufferSize(((Integer)value).intValue());
++            break;
++        case SocketOptions.SO_SNDBUF:
++            s.setSendBufferSize(((Integer)value).intValue());
++            break;
++        case SocketOptions.IP_TOS:
++            s.setTrafficClass(((Integer)value).intValue());
++            break;
++        case SocketOptions.SO_LINGER:
++            if (value instanceof Boolean) {
++                s.setSoLinger(false, 0);
++            } else {
++                s.setSoLinger(true, ((Integer)value).intValue());
++            }
++            break;
++        default:
++            throw new SocketException("option " + optID + " not supported");
++        }
++    }
++
++    public Object getOption(int optID) throws SocketException {
++        Socket s;
++        synchronized (this) {
++            if (closed) {
++                throw new SocketException("Socket is closed");
++            }
++            s = socket;
++            if (s == null) {
++                if (optID == SocketOptions.SO_TIMEOUT) {
++                    return new Integer(timeout);
++                }
++                return null;
++            }
++        }
++        switch (optID) {
++        case SocketOptions.SO_TIMEOUT:   return new Integer(s.getSoTimeout());
++        case SocketOptions.TCP_NODELAY:  return Boolean.valueOf(s.getTcpNoDelay());
++        case SocketOptions.SO_KEEPALIVE: return Boolean.valueOf(s.getKeepAlive());
++        case SocketOptions.SO_OOBINLINE: return Boolean.valueOf(s.getOOBInline());
++        case SocketOptions.SO_REUSEADDR: return Boolean.valueOf(s.getReuseAddress());
++        case SocketOptions.SO_RCVBUF:    return new Integer(s.getReceiveBufferSize());
++        case SocketOptions.SO_SNDBUF:    return new Integer(s.getSendBufferSize());
++        case SocketOptions.IP_TOS:       return new Integer(s.getTrafficClass());
++        case SocketOptions.SO_BINDADDR:  return s.getLocalAddress();
++        case SocketOptions.SO_LINGER: {
++            int l = s.getSoLinger();
++            return l < 0 ? (Object)Boolean.FALSE : (Object)new Integer(l);
++        }
++        default:
++            return null;
++        }
++    }
++
++    private static final Logger logger = Logger.getLogger(BDJSocketImpl.class.getName());
++}
+diff --git a/src/libbluray/bdj/java/org/videolan/BDJSockets.java b/src/libbluray/bdj/java/org/videolan/BDJSockets.java
+index 624954b..6a203a3 100644
+--- a/src/libbluray/bdj/java/org/videolan/BDJSockets.java
++++ b/src/libbluray/bdj/java/org/videolan/BDJSockets.java
+@@ -50,6 +50,13 @@ class BDJSockets {
+         /* drop closed sockets */
+         for (Iterator it = sockets.iterator(); it.hasNext(); ) {
+             SocketImpl socketImpl = (SocketImpl)it.next();
++            if (socketImpl instanceof BDJSocketImpl) {
++                /* Hades: the sockets of BDJSocketFactory */
++                if (((BDJSocketImpl)socketImpl).isClosed()) {
++                    it.remove();
++                }
++                continue;
++            }
+             Socket     socket = getSocket(socketImpl);
+             if (socket != null && socket.isClosed()) {
+                 it.remove();
+@@ -64,6 +71,11 @@ class BDJSockets {
+ 
+         while (!sockets.isEmpty()) {
+             SocketImpl socketImpl = (SocketImpl)sockets.removeFirst();
++            if (socketImpl instanceof BDJSocketImpl) {
++                /* Hades: the sockets of BDJSocketFactory */
++                ((BDJSocketImpl)socketImpl).closeFromXlet();
++                continue;
++            }
+             Socket socket = getSocket(socketImpl);
+             if (socket != null && !socket.isClosed()) {
+                 logger.warning("Closing " + socket);
+diff --git a/src/libbluray/bdj/java/org/videolan/Libbluray.java b/src/libbluray/bdj/java/org/videolan/Libbluray.java
+index 2549c77..8567769 100644
+--- a/src/libbluray/bdj/java/org/videolan/Libbluray.java
++++ b/src/libbluray/bdj/java/org/videolan/Libbluray.java
+@@ -196,6 +196,16 @@ public class Libbluray {
+             System.err.println("Hooking socket factory failed: " + t + "\n" + Logger.dumpStack(t));
+         }
+ 
++        /* Hades, BD-Live: the resolver of the JVM is chosen at its first use, by the class loader of
++           the thread; here, before any code of the disc runs, it is org.videolan.hades.bdlive */
++        if ("true".equals(System.getProperty("org.videolan.hades.bdlive"))) {
++            try {
++                java.net.InetAddress.getAllByName("hades-bdlive.invalid");
++            } catch (Throwable t) {
++                /* the name is never resolved; only the resolver was wanted */
++            }
++        }
++
+         /* enable filesystem hooks */
+         java.io.BDFileSystem.setBooted();
+     }
+@@ -397,7 +407,10 @@ public class Libbluray {
+         System.setProperty("bluray.memory.java_heap", "32768");
+         System.setProperty("bluray.memory.font_cache", "4096");
+ 
+-        System.setProperty("bluray.network.connected", "YES");
++        /* Hades, BD-Live: a network only in the BD-J service with network and with BD-Live on in the
++           player (bdlive_bdj.h); a disc sees "NO" otherwise */
++        System.setProperty("bluray.network.connected",
++                           "true".equals(System.getProperty("org.videolan.hades.bdlive")) ? "YES" : "NO");
+ 
+         try {
+             setSecurityManager(new BDJSecurityManager(discRoot, persistentRoot, budaRoot, getJavaMajor()));
+diff --git a/src/libbluray/bdj/java/org/videolan/NetAddress.java b/src/libbluray/bdj/java/org/videolan/NetAddress.java
+new file mode 100644
+index 0000000..7bc6b75
+--- /dev/null
++++ b/src/libbluray/bdj/java/org/videolan/NetAddress.java
+@@ -0,0 +1,149 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++package org.videolan;
++
++import java.net.Inet4Address;
++import java.net.InetAddress;
++import java.util.StringTokenizer;
++
++/*
++ * BD-Live: the addresses the Java code of a disc may connect to. The rule of bdlive_net.c, in
++ * Java: IPv4 of the Internet only (not this network, private networks, carrier-grade NAT,
++ * loopback, link-local, IETF assignments, documentation, 6to4 relays, benchmarking, multicast,
++ * reserved, broadcast), and not this system or a network it is on (HADES_BDJ_BDLIVE_LOCAL, which
++ * the BD-J server reads from the interfaces before it confines itself). No IPv6.
++ */
++public final class NetAddress {
++
++    private static final int[][] REFUSED = {
++        /* network, prefix length */
++        { 0x00000000,  8 }, { 0x0a000000,  8 }, { 0x64400000, 10 }, { 0x7f000000,  8 },
++        { 0xa9fe0000, 16 }, { 0xac100000, 12 }, { 0xc0000000, 24 }, { 0xc0000200, 24 },
++        { 0xc0586300, 24 }, { 0xc0a80000, 16 }, { 0xc6120000, 15 }, { 0xc6336400, 24 },
++        { 0xcb007100, 24 }, { 0xe0000000,  4 }, { 0xf0000000,  4 },
++    };
++    private static final String[] WHY = {
++        "\"this network\" (0.0.0.0/8)", "a private network (10.0.0.0/8)",
++        "carrier-grade NAT (100.64.0.0/10)", "loopback (127.0.0.0/8)",
++        "link-local (169.254.0.0/16)", "a private network (172.16.0.0/12)",
++        "IETF protocol assignments (192.0.0.0/24)", "documentation (192.0.2.0/24)",
++        "6to4 relays (192.88.99.0/24)", "a private network (192.168.0.0/16)",
++        "benchmarking (198.18.0.0/15)", "documentation (198.51.100.0/24)",
++        "documentation (203.0.113.0/24)", "multicast (224.0.0.0/4)",
++        "reserved or broadcast (240.0.0.0/4)",
++    };
++
++    /* the subnets of this system: address, mask; null: they could not be read (nothing allowed) */
++    private static int[][] local;
++    private static boolean localRead;
++
++    private NetAddress() {
++    }
++
++    private static int mask(int len) {
++        return len == 0 ? 0 : (int)(0xffffffffL << (32 - len));
++    }
++
++    private static synchronized int[][] local() {
++        if (!localRead) {
++            localRead = true;
++            local = parseLocal(System.getenv("HADES_BDJ_BDLIVE_LOCAL"));
++        }
++        return local;
++    }
++
++    /* "a.b.c.d/n,..." -> {addr, mask}...; null for anything else */
++    static int[][] parseLocal(String s) {
++        if (s == null) {
++            return null;
++        }
++        StringTokenizer st = new StringTokenizer(s, ",");
++        int[][] r = new int[st.countTokens()][];
++        for (int i = 0; i < r.length; i++) {
++            String t = st.nextToken();
++            int slash = t.indexOf('/');
++            if (slash < 0) {
++                return null;
++            }
++            StringTokenizer o = new StringTokenizer(t.substring(0, slash), ".");
++            if (o.countTokens() != 4) {
++                return null;
++            }
++            int a = 0, len;
++            try {
++                for (int k = 0; k < 4; k++) {
++                    int b = Integer.parseInt(o.nextToken());
++                    if (b < 0 || b > 255) {
++                        return null;
++                    }
++                    a = (a << 8) | b;
++                }
++                len = Integer.parseInt(t.substring(slash + 1));
++            } catch (NumberFormatException e) {
++                return null;
++            }
++            if (len < 0 || len > 32) {
++                return null;
++            }
++            r[i] = new int[] { a, mask(len) };
++        }
++        return r;
++    }
++
++    /* null if BD-Live may connect to the IPv4 address (in host order), or why not */
++    static String refusal4(int addr, int[][] loc) {
++        for (int i = 0; i < REFUSED.length; i++) {
++            if ((addr & mask(REFUSED[i][1])) == REFUSED[i][0]) {
++                return WHY[i];
++            }
++        }
++        if (loc == null) {
++            return "the networks of this system are not known";
++        }
++        for (int i = 0; i < loc.length; i++) {
++            if (addr == loc[i][0]) {
++                return "an address of this system";
++            }
++            if ((addr & loc[i][1]) == (loc[i][0] & loc[i][1])) {
++                return "a network this system is on";
++            }
++        }
++        return null;
++    }
++
++    /* null if BD-Live may connect to the address, or why not */
++    public static String refusal(InetAddress address) {
++        if (!(address instanceof Inet4Address)) {
++            return address == null ? "no address" : "IPv6 (BD-Live uses IPv4 only)";
++        }
++        byte[] b = address.getAddress();
++        int a = ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255);
++        return refusal4(a, local());
++    }
++
++    /* for the tests: the rule with the given subnets of this system */
++    public static String refusal(byte[] b, String localSubnets) {
++        if (b == null || b.length != 4) {
++            return "IPv6 (BD-Live uses IPv4 only)";
++        }
++        int a = ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255);
++        return refusal4(a, parseLocal(localSubnets));
++    }
++}
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 1de53af..1edd62c 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -3571,6 +3571,15 @@ static int _set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
+         return 1;
+     }
+ 
++    if (idx == BLURAY_PLAYER_SETTING_BDJ_NETWORK) {
++        /* Hades, BD-Live: taken when the JVM is created (bdlive_bdj.h) */
++        if (value > BLURAY_BDJ_NETWORK_INTERNET) {
++            return 0;
++        }
++        bd->bdj_config.network_internet = value == BLURAY_BDJ_NETWORK_INTERNET;
++        return 1;
++    }
++
+     if (idx == BLURAY_PLAYER_SETTING_UO_RESTRICTION_LEVEL) {
+         if (BLURAY_PLAYER_SETTING_UO_RESTRICTION_COMPLIANT < value) {
+             BD_DEBUG(DBG_BLURAY | DBG_CRIT, "Invalid UO restriction level\n");
+diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
+index a1e0990..d070391 100644
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -774,6 +774,7 @@ typedef enum {
+     BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE   = 0x101, /**< Enable/disable BD-J persistent storage. Integer. Default: enabled. */
+     BLURAY_PLAYER_SETTING_UO_RESTRICTION_LEVEL = 0x102, /**< Set User Operations (UO) restriction mask enforcement level. bd_player_setting_uo_restriction_level value. Default: BLURAY_PLAYER_SETTING_UO_RESTRICTION_RELAXED. */
+ 
++    BLURAY_PLAYER_SETTING_BDJ_NETWORK          = 0x1100, /**< (LibreELEC Hades) BD-Live: network for the Java code of a disc. bd_player_setting_bdj_network value. Default: BLURAY_BDJ_NETWORK_NONE. */
+     BLURAY_PLAYER_SETTING_BDJ_REMOTE           = 0x1101, /**< (LibreELEC Hades) Where BD-J titles run. bd_player_setting_bdj_remote value, before the disc is opened. Default: BLURAY_BDJ_REMOTE_AUTO. */
+ 
+     BLURAY_PLAYER_PERSISTENT_ROOT              = 0x200, /**< Root path to the BD_J persistent storage location. String. */
+@@ -789,6 +790,14 @@ typedef enum {
+ 
+ #define BD_HAVE_BDJ_REMOTE 1
+ 
++/** (LibreELEC Hades) BD-Live: the network of the Java code of a disc (BLURAY_PLAYER_SETTING_BDJ_NETWORK) */
++typedef enum {
++    BLURAY_BDJ_NETWORK_NONE     = 0,  /**< no network (the default) */
++    BLURAY_BDJ_NETWORK_INTERNET = 1,  /**< IPv4 addresses of the Internet only, in the isolated BD-J service with network; names resolved by the player */
++} bd_player_setting_bdj_network;
++
++#define BD_HAVE_BDJ_NETWORK_SETTING 1
++
+ /**
+  *
+  *  Update player setting
+diff --git a/src/meson.build b/src/meson.build
+index 31cd9b3..6e6ab53 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -7,6 +7,7 @@ libbluray_src = files(
+     'libbluray/register.c',
+     'libbluray/bdj/bdj.c',
+     'libbluray/bdj/bdj_sandbox.c',
++    'libbluray/bdj/bdlive_net.c',
+     'libbluray/bdj/bdjo_parse.c',
+     'libbluray/bdj/bdjo_parse.c',
+     'libbluray/bdj/native/bdjo.c',

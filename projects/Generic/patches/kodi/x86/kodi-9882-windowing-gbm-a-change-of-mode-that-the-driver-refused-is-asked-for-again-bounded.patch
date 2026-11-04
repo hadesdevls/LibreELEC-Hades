@@ -1,0 +1,377 @@
+From 2db1c0431332d506021a7a46c276165b8f5f1fa6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:01:50 +0000
+Subject: [PATCH] windowing/gbm: a change of mode that the driver refused is
+ asked for again, bounded
+
+Kodi clears its pending modeset when it assembles the commit that carries it
+(CDRMAtomic::FlipPage()). When the driver refuses the test of that commit,
+DrmAtomicCommit() falls back to the request before it, which goes out in the
+old mode, and nothing asks for the new mode again: the display stays in the
+mode before while Kodi draws for the new one, until the next change of mode.
+
+The change is now asked for again with the next two frames of the ordinary
+output, then once every 2 s, six commits in all (CModesetRetry,
+DRMModesetRetry.h), until the selected mode is on the output (CCommittedMode).
+Then it is given up, and the other subsystems are told that the display was
+lost and is back, as SetFullScreen() tells of a change of mode. kodi.log has
+one line for the first refusal, one when the mode is taken after refusals, and
+one when it is given up. An output that is meant to be off is not asked for
+again.
+
+The flag of a pending modeset is cleared as before: what waits on
+ModesetPending() does not wait between the retries, and a frame of native
+Dolby Vision (FlipPageTransactional()) never carries a modeset that is not
+pending.
+
+The idea of keeping the change pending until the selected mode is on the
+output is CroqueMr's (libreelec-x86-DV, R1.0.0 RC3). Keeping m_need_modeset
+itself up until then, as there, would in Hades make every frame of native
+output allow a modeset and keep what waits on a pending modeset waiting, and
+with a lasting refusal every frame would commit a refused modeset: the host
+test (modesetretry_test) gives 480 such commits in 20 s for that form, and 6
+for this one.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp      |  17 +++
+ xbmc/windowing/gbm/WinSystemGbm.h        |   2 +
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp     |  53 +++++++++-
+ xbmc/windowing/gbm/drm/DRMAtomic.h       |  15 ++-
+ xbmc/windowing/gbm/drm/DRMModesetRetry.h | 129 +++++++++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMUtils.h        |   3 +
+ 6 files changed, 215 insertions(+), 4 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/drm/DRMModesetRetry.h
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 3a8325c..530ff53 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -2453,6 +2453,20 @@ bool CWinSystemGbm::FlipHeldGui()
+   return false;
+ }
+ 
++void CWinSystemGbm::AnnounceModesetGivenUp()
++{
++  // Hades: the output keeps the mode it had (CModesetRetry). What waits for a change of mode (the
++  // renderer, the audio of the display) is told of a loss and of the return of the display, as
++  // SetFullScreen() tells of a change, so that it looks again at the mode that is on the output.
++  OnLostDevice();
++  const auto delay =
++      std::chrono::milliseconds(CServiceBroker::GetSettingsComponent()->GetSettings()->GetInt(
++                                    "videoscreen.delayrefreshchange") *
++                                100);
++  if (delay > 0ms)
++    m_dispResetTimer.Set(delay);
++}
++
+ void CWinSystemGbm::AnnounceHeldModeChange(bool transport)
+ {
+   if (!m_modeAnnounce.Before(transport))
+@@ -2904,6 +2918,9 @@ void CWinSystemGbm::FlipPage(bool rendered, bool videoLayer, bool async)
+   // Hades: ... and Kodi's limited range asked of the driver, in a commit with a mode set (CRgbRange)
+   StageRgbRange();
+   m_DRM->FlipPage(bo, rendered, videoLayer, async);
++  // Hades: a change of mode that the driver kept refusing was given up (CModesetRetry)
++  if (m_DRM->TakeModesetGivenUp())
++    AnnounceModesetGivenUp();
+   // Hades: whether the driver took the HDR10+ metadata that the request carried
+   HDR10PlusCommitted();
+   HdmiVrrOffCommitted();
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index d45f7ce..482dc7d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -284,6 +284,8 @@ public:
+ 
+ protected:
+   void OnLostDevice();
++  //! Hades: a change of mode that the driver kept refusing was given up (CModesetRetry)
++  void AnnounceModesetGivenUp();
+   void OnResetDisplay();
+   //! \brief Queue again the colorimetry and the HDR metadata that were queued last: the driver
+   //! takes them with a flip, and they are dropped with a flip that it refuses.
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index f5921fb..26a8f51 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -775,6 +775,11 @@ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, boo
+ {
+   struct drm_fb* drm_fb = nullptr;
+   uint32_t flags = 0;
++  // Hades: ... or a change of mode that the driver refused, asked for again (CModesetRetry). The
++  // flag of a pending modeset is cleared as before: what waits for it (ModesetPending(), the
++  // frames of native output, FlipPageTransactional()) sees no modeset pending between the retries.
++  const auto now = CModesetRetry::Clock::now();
++  const bool modeset = CommitsModeset(m_need_modeset, m_active, m_modesetRetry, now);
+ 
+   if (rendered)
+   {
+@@ -789,18 +794,58 @@ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, boo
+       return;
+     }
+ 
+-    if (async && !m_need_modeset)
++    if (async && !modeset)
+       flags |= DRM_MODE_ATOMIC_NONBLOCK;
+   }
+ 
+-  if (m_need_modeset)
++  if (modeset)
+   {
+     flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+     m_need_modeset = false;
+     CLog::LogF(LOGDEBUG, "Execute modeset at next commit");
+   }
+ 
+-  DrmAtomicCommit(!drm_fb ? 0 : drm_fb->fb_id, flags, rendered, videoLayer);
++  const bool accepted = DrmAtomicCommit(!drm_fb ? 0 : drm_fb->fb_id, flags, rendered, videoLayer);
++  if (modeset)
++    SettleModeset(accepted, now);
++}
++
++void CDRMAtomic::SettleModeset(bool accepted, CModesetRetry::Clock::time_point now)
++{
++  // (an output that is meant to be off shows no mode: nothing to ask for again)
++  if (!m_active || !m_mode)
++  {
++    m_modesetRetry.Forget();
++    return;
++  }
++  const auto outcome = m_modesetRetry.Result(accepted && SelectedModeOnOutput(), now);
++  const unsigned int refusals = m_modesetRetry.Refusals();
++  switch (outcome)
++  {
++    case CModesetRetry::Outcome::TAKEN:
++      if (refusals)
++        CLog::LogF(LOGINFO, "the driver took the mode {}x{} {} Hz after {} refusal(s)",
++                   m_mode->hdisplay, m_mode->vdisplay, m_mode->vrefresh, refusals);
++      break;
++    case CModesetRetry::Outcome::AGAIN:
++      if (refusals == 1)
++        CLog::LogF(LOGWARNING,
++                   "the driver refused the change to the mode {}x{} {} Hz: the output stays in the "
++                   "mode it has; the change is asked for again with the next {} frames, then every "
++                   "{} s, {} times in all",
++                   m_mode->hdisplay, m_mode->vdisplay, m_mode->vrefresh, CModesetRetry::QUICK,
++                   CModesetRetry::SPACING.count() / 1000, CModesetRetry::ATTEMPTS);
++      break;
++    case CModesetRetry::Outcome::GIVEN_UP:
++      CLog::LogF(LOGERROR,
++                 "the driver refused the change to the mode {}x{} {} Hz {} times: given up, the "
++                 "output keeps the mode it has; the display is told as lost and back",
++                 m_mode->hdisplay, m_mode->vdisplay, m_mode->vrefresh, refusals);
++      m_modesetGivenUp = true;
++      break;
++    case CModesetRetry::Outcome::NONE:
++      break;
++  }
+ }
+ 
+ bool CDRMAtomic::InitDrm()
+@@ -913,6 +958,7 @@ std::optional<bool> CDRMAtomic::SelectedModeOnCrtc() const
+ bool CDRMAtomic::SetVideoMode(const RESOLUTION_INFO& res, struct gbm_bo* bo)
+ {
+   m_need_modeset = true;
++  m_modesetRetry.Asked(); // (Hades)
+ 
+   return true;
+ }
+@@ -920,6 +966,7 @@ bool CDRMAtomic::SetVideoMode(const RESOLUTION_INFO& res, struct gbm_bo* bo)
+ bool CDRMAtomic::SetActive(bool active)
+ {
+   m_need_modeset = true;
++  m_modesetRetry.Asked(); // (Hades)
+   m_active = active;
+ 
+   return true;
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index c7b21c8..7f36315 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "DRMCommittedMode.h"
++#include "DRMModesetRetry.h"
+ #include "DRMUtils.h"
+ #include "DVFrameTest.h"
+ #include "utils/log.h"
+@@ -63,7 +64,14 @@ public:
+   bool TakeFlipRefused() override { return std::exchange(m_flipRefused, false); }
+   bool TakeFlipDropped() override { return std::exchange(m_flipDropped, false); }
+   FloatRefusal RefusedForBuffer(struct gbm_bo* bo) override;
+-  void AllowModeset() override { m_need_modeset = true; }
++  void AllowModeset() override
++  {
++    m_need_modeset = true;
++    m_modesetRetry.Asked();
++  }
++  //! Hades: a change of mode that the driver kept refusing was given up since the last question
++  //! (CModesetRetry)
++  bool TakeModesetGivenUp() override { return std::exchange(m_modesetGivenUp, false); }
+   //! Hades: the next commit would carry more than a framebuffer: properties added since the last
+   //! one, or a modeset that is pending
+   bool HasPendingRequest() const { return m_need_modeset || (m_req && !m_req->Empty()); }
+@@ -177,6 +185,11 @@ private:
+   std::vector<std::string> m_dvRefused; //!< see DVRefused()
+ 
+   bool m_need_modeset{true};
++  //! Hades: a change of mode that the driver refused, asked for again (CModesetRetry), and
++  //! whether one was given up (TakeModesetGivenUp())
++  CModesetRetry m_modesetRetry;
++  bool m_modesetGivenUp = false;
++  void SettleModeset(bool accepted, CModesetRetry::Clock::time_point now);
+   //! Hades: the mode that the commits put on the CRTC (IsSelectedModeCommitted())
+   CCommittedMode<drmModeModeInfo> m_committedMode;
+   //! Hades: which commits are tested first, and what the frames of native output took
+diff --git a/xbmc/windowing/gbm/drm/DRMModesetRetry.h b/xbmc/windowing/gbm/drm/DRMModesetRetry.h
+new file mode 100644
+index 0000000..0963a36
+--- /dev/null
++++ b/xbmc/windowing/gbm/drm/DRMModesetRetry.h
+@@ -0,0 +1,129 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <chrono>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: a change of mode that the driver refused is asked for again, a bounded number of
++ *        times, until the selected mode is on the output
++ *
++ * Kodi clears its pending modeset when it assembles the commit that carries it
++ * (CDRMAtomic::FlipPage()). A commit of the ordinary output whose test the driver refuses falls
++ * back to the request before it (CDRMAtomic::DrmAtomicCommit()), which goes out in the mode on the
++ * output; and a commit that the driver refuses outright changes nothing. Either way the selected
++ * mode is not on the output (CCommittedMode) and nothing asked for it again: the display stayed in
++ * the mode before while Kodi drew for the new one, until the next change of mode. (The idea of
++ * keeping the modeset pending until the selected mode is committed is CroqueMr's, R1.0.0 RC3.)
++ *
++ * Here the change is asked for again with the next two frames of the ordinary output (a refusal
++ * that comes of a passing state of the link, while it trains, or of a commit the driver was still
++ * busy with), then once every SPACING, up to ATTEMPTS commits in all: about seven seconds. Then
++ * it is given up, and the caller tells the other subsystems that the display was lost and is back
++ * (CWinSystemGbm), as after a change of mode, so that what waits for the mode on the output looks
++ * at the one that is there. A new choice of mode (or of the state of the output) starts again.
++ * Only the commits of the ordinary output take part: the frames of native Dolby Vision are
++ * committed without a modeset when nothing is pending (CDRMAtomic::FlipPageTransactional()), and a
++ * retry is never added to them.
++ *
++ * This class only decides; the time is given to it, so that a test runs it on the host.
++ */
++class CModesetRetry
++{
++public:
++  using Clock = std::chrono::steady_clock;
++  static constexpr unsigned int QUICK = 2; //!< retries with the next frames
++  static constexpr unsigned int ATTEMPTS = 6; //!< commits of the change in all (the first one too)
++  static constexpr std::chrono::milliseconds SPACING{2000};
++
++  enum class Outcome
++  {
++    NONE, //!< the commit did not carry a change that is followed here
++    TAKEN, //!< the selected mode is on the output
++    AGAIN, //!< refused: asked for again later
++    GIVEN_UP, //!< refused ATTEMPTS times: not asked for again until a new choice
++  };
++
++  //! A change of mode, or of the state of the output, was chosen: it is followed from its first
++  //! commit
++  void Asked()
++  {
++    m_refusals = 0;
++    m_pending = false;
++    m_followed = true;
++  }
++
++  //! Nothing is followed (an output that is meant to be off shows no mode)
++  void Forget()
++  {
++    m_refusals = 0;
++    m_pending = false;
++    m_followed = false;
++  }
++
++  //! Whether a commit of the ordinary output made now carries the change again
++  bool Due(Clock::time_point now) const { return m_pending && now >= m_next; }
++
++  //! A commit that carried the change went out (accepted) or not; onOutput: the selected mode is
++  //! the one on the output after it (CCommittedMode)
++  Outcome Result(bool onOutput, Clock::time_point now)
++  {
++    if (!m_followed)
++      return Outcome::NONE;
++    if (onOutput)
++    {
++      m_pending = false;
++      m_followed = false;
++      return Outcome::TAKEN;
++    }
++    ++m_refusals;
++    if (m_refusals >= ATTEMPTS)
++    {
++      m_pending = false;
++      m_followed = false;
++      return Outcome::GIVEN_UP;
++    }
++    m_pending = true;
++    m_next = m_refusals <= QUICK ? now : now + SPACING;
++    return Outcome::AGAIN;
++  }
++
++  //! Refusals of the change followed now, or of the one that was just taken or given up
++  unsigned int Refusals() const { return m_refusals; }
++  //! A retry is waiting for its time
++  bool Pending() const { return m_pending; }
++
++private:
++  unsigned int m_refusals = 0;
++  bool m_pending = false;
++  bool m_followed = false;
++  Clock::time_point m_next{};
++};
++
++//! Hades: whether a commit of the ordinary output (CDRMAtomic::FlipPage()) allows a modeset: one is
++//! pending, or a change of mode that the driver refused is due to be asked for again (never while
++//! the output is meant to be off)
++inline bool CommitsModeset(bool pending,
++                           bool active,
++                           const CModesetRetry& retry,
++                           CModesetRetry::Clock::time_point now)
++{
++  return pending || (active && retry.Due(now));
++}
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 0feeebc..ca9701e 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -79,6 +79,9 @@ public:
+   //! asked, for whatever reason: also the ones that TakeFlipRefused() does not tell of, but for
+   //! a commit made while the output is meant to be off. What such a commit carried is lost.
+   virtual bool TakeFlipDropped() { return false; }
++  //! \brief Hades: a change of mode that the driver kept refusing was given up since this was
++  //! asked last (CDRMAtomic, CModesetRetry)
++  virtual bool TakeModesetGivenUp() { return false; }
+   //! \brief Hades: what the last refusal that TakeFlipRefused() told of was about, as the driver
+   //! answers when it is asked again with bo, an 8-bit buffer of the output, in place of the
+   //! frame's (JudgeFloatRefusal()). Asked once for each refusal; UNKNOWN when it cannot be asked
+-- 
+2.53.0
+

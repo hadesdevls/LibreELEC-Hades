@@ -1,0 +1,193 @@
+From f97db5781d0528626a6704e9de6039a97b168990 Mon Sep 17 00:00:00 2001
+From: Mar <mardgez13@gmail.com>
+Date: Tue, 20 Oct 2026 13:53:27 +0200
+Subject: [PATCH] Re-collect ClientHello extensions whenever custom extensions
+ are in use
+
+If the ClientHello callback switches the SSL_CTX with SSL_set_SSL_CTX(),
+the ClientHello extensions have already been collected for the previous
+SSL_CTX, whose custom extensions can differ from those of the new one.
+Collect them again after the callback, so that their number and indices
+match the SSL_CTX now in use.  The built-in extensions have already
+been initialised, and the debug callback has already been given
+the extensions, so neither is done again.
+
+Add test_ctx_switch_more_custom_exts to sslapitest, which switches
+to an SSL_CTX with more custom extensions in the ClientHello callback,
+and check that the new SSL_CTX parses the custom extension the client
+sends.
+
+Assisted-by: Claude:claude-opus-5-5
+Reviewed-by: Matt Caswell <matt@openssl.foundation>
+Reviewed-by: Dmitry Belyavskiy <beldmit@gmail.com>
+Reviewed-by: Eugene Syromiatnikov <esyr@openssl.org>
+Merge-date: Fri Oct 30 03:20:43 2026
+Merged-from: https://github.com/openssl/openssl/pull/33375
+(cherry picked from commit cb6ca8e08abc1c97e3bba6c0caa843fee4375327)
+---
+ ssl/statem/statem_srvr.c |  32 +++++++++++++
+ test/sslapitest.c        | 101 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 133 insertions(+)
+
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index 03fcc6e..5917bd4 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -1749,6 +1749,38 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
+         }
+     }
+ 
++    /*
++     * The callback may have switched to an SSL_CTX with a different set of
++     * custom extensions, possibly in an earlier call that returned
++     * SSL_CLIENT_HELLO_RETRY. The collected extensions are indexed by the
++     * custom extensions in use when they were collected, so collect them
++     * again unless neither set has any.
++     */
++    if (clienthello->pre_proc_exts_len != TLSEXT_IDX_num_builtins
++        || s->cert->custext.meths_count != 0) {
++        PACKET extensions = clienthello->extensions;
++        void (*debug_cb)(SSL *, int, int, const unsigned char *, int, void *)
++            = s->ext.debug_cb;
++        int ret;
++
++        OPENSSL_free(clienthello->pre_proc_exts);
++        clienthello->pre_proc_exts = NULL;
++        clienthello->pre_proc_exts_len = 0;
++        /*
++         * The first collection has already initialised the built-in
++         * extensions and passed the extensions to the debug callback.
++         */
++        s->ext.debug_cb = NULL;
++        ret = tls_collect_extensions(s, &extensions, SSL_EXT_CLIENT_HELLO,
++            &clienthello->pre_proc_exts,
++            &clienthello->pre_proc_exts_len, 0);
++        s->ext.debug_cb = debug_cb;
++        if (!ret) {
++            /* SSLfatal already been called */
++            goto err;
++        }
++    }
++
+     /* Set up the client_random */
+     memcpy(s->s3.client_random, clienthello->random, SSL3_RANDOM_SIZE);
+ 
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index c1bdfcb..ae4a297 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -11372,6 +11372,106 @@ end:
+     return testresult;
+ }
+ #endif /* OPENSSL_NO_TLS1_2 */
++
++/*
++ * The ClientHello raw extension array is sized when the ClientHello is
++ * collected. Switching to an SSL_CTX with more custom extensions from the
++ * ClientHello callback must not make the later parse walk past its end, and
++ * the new SSL_CTX must get the custom extension the client sent, which is the
++ * last of its own.
++ */
++struct cust_ext_switch_st {
++    SSL_CTX *newctx;
++    int retry;
++    int parsed; /* Times the new SSL_CTX parsed the client's extension */
++};
++
++static int cust_ext_switch_parse_cb(SSL *s, unsigned int ext_type,
++    unsigned int context, const unsigned char *in, size_t inlen, X509 *x,
++    size_t chainidx, int *al, void *parse_arg)
++{
++    int *parsed = parse_arg;
++
++    if (ext_type == 0xff4f)
++        (*parsed)++;
++    return 1;
++}
++
++static int cust_ext_switch_ch_cb(SSL *s, int *al, void *arg)
++{
++    struct cust_ext_switch_st *data = arg;
++
++    if (SSL_get_SSL_CTX(s) == data->newctx)
++        return SSL_CLIENT_HELLO_SUCCESS;
++    if (SSL_set_SSL_CTX(s, data->newctx) == NULL) {
++        *al = SSL_AD_INTERNAL_ERROR;
++        return SSL_CLIENT_HELLO_ERROR;
++    }
++    return data->retry ? SSL_CLIENT_HELLO_RETRY : SSL_CLIENT_HELLO_SUCCESS;
++}
++
++/*
++ * Test 0: The callback switches the SSL_CTX and returns success
++ * Test 1: The callback switches the SSL_CTX and returns retry, so the
++ *         handshake goes on with the new SSL_CTX, which has no callback
++ */
++static int test_ctx_switch_more_custom_exts(int idx)
++{
++    SSL_CTX *sctx = NULL, *newsctx = NULL, *cctx = NULL;
++    SSL *serverssl = NULL, *clientssl = NULL;
++    struct cust_ext_switch_st cbdata;
++    unsigned int i;
++    int testresult = 0;
++
++    memset(&cbdata, 0, sizeof(cbdata));
++
++    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
++            TLS_client_method(), 0, 0, &sctx, &cctx, cert, privkey))
++        || !TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(), NULL,
++            0, 0, &newsctx, NULL, cert, privkey)))
++        goto end;
++
++    for (i = 0; i < 64; i++)
++        if (!TEST_true(SSL_CTX_add_custom_ext(newsctx, 0xff10 + i,
++                SSL_EXT_CLIENT_HELLO, NULL, NULL, NULL,
++                cust_ext_switch_parse_cb, &cbdata.parsed)))
++            goto end;
++
++    /* The client sends 0xff4f empty */
++    if (!TEST_true(SSL_CTX_add_custom_ext(cctx, 0xff4f, SSL_EXT_CLIENT_HELLO,
++            NULL, NULL, NULL, NULL, NULL)))
++        goto end;
++
++    cbdata.newctx = newsctx;
++    cbdata.retry = idx == 1;
++    SSL_CTX_set_client_hello_cb(sctx, cust_ext_switch_ch_cb, &cbdata);
++
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
++            NULL, NULL)))
++        goto end;
++
++    if (cbdata.retry
++        && (!TEST_false(create_ssl_connection(serverssl, clientssl,
++                SSL_ERROR_WANT_CLIENT_HELLO_CB))
++            || !TEST_int_eq(SSL_get_error(serverssl, -1),
++                SSL_ERROR_WANT_CLIENT_HELLO_CB)))
++        goto end;
++
++    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE))
++        || !TEST_ptr_eq(SSL_get_SSL_CTX(serverssl), newsctx)
++        || !TEST_int_eq(cbdata.parsed, 1))
++        goto end;
++
++    testresult = 1;
++end:
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(newsctx);
++    SSL_CTX_free(cctx);
++    return testresult;
++}
+ #endif
+ 
+ #ifndef OPENSSL_NO_TLS1_2
+@@ -15017,6 +15117,7 @@ int setup_tests(void)
+ #endif
+ #if !defined(OPENSSL_NO_TLS1_2) || !defined(OSSL_NO_USABLE_TLS1_3)
+     ADD_ALL_TESTS(test_sigalg_ctx_switch, 4);
++    ADD_ALL_TESTS(test_ctx_switch_more_custom_exts, 2);
+     ADD_ALL_TESTS(test_sigalg_ctx_switch_cert_cb, 2);
+ #ifndef OPENSSL_NO_TLS1_2
+     ADD_TEST(test_sigalg_ctx_switch_reneg);

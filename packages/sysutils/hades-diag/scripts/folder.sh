@@ -20,9 +20,11 @@
 FC=/storage/.cache/hades-diag/last-start
 FM=/run/hades-diag-mark
 # What the file .filtered of a folder holds: the filter that the folder went through. 2: with the names of the
-# Bluetooth devices. An empty file is of the filter before them: collect.sh puts such a folder through the filter
-# again, and to-usb.sh leaves it out until then (it has FILTERED of its own: it does not read this file).
-FILTERED=2
+# Bluetooth devices; 3: with a marker for each name in the paths of drives, media folders and shares, and for the
+# labels of drives. An empty file, or an earlier number, is of a filter before them: collect.sh puts such a folder
+# through the filter again, and to-usb.sh leaves it out until then (it has FILTERED of its own: it does not read
+# this file).
+FILTERED=3
 
 # The folders of the starts that are here, "<number> <name>" a line, by their numbers (start-07 is start 7)
 start_folders() { ls $D 2>/dev/null | sed -n 's/^[Ss][Tt][Aa][Rr][Tt]-0*\([0-9]\{1,9\}\)$/\1 &/p' | sort -n; }

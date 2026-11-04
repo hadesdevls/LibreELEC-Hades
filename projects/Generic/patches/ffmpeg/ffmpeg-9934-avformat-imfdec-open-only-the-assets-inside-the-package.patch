@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 19:57:51 +0000
+Subject: [PATCH] avformat/imfdec: open only the assets inside the package
+
+The Path of each asset of an asset map (SMPTE ST 429-9) was used as it
+was when it was an absolute path or a URL, and was appended to the folder
+of the asset map otherwise, ".." segments included. A package could so
+make the demuxer open any MXF file the process can reach: through another
+absolute path, through any protocol FFmpeg was built with ("file:",
+"subfile,...:", "http://"...), or through "../" out of the package
+(CVE-2026-120210; FFmpeg master had no fix on 2026-11-03).
+
+An asset is now kept only when its Path names a file inside the folder of
+the asset map: a relative path with no protocol prefix, drive letter or
+network share, no ".." segment ('/' and '\' both separate segments) and
+no percent-encoded '.', '/' or '\' (a server that decodes them would see
+a ".." or a separator); or an absolute path or URL that starts with that
+folder and goes on with such a path. Any other asset is left out, with an
+error in the log naming its UUID, so a composition that uses it fails to
+open ("Could not find asset locator") instead of reading a file from
+elsewhere. The folder is the asset map's, as before: the folder of the
+CPL, unless another asset map is named with the "assetmaps" option. It
+is compared as text, as the demuxer names it: an absolute Path is kept
+only when the package was opened through the same absolute path or URL
+(a package opened through a relative path keeps only relative Paths).
+
+What changes for a package that worked before: one whose asset map points
+at files or URLs outside its own folder no longer opens. Not covered: a
+symbolic link inside the package that points elsewhere.
+
+The unit test (fate-imf) gains an asset map of 23 assets, of which the 6
+inside the package are kept; the code before this patch keeps all 23.
+---
+ libavformat/imfdec.c    | 89 +++++++++++++++++++++++++++++++++++++++-
+ libavformat/tests/imf.c | 90 +++++++++++++++++++++++++++++++++++++++++
+ tests/ref/fate/imf      |  8 ++++
+ 3 files changed, 186 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/imfdec.c b/libavformat/imfdec.c
+index 84b7a4d..db1648e 100644
+--- a/libavformat/imfdec.c
++++ b/libavformat/imfdec.c
+@@ -154,6 +154,79 @@ static int imf_uri_is_dos_abs_path(const char *string)
+     return 0;
+ }
+ 
++/**
++ * Tell whether a path segment of length len is a parent reference ("..").
++ */
++static int imf_uri_segment_is_parent(const char *segment, size_t len)
++{
++    return len == 2 && segment[0] == '.' && segment[1] == '.';
++}
++
++/**
++ * Tell whether the Path of an asset map Chunk stays inside the folder of the
++ * asset map once appended to it: a relative path with no URL scheme or
++ * protocol prefix, no drive letter or network share, no ".." segment ('/'
++ * and '\\' both count as separators), and no percent-encoded '.', '/' or
++ * '\\' (a server that decodes them would see a ".." or a separator).
++ */
++static int imf_uri_is_package_relative(const char *uri)
++{
++    const char *p = uri;
++
++    if (!uri[0] || imf_uri_is_url(uri) || imf_uri_is_unix_abs_path(uri) ||
++        imf_uri_is_dos_abs_path(uri) || uri[0] == '\\')
++        return 0;
++
++    /* "file:", "pipe:", "C:", "subfile,...:" and any other prefix that
++     * names a protocol or a drive come before the first separator */
++    if (memchr(uri, ':', strcspn(uri, "/\\")))
++        return 0;
++
++    for (; *p; p++)
++        if (p[0] == '%' && (av_strncasecmp(p + 1, "2e", 2) == 0 ||
++                            av_strncasecmp(p + 1, "2f", 2) == 0 ||
++                            av_strncasecmp(p + 1, "5c", 2) == 0))
++            return 0;
++
++    for (p = uri; *p;) {
++        size_t len = strcspn(p, "/\\");
++
++        if (imf_uri_segment_is_parent(p, len))
++            return 0;
++        p += len;
++        if (*p)
++            p++;
++    }
++
++    return 1;
++}
++
++/**
++ * Tell whether the Path of an asset map Chunk names a file inside base_url,
++ * the folder of the asset map: either a path relative to it, or an absolute
++ * path or URL that starts with that folder and goes on with such a path.
++ */
++static int imf_uri_is_inside_package(const char *uri, const char *base_url)
++{
++    size_t base_len;
++
++    if (imf_uri_is_package_relative(uri))
++        return 1;
++
++    if (!base_url || !(base_len = strlen(base_url)) ||
++        strncmp(uri, base_url, base_len))
++        return 0;
++
++    uri += base_len;
++    if (base_url[base_len - 1] != '/') {
++        if (*uri != '/')
++            return 0;
++        uri++;
++    }
++
++    return imf_uri_is_package_relative(uri);
++}
++
+ static int imf_time_to_ts(int64_t *ts, AVRational t, AVRational time_base)
+ {
+     int dst_num;
+@@ -269,7 +342,21 @@ static int parse_imf_asset_map_from_xml_dom(AVFormatContext *s,
+             break;
+         }
+ 
+-        if (!imf_uri_is_url(uri) && !imf_uri_is_unix_abs_path(uri) && !imf_uri_is_dos_abs_path(uri))
++        /* An asset map only locates assets inside its own package: a Path
++         * that leaves the folder of the asset map (another absolute path or
++         * URL, or ".." segments) would make the demuxer open any MXF file
++         * the process can reach (CVE-2026-120210). Such an asset is left
++         * out, and a composition that uses it fails to find it. */
++        if (!imf_uri_is_inside_package(uri, base_url)) {
++            av_log(s, AV_LOG_ERROR,
++                   "Ignoring asset " AV_PRI_URN_UUID " of the asset map: its Path "
++                   "is not inside the folder of the asset map\n",
++                   AV_UUID_ARG(asset->uuid));
++            xmlFree(uri);
++            continue;
++        }
++
++        if (imf_uri_is_package_relative(uri))
+             asset->absolute_uri = av_append_path_component(base_url, uri);
+         else
+             asset->absolute_uri = av_strdup(uri);
+diff --git a/libavformat/tests/imf.c b/libavformat/tests/imf.c
+index 92d1052..90326ff 100644
+--- a/libavformat/tests/imf.c
++++ b/libavformat/tests/imf.c
+@@ -328,6 +328,41 @@ const char *asset_map_doc =
+     "</am:AssetList>"
+     "</am:AssetMap>";
+ 
++#define TEST_ASSET(uuid, path)                                 \
++    "<am:Asset><am:Id>urn:uuid:" uuid "</am:Id><am:ChunkList><am:Chunk>" \
++    "<am:Path>" path "</am:Path></am:Chunk></am:ChunkList></am:Asset>"
++
++const char *asset_map_unsafe_doc =
++    "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>"
++    "<am:AssetMap xmlns:am=\"http://www.smpte-ra.org/schemas/429-9/2007/AM\">"
++    "<am:Id>urn:uuid:3d0ca1a4-2f27-4c55-9c8e-8a4b1c1f2e01</am:Id>"
++    "<am:AssetList>"
++    TEST_ASSET("00000000-0000-4000-8000-000000000001", "video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000002", "../video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000003", "a/b/../../../video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000004", "sub/dir/audio.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000005", "..\\video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000006", "/tmp/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000007", "file:///tmp/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000008", "file:video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000009", "http://example.invalid/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000a", "C:\\video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000b", "\\\\server\\share\\video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000c", "subfile,,start,0,end,0,,:video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000d", "%2e%2e/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000e", "..%2Fvideo.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-00000000000f", "./..")
++    TEST_ASSET("00000000-0000-4000-8000-000000000010", "..video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000011", "a..b/c:d.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000012", "./video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000013", "/package/inside.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000014", "/packagex/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000015", "/package/../video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000016", "/package//tmp/video.mxf")
++    TEST_ASSET("00000000-0000-4000-8000-000000000017", "pipe:0")
++    "</am:AssetList>"
++    "</am:AssetMap>";
++
+ static int test_cpl_parsing(void)
+ {
+     xmlDocPtr doc;
+@@ -495,6 +530,58 @@ cleanup:
+     return ret;
+ }
+ 
++static const char *ASSET_MAP_UNSAFE_EXPECTED_URIS[] = {
++    "/package/video.mxf",
++    "/package/sub/dir/audio.mxf",
++    "/package/..video.mxf",
++    "/package/a..b/c:d.mxf",
++    "/package/./video.mxf",
++    "/package/inside.mxf",
++};
++
++static int test_asset_map_unsafe_paths(void)
++{
++    IMFAssetLocatorMap asset_locator_map;
++    const uint32_t expected = FF_ARRAY_ELEMS(ASSET_MAP_UNSAFE_EXPECTED_URIS);
++    xmlDoc *doc;
++    int ret = 0;
++
++    doc = xmlReadMemory(asset_map_unsafe_doc, strlen(asset_map_unsafe_doc), NULL, NULL, 0);
++    if (doc == NULL) {
++        printf("Asset map XML parsing failed.\n");
++        return 1;
++    }
++
++    imf_asset_locator_map_init(&asset_locator_map);
++
++    printf("Parse asset map with paths that leave the package\n");
++    if (parse_imf_asset_map_from_xml_dom(NULL, doc, &asset_locator_map, "/package")) {
++        printf("Asset map parsing failed.\n");
++        ret = 1;
++        goto cleanup;
++    }
++
++    printf("Compare assets count: %u to %u\n", asset_locator_map.asset_count, expected);
++    if (asset_locator_map.asset_count != expected) {
++        ret = 1;
++        goto cleanup;
++    }
++
++    for (uint32_t i = 0; i < asset_locator_map.asset_count; ++i) {
++        printf("\tKept %s\n", asset_locator_map.assets[i].absolute_uri);
++        if (strcmp(asset_locator_map.assets[i].absolute_uri, ASSET_MAP_UNSAFE_EXPECTED_URIS[i])) {
++            printf("Unexpected asset locator URI: %s instead of %s\n",
++                   asset_locator_map.assets[i].absolute_uri, ASSET_MAP_UNSAFE_EXPECTED_URIS[i]);
++            ret = 1;
++        }
++    }
++
++cleanup:
++    imf_asset_locator_map_deinit(&asset_locator_map);
++    xmlFreeDoc(doc);
++    return ret;
++}
++
+ typedef struct PathTypeTestStruct {
+     const char *path;
+     int is_url;
+@@ -569,6 +656,9 @@ int main(int argc, char *argv[])
+     if (test_path_type_functions() != 0)
+         ret = 1;
+ 
++    if (test_asset_map_unsafe_paths() != 0)
++        ret = 1;
++
+     printf("#### The following should fail ####\n");
+     if (test_cpl_from_doc(&cpl, cpl_bad_empty_doc, 0) != 0)
+         ret = 1;
+diff --git a/tests/ref/fate/imf b/tests/ref/fate/imf
+index fdfed8a..63e37f0 100644
+--- a/tests/ref/fate/imf
++++ b/tests/ref/fate/imf
+@@ -50,6 +50,14 @@ For asset: 3:
+ For asset: 4:
+ 	Compare urn:uuid:dd04528d-9b80-452a-7a13-805b08278b3d to urn:uuid:dd04528d-9b80-452a-7a13-805b08278b3d.
+ 	Compare PKL_IMF_TEST_ASSET_MAP.xml to PKL_IMF_TEST_ASSET_MAP.xml.
++Parse asset map with paths that leave the package
++Compare assets count: 6 to 6
++	Kept /package/video.mxf
++	Kept /package/sub/dir/audio.mxf
++	Kept /package/..video.mxf
++	Kept /package/a..b/c:d.mxf
++	Kept /package/./video.mxf
++	Kept /package/inside.mxf
+ #### The following should fail ####
+ CPL parsing failed.
+ #### End failing test ####

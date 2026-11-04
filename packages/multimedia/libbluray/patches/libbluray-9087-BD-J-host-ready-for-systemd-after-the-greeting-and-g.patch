@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 05:06:45 +0000
+Subject: [PATCH] BD-J host: ready for systemd after the greeting, and gone
+ with its player
+
+The image runs one host per disc (hades-bdj@.service, Accept=yes). A host
+stuck before it greeted the player stayed until RuntimeMaxSec (24 h), with up
+to 1 GiB and a processor: the player gives up after 30 s, but without the
+greeting it does not know the host's pid. A host whose player went away (Kodi
+ended, crashed or restarted) stayed for as long as the disc's Java kept the
+closing from finishing, and with Accept=yes systemd cannot see that.
+
+- hades-bdj-host speaks systemd's readiness protocol (sd_notify, without
+  libsystemd). It opens $NOTIFY_SOCKET first thing, before its filter, and
+  removes the variable from the environment. READY=1 goes out once the player
+  is greeted, before anything of the disc is read (BD_BDJ_HOST_CONFIG.ready),
+  and the socket is closed. The units wait for it (Type=notify) and kill the
+  whole instance when it does not come in time.
+- Its filter refuses datagram sockets of AF_UNIX: nothing that runs after it
+  (the JVM, the disc's code) can write to systemd's notification socket. A
+  stream socket cannot connect to it.
+- bd_bdj_host_run(): a thread of its own waits for the end of the connection
+  (POLLRDHUP). The disc is then closed in order, and if that does not finish
+  in 5 s the process ends (_exit()). As PID 1 of its own PID namespace
+  (PrivatePIDs=), everything the disc started ends with it.
+
+Measured with the systemd of the build host (259) and the units of the tree:
+the host is ready 57 ms after its start (119 ms on two processors shared with
+32 busy loops); one that never answers the greeting is killed at 30 s, with
+nothing of it left; with a disc whose Java never ends (a key handler that never
+returns: the shutdown of libbluray waits for its thread without a limit) and
+the player killed, the host ends 5.0 s later.
+---
+ src/libbluray/bluray.h            |  6 ++-
+ src/libbluray/remote/bdr_server.c | 62 ++++++++++++++++++++++++++++
+ src/tools/hades_bdj_host.c        | 68 +++++++++++++++++++++++++++++++
+ src/tools/hades_bdj_sandbox.c     | 12 ++++++
+ 4 files changed, 147 insertions(+), 1 deletion(-)
+
+diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
+index d070391..812f6e2 100644
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1374,13 +1374,17 @@ typedef struct bd_bdj_host_config_s {
+     const char *java_home;        /**< Java runtime of the host; NULL: autodetect */
+     const char *persistent_root;  /**< BD-J persistent storage; NULL: none */
+     const char *cache_root;       /**< BD-J cache; NULL: the default */
++    void      (*ready)(void *ctx); /**< called once the player is greeted, before anything of the
++                                        disc is read (hades-bdj-host tells systemd); NULL: none */
++    void       *ready_ctx;
+ } BD_BDJ_HOST_CONFIG;
+ 
+ /**
+  *
+  *  Be the isolated BD-J host for the player on a connected socket: open the disc it plays,
+  *  through it, and play its calls until it closes the disc. Only for hades-bdj-host, in a
+- *  process that has isolated itself.
++ *  process that has isolated itself. When the player goes away (the connection ends) and the
++ *  disc does not close within a few seconds, the process ends (_exit()).
+  *
+  * @param fd  the connection (SOCK_STREAM)
+  * @param config  what the host gives the disc
+diff --git a/src/libbluray/remote/bdr_server.c b/src/libbluray/remote/bdr_server.c
+index beb226b..cd670a0 100644
+--- a/src/libbluray/remote/bdr_server.c
++++ b/src/libbluray/remote/bdr_server.c
+@@ -27,6 +27,10 @@
+  * wait for them: libbluray reads the disc from the calling thread and from the Java threads.
+  */
+ 
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE   /* POLLRDHUP */
++#endif
++
+ #if HAVE_CONFIG_H
+ #include "config.h"
+ #endif
+@@ -44,7 +48,9 @@
+ #include "util/macro.h"
+ 
+ #include <errno.h>
++#include <poll.h>
+ #include <pthread.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -56,6 +62,8 @@
+ 
+ #define SLOTS            64
+ #define ARGB_ACK_TIMEOUT 10   /* seconds */
++#define HANGUP_GRACE_S    5   /* the player went away: the disc closes in this time, or the
++                                 process ends anyway */
+ 
+ typedef struct srv_msg {
+     struct srv_msg *next;
+@@ -945,6 +953,43 @@ static int _do_open(BDR_SERVER *s, const SRV_MSG *msg, const BD_BDJ_HOST_CONFIG
+     return ok.bluray_detected > 0 && ok.bdj_handled ? 0 : -1;
+ }
+ 
++/*
++ * The player went away (Kodi closed the connection: it ended, crashed or restarted) or the
++ * connection broke. This process must not outlive it, and systemd cannot see it (one instance per
++ * connection, Accept=yes): the receiver sees the end too and the disc is closed in order, and if
++ * the disc's code does not let that finish in HANGUP_GRACE_S, the process ends here. A thread of
++ * its own that waits for nothing else: what the disc runs cannot hold it.
++ */
++static void *_hangup_thread(void *p)
++{
++    static const char line[] = "hades-bdj-host: the player went away, and the disc did not close in "
++                               "5 s: the host ends here\n";
++    int fd = (int)(intptr_t)p;
++    struct timespec until;
++    ssize_t w;
++
++    for (;;) {
++        struct pollfd pfd;
++        int r;
++        pfd.fd      = fd;
++        pfd.events  = POLLRDHUP;   /* the end of the connection only (POLLHUP and POLLERR come anyway) */
++        pfd.revents = 0;
++        r = poll(&pfd, 1, -1);
++        if (r > 0 || (r < 0 && errno != EINTR)) {
++            break;
++        }
++    }
++
++    clock_gettime(CLOCK_MONOTONIC, &until);
++    until.tv_sec += HANGUP_GRACE_S;
++    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &until, NULL) == EINTR) {
++    }
++    w = write(2, line, sizeof(line) - 1);
++    (void)w;
++    _exit(4);
++    return NULL;
++}
++
+ static int _hello(BDR_SERVER *s)
+ {
+     BDR_HDR hdr;
+@@ -1003,6 +1048,23 @@ int bd_bdj_host_run(int fd, const BD_BDJ_HOST_CONFIG *cfg)
+         goto out;
+     }
+ 
++    /* ready: the player is greeted, and nothing of the disc is read yet */
++    if (cfg && cfg->ready) {
++        cfg->ready(cfg->ready_ctx);
++    }
++    {
++        pthread_t th;
++        pthread_attr_t attr;
++        int r;
++        pthread_attr_init(&attr);
++        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++        r = pthread_create(&th, &attr, _hangup_thread, (void *)(intptr_t)fd);
++        pthread_attr_destroy(&attr);
++        if (r) {
++            goto out;
++        }
++    }
++
+     g_srv = s;
+     bd_set_debug_handler(_log);
+ 
+diff --git a/src/tools/hades_bdj_host.c b/src/tools/hades_bdj_host.c
+index 2be5c18..233dc85 100644
+--- a/src/tools/hades_bdj_host.c
++++ b/src/tools/hades_bdj_host.c
+@@ -33,13 +33,16 @@
+ 
+ #include "hades_bdj_sandbox.h"
+ 
++#include <errno.h>
+ #include <fcntl.h>
++#include <stddef.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
++#include <sys/un.h>
+ 
+ #define DEFAULT_JAVA_HOME       "/usr/lib/hades-bdj/jre"
+ #define DEFAULT_PERSISTENT_ROOT "/var/lib/hades-bdj/persistent"
+@@ -52,6 +55,67 @@ static int _usage(const char *argv0)
+     return 2;
+ }
+ 
++/*
++ * systemd's readiness protocol (sd_notify(3), without libsystemd). The socket in $NOTIFY_SOCKET
++ * is opened first thing, before the sandbox, and the variable leaves the environment, so that
++ * nothing started later (the JVM, the disc's code) knows it. READY=1 goes out once the player is
++ * greeted, before anything of the disc is read (bd_bdj_host_run() calls _ready()), and the socket
++ * is closed then. hades-bdj@.service waits for it (Type=notify) and kills the whole instance when
++ * it does not come in time.
++ */
++static int g_notify_fd = -1;
++
++static void _notify_open(void)
++{
++    const char *path = getenv("NOTIFY_SOCKET");
++    struct sockaddr_un sa;
++    socklen_t salen;
++    size_t len;
++
++    if (!path || !path[0]) {
++        return;
++    }
++    len = strlen(path);
++    if ((path[0] != '/' && path[0] != '@') || len >= sizeof(sa.sun_path)) {
++        unsetenv("NOTIFY_SOCKET");
++        fprintf(stderr, "hades-bdj-host: NOTIFY_SOCKET is not a socket it can use\n");
++        return;
++    }
++    memset(&sa, 0, sizeof(sa));
++    sa.sun_family = AF_UNIX;
++    memcpy(sa.sun_path, path, len);
++    if (path[0] == '@') {
++        sa.sun_path[0] = 0;   /* an abstract socket */
++    }
++    salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + len + (path[0] == '/'));
++    unsetenv("NOTIFY_SOCKET");
++
++    g_notify_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (g_notify_fd < 0 || connect(g_notify_fd, (struct sockaddr *)&sa, salen) < 0) {
++        fprintf(stderr, "hades-bdj-host: systemd's notification socket: %s\n", strerror(errno));
++        if (g_notify_fd >= 0) {
++            close(g_notify_fd);
++        }
++        g_notify_fd = -1;
++    }
++}
++
++/* the player is greeted: ready (BD_BDJ_HOST_CONFIG.ready) */
++static void _ready(void *ctx)
++{
++    static const char msg[] = "READY=1";
++
++    (void)ctx;
++    if (g_notify_fd < 0) {
++        return;
++    }
++    if (send(g_notify_fd, msg, sizeof(msg) - 1, MSG_NOSIGNAL) < 0) {
++        fprintf(stderr, "hades-bdj-host: could not tell systemd it is ready: %s\n", strerror(errno));
++    }
++    close(g_notify_fd);
++    g_notify_fd = -1;
++}
++
+ /* the socket systemd passed (sd_listen_fds() for one descriptor), or -1 */
+ static int _listen_fd(void)
+ {
+@@ -116,7 +180,11 @@ int main(int argc, char **argv)
+     struct stat st;
+     int fd = -1, sandbox = 1, i, rc;
+ 
++    /* before anything else, systemd's notification socket (see _notify_open()) */
++    _notify_open();
++
+     memset(&cfg, 0, sizeof(cfg));
++    cfg.ready           = _ready;
+     cfg.java_home       = DEFAULT_JAVA_HOME;
+     cfg.persistent_root = DEFAULT_PERSISTENT_ROOT;
+     cfg.cache_root      = DEFAULT_CACHE_ROOT;
+diff --git a/src/tools/hades_bdj_sandbox.c b/src/tools/hades_bdj_sandbox.c
+index dca7ad7..e21a812 100644
+--- a/src/tools/hades_bdj_sandbox.c
++++ b/src/tools/hades_bdj_sandbox.c
+@@ -156,6 +156,18 @@ static int _filter(int internet)
+ 
+     if (_socket_rules(ctx, "socket", internet) || _socket_rules(ctx, "socketpair", internet))
+         goto out;
++
++    /* no datagram socket of AF_UNIX: the one this process has, systemd's notification socket, is
++       opened before this filter and closed once the server is ready (hades_bdj_host.c), and
++       nothing after that may write there (READY=1, STOPPING=1...). A stream socket can not
++       connect to it. */
++    {
++        struct scmp_arg_cmp dg[2];
++        dg[0] = SCMP_A0(SCMP_CMP_EQ, AF_UNIX);
++        dg[1] = SCMP_A1(SCMP_CMP_MASKED_EQ, 0xf, SOCK_DGRAM);
++        if (_rule(ctx, SCMP_ACT_ERRNO(EPERM), "socket", 2, dg))
++            goto out;
++    }
+     if (internet && hades_bdj_sandbox_net_rules(ctx))
+         goto out;
+ 

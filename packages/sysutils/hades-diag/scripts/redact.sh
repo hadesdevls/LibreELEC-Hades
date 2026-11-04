@@ -13,7 +13,11 @@
 #                              key ID printed in hex for a token, and a line of them for a blob
 #   redact.sh edid <in> <out>  an EDID, without its serial numbers
 #   redact.sh tree <in> <out>  a folder of the diagnostics into another, each file through what fits it:
-#                              an EDID (edid/*.bin) as above, the archive of the ACPI tables as it is (the
+#                              an EDID (edid/*.bin, also in a folder below <in>: a folder of a start
+#                              holds its snapshots, 1-minute/edid/...) as above, never as text (that turned each
+#                              byte 0 into a line end, and left the serial number in it); a copy that an earlier
+#                              version damaged so (its header 0a ff ff ff ff ff ff 0a) cannot be mended and is left
+#                              out, with a note in its place. The archive of the ACPI tables as it is (the
 #                              firmware's description of the machine: no text of the system), Kodi's logs and
 #                              the journal through the whole filter (once more where they were made through
 #                              it: a second pass changes nothing; the first one, for what an earlier version
@@ -21,6 +25,8 @@
 #                              newer than its file of <in> is kept as it is
 #   redact.sh btname <file>    the name and the alias of a Bluetooth device in a file of BlueZ, as the
 #                              markers that the filter puts where they stand: "Name: [bt-name-...]"
+# With HADES_REDACT_DROP_UNENDED set, a last line of the input with no line end is left out (the input was cut
+# while it was written, shutdown.sh); with HADES_REDACT_STATS set, what the filter did goes to standard error.
 # The names of the Bluetooth devices are those that BlueZ keeps in /storage/.cache/bluetooth: of each paired
 # device (<adapter>/<device>/info), and of the devices that it saw when it looked for some, in its cache of names
 # (<adapter>/cache/<device>; the 64 files of it written last). Where they cannot be read, the rest of the filter
@@ -63,7 +69,8 @@ btnames() {
 # (a line end and a random word after the input, so that a last line that had no line end gets none: see
 # emit() in redact-ids.awk)
 last=hades-end-$(head -c 12 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
-ids() { { cat; printf '\n%s\n' "$last"; } | awk -v KEYFILE="$key" -v TMP="$W/h" -v HOST="$host" -v NAMES="$W/names" -v MODE="$1" -v LAST="$last" -f "$L/redact-ids.awk"; }
+# (the digests that one file of a run made are kept in $W/dg for the files after it: see digest() in redact-ids.awk)
+ids() { { cat; printf '\n%s\n' "$last"; } | awk -v KEYFILE="$key" -v TMP="$W/h" -v DGFILE="$W/dg" -v HOST="$host" -v NAMES="$W/names" -v MODE="$1" -v LAST="$last" -v DROPCUT="${HADES_REDACT_DROP_UNENDED:-}" -v STATS="${HADES_REDACT_STATS:-}" -f "$L/redact-ids.awk"; }
 edid() {
   e=$(set -o pipefail; od -An -v -tx1 < "$1" | awk -v MODE=edid -f "$L/redact-ids.awk") || return 1
   printf "$e" > "$2"
@@ -78,7 +85,11 @@ tree() {
     [ "$2/$f" -nt "$1/$f" ] && continue
     case $f in */*) mkdir -p "$2/${f%/*}" ;; esac
     case $f in
-      edid/*.bin) edid "$1/$f" "$2/$f" ;;
+      edid/*.bin|*/edid/*.bin)
+        edid "$1/$f" "$2/$f" && if [ ! -s "$2/$f" ]; then
+          rm -f "$2/$f"
+          echo "An earlier version of the diagnostics damaged this copy of the EDID (each byte 0 became a line end): it cannot be mended and is left out." > "$2/$f.left-out.txt"
+        fi ;;
       *.tar.gz) cp "$1/$f" "$2/$f" ;;
       kodi*.log.gz|*/kodi*.log.gz|journal*.gz|*/journal*.gz) (set -o pipefail; gunzip -c "$1/$f" | ids log | sed -E -f "$L/redact.sed" | gzip > "$2/$f") ;;
       kodi-tail*|*/kodi-tail*) (set -o pipefail; ids log < "$1/$f" | sed -E -f "$L/redact.sed" > "$2/$f") ;;

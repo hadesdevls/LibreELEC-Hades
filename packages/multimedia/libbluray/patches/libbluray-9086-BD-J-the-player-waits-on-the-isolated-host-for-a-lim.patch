@@ -1,0 +1,504 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 04:03:47 +0000
+Subject: [PATCH] BD-J: the player waits on the isolated host for a limited
+ time only
+
+A host that stops reading what the player sends held the thread that sent.
+The reader of the client waited in its acknowledgement of a drawing, every
+call of the player waited for the reader, and so the player's thread was held
+until the call's 60 s without anything from the host ran out. A send without a
+call (BDR_CLOSE when the disc closes) had no end at all. A host that never
+answered a call but kept sending other things (log lines, drawings) was never
+taken as hung. The greeting was waited for without end.
+
+- bdr_send_timed(): a send that the peer must take within a time limit. With
+  a limit, sendmsg() never blocks (MSG_DONTWAIT): the wait for room is poll(),
+  up to the deadline, then ETIMEDOUT. bdr_send() is bdr_send_timed() without a
+  limit (the host's sends, as before).
+- Every send of the client has a limit of 5 s. A message the host does not
+  take in that time ends the host as one that does not answer: it is killed,
+  the disc goes on as when BD-J does not start, and the log says once "BD-J
+  host: it stopped reading what the player sends (nothing taken in 5 s)".
+  Measured with the image's units and a stream read through the host: the
+  sends to a healthy host never waited for room, idle or with the host and the
+  player on two processors shared with 8 and with 32 busy loops. With a send
+  buffer of 8 KiB, so that most large messages wait for the host to read them,
+  the longest wait was 32 ms (one processor shared with 64 busy loops). The
+  host reads in a thread that does nothing else.
+- The answers to names (BD-Live) go out with the same limit, and one that
+  does not ends the host through the client: bdr_net_new() takes the limit
+  and a callback.
+- A call, or the opening of the disc, never takes longer than five times its
+  limit (300 s, 600 s), whatever the host sends meanwhile.
+- The answer to the greeting is waited for at most 30 s, and connect() at
+  most as long (SO_SNDTIMEO, which connect() honours on a stream socket of
+  this kind when the listener takes no connection).
+- A host that does not take BDR_CLOSE gets no grace time to close the disc.
+---
+ src/libbluray/remote/bdr_client.c     | 122 +++++++++++++++++++++++---
+ src/libbluray/remote/bdr_net.h        |   7 +-
+ src/libbluray/remote/bdr_net_client.c |  32 ++++---
+ src/libbluray/remote/bdr_wire.c       |  58 +++++++++++-
+ src/libbluray/remote/bdr_wire.h       |  10 +++
+ 5 files changed, 198 insertions(+), 31 deletions(-)
+
+diff --git a/src/libbluray/remote/bdr_client.c b/src/libbluray/remote/bdr_client.c
+index e738fe5..1a1b668 100644
+--- a/src/libbluray/remote/bdr_client.c
++++ b/src/libbluray/remote/bdr_client.c
+@@ -68,6 +68,7 @@
+ #include <signal.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <poll.h>
+ #include <string.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -75,6 +76,7 @@
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <sys/syscall.h>
++#include <sys/time.h>
+ #include <sys/types.h>
+ #include <sys/un.h>
+ #include <sys/wait.h>
+@@ -106,6 +108,15 @@
+ 
+ #define START_TIMEOUT_MS    120000  /* opening a disc can read many files over a network */
+ #define CALL_TIMEOUT_MS      60000  /* a call: nothing at all from the host for that long */
++#define CALL_LIMIT_TIMES         5  /* a call, or the opening: never longer than this many times
++                                       its limit above, whatever the host sends meanwhile */
++#define HELLO_TIMEOUT_MS     30000  /* the connection, and the answer to the greeting: the host
++                                       gives it before it reads anything of the disc */
++#define SEND_TIMEOUT_S           5  /* a message the host does not take in this time: it stopped
++                                       reading, it is taken as hung (measured: notes of F2) */
++#define SEND_TIMEOUT_MS  (SEND_TIMEOUT_S * 1000)
++#define BDR_STR_(x) #x
++#define BDR_STR(x)  BDR_STR_(x)
+ #define CLOSE_GRACE_MS        5000  /* the host closes the disc (its Xlets end) */
+ #define LOG_LINES_PER_SECOND   100
+ #define LOG_LINES_TOTAL       2000  /* a connection; then, once a minute, how many were left out */
+@@ -335,11 +346,37 @@ static void _fail(BDR_CLIENT *c, const char *why)
+     }
+ }
+ 
++/*
++ * Every message to the host goes out here: one the host does not take within SEND_TIMEOUT_MS
++ * (it stopped reading) fails, so no thread of the player waits on a hung host longer than that
++ * (without a limit, the reader would wait in its acknowledgement of a drawing and each call for
++ * the reader, until CALL_TIMEOUT_MS).
++ */
++static int _send_msg(BDR_CLIENT *c, uint16_t type, uint32_t id, const void *p1, size_t l1,
++                     const void *p2, size_t l2, int pass_fd)
++{
++    return bdr_send_timed(c->fd, &c->send_lock, SEND_TIMEOUT_MS, type, 0, id, p1, l1, p2, l2,
++                          NULL, 0, pass_fd);
++}
++
++/* a send failed (errno err): the host is ended, as one that does not answer */
++static void _send_failed(BDR_CLIENT *c, int err)
++{
++    _fail(c, err == ETIMEDOUT ? "it stopped reading what the player sends (nothing taken in "
++          BDR_STR(SEND_TIMEOUT_S) " s)" : "the connection failed");
++}
++
++/* BD-Live: an answer to a name that did not go out (bdr_net_client.c) */
++static void _net_send_failed(void *ctx, int err)
++{
++    _send_failed((BDR_CLIENT *)ctx, err);
++}
++
+ static int _send(BDR_CLIENT *c, uint16_t type, uint32_t id, const void *p1, size_t l1,
+                  const void *p2, size_t l2)
+ {
+-    if (bdr_send(c->fd, &c->send_lock, type, 0, id, p1, l1, p2, l2, NULL, 0, -1) < 0) {
+-        _fail(c, "the connection failed");
++    if (_send_msg(c, type, id, p1, l1, p2, l2, -1) < 0) {
++        _send_failed(c, errno);
+         return -1;
+     }
+     return 0;
+@@ -1231,6 +1268,8 @@ static uint8_t *_request(BDR_CLIENT *c, uint16_t type, uint16_t answer, const vo
+     BDR_WAITER w;
+     BDR_WAITER **pw;
+     uint8_t *result = NULL;
++    uint64_t started;
++    const uint64_t limit = (uint64_t)timeout_ms * CALL_LIMIT_TIMES;
+ 
+     memset(&w, 0, sizeof(w));
+     _cond_init(&w.cond);
+@@ -1245,15 +1284,26 @@ static uint8_t *_request(BDR_CLIENT *c, uint16_t type, uint16_t answer, const vo
+     w.next = c->waiters;
+     c->waiters = &w;
+     c->last_rx = _now_ms();
++    started = c->last_rx;
+     pthread_mutex_unlock(&c->lock);
+ 
+-    if (bdr_send(c->fd, &c->send_lock, type, 0, w.id, p1, l1, p2, l2, NULL, 0, pass_fd) < 0) {
+-        _fail(c, "the connection failed");
++    if (_send_msg(c, type, w.id, p1, l1, p2, l2, pass_fd) < 0) {
++        _send_failed(c, errno);
+     }
+ 
+     pthread_mutex_lock(&c->lock);
+     while (1) {
+-        BDR_ITEM *it = _queue_pop(&w.sync);
++        BDR_ITEM *it;
++        /* whatever comes meanwhile (overlays of this call too), a call has an end: a host that
++           keeps sending other things never answers it otherwise */
++        if (!w.done && !c->dead && _now_ms() - started > limit) {
++            char why[64];
++            snprintf(why, sizeof(why), "a call took longer than %u s", (unsigned)(limit / 1000));
++            pthread_mutex_unlock(&c->lock);
++            _fail(c, why);
++            pthread_mutex_lock(&c->lock);
++        }
++        it = _queue_pop(&w.sync);
+         if (it) {
+             pthread_mutex_unlock(&c->lock);
+             _deliver_overlay(c, it);
+@@ -1303,7 +1353,7 @@ static uint8_t *_request(BDR_CLIENT *c, uint16_t type, uint16_t answer, const vo
+     return result;
+ }
+ 
+-static unsigned _call_timeout(void)
++static unsigned _test_timeout(unsigned ms)
+ {
+ #ifdef BDR_TEST_EXEC
+     /* test builds only: a hung host is found sooner */
+@@ -1312,7 +1362,12 @@ static unsigned _call_timeout(void)
+         return (unsigned)atoi(env);
+     }
+ #endif
+-    return CALL_TIMEOUT_MS;
++    return ms;
++}
++
++static unsigned _call_timeout(void)
++{
++    return _test_timeout(CALL_TIMEOUT_MS);
+ }
+ 
+ /*
+@@ -1410,9 +1465,24 @@ static int _connect_socket(BDR_CLIENT *c)
+     memset(&sa, 0, sizeof(sa));
+     sa.sun_family = AF_UNIX;
+     strcpy(sa.sun_path, path);
+-    if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+-        BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J host: can not connect to %s (%s)\n", path, strerror(errno));
+-        return -1;
++    {
++        /* a listener that takes no connection (its queue full) is not waited for without end: on
++           a socket of this kind, connect() waits at most SO_SNDTIMEO */
++        struct timeval tv;
++        tv.tv_sec  = HELLO_TIMEOUT_MS / 1000;
++        tv.tv_usec = 0;
++        if (setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
++            return -1;
++        }
++        if (connect(c->fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
++            BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J host: can not connect to %s (%s)\n", path, strerror(errno));
++            return -1;
++        }
++        /* the sends have their own limit (_send_msg()) */
++        tv.tv_sec = 0;
++        if (setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
++            return -1;
++        }
+     }
+     return 0;
+ }
+@@ -1469,6 +1539,8 @@ static int _recv_hello(BDR_CLIENT *c, int product)
+     int have_cred = 0, off = 0;
+     size_t done = 0, want = sizeof(hdr) + sizeof(hello);
+     uint8_t raw[sizeof(BDR_HDR) + sizeof(BDR_HELLO_MSG)];
++    const unsigned limit = _test_timeout(HELLO_TIMEOUT_MS);
++    const uint64_t deadline = _now_ms() + limit;
+ 
+     /* SO_PASSCRED was set before BDR_HELLO went out: the kernel records the credentials of the
+        writer only while the reader asks for them */
+@@ -1483,6 +1555,28 @@ static int _recv_hello(BDR_CLIENT *c, int product)
+         msg.msg_control    = control.buf;
+         msg.msg_controllen = sizeof(control.buf);
+ 
++        {
++            /* the answer is waited for until the deadline, not without end */
++            struct pollfd pfd;
++            uint64_t now = _now_ms();
++            int r;
++            if (now >= deadline) {
++                BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J host: no answer to the greeting in %u s\n",
++                         limit / 1000);
++                return -1;
++            }
++            pfd.fd      = c->fd;
++            pfd.events  = POLLIN;
++            pfd.revents = 0;
++            r = poll(&pfd, 1, (int)(deadline - now));
++            if (r < 0 && errno != EINTR) {
++                return -1;
++            }
++            if (r <= 0) {
++                continue;
++            }
++        }
++
+         n = recvmsg(c->fd, &msg, MSG_CMSG_CLOEXEC);
+         if (n < 0 && errno == EINTR) {
+             continue;
+@@ -1659,7 +1753,7 @@ BDR_CLIENT *bdr_client_start(const BDR_START *st)
+         }
+     }
+     /* BD-Live on or off: off, the names the host asks for are refused */
+-    c->net = bdr_net_new(c->fd, &c->send_lock, c->bdlive);
++    c->net = bdr_net_new(c->fd, &c->send_lock, c->bdlive, SEND_TIMEOUT_MS, _net_send_failed, c);
+     if (!c->net) {
+         goto fail;
+     }
+@@ -1669,7 +1763,7 @@ BDR_CLIENT *bdr_client_start(const BDR_START *st)
+     hello.layout      = BDR_LAYOUT;
+     hello.max_payload = BDR_MAX_PAYLOAD;
+     hello.pid         = (uint32_t)getpid();
+-    if (bdr_send(c->fd, &c->send_lock, BDR_HELLO, 0, 0, &hello, sizeof(hello), NULL, 0, NULL, 0, -1) < 0 ||
++    if (_send_msg(c, BDR_HELLO, 0, &hello, sizeof(hello), NULL, 0, -1) < 0 ||
+         _recv_hello(c, product) < 0) {
+         goto fail;
+     }
+@@ -1748,9 +1842,9 @@ void bdr_client_close(BDR_CLIENT **pc)
+     c->closing = 1;
+     pthread_mutex_unlock(&c->lock);
+ 
+-    if (c->fd >= 0 && c->rx_started) {
++    /* a host that does not take BDR_CLOSE (SEND_TIMEOUT_MS) gets no time to close the disc */
++    if (c->fd >= 0 && c->rx_started && _send_msg(c, BDR_CLOSE, 0, NULL, 0, NULL, 0, -1) == 0) {
+         struct timespec ts;
+-        bdr_send(c->fd, &c->send_lock, BDR_CLOSE, 0, 0, NULL, 0, NULL, 0, NULL, 0, -1);
+         _deadline(&ts, CLOSE_GRACE_MS);
+         pthread_mutex_lock(&c->lock);
+         while (!c->dead) {
+diff --git a/src/libbluray/remote/bdr_net.h b/src/libbluray/remote/bdr_net.h
+index 708d69c..2741986 100644
+--- a/src/libbluray/remote/bdr_net.h
++++ b/src/libbluray/remote/bdr_net.h
+@@ -70,7 +70,12 @@ BD_PRIVATE const char *bdr_net_socket(void);
+ /* on: BD-Live is on; off, every name the host asks for is refused (and said, within the cap of the
+    log: BDR_NET_LOG_LINES lines a connection, then once a minute how many were left out) */
+ #define BDR_NET_LOG_LINES 100
+-BD_PRIVATE BDR_NET *bdr_net_new(int fd, pthread_mutex_t *send_lock, int on);
++/* the answers go out with bdr_send_timed(timeout_ms); one that does not (errno err: ETIMEDOUT, the
++   host took nothing in that time) leaves the connection of no use: fail (may be NULL) is called
++   then, with the lock of net held, never after bdr_net_detach() */
++typedef void (*bdr_net_fail_f)(void *ctx, int err);
++BD_PRIVATE BDR_NET *bdr_net_new(int fd, pthread_mutex_t *send_lock, int on, unsigned timeout_ms,
++                                bdr_net_fail_f fail, void *ctx);
+ /* a BDR_RESOLVE of the host */
+ BD_PRIVATE void bdr_net_request(BDR_NET *net, int fd, pthread_mutex_t *send_lock, uint32_t id,
+                                 const uint8_t *payload, uint32_t len);
+diff --git a/src/libbluray/remote/bdr_net_client.c b/src/libbluray/remote/bdr_net_client.c
+index f16a289..28240c7 100644
+--- a/src/libbluray/remote/bdr_net_client.c
++++ b/src/libbluray/remote/bdr_net_client.c
+@@ -58,6 +58,9 @@ struct bdr_net {
+     int              refs;       /* the connection, and each lookup */
+     int              fd;
+     pthread_mutex_t *send_lock;
++    unsigned         timeout_ms;  /* of a send */
++    bdr_net_fail_f   fail;
++    void            *fail_ctx;
+     unsigned         running;
+     time_t           second;
+     unsigned         in_second;
+@@ -210,22 +213,18 @@ static void _unref(BDR_NET *net)
+     }
+ }
+ 
+-static void _answer(int fd, pthread_mutex_t *send_lock, uint32_t id, int64_t ret, const uint8_t *data,
+-                    uint32_t dlen)
++static void _answer_net(BDR_NET *net, uint32_t id, int64_t ret, const uint8_t *data, uint32_t dlen)
+ {
+     BDR_FILE_REPLY_MSG rep;
+ 
+     memset(&rep, 0, sizeof(rep));
+     rep.ret  = ret;
+     rep.dlen = dlen;
+-    bdr_send(fd, send_lock, BDR_FILE_REPLY, 0, id, &rep, sizeof(rep), data, dlen, NULL, 0, -1);
+-}
+-
+-static void _answer_net(BDR_NET *net, uint32_t id, int64_t ret, const uint8_t *data, uint32_t dlen)
+-{
+     pthread_mutex_lock(&net->lock);
+-    if (net->attached) {
+-        _answer(net->fd, net->send_lock, id, ret, data, dlen);
++    if (net->attached &&
++        bdr_send_timed(net->fd, net->send_lock, net->timeout_ms, BDR_FILE_REPLY, 0, id, &rep,
++                       sizeof(rep), data, dlen, NULL, 0, -1) < 0 && net->fail) {
++        net->fail(net->fail_ctx, errno);
+     }
+     pthread_mutex_unlock(&net->lock);
+ }
+@@ -321,7 +320,8 @@ out:
+     return NULL;
+ }
+ 
+-BDR_NET *bdr_net_new(int fd, pthread_mutex_t *send_lock, int on)
++BDR_NET *bdr_net_new(int fd, pthread_mutex_t *send_lock, int on, unsigned timeout_ms,
++                     bdr_net_fail_f fail, void *ctx)
+ {
+     BDR_NET *net = calloc(1, sizeof(*net));
+ 
+@@ -333,8 +333,11 @@ BDR_NET *bdr_net_new(int fd, pthread_mutex_t *send_lock, int on)
+     net->on        = on;
+     net->attached  = 1;
+     net->refs      = 1;
+-    net->fd        = fd;
+-    net->send_lock = send_lock;
++    net->fd         = fd;
++    net->send_lock  = send_lock;
++    net->timeout_ms = timeout_ms;
++    net->fail       = fail;
++    net->fail_ctx   = ctx;
+     return net;
+ }
+ 
+@@ -366,9 +369,10 @@ void bdr_net_request(BDR_NET *net, int fd, pthread_mutex_t *send_lock, uint32_t
+     time_t now = time(NULL);
+     int busy = 0;
+ 
++    (void)fd;
++    (void)send_lock;
+     if (!net) {
+-        _answer(fd, send_lock, id, BDR_NET_OFF, NULL, 0);
+-        return;
++        return;   /* never: the client does not run without one (bdr_client_start()) */
+     }
+     if (!net->on) {
+         NET_LOG(net, "BD-Live: the BD-J host asked for a name with BD-Live off: refused\n");
+diff --git a/src/libbluray/remote/bdr_wire.c b/src/libbluray/remote/bdr_wire.c
+index 3a41e08..1ab8095 100644
+--- a/src/libbluray/remote/bdr_wire.c
++++ b/src/libbluray/remote/bdr_wire.c
+@@ -24,20 +24,64 @@
+ #include "bdr_wire.h"
+ 
+ #include <errno.h>
++#include <poll.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <sys/socket.h>
+ #include <sys/uio.h>
+ #include <unistd.h>
+ 
++static uint64_t _now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
++}
++
++/* wait until fd takes more, at most until deadline (ms of CLOCK_MONOTONIC): 0, or -1 with errno
++   (ETIMEDOUT: the deadline passed) */
++static int _wait_writable(int fd, uint64_t deadline)
++{
++    while (1) {
++        struct pollfd pfd;
++        uint64_t now = _now_ms(), left;
++        int r;
++
++        if (now >= deadline) {
++            errno = ETIMEDOUT;
++            return -1;
++        }
++        left = deadline - now;
++        pfd.fd      = fd;
++        pfd.events  = POLLOUT;
++        pfd.revents = 0;
++        r = poll(&pfd, 1, left > 60000 ? 60000 : (int)left);
++        if (r > 0) {
++            return 0;   /* it takes more, or has an error that the next send reports */
++        }
++        if (r < 0 && errno != EINTR) {
++            return -1;
++        }
++    }
++}
++
+ int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint32_t id,
+              const void *p1, size_t l1, const void *p2, size_t l2,
+              const void *p3, size_t l3, int pass_fd)
++{
++    return bdr_send_timed(fd, lock, 0, type, flags, id, p1, l1, p2, l2, p3, l3, pass_fd);
++}
++
++int bdr_send_timed(int fd, pthread_mutex_t *lock, unsigned timeout_ms, uint16_t type,
++                   uint16_t flags, uint32_t id, const void *p1, size_t l1,
++                   const void *p2, size_t l2, const void *p3, size_t l3, int pass_fd)
+ {
+     BDR_HDR hdr;
+     struct iovec iov[4];
+-    int n_iov = 0, cur = 0, result = 0, first = 1;
++    int n_iov = 0, cur = 0, result = 0, first = 1, err = 0;
+     size_t total = l1 + l2 + l3;
++    uint64_t deadline;
+ 
+     if (fd < 0 || l1 > BDR_MAX_PAYLOAD || l2 > BDR_MAX_PAYLOAD || l3 > BDR_MAX_PAYLOAD ||
+         total > BDR_MAX_PAYLOAD) {
+@@ -59,6 +103,7 @@ int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint3
+     if (l3) { iov[n_iov].iov_base = (void *)(uintptr_t)p3; iov[n_iov].iov_len = l3; n_iov++; }
+ 
+     pthread_mutex_lock(lock);
++    deadline = _now_ms() + timeout_ms;
+ 
+     while (cur < n_iov) {
+         struct msghdr msg;
+@@ -84,11 +129,17 @@ int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint3
+             memcpy(CMSG_DATA(cmsg), &pass_fd, sizeof(int));
+         }
+ 
+-        sent = sendmsg(fd, &msg, MSG_NOSIGNAL);
++        /* with a limit, a send never blocks: the wait for room is poll(), up to the deadline */
++        sent = sendmsg(fd, &msg, MSG_NOSIGNAL | (timeout_ms ? MSG_DONTWAIT : 0));
+         if (sent < 0) {
+             if (errno == EINTR) {
+                 continue;
+             }
++            if (timeout_ms && (errno == EAGAIN || errno == EWOULDBLOCK) &&
++                _wait_writable(fd, deadline) == 0) {
++                continue;
++            }
++            err = errno;
+             result = -1;
+             break;
+         }
+@@ -109,6 +160,9 @@ int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t flags, uint3
+ 
+     pthread_mutex_unlock(lock);
+ 
++    if (result < 0) {
++        errno = err;
++    }
+     return result;
+ }
+ 
+diff --git a/src/libbluray/remote/bdr_wire.h b/src/libbluray/remote/bdr_wire.h
+index de8fed7..d4bb3fa 100644
+--- a/src/libbluray/remote/bdr_wire.h
++++ b/src/libbluray/remote/bdr_wire.h
+@@ -39,6 +39,16 @@ BD_PRIVATE int bdr_send(int fd, pthread_mutex_t *lock, uint16_t type, uint16_t f
+                         const void *p1, size_t l1, const void *p2, size_t l2,
+                         const void *p3, size_t l3, int pass_fd);
+ 
++/*
++ * bdr_send() for a sender that must not wait without end on a peer that stopped reading: the
++ * peer must take the whole message within timeout_ms of the moment *lock is held (0: no limit,
++ * as bdr_send()), or the send fails with errno ETIMEDOUT. What part of the message went out
++ * stays out: the connection is then of no further use, as after any failure.
++ */
++BD_PRIVATE int bdr_send_timed(int fd, pthread_mutex_t *lock, unsigned timeout_ms, uint16_t type,
++                              uint16_t flags, uint32_t id, const void *p1, size_t l1,
++                              const void *p2, size_t l2, const void *p3, size_t l3, int pass_fd);
++
+ /*
+  * Receive one message. *payload is allocated (free()) when hdr->len > 0, NULL otherwise.
+  * A file descriptor that comes with it is stored in *recv_fd if recv_fd is not NULL (-1 if

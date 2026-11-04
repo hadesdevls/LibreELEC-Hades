@@ -8,6 +8,7 @@ PKG_SHA256="ee914d57ac8e8c9b4ab238dc3dd1d7e461b62896408e55b8ac737b5edaa8eaca"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE="https://github.com/sailfishos/plymouth-lite"
 PKG_URL="https://github.com/sailfishos/plymouth-lite/archive/${PKG_VERSION}.tar.gz"
+PKG_DEPENDS_TARGET="toolchain libpng"
 PKG_DEPENDS_INIT="toolchain gcc:init libpng"
 PKG_LONGDESC="Boot splash screen based on Fedora's Plymouth code"
 
@@ -15,6 +16,27 @@ pre_configure_init() {
   # plymouth-lite dont support to build in subdirs
   cd ${PKG_BUILD}
     rm -rf .${TARGET_NAME}-init
+}
+
+# Hades: ply-image in the system as well, for the notice "one display" that Kodi's start draws
+# (kodi-display-notice), built as the one of the initramfs. The two builds share the folder of the
+# sources: each one makes its program again, whatever the other left there.
+pre_configure_target() {
+  cd ${PKG_BUILD}
+    rm -rf .${TARGET_NAME}
+}
+
+pre_make_target() {
+  make clean
+}
+
+pre_make_init() {
+  make clean
+}
+
+makeinstall_target() {
+  mkdir -p ${INSTALL}/usr/bin
+    cp ply-image ${INSTALL}/usr/bin
 }
 
 makeinstall_init() {

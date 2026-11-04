@@ -430,6 +430,13 @@ snapshot() {
   lim journalctl -b -u kodi --no-pager | tail -80 | clean
   echo "== services"; for u in iptables sshd smbd bluetooth avahi-daemon wait-time-sync kodi-autostart hades-diag kodi; do echo "$u: $(lim systemctl is-active $u)"; done
   lim systemctl --failed --no-pager
+  # Hades: what iptables.service is given (each line with "$" at its end, a line end of Windows as "\r"), and
+  # whether a firewall is loaded (the policy of INPUT)
+  echo "== firewall"
+  for f in /storage/.cache/services/iptables.conf /storage/.cache/services/iptables.disabled; do
+    [ -e $f ] && { echo "${f##*/}: $(wc -c < $f) bytes"; head -n 5 $f | cut -c1-120 | awk '{ gsub(/\r/, "\\\\r"); gsub(/\t/, "\\\\t"); print $0 "$" }'; }
+  done
+  echo "INPUT: $(lim iptables -S INPUT | head -n 1) | $(lim ip6tables -S INPUT | head -n 1)"
   echo "== sockets (the Varlink system installer of systemd 262 must not listen)"
   echo "systemd-sysinstall.socket: enabled=$(lim systemctl is-enabled systemd-sysinstall.socket) active=$(lim systemctl is-active systemd-sysinstall.socket)"
   lim systemctl list-sockets --all --no-pager | grep -iE "sysinstall|listen" | head -20
@@ -469,9 +476,31 @@ snapshot() {
   rm -rf $S $S.filtered
 }
 
+# The start before this one, as the journal kept it in the storage (hades_diag_journal in the init, or the
+# setting of LibreELEC; the machine ID is kept in the storage, so "-b -1" is that start, and journalctl does not
+# take --merge with -b): previous-boot/journal.txt.gz, the last 8 MiB of it, and journal-kernel.txt.gz, the
+# kernel's lines of it, through the filter for logs. It tells how a start that hung or lost its power ended,
+# which nothing else here can: that start saved nothing. Written once, before the first snapshot; nothing where
+# the journal has no start before this one.
+previous_boot() {
+  local P=$T/previous-boot
+  [ -e /run/hades-diag-journal ] || [ -f /storage/.cache/journald.conf.d/00_settings.conf ] || return 0
+  lim journalctl --list-boots --no-pager 2>/dev/null | grep -q '^ *-1 ' || return 0
+  rm -rf $P $P.filtered; mkdir -p $P
+  echo "$B" > $P/build.txt
+  lim journalctl -b -1 --no-pager > $T/previous.txt
+  last 8388608 $T/previous.txt | clean | gzip > $P/journal.txt.gz
+  lim journalctl -b -1 -k --no-pager > $T/previous.txt
+  last 8388608 $T/previous.txt | clean | gzip > $P/journal-kernel.txt.gz
+  rm -f $T/previous.txt
+  to_flash previous-boot
+  rm -rf $P $P.filtered
+}
+
 # (what a run of this that was killed left turned up)
 debug_down
 refilter
+mkdir -p $T; previous_boot
 sleep 60; snapshot 1-minute
 sleep 150; snapshot 4-minutes
 ) >/dev/null 2>&1 &

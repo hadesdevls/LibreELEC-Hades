@@ -21,4 +21,5 @@ PKG_CMAKE_OPTS_TARGET="-DBUILD_CMRTLIB=OFF \
                        -DBUILD_TYPE=release \
                        -DENABLE_NONFREE_KERNELS=ON \
                        -DMEDIA_BUILD_FATAL_WARNINGS=ON \
+                       -DMEDIA_BUILD_HARDENING=ON \
                        -DMEDIA_RUN_TEST_SUITE=OFF"

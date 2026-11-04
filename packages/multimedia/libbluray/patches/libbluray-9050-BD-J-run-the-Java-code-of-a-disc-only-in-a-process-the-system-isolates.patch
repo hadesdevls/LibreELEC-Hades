@@ -1,0 +1,422 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:13:00 +0000
+Subject: [PATCH] BD-J: run the Java code of a disc only in a process the
+ system isolates
+
+libbluray creates the JVM of BD-J in the player's own process. A player
+such as Kodi runs as root on LibreELEC, and from Java 24 on (JEP 486)
+there is no security manager to keep the disc's code to the disc; from
+Java 18 to 23 libbluray's way of installing it stores the manager without
+putting it in force (measured with OpenJDK 21: System.getSecurityManager()
+is null and an Xlet reads a file outside the disc).
+
+The Java code of a disc now runs only in an isolated service, a process of
+its own (hades-bdj@.service: its own user, no capabilities, no network,
+nothing of the player's files, a seccomp filter). bdj_sandbox_check() reads
+from the kernel, in /proc/self, whether this process is such a one: no user
+or group id 0 (real, effective, saved, file system), no supplementary group
+but its own, empty capability sets (permitted, effective, ambient,
+bounding), no_new_privs, a seccomp filter in force, and no network
+interface but lo (unless the service runs with BD-Live,
+HADES_BDJ_NETWORK=internet, where the system limits the addresses).
+Anything it cannot read counts as not isolated.
+
+bdj_open() creates no JVM when the check fails, and says why in the log;
+bdj_jvm_available() does not even load the JVM library then, and returns
+BDJ_CHECK_NOT_ISOLATED (disc info: no JVM, BD-J not handled). The file
+builds without the rest of libbluray (-DHADES_BDJ_SANDBOX_STANDALONE), for
+the server of the service.
+
+The JVM of the service gets org.videolan.hades.sandboxed=true (the next
+patch lets Libbluray.init() run without a security manager there, and only
+there), java.io.tmpdir=/tmp (the service's own /tmp; LibreELEC's 0001 sets
+the folder of its Java add-on, which the service does not see), and neither
+a performance data file nor an attach socket.
+---
+ src/libbluray/bdj/bdj.c         |  25 ++++
+ src/libbluray/bdj/bdj.h         |   1 +
+ src/libbluray/bdj/bdj_sandbox.c | 220 ++++++++++++++++++++++++++++++++
+ src/libbluray/bdj/bdj_sandbox.h |  61 +++++++++
+ src/meson.build                 |   1 +
+ 5 files changed, 308 insertions(+)
+ create mode 100644 src/libbluray/bdj/bdj_sandbox.c
+ create mode 100644 src/libbluray/bdj/bdj_sandbox.h
+
+diff --git a/src/libbluray/bdj/bdj.c b/src/libbluray/bdj/bdj.c
+index 005aad8..9808018 100644
+--- a/src/libbluray/bdj/bdj.c
++++ b/src/libbluray/bdj/bdj.c
+@@ -23,6 +23,7 @@
+ #endif
+ 
+ #include "bdj.h"
++#include "bdj_sandbox.h"
+ 
+ #include "native/register_native.h"
+ 
+@@ -811,6 +812,15 @@ static int _bdj_init(JNIEnv *env, struct bluray *bd, const char *disc_root, cons
+ int bdj_jvm_available(BDJ_CONFIG *storage)
+ {
+     const char *java_home = NULL;
++    char why[128];
++
++    /* Hades: a process that is not isolated does not even load a JVM library */
++    if (!bdj_sandbox_check(why, sizeof(why))) {
++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J check: not the isolated BD-J service (%s): no JVM is loaded "
++                 "in this process\n", why);
++        return BDJ_CHECK_NOT_ISOLATED;
++    }
++
+     void* jvm_lib = _load_jvm(&java_home, storage->java_home);
+     if (!jvm_lib) {
+         const char *env_home = getenv("JAVA_HOME");
+@@ -950,6 +960,15 @@ static int _create_jvm(void *jvm_lib, const char *java_home, BDJ_CONFIG *cfg,
+     BD_DEBUG(DBG_BDJ | DBG_CRIT, "Use /storage/.kodi/userdata/addon_data/tools.jre.zulu as cache dir.\n");
+     option[n++].optionString = str_dup   ("-Djava.awt.headless=false");
+     BD_DEBUG(DBG_CRIT | DBG_BDJ, "Disable X11 check\n");
++
++    /* Hades: this JVM is in the isolated BD-J service (bdj_open() creates one nowhere else).
++     * Libbluray.init() may then run without a security manager where Java has none (24 and
++     * later); the service gives the process its own /tmp; no performance data file and no
++     * attach socket in it. */
++    option[n++].optionString = str_dup   ("-Dorg.videolan.hades.sandboxed=true");
++    option[n++].optionString = str_dup   ("-Djava.io.tmpdir=/tmp");
++    option[n++].optionString = str_dup   ("-XX:-UsePerfData");
++    option[n++].optionString = str_dup   ("-XX:+DisableAttachMechanism");
+ #ifdef HAVE_BDJ_J2ME
+     option[n++].optionString = str_printf("-Djava.home=%s", java_home);
+     option[n++].optionString = str_printf("-Xbootclasspath/a:%s/lib/xmlparser.jar", java_home);
+@@ -1055,6 +1074,12 @@ BDJAVA* bdj_open(const char *path, struct bluray *bd,
+ {
+     BD_DEBUG(DBG_BDJ, "bdj_open()\n");
+ 
++    /* Hades: no JVM in a process that the system does not isolate (the player's own, Kodi as
++     * root): the Java code of a disc runs in the BD-J service only (bdj_sandbox.h) */
++    if (!bdj_process_is_sandboxed()) {
++        return NULL;
++    }
++
+     if (!_find_libbluray_jar(cfg)) {
+         BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J start failed: " BDJ_JARFILE " not found.\n");
+         return NULL;
+diff --git a/src/libbluray/bdj/bdj.h b/src/libbluray/bdj/bdj.h
+index 43b0132..34af91f 100644
+--- a/src/libbluray/bdj/bdj.h
++++ b/src/libbluray/bdj/bdj.h
+@@ -86,6 +86,7 @@ enum {
+     BDJ_CHECK_OK     = 0,
+     BDJ_CHECK_NO_JVM = 1,
+     BDJ_CHECK_NO_JAR = 2,
++    BDJ_CHECK_NOT_ISOLATED = 3,  /* Hades: not the isolated BD-J service (bdj_sandbox.h) */
+ };
+ 
+ BD_PRIVATE int  bdj_jvm_available(BDJ_CONFIG *storage);  /* rreturn: BDJ_CHECK_* */
+diff --git a/src/libbluray/bdj/bdj_sandbox.c b/src/libbluray/bdj/bdj_sandbox.c
+new file mode 100644
+index 0000000..a17fe1a
+--- /dev/null
++++ b/src/libbluray/bdj/bdj_sandbox.c
+@@ -0,0 +1,220 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#if HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "bdj_sandbox.h"
++
++#ifndef HADES_BDJ_SANDBOX_STANDALONE
++#include "util/logging.h"
++#endif
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef __linux__
++#include <unistd.h>
++#include <sys/types.h>
++#endif
++
++static int _fail(char *why, size_t why_size, const char *what)
++{
++    if (why && why_size) {
++        snprintf(why, why_size, "%s", what);
++    }
++    return 0;
++}
++
++#ifdef __linux__
++
++/* the value of "<name>:" in /proc/self/status, without the tab after the colon */
++static int _status_value(const char *status, const char *name, char *out, size_t out_size)
++{
++    size_t len = strlen(name);
++    const char *p = status;
++
++    while (p && *p) {
++        if (!strncmp(p, name, len) && p[len] == ':') {
++            const char *v = p + len + 1;
++            const char *e;
++            size_t n;
++            while (*v == '\t' || *v == ' ')
++                v++;
++            e = strchr(v, '\n');
++            n = e ? (size_t)(e - v) : strlen(v);
++            if (n >= out_size)
++                return 0;
++            memcpy(out, v, n);
++            out[n] = 0;
++            return 1;
++        }
++        p = strchr(p, '\n');
++        if (p)
++            p++;
++    }
++    return 0;
++}
++
++/* every number in a list separated by blanks: none may be 0; with must_equal, each one is it */
++static int _ids_ok(const char *list, int count, unsigned long must_equal, int check_equal)
++{
++    const char *p = list;
++    int n = 0;
++
++    while (*p) {
++        char *end;
++        unsigned long v;
++        while (*p == ' ' || *p == '\t')
++            p++;
++        if (!*p)
++            break;
++        if (*p < '0' || *p > '9')
++            return 0;
++        v = strtoul(p, &end, 10);
++        if (end == p || v == 0)
++            return 0;
++        if (check_equal && v != must_equal)
++            return 0;
++        p = end;
++        n++;
++    }
++    return count < 0 || n == count;
++}
++
++/* a capability set in hex, as /proc/self/status shows it: 1 when it is empty */
++static int _caps_empty(const char *hex)
++{
++    const char *p = hex;
++    if (!*p)
++        return 0;
++    for (; *p; p++) {
++        if (*p != '0')
++            return 0;
++    }
++    return 1;
++}
++
++/* the network namespace of this process has no interface but lo (/proc/self/net/dev) */
++static int _only_loopback(char *why, size_t why_size)
++{
++    char line[256];
++    int n = 0, others = 0, lo = 0;
++    FILE *fp = fopen("/proc/self/net/dev", "r");
++
++    if (!fp)
++        return _fail(why, why_size, "cannot read /proc/self/net/dev");
++
++    while (fgets(line, sizeof(line), fp)) {
++        char *colon, *name = line;
++        if (n++ < 2)
++            continue; /* the two lines of headers */
++        colon = strchr(line, ':');
++        if (!colon) {
++            others++;
++            continue;
++        }
++        *colon = 0;
++        while (*name == ' ')
++            name++;
++        if (!strcmp(name, "lo"))
++            lo++;
++        else
++            others++;
++    }
++    fclose(fp);
++
++    if (n < 2)
++        return _fail(why, why_size, "/proc/self/net/dev has no table");
++    if (others)
++        return _fail(why, why_size, "a network interface other than lo is present");
++    (void)lo;
++    return 1;
++}
++
++int bdj_sandbox_check(char *why, size_t why_size)
++{
++    char status[8192];
++    char v[512];
++    size_t got;
++    FILE *fp;
++    unsigned long gid;
++    const char *net;
++
++    fp = fopen("/proc/self/status", "r");
++    if (!fp)
++        return _fail(why, why_size, "cannot read /proc/self/status");
++    got = fread(status, 1, sizeof(status) - 1, fp);
++    fclose(fp);
++    if (got == 0 || got >= sizeof(status) - 1)
++        return _fail(why, why_size, "cannot read /proc/self/status");
++    status[got] = 0;
++
++    /* real, effective, saved and file system ids */
++    if (!_status_value(status, "Uid", v, sizeof(v)) || !_ids_ok(v, 4, 0, 0))
++        return _fail(why, why_size, "running as root (a user id is 0)");
++    if (!_status_value(status, "Gid", v, sizeof(v)) || !_ids_ok(v, 4, 0, 0))
++        return _fail(why, why_size, "a group id is 0");
++    gid = (unsigned long)getegid();
++    if (!_status_value(status, "Groups", v, sizeof(v)) || !_ids_ok(v, -1, gid, 1))
++        return _fail(why, why_size, "a supplementary group other than its own");
++
++    if (!_status_value(status, "CapPrm", v, sizeof(v)) || !_caps_empty(v) ||
++        !_status_value(status, "CapEff", v, sizeof(v)) || !_caps_empty(v) ||
++        !_status_value(status, "CapAmb", v, sizeof(v)) || !_caps_empty(v) ||
++        !_status_value(status, "CapBnd", v, sizeof(v)) || !_caps_empty(v))
++        return _fail(why, why_size, "a capability set is not empty");
++
++    if (!_status_value(status, "NoNewPrivs", v, sizeof(v)) || strcmp(v, "1"))
++        return _fail(why, why_size, "no_new_privs is not set");
++    if (!_status_value(status, "Seccomp", v, sizeof(v)) || strcmp(v, "2"))
++        return _fail(why, why_size, "no seccomp filter in force");
++
++    net = getenv(HADES_BDJ_NETWORK_ENV);
++    if (net && !strcmp(net, HADES_BDJ_NETWORK_INTERNET)) {
++        /* the BD-Live variant: the service limits the addresses (IPAddressDeny=) */
++        return 1;
++    }
++    return _only_loopback(why, why_size);
++}
++
++#else /* !__linux__ */
++
++int bdj_sandbox_check(char *why, size_t why_size)
++{
++    return _fail(why, why_size, "isolation is implemented for Linux only");
++}
++
++#endif
++
++#ifndef HADES_BDJ_SANDBOX_STANDALONE
++int bdj_process_is_sandboxed(void)
++{
++    char why[128];
++
++    if (bdj_sandbox_check(why, sizeof(why))) {
++        return 1;
++    }
++    BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J refused: this process is not isolated (%s). The Java code of a "
++             "disc runs only in the isolated BD-J service, never in the player's process.\n", why);
++    return 0;
++}
++#endif
+diff --git a/src/libbluray/bdj/bdj_sandbox.h b/src/libbluray/bdj/bdj_sandbox.h
+new file mode 100644
+index 0000000..f0c4fe3
+--- /dev/null
++++ b/src/libbluray/bdj/bdj_sandbox.h
+@@ -0,0 +1,61 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _BDJ_SANDBOX_H_
++#define _BDJ_SANDBOX_H_
++
++#include "util/attributes.h"
++
++#include <stddef.h>
++
++/*
++ * The Java code of a disc (BD-J) runs only in a process that the system isolates: the service
++ * hades-bdj@.service, whose server applies a seccomp filter of its own before it opens anything
++ * of the disc (src/tools/hades_bdj_sandbox.c). A player's own process (Kodi runs as root) never
++ * creates a JVM.
++ *
++ * Isolated means, read from the kernel by this process itself:
++ *   - real, effective, saved and file system user and group ids are not 0, and there is no
++ *     supplementary group other than the process's own group;
++ *   - no capability: permitted, effective, ambient and bounding sets are empty;
++ *   - no_new_privs is set, and a seccomp filter is in force (Seccomp: 2);
++ *   - no network interface but loopback in the network namespace of the process, unless the
++ *     service runs with BD-Live (HADES_BDJ_NETWORK=internet in its environment), where the
++ *     system limits the addresses instead.
++ * Anything that cannot be read counts as not isolated.
++ */
++
++/* the environment variable the BD-Live variant of the service sets, and its value */
++#define HADES_BDJ_NETWORK_ENV      "HADES_BDJ_NETWORK"
++#define HADES_BDJ_NETWORK_INTERNET "internet"
++
++/*
++ * 1 when this process is isolated as said above; else 0, with the first check that failed
++ * written to why (if not NULL). No logging and no other part of libbluray: the server
++ * (src/tools/hades_bdj_host.c) builds this file into itself too, with
++ * -DHADES_BDJ_SANDBOX_STANDALONE.
++ */
++BD_PRIVATE int bdj_sandbox_check(char *why, size_t why_size);
++
++#ifndef HADES_BDJ_SANDBOX_STANDALONE
++/* bdj_sandbox_check(), and the reason in the log when it is 0 */
++BD_PRIVATE int bdj_process_is_sandboxed(void);
++#endif
++
++#endif /* _BDJ_SANDBOX_H_ */
+diff --git a/src/meson.build b/src/meson.build
+index 255fbc4..b1e3009 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -6,6 +6,7 @@ libbluray_src = files(
+     'libbluray/bluray.c',
+     'libbluray/register.c',
+     'libbluray/bdj/bdj.c',
++    'libbluray/bdj/bdj_sandbox.c',
+     'libbluray/bdj/bdjo_parse.c',
+     'libbluray/bdj/bdjo_parse.c',
+     'libbluray/bdj/native/bdjo.c',
+-- 
+2.53.0
+

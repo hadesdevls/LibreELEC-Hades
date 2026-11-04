@@ -1,0 +1,874 @@
+From 8ce3f8bbcd94282540f1d403dd6dbc9d4afb127e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:03:42 +0000
+Subject: [PATCH] windowing/gbm: the link set up again after a hot-plug event
+ read from what nvidia-drm says, and SCDC read off the thread that draws,
+ through the connector's own DDC port
+
+Found by an independent review of 1.0 RC6, and reproduced on the host:
+
+- an output on FRL (3840x2160 at 119.88 Hz on an RTX 4080 SUPER to an LG
+  C5, the GUI that the user keeps) was turned off and on after any hot-plug
+  event: TMDS_Config (SCDC 0x20) says nothing of an FRL link, and every mode
+  above 340 MHz was taken as scrambled TMDS. Over FRL that is 3 to 6 s of
+  black, and nvidia-drm refused to turn such an output on again (-22) in a
+  test of 1.0 RC2;
+- a mode sent in YCbCr 4:2:0 (3840x2160 at 60 Hz, 8 bits: 297 MHz, not
+  scrambled) was counted at its full rate, and its TMDS_Config of 0 taken as
+  a display that lost its setup;
+- the adapter of the connector was looked for on the thread that draws,
+  before the commit of the frame, by reading the EDID address of every i2c
+  adapter of the card, buses that are not the display's among them (the RGB
+  controller of a board).
+
+Now:
+
+- the link is what nvidia-drm says (NV_OUTPUT_LINK: TMDS with or without
+  scrambling, FRL at its rate, DisplayPort, and the pixel format; LinkOf()).
+  TMDS without scrambling and DisplayPort need nothing written. Over FRL the
+  display kept its setup where Config_1 (SCDC 0x31) has an FRL_Rate other than
+  0; over scrambled TMDS where TMDS_Config has scrambling and the 1/40 ratio
+  on (SinkOf()). Where the driver does not say the link, a mode is counted at
+  its TMDS rate in its format (4:2:2 at its pixel clock, 4:2:0 at half; RGB
+  where the format is not known), and an FRL_Rate other than 0 is a kept FRL
+  link;
+- SCDC is read on a thread of its own (std::async), and the frame never waits
+  for it: the verdict is made when the read answers, with the output as it is
+  then. Only the adapter of the DDC port that nvidia-drm names for the
+  connector (NV_DDC_I2C_PORT) is opened, found by its name in sysfs; no other
+  bus of the card is touched. That it is the connector's port is checked by the
+  EDID that it gives. Where nvidia-drm does not name a port, or the read fails,
+  the output is turned off and on as before, and kodi.log says why.
+
+kodi.log gives the link with the verdict ("... over FRL (pixel clock ... kHz,
+8 bpc)", "SCDC of the display, read through i2c-N (the DDC port P of the
+connector), the link FRL: TMDS_Config 0x00, Config_1 0x05, ...: the display has
+the setup of the link").
+
+The decision stays in HotplugRelink.h, without DRM, for a host test.
+---
+ xbmc/windowing/gbm/HotplugRelink.h            | 221 ++++++++---
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 365 +++++++++++-------
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  19 +-
+ 3 files changed, 416 insertions(+), 189 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/HotplugRelink.h b/xbmc/windowing/gbm/HotplugRelink.h
+index 0a0e5c3..54feb51 100644
+--- a/xbmc/windowing/gbm/HotplugRelink.h
++++ b/xbmc/windowing/gbm/HotplugRelink.h
+@@ -11,39 +11,45 @@
+ #include <algorithm>
+ #include <cstdint>
+ #include <optional>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+ /*
+- * Hades: a display that comes back on an HDMI link that the source scrambles, and that nvidia-drm
+- * does not set up again.
++ * Hades: a display that comes back on an HDMI link that the source scrambles or trains, and that
++ * nvidia-drm does not set up again.
+  *
+  * Above a TMDS character rate of 340 MHz (HDMI 2.0) the source scrambles the link and tells the
+- * sink so through its SCDC registers (TMDS_Config: scrambling on, bit clock ratio 1/40). A sink
+- * that is switched off and on resets those registers, and gives a hot-plug pulse. Until the source
+- * writes them again the sink cannot read the link: no picture, while the source and its state are
+- * as before. i915 reads TMDS_Config at each hot-plug event and sets the link up again where the
+- * sink lost it (intel_hdmi_reset_link(), intel_ddi.c), and amdgpu does a commit for a sink it saw
+- * leave (dm_restore_drm_connector_state(); linux-9964 for one that it did not see leave). NVKMS
+- * writes them in the closed part of the driver, only when it sets a head up: after such a pulse
+- * nvidia-drm sends the event, reads the same EDID and does nothing more. Issue #11 (RTX 3050, LG
+- * B7, HDMI-A-3, 3840x2160 at 50 Hz, 594 MHz, scrambled): no picture after the TV was switched off
+- * and on; the kernel's log and the DRM state the same before and after; a change to 1080p (not
+- * scrambled) brought the picture back.
++ * sink so through its SCDC registers (TMDS_Config: scrambling on, bit clock ratio 1/40); over FRL
++ * (HDMI 2.1) the source trains the link at the rate that it writes there (Config_1: FRL_Rate). A
++ * sink that is switched off and on resets those registers, and gives a hot-plug pulse. Until the
++ * source writes them again the sink cannot read the link: no picture, while the source and its
++ * state are as before. i915 reads TMDS_Config at each hot-plug event and sets the link up again
++ * where the sink lost it (intel_hdmi_reset_link(), intel_ddi.c), and amdgpu does a commit for a
++ * sink it saw leave (dm_restore_drm_connector_state(); linux-9964 for one that it did not see
++ * leave). NVKMS writes them in the closed part of the driver, only when it sets a head up: after
++ * such a pulse nvidia-drm sends the event, reads the same EDID and does nothing more. Issue #11
++ * (RTX 3050, LG B7, HDMI-A-3, 3840x2160 at 50 Hz, 594 MHz, scrambled): no picture after the TV was
++ * switched off and on; the kernel's log and the DRM state the same before and after; a change to
++ * 1080p (not scrambled) brought the picture back.
+  *
+  * So, on nvidia-drm, a hot-plug event after which the display in use is there, with the output on
+- * in a mode whose link is scrambled, has the output turned off and on again once, as when the
+- * screen is blanked and woken: NVKMS sets the head and the link up from scratch, SCDC included,
+- * only where the display lost the setup. Kodi reads TMDS_Config of the display itself, as i915 does,
+- * through the i2c adapter that the NVIDIA kernel module registers for the DDC port of the connector
+- * (nv-i2c.c: one adapter per I2C port of the GPU, whose transfers its resource manager makes under
+- * its own locks, as its reads of the EDID; which one is the connector's is found by the EDID it
+- * gives: AdapterOfEdid()). Read only: the offset of a register, then its byte. Where it cannot be
+- * read (no adapter, none or two of them giving the display's EDID, a refused transfer) the output
+- * is turned off and on as when it is not known whether the display lost it: a picture that was
+- * there goes black once, for the time the TV takes to sync again. It is not done:
+- * - where the link is not scrambled (at most 340 MHz: the sink needs nothing written);
+- * - where the display kept the setup (TMDS_Config has scrambling and the 1/40 ratio on);
++ * in a mode whose link is scrambled or trained, has the output turned off and on again once, as
++ * when the screen is blanked and woken: NVKMS sets the head and the link up from scratch, SCDC
++ * included, only where the display lost the setup. What the link is, nvidia-drm says
++ * (NV_OUTPUT_LINK: TMDS with or without scrambling, FRL at its rate, the pixel format: LinkOf());
++ * where it does not, it is told from the mode (TmdsKHz()). Kodi reads the display's SCDC itself,
++ * as i915 does, through the i2c adapter that the NVIDIA kernel module registers for the DDC port of
++ * the connector, which nvidia-drm names (NV_DDC_I2C_PORT; nv-i2c.c: one adapter per I2C port of the
++ * GPU, whose transfers its resource manager makes under its own locks, as its reads of the EDID),
++ * off the thread that draws, and no other bus of the card; that the port is the connector's is
++ * checked by the EDID that it gives (AdapterOfEdid()). Read only: the offset of a register, then
++ * its byte. Where it cannot be read the output is turned off and on as when it is not known whether
++ * the display lost it. It is not done:
++ * - where the link is neither scrambled nor trained (TMDS at 340 MHz or less, a mode in YCbCr
++ *   4:2:0 counted at its own rate: the sink needs nothing written), or is DisplayPort;
++ * - where the display kept the setup (TMDS_Config with scrambling and the 1/40 ratio on; over FRL,
++ *   an FRL_Rate other than 0);
+  * - where the event is explained by another output of the device, which changed (connected,
+  *   disconnected, or another EDID) while the one in use did not, unless the display in use is
+  *   known to have lost the setup;
+@@ -64,47 +70,140 @@ constexpr int64_t AFTER_OWN_MS = 10000;
+ constexpr int64_t SPACING_MS = 30000;
+ //! HDMI 2.0: above this TMDS character rate the source scrambles the link
+ constexpr int64_t SCRAMBLED_ABOVE_KHZ = 340000;
++//! ... and above this one TMDS cannot carry it: HDMI 2.1 sends it over FRL
++constexpr int64_t TMDS_MAX_KHZ = 600000;
+ 
+-//! The DDC addresses and SCDC registers that are read (HDMI 2.0)
++//! The DDC addresses and SCDC registers that are read (HDMI 2.0 and 2.1)
+ constexpr uint8_t EDID_ADDRESS = 0x50;
+ constexpr uint8_t SCDC_ADDRESS = 0x54;
+ constexpr uint8_t SCDC_TMDS_CONFIG = 0x20; //!< bit 0 Scrambling_Enable, bit 1 TMDS_Bit_Clock_Ratio
+ constexpr uint8_t SCDC_SCRAMBLER_STATUS = 0x21; //!< bit 0 Scrambling_Status
++constexpr uint8_t SCDC_CONFIG_1 = 0x31; //!< bits 3:0 FRL_Rate (0: TMDS), bits 7:4 FFE_Levels
+ constexpr uint8_t SCDC_STATUS_FLAGS_0 = 0x40; //!< bit 0 Clock_Detected, bits 1-3 Ch0-2_Locked
++//! nvidia-drm's NV_DDC_I2C_PORT where the connector has no DDC port that it knows
++constexpr uint64_t NO_DDC_PORT = 255;
++
++//! What the link of the output is (NV_OUTPUT_LINK of nvidia-drm, LinkOf())
++enum class Link
++{
++  UNKNOWN, //!< not said (a driver without it, or nothing driven)
++  TMDS, //!< TMDS without scrambling
++  TMDS_SCRAMBLED, //!< TMDS above 340 MHz, or scrambled at less where the display asks for it
++  FRL, //!< HDMI 2.1 FRL
++  DP, //!< DisplayPort
++};
++
++//! The pixel format of the output (NV_OUTPUT_LINK, bits 16-23)
++enum class Format
++{
++  RGB = 0,
++  YCBCR444 = 1,
++  YCBCR422 = 2,
++  YCBCR420 = 3,
++};
++
++//! NV_OUTPUT_LINK: bits 0-7 the kind (1 TMDS, 2 TMDS scrambled, 3 FRL, 4 DisplayPort), bits 8-15
++//! the FRL rate (1..6), bits 16-23 the pixel format; 0, or no value: not said
++inline Link LinkOf(std::optional<uint64_t> value)
++{
++  if (!value)
++    return Link::UNKNOWN;
++  switch (*value & 0xff)
++  {
++    case 1:
++      return Link::TMDS;
++    case 2:
++      return Link::TMDS_SCRAMBLED;
++    case 3:
++      return Link::FRL;
++    case 4:
++      return Link::DP;
++    default:
++      return Link::UNKNOWN;
++  }
++}
++inline unsigned int FrlRateOf(std::optional<uint64_t> value)
++{
++  return value ? static_cast<unsigned int>((*value >> 8) & 0xff) : 0;
++}
++inline std::optional<Format> FormatOf(std::optional<uint64_t> value)
++{
++  if (!value || LinkOf(value) == Link::UNKNOWN)
++    return std::nullopt;
++  const unsigned int format = static_cast<unsigned int>((*value >> 16) & 0xff);
++  if (format > 3)
++    return std::nullopt;
++  return static_cast<Format>(format);
++}
++inline const char* Name(Link link)
++{
++  switch (link)
++  {
++    case Link::TMDS:
++      return "TMDS";
++    case Link::TMDS_SCRAMBLED:
++      return "TMDS, scrambled";
++    case Link::FRL:
++      return "FRL";
++    case Link::DP:
++      return "DisplayPort";
++    default:
++      return "not said by the driver";
++  }
++}
+ 
+ /*!
+- * \brief The TMDS character rate of a mode, in kHz: its pixel clock at bpc bits per component in
+- * RGB or YCbCr 4:4:4 (8 at least). A mode sent in YCbCr 4:2:0 has half of it, which is not known
+- * here: it is counted as at the full rate, which costs, at most, the output turned off and on
+- * when that was not needed. A mode sent over FRL is above the limit too, and is set up again
+- * the same way (its link is trained again).
++ * \brief The TMDS character rate of a mode, in kHz: its pixel clock at bpc bits per component (8
++ *        at least) in RGB or YCbCr 4:4:4; in 4:2:2 the pixel clock whatever the depth (up to 12
++ *        bits, carried as 8-bit RGB); in 4:2:0 half of the 4:4:4 rate. Where the format is not
++ *        known it is counted as RGB, which costs, at most, the output turned off and on when that
++ *        was not needed.
+  */
+-inline int64_t TmdsKHz(int64_t clockKHz, int bpc)
++inline int64_t TmdsKHz(int64_t clockKHz, int bpc, std::optional<Format> format = std::nullopt)
+ {
+-  return clockKHz * std::max(bpc, 8) / 8;
++  const int64_t full = clockKHz * std::max(bpc, 8) / 8;
++  if (format == Format::YCBCR422)
++    return clockKHz;
++  if (format == Format::YCBCR420)
++    return full / 2;
++  return full;
+ }
+ 
+-//! What the display's SCDC says of a link that the source scrambles
++//! What the display's SCDC says of the link that the source sends
+ enum class Sink
+ {
+   UNKNOWN, //!< it could not be read
+-  KEPT, //!< TMDS_Config has Scrambling_Enable and TMDS_Bit_Clock_Ratio on, as the source wrote them
++  KEPT, //!< the display has the setup that the source wrote
+   LOST, //!< it has not (a sink that was switched off and on has 0)
+ };
+ 
+-//! What TMDS_Config says of a link above 340 MHz (as i915 compares it: intel_hdmi_reset_link())
+-inline Sink SinkOf(std::optional<uint8_t> tmdsConfig)
++/*!
++ * \brief What the SCDC says: over FRL, FRL_Rate (Config_1, bits 3:0), which is 0 for TMDS and is
++ *        the rate that the link was trained at otherwise; over TMDS, TMDS_Config with
++ *        Scrambling_Enable and TMDS_Bit_Clock_Ratio both on (as i915 compares it:
++ *        intel_hdmi_reset_link()). TMDS_Config says nothing of an FRL link. Where the link is not
++ *        said, an FRL_Rate other than 0 is an FRL link that the display kept, and TMDS_Config is
++ *        read as for TMDS.
++ */
++inline Sink SinkOf(Link link, std::optional<uint8_t> tmdsConfig, std::optional<uint8_t> frlRate)
+ {
++  if (link == Link::FRL)
++  {
++    if (!frlRate)
++      return Sink::UNKNOWN;
++    return (*frlRate & 0x0f) != 0 ? Sink::KEPT : Sink::LOST;
++  }
++  if (link == Link::UNKNOWN && frlRate && (*frlRate & 0x0f) != 0)
++    return Sink::KEPT;
+   if (!tmdsConfig)
+     return Sink::UNKNOWN;
+   return (*tmdsConfig & 0x03) == 0x03 ? Sink::KEPT : Sink::LOST;
+ }
+ 
+ /*!
+- * \brief The i2c adapter of the connector: the one whose DDC port gives the display's EDID (its
+- *        first 128 bytes, as the EDID property of the connector has them). reads: each adapter
+- *        that answered, with what it gave. -1 where none gives it, or more than one (two displays
+- *        with the same EDID: which one is the connector's is not known).
++ * \brief That the adapter is the connector's: it gives the display's EDID (its first 128 bytes, as
++ *        the EDID property of the connector has them). reads: each adapter that answered, with what
++ *        it gave. -1 where none gives it, or more than one.
+  */
+ inline int AdapterOfEdid(const std::vector<std::pair<int, std::vector<uint8_t>>>& reads,
+                          const std::vector<uint8_t>& edid)
+@@ -123,6 +222,13 @@ inline int AdapterOfEdid(const std::vector<std::pair<int, std::vector<uint8_t>>>
+   return found;
+ }
+ 
++//! What a read of the display's SCDC found (made off the thread that draws), and what to log
++struct ScdcRead
++{
++  Sink sink = Sink::UNKNOWN;
++  std::string said;
++};
++
+ enum class Verdict
+ {
+   NOT_DUE, //!< no hot-plug event since the last look
+@@ -132,7 +238,7 @@ enum class Verdict
+   NOT_HDMI, //!< the connector does not drive its display as HDMI now
+   NOT_CONNECTED, //!< the display in use is not there now
+   OFF, //!< the output is off (blanked, or meant to be off): its next turning on sets it up
+-  NOT_SCRAMBLED, //!< at most 340 MHz: nothing to write again
++  NOT_SCRAMBLED, //!< a link with nothing written to the display (TMDS at 340 MHz or less)
+   SINK_KEPT, //!< the display kept the setup that the driver wrote (SCDC)
+   ECHO, //!< within AFTER_OWN_MS of the last time: the sink's answer to it
+   OTHER_OUTPUT, //!< another output of the device changed and the one in use did not
+@@ -150,13 +256,30 @@ struct Facts
+   bool drivenAsHdmi = false; //!< NVIDIA_DUAL_MODE::DrivenAsHdmi()
+   bool connected = false; //!< the display in use is there, as the kernel says after a probe
+   bool on = false; //!< Kodi has the output on and the kernel says that its CRTC is active
+-  int64_t tmdsKHz = 0; //!< TmdsKHz() of the mode on the output
++  Link link = Link::UNKNOWN; //!< what the driver says the link is (LinkOf())
++  int64_t tmdsKHz = 0; //!< TmdsKHz() of the mode on the output (where the link is not said)
+   Sink sink = Sink::UNKNOWN; //!< what its SCDC says (read only where it can change the verdict)
+   bool otherOutputChanged = false; //!< another output of the device changed since the last look
+   int64_t sinceRelinkMs = -1; //!< since the output was last turned off and on for this; -1: never
+   bool nativeDV = false; //!< native Dolby Vision is on (not the menus in Dolby Vision)
+ };
+ 
++//! Whether the link has something written to the display that a display switched off and on loses
++inline bool SetUpLink(const Facts& f)
++{
++  switch (f.link)
++  {
++    case Link::TMDS_SCRAMBLED:
++    case Link::FRL:
++      return true;
++    case Link::TMDS:
++    case Link::DP:
++      return false;
++    default:
++      return f.tmdsKHz > SCRAMBLED_ABOVE_KHZ;
++  }
++}
++
+ inline Verdict Decide(const Facts& f)
+ {
+   if (!f.due)
+@@ -167,13 +290,13 @@ inline Verdict Decide(const Facts& f)
+     return Verdict::SETTING_OFF;
+   if (!f.nvidia)
+     return Verdict::NOT_NVIDIA;
+-  if (!f.drivenAsHdmi)
++  if (!f.drivenAsHdmi || f.link == Link::DP)
+     return Verdict::NOT_HDMI;
+   if (!f.connected)
+     return Verdict::NOT_CONNECTED;
+   if (!f.on)
+     return Verdict::OFF;
+-  if (f.tmdsKHz <= SCRAMBLED_ABOVE_KHZ)
++  if (!SetUpLink(f))
+     return Verdict::NOT_SCRAMBLED;
+   if (f.sink == Sink::KEPT)
+     return Verdict::SINK_KEPT;
+@@ -210,10 +333,10 @@ inline const char* Why(Verdict v)
+     case Verdict::OFF:
+       return "the output is off: turning it on sets the link up";
+     case Verdict::NOT_SCRAMBLED:
+-      return "the link of the mode is not scrambled (340 MHz or less): the display needs nothing "
+-             "written again";
++      return "the link is neither scrambled nor trained (TMDS at 340 MHz or less): the display "
++             "needs nothing written again";
+     case Verdict::SINK_KEPT:
+-      return "the display kept the scrambling setup that the driver wrote";
++      return "the display kept the setup of the link that the driver wrote";
+     case Verdict::ECHO:
+       return "it came within 10 s of the output turned off and on for the event before: the "
+              "display's answer to that";
+@@ -229,7 +352,7 @@ inline const char* Why(Verdict v)
+   }
+ }
+ 
+-//! Whether the verdict is told at INFO (the way that was taken where the link was scrambled)
++//! Whether the verdict is told at INFO (the way that was taken where the link was set up)
+ inline bool TellsAtInfo(Verdict v)
+ {
+   return v == Verdict::SINK_KEPT || v == Verdict::ECHO || v == Verdict::OTHER_OUTPUT ||
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 10303e3..b51e26d 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1310,26 +1310,36 @@ std::map<uint32_t, std::pair<bool, std::vector<uint8_t>>> OutputsOfDevice(int fd
+   return outputs;
+ }
+ 
+-// Hades: the i2c adapters that the NVIDIA kernel module registers for the I2C ports of the GPU of a
+-// DRM device (nv-i2c.c: "NVIDIA i2c adapter <port> at <bus>:<slot>.<function>", a child of the PCI
+-// device; the adapters over DisplayPort AUX are named so too, and give no SCDC): their numbers, the
+-// N of /dev/i2c-N
+-std::vector<int> NvidiaI2cAdapters(int drmFd)
++// Hades: the PCI device of a DRM device, as sysfs has it ("" where it cannot be read)
++std::string PciDeviceOf(int drmFd)
+ {
+-  std::vector<int> adapters;
+   struct stat st = {};
+   if (fstat(drmFd, &st) != 0 || !S_ISCHR(st.st_mode))
+-    return adapters;
++    return {};
+   const std::string link = StringUtils::Format("/sys/dev/char/{}:{}/device", major(st.st_rdev),
+                                                minor(st.st_rdev));
+   char* real = realpath(link.c_str(), nullptr);
+   if (!real)
+-    return adapters;
+-  const std::string device = real;
++    return {};
++  std::string device = real;
+   free(real);
++  return device;
++}
++
++// Hades: the i2c adapter that the NVIDIA kernel module registers for one I2C port of the GPU of a
++// PCI device (nv-i2c.c: "NVIDIA i2c adapter <port> at <bus>:<slot>.<function>", a child of the PCI
++// device): its number, the N of /dev/i2c-N; -1 where there is none, or more than one. Only names
++// in sysfs are read: no bus is touched.
++int NvidiaI2cAdapter(const std::string& device, unsigned int port)
++{
++  if (device.empty())
++    return -1;
++  const std::string want = StringUtils::Format("NVIDIA i2c adapter {} at ", port);
+   DIR* dir = opendir("/sys/bus/i2c/devices");
+   if (!dir)
+-    return adapters;
++    return -1;
++  int found = -1;
++  bool twice = false;
+   while (const dirent* entry = readdir(dir))
+   {
+     int number = -1;
+@@ -1343,18 +1353,18 @@ std::vector<int> NvidiaI2cAdapters(int drmFd)
+     const std::string where = adapter;
+     free(adapter);
+     const auto slash = where.rfind('/');
+-    if (slash == std::string::npos || where.compare(0, slash, device) != 0 ||
+-        slash != device.size())
++    if (slash != device.size() || where.compare(0, slash, device) != 0)
+       continue;
+     std::ifstream file(path + "/name");
+     std::string name;
+     std::getline(file, name);
+-    if (name.rfind("NVIDIA i2c adapter ", 0) == 0)
+-      adapters.push_back(number);
++    if (name.rfind(want, 0) != 0)
++      continue;
++    twice = twice || found >= 0;
++    found = number;
+   }
+   closedir(dir);
+-  std::sort(adapters.begin(), adapters.end());
+-  return adapters;
++  return twice ? -1 : found;
+ }
+ 
+ // Hades: reads through /dev/i2c-N, and nothing else: a byte at an offset (SMBus "read byte data":
+@@ -1442,21 +1452,84 @@ private:
+   unsigned long m_funcs = 0;
+   int m_error = 0;
+ };
++
++// Hades: the display's SCDC, read through the adapter of the DDC port of its connector, on a
++// thread of its own (a transfer of the NVIDIA module waits for the locks of its resource manager,
++// and an I2C transfer for the display): its EDID first (that the port is the connector's: the
++// bytes that nvidia-drm has), then TMDS_Config and Config_1 (FRL_Rate), and for the log
++// Scrambler_Status and Status_Flags_0. Only reads; only that bus.
++HOTPLUG_RELINK::ScdcRead ReadScdcOf(std::string device,
++                                    unsigned int port,
++                                    std::vector<uint8_t> edid,
++                                    HOTPLUG_RELINK::Link link)
++{
++  using namespace HOTPLUG_RELINK;
++  ScdcRead read;
++  const char* const unknown = "so whether the display lost the setup is not known";
++  const int adapter = NvidiaI2cAdapter(device, port);
++  if (adapter < 0)
++  {
++    read.said = StringUtils::Format("its SCDC could not be read: the NVIDIA kernel module has no "
++                                    "single i2c adapter for the DDC port {} of the connector, {}",
++                                    port, unknown);
++    return read;
++  }
++  CI2cRead i2c(adapter);
++  std::vector<uint8_t> bytes(128);
++  bool got = true;
++  for (int offset = 0; got && offset < 128; offset += 32)
++    got = i2c.Block32(EDID_ADDRESS, static_cast<uint8_t>(offset), bytes.data() + offset);
++  if (!got)
++  {
++    read.said = StringUtils::Format(
++        "its SCDC was not read: the EDID could not be read through i2c-{} ({}), {}", adapter,
++        std::strerror(i2c.Error()), unknown);
++    return read;
++  }
++  if (AdapterOfEdid({{adapter, bytes}}, edid) != adapter)
++  {
++    read.said = StringUtils::Format("its SCDC was not read: i2c-{} (the DDC port {} that "
++                                    "nvidia-drm names) gives another EDID than the connector's, {}",
++                                    adapter, port, unknown);
++    return read;
++  }
++  uint8_t config = 0;
++  uint8_t frl = 0;
++  const bool configRead = i2c.Byte(SCDC_ADDRESS, SCDC_TMDS_CONFIG, config);
++  const bool frlRead = i2c.Byte(SCDC_ADDRESS, SCDC_CONFIG_1, frl);
++  uint8_t status = 0;
++  uint8_t flags = 0;
++  const bool more = i2c.Byte(SCDC_ADDRESS, SCDC_SCRAMBLER_STATUS, status) &&
++                    i2c.Byte(SCDC_ADDRESS, SCDC_STATUS_FLAGS_0, flags);
++  read.sink = SinkOf(link, configRead ? std::optional<uint8_t>(config) : std::nullopt,
++                     frlRead ? std::optional<uint8_t>(frl) : std::nullopt);
++  const auto hex = [](bool ok, uint8_t value)
++  {
++    return ok ? StringUtils::Format("{:#04x}", static_cast<unsigned int>(value))
++              : std::string("not read");
++  };
++  read.said = StringUtils::Format(
++      "SCDC of the display, read through i2c-{} (the DDC port {} of the connector), the link {}: "
++      "TMDS_Config {}, Config_1 {}, Scrambler_Status {}, Status_Flags_0 {}: the display {}",
++      adapter, port, Name(link), hex(configRead, config), hex(frlRead, frl), hex(more, status),
++      hex(more, flags),
++      read.sink == Sink::KEPT   ? "has the setup of the link"
++      : read.sink == Sink::LOST ? "lost the setup of the link"
++                                : "says nothing that can be read for this link");
++  if (read.sink == Sink::UNKNOWN)
++    read.said += StringUtils::Format(" ({}, {})", std::strerror(i2c.Error()), unknown);
++  return read;
++}
+ } // namespace
+ 
+-void CWinSystemGbmGLESContext::LookForRelink()
++const std::string& CWinSystemGbmGLESContext::DriverName()
+ {
+-  // (two loads a frame while no hot-plug event came)
+-  if (!m_displayWatch)
+-    return;
+-  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+-  CDRMConnector* connector = drm ? drm->GetConnector() : nullptr;
+-  if (!connector)
+-    return;
+-  const int fd = drm->GetFileDescriptor();
+   if (m_relinkDriver.empty())
+   {
+-    if (drmVersionPtr version = drmGetVersion(fd))
++    const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++    if (!drm)
++      return m_relinkDriver; // (asked again: no device yet)
++    if (drmVersionPtr version = drmGetVersion(drm->GetFileDescriptor()))
+     {
+       m_relinkDriver = version->name ? version->name : "?";
+       drmFreeVersion(version);
+@@ -1464,7 +1537,55 @@ void CWinSystemGbmGLESContext::LookForRelink()
+     else
+       m_relinkDriver = "?";
+   }
+-  const bool nvidia = m_relinkDriver == "nvidia-drm";
++  return m_relinkDriver;
++}
++
++void CWinSystemGbmGLESContext::RelinkOutputFacts(HOTPLUG_RELINK::Facts& facts, int& bpc)
++{
++  bpc = 8;
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  CDRMConnector* connector = drm ? drm->GetConnector() : nullptr;
++  if (!connector)
++  {
++    facts.on = false;
++    return;
++  }
++  facts.on = drm->IsActive() && drm->GetCrtc() &&
++             drm->GetCrtc()->ReadPropertyValue("ACTIVE").value_or(0) != 0;
++  // (the depth and the link that NVKMS drives the connector with, where nvidia-drm says them:
++  // NV_OUTPUT_BPC, nvidia-open-kernel-modules-9013, and NV_OUTPUT_LINK; 8 bits and the mode
++  // otherwise)
++  const auto said = connector->SupportsProperty("NV_OUTPUT_BPC")
++                        ? connector->ReadPropertyValue("NV_OUTPUT_BPC")
++                        : std::optional<uint64_t>{};
++  bpc = said && *said >= 8 && *said <= 16 ? static_cast<int>(*said) : 8;
++  const auto link = connector->SupportsProperty("NV_OUTPUT_LINK")
++                        ? connector->ReadPropertyValue("NV_OUTPUT_LINK")
++                        : std::optional<uint64_t>{};
++  facts.link = HOTPLUG_RELINK::LinkOf(link);
++  const drmModeModeInfo* mode = drm->GetSelectedMode();
++  facts.tmdsKHz =
++      mode ? HOTPLUG_RELINK::TmdsKHz(mode->clock, bpc, HOTPLUG_RELINK::FormatOf(link)) : 0;
++  facts.sinceRelinkMs = m_relinkDone ? std::chrono::duration_cast<std::chrono::milliseconds>(
++                                           std::chrono::steady_clock::now() - m_relinkAt)
++                                           .count()
++                                     : -1;
++#ifdef HAVE_DVBRIDGE
++  facts.nativeDV = m_dvState.Captured() && !m_dvMenus;
++#endif
++}
++
++void CWinSystemGbmGLESContext::LookForRelink()
++{
++  // (two loads a frame while no hot-plug event came and no read is in flight)
++  if (!m_displayWatch)
++    return;
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  CDRMConnector* connector = drm ? drm->GetConnector() : nullptr;
++  if (!connector)
++    return;
++  const int fd = drm->GetFileDescriptor();
++  const bool nvidia = DriverName() == "nvidia-drm";
+   // the outputs as the kernel last found them, with the first frame: what the first event is
+   // compared with (only where the driver is one that this is for)
+   if (nvidia && !m_relinkOutputsTaken)
+@@ -1472,6 +1593,25 @@ void CWinSystemGbmGLESContext::LookForRelink()
+     m_relinkOutputs = OutputsOfDevice(fd, false);
+     m_relinkOutputsTaken = true;
+   }
++  // A read of the display's SCDC in flight: its answer once it is there (a frame never waits for
++  // it), with the output as it is then
++  if (m_relinkRead.valid())
++  {
++    if (m_relinkRead.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
++      return;
++    const HOTPLUG_RELINK::ScdcRead read = m_relinkRead.get();
++    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
++                          std::chrono::steady_clock::now() - m_relinkReadAt)
++                          .count();
++    HOTPLUG_RELINK::Facts facts = m_relinkFacts;
++    int bpc = 8;
++    RelinkOutputFacts(facts, bpc);
++    facts.sink = read.sink;
++    RelinkDecide(facts, bpc,
++                 took >= 1000 ? read.said + StringUtils::Format("; the read took {} ms", took)
++                              : read.said);
++    return;
++  }
+   const unsigned int hotplugs = m_displayWatch->Hotplugs();
+   if (hotplugs == m_relinkHotplugs ||
+       m_displayWatch->SinceHotplugMs() < HOTPLUG_RELINK::SETTLE_MS)
+@@ -1515,35 +1655,65 @@ void CWinSystemGbmGLESContext::LookForRelink()
+     facts.otherOutputChanged = otherChanged && !ownChanged;
+     m_relinkOutputs = std::move(outputs);
+   }
+-  const auto active = [&drm]
+-  { return drm->GetCrtc() && drm->GetCrtc()->ReadPropertyValue("ACTIVE").value_or(0) != 0; };
+-  facts.on = drm->IsActive() && active();
+-  const drmModeModeInfo* mode = drm->GetSelectedMode();
+-  // (the depth that NVKMS drives the connector at, where nvidia-drm says it: NV_OUTPUT_BPC,
+-  // nvidia-open-kernel-modules-9013; 8 bits otherwise)
+-  const auto said = connector->SupportsProperty("NV_OUTPUT_BPC")
+-                        ? connector->ReadPropertyValue("NV_OUTPUT_BPC")
+-                        : std::optional<uint64_t>{};
+-  const int bpc = said && *said >= 8 && *said <= 16 ? static_cast<int>(*said) : 8;
+-  facts.tmdsKHz = mode ? HOTPLUG_RELINK::TmdsKHz(mode->clock, bpc) : 0;
+-  const auto now = std::chrono::steady_clock::now();
+-  facts.sinceRelinkMs =
+-      m_relinkDone
+-          ? std::chrono::duration_cast<std::chrono::milliseconds>(now - m_relinkAt).count()
+-          : -1;
+-#ifdef HAVE_DVBRIDGE
+-  facts.nativeDV = m_dvState.Captured() && !m_dvMenus;
+-#endif
++  int bpc = 8;
++  RelinkOutputFacts(facts, bpc);
+ 
+-  // What the display's SCDC says, where it can change the verdict: the output is turned off and
+-  // on only where the display lost the setup, or where that cannot be known (ReadScdc())
+-  std::string scdc;
++  // What the display's SCDC says, where it can change the verdict: read on a thread of its own,
++  // through the DDC port of the connector that nvidia-drm names (NV_DDC_I2C_PORT), and no other
++  // bus (ReadScdcOf())
+   if (HOTPLUG_RELINK::ScdcWanted(HOTPLUG_RELINK::Decide(facts)))
+   {
++    const char* const unknown = "so whether the display lost the setup is not known";
++    const auto port = connector->SupportsProperty("NV_DDC_I2C_PORT")
++                          ? connector->ReadPropertyValue("NV_DDC_I2C_PORT")
++                          : std::optional<uint64_t>{};
+     const auto ownNow = m_relinkOutputs.find(own);
+-    facts.sink = ReadScdc(
+-        fd, ownNow != m_relinkOutputs.end() ? ownNow->second.second : std::vector<uint8_t>{}, scdc);
++    const std::string device = PciDeviceOf(fd);
++    std::string why;
++    if (!port)
++      why = StringUtils::Format("its SCDC could not be read: nvidia-drm does not say the DDC port "
++                                "of the connector (NV_DDC_I2C_PORT), {}",
++                                unknown);
++    else if (*port >= HOTPLUG_RELINK::NO_DDC_PORT)
++      why = StringUtils::Format(
++          "its SCDC could not be read: nvidia-drm knows no DDC port for the connector, {}",
++          unknown);
++    else if (ownNow == m_relinkOutputs.end() || ownNow->second.second.empty() || device.empty())
++      why = StringUtils::Format("its SCDC could not be read: the EDID of the connector or its "
++                                "graphics card could not be read, {}",
++                                unknown);
++    else
++    {
++      try
++      {
++        m_relinkFacts = facts;
++        m_relinkReadAt = std::chrono::steady_clock::now();
++        m_relinkRead = std::async(std::launch::async, ReadScdcOf, device,
++                                  static_cast<unsigned int>(*port), ownNow->second.second,
++                                  facts.link);
++        return;
++      }
++      catch (const std::system_error& error)
++      {
++        why = StringUtils::Format(
++            "its SCDC could not be read: no thread could be started for it ({}), {}",
++            error.what(), unknown);
++      }
++    }
++    RelinkDecide(facts, bpc, why);
++    return;
+   }
++  RelinkDecide(facts, bpc, std::string());
++}
++
++void CWinSystemGbmGLESContext::RelinkDecide(HOTPLUG_RELINK::Facts facts,
++                                             int bpc,
++                                             const std::string& scdc)
++{
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  CDRMConnector* connector = drm ? drm->GetConnector() : nullptr;
++  if (!connector)
++    return;
+   const HOTPLUG_RELINK::Verdict verdict = HOTPLUG_RELINK::Decide(facts);
+   const std::string name = connector->GetName();
+   if (verdict != HOTPLUG_RELINK::Verdict::RELINK)
+@@ -1554,16 +1724,19 @@ void CWinSystemGbmGLESContext::LookForRelink()
+                 name, why, scdc.empty() ? std::string() : " (" + scdc + ")");
+     return;
+   }
+-
++  const drmModeModeInfo* mode = drm->GetSelectedMode();
+   CLog::Log(LOGINFO,
+             "Hot-plug: the display of {} is there again after the event, with the output on in "
+-            "{}x{} @ {} Hz, whose HDMI link is scrambled (TMDS {} kHz at {} bpc): the output is "
+-            "turned off and on again once, so that the driver sets the link up from scratch and "
+-            "tells the display the scrambling again ({}; nvidia-drm does not after a hot-plug "
+-            "event; advancedsettings.xml: hotplugrelink)",
+-            name, mode->hdisplay, mode->vdisplay, mode->vrefresh, facts.tmdsKHz, bpc, scdc);
++            "{}x{} @ {} Hz over {} (pixel clock {} kHz, {} bpc): the output is turned off and on "
++            "again once, so that the driver sets the link up from scratch and tells the display "
++            "its setup again ({}; nvidia-drm does not after a hot-plug event; "
++            "advancedsettings.xml: hotplugrelink)",
++            name, mode ? mode->hdisplay : 0, mode ? mode->vdisplay : 0, mode ? mode->vrefresh : 0,
++            HOTPLUG_RELINK::Name(facts.link), mode ? mode->clock : 0, bpc, scdc);
+   m_relinkDone = true;
+-  m_relinkAt = now;
++  m_relinkAt = std::chrono::steady_clock::now();
++  const auto active = [&drm]
++  { return drm->GetCrtc() && drm->GetCrtc()->ReadPropertyValue("ACTIVE").value_or(0) != 0; };
+   // As when the screen is blanked and woken (and as FlipStalled() does): Hide() ends the menus in
+   // Dolby Vision and what holds the output, and turns it off in a commit that waits; Show() turns
+   // it on in the mode it had. A refusal of the first falls back to the request before it (the
+@@ -1592,82 +1765,6 @@ void CWinSystemGbmGLESContext::LookForRelink()
+   OutputLeftOff();
+ }
+ 
+-HOTPLUG_RELINK::Sink CWinSystemGbmGLESContext::ReadScdc(int fd,
+-                                                         const std::vector<uint8_t>& edid,
+-                                                         std::string& said)
+-{
+-  using namespace HOTPLUG_RELINK;
+-  const char* const unknown = "so whether the display lost the setup is not known";
+-  // The adapter of the connector: the one whose DDC port gives the display's EDID; found again
+-  // where the EDID is another, or after a read that failed
+-  if (m_relinkAdapter < 0 || m_relinkAdapterEdid != edid)
+-  {
+-    m_relinkAdapter = -1;
+-    m_relinkAdapterEdid.clear();
+-    const std::vector<int> adapters = NvidiaI2cAdapters(fd);
+-    if (adapters.empty())
+-    {
+-      said = StringUtils::Format(
+-          "its SCDC could not be read: the NVIDIA kernel module registered no i2c adapter for this "
+-          "graphics card, {}",
+-          unknown);
+-      return Sink::UNKNOWN;
+-    }
+-    std::vector<std::pair<int, std::vector<uint8_t>>> reads;
+-    for (const int adapter : adapters)
+-    {
+-      CI2cRead i2c(adapter);
+-      std::vector<uint8_t> bytes(128);
+-      bool read = true;
+-      for (int offset = 0; read && offset < 128; offset += 32)
+-        read = i2c.Block32(EDID_ADDRESS, static_cast<uint8_t>(offset), bytes.data() + offset);
+-      if (read)
+-        reads.emplace_back(adapter, std::move(bytes));
+-    }
+-    m_relinkAdapter = AdapterOfEdid(reads, edid);
+-    if (m_relinkAdapter < 0)
+-    {
+-      const auto same = std::count_if(
+-          reads.begin(), reads.end(),
+-          [&edid](const auto& one)
+-          {
+-            return edid.size() >= 128 &&
+-                   std::equal(one.second.begin(), one.second.begin() + 128, edid.begin());
+-          });
+-      said = StringUtils::Format(
+-          "its SCDC could not be read: of the {} i2c adapters of the graphics card, {} gave an "
+-          "EDID and {} gave this display's, so the one of its DDC port is not known, {}",
+-          adapters.size(), reads.size(), same, unknown);
+-      return Sink::UNKNOWN;
+-    }
+-    m_relinkAdapterEdid = edid;
+-  }
+-  CI2cRead i2c(m_relinkAdapter);
+-  uint8_t config = 0;
+-  if (!i2c.Byte(SCDC_ADDRESS, SCDC_TMDS_CONFIG, config))
+-  {
+-    said = StringUtils::Format("its SCDC could not be read through i2c-{} ({}), {}",
+-                               m_relinkAdapter, std::strerror(i2c.Error()), unknown);
+-    m_relinkAdapter = -1;
+-    return Sink::UNKNOWN;
+-  }
+-  uint8_t status = 0;
+-  uint8_t flags = 0;
+-  const bool more = i2c.Byte(SCDC_ADDRESS, SCDC_SCRAMBLER_STATUS, status) &&
+-                    i2c.Byte(SCDC_ADDRESS, SCDC_STATUS_FLAGS_0, flags);
+-  const Sink sink = SinkOf(config);
+-  said = StringUtils::Format(
+-      "SCDC of the display, read through i2c-{}: TMDS_Config {:#04x}{}: the display {} the "
+-      "scrambling setup",
+-      m_relinkAdapter, static_cast<unsigned int>(config),
+-      more ? StringUtils::Format(", Scrambler_Status {:#04x}, Status_Flags_0 {:#04x}",
+-                                 static_cast<unsigned int>(status),
+-                                 static_cast<unsigned int>(flags))
+-           : std::string(", the other registers not read"),
+-      sink == Sink::KEPT ? "has" : "lost");
+-  return sink;
+-}
+-
+ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+ {
+ #ifdef HAVE_DVBRIDGE
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 37b8089..cb95077 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -16,6 +16,7 @@
+ #include "utils/EGLUtils.h"
+ 
+ #include <chrono>
++#include <future>
+ #include <array>
+ #include <atomic>
+ #include <map>
+@@ -388,12 +389,18 @@ private:
+   //! ... when the output was last turned off and on for it
+   bool m_relinkDone{false};
+   std::chrono::steady_clock::time_point m_relinkAt{};
+-  //! ... what the display's SCDC says of the scrambling setup, read through the i2c adapter of the
+-  //! DDC port of the connector; said: what was read, or why nothing could be, for the log
+-  HOTPLUG_RELINK::Sink ReadScdc(int fd, const std::vector<uint8_t>& edid, std::string& said);
+-  //! ... that adapter (/dev/i2c-N; -1: not known), and the EDID that it was found with
+-  int m_relinkAdapter{-1};
+-  std::vector<uint8_t> m_relinkAdapterEdid;
++  //! ... the facts of the output now: on, its link, its depth, native Dolby Vision (for the look
++  //! after an event, and again when the read of the display's SCDC answers)
++  void RelinkOutputFacts(HOTPLUG_RELINK::Facts& facts, int& bpc);
++  //! ... what the facts call for, done: the log, and the output turned off and on
++  void RelinkDecide(HOTPLUG_RELINK::Facts facts, int bpc, const std::string& scdc);
++  //! ... the read of the display's SCDC, made on a thread of its own (a frame never waits for
++  //! it), the facts that it is for, and when it began
++  std::future<HOTPLUG_RELINK::ScdcRead> m_relinkRead;
++  HOTPLUG_RELINK::Facts m_relinkFacts;
++  std::chrono::steady_clock::time_point m_relinkReadAt{};
++  //! Hades: the driver of the device in use ("nvidia-drm", "i915", "amdgpu"), read once
++  const std::string& DriverName();
+ 
+   bool m_guiCompositing{false};
+   CFrameBufferObject m_guiFbo;
+-- 
+2.53.0
+

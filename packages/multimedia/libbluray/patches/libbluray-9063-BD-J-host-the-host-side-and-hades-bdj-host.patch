@@ -1,0 +1,1345 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:52:29 +0000
+Subject: [PATCH] BD-J host: the host side and hades-bdj-host
+
+bd_bdj_host_run(): what the host process runs on its one connection. It opens the disc with
+bd_open_files(), whose files are requests to the player, and plays the player's calls one at a
+time in the order they come, as the player's BLURAY would see them; a receiver thread hands the
+answers of the player to the threads that wait for them (libbluray reads the disc from the
+calling thread and from the Java threads). Small reads of a file are served from a read-ahead of
+128 KiB, so that a stream takes one request to the player per 128 KiB and not one per aligned
+unit. HDMV overlays are sent inline, marked with the call they were drawn in; an ARGB update is
+drawn into the shared memory and waits for the player's acknowledgement before the next one.
+Only the host decides its Java, cache and persistent storage; an ARGB plane larger than the
+shared memory is not shown and said in the log. Every log line of libbluray goes to the player.
+When the player closes the disc, the disc is closed while the player is still connected (the
+CLOSE of the BD-J planes reaches it), then the connection and the process end.
+
+hades-bdj-host is the program (src/tools, -Dhades_bdj_host=enabled, installed in
+<libdir>/hades-bdj). It takes the connection from systemd (LISTEN_FDS=1, descriptor 3, or
+standard input with StandardInput=socket) or --fd, and isolates itself with
+hades_bdj_sandbox_enter() before it reads anything; it is linked with the sandbox and its check
+(bdj_sandbox.c, standalone) and libseccomp. It gives the disc /usr/lib/hades-bdj/jre,
+/var/lib/hades-bdj/persistent if it is writable, and /tmp/hades-bdj-cache. Builds for tests
+(-Dhades_bdj_test=true, never in an image) also take --no-sandbox.
+---
+ meson_options.txt                 |   12 +
+ src/libbluray/remote/bdr_server.c | 1075 +++++++++++++++++++++++++++++
+ src/tools/hades_bdj_host.c        |  175 +++++
+ src/tools/meson.build             |   18 +
+ 4 files changed, 1280 insertions(+)
+ create mode 100644 src/libbluray/remote/bdr_server.c
+ create mode 100644 src/tools/hades_bdj_host.c
+
+diff --git a/meson_options.txt b/meson_options.txt
+index dbce4d1..1bd4d11 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -67,3 +67,15 @@ option('libxml2',
+     type: 'feature',
+     value: 'auto',
+     description: 'Metadata support with libxml2')
++
++# LibreELEC Hades: the isolated BD-J host
++
++option('hades_bdj_host',
++    type: 'feature',
++    value: 'disabled',
++    description: 'Build hades-bdj-host, the isolated BD-J host (Linux)')
++
++option('hades_bdj_test',
++    type: 'boolean',
++    value: false,
++    description: 'Tests only, never in an image: the client may start the host itself, the host may run without isolation')
+diff --git a/src/libbluray/remote/bdr_server.c b/src/libbluray/remote/bdr_server.c
+new file mode 100644
+index 0000000..67c3c01
+--- /dev/null
++++ b/src/libbluray/remote/bdr_server.c
+@@ -0,0 +1,1075 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * The host side of bdr_protocol.h: bd_bdj_host_run(), what hades-bdj-host runs on its one
++ * connection, after it has isolated itself. One disc, then the process ends.
++ *
++ * The calling thread executes the player's calls in the order they come, one at a time, as the
++ * BLURAY of a player would see them. A receiver thread reads the connection and hands the
++ * answers to the requests of this side (file reads, ARGB acknowledgements) to the threads that
++ * wait for them: libbluray reads the disc from the calling thread and from the Java threads.
++ */
++
++#if HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include "bdr_protocol.h"
++#include "bdr_wire.h"
++
++#include "bluray.h"
++#include "bluray_internal.h"
++#include "player_settings.h"
++#include "decoders/overlay.h"
++#include "file/filesystem.h"
++#include "util/logging.h"
++#include "util/macro.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++
++#define SLOTS            64
++#define ARGB_ACK_TIMEOUT 10   /* seconds */
++
++typedef struct srv_msg {
++    struct srv_msg *next;
++    BDR_HDR         hdr;
++    uint8_t        *payload;
++    int             fd;
++} SRV_MSG;
++
++typedef struct {
++    int       state;    /* 0 free, 1 waiting, 2 answered */
++    uint32_t  id;
++    uint16_t  type;
++    uint8_t  *payload;
++    uint32_t  len;
++} SRV_SLOT;
++
++typedef struct {
++    int              fd;
++    pthread_mutex_t  send_lock;
++    pthread_mutex_t  lock;
++    pthread_cond_t   cond;       /* queue, slots and the end */
++    int              dead;
++
++    SRV_MSG         *q_head, *q_tail;
++    SRV_SLOT         slot[SLOTS];
++    uint32_t         next_req;
++
++    BLURAY          *bd;
++    uint8_t         *shm;
++    pthread_t        executor;
++    int              in_call;
++    uint32_t         cur_call;
++
++    /* ARGB planes the host can show: their size from INIT, 0 when not shown */
++    unsigned         plane_w[BDR_PLANES], plane_h[BDR_PLANES];
++
++    int              persistent;
++} BDR_SERVER;
++
++static BDR_SERVER *g_srv;
++
++/*
++ * log: every line of libbluray goes to the player
++ */
++
++static void _log(const char *msg)
++{
++    BDR_SERVER *s = g_srv;
++    size_t len = strlen(msg);
++
++    if (len > BDR_MAX_LOG) {
++        len = BDR_MAX_LOG;
++    }
++    if (s && !s->dead) {
++        bdr_send(s->fd, &s->send_lock, BDR_LOG, 0, 0, msg, len, NULL, 0, NULL, 0, -1);
++    } else {
++        fprintf(stderr, "%.*s", (int)len, msg);
++    }
++}
++
++/*
++ * requests to the player
++ */
++
++static void _set_dead(BDR_SERVER *s)
++{
++    pthread_mutex_lock(&s->lock);
++    s->dead = 1;
++    pthread_cond_broadcast(&s->cond);
++    pthread_mutex_unlock(&s->lock);
++}
++
++/*
++ * Send a request and wait for its answer. Returns the answer's payload (free(), may be NULL with
++ * *len 0) and 0, or -1 when the connection is gone or (timeout_s > 0) no answer came in time.
++ */
++static int _request(BDR_SERVER *s, uint16_t type, uint16_t answer, const void *p1, size_t l1,
++                    const void *p2, size_t l2, int timeout_s, uint8_t **payload, uint32_t *len)
++{
++    int i, result = -1;
++    uint32_t id;
++    struct timespec ts;
++
++    *payload = NULL;
++    *len = 0;
++
++    pthread_mutex_lock(&s->lock);
++    for (;;) {
++        if (s->dead) {
++            pthread_mutex_unlock(&s->lock);
++            return -1;
++        }
++        for (i = 0; i < SLOTS; i++) {
++            if (s->slot[i].state == 0) {
++                break;
++            }
++        }
++        if (i < SLOTS) {
++            break;
++        }
++        pthread_cond_wait(&s->cond, &s->lock);
++    }
++    if (++s->next_req == 0) {
++        s->next_req = 1;
++    }
++    id = s->next_req;
++    s->slot[i].state = 1;
++    s->slot[i].id    = id;
++    pthread_mutex_unlock(&s->lock);
++
++    if (bdr_send(s->fd, &s->send_lock, type, 0, id, p1, l1, p2, l2, NULL, 0, -1) < 0) {
++        _set_dead(s);
++    }
++
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += timeout_s;
++
++    pthread_mutex_lock(&s->lock);
++    while (s->slot[i].state == 1 && !s->dead) {
++        if (timeout_s > 0) {
++            if (pthread_cond_timedwait(&s->cond, &s->lock, &ts) == ETIMEDOUT) {
++                break;
++            }
++        } else {
++            pthread_cond_wait(&s->cond, &s->lock);
++        }
++    }
++    if (s->slot[i].state == 2 && s->slot[i].type == answer) {
++        *payload = s->slot[i].payload;
++        *len     = s->slot[i].len;
++        result = 0;
++    } else {
++        free(s->slot[i].payload);
++    }
++    s->slot[i].payload = NULL;
++    s->slot[i].state   = 0;
++    pthread_cond_broadcast(&s->cond);
++    pthread_mutex_unlock(&s->lock);
++
++    return result;
++}
++
++/* a file request: ret, value and data of the answer; -1 if there is none */
++static int _file_request(BDR_SERVER *s, uint16_t type, const void *p1, size_t l1, const void *p2,
++                         size_t l2, BDR_FILE_REPLY_MSG *rep, uint8_t *data, uint32_t data_max)
++{
++    uint8_t *payload;
++    uint32_t len;
++
++    if (_request(s, type, BDR_FILE_REPLY, p1, l1, p2, l2, 0, &payload, &len) < 0) {
++        return -1;
++    }
++    if (len < sizeof(*rep)) {
++        free(payload);
++        return -1;
++    }
++    memcpy(rep, payload, sizeof(*rep));
++    if (rep->dlen != len - sizeof(*rep) || rep->dlen > data_max) {
++        free(payload);
++        return -1;
++    }
++    if (rep->dlen && data) {
++        memcpy(data, payload + sizeof(*rep), rep->dlen);
++    }
++    free(payload);
++    return 0;
++}
++
++static int _path_request(BDR_SERVER *s, uint16_t type, const char *path, BDR_FILE_REPLY_MSG *rep)
++{
++    BDR_PATH_MSG m;
++    size_t plen = strlen(path) + 1;
++
++    if (plen > BDR_MAX_PATH) {
++        return -1;
++    }
++    m.plen = (uint32_t)plen;
++    return _file_request(s, type, &m, sizeof(m), path, plen, rep, NULL, 0);
++}
++
++static void _handle_message(BDR_SERVER *s, uint16_t type, uint32_t handle)
++{
++    BDR_HANDLE_MSG m;
++    m.handle = handle;
++    bdr_send(s->fd, &s->send_lock, type, 0, 0, &m, sizeof(m), NULL, 0, NULL, 0, -1);
++}
++
++/*
++ * the disc, through the player
++ */
++
++typedef struct {
++    BDR_SERVER *s;
++    uint32_t    handle;
++    int64_t     pos;
++    int64_t     size;
++
++    uint8_t    *ra;      /* read-ahead: ra_len bytes of the file from ra_pos */
++    int64_t     ra_pos;
++    uint32_t    ra_len;
++} SRV_FILE;
++
++static void _file_close(BD_FILE_H *file)
++{
++    SRV_FILE *f = (SRV_FILE *)file->internal;
++    _handle_message(f->s, BDR_FILE_CLOSE, f->handle);
++    X_FREE(f->ra);
++    X_FREE(file->internal);
++    X_FREE(file);
++}
++
++static int64_t _file_seek(BD_FILE_H *file, int64_t offset, int32_t origin)
++{
++    SRV_FILE *f = (SRV_FILE *)file->internal;
++    int64_t pos;
++
++    switch (origin) {
++    case SEEK_SET: pos = offset;           break;
++    case SEEK_CUR: pos = f->pos + offset;  break;
++    case SEEK_END: pos = f->size + offset; break;
++    default: return -1;
++    }
++    if (pos < 0) {
++        return -1;
++    }
++    f->pos = pos;
++    return pos;
++}
++
++static int64_t _file_tell(BD_FILE_H *file)
++{
++    return ((SRV_FILE *)file->internal)->pos;
++}
++
++static int _file_eof(BD_FILE_H *file)
++{
++    SRV_FILE *f = (SRV_FILE *)file->internal;
++    return f->pos >= f->size;
++}
++
++/* one read request: n bytes of the file at pos into dst; the bytes read, or -1 */
++static int64_t _fetch(SRV_FILE *f, int64_t pos, uint8_t *dst, uint32_t n)
++{
++    BDR_READ_MSG m;
++    BDR_FILE_REPLY_MSG rep;
++
++    m.handle = f->handle;
++    m.len    = n;
++    m.offset = pos;
++    if (_file_request(f->s, BDR_FILE_READ, &m, sizeof(m), NULL, 0, &rep, dst, n) < 0 ||
++        rep.ret < 0 || rep.ret > n || (uint32_t)rep.ret != rep.dlen) {
++        return -1;
++    }
++    return rep.ret;
++}
++
++/*
++ * libbluray reads a stream one aligned unit (6144 bytes) at a time: small reads are served from
++ * a read-ahead of BDR_MAX_DATA bytes, so that a stream takes one request to the player per
++ * 128 KiB, not one per unit. The files of a disc do not change while it plays.
++ */
++static int64_t _file_read(BD_FILE_H *file, uint8_t *buf, int64_t size)
++{
++    SRV_FILE *f = (SRV_FILE *)file->internal;
++    int64_t done = 0;
++
++    if (size <= 0) {
++        return 0;
++    }
++    while (done < size) {
++        int64_t want = size - done, r;
++
++        if (f->ra && f->pos >= f->ra_pos && f->pos < f->ra_pos + f->ra_len) {
++            int64_t off = f->pos - f->ra_pos;
++            int64_t n = f->ra_len - off;
++            if (n > want) {
++                n = want;
++            }
++            memcpy(buf + done, f->ra + off, (size_t)n);
++            done   += n;
++            f->pos += n;
++            continue;
++        }
++        if (f->pos >= f->size) {
++            break;
++        }
++
++        if (want >= BDR_MAX_DATA) {
++            /* a large read goes straight to the caller */
++            r = _fetch(f, f->pos, buf + done, BDR_MAX_DATA);
++            if (r <= 0) {
++                return done ? done : r;
++            }
++            done   += r;
++            f->pos += r;
++            continue;
++        }
++
++        if (!f->ra) {
++            f->ra = malloc(BDR_MAX_DATA);
++            if (!f->ra) {
++                return done ? done : -1;
++            }
++        }
++        f->ra_len = 0;
++        r = _fetch(f, f->pos, f->ra, BDR_MAX_DATA);
++        if (r <= 0) {
++            return done ? done : r;
++        }
++        f->ra_pos = f->pos;
++        f->ra_len = (uint32_t)r;
++    }
++    return done;
++}
++
++static BD_FILE_H *_open_file(void *handle, const char *rel_path)
++{
++    BDR_SERVER *s = (BDR_SERVER *)handle;
++    BDR_FILE_REPLY_MSG rep;
++    BD_FILE_H *file;
++    SRV_FILE *f;
++
++    if (_path_request(s, BDR_FILE_OPEN, rel_path, &rep) < 0 || rep.ret < 0 || rep.value < 0) {
++        return NULL;
++    }
++
++    file = calloc(1, sizeof(*file));
++    f = calloc(1, sizeof(*f));
++    if (!file || !f) {
++        X_FREE(file);
++        X_FREE(f);
++        _handle_message(s, BDR_FILE_CLOSE, (uint32_t)rep.ret);
++        return NULL;
++    }
++    f->s      = s;
++    f->handle = (uint32_t)rep.ret;
++    f->size   = rep.value;
++    file->internal = f;
++    file->close = _file_close;
++    file->seek  = _file_seek;
++    file->tell  = _file_tell;
++    file->eof   = _file_eof;
++    file->read  = _file_read;
++    file->write = NULL;
++    return file;
++}
++
++typedef struct {
++    BDR_SERVER *s;
++    uint32_t    handle;
++} SRV_DIR;
++
++static void _dir_close(BD_DIR_H *dir)
++{
++    SRV_DIR *d = (SRV_DIR *)dir->internal;
++    _handle_message(d->s, BDR_DIR_CLOSE, d->handle);
++    X_FREE(dir->internal);
++    X_FREE(dir);
++}
++
++static int _dir_read(BD_DIR_H *dir, BD_DIRENT *entry)
++{
++    SRV_DIR *d = (SRV_DIR *)dir->internal;
++    BDR_HANDLE_MSG m;
++    BDR_FILE_REPLY_MSG rep;
++    char name[sizeof(entry->d_name)];
++
++    m.handle = d->handle;
++    if (_file_request(d->s, BDR_DIR_READ, &m, sizeof(m), NULL, 0, &rep, (uint8_t *)name,
++                      sizeof(name) - 1) < 0 || rep.ret < 0) {
++        return -1;
++    }
++    if (rep.ret > 0) {
++        return 1;
++    }
++    memcpy(entry->d_name, name, rep.dlen);
++    entry->d_name[rep.dlen] = 0;
++    return 0;
++}
++
++static BD_DIR_H *_open_dir(void *handle, const char *rel_path)
++{
++    BDR_SERVER *s = (BDR_SERVER *)handle;
++    BDR_FILE_REPLY_MSG rep;
++    BD_DIR_H *dir;
++    SRV_DIR *d;
++
++    if (_path_request(s, BDR_DIR_OPEN, rel_path, &rep) < 0 || rep.ret < 0) {
++        return NULL;
++    }
++    dir = calloc(1, sizeof(*dir));
++    d = calloc(1, sizeof(*d));
++    if (!dir || !d) {
++        X_FREE(dir);
++        X_FREE(d);
++        _handle_message(s, BDR_DIR_CLOSE, (uint32_t)rep.ret);
++        return NULL;
++    }
++    d->s      = s;
++    d->handle = (uint32_t)rep.ret;
++    dir->internal = d;
++    dir->close = _dir_close;
++    dir->read  = _dir_read;
++    return dir;
++}
++
++/*
++ * overlays
++ */
++
++static int _drawn_in_call(BDR_SERVER *s, uint16_t *flags, uint32_t *id)
++{
++    if (s->in_call && pthread_equal(pthread_self(), s->executor)) {
++        *flags = BDR_F_SYNC;
++        *id    = s->cur_call;
++        return 1;
++    }
++    *flags = 0;
++    *id    = 0;
++    return 0;
++}
++
++static void _overlay_cb(void *handle, const BD_OVERLAY * const ov)
++{
++    BDR_SERVER *s = (BDR_SERVER *)handle;
++    BDR_OVERLAY_MSG m;
++    uint16_t flags;
++    uint32_t id;
++    size_t n = 0;
++
++    _drawn_in_call(s, &flags, &id);
++    memset(&m, 0, sizeof(m));
++
++    if (!ov) {
++        m.null_overlay = 1;
++        bdr_send(s->fd, &s->send_lock, BDR_OVERLAY, flags, id, &m, sizeof(m), NULL, 0, NULL, 0, -1);
++        return;
++    }
++
++    m.pts   = ov->pts;
++    m.plane = ov->plane;
++    m.cmd   = ov->cmd;
++    m.palette_update_flag = ov->palette_update_flag;
++    m.x = ov->x;
++    m.y = ov->y;
++    m.w = ov->w;
++    m.h = ov->h;
++    m.has_palette = ov->palette ? 1 : 0;
++
++    if (ov->img && ov->cmd == BD_OVERLAY_DRAW) {
++        /* the elements that make up w x h pixels, as a player walks them */
++        uint64_t total = (uint64_t)ov->w * ov->h, acc = 0;
++        size_t limit = (BDR_MAX_PAYLOAD - sizeof(m) - 256 * sizeof(BD_PG_PALETTE_ENTRY)) /
++                       sizeof(BD_PG_RLE_ELEM);
++        while (acc < total && n < limit) {
++            acc += ov->img[n].len;
++            n++;
++        }
++        m.has_img = 1;
++        m.n_rle   = (uint32_t)n;
++    }
++
++    bdr_send(s->fd, &s->send_lock, BDR_OVERLAY, flags, id, &m, sizeof(m),
++             ov->palette, ov->palette ? 256 * sizeof(BD_PG_PALETTE_ENTRY) : 0,
++             m.has_img ? (const void *)ov->img : NULL, n * sizeof(BD_PG_RLE_ELEM), -1);
++}
++
++static void _argb_cb(void *handle, const BD_ARGB_OVERLAY * const ov)
++{
++    BDR_SERVER *s = (BDR_SERVER *)handle;
++    BDR_ARGB_MSG m;
++    unsigned plane;
++
++    if (!ov) {
++        return;
++    }
++    plane = ov->plane;
++    if (plane >= BDR_PLANES) {
++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "ARGB overlay on plane %u not shown\n", plane);
++        return;
++    }
++
++    memset(&m, 0, sizeof(m));
++    m.pts   = ov->pts;
++    m.plane = (uint8_t)plane;
++    m.cmd   = ov->cmd;
++
++    switch (ov->cmd) {
++    case BD_ARGB_OVERLAY_INIT:
++        if (ov->w < 1 || ov->h < 1 || ov->w > BDR_PLANE_W || ov->h > BDR_PLANE_H) {
++            BD_DEBUG(DBG_BDJ | DBG_CRIT, "ARGB plane %u of %ux%u is larger than %ux%u: not shown\n",
++                     plane, (unsigned)ov->w, (unsigned)ov->h, BDR_PLANE_W, BDR_PLANE_H);
++            s->plane_w[plane] = s->plane_h[plane] = 0;
++            return;
++        }
++        s->plane_w[plane] = ov->w;
++        s->plane_h[plane] = ov->h;
++        m.w = ov->w;
++        m.h = ov->h;
++        break;
++
++    case BD_ARGB_OVERLAY_CLOSE:
++        s->plane_w[plane] = s->plane_h[plane] = 0;
++        break;
++
++    case BD_ARGB_OVERLAY_FLUSH:
++        if (!s->plane_w[plane]) {
++            return;
++        }
++        break;
++
++    case BD_ARGB_OVERLAY_DRAW: {
++        uint8_t *payload;
++        uint32_t len, row;
++        uint8_t *base;
++        if (!s->plane_w[plane] || !ov->argb || ov->w < 1 || ov->h < 1 ||
++            (unsigned)ov->x + ov->w > s->plane_w[plane] ||
++            (unsigned)ov->y + ov->h > s->plane_h[plane]) {
++            return;
++        }
++        base = s->shm + (uint64_t)plane * BDR_SHM_PLANE;
++        for (row = 0; row < ov->h; row++) {
++            memcpy(base + (((size_t)ov->y + row) * BDR_PLANE_W + ov->x) * 4,
++                   ov->argb + (size_t)row * ov->stride, (size_t)ov->w * 4);
++        }
++        m.x = ov->x;
++        m.y = ov->y;
++        m.w = ov->w;
++        m.h = ov->h;
++        /* the player copies the pixels, then the shared memory may be drawn again */
++        if (_request(s, BDR_ARGB, BDR_ARGB_ACK, &m, sizeof(m), NULL, 0, ARGB_ACK_TIMEOUT,
++                     &payload, &len) == 0) {
++            free(payload);
++        }
++        return;
++    }
++
++    default:
++        return;
++    }
++
++    bdr_send(s->fd, &s->send_lock, BDR_ARGB, 0, 0, &m, sizeof(m), NULL, 0, NULL, 0, -1);
++}
++
++static void _register_overlays(BDR_SERVER *s, int overlay, int argb)
++{
++    bd_register_overlay_proc(s->bd, s, overlay ? _overlay_cb : NULL);
++    bd_register_argb_overlay_proc(s->bd, s, argb ? _argb_cb : NULL, NULL);
++}
++
++/*
++ * receiver
++ */
++
++static void *_rx_thread(void *p)
++{
++    BDR_SERVER *s = (BDR_SERVER *)p;
++
++    for (;;) {
++        BDR_HDR hdr;
++        uint8_t *payload;
++        int fd = -1, r, i;
++
++        r = bdr_recv(s->fd, &hdr, &payload, &fd);
++        if (r) {
++            break;
++        }
++        if (fd >= 0 && hdr.type != BDR_OPEN) {
++            close(fd);
++            free(payload);
++            break;
++        }
++
++        if (hdr.type == BDR_FILE_REPLY || hdr.type == BDR_ARGB_ACK) {
++            pthread_mutex_lock(&s->lock);
++            for (i = 0; i < SLOTS; i++) {
++                if (s->slot[i].state == 1 && s->slot[i].id == hdr.id) {
++                    s->slot[i].state   = 2;
++                    s->slot[i].type    = hdr.type;
++                    s->slot[i].payload = payload;
++                    s->slot[i].len     = hdr.len;
++                    payload = NULL;
++                    break;
++                }
++            }
++            pthread_cond_broadcast(&s->cond);
++            pthread_mutex_unlock(&s->lock);
++            free(payload);
++            continue;
++        }
++
++        {
++            SRV_MSG *m = calloc(1, sizeof(*m));
++            if (!m) {
++                free(payload);
++                if (fd >= 0) {
++                    close(fd);
++                }
++                break;
++            }
++            m->hdr     = hdr;
++            m->payload = payload;
++            m->fd      = fd;
++            pthread_mutex_lock(&s->lock);
++            if (s->q_tail) {
++                s->q_tail->next = m;
++            } else {
++                s->q_head = m;
++            }
++            s->q_tail = m;
++            pthread_cond_broadcast(&s->cond);
++            pthread_mutex_unlock(&s->lock);
++        }
++    }
++
++    _set_dead(s);
++    return NULL;
++}
++
++static SRV_MSG *_next_message(BDR_SERVER *s)
++{
++    SRV_MSG *m;
++    pthread_mutex_lock(&s->lock);
++    while (!s->q_head && !s->dead) {
++        pthread_cond_wait(&s->cond, &s->lock);
++    }
++    m = s->q_head;
++    if (m) {
++        s->q_head = m->next;
++        if (!s->q_head) {
++            s->q_tail = NULL;
++        }
++    }
++    pthread_mutex_unlock(&s->lock);
++    return m;
++}
++
++static void _free_message(SRV_MSG *m)
++{
++    if (m) {
++        if (m->fd >= 0) {
++            close(m->fd);
++        }
++        free(m->payload);
++        free(m);
++    }
++}
++
++/*
++ * settings and calls
++ */
++
++/* settings that only the host decides */
++static int _setting_allowed(BDR_SERVER *s, uint32_t idx, int is_str)
++{
++    if (is_str) {
++        return idx == BLURAY_PLAYER_SETTING_AUDIO_LANG || idx == BLURAY_PLAYER_SETTING_PG_LANG ||
++               idx == BLURAY_PLAYER_SETTING_MENU_LANG || idx == BLURAY_PLAYER_SETTING_COUNTRY_CODE;
++    }
++    if (idx == BLURAY_PLAYER_SETTING_BDJ_REMOTE) {
++        return 0;
++    }
++    if (idx == BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE && !s->persistent) {
++        return 0;
++    }
++    return 1;
++}
++
++/* a string inside a message, NUL terminated where it says; NULL if not */
++static const char *_msg_string(const uint8_t *p, size_t avail, uint32_t slen)
++{
++    if (slen < 1 || slen > BDR_MAX_STRING || slen != avail || p[slen - 1] != 0 ||
++        strlen((const char *)p) != slen - 1) {
++        return NULL;
++    }
++    return (const char *)p;
++}
++
++static void _apply_setting(BDR_SERVER *s, const SRV_MSG *msg)
++{
++    BDR_SETTING_MSG m;
++    const char *str = NULL;
++
++    if (msg->hdr.len < sizeof(m)) {
++        return;
++    }
++    memcpy(&m, msg->payload, sizeof(m));
++    if (m.is_str) {
++        str = _msg_string(msg->payload + sizeof(m), msg->hdr.len - sizeof(m), m.slen);
++        if (!str) {
++            return;
++        }
++    }
++    if (!_setting_allowed(s, m.idx, m.is_str)) {
++        return;
++    }
++    if (str) {
++        bd_set_player_setting_str(s->bd, m.idx, str);
++    } else {
++        bd_set_player_setting(s->bd, m.idx, m.value);
++    }
++}
++
++static void _reply(BDR_SERVER *s, uint32_t id, int64_t ret, const BD_EVENT *ev,
++                   const void *data, uint32_t dlen)
++{
++    BDR_REPLY_MSG r;
++    memset(&r, 0, sizeof(r));
++    r.ret = ret;
++    if (ev) {
++        r.has_event = 1;
++        r.event     = ev->event;
++        r.param     = ev->param;
++    }
++    r.dlen = dlen;
++    bdr_send(s->fd, &s->send_lock, BDR_REPLY, 0, id, &r, sizeof(r), data, dlen, NULL, 0, -1);
++}
++
++static void _do_call(BDR_SERVER *s, const SRV_MSG *msg, uint8_t *buf)
++{
++    BDR_CALL_MSG m;
++    BLURAY *bd = s->bd;
++    const char *str = NULL;
++    BD_EVENT ev;
++    int64_t ret = 0;
++    uint32_t dlen = 0, n;
++    int with_event = 0;
++
++    if (msg->hdr.len < sizeof(m)) {
++        return;
++    }
++    memcpy(&m, msg->payload, sizeof(m));
++    if (m.slen) {
++        str = _msg_string(msg->payload + sizeof(m), msg->hdr.len - sizeof(m), m.slen);
++    }
++    memset(&ev, 0, sizeof(ev));
++
++    s->in_call  = 1;
++    s->cur_call = msg->hdr.id;
++
++    switch (m.op) {
++    case BDR_OP_SELECT_TITLE:      ret = bd_select_title(bd, (uint32_t)m.a[0]); break;
++    case BDR_OP_SELECT_PLAYLIST:   ret = bd_select_playlist(bd, (uint32_t)m.a[0]); break;
++    case BDR_OP_GET_CURRENT_TITLE: ret = bd_get_current_title(bd); break;
++    case BDR_OP_READ:
++        n = (m.a[0] < 0 || m.a[0] > BDR_MAX_DATA) ? BDR_MAX_DATA : (uint32_t)m.a[0];
++        ret = bd_read(bd, buf, (int)n);
++        dlen = ret > 0 ? (uint32_t)ret : 0;
++        break;
++    case BDR_OP_SEEK:              ret = bd_seek(bd, (uint64_t)m.a[0]); break;
++    case BDR_OP_SEEK_TIME:         ret = bd_seek_time(bd, (uint64_t)m.a[0]); break;
++    case BDR_OP_SEEK_CHAPTER:      ret = bd_seek_chapter(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_SEEK_MARK:         ret = bd_seek_mark(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_SEEK_PLAYITEM:     ret = bd_seek_playitem(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_SELECT_ANGLE:      ret = bd_select_angle(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_SEAMLESS_ANGLE_CHANGE: bd_seamless_angle_change(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_SELECT_STREAM:
++        ret = bd_select_stream(bd, (uint32_t)m.a[0], (uint32_t)m.a[1], (uint32_t)m.a[2]);
++        break;
++    case BDR_OP_CHAPTER_POS:       ret = bd_chapter_pos(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_GET_CURRENT_CHAPTER: ret = bd_get_current_chapter(bd); break;
++    case BDR_OP_GET_TITLE_SIZE:    ret = (int64_t)bd_get_title_size(bd); break;
++    case BDR_OP_GET_CURRENT_ANGLE: ret = bd_get_current_angle(bd); break;
++    case BDR_OP_TELL:              ret = (int64_t)bd_tell(bd); break;
++    case BDR_OP_TELL_TIME:         ret = (int64_t)bd_tell_time(bd); break;
++    case BDR_OP_SET_PLAYER_SETTING:
++        ret = _setting_allowed(s, (uint32_t)m.a[0], 0) ?
++              bd_set_player_setting(bd, (uint32_t)m.a[0], (uint32_t)m.a[1]) : 0;
++        break;
++    case BDR_OP_SET_PLAYER_SETTING_STR:
++        ret = (str && _setting_allowed(s, (uint32_t)m.a[0], 1)) ?
++              bd_set_player_setting_str(bd, (uint32_t)m.a[0], str) : 0;
++        break;
++    case BDR_OP_GET_EVENT:
++        ret = bd_get_event(bd, &ev);
++        with_event = ret != 0;
++        break;
++    case BDR_OP_PLAY:              ret = bd_play(bd); break;
++    case BDR_OP_PLAY_TITLE:        ret = bd_play_title(bd, (unsigned)m.a[0]); break;
++    case BDR_OP_MENU_CALL:         ret = bd_menu_call(bd, m.a[0]); break;
++    case BDR_OP_READ_EXT:
++        n = (m.a[0] < 0 || m.a[0] > BDR_MAX_DATA) ? BDR_MAX_DATA : (uint32_t)m.a[0];
++        ret = bd_read_ext(bd, buf, (int)n, &ev);
++        dlen = ret > 0 ? (uint32_t)ret : 0;
++        with_event = 1;
++        break;
++    case BDR_OP_READ_SKIP_STILL:   ret = bd_read_skip_still(bd); break;
++    case BDR_OP_SET_SCR:           bd_set_scr(bd, m.a[0]); break;
++    case BDR_OP_SET_RATE:          ret = bd_set_rate(bd, (uint32_t)m.a[0]); break;
++    case BDR_OP_USER_INPUT:        ret = bd_user_input(bd, m.a[0], (uint32_t)m.a[1]); break;
++    case BDR_OP_MOUSE_SELECT:
++        ret = bd_mouse_select(bd, m.a[0], (uint16_t)m.a[1], (uint16_t)m.a[2]);
++        break;
++    case BDR_OP_START_BDJ:         ret = str ? bd_start_bdj(bd, str) : 0; break;
++    case BDR_OP_STOP_BDJ:          bd_stop_bdj(bd); break;
++    case BDR_OP_GET_TITLES:
++        ret = bd_get_titles(bd, (uint8_t)m.a[0], (uint32_t)m.a[1]);
++        break;
++    case BDR_OP_CLIP_NAME: {
++        char name[6];
++        ret = bdpriv_clip_name(bd, (unsigned)m.a[0], name);
++        if (ret > 0) {
++            memcpy(buf, name, 5);
++            dlen = 5;
++        }
++        break;
++    }
++    case BDR_OP_REGISTER_OVERLAYS:
++        _register_overlays(s, m.a[0] != 0, m.a[1] != 0);
++        break;
++#ifdef BD_HAVE_BDJ_WAITING_FOR_PLAYBACK
++    case BDR_OP_BDJ_WAITING_FOR_PLAYBACK: ret = bd_bdj_waiting_for_playback(bd); break;
++#endif
++#ifdef BD_BDJ_PRESENTATION_TIMING
++    case BDR_OP_BDJ_SET_PRESENTATION_TIMING: bd_bdj_set_presentation_timing(bd, (int)m.a[0]); break;
++    case BDR_OP_BDJ_PENDING_SEQ:   ret = bd_bdj_pending_seq(bd); break;
++    case BDR_OP_BDJ_RELEASE:       bd_bdj_release(bd, (uint32_t)m.a[0]); break;
++    case BDR_OP_BDJ_RELEASE_ALL:   bd_bdj_release_all(bd); break;
++#endif
++    default:
++        ret = -1;
++        break;
++    }
++
++    s->in_call = 0;
++
++    _reply(s, msg->hdr.id, ret, with_event ? &ev : NULL, buf, dlen);
++}
++
++static int _do_open(BDR_SERVER *s, const SRV_MSG *msg, const BD_BDJ_HOST_CONFIG *cfg)
++{
++    BDR_OPEN_MSG m;
++    BDR_OPEN_OK_MSG ok;
++    const BLURAY_DISC_INFO *di;
++    struct stat st;
++    void *p;
++
++    memset(&ok, 0, sizeof(ok));
++
++    if (msg->hdr.len != sizeof(m) || msg->fd < 0 || fstat(msg->fd, &st) < 0 ||
++        (uint64_t)st.st_size != BDR_SHM_SIZE) {
++        goto reply;
++    }
++    memcpy(&m, msg->payload, sizeof(m));
++
++    p = mmap(NULL, (size_t)BDR_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, msg->fd, 0);
++    if (p == MAP_FAILED) {
++        goto reply;
++    }
++    s->shm = (uint8_t *)p;
++
++    bd_set_debug_mask(m.debug_mask);
++
++    if (cfg && cfg->java_home) {
++        bd_set_player_setting_str(s->bd, BLURAY_PLAYER_JAVA_HOME, cfg->java_home);
++    }
++    if (cfg && cfg->cache_root) {
++        bd_set_player_setting_str(s->bd, BLURAY_PLAYER_CACHE_ROOT, cfg->cache_root);
++    }
++    if (s->persistent) {
++        bd_set_player_setting_str(s->bd, BLURAY_PLAYER_PERSISTENT_ROOT, cfg->persistent_root);
++    }
++
++    if (!bd_open_files(s->bd, s, _open_dir, _open_file)) {
++        ok.bluray_detected = 0;
++        goto reply;
++    }
++    bd_get_event(s->bd, NULL);
++    if (m.titles_valid) {
++        bd_get_titles(s->bd, (uint8_t)m.titles_flags, m.titles_min);
++    }
++    _register_overlays(s, m.want_overlay, m.want_argb);
++
++    di = bd_get_disc_info(s->bd);
++    if (di) {
++        ok.bluray_detected      = di->bluray_detected;
++        ok.bdj_detected         = di->bdj_detected;
++        ok.libjvm_detected      = di->libjvm_detected;
++        ok.bdj_handled          = di->bdj_handled;
++        ok.first_play_supported = di->first_play_supported;
++        ok.top_menu_supported   = di->top_menu_supported;
++        ok.num_titles           = di->num_titles;
++    }
++
++ reply:
++    bdr_send(s->fd, &s->send_lock, BDR_OPEN_OK, 0, msg->hdr.id, &ok, sizeof(ok), NULL, 0, NULL, 0, -1);
++    return ok.bluray_detected > 0 && ok.bdj_handled ? 0 : -1;
++}
++
++static int _hello(BDR_SERVER *s)
++{
++    BDR_HDR hdr;
++    uint8_t *payload;
++    BDR_HELLO_MSG m;
++    int r;
++
++    r = bdr_recv(s->fd, &hdr, &payload, NULL);
++    if (r) {
++        return -1;
++    }
++    if (hdr.type != BDR_HELLO || hdr.len != sizeof(m)) {
++        free(payload);
++        return -1;
++    }
++    memcpy(&m, payload, sizeof(m));
++    free(payload);
++    if (m.version != BDR_VERSION || m.layout != BDR_LAYOUT || m.max_payload != BDR_MAX_PAYLOAD) {
++        return -1;
++    }
++
++    memset(&m, 0, sizeof(m));
++    m.version     = BDR_VERSION;
++    m.layout      = BDR_LAYOUT;
++    m.max_payload = BDR_MAX_PAYLOAD;
++    m.pid         = (uint32_t)getpid();
++    return bdr_send(s->fd, &s->send_lock, BDR_HELLO_OK, 0, 0, &m, sizeof(m), NULL, 0, NULL, 0, -1);
++}
++
++int bd_bdj_host_run(int fd, const BD_BDJ_HOST_CONFIG *cfg)
++{
++    BDR_SERVER *s;
++    pthread_t rx;
++    uint8_t *buf;
++    int opened = 0, result = 1, i;
++
++    if (fd < 0 || g_srv) {
++        return 1;
++    }
++
++    s = calloc(1, sizeof(*s));
++    buf = malloc(BDR_MAX_DATA);
++    if (!s || !buf) {
++        free(s);
++        free(buf);
++        return 1;
++    }
++    s->fd = fd;
++    s->executor = pthread_self();
++    s->persistent = cfg && cfg->persistent_root && cfg->persistent_root[0];
++    pthread_mutex_init(&s->send_lock, NULL);
++    pthread_mutex_init(&s->lock, NULL);
++    pthread_cond_init(&s->cond, NULL);
++
++    if (_hello(s) < 0) {
++        goto out;
++    }
++
++    g_srv = s;
++    bd_set_debug_handler(_log);
++
++    s->bd = bd_init();
++    if (!s->bd) {
++        goto out;
++    }
++    /* this process is the host: BD-J runs here */
++    bd_set_player_setting(s->bd, BLURAY_PLAYER_SETTING_BDJ_REMOTE, BLURAY_BDJ_REMOTE_NEVER);
++    if (!s->persistent) {
++        bd_set_player_setting(s->bd, BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE, 0);
++    }
++
++    if (pthread_create(&rx, NULL, _rx_thread, s)) {
++        goto out;
++    }
++
++    for (;;) {
++        SRV_MSG *msg = _next_message(s);
++        if (!msg) {
++            break;   /* the player is gone */
++        }
++        if (msg->hdr.type == BDR_CLOSE) {
++            _free_message(msg);
++            result = 0;
++            break;
++        }
++        if (msg->hdr.type == BDR_SETTING) {
++            _apply_setting(s, msg);
++        } else if (msg->hdr.type == BDR_OPEN && !opened) {
++            opened = 1;
++            if (_do_open(s, msg, cfg) < 0) {
++                _free_message(msg);
++                break;
++            }
++        } else if (msg->hdr.type == BDR_CALL && opened) {
++            _do_call(s, msg, buf);
++        } else {
++            _free_message(msg);
++            break;   /* not in the protocol */
++        }
++        _free_message(msg);
++    }
++
++    /*
++     * The disc is closed while the player is still there (when it is), so that what closing
++     * draws reaches it (the CLOSE of the BD-J planes) and what it reads is answered. Then the
++     * connection ends, and the process after this.
++     */
++    bd_close(s->bd);
++    s->bd = NULL;
++    _set_dead(s);
++    shutdown(fd, SHUT_RDWR);
++    pthread_join(rx, NULL);
++
++ out:
++    g_srv = NULL;
++    for (i = 0; i < SLOTS; i++) {
++        free(s->slot[i].payload);
++    }
++    while (s->q_head) {
++        SRV_MSG *m = s->q_head;
++        s->q_head = m->next;
++        _free_message(m);
++    }
++    if (s->bd) {
++        bd_close(s->bd);
++    }
++    free(buf);
++    return result;
++}
+diff --git a/src/tools/hades_bdj_host.c b/src/tools/hades_bdj_host.c
+new file mode 100644
+index 0000000..2be5c18
+--- /dev/null
++++ b/src/tools/hades_bdj_host.c
+@@ -0,0 +1,175 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * hades-bdj-host: the isolated BD-J host of LibreELEC Hades. One process per disc, started by
++ * systemd for one connection of a player (hades-bdj.socket, Accept=yes: the connection is file
++ * descriptor 3 with LISTEN_FDS=1, or standard input with StandardInput=socket). It isolates
++ * itself before it reads anything of the connection, then plays the disc's BD-J titles for that
++ * player (bd_bdj_host_run()) and ends.
++ *
++ *   hades-bdj-host [--fd N] [--java-home DIR] [--persistent-root DIR] [--cache-root DIR]
++ *
++ * Builds for tests (-Dhades_bdj_test=true, never in an image) also take --no-sandbox.
++ */
++
++#include "libbluray/bluray.h"
++
++#include "hades_bdj_sandbox.h"
++
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++
++#define DEFAULT_JAVA_HOME       "/usr/lib/hades-bdj/jre"
++#define DEFAULT_PERSISTENT_ROOT "/var/lib/hades-bdj/persistent"
++#define DEFAULT_CACHE_ROOT      "/tmp/hades-bdj-cache"
++
++static int _usage(const char *argv0)
++{
++    fprintf(stderr, "usage: %s [--fd N] [--java-home DIR] [--persistent-root DIR] [--cache-root DIR]\n",
++            argv0);
++    return 2;
++}
++
++/* the socket systemd passed (sd_listen_fds() for one descriptor), or -1 */
++static int _listen_fd(void)
++{
++    const char *pid = getenv("LISTEN_PID");
++    const char *fds = getenv("LISTEN_FDS");
++
++    if (!pid || !fds || atol(pid) != (long)getpid() || strcmp(fds, "1")) {
++        return -1;
++    }
++    unsetenv("LISTEN_PID");
++    unsetenv("LISTEN_FDS");
++    unsetenv("LISTEN_FDNAMES");
++    return 3;
++}
++
++static int _same_file(int a, int b)
++{
++    struct stat sa, sb;
++    return fstat(a, &sa) == 0 && fstat(b, &sb) == 0 && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
++}
++
++/*
++ * The connection on a descriptor of its own, above the standard ones, and none of those on it:
++ * the JVM and libbluray write to standard output and error, and nothing they write may reach the
++ * connection (with StandardInput=socket, or a socket-activate --inetd, standard input and output
++ * are the socket). Returns the new descriptor, or -1.
++ */
++static int _detach_stdio(int fd)
++{
++    int nfd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
++    int null = open("/dev/null", O_RDWR | O_CLOEXEC);
++    int i;
++
++    if (nfd < 0 || null < 0) {
++        return -1;
++    }
++    for (i = 0; i <= 2; i++) {
++        if (_same_file(i, nfd) && dup2(null, i) < 0) {
++            return -1;
++        }
++    }
++    if (fd > 2) {
++        close(fd);
++    }
++    close(null);
++    return nfd;
++}
++
++static int _is_stream_socket(int fd)
++{
++    struct stat st;
++    int type = 0;
++    socklen_t len = sizeof(type);
++
++    return fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode) &&
++           getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0 && type == SOCK_STREAM;
++}
++
++int main(int argc, char **argv)
++{
++    BD_BDJ_HOST_CONFIG cfg;
++    struct stat st;
++    int fd = -1, sandbox = 1, i, rc;
++
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.java_home       = DEFAULT_JAVA_HOME;
++    cfg.persistent_root = DEFAULT_PERSISTENT_ROOT;
++    cfg.cache_root      = DEFAULT_CACHE_ROOT;
++
++    for (i = 1; i < argc; i++) {
++        if (!strcmp(argv[i], "--fd") && i + 1 < argc) {
++            fd = atoi(argv[++i]);
++        } else if (!strcmp(argv[i], "--java-home") && i + 1 < argc) {
++            cfg.java_home = argv[++i];
++        } else if (!strcmp(argv[i], "--persistent-root") && i + 1 < argc) {
++            cfg.persistent_root = argv[++i];
++        } else if (!strcmp(argv[i], "--cache-root") && i + 1 < argc) {
++            cfg.cache_root = argv[++i];
++#ifdef HADES_BDJ_TEST
++        } else if (!strcmp(argv[i], "--no-sandbox")) {
++            sandbox = 0;
++#endif
++        } else {
++            return _usage(argv[0]);
++        }
++    }
++
++    if (fd < 0) {
++        fd = _listen_fd();
++    }
++    if (fd < 0 && _is_stream_socket(0)) {
++        /* StandardInput=socket: the connection is standard input */
++        fd = 0;
++    }
++    if (fd < 0 || !_is_stream_socket(fd)) {
++        fprintf(stderr, "hades-bdj-host: no connection (fd %d)\n", fd);
++        return 2;
++    }
++    fd = _detach_stdio(fd);
++    if (fd < 0) {
++        fprintf(stderr, "hades-bdj-host: could not set the connection apart\n");
++        return 2;
++    }
++
++    /* isolated before anything of the player or of the disc is read */
++    if (sandbox && hades_bdj_sandbox_enter() != 0) {
++        fprintf(stderr, "hades-bdj-host: could not isolate itself: BD-J does not run\n");
++        return 3;
++    }
++
++    /* without a writable persistent storage, the disc gets none */
++    if (cfg.persistent_root && (stat(cfg.persistent_root, &st) != 0 || !S_ISDIR(st.st_mode) ||
++                                access(cfg.persistent_root, W_OK) != 0)) {
++        cfg.persistent_root = NULL;
++    }
++
++    rc = bd_bdj_host_run(fd, &cfg);
++
++    /* the JVM's threads are not waited for: the process ends with the disc */
++    _exit(rc);
++}
+diff --git a/src/tools/meson.build b/src/tools/meson.build
+index 880b131..3281abf 100644
+--- a/src/tools/meson.build
++++ b/src/tools/meson.build
+@@ -19,3 +19,21 @@ if get_option('enable_tools')
+         install: true)
+ 
+ endif
++
++# LibreELEC Hades: the isolated BD-J host
++if get_option('hades_bdj_host').enabled()
++    if host_machine.system() != 'linux'
++        error('hades_bdj_host needs Linux')
++    endif
++    hades_bdj_host_args = ['-DHADES_BDJ_SANDBOX_STANDALONE']
++    if get_option('hades_bdj_test')
++        hades_bdj_host_args += '-DHADES_BDJ_TEST=1'
++    endif
++    executable('hades-bdj-host', 'hades_bdj_host.c', 'hades_bdj_sandbox.c',
++        '../libbluray/bdj/bdj_sandbox.c',
++        dependencies: [libbluray_dep, dependency('libseccomp'), thread_dependency],
++        include_directories: libbluray_inc_dirs,
++        c_args: hades_bdj_host_args,
++        install: true,
++        install_dir: get_option('libdir') / 'hades-bdj')
++endif
+-- 
+2.53.0
+

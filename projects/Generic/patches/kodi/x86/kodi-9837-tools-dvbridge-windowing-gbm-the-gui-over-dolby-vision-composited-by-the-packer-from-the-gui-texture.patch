@@ -1,0 +1,679 @@
+From 09f8a4f9edab34db744113ae81d77727639ca83f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 22:15:30 +0000
+Subject: [PATCH] tools/dvbridge, windowing/gbm: the GUI over Dolby Vision
+ composited by the packer, from the GUI texture
+
+On an Intel HD Graphics 610 (a user's diagnostic, profile 7 FEL at
+fidelity step-down level 3, frames presented a frame ahead), the frames
+drawn directly took 34 ms of GPU time of the 41.7 ms of a refresh; with
+the player information open every frame was composed, and took 103 ms:
+95 frames shown in 10 s, the sound stalled.
+
+The composed way of the source transport made the picture that Kodi
+draws over in a 3840x2160 RGBA32F texture (pass 3), CompositeGui()
+blended the GUI into it (its fragments over the whole raster, a read and
+a write of 32 bytes where the GUI covers), and pass 4 read it back: 64
+bytes a pixel under the GUI, which the background of the player
+information spreads over three quarters of the raster.
+
+Now, for a frame presented a frame ahead (the GPUs that need it), in
+YCbCr (affine decoding: profiles 7 and 8; profile 5 and the IPT tunnel
+convert what is drawn over in pass 8, from pass 3), with Kodi's composite
+into PQ in full range, pass 4 composites the GUI itself at each pixel
+(PACK_GUI): the GUI texture sampled where the composite samples it, with
+its own bilinear filter, the arithmetic of gles_gui_composite.frag where
+fragment shaders have highp (the sRGB EOTF, BT.709 to BT.2020 in linear
+light, the PQ signal of the GUI white, the coverage squared) and Kodi's
+blend factors, and nothing is written into the RGBA32F picture. The tiles
+that the GUI may reach (passes 6 and 7) are kept: elsewhere pass 4 takes
+the codes of the transport as before. A frame that something else is
+drawn into (PQ subtitles, a capture) makes the picture whole and gives
+the composite back to Kodi (dvbridge_source_complete()). Such a frame
+takes no part of the GUI cache, and its level 5 block takes every edge
+with bars, as every frame presented a frame ahead already does.
+
+Wherever the GUI covers nothing (its sample's alpha is 0, which the
+composite discards) the pixel is the transport's, the same bytes by
+construction. Under the GUI the same expressions as the composite and
+the blend unit; measured with Mesa's zink over lavapipe against Kodi's
+own composite shader, its quad, projection and blend factors: the same
+transport bytes in every pixel, three pictures of a profile 7 FEL stream
+at step-down levels 0 and 3, a GUI of 1920x1080 and of 3840x2160 that
+covers 55 % of the raster; the IPT tunnel does not take it (the same
+bytes as before); three mutations of the program are caught. A GPU's
+blend unit may round apart from a shader by a code here and there under
+a translucent GUI: not verified on a GPU.
+
+advancedsettings.xml: <video><dvguiinplace>false</dvguiinplace></video>
+composites the GUI as before. kodi.log says it once
+("DVBridge: the GUI over the picture is composited by the packer of the
+transport ..."), and the line of every 10 s counts the frames
+("N frames with GUI elements composited by the packer, from the GUI
+texture").
+
+The idea of reading Kodi's menus in place, without a picture to
+composite them into, comes from YBLOD (dangerouslaser), whose engine
+does so in Vulkan; this is written for the passes of this bridge.
+---
+ tools/dvbridge/dvbridge_render.c              |  31 ++-
+ tools/dvbridge/dvbridge_render.h              |  12 ++
+ tools/dvbridge/dvbridge_source.c              | 195 ++++++++++++++++++
+ tools/dvbridge/dvbridge_source.h              |  14 ++
+ .../VideoRenderers/DVBridgeGLES.cpp           |   9 +-
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |  12 +-
+ xbmc/rendering/gles/GuiCompositeShaderGLES.h  |   5 +
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   5 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  42 +++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   6 +
+ 11 files changed, 328 insertions(+), 5 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index b134e69..eef2333 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -136,6 +136,9 @@ struct dvbridge_renderer {
+     unsigned drawn_gui;
+     int drawn_w, drawn_h;
+     uint64_t drawn_key;
++    /* Hades: the GUI white for the GUI read in place by the packer, for the next frame
++     * (dvbridge_render_set_gui_in_place()); 0: not asked */
++    float inplace_peak;
+     /* Hades: Dolby Vision Low-Latency (dvbridge_render_set_low_latency()): the picture mapped to
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+@@ -1092,8 +1095,13 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         /* Hades: in the tiles that what will be drawn over it may reach, where the caller said what
+          * that is (dvbridge_render_set_drawn()) */
+         dvbridge_source_drawn(r->source_packer, r->drawn_gui, r->drawn_w, r->drawn_h);
++        /* Hades: the GUI read in place by the packer where it is asked (then without the GUI
++         * cache, which reads the picture with the GUI composited over it) */
++        const float inplace = r->drawn_gui ? r->inplace_peak : 0.0f;
++        dvbridge_source_gui_in_place(r->source_packer, inplace);
+         /* (Hades: and the key of its composite, for the GUI cache) */
+-        dvbridge_source_drawn_key(r->source_packer, r->drawn_gui ? r->drawn_key : 0);
++        dvbridge_source_drawn_key(r->source_packer,
++                                  r->drawn_gui && inplace <= 0.0f ? r->drawn_key : 0);
+         if (fbo)
+             timer_begin(r, TIMER_PICTURE);
+         ok = fbo && dvbridge_source_picture(r->source_packer, transport_params(r), r->pack_luma,
+@@ -1356,8 +1364,10 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     }
+     restore_gl_state(&state);
+     /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
+-    if (r)
++    if (r) {
+         r->drawn_gui = 0;
++        r->inplace_peak = 0.0f;
++    }
+     return ok;
+ }
+ 
+@@ -1370,6 +1380,7 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+         /* (Hades: nothing is drawn over a frame drawn directly; a frame that is composed after
+          * this one was refused is told again) */
+         r->drawn_gui = 0;
++        r->inplace_peak = 0.0f;
+     }
+     /* (Hades: the converted transport's direct way also needs quad operations and a picture that
+      * fills the raster, which render() checks: the source transport packs a picture drawn at its own
+@@ -2439,6 +2450,22 @@ void dvbridge_render_set_drawn(struct dvbridge_renderer *r, unsigned gui, int wi
+     r->drawn_h = height;
+ }
+ 
++void dvbridge_render_set_gui_in_place(struct dvbridge_renderer *r, float peak)
++{
++    if (r)
++        r->inplace_peak = peak;
++}
++
++bool dvbridge_render_gui_in_place(const struct dvbridge_renderer *r)
++{
++    return r && r->ready && r->source && dvbridge_source_gui_in_placed(r->source_packer);
++}
++
++bool dvbridge_render_can_gui_in_place(const struct dvbridge_renderer *r)
++{
++    return r && dvbridge_source_can_gui_in_place(r->source_packer);
++}
++
+ void dvbridge_render_use_gui_cache(struct dvbridge_renderer *r, bool use)
+ {
+     if (r)
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 3e694c1..809dc7d 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -462,6 +462,18 @@ void dvbridge_render_set_window(struct dvbridge_renderer *renderer, pl_tex windo
+ #define DVBRIDGE_RENDER_DRAWN 1
+ void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui, int width,
+                                int height);
++/* Hades: Kodi's GUI read in place by the packer of the source transport (dvbridge_source_gui_in_place()),
++ * for the next frame that is composed with a GUI of dvbridge_render_set_drawn(), as that call: peak, the
++ * GUI white of Kodi's composite in units of 10000 cd/m2 (0: not asked). It takes that frame out of the
++ * GUI cache. dvbridge_render_gui_in_place(): the prepared frame takes it, and the caller does not
++ * composite its GUI over the picture of dvbridge_render_texture() (dvbridge_render_complete() draws the
++ * picture whole and gives the composite back: false after that); its level 5 block is then made with
++ * every edge that has bars (DVBRIDGE_COVER_MEASURE cannot measure it). can: the packer has the program,
++ * and no frame packed so failed. */
++#define DVBRIDGE_RENDER_GUI_IN_PLACE 1
++void dvbridge_render_set_gui_in_place(struct dvbridge_renderer *renderer, float peak);
++bool dvbridge_render_gui_in_place(const struct dvbridge_renderer *renderer);
++bool dvbridge_render_can_gui_in_place(const struct dvbridge_renderer *renderer);
+ /* Hades: the GUI cache of the source transport (dvbridge_source_gui_cache(): the bytes of the
+  * tiles where the GUI is opaque and did not change are copied from the frame before that packed
+  * them, not converted again; the same bytes). Off until asked for; it takes the frames whose
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 937b4f8..4097950 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -698,6 +698,81 @@ static const char PACK[] =
+     "    }\n"
+     PACK_END;
+ 
++/* Hades: 4 with Kodi's GUI read in place (dvbridge_source_gui_in_place()). What CompositeGui()
++ * would composite over the picture of pass 3 is composited here, at each pixel, with the arithmetic
++ * of Kodi's composite where fragment shaders have highp (gles_gui_composite.frag, KODI_GUI_EXACT: the
++ * sRGB EOTF of IEC 61966-2-1, BT.709 to BT.2020 in linear light, the PQ signal of the GUI white, the
++ * coverage squared) and then the blend of its factors (colour a + picture (1 - a); alpha a + 2 (1 -
++ * a)), from the GUI texture sampled where the composite samples it: the pixel centre of the raster,
++ * its last row on the first row of the raster, with the texture's own (bilinear, clamped) filter.
++ * Nothing is written into a picture of 32-bit floats: pass 3 (16 bytes a pixel), the composite's
++ * read and write of it (32) and pass 4's read (16) are not made where the GUI reaches, nor the
++ * composite's fragments over the rest of the raster. Where the sample's alpha is 0, which the
++ * composite discards, the pixel is the transport's, as in PACK: the same bytes wherever the GUI
++ * covers nothing. Under the GUI the same expressions; a GPU may round its blend unit apart from
++ * them by a code here and there. Affine decoding only (profiles 7 and 8 in YCbCr): profile 5 and the
++ * IPT tunnel convert what is drawn over in pass 8, from the picture of pass 3. */
++#define GUI_COMPOSITE                                                                             \
++    "uniform highp sampler2D gui;\n"                                                              \
++    "uniform float gui_peak;\n" /* the GUI white in units of 10000 cd/m2 (Kodi's u_pqPeak) */      \
++    "const mat3 bt709_to_bt2020 = mat3(0.627403896, 0.069097289, 0.016391439,\n"                  \
++    "                                  0.329283038, 0.919540395, 0.088013308,\n"                  \
++    "                                  0.043313066, 0.011362316, 0.895595253);\n"                 \
++    "vec3 srgb_to_linear(vec3 c)\n"                                                               \
++    "{\n"                                                                                         \
++    "    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"   \
++    "}\n"                                                                                         \
++    "vec3 gui_pq(vec3 l)\n"                                                                       \
++    "{\n"                                                                                         \
++    "    vec3 t = pow(max(l, vec3(0.0)), vec3(m1));\n"                                            \
++    "    return pow((c1 + c2 * t) / (1.0 + c3 * t), vec3(m2));\n"                                 \
++    "}\n"                                                                                         \
++    /* the pixel as the composite leaves it in the picture of pass 3 (alpha 2: nothing drawn) */  \
++    "vec4 composited(ivec2 p)\n"                                                                  \
++    "{\n"                                                                                         \
++    "    vec4 g = texture(gui, vec2((float(p.x) + 0.5) / 3840.0, 1.0 - (float(p.y) + 0.5) / 2160.0));\n" \
++    "    if (g.a == 0.0)\n"                                                                       \
++    "        return vec4(0.0, 0.0, 0.0, 2.0);\n"                                                  \
++    "    vec3 colour = gui_pq((bt709_to_bt2020 * srgb_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);\n" \
++    "    float a = g.a * g.a;\n"                                                                  \
++    "    return vec4(colour * a + picture_at(p) * (1.0 - a), a + 2.0 * (1.0 - a));\n"             \
++    "}\n"
++
++static const char PACK_GUI[] =
++    "#version 300 es\n"
++    COMMON
++    GUI_COMPOSITE
++    "uniform int has_layer, code_max;\n"
++    "uniform mat3 ycc_inverse, lms_inverse;\n"
++    "uniform uvec4 metadata_words[128];\n"
++    "uniform uint packet_count;\n"
++    "uniform uint flip_y;\n"
++    "flat in int tile_drawn;\n" /* (TILED_VERTEX) the GUI may reach this tile */
++    "out vec4 color;\n"
++    PACK_PARITY
++    DRAWN_OVER_CODE
++    "void main()\n"
++    "{\n"
++    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "    if (flip_y != 0u) p.y = 2159 - p.y;\n"
++    "    int ex = p.x & ~1;\n"
++    "    bool odd = (p.x & 1) != 0;\n"
++    "    vec4 own = vec4(0.0, 0.0, 0.0, 2.0), even = own;\n"
++    "    if (has_layer != 0 && tile_drawn != 0) {\n"
++    "        own = composited(p);\n"
++    "        even = odd ? composited(ivec2(ex, p.y)) : own;\n"
++    "    }\n"
++    "    uint y = own.a != 2.0 ? code(drawn_over(p, own).x) : luma_code(p);\n"
++    "    uint c;\n"
++    "    if (even.a != 2.0) {\n"
++    "        vec3 e = drawn_over(ivec2(ex, p.y), even);\n"
++    "        c = code(odd ? e.z : e.y);\n"
++    "    } else {\n"
++    "        uvec2 cc = pair_chroma(ex, p.y);\n"
++    "        c = odd ? cc.y : cc.x;\n"
++    "    }\n"
++    PACK_END;
++
+ /* Hades: 4 for the frames whose pixels drawn over pass 8 converted (pairs_made; the other branch is
+  * that of PACK). A program of its own, so that PACK stays what it was for every other frame, and
+  * where this one or PAIRS cannot be made on a GPU, the packer is made without them, as before. */
+@@ -1492,6 +1567,19 @@ struct dvbridge_source_packer {
+     int rows_of[8];
+     struct common_uniforms pc, cc; /* of pass 4 and of pass 3 */
+     struct pack_uniforms u;
++    /* Hades: pass 4 with the GUI read in place (PACK_GUI, dvbridge_source_gui_in_place()): its program
++     * and uniforms (gc, g); the GUI white asked for the next picture (0: not asked); inplace: the last
++     * picture is to be packed so (pass 3 was not drawn, and nothing is to be composited over it), with
++     * the GUI texture, its size and white; inplace_failed: a pack so failed on this GPU (never again). */
++    GLuint pack_gui;
++    struct common_uniforms gc;
++    struct {
++        GLint has_layer, code_max, ycc_inverse, lms_inverse, words, count, flip, gui, peak, tiles,
++            mode, tflip;
++    } g;
++    float inplace_asked, inplace_peak;
++    bool inplace, inplace_failed;
++    unsigned inplace_gui;
+     /* Hades: pass 8, its uniforms, the codes that it writes, and the form of pass 4 that takes them
+      * (pack_pairs: its uniforms w, wc and those of w_more). Both programs or neither: where one of
+      * them cannot be made, pass 4 is PACK alone and converts the pixels drawn over itself, as it did
+@@ -1874,6 +1962,23 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void)
+         }
+         p->cache_usable = made && p->drawn_usable;
+     }
++    /* Hades: pass 4 with the GUI read in place; without it the GUI is composited over the picture
++     * of pass 3, as before */
++    {
++        static const char *const pack_gui[] = {"has_layer", "code_max", "ycc_inverse",
++            "lms_inverse", "metadata_words", "packet_count", "flip_y", "gui", "gui_peak",
++            "drawn_tiles", "tiles_mode", "tiles_flip"};
++        _Static_assert(sizeof(p->g) == COUNT(pack_gui) * sizeof(GLint), "pack_gui uniforms");
++        p->pack_gui = link_with(TILED_VERTEX, PACK_GUI);
++        if (p->pack_gui && (!locate(p->pack_gui, &p->gc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
++                            !locate(p->pack_gui, &p->g.has_layer, pack_gui, COUNT(pack_gui)))) {
++            glDeleteProgram(p->pack_gui);
++            p->pack_gui = 0;
++        }
++        if (!p->pack_gui)
++            fprintf(stderr, "DV source transport: the packing that reads the GUI in place could not "
++                            "be made; the GUI is composited over the picture, as before\n");
++    }
+     /* Hades: pass 9; without it the pictures go out as composed */
+     {
+         static const char *const ipt[] = {"luma_plane", "chroma_rows", "code_scale", "ycc_src",
+@@ -1928,6 +2033,7 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+     glDeleteProgram(p->pack);
++    glDeleteProgram(p->pack_gui);
+     glDeleteProgram(p->picture);
+     glDeleteProgram(p->resite);
+     glDeleteProgram(p->rows);
+@@ -2468,10 +2574,28 @@ void dvbridge_source_drawn(struct dvbridge_source_packer *p, unsigned gui, int w
+     p->gui_h = known ? height : 0;
+ }
+ 
++void dvbridge_source_gui_in_place(struct dvbridge_source_packer *p, float peak)
++{
++    if (p)
++        p->inplace_asked = isfinite(peak) && peak > 0.0f && peak <= 1.0f ? peak : 0.0f;
++}
++
++bool dvbridge_source_can_gui_in_place(const struct dvbridge_source_packer *p)
++{
++    return p && p->pack_gui && !p->inplace_failed;
++}
++
++bool dvbridge_source_gui_in_placed(const struct dvbridge_source_packer *p)
++{
++    return p && p->inplace;
++}
++
+ void dvbridge_source_forget(struct dvbridge_source_packer *p)
+ {
+     if (!p)
+         return;
++    p->inplace = false;
++    p->inplace_asked = 0.0f;
+     p->gui = 0;
+     p->tiles_mode = 0;
+     p->picture_level = 0;
+@@ -2785,10 +2909,14 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+                              int height, int x, int y, const unsigned margins[4],
+                              unsigned framebuffer)
+ {
++    /* Hades: (the GUI read in place is asked for this picture only) */
++    const float inplace = p ? p->inplace_asked : 0.0f;
+     if (p) {
+         p->tiles_mode = 0;
+         p->picture_level = 0;
+         p->cache_frame = false;
++        p->inplace = false;
++        p->inplace_asked = 0.0f;
+     }
+     if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
+         !rows_of(p, width, height, x, y, margins)) {
+@@ -2805,10 +2933,24 @@ bool dvbridge_source_picture(struct dvbridge_source_packer *p,
+      * the picture's). Hades: with the GUI cache, not in the tiles copied from it (unless check). */
+     bool cached = false;
+     const int how = make_tiles(p, params, &cached) ? 1 : 0;
++    const unsigned gui = p->gui;
+     p->gui = 0;
+     p->drawn_key = 0;
+     if (!how)
+         dvbridge_gl_drain_errors();
++    /* Hades: Kodi's GUI read in place by pass 4 (PACK_GUI): pass 3 is not drawn, and the caller does
++     * not composite the GUI (dvbridge_source_gui_in_placed()); in the tiles that it may reach, or
++     * over the whole raster where they could not be made. Not with the GUI cache, which reads the
++     * picture of pass 3 with the GUI composited over it. */
++    if (inplace > 0.0f && gui && params->affine && !cached && p->pack_gui && !p->inplace_failed) {
++        if (!end(&state, true))
++            return false;
++        p->inplace = true;
++        p->inplace_gui = gui;
++        p->inplace_peak = inplace;
++        p->tiles_mode = how;
++        return true;
++    }
+     int level = 0;
+     const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer,
+                                     how && cached && !p->cache_check ? 4 : how, p->gui_level,
+@@ -2839,6 +2981,24 @@ bool dvbridge_source_complete(struct dvbridge_source_packer *p,
+                               int height, int x, int y, const unsigned margins[4],
+                               unsigned framebuffer)
+ {
++    /* Hades: a picture whose GUI was to be read in place has no pass 3 at all: drawn whole now,
++     * and the GUI is composited over it by the caller, as before (dvbridge_source_gui_in_placed()) */
++    if (p && p->inplace) {
++        p->inplace = false;
++        p->tiles_mode = 0;
++        p->picture_level = 0;
++        p->cache_frame = false;
++        if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
++            !rows_of(p, width, height, x, y, margins))
++            return false;
++        struct dvbridge_gl_state whole;
++        begin(p, &whole);
++        int level = 0;
++        const bool drawn = draw_picture(p, params, luma, width, height, x, y, margins, framebuffer,
++                                        0, p->gui_level, &level);
++        p->picture_level = drawn ? level : 0;
++        return end(&whole, drawn);
++    }
+     if (!p || !p->tiles_mode)
+         return true;
+     if (!picture_fits(p, params, width, height, x, y, margins) || !luma || !framebuffer ||
+@@ -2953,6 +3113,38 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+     }
+     p->pairs_missed = layer && !params->affine && !pairs;
++    /* Hades: the GUI read in place: composited here from its texture (PACK_GUI), in the tiles that it
++     * may reach (or over the whole raster where they were not made) */
++    if (p->inplace && layer && params->affine) {
++        p->inplace = false;
++        glViewport(0, 0, 3840, 2160);
++        glUseProgram(p->pack_gui);
++        set_common(p, &p->gc, params, luma, width, height, x, y, margins);
++        /* (the texture's own filter, as Kodi's composite samples it: no sampler object) */
++        glActiveTexture(GL_TEXTURE2);
++        glBindTexture(GL_TEXTURE_2D, p->inplace_gui);
++        glBindSampler(2, 0);
++        glUniform1i(p->g.gui, 2);
++        glUniform1f(p->g.peak, p->inplace_peak);
++        glUniform1i(p->g.has_layer, 1);
++        const int how = p->tiles_mode ? 3 : 0;
++        set_tiles(p, p->g.tiles, p->g.mode, how);
++        glUniform1i(p->g.tflip, flip_y);
++        set_inverse(p->g.ycc_inverse, p->g.lms_inverse, p->g.code_max, params);
++        glUniform4uiv(p->g.words, 128, packets);
++        glUniform1ui(p->g.count, count);
++        glUniform1ui(p->g.flip, flip_y);
++        glDrawArrays(GL_TRIANGLES, 0, tiled_vertices(how));
++        const bool ok = glGetError() == GL_NO_ERROR;
++        if (!ok) {
++            dvbridge_gl_drain_errors();
++            p->inplace_failed = true;
++            fprintf(stderr, "DV source transport: the packing that reads the GUI in place failed; the "
++                            "GUI is composited over the picture from the next frame on\n");
++        }
++        return end(&state, ok);
++    }
++    p->inplace = false;
+     /* Hades: PACK_PAIRS with the codes of pass 8; PACK, as it was, for every other frame */
+     const struct pack_uniforms *u = pairs ? &p->w : &p->u;
+     glViewport(0, 0, 3840, 2160);
+@@ -3151,6 +3343,9 @@ void dvbridge_source_gui_targets(const struct dvbridge_source_packer *p, unsigne
+ bool dvbridge_source_cover(struct dvbridge_source_packer *p, unsigned layer,
+                            const unsigned margins[4], unsigned *edges)
+ {
++    /* Hades: (the GUI read in place: there is no picture with the GUI composited over it to read) */
++    if (p && p->inplace)
++        return false;
+     if (!p || !layer || !margins || !edges || margins[0] + margins[1] >= 3840 ||
+         margins[2] + margins[3] >= 2160)
+         return false;
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 7ed12e7..4134633 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -198,6 +198,20 @@ bool dvbridge_source_complete(struct dvbridge_source_packer *packer,
+                               const struct dvbridge_source_params *params, unsigned luma, int width,
+                               int height, int x, int y, const unsigned margins[4],
+                               unsigned framebuffer);
++/* Hades: Kodi's GUI read in place by the packer (PACK_GUI, dvbridge_source.c). For the next
++ * dvbridge_source_picture() that takes a GUI of dvbridge_source_drawn(), of a picture whose decoding is
++ * affine (profiles 7 and 8 in YCbCr), without the GUI cache: peak, the GUI white of Kodi's composite in
++ * units of 10000 cd/m2 (its u_pqPeak; 0: not asked). Pass 3 is then not drawn and the caller does not
++ * composite the GUI over the picture (dvbridge_source_gui_in_placed()): dvbridge_source_pack(), given a
++ * layer, composites it at each pixel from the GUI texture, with the arithmetic of Kodi's composite where
++ * fragment shaders have highp, into PQ, not in limited range, with Kodi's blend factors.
++ * dvbridge_source_complete() draws the picture whole and gives the composite back to the caller;
++ * dvbridge_source_cover() cannot measure such a picture (false). The same bytes wherever the GUI covers
++ * no pixel (the alpha of its sample is 0); under it, the same expressions as the composite and the
++ * blend unit. can: the program was made, and no pack so failed. */
++void dvbridge_source_gui_in_place(struct dvbridge_source_packer *packer, float peak);
++bool dvbridge_source_can_gui_in_place(const struct dvbridge_source_packer *packer);
++bool dvbridge_source_gui_in_placed(const struct dvbridge_source_packer *packer);
+ /* Hades: no picture of dvbridge_source_picture() is taken from now on (another render) */
+ void dvbridge_source_forget(struct dvbridge_source_packer *packer);
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 3aa5421..48ebd37 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -988,10 +988,17 @@ void CDVBridgeGLES::PQTextureDrawn()
+     dvbridge_render_texture_drawn(m_renderer);
+ }
+ 
+-void CDVBridgeGLES::SetDrawnOver(unsigned int guiTexture, int width, int height, uint64_t composite)
++void CDVBridgeGLES::SetDrawnOver(
++    unsigned int guiTexture, int width, int height, uint64_t composite, float inPlacePeak)
+ {
+   dvbridge_render_set_drawn_key(m_renderer, guiTexture ? composite : 0);
+   dvbridge_render_set_drawn(m_renderer, guiTexture, width, height);
++  dvbridge_render_set_gui_in_place(m_renderer, guiTexture ? inPlacePeak : 0.0f);
++}
++
++bool CDVBridgeGLES::GuiInPlace() const
++{
++  return m_prepared && !m_direct && dvbridge_render_gui_in_place(m_renderer);
+ }
+ 
+ bool CDVBridgeGLES::CompletePicture()
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index c159970..b2a1378 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -270,7 +270,17 @@ public:
+   //! texture's texels: its program and tables); a GUI drawn with the same key whose texels did not
+   //! change keeps its packed bytes where it is opaque (the GUI cache: dvbridge_render_use_gui_cache()).
+   //! 0: not known.
+-  void SetDrawnOver(unsigned int guiTexture, int width, int height, uint64_t composite = 0);
++  //! Hades: inPlacePeak, the GUI white of that composite in units of 10000 cd/m2 where the packer is to
++  //! composite the GUI itself from the texture, with the arithmetic of Kodi's composite into PQ
++  //! (dvbridge_render_set_gui_in_place()); 0: the caller composites it (CompositeGui()), as before.
++  void SetDrawnOver(unsigned int guiTexture,
++                    int width,
++                    int height,
++                    uint64_t composite = 0,
++                    float inPlacePeak = 0.0f);
++  //! Hades: the packer composites the GUI over the prepared frame itself (SetDrawnOver()): nothing is
++  //! to be drawn into the PQ picture for it. False once the picture is made whole (CompletePicture()).
++  bool GuiInPlace() const;
+   //! Hades: the picture of the prepared frame whole, for what else is drawn into it (PQ subtitles,
+   //! a capture that reads it); false where that could not be done
+   bool CompletePicture();
+diff --git a/xbmc/rendering/gles/GuiCompositeShaderGLES.h b/xbmc/rendering/gles/GuiCompositeShaderGLES.h
+index 71b6d96..446792e 100644
+--- a/xbmc/rendering/gles/GuiCompositeShaderGLES.h
++++ b/xbmc/rendering/gles/GuiCompositeShaderGLES.h
+@@ -26,6 +26,11 @@ public:
+   //! failure the previous ones stay.
+   bool CreateLUTs(int colorTransfer, int referenceWhite = 100);
+   int GetReferenceWhite() const { return m_referenceWhite; }
++  //! Hades: the GUI white of the exact conversion to PQ (u_pqPeak, units of 10000 cd/m2), and whether
++  //! the composite is to PQ (not HLG): for the packer of native Dolby Vision output, which composites
++  //! the GUI itself with the same arithmetic (dvbridge_render_set_gui_in_place())
++  float GetPQPeak() const { return m_pqPeak; }
++  bool IsPQ() const { return m_ootfGamma <= 0.0f; }
+ 
+   GLint GetPosLoc() { return m_hPos; }
+   GLint GetTexLoc() { return m_hTex; }
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 372fe47..d55caa3 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -206,6 +206,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVDrawnTiles = true;
+   m_videoDVGuiCache = true;
+   m_videoDVGuiCacheCheck = false;
++  m_videoDVGuiInPlace = true;
+   m_videoDVLLPattern = false;
+   m_videoDVCCMComposer = true;
+   m_videoDVAheadAlways = false;
+@@ -722,6 +723,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvdrawntiles", m_videoDVDrawnTiles);
+     XMLUtils::GetBoolean(pElement, "dvguicache", m_videoDVGuiCache);
+     XMLUtils::GetBoolean(pElement, "dvguicachecheck", m_videoDVGuiCacheCheck);
++    XMLUtils::GetBoolean(pElement, "dvguiinplace", m_videoDVGuiInPlace);
+     XMLUtils::GetBoolean(pElement, "dvllpattern", m_videoDVLLPattern);
+     XMLUtils::GetBoolean(pElement, "dvccmcomposer", m_videoDVCCMComposer);
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index f1b07f9..1000e98 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -175,6 +175,11 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! measurement of what that saves; video/dvguicachecheck packs those again and compares them
+     bool m_videoDVGuiCache;
+     bool m_videoDVGuiCacheCheck;
++    //! Hades: the GUI over a picture of native Dolby Vision in YCbCr, in a frame presented a frame
++    //! ahead, composited by the packer of the transport from the GUI texture, without the 3840x2160
++    //! picture in 32-bit floats that it was composited into (video/dvguiinplace; the same bytes
++    //! wherever the GUI covers nothing). Off for a measurement of what that saves
++    bool m_videoDVGuiInPlace;
+     //! Hades: native Dolby Vision Low-Latency shows a test pattern in place of the picture
+     //! (video/dvllpattern), for a first look at a display (dvbridge_render_set_ll_pattern())
+     bool m_videoDVLLPattern;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 33362ed..ff061cb 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1198,12 +1198,16 @@ bool CWinSystemGbmGLESContext::SetGuiCompositing(int colorTransfer)
+     if (!m_compositeShader)
+     {
+       std::string defines;
++      m_compositeLimited = false;
+       if (UseLimitedColor()
+ #ifdef HAVE_DVBRIDGE
+           && !m_dvState.Captured()
+ #endif
+           )
++      {
+         defines += "#define KODI_LIMITED_RANGE 1\n";
++        m_compositeLimited = true;
++      }
+       m_compositeShader = std::make_unique<CGuiCompositeShaderGLES>(defines);
+       ++m_compositeRevision;
+       if (!m_compositeShader->CompileAndLink())
+@@ -1418,6 +1422,24 @@ void CWinSystemGbmGLESContext::CompositeGui()
+       DVBridgeFrameShown(false, m_dvFramePts);
+       return;
+     }
++    // Hades: the packer composites the GUI itself, from this texture (RenderDVBridge(),
++    // SetDrawnOver()): nothing is drawn into the picture, and the frame has something drawn over it
++    if (m_dvBridge->GuiInPlace())
++    {
++      m_dvDrawnOver = true;
++      m_dvStats.guiInPlace++;
++      if (!m_dvGuiInPlaceSaid)
++      {
++        m_dvGuiInPlaceSaid = true;
++        CLog::Log(LOGINFO,
++                  "DVBridge: the GUI over the picture is composited by the packer of the transport, "
++                  "from the GUI texture, with the arithmetic of the GUI composite: not into the "
++                  "3840x2160 picture in 32-bit floats that it was composited into and the packer "
++                  "read again (frames presented a frame ahead, in YCbCr; the same bytes wherever the "
++                  "GUI covers nothing; video/dvguiinplace)");
++      }
++      return;
++    }
+     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+     glGetIntegerv(GL_VIEWPORT, previousViewport);
+     // The GUI covers the whole picture, black bars included, whatever scissor rectangle is set.
+@@ -4086,9 +4108,22 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   const auto drawnSettings = CServiceBroker::GetSettingsComponent();
+   const bool drawnTiles =
+       !drawnSettings || drawnSettings->GetAdvancedSettings()->m_videoDVDrawnTiles;
++  // Hades: and the packer composites the GUI itself, from its texture, with the arithmetic of the
++  // composite, for a frame presented a frame ahead (whose level 5 block takes every edge with bars:
++  // nothing of the picture with the GUI over it is measured), where the composite converts into PQ
++  // in full range: then the picture of 3840x2160 32-bit floats that the GUI was composited into, the
++  // composite's read and write of it and the packer's read are not made (the same bytes wherever the
++  // GUI covers nothing). Weak GPUs are those that present a frame ahead. advancedsettings.xml:
++  // <video><dvguiinplace>false</dvguiinplace></video>
++  float guiInPlace = 0.0f;
++  if (!overlayFree && !captured && drawnTiles && m_guiFbo.IsValid() && m_compositeShader &&
++      m_compositeShader->IsPQ() && !m_compositeLimited &&
++      (!drawnSettings || drawnSettings->GetAdvancedSettings()->m_videoDVGuiInPlace) &&
++      DVAheadWanted() && m_modeAnnounce.Pending() != CHeldModeAnnouncement::Step::BEFORE_NEXT)
++    guiInPlace = m_compositeShader->GetPQPeak();
+   if (!overlayFree && !captured && drawnTiles && m_guiFbo.IsValid())
+     m_dvBridge->SetDrawnOver(m_guiFbo.Texture(), m_guiFboWidth, m_guiFboHeight,
+-                             m_compositeShader ? m_compositeRevision : 0);
++                             m_compositeShader ? m_compositeRevision : 0, guiInPlace);
+   else
+     m_dvBridge->SetDrawnOver(0, 0, 0);
+   DVGpuTimerMark(true);
+@@ -6789,6 +6824,11 @@ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+         "between flips and those against the player's clock (from asking for each to its first "
+         "frame: the longest {:.0f} ms)",
+         m_dvStats.seeks, m_dvStats.seekMaxMs);
++  // Hades: the frames whose GUI the packer composited itself (video/dvguiinplace)
++  if (m_dvStats.guiInPlace)
++    ioctls += StringUtils::Format("; {} frames with GUI elements composited by the packer, from "
++                                  "the GUI texture (video/dvguiinplace)",
++                                  m_dvStats.guiInPlace);
+   m_dvLag.Reset();
+   // Hades: the GPU time of each pass, where advancedsettings.xml asks for it (dvpasstimes)
+   std::vector<dvbridge_pass_time> passes;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 8c52f5a..96975cd 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -376,6 +376,11 @@ private:
+   //! Hades: a new value whenever the program or the tables of the GUI composite are made: the key
+   //! of the composite for the Dolby Vision bridge's GUI cache (CDVBridgeGLES::SetDrawnOver())
+   uint64_t m_compositeRevision{1};
++  //! Hades: the composite shader was made with KODI_LIMITED_RANGE (the packer of native Dolby Vision
++  //! output does not composite the GUI itself then)
++  bool m_compositeLimited{false};
++  //! Hades: the packer composited the GUI itself (said once in the log)
++  bool m_dvGuiInPlaceSaid{false};
+   //! The transfer function the composite LUTs were created for (SetGuiCompositing())
+   int m_compositeTransfer{0};
+   //! A GUI white setting whose LUTs could not be created: not tried again until the setting returns
+@@ -692,6 +697,7 @@ private:
+     unsigned int shown = 0;
+     unsigned int notShown = 0;
+     unsigned int withGui = 0;
++    unsigned int guiInPlace = 0; //!< Hades: ... of them with the GUI composited by the packer
+     unsigned int prepared = 0;
+     unsigned int flushes = 0;
+     unsigned int late = 0; //!< presentations that took more than 1.5 refresh periods
+-- 
+2.53.0
+

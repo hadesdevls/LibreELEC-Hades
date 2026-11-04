@@ -1,0 +1,357 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:50:01 +0000
+Subject: [PATCH 3/3] tools: BD-Live in the BD-J server: TCP over IPv4 only,
+ the filter of addresses checked
+
+With HADES_BDJ_NETWORK=internet (hades-bdj-net@.service), the server's seccomp filter allows
+sockets of AF_UNIX and TCP over IPv4 only: no IPv6, no UDP or other socket type, no protocol but
+TCP; and nothing listens or accepts.
+
+The addresses are limited by the unit (IPAddressDeny=, a BPF filter of the kernel on the
+instance's cgroup). systemd starts a unit without it, with a warning, where the kernel cannot do
+it, so before the filter takes UDP away the server sends a datagram to loopback and to a
+documentation address and ends unless the kernel refuses both (EPERM). Measured on the build host:
+a TCP connection to a refused address is not refused at once (its SYN is dropped and connect()
+waits), a datagram is; without the filter it goes. It also reads the subnets of this system's
+interfaces while netlink is there, for the Java check (HADES_BDJ_BDLIVE_LOCAL).
+---
+ src/tools/hades_bdj_sandbox.c     |  26 ++--
+ src/tools/hades_bdj_sandbox_net.c | 201 ++++++++++++++++++++++++++++++
+ src/tools/hades_bdj_sandbox_net.h |  40 ++++++
+ src/tools/meson.build             |   2 +-
+ 4 files changed, 256 insertions(+), 13 deletions(-)
+ create mode 100644 src/tools/hades_bdj_sandbox_net.c
+ create mode 100644 src/tools/hades_bdj_sandbox_net.h
+
+diff --git a/src/tools/hades_bdj_sandbox.c b/src/tools/hades_bdj_sandbox.c
+index 866a7b3..dca7ad7 100644
+--- a/src/tools/hades_bdj_sandbox.c
++++ b/src/tools/hades_bdj_sandbox.c
+@@ -37,6 +37,7 @@
+ 
+ #include "hades_bdj_sandbox.h"
+ 
++#include "hades_bdj_sandbox_net.h"
+ #include "libbluray/bdj/bdj_sandbox.h"
+ 
+ #include <errno.h>
+@@ -109,18 +110,8 @@ static int _socket_rules(scmp_filter_ctx ctx, const char *name, int internet)
+         return _rule(ctx, act, name, 1, &cmp);
+     }
+ 
+-    /* AF_UNSPEC (0), the families between AF_UNIX (1) and AF_INET6 (10) but AF_INET (2), and
+-       everything above AF_INET6 (netlink, packet, ...) */
+-    cmp = SCMP_A0(SCMP_CMP_EQ, AF_UNSPEC);
+-    if (_rule(ctx, act, name, 1, &cmp))
+-        return -1;
+-    for (unsigned long family = 3; family < AF_INET6; family++) {
+-        cmp = SCMP_A0(SCMP_CMP_EQ, family);
+-        if (_rule(ctx, act, name, 1, &cmp))
+-            return -1;
+-    }
+-    cmp = SCMP_A0(SCMP_CMP_GT, AF_INET6);
+-    return _rule(ctx, act, name, 1, &cmp);
++    /* BD-Live: AF_UNIX, and TCP over IPv4 (hades_bdj_sandbox_net.c) */
++    return hades_bdj_sandbox_net_socket_rules(ctx, name);
+ }
+ 
+ static int _filter(int internet)
+@@ -165,6 +156,8 @@ static int _filter(int internet)
+ 
+     if (_socket_rules(ctx, "socket", internet) || _socket_rules(ctx, "socketpair", internet))
+         goto out;
++    if (internet && hades_bdj_sandbox_net_rules(ctx))
++        goto out;
+ 
+     rc = seccomp_load(ctx);
+     if (rc < 0) {
+@@ -196,6 +189,10 @@ int hades_bdj_sandbox_enter(void)
+         return -1;
+     }
+ 
++    /* BD-Live: the networks of this system, read while netlink is still there */
++    if (internet && hades_bdj_sandbox_net_prepare() != 0)
++        return -1;
++
+     if (_filter(internet) != 0)
+         return -1;
+ 
+@@ -206,6 +203,11 @@ int hades_bdj_sandbox_enter(void)
+         return -1;
+     }
+ 
++    if (internet && hades_bdj_sandbox_net_check(why, sizeof(why)) != 0) {
++        fprintf(stderr, "hades-bdj: BD-Live: %s\n", why);
++        return -1;
++    }
++
+     if (!bdj_sandbox_check(why, sizeof(why))) {
+         fprintf(stderr, "hades-bdj: not isolated: %s\n", why);
+         return -1;
+diff --git a/src/tools/hades_bdj_sandbox_net.c b/src/tools/hades_bdj_sandbox_net.c
+new file mode 100644
+index 0000000..dc786e4
+--- /dev/null
++++ b/src/tools/hades_bdj_sandbox_net.c
+@@ -0,0 +1,201 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * BD-Live in the BD-J server: the second and third walls below the check of libbluray's Java
++ * (NetAddress, BDJSocketImpl).
++ *
++ * - The service (hades-bdj-net@.service) reaches only addresses of the Internet: IPAddressDeny=,
++ *   a BPF program of the kernel on the cgroup of the instance. systemd starts the unit without
++ *   it, with only a warning, where the kernel cannot do it: so the server checks that a
++ *   datagram to loopback and to a documentation address is refused by the kernel (EPERM)
++ *   before it opens the disc, and ends otherwise.
++ * - This filter: sockets of AF_UNIX (the connection to the player) and TCP over IPv4 only; no
++ *   UDP (no name server, no other datagram), no IPv6, no raw sockets, no other protocol; nothing
++ *   listens or accepts.
++ */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
++#include "hades_bdj_sandbox_net.h"
++
++#include "libbluray/bdj/bdlive_net.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++static int _refused_by_system(const char *addr, char *why, unsigned len);
++
++int hades_bdj_sandbox_net_prepare(void)
++{
++    BDLIVE_LOCAL local;
++    char buf[1024];
++
++    /* the system's filter on the addresses: loopback, where the player listens, and an address
++       that would go out by the default route */
++    if (!_refused_by_system("127.0.0.1", buf, sizeof(buf)) || !_refused_by_system("192.0.2.1", buf, sizeof(buf))) {
++        fprintf(stderr, "hades-bdj: BD-Live: %s\n", buf);
++        return -1;
++    }
++
++    if (bdlive_local_read(&local) != 0 || local.count == 0) {
++        fprintf(stderr, "hades-bdj: BD-Live: the networks of this system can not be read\n");
++        return -1;
++    }
++    bdlive_local_format(&local, buf, sizeof(buf));
++    if (!buf[0] || setenv("HADES_BDJ_BDLIVE_LOCAL", buf, 1) != 0) {
++        return -1;
++    }
++    fprintf(stderr, "hades-bdj: BD-Live: never to this system or its networks: %s\n", buf);
++    return 0;
++}
++
++static int _add(scmp_filter_ctx ctx, uint32_t action, int nr, unsigned count, const struct scmp_arg_cmp *cmp)
++{
++    int rc;
++
++    if (nr == __NR_SCMP_ERROR) {
++        return 0;
++    }
++    rc = seccomp_rule_add_array(ctx, action, nr, count, cmp);
++    if (rc < 0) {
++        fprintf(stderr, "hades-bdj: seccomp rule failed: %s\n", strerror(-rc));
++        return -1;
++    }
++    return 0;
++}
++
++int hades_bdj_sandbox_net_socket_rules(scmp_filter_ctx ctx, const char *name)
++{
++    const int nr = seccomp_syscall_resolve_name(name);
++    struct scmp_arg_cmp cmp[2];
++    int type, proto;
++
++    /* families: AF_UNIX and AF_INET; every other one, AF_INET6 included */
++    cmp[0] = SCMP_A0(SCMP_CMP_EQ, AF_UNSPEC);
++    if (_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), nr, 1, cmp))
++        return -1;
++    cmp[0] = SCMP_A0(SCMP_CMP_GT, AF_INET);
++    if (_add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), nr, 1, cmp))
++        return -1;
++
++    if (!strcmp(name, "socketpair")) {
++        cmp[0] = SCMP_A0(SCMP_CMP_EQ, AF_INET);
++        return _add(ctx, SCMP_ACT_ERRNO(EAFNOSUPPORT), nr, 1, cmp);
++    }
++
++    /* AF_INET: SOCK_STREAM only (the low four bits are the type; the others SOCK_CLOEXEC and
++       SOCK_NONBLOCK) */
++    for (type = 0; type < 16; type++) {
++        if (type == SOCK_STREAM)
++            continue;
++        cmp[0] = SCMP_A0(SCMP_CMP_EQ, AF_INET);
++        cmp[1] = SCMP_A1(SCMP_CMP_MASKED_EQ, 0xf, (unsigned)type);
++        if (_add(ctx, SCMP_ACT_ERRNO(EPROTONOSUPPORT), nr, 2, cmp))
++            return -1;
++    }
++    /* and TCP: protocol 0 or IPPROTO_TCP (6), not SCTP, MPTCP or another */
++    for (proto = 1; proto < IPPROTO_TCP; proto++) {
++        cmp[0] = SCMP_A0(SCMP_CMP_EQ, AF_INET);
++        cmp[1] = SCMP_A2(SCMP_CMP_EQ, (unsigned)proto);
++        if (_add(ctx, SCMP_ACT_ERRNO(EPROTONOSUPPORT), nr, 2, cmp))
++            return -1;
++    }
++    cmp[0] = SCMP_A0(SCMP_CMP_EQ, AF_INET);
++    cmp[1] = SCMP_A2(SCMP_CMP_GT, IPPROTO_TCP);
++    return _add(ctx, SCMP_ACT_ERRNO(EPROTONOSUPPORT), nr, 2, cmp);
++}
++
++int hades_bdj_sandbox_net_rules(scmp_filter_ctx ctx)
++{
++    static const char *const refused[] = { "listen", "accept", "accept4" };
++    size_t i;
++
++    for (i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
++        if (_add(ctx, SCMP_ACT_ERRNO(EPERM), seccomp_syscall_resolve_name(refused[i]), 0, NULL))
++            return -1;
++    }
++    return 0;
++}
++
++/*
++ * The kernel's filter of the service's addresses (IPAddressDeny=) is in force: a datagram to addr
++ * is refused at once (EPERM). Measured: a TCP connection to a refused address is not refused at
++ * once, its SYN is dropped and connect() waits; a datagram is, and without the filter it goes. So
++ * the proof is a datagram, sent before the seccomp filter takes UDP away. 1, else 0 and why.
++ */
++static int _refused_by_system(const char *addr, char *why, unsigned len)
++{
++    struct sockaddr_in sa;
++    int fd, rc, err;
++
++    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (fd < 0) {
++        snprintf(why, len, "no socket to check the filter of addresses: %s", strerror(errno));
++        return 0;
++    }
++    memset(&sa, 0, sizeof(sa));
++    sa.sin_family = AF_INET;
++    sa.sin_port   = htons(9);   /* discard */
++    inet_pton(AF_INET, addr, &sa.sin_addr);
++    rc  = (int)sendto(fd, "", 0, 0, (struct sockaddr *)&sa, sizeof(sa));
++    err = errno;
++    close(fd);
++    if (rc >= 0 || err != EPERM) {
++        snprintf(why, len, "a datagram to %s was not refused by the system (%s): the addresses of the "
++                 "service are not limited (IPAddressDeny=)", addr, rc >= 0 ? "sent" : strerror(err));
++        return 0;
++    }
++    return 1;
++}
++
++int hades_bdj_sandbox_net_check(char *why, unsigned len)
++{
++    int fd;
++
++    /* our filter on the sockets */
++    fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
++    if (fd >= 0 || errno != EPROTONOSUPPORT) {
++        if (fd >= 0)
++            close(fd);
++        snprintf(why, len, "a UDP socket was not refused");
++        return -1;
++    }
++    fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (fd >= 0 || errno != EAFNOSUPPORT) {
++        if (fd >= 0)
++            close(fd);
++        snprintf(why, len, "an IPv6 socket was not refused");
++        return -1;
++    }
++    if (listen(0, 1) == 0 || errno != EPERM) {
++        snprintf(why, len, "listen() was not refused");
++        return -1;
++    }
++    return 0;
++}
+diff --git a/src/tools/hades_bdj_sandbox_net.h b/src/tools/hades_bdj_sandbox_net.h
+new file mode 100644
+index 0000000..f5e88e4
+--- /dev/null
++++ b/src/tools/hades_bdj_sandbox_net.h
+@@ -0,0 +1,40 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/* BD-Live in the BD-J server (hades_bdj_sandbox.c, with HADES_BDJ_NETWORK=internet) */
++
++#ifndef HADES_BDJ_SANDBOX_NET_H_
++#define HADES_BDJ_SANDBOX_NET_H_
++
++#include <seccomp.h>
++
++/* before the filter: the networks of this system, for the JVM (HADES_BDJ_BDLIVE_LOCAL); 0 or -1 */
++int hades_bdj_sandbox_net_prepare(void);
++
++/* the rules of socket() / socketpair() with BD-Live: AF_UNIX, and TCP over IPv4; 0 or -1 */
++int hades_bdj_sandbox_net_socket_rules(scmp_filter_ctx ctx, const char *name);
++
++/* the rest with BD-Live: no listening, no accepting; 0 or -1 */
++int hades_bdj_sandbox_net_rules(scmp_filter_ctx ctx);
++
++/* after the filter: the filters are in force (the system's on the addresses, ours on the
++   sockets); 0, or -1 and why */
++int hades_bdj_sandbox_net_check(char *why, unsigned len);
++
++#endif /* HADES_BDJ_SANDBOX_NET_H_ */
+diff --git a/src/tools/meson.build b/src/tools/meson.build
+index 3281abf..60c7ad2 100644
+--- a/src/tools/meson.build
++++ b/src/tools/meson.build
+@@ -30,7 +30,7 @@ if get_option('hades_bdj_host').enabled()
+         hades_bdj_host_args += '-DHADES_BDJ_TEST=1'
+     endif
+     executable('hades-bdj-host', 'hades_bdj_host.c', 'hades_bdj_sandbox.c',
+-        '../libbluray/bdj/bdj_sandbox.c',
++        'hades_bdj_sandbox_net.c', '../libbluray/bdj/bdj_sandbox.c', '../libbluray/bdj/bdlive_net.c',
+         dependencies: [libbluray_dep, dependency('libseccomp'), thread_dependency],
+         include_directories: libbluray_inc_dirs,
+         c_args: hades_bdj_host_args,

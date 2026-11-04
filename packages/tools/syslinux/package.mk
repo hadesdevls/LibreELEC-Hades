@@ -48,6 +48,27 @@ make_host() {
        CFLAGS="-I${TOOLCHAIN}/include -I${PKG_BUILD}/libinstaller -I${PKG_BUILD}/libfat -I${PKG_BUILD}/bios -I${PKG_BUILD}/utils -fomit-frame-pointer -D_FILE_OFFSET_BITS=64" \
        LDFLAGS="-L${TOOLCHAIN}/lib" \
        installer
+  hades_make_mbr
+}
+
+# Hades: mbr.bin and gptmbr.bin (the code of the master boot record that the image and the installer of
+# the image write) made from their source, in place of the ones that the release ships built: with
+# syslinux-9001 they come out byte for byte the same (assembly; checked with scripts/build). The rest of
+# bios/ (ldlinux.sys, ldlinux.c32, the modules) stays as the release ships it: built again it is not the
+# same (another compiler), and it is what boots.
+# Built without the flags that the build exports for its own programs, as the target stage of this recipe
+# builds all of syslinux: in the host stage they are gcc options (-Wl,-rpath, -march=native), and
+# mbr/Makefile hands LDFLAGS to ld itself. In a subshell, so that nothing else loses them.
+hades_make_mbr() {
+  rm -rf bios/mbr
+  (
+    unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+    make bios BSUBDIRS=mbr ISUBDIRS= ITARGET= BTARGET= CC=${CC}
+  )
+}
+
+post_make_target() {
+  hades_make_mbr
 }
 
 makeinstall_host() {
@@ -60,6 +81,15 @@ makeinstall_host() {
     cp bios/mbr/gptmbr.bin ${TOOLCHAIN}/share/syslinux
     cp efi64/efi/syslinux.efi ${TOOLCHAIN}/share/syslinux/bootx64.efi
     cp efi64/com32/elflink/ldlinux/ldlinux.e64  ${TOOLCHAIN}/share/syslinux
+
+  # Hades: the BIOS menu with the look of the build (scripts/mkimage puts it on the boot partition):
+  # vesamenu.c32 and the two libraries it loads, from the same release as ldlinux.c32 (they must match
+  # it), and theme/hades (menu.cfg and its background, made by make-boot-theme.py)
+  rm -rf ${TOOLCHAIN}/share/syslinux/hades
+  mkdir -p ${TOOLCHAIN}/share/syslinux/hades
+    cp bios/com32/menu/vesamenu.c32 bios/com32/lib/libcom32.c32 bios/com32/libutil/libutil.c32 \
+       ${TOOLCHAIN}/share/syslinux/hades
+    cp ${PKG_DIR}/theme/hades/* ${TOOLCHAIN}/share/syslinux/hades
 }
 
 makeinstall_target() {

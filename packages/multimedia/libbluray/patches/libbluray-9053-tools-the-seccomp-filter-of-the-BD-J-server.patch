@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:13:00 +0000
+Subject: [PATCH] tools: the seccomp filter of the BD-J server
+
+hades_bdj_sandbox_enter() is what the server of the isolated BD-J service
+(hades-bdj-host) calls first, before it opens anything of the disc and
+before any JVM exists. LibreELEC builds systemd without seccomp, so the
+service's own SystemCallFilter= and the other seccomp options would do
+nothing; the server installs the filter itself (libseccomp), for every
+thread the JVM will start (TSYNC), and then checks from the kernel that the
+process is isolated (bdj_sandbox_check()). Any failure: the server exits
+without opening the disc.
+
+A list of refusals over a default that allows, not an allow list: what a
+JVM calls changes with the JVM, its collectors and glibc, and a call
+missing from an allow list would break the menus where nobody looked.
+Refused with EPERM: other processes (ptrace, process_vm_*, pidfd_getfd,
+kcmp, process_madvise, move_pages, migrate_pages), namespaces, mounts and
+roots (unshare, setns, the mount family, chroot, pivot_root; clone with a
+namespace flag; clone3 gets ENOSYS, so glibc falls back to clone), new
+programs (execve, execveat), kernel interfaces a confined process does not
+need (bpf, perf_event_open, userfaultfd, io_uring, keys, handles,
+fanotify, syslog...), the machine (modules, kexec, reboot, swap, clocks,
+I/O ports, host names), personality() other than the default; sockets of
+any family but AF_UNIX get EAFNOSUPPORT (with BD-Live, AF_INET and AF_INET6
+too). A system call of another architecture (i386, x32) ends the process.
+A refused unshare(0) afterwards shows that this filter, not merely some
+filter, is in force.
+
+Measured in the service on the build host (systemd 259), with a test
+program after this call: each of those calls refused as said, threads,
+anonymous executable memory and AF_UNIX sockets work, an i386 and an x32
+call end the process (SIGSYS). A JVM (OpenJDK 8, 17, 21 and 26) runs BD-J
+under it.
+---
+ src/tools/hades_bdj_sandbox.c | 217 ++++++++++++++++++++++++++++++++++
+ src/tools/hades_bdj_sandbox.h |  43 +++++++
+ 2 files changed, 260 insertions(+)
+ create mode 100644 src/tools/hades_bdj_sandbox.c
+ create mode 100644 src/tools/hades_bdj_sandbox.h
+
+diff --git a/src/tools/hades_bdj_sandbox.c b/src/tools/hades_bdj_sandbox.c
+new file mode 100644
+index 0000000..866a7b3
+--- /dev/null
++++ b/src/tools/hades_bdj_sandbox.c
+@@ -0,0 +1,217 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * The seccomp filter of the BD-J server, and the check that follows it (hades_bdj_sandbox.h).
++ *
++ * A list of refusals on top of everything else allowed, not a list of what is allowed: what a JVM
++ * calls changes with the JVM, its garbage collectors and glibc, and a call missing from an allow
++ * list would break the menus somewhere nobody tried. What is refused here is what a disc's code
++ * (Java with no security manager, or a native library it loads) could use to reach beyond the
++ * process: other processes, namespaces and mounts, kernel interfaces with a history of holes,
++ * new programs, sockets of other families. Refused calls fail with EPERM (EAFNOSUPPORT for a
++ * socket family, ENOSYS for clone3, so that glibc falls back to clone, whose flags are checked),
++ * which the JVM handles as any refusal; a call of another architecture (i386, x32) ends the
++ * process.
++ */
++
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE /* CLONE_NEW* */
++#endif
++
++#include "hades_bdj_sandbox.h"
++
++#include "libbluray/bdj/bdj_sandbox.h"
++
++#include <errno.h>
++#include <sched.h>
++#include <seccomp.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/prctl.h>
++#include <sys/socket.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#ifndef CLONE_NEWTIME
++#define CLONE_NEWTIME 0x00000080
++#endif
++
++/* refused with EPERM, whatever their arguments */
++static const char *const refused[] = {
++    /* other processes */
++    "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd", "kcmp",
++    "process_madvise", "move_pages", "migrate_pages",
++    /* namespaces, mounts and roots */
++    "unshare", "setns", "mount", "umount2", "pivot_root", "chroot", "move_mount", "open_tree",
++    "open_tree_attr", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr",
++    /* new programs: the server is the only program of the service */
++    "execve", "execveat",
++    /* kernel interfaces that a confined process does not need */
++    "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter",
++    "io_uring_register", "keyctl", "add_key", "request_key", "open_by_handle_at",
++    "name_to_handle_at", "fanotify_init", "lookup_dcookie", "uselib", "sysfs", "_sysctl",
++    "ustat", "vhangup", "syslog", "acct", "quotactl", "quotactl_fd", "nfsservctl",
++    /* the machine itself */
++    "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "reboot",
++    "swapon", "swapoff", "settimeofday", "clock_settime", "clock_adjtime", "adjtimex", "iopl",
++    "ioperm", "sethostname", "setdomainname",
++};
++
++static const unsigned long namespace_flags[] = {
++    CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWUSER, CLONE_NEWPID, CLONE_NEWNET,
++    CLONE_NEWCGROUP, CLONE_NEWTIME,
++};
++
++static int _rule(scmp_filter_ctx ctx, uint32_t action, const char *name, unsigned count,
++                 const struct scmp_arg_cmp *cmp)
++{
++    int nr = seccomp_syscall_resolve_name(name);
++    int rc;
++
++    if (nr == __NR_SCMP_ERROR) {
++        /* not a system call this libseccomp knows: nothing to refuse */
++        return 0;
++    }
++    rc = seccomp_rule_add_array(ctx, action, nr, count, cmp);
++    if (rc < 0) {
++        fprintf(stderr, "hades-bdj: seccomp rule for %s failed: %s\n", name, strerror(-rc));
++        return -1;
++    }
++    return 0;
++}
++
++/* socket() and socketpair() of any family but AF_UNIX; with BD-Live, AF_INET and AF_INET6 too */
++static int _socket_rules(scmp_filter_ctx ctx, const char *name, int internet)
++{
++    const uint32_t act = SCMP_ACT_ERRNO(EAFNOSUPPORT);
++    struct scmp_arg_cmp cmp;
++
++    if (!internet) {
++        cmp = SCMP_A0(SCMP_CMP_NE, AF_UNIX);
++        return _rule(ctx, act, name, 1, &cmp);
++    }
++
++    /* AF_UNSPEC (0), the families between AF_UNIX (1) and AF_INET6 (10) but AF_INET (2), and
++       everything above AF_INET6 (netlink, packet, ...) */
++    cmp = SCMP_A0(SCMP_CMP_EQ, AF_UNSPEC);
++    if (_rule(ctx, act, name, 1, &cmp))
++        return -1;
++    for (unsigned long family = 3; family < AF_INET6; family++) {
++        cmp = SCMP_A0(SCMP_CMP_EQ, family);
++        if (_rule(ctx, act, name, 1, &cmp))
++            return -1;
++    }
++    cmp = SCMP_A0(SCMP_CMP_GT, AF_INET6);
++    return _rule(ctx, act, name, 1, &cmp);
++}
++
++static int _filter(int internet)
++{
++    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
++    struct scmp_arg_cmp cmp;
++    int rc = -1;
++
++    if (!ctx) {
++        fprintf(stderr, "hades-bdj: seccomp_init() failed\n");
++        return -1;
++    }
++
++    /* i386 and x32 system calls end the process; every thread of the process gets the filter */
++    if (seccomp_attr_set(ctx, SCMP_FLTATR_ACT_BADARCH, SCMP_ACT_KILL_PROCESS) < 0 ||
++        seccomp_attr_set(ctx, SCMP_FLTATR_CTL_TSYNC, 1) < 0 ||
++        seccomp_attr_set(ctx, SCMP_FLTATR_CTL_NNP, 1) < 0) {
++        fprintf(stderr, "hades-bdj: seccomp attributes failed\n");
++        goto out;
++    }
++
++    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
++        if (_rule(ctx, SCMP_ACT_ERRNO(EPERM), refused[i], 0, NULL))
++            goto out;
++    }
++
++    /* clone() with a namespace flag; clone3() takes its flags in memory a filter cannot read:
++       ENOSYS, and glibc and the JVM use clone() */
++    for (size_t i = 0; i < sizeof(namespace_flags) / sizeof(namespace_flags[0]); i++) {
++        cmp = SCMP_A0(SCMP_CMP_MASKED_EQ, namespace_flags[i], namespace_flags[i]);
++        if (_rule(ctx, SCMP_ACT_ERRNO(EPERM), "clone", 1, &cmp))
++            goto out;
++    }
++    if (_rule(ctx, SCMP_ACT_ERRNO(ENOSYS), "clone3", 0, NULL))
++        goto out;
++
++    /* personality(): only back to the default (PER_LINUX), no other execution domain or flag
++       (READ_IMPLIES_EXEC, ADDR_NO_RANDOMIZE...) */
++    cmp = SCMP_A0(SCMP_CMP_NE, 0);
++    if (_rule(ctx, SCMP_ACT_ERRNO(EPERM), "personality", 1, &cmp))
++        goto out;
++
++    if (_socket_rules(ctx, "socket", internet) || _socket_rules(ctx, "socketpair", internet))
++        goto out;
++
++    rc = seccomp_load(ctx);
++    if (rc < 0) {
++        fprintf(stderr, "hades-bdj: seccomp_load() failed: %s\n", strerror(-rc));
++        rc = -1;
++        goto out;
++    }
++    rc = 0;
++
++out:
++    seccomp_release(ctx);
++    return rc;
++}
++
++int hades_bdj_sandbox_enter(void)
++{
++    char why[128];
++    const char *net = getenv(HADES_BDJ_NETWORK_ENV);
++    int internet = net && !strcmp(net, HADES_BDJ_NETWORK_INTERNET);
++
++    if (getuid() == 0 || geteuid() == 0 || getgid() == 0 || getegid() == 0) {
++        fprintf(stderr, "hades-bdj: refusing to run as root\n");
++        return -1;
++    }
++
++    /* the service sets it (NoNewPrivileges=yes); a filter without CAP_SYS_ADMIN needs it */
++    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
++        fprintf(stderr, "hades-bdj: PR_SET_NO_NEW_PRIVS failed: %s\n", strerror(errno));
++        return -1;
++    }
++
++    if (_filter(internet) != 0)
++        return -1;
++
++    /* our filter, and not merely some filter, is in force: unshare() of nothing is refused */
++    errno = 0;
++    if (syscall(SYS_unshare, 0) != -1 || errno != EPERM) {
++        fprintf(stderr, "hades-bdj: the seccomp filter is not in force\n");
++        return -1;
++    }
++
++    if (!bdj_sandbox_check(why, sizeof(why))) {
++        fprintf(stderr, "hades-bdj: not isolated: %s\n", why);
++        return -1;
++    }
++
++    fprintf(stderr, "hades-bdj: isolated (%s)\n", internet ? "BD-Live: network to the Internet" :
++            "no network");
++    return 0;
++}
+diff --git a/src/tools/hades_bdj_sandbox.h b/src/tools/hades_bdj_sandbox.h
+new file mode 100644
+index 0000000..bc5299e
+--- /dev/null
++++ b/src/tools/hades_bdj_sandbox.h
+@@ -0,0 +1,43 @@
++/*
++ * This file is part of libbluray
++ * Copyright (C) 2026  Hades
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see
++ * <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef HADES_BDJ_SANDBOX_H_
++#define HADES_BDJ_SANDBOX_H_
++
++/*
++ * Called by the BD-J server (hades-bdj-host) first thing, before it opens anything of the disc
++ * and before any JVM exists. The service (hades-bdj@.service) has already isolated the process:
++ * its own user, no capabilities, no_new_privs, no network, no /storage, its own /tmp. This adds
++ * what systemd cannot here (LibreELEC builds systemd without seccomp): a seccomp filter, kept by
++ * every thread the JVM starts, that refuses the system calls a disc's code could use to reach
++ * further (other processes, namespaces, mounts, kernel interfaces, new programs, sockets of other
++ * families). Then it checks, from the kernel, that the process is isolated
++ * (src/libbluray/bdj/bdj_sandbox.c).
++ *
++ * The network families are refused unless the environment of the service says BD-Live
++ * (HADES_BDJ_NETWORK=internet), where AF_INET and AF_INET6 are let through and the service limits
++ * the addresses.
++ *
++ * Returns 0 when the filter is in force and the process is isolated; otherwise the reason is
++ * written to stderr (the journal of the service) and the server must exit without opening the
++ * disc.
++ */
++int hades_bdj_sandbox_enter(void);
++
++#endif /* HADES_BDJ_SANDBOX_H_ */
+-- 
+2.53.0
+

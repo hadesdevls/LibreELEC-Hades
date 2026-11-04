@@ -1,0 +1,198 @@
+From 4fd657b67cc9c4af66eebaff5d62e97e1c7fd0c0 Mon Sep 17 00:00:00 2001
+From: Nikola Pajkovsky <nikolap@openssl.org>
+Date: Wed, 7 Oct 2026 12:17:55 +0200
+Subject: [PATCH] x509: fix duplicate detection in unsorted store object stacks
+
+X509_OBJECT_retrieve_match() stops searching at the first object with
+a different type or name, assuming matching objects are contiguous.
+However, sk_X509_OBJECT_find() searches unsorted stacks without sorting
+them, so interleaved objects can cause an existing duplicate to be missed.
+
+Continue past unrelated objects when the stack is unsorted, retaining
+the early exit for sorted stacks. This handles both per-name hash-table
+lists and the legacy flat stack without changing comparison semantics
+or reordering store objects.
+
+Add regression tests for certificate and CRL duplicates in hash-table,
+unsorted legacy, and sorted legacy stores. Check both repeated pointers
+and separately decoded copies, and verify that distinct objects remain
+in the store.
+
+Resolves: https://github.com/openssl/openssl/issues/31649
+Fixes: 04589b59ef50 "x509store: reduce lock contention in X509_STORE"
+Assisted-by: OpenCode:openai/gpt-6-astra
+Signed-off-by: Nikola Pajkovsky <nikolap@openssl.org>
+Reviewed-by: Bob Beck <beck@openssl.org>
+Reviewed-by: Andrew Dinh <andrewd@openssl.org>
+Reviewed-by: Eugene Syromiatnikov <esyr@openssl.org>
+Merge-date: Thu Oct 29 08:39:48 2026
+Merged-from: https://github.com/openssl/openssl/pull/33141
+(cherry picked from commit 77be9587db7d96d0c22df698e18f3e9c6c094b60)
+---
+ crypto/x509/x509_lu.c |  11 ++--
+ test/x509_test.c      | 113 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 121 insertions(+), 3 deletions(-)
+
+diff --git a/crypto/x509/x509_lu.c b/crypto/x509/x509_lu.c
+index 94c1247..0e8e999 100644
+--- a/crypto/x509/x509_lu.c
++++ b/crypto/x509/x509_lu.c
+@@ -1017,7 +1017,7 @@ end:
+ X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h,
+     X509_OBJECT *x)
+ {
+-    int idx, i, num;
++    int idx, i, num, sorted;
+     X509_OBJECT *obj;
+ 
+     idx = sk_X509_OBJECT_find(h, x);
+@@ -1025,11 +1025,16 @@ X509_OBJECT *X509_OBJECT_retrieve_match(STACK_OF(X509_OBJECT) *h,
+         return NULL;
+     if ((x->type != X509_LU_X509) && (x->type != X509_LU_CRL))
+         return sk_X509_OBJECT_value(h, idx);
++    sorted = sk_X509_OBJECT_is_sorted(h);
+     for (i = idx, num = sk_X509_OBJECT_num(h); i < num; i++) {
+         obj = sk_X509_OBJECT_value(h, i);
+         if (x509_object_cmp((const X509_OBJECT **)&obj,
+-                (const X509_OBJECT **)&x))
+-            return NULL;
++                (const X509_OBJECT **)&x)) {
++            /* Matching objects are contiguous only in a sorted stack. */
++            if (sorted)
++                return NULL;
++            continue;
++        }
+         if (x->type == X509_LU_X509) {
+             if (!X509_cmp(obj->data.x509, x->data.x509))
+                 return obj;
+diff --git a/test/x509_test.c b/test/x509_test.c
+index 0eb3f70..5f720bc 100644
+--- a/test/x509_test.c
++++ b/test/x509_test.c
+@@ -104,6 +104,118 @@ static int test_x509_tbs_cache(void)
+     return ret;
+ }
+ 
++static int test_x509_store_object_count(X509_STORE *store, int expected)
++{
++    STACK_OF(X509_OBJECT) *objs = X509_STORE_get1_objects(store);
++    int ret = TEST_ptr(objs)
++        && TEST_int_eq(sk_X509_OBJECT_num(objs), expected);
++
++    sk_X509_OBJECT_pop_free(objs, X509_OBJECT_free);
++    return ret;
++}
++
++/*
++ * Test both object types with a hash-table store, an unsorted legacy stack,
++ * and a sorted legacy stack. Matching objects are separated by the other type.
++ */
++static int test_x509_store_duplicates(int idx)
++{
++    int crl_test = idx % 2, mode = idx / 2;
++    int i, ret = 0;
++    const unsigned char *p;
++    X509_STORE *store = NULL;
++    STACK_OF(X509_OBJECT) *objs = NULL;
++    X509 *cert = NULL, *certs[4] = { NULL };
++    X509_CRL *crl = NULL, *crls[4] = { NULL };
++    ASN1_TIME *last_update = NULL;
++
++#ifdef OPENSSL_NO_DEPRECATED_4_0
++    if (mode != 0)
++        return TEST_skip("X509_STORE_get0_objects is disabled");
++#endif
++
++    p = certdata;
++    if (!TEST_ptr(store = X509_STORE_new())
++        || !TEST_ptr(cert = d2i_X509(NULL, &p, sizeof(certdata))))
++        goto end;
++    p = crldata;
++    if (!TEST_ptr(crl = d2i_X509_CRL(NULL, &p, sizeof(crldata)))
++        || !TEST_true(X509_CRL_set_issuer_name(crl,
++            X509_get_subject_name(cert))))
++        goto end;
++
++    /* Decode signed objects so the CRLs have their cached fingerprints. */
++    for (i = 0; i < 4; i++) {
++        if (!TEST_true(ASN1_INTEGER_set(X509_get_serialNumber(cert), i + 1))
++            || !TEST_int_gt(X509_sign(cert, privkey, signmd), 0)
++            || !TEST_ptr(certs[i] = X509_dup(cert))
++            || !TEST_ptr(last_update = ASN1_TIME_adj(NULL, 0, i, 0))
++            || !TEST_true(X509_CRL_set1_lastUpdate(crl, last_update))
++            || !TEST_int_gt(X509_CRL_sign(crl, privkey, signmd), 0)
++            || !TEST_ptr(crls[i] = X509_CRL_dup(crl)))
++            goto end;
++        ASN1_TIME_free(last_update);
++        last_update = NULL;
++    }
++
++#ifndef OPENSSL_NO_DEPRECATED_4_0
++    if (mode != 0 && !TEST_ptr(objs = X509_STORE_get0_objects(store)))
++        goto end;
++#endif
++
++    for (i = 0; i < 4; i++) {
++        if (!TEST_true(crl_test ? X509_STORE_add_crl(store, crls[i])
++                                : X509_STORE_add_cert(store, certs[i])))
++            goto end;
++        if (i == 0
++            && !TEST_true(crl_test ? X509_STORE_add_cert(store, certs[0])
++                                   : X509_STORE_add_crl(store, crls[0])))
++            goto end;
++    }
++    if (!test_x509_store_object_count(store, 5))
++        goto end;
++    if (mode != 0 && !TEST_false(sk_X509_OBJECT_is_sorted(objs)))
++        goto end;
++    if (mode == 2) {
++        sk_X509_OBJECT_sort(objs);
++        if (!TEST_true(sk_X509_OBJECT_is_sorted(objs)))
++            goto end;
++    }
++
++    for (i = 0; i < 4; i++) {
++        if (!TEST_true(crl_test ? X509_STORE_add_crl(store, crls[i])
++                                : X509_STORE_add_cert(store, certs[i]))
++            || !test_x509_store_object_count(store, 5))
++            goto end;
++        /* Equal encodings at different addresses must also be duplicates. */
++        if (crl_test) {
++            X509_CRL_free(crl);
++            crl = X509_CRL_dup(crls[i]);
++            if (!TEST_ptr(crl) || !TEST_true(X509_STORE_add_crl(store, crl)))
++                goto end;
++        } else {
++            X509_free(cert);
++            cert = X509_dup(certs[i]);
++            if (!TEST_ptr(cert) || !TEST_true(X509_STORE_add_cert(store, cert)))
++                goto end;
++        }
++        if (!test_x509_store_object_count(store, 5))
++            goto end;
++    }
++    ret = 1;
++
++end:
++    ASN1_TIME_free(last_update);
++    X509_STORE_free(store);
++    X509_free(cert);
++    X509_CRL_free(crl);
++    for (i = 0; i < 4; i++) {
++        X509_free(certs[i]);
++        X509_CRL_free(crls[i]);
++    }
++    return ret;
++}
++
+ static int test_x509_verify_with_new(void)
+ {
+     int ret;
+@@ -931,6 +1043,7 @@ int setup_tests(void)
+ 
+     ADD_TEST(test_x509_tbs_cache);
+     ADD_TEST(test_x509_crl_tbs_cache);
++    ADD_ALL_TESTS(test_x509_store_duplicates, 6);
+     ADD_TEST(test_asn1_item_verify);
+     ADD_MFAIL_NO_CHECK_TEST(test_x509_asn1_item_verify_mfail);
+     ADD_MFAIL_TEST(test_x509_issuer_name_hash_mfail);

@@ -1,0 +1,261 @@
+From d0784837bd6fbd577fd309b3a1597f74fce5b711 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:41:05 +0000
+Subject: [PATCH] egl-gbm: a window surface whose stream has a FIFO of three,
+ falling back to two
+
+egl-gbm 1.1.4 (the tag is the head of its main branch, 2026-11-03) makes
+the stream of every window surface with a FIFO of two ("one front, one
+back"), and counts the buffers an application may hold locked by that
+length: gbm_surface_has_free_buffers() is false as soon as two are
+locked. That is enough to show a frame and draw the next one; it is not
+enough to draw a frame while the one before is queued for a flip that
+has not come and the one on the screen is still scanned out. Kodi in
+LibreELEC Hades presents Dolby Vision frames a frame ahead that way where
+the GPU needs more than half a refresh for them, and on NVIDIA it never
+could: "the output has no third buffer", on any card (a GT 1030 with the
+580 driver needed 46-49 ms a frame of a 41.7 ms refresh and showed about
+95 frames in 10 s of 240).
+
+The stream is now made with a FIFO of three, and with two, as before,
+where the driver makes none of three or no producer surface on it (the
+stream that failed is destroyed first; the error is the one of the last
+try). The surface remembers its FIFO length, and the bounds of
+numFreeImages follow it.
+
+Why three and not two with one more free buffer counted: NVIDIA's
+egl-wayland documents (wayland-eglsurface.c) that the driver keeps one
+image of a stream for itself, the one it renders into, and gives its
+own streams a FIFO of two to have four images. How many images a stream
+of a given length has is not documented. Counting a third free buffer on
+a FIFO of two is only safe if the driver keeps two images beyond the
+FIFO; if it keeps one, the producer has nothing to render into and
+eglSwapBuffers() waits for a release that only the same thread can make.
+A FIFO of three leaves a buffer to draw into in both cases.
+
+Cost: one image more of the size and format of the window (33 MB at
+3840x2160 in a 32-bit format, 66 MB in half floats). Latency does not
+change for a client that locks the front buffer after each swap, as GBM
+clients do: the FIFO then never holds more than the frame just swapped.
+
+Checked on the host: gbm-surface.c, included as it is, over a fake
+EGLStream that models the images of a stream as its FIFO length plus one
+or plus two, driven as Kodi drives it (the ordinary output, then 200
+frames presented a frame ahead): with this, the ordinary output holds
+three at most, 199 of 199 frames go a frame ahead and the producer never
+lacks an image, with both models; a driver that refuses a FIFO of three,
+or fails the producer surface on it, gets a FIFO of two with nothing
+left behind; with both refused there is no surface, no stream and the
+display's reference is given back. 1.1.4 with 9000 fails 8 of those
+checks, and five mutations of this change are each caught (counting one
+more free buffer instead makes the producer block with the model of one
+image beyond the FIFO). gbm-surface.c builds with the compiler of the
+image and the -Wall -Werror of its meson.build, without warnings.
+---
+ src/gbm-surface.c | 147 +++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 113 insertions(+), 34 deletions(-)
+
+diff --git a/src/gbm-surface.c b/src/gbm-surface.c
+index ec4a611..ee33430 100644
+--- a/src/gbm-surface.c
++++ b/src/gbm-surface.c
+@@ -19,8 +19,31 @@
+ 
+ #define MAX_STREAM_IMAGES 10
+ 
+-// One front, one back.
+-#define WINDOW_STREAM_FIFO_LENGTH 2
++/*
++ * Hades: the FIFO length of the stream of a window surface, which is also the
++ * most buffers that the application can hold locked at once (numFreeImages):
++ * three, and two (as egl-gbm 1.1.4 had it, "one front, one back") where the
++ * driver does not make a stream of three.
++ *
++ * Two was enough to show a frame and draw the next one. It is not enough to
++ * draw a frame while the one before is queued for a flip that has not come
++ * and the one on the screen is still scanned out: a compositor that presents
++ * a frame ahead (Kodi on Mesa, with four buffers) holds two buffers locked
++ * while it draws the third, and with two gbm_surface_has_free_buffers() says
++ * there is none, so such a client always has to wait for each flip before it
++ * draws (Kodi in LibreELEC Hades: "the output has no third buffer").
++ *
++ * What a stream of N costs: NVIDIA's own EGLStream clients document that the
++ * driver keeps one image of the stream for itself, the one it renders into,
++ * and egl-wayland gives its streams a FIFO of two to have four images (a
++ * comment in wayland-eglsurface.c); with three, one image more of the size
++ * and format of the window (33 MB at 3840x2160 in a 32-bit format, 66 MB in
++ * half floats). Latency does not change for a client that locks the front
++ * buffer after each swap, as GBM clients do: the FIFO then never holds more
++ * than the frame just swapped.
++ */
++#define WINDOW_STREAM_FIFO_LENGTH 3
++#define WINDOW_STREAM_FIFO_LENGTH_BEFORE 2
+ 
+ typedef struct GbmSurfaceImageRec {
+     EGLImage image;
+@@ -63,6 +86,8 @@ typedef struct GbmSurfaceRec {
+      * eGbmSurfaceReleaseBuffer.
+      */
+     int numFreeImages;
++    /* Hades: the FIFO length that the stream was made with */
++    int fifoLength;
+ } GbmSurface;
+ 
+ /*
+@@ -158,7 +183,7 @@ RemoveSurfImage(GbmDisplay* display, GbmSurface* surf, EGLImage img)
+                         if (surf->acquiredImages.last == acqImg)
+                             surf->acquiredImages.last = prev;
+ 
+-                        assert(surf->numFreeImages < WINDOW_STREAM_FIFO_LENGTH);
++                        assert(surf->numFreeImages < surf->fifoLength);
+                         surf->numFreeImages++;
+                         break;
+                     }
+@@ -391,11 +416,78 @@ eGbmSurfaceReleaseBuffer(struct gbm_surface* s, struct gbm_bo *bo)
+                                                 surf->stream,
+                                                 img,
+                                                 EGL_NO_SYNC_KHR);
+-        assert(surf->numFreeImages < WINDOW_STREAM_FIFO_LENGTH);
++        assert(surf->numFreeImages < surf->fifoLength);
+         surf->numFreeImages++;
+     }
+ }
+ 
++/*
++ * Hades: the stream of a window surface with a FIFO of fifoLength, its consumer
++ * connected and its producer surface made; on a failure, nothing of it is left
++ * (the stream is destroyed) and *err says why, as the hook reports it.
++ */
++static bool
++CreateSurfStream(GbmDisplay* display,
++                 GbmSurface* surf,
++                 EGLConfig config,
++                 struct gbm_surface* s,
++                 const EGLint* surfAttrs,
++                 EGLint fifoLength,
++                 EGLint* err)
++{
++    GbmPlatformData* data = display->data;
++    EGLDisplay dpy = display->devDpy;
++    const EGLint streamAttrs[] = {
++        EGL_STREAM_FIFO_LENGTH_KHR, fifoLength,
++        EGL_NONE
++    };
++
++    surf->stream = data->egl.CreateStreamKHR(dpy, streamAttrs);
++
++    if (!surf->stream) {
++        surf->stream = EGL_NO_STREAM_KHR;
++        *err = EGL_BAD_ALLOC;
++        return false;
++    }
++
++    if (!data->egl.StreamImageConsumerConnectNV(dpy,
++                                                surf->stream,
++                                                s->v0.count,
++                                                s->v0.modifiers,
++                                                NULL)) {
++        *err = EGL_BAD_ALLOC;
++        goto fail;
++    }
++
++    surf->egl = data->egl.CreateStreamProducerSurfaceKHR(dpy,
++                                                         config,
++                                                         surf->stream,
++                                                         surfAttrs);
++
++    if (!surf->egl) {
++        surf->egl = EGL_NO_SURFACE;
++        *err = data->egl.GetError();
++        // Pass EGL_BAD_MATCH through, since that's an allowed error for
++        // eglCreateWindowSurface, and it would still make sense to the
++        // application. Otherwise, send back EGL_BAD_ALLOC.
++        if (*err != EGL_BAD_MATCH) {
++            *err = EGL_BAD_ALLOC;
++        }
++        goto fail;
++    }
++
++    surf->fifoLength = fifoLength;
++    surf->numFreeImages = fifoLength;
++
++    return true;
++
++fail:
++    data->egl.DestroyStreamKHR(dpy, surf->stream);
++    surf->stream = EGL_NO_STREAM_KHR;
++
++    return false;
++}
++
+ static void
+ FreeSurface(GbmObject* obj)
+ {
+@@ -446,10 +538,11 @@ eGbmCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
+         EGL_HEIGHT, s->v0.height,
+         EGL_NONE
+     };
+-    static const EGLint streamAttrs[] = {
+-        EGL_STREAM_FIFO_LENGTH_KHR, WINDOW_STREAM_FIFO_LENGTH,
+-        EGL_NONE
++    static const EGLint fifoLengths[] = {
++        WINDOW_STREAM_FIFO_LENGTH,
++        WINDOW_STREAM_FIFO_LENGTH_BEFORE
+     };
++    unsigned int i;
+     static const EGLint syncAttrs[] = {
+         EGL_SYNC_STATUS_KHR, EGL_SIGNALED_KHR,
+         EGL_NONE
+@@ -493,36 +586,22 @@ eGbmCreatePlatformWindowSurfaceHook(EGLDisplay dpy,
+     surf->base.type = EGL_OBJECT_SURFACE_KHR;
+     surf->base.refCount = 1;
+     surf->base.free = FreeSurface;
+-    surf->stream = data->egl.CreateStreamKHR(dpy, streamAttrs);
+-    surf->numFreeImages = WINDOW_STREAM_FIFO_LENGTH;
++    surf->stream = EGL_NO_STREAM_KHR;
++    surf->egl = EGL_NO_SURFACE;
+ 
+-    if (!surf->stream) {
+-        err = EGL_BAD_ALLOC;
+-        goto fail;
+-    }
+-
+-    if (!data->egl.StreamImageConsumerConnectNV(dpy,
+-                                                surf->stream,
+-                                                s->v0.count,
+-                                                s->v0.modifiers,
+-                                                NULL)) {
+-        err = EGL_BAD_ALLOC;
+-        goto fail;
++    /*
++     * Hades: a stream of three, and of two where the driver makes none of three
++     * (fail closed: the window surface as egl-gbm 1.1.4 made it); the error is
++     * the one of the last try.
++     */
++    for (i = 0; i < ARRAY_LEN(fifoLengths); i++) {
++        if (CreateSurfStream(display, surf, config, s, surfAttrs,
++                             fifoLengths[i], &err)) {
++            break;
++        }
+     }
+ 
+-    surf->egl = data->egl.CreateStreamProducerSurfaceKHR(dpy,
+-                                                         config,
+-                                                         surf->stream,
+-                                                         surfAttrs);
+-
+-    if (!surf->egl) {
+-        err = data->egl.GetError();
+-        // Pass EGL_BAD_MATCH through, since that's an allowed error for
+-        // eglCreateWindowSurface, and it would still make sense to the
+-        // application. Otherwise, send back EGL_BAD_ALLOC.
+-        if (err != EGL_BAD_MATCH) {
+-            err = EGL_BAD_ALLOC;
+-        }
++    if (i == ARRAY_LEN(fifoLengths)) {
+         goto fail;
+     }
+ 
+-- 
+2.53.0
+

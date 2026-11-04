@@ -3,11 +3,11 @@
 # boot/DIAG-OFF.TXT is that switch as an image carries it (scripts/image, scripts/mkimage).
 
 PKG_NAME="hades-diag"
-PKG_VERSION="18"
+PKG_VERSION="19"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE=""
 PKG_URL=""
-PKG_LONGDESC="Diagnostics of a start on real hardware (displays, graphics drivers, logs), every file through a filter that puts markers in the place of addresses, serial numbers and other identifiers and takes credentials and the names of media out, written to the folder hades-diag of the boot partition while that partition has a file named DIAG-ON.TXT. Each start has a folder of its own there, numbered on from the start before it, also across an update of the system, and the last eight are kept. They read what the system is doing; once per start, for a display that is plugged in and not seen, they also ask the empty HDMI and DisplayPort outputs again, list the PCI devices (which wakes a graphics card that sleeps) and, where no display is seen on any socket, leave the kernel's display messages turned up for about three minutes. Nothing on that partition is run."
+PKG_LONGDESC="Diagnostics of a start on real hardware (displays, graphics drivers, logs), every file through a filter that puts markers in the place of addresses, serial numbers and other identifiers and takes credentials and the names of media out, written to the folder hades-diag of the boot partition while that partition has a file named DIAG-ON.TXT. Each start has a folder of its own there, numbered on from the start before it, also across an update of the system, and the last eight are kept. They read what the system is doing; once per start, for a display that is plugged in and not seen, they also ask the empty HDMI and DisplayPort outputs again, list the PCI devices (which wakes a graphics card that sleeps) and, where no display is seen on any socket, leave the kernel's display messages turned up for about three minutes. While the switch is on, the journal of each start is kept in the storage, and the first snapshot of the next start saves it (previous-boot); turned off, that journal is deleted. Nothing on that partition is run."
 PKG_TOOLCHAIN="manual"
 
 makeinstall_target() {

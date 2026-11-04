@@ -1,0 +1,213 @@
+From 97a81b0dce23a7864f068d6e59c059b18843dc98 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 20:31:12 +0000
+Subject: [PATCH] drm/amd/display: set an HDMI link up again where the display
+ lost its scrambling setup at a hot-plug event
+
+Above 340 MHz of TMDS character rate, or below it with
+LTE_340MCSC_SCRAMBLE, an HDMI 2.0 stream shows a picture only while the
+sink has scrambling, and above 340 MHz the 1/40 TMDS bit clock ratio, set
+in its SCDC TMDS_Config. DC writes it when it enables the stream
+(enable_link_hdmi(), write_scdc_data()), and a sink resets its SCDC when
+it loses power.
+
+When the kernel sees the display go away and come back, the link has a
+new sink: detect_link_and_local_sink() released the one before at the
+disconnection, and dm_restore_drm_connector_state() forces a commit
+because the stream's sink is not the connector's any more; that commit
+enables the stream and writes TMDS_Config again. When it does not see it
+go away (a pulse of HPD shorter than the handling of its interrupt, a TV
+that keeps HPD up in standby and pulses it as it turns on, or the HDMI
+HPD debounce taking it as a spontaneous toggle), the detection finds the
+same EDID, keeps the sink before it, and dm_restore_drm_connector_state()
+commits nothing. The display then shows no picture until the mode
+changes. The issue #11 of LibreELEC Hades is that case with nvidia-drm,
+which has the same gap: an LG B7 at 3840x2160 at 50 Hz (594 MHz,
+scrambled) turned off and on, one hot-plug event, the same EDID, no
+picture, and the picture back after a change to 1080p.
+
+i915 handles it at each hot-plug event: intel_hdmi_reset_link() reads
+TMDS_Config back and, where the sink does not have what the output
+sends, sets the link up again with a modeset. This does the same in
+dm_restore_drm_connector_state(), where the sink is the same one: an
+enabled HDMI TMDS stream (never FRL, DVI or DisplayPort) that needs
+scrambling, to a sink with SCDC that DC writes (not skip_scdc_overwrite),
+with no commit of the connector on its way, reads TMDS_Config through the
+connector's DDC adapter, and where its scrambling and ratio bits are not
+the ones that write_scdc_data() writes for the stream (3 above 340 MHz, 1
+with LTE_340MCSC_SCRAMBLE), forces the same commit as for a new sink. A
+read that fails changes nothing, as in i915. The same connector is set
+up again at most once in 30 s: a display that lost the setup with each
+commit could not keep the link coming up again. The kernel log says it:
+
+  [CONNECTOR:N:HDMI-A-1] after a hot-plug event with the same display,
+  its SCDC TMDS_Config is 0x00 and the output sends at 594000 kHz with
+  0x03: the output is set up again, as for a display plugged in
+
+and, with drm.debug, a display that kept its setup or a read that
+failed.
+
+The forced commit duplicates the state of the connector, its CRTC and
+the primary plane with mode_changed set, as for a new sink: the stream
+is made again from the same state, the Dolby Vision tunnel of
+linux-9910 with it (amdgpu_dm_dvbridge_fill_stream() runs from the
+connector state that is kept), and nothing changes for a stream at 340
+MHz or below without LTE_340MCSC_SCRAMBLE, which needs no SCDC setup.
+
+The new code goes after dm_force_atomic_commit(), with its include next
+to it, so that the patches after this one in the series apply without an
+offset.
+---
+ .../display/amdgpu_dm/amdgpu_dm_connector.c   | 132 ++++++++++++++++++
+ 1 file changed, 132 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index ca9e538..5521175 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -4182,6 +4182,135 @@ static int dm_force_atomic_commit(struct drm_connector *connector)
+ 	return ret;
+ }
+ 
++/*
++ * Hades: an HDMI display that comes back with the same EDID and without the scrambling
++ * setup of the link.
++ *
++ * Above 340 MHz of TMDS character rate, or below it with LTE_340MCSC_SCRAMBLE, an HDMI
++ * stream shows a picture only while the sink has scrambling (and, above 340 MHz, the 1/40
++ * TMDS bit clock ratio) set in its SCDC TMDS_Config, which enable_link_hdmi() writes when
++ * the stream is enabled (write_scdc_data()). A sink resets its SCDC when it loses power.
++ * Where the kernel saw the display go away, the link has a new sink when it comes back, and
++ * dm_restore_drm_connector_state() forces a commit, which writes TMDS_Config again. Where it
++ * did not (a short pulse of HPD, a TV that keeps HPD up in standby and pulses it as it turns
++ * on, or the HDMI HPD debounce taking it as a spontaneous toggle), the detection keeps the
++ * sink before it (same EDID), nothing is committed, and the display shows no picture until
++ * the mode changes. Issue #11 of LibreELEC Hades shows it on an LG B7 at 2160p50 (594 MHz)
++ * with nvidia-drm, which has the same gap; the detection of DC leaves it open the same way.
++ * i915 reads TMDS_Config back at each hot-plug event and sets the link up again where the
++ * sink does not have what the output sends (intel_hdmi_reset_link()); this does the same.
++ *
++ * Only an enabled HDMI TMDS stream whose sink has SCDC and is not one whose SCDC DC leaves
++ * alone (skip_scdc_overwrite); never FRL, DVI or DisplayPort. A read of TMDS_Config that
++ * fails changes nothing, as in i915. The same connector is set up again at most once in
++ * DM_HDMI_SCDC_RESET_GAP_S seconds: a display that lost the setup with each commit could not
++ * keep the link coming up again.
++ */
++#include <drm/display/drm_scdc_helper.h>
++
++#define DM_HDMI_SCDC_RESET_GAP_S 30
++
++enum dm_hdmi_scdc_verdict {
++	DM_HDMI_SCDC_NOT_HERE,	/* no setup to keep on this stream, or DC does not write it */
++	DM_HDMI_SCDC_UNREAD,	/* TMDS_Config could not be read: nothing is done */
++	DM_HDMI_SCDC_KEPT,	/* the sink has what the stream needs */
++	DM_HDMI_SCDC_TOO_SOON,	/* lost again within the gap: not set up again before it ends */
++	DM_HDMI_SCDC_RESET,	/* lost: the stream is set up again */
++};
++
++/*
++ * What TMDS_Config holds while the stream goes out, as write_scdc_data() writes it (3 above
++ * 340 MHz, 1 with LTE_340MCSC_SCRAMBLE, 0 otherwise), and 0 where DC writes nothing: a
++ * stream that is not HDMI TMDS, a sink without SCDC, or one whose SCDC DC leaves alone.
++ */
++static u8 dm_hdmi_scdc_wanted(bool hdmi_tmds, bool scdc_present, bool skip_scdc_overwrite,
++			      u32 phy_pix_clk, bool lte_340mcsc_scramble)
++{
++	if (!hdmi_tmds || !scdc_present || skip_scdc_overwrite)
++		return 0;
++	if (phy_pix_clk > 340000)
++		return SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE;
++	return lte_340mcsc_scramble ? SCDC_SCRAMBLING_ENABLE : 0;
++}
++
++static enum dm_hdmi_scdc_verdict dm_hdmi_scdc_verdict(u8 wanted, int read, u8 config,
++						      bool too_soon)
++{
++	if (!wanted)
++		return DM_HDMI_SCDC_NOT_HERE;
++	if (read < 0)
++		return DM_HDMI_SCDC_UNREAD;
++	if ((config & (SCDC_TMDS_BIT_CLOCK_RATIO_BY_40 | SCDC_SCRAMBLING_ENABLE)) == wanted)
++		return DM_HDMI_SCDC_KEPT;
++	return too_soon ? DM_HDMI_SCDC_TOO_SOON : DM_HDMI_SCDC_RESET;
++}
++
++static bool dm_hdmi_scdc_lost(struct amdgpu_dm_connector *aconnector,
++			      const struct dm_crtc_state *acrtc_state)
++{
++	/*
++	 * The connector set up again last, and when. Under the modeset locks of its device;
++	 * with two devices a race can only get this guard wrong, and the pointer is only
++	 * compared.
++	 */
++	static const struct drm_connector *last_connector;
++	static unsigned long last_reset;
++	struct drm_connector *connector = &aconnector->base;
++	const struct dc_stream_state *stream = acrtc_state->stream;
++	const struct dc_sink *sink = stream->sink;
++	enum dm_hdmi_scdc_verdict verdict;
++	u8 wanted, config = 0;
++	int read;
++
++	if (!sink || !acrtc_state->base.active || !connector->ddc)
++		return false;
++	wanted = dm_hdmi_scdc_wanted(dc_is_hdmi_tmds_signal(stream->signal),
++				     sink->edid_caps.scdc_present,
++				     sink->edid_caps.panel_patch.skip_scdc_overwrite,
++				     stream->phy_pix_clk,
++				     stream->timing.flags.LTE_340MCSC_SCRAMBLE != 0);
++	if (!wanted)
++		return false;
++	/* a commit of the connector on its way writes TMDS_Config itself */
++	if (connector->state->commit &&
++	    !try_wait_for_completion(&connector->state->commit->hw_done))
++		return false;
++
++	read = drm_scdc_readb(connector->ddc, SCDC_TMDS_CONFIG, &config);
++	verdict = dm_hdmi_scdc_verdict(wanted, read, config,
++				       last_connector == connector &&
++				       time_before(jiffies, last_reset +
++						   DM_HDMI_SCDC_RESET_GAP_S * HZ));
++	switch (verdict) {
++	case DM_HDMI_SCDC_UNREAD:
++		drm_dbg_kms(connector->dev,
++			    "[CONNECTOR:%d:%s] SCDC TMDS_Config could not be read after a hot-plug event (%d): the link is left as it is\n",
++			    connector->base.id, connector->name, read);
++		return false;
++	case DM_HDMI_SCDC_KEPT:
++		drm_dbg_kms(connector->dev,
++			    "[CONNECTOR:%d:%s] SCDC TMDS_Config 0x%02x after a hot-plug event: the display kept the scrambling setup of the link\n",
++			    connector->base.id, connector->name, config);
++		return false;
++	case DM_HDMI_SCDC_TOO_SOON:
++		drm_info(connector->dev,
++			 "[CONNECTOR:%d:%s] the display lost the scrambling setup of the link again (SCDC TMDS_Config 0x%02x, the output sends with 0x%02x) within %d s of setting it up again: not set up again before that\n",
++			 connector->base.id, connector->name, config, wanted,
++			 DM_HDMI_SCDC_RESET_GAP_S);
++		return false;
++	case DM_HDMI_SCDC_RESET:
++		last_connector = connector;
++		last_reset = jiffies;
++		drm_info(connector->dev,
++			 "[CONNECTOR:%d:%s] after a hot-plug event with the same display, its SCDC TMDS_Config is 0x%02x and the output sends at %u kHz with 0x%02x: the output is set up again, as for a display plugged in\n",
++			 connector->base.id, connector->name, config,
++			 stream->phy_pix_clk, wanted);
++		return true;
++	default:
++		return false;
++	}
++}
++
+ /*
+  * This function handles all cases when set mode does not come upon hotplug.
+  * This includes when a display is unplugged then plugged back into the
+@@ -4217,6 +4346,9 @@ void dm_restore_drm_connector_state(struct drm_device *dev,
+ 	 */
+ 	if (acrtc_state->stream->sink != aconnector->dc_sink)
+ 		dm_force_atomic_commit(&aconnector->base);
++	/* Hades: ... and the same sink, which lost the scrambling setup of the link */
++	else if (dm_hdmi_scdc_lost(aconnector, acrtc_state))
++		dm_force_atomic_commit(&aconnector->base);
+ }
+ 
+ static bool dm_edid_parser_send_cea(struct amdgpu_display_manager *dm,

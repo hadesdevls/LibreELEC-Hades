@@ -1,0 +1,317 @@
+From 92339ad01b10ac7a07dfc46e491760ecfbbb5c8a Mon Sep 17 00:00:00 2001
+From: Mounir IDRASSI <mounir.idrassi@idrix.fr>
+Date: Mon, 27 Jul 2026 11:44:48 +0900
+Subject: [PATCH] Fix provider fallback duplication in provider store
+
+provider_activate_fallbacks() created a second provider object when a
+fallback had already been loaded with OSSL_PROVIDER_try_load(..., 1).
+Child-provider synchronization matches by name, so the duplicate could
+unbalance references and cause a double free during store teardown.
+
+Reuse the existing store entry and take the activation reference owned by
+automatic fallback loading. Construct a new object only when no match
+exists, and assert that the upcall-suppressed reuse path is not used for
+child providers.
+
+Add regression tests for the original sequence, a default-only variant,
+and reactivation of an inactive in-store provider.
+
+Fixes #32079
+Assisted-by: OpenCode:GLM-5.2
+Assisted-by: Grok:Grok-4.5
+
+Reviewed-by: Jakub Zelenka <jakub.zelenka@openssl.foundation>
+Reviewed-by: Nikola Pajkovsky <nikolap@openssl.org>
+Merge-date: Thu Oct 29 12:00:04 2026
+Merged-from: https://github.com/openssl/openssl/pull/32088
+(cherry picked from commit 5d0c3576b4df2d56bfa4e98d7eb68a3fe35858ae)
+---
+ crypto/provider_core.c        |  36 +++++++
+ test/provider_fallback_test.c | 194 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 229 insertions(+), 1 deletion(-)
+
+diff --git a/crypto/provider_core.c b/crypto/provider_core.c
+index 2a47a9e..c84a7d1 100644
+--- a/crypto/provider_core.c
++++ b/crypto/provider_core.c
+@@ -1299,6 +1299,10 @@ static int provider_activate(OSSL_PROVIDER *prov, int lock, int upcalls)
+ 
+         if (count == 1 && store != NULL) {
+             ret = create_provider_children(prov);
++            if (!ret
++                && CRYPTO_atomic_add(&prov->activatecnt, -1, &count,
++                    prov->activatecnt_lock))
++                prov->flag_activated = 0;
+         }
+     }
+     if (lock) {
+@@ -1438,6 +1442,9 @@ static int provider_activate_fallbacks(struct provider_store_st *store)
+     int activated_fallback_count = 0;
+     int ret = 0;
+     const OSSL_PROVIDER_INFO *p;
++    OSSL_PROVIDER tmpl = {
++        0,
++    };
+ 
+     if (!CRYPTO_THREAD_read_lock(store->lock))
+         return 0;
+@@ -1460,10 +1467,39 @@ static int provider_activate_fallbacks(struct provider_store_st *store)
+         OSSL_PROVIDER_INFO *info = store->provinfo;
+         STACK_OF(INFOPAIR) *params = NULL;
+         size_t i;
++        int idx;
+ 
+         if (!p->is_fallback)
+             continue;
+ 
++        /*
++         * Reuse an explicitly loaded fallback and take the activation
++         * reference normally owned by automatic fallback loading.
++         */
++        tmpl.name = (char *)p->name;
++        idx = sk_OSSL_PROVIDER_find(store->providers, &tmpl);
++        if (idx != -1) {
++            int activate_count;
++
++            prov = sk_OSSL_PROVIDER_value(store->providers, idx);
++            /*
++             * store->lock is held. Take flag_lock in order and suppress
++             * internal locking. Fallback entries cannot require parent upcalls.
++             */
++#ifndef FIPS_MODULE
++            if (!ossl_assert(!prov->ischild))
++                goto err;
++#endif
++            if (!CRYPTO_THREAD_write_lock(prov->flag_lock))
++                goto err;
++            activate_count = provider_activate(prov, 0, 0);
++            CRYPTO_THREAD_unlock(prov->flag_lock);
++            if (activate_count < 0)
++                goto err;
++            activated_fallback_count++;
++            continue;
++        }
++
+         for (i = 0; i < store->numprovinfo; info++, i++) {
+             if (strcmp(info->name, p->name) != 0)
+                 continue;
+diff --git a/test/provider_fallback_test.c b/test/provider_fallback_test.c
+index db65af3..dfdff1d 100644
+--- a/test/provider_fallback_test.c
++++ b/test/provider_fallback_test.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2020-2024 The OpenSSL Project Authors. All Rights Reserved.
++ * Copyright 2020-2026 The OpenSSL Project Authors. All Rights Reserved.
+  *
+  * Licensed under the Apache License 2.0 (the "License").  You may not use
+  * this file except in compliance with the License.  You can obtain a copy
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <stddef.h>
++#include <string.h>
+ #include <openssl/provider.h>
+ #include <openssl/evp.h>
+ #include "testutil.h"
+@@ -53,9 +54,200 @@ static int test_explicit_provider(void)
+     return ok;
+ }
+ 
++/* Count active default providers. */
++static int count_default_provider(OSSL_PROVIDER *prov, void *cbdata)
++{
++    int *count = cbdata;
++
++    if (strcmp(OSSL_PROVIDER_get0_name(prov), "default") == 0)
++        (*count)++;
++    return 1;
++}
++
++/* Reproduce fallback duplication with child-provider synchronization. */
++static int test_fallback_duplication(void)
++{
++    OSSL_LIB_CTX *ctx = NULL;
++    OSSL_PROVIDER *legacy = NULL, *deflt = NULL;
++    EVP_MD *md = NULL;
++    int default_count;
++    int ok = 0;
++#ifdef OPENSSL_NO_MD4
++    const char *trigger_algo = "SHA256";
++#else
++    const char *trigger_algo = "MD4";
++#endif
++
++    if (!TEST_ptr(ctx = OSSL_LIB_CTX_new()))
++        return 0;
++
++    /* Load legacy first so the child-provider path is exercised. */
++    legacy = OSSL_PROVIDER_try_load(ctx, "legacy", 1);
++    if (legacy == NULL) {
++        int skip = TEST_skip("Legacy provider not available");
++
++        OSSL_LIB_CTX_free(ctx);
++        return skip;
++    }
++
++    /* Load default while retaining automatic fallback activation. */
++    if (!TEST_ptr(deflt = OSSL_PROVIDER_try_load(ctx, "default", 1)))
++        goto err;
++
++    /* Trigger fallback activation; MD4 also exercises legacy. */
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, trigger_algo, "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++
++    default_count = 0;
++    if (!TEST_true(OSSL_PROVIDER_do_all(ctx, count_default_provider,
++            &default_count))
++        || !TEST_int_eq(default_count, 1))
++        goto err;
++
++    /* The fallback reference must keep default active. */
++    if (!TEST_true(OSSL_PROVIDER_unload(deflt)))
++        goto err;
++    deflt = NULL;
++    if (!TEST_true(OSSL_PROVIDER_unload(legacy)))
++        goto err;
++    legacy = NULL;
++
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, "SHA256", "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++
++    /* Repeat the issue's load/fetch/unload cycle. */
++    if (!TEST_ptr(deflt = OSSL_PROVIDER_try_load(ctx, "default", 1)))
++        goto err;
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, "SHA256", "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++    if (!TEST_true(OSSL_PROVIDER_unload(deflt)))
++        goto err;
++    deflt = NULL;
++
++    ok = 1;
++
++err:
++    EVP_MD_free(md);
++    OSSL_PROVIDER_unload(deflt);
++    OSSL_PROVIDER_unload(legacy);
++    /* This teardown previously double-freed the duplicate. */
++    OSSL_LIB_CTX_free(ctx);
++    return ok;
++}
++
++/* Reproduce the duplication without relying on the legacy module. */
++static int test_fallback_default_only(void)
++{
++    OSSL_LIB_CTX *ctx = NULL;
++    OSSL_PROVIDER *deflt = NULL;
++    EVP_MD *md = NULL;
++    int default_count;
++    int ok = 0;
++
++    if (!TEST_ptr(ctx = OSSL_LIB_CTX_new()))
++        return 0;
++
++    if (!TEST_ptr(deflt = OSSL_PROVIDER_try_load(ctx, "default", 1)))
++        goto err;
++
++    /* Fallback activation must reuse the explicit default. */
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, "SHA256", "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++
++    default_count = 0;
++    if (!TEST_true(OSSL_PROVIDER_do_all(ctx, count_default_provider,
++            &default_count))
++        || !TEST_int_eq(default_count, 1))
++        goto err;
++
++    /* Unloading the explicit handle must not deactivate the fallback. */
++    if (!TEST_true(OSSL_PROVIDER_unload(deflt)))
++        goto err;
++    deflt = NULL;
++
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, "SHA256", "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++
++    ok = 1;
++
++err:
++    EVP_MD_free(md);
++    OSSL_PROVIDER_unload(deflt);
++    OSSL_LIB_CTX_free(ctx);
++    return ok;
++}
++
++/* Exercise fallback reuse with an inactive in-store provider. */
++static int test_fallback_reactivate_inactive(void)
++{
++    OSSL_LIB_CTX *ctx = NULL;
++    OSSL_PROVIDER *legacy = NULL, *deflt = NULL;
++    EVP_MD *md = NULL;
++    int default_count;
++    int ok = 0;
++
++    if (!TEST_ptr(ctx = OSSL_LIB_CTX_new()))
++        return 0;
++
++    /* Register child-provider callbacks before loading default. */
++    legacy = OSSL_PROVIDER_try_load(ctx, "legacy", 1);
++    if (legacy == NULL) {
++        int skip = TEST_skip("Legacy provider not available");
++
++        OSSL_LIB_CTX_free(ctx);
++        return skip;
++    }
++
++    if (!TEST_ptr(deflt = OSSL_PROVIDER_try_load(ctx, "default", 1)))
++        goto err;
++
++    /* Leave the in-store object inactive with fallbacks enabled. */
++    if (!TEST_true(OSSL_PROVIDER_unload(deflt)))
++        goto err;
++    deflt = NULL;
++
++    /* Reactivate the object through fallback loading. */
++    if (!TEST_ptr(md = EVP_MD_fetch(ctx, "SHA256", "-fips")))
++        goto err;
++    EVP_MD_free(md);
++    md = NULL;
++
++    default_count = 0;
++    if (!TEST_true(OSSL_PROVIDER_do_all(ctx, count_default_provider,
++            &default_count))
++        || !TEST_int_eq(default_count, 1))
++        goto err;
++
++    if (!TEST_true(OSSL_PROVIDER_unload(legacy)))
++        goto err;
++    legacy = NULL;
++
++    ok = 1;
++
++err:
++    EVP_MD_free(md);
++    OSSL_PROVIDER_unload(deflt);
++    OSSL_PROVIDER_unload(legacy);
++    OSSL_LIB_CTX_free(ctx);
++    return ok;
++}
++
+ int setup_tests(void)
+ {
+     ADD_TEST(test_fallback_provider);
+     ADD_TEST(test_explicit_provider);
++    ADD_TEST(test_fallback_duplication);
++    ADD_TEST(test_fallback_default_only);
++    ADD_TEST(test_fallback_reactivate_inactive);
+     return 1;
+ }

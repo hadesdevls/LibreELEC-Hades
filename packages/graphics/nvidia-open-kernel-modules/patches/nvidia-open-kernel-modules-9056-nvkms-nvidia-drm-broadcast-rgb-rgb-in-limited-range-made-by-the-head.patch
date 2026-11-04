@@ -1,0 +1,354 @@
+From 72181593945e8932d7330a8fa15e3442b8d5676b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 21:27:14 +0000
+Subject: [PATCH] nvkms, nvidia-drm: Broadcast RGB, RGB in limited range made
+ by the head
+
+nvidia-drm had no "Broadcast RGB". A client that wants RGB in limited range
+(Kodi's "Use limited colour range (16-235)") had to draw its pixels in
+16-235 itself, while NVKMS drove every RGB head in full range and said so in
+the AVI InfoFrame where the display can select the range (QS), the default
+range otherwise. i915, xe and amdgpu have the property, and the Kodi of
+LibreELEC Hades asks those drivers for "Limited 16:235" and draws in full
+range, so that the range is compressed once (RgbRange.h). On nvidia-drm it
+could only compress the picture itself, and with YCbCr output, which NVKMS
+makes in limited range from the full range of the framebuffer, its 16-235
+was compressed twice.
+
+DRM's standard property is now attached to HDMI connectors and to the
+dual-mode DisplayPort connectors that are offered as HDMI. "Limited 16:235"
+sets KAPI's new hadesColorRangeLimited, which asks NVKMS for
+NV_KMS_DPY_ATTRIBUTE_COLOR_RANGE_LIMITED in the mode set of the head
+(colorRangeSpecified). NVKMS then compresses the RGB range of the head, and
+its AVI InfoFrame says limited range where the display can select it, the
+default range otherwise, as i915 does (nvkms-hdmi.c, unchanged). YCbCr stays
+limited range whatever the property says (nvChooseColorRangeEvo()). A mode
+set whose range NVKMS cannot make (RGB at 6 bpc, full range only) is refused
+(AssignProposedModeSetColorFormatAndColorRangeSpecified()) rather than sent
+otherwise.
+
+"Automatic" and "Full" leave the range to NVKMS, as before (full range for
+RGB): with the property at its default every commit is the one of before.
+Never with Dolby Vision: with the Dolby VSIF of the tunnel (Standard or
+Low-Latency) or the signalling of HDMI 1.4b in the connector state, the head
+keeps NVKMS's range, so that the tunnel goes out bit for bit in full range
+whatever the property says. A change of it is a mode set of the head, in KAPI (bRequiredModeset) and in
+DRM (mode_changed, as for NV_HDMI_VRR_OFF), compared with the head's
+inherited configuration: a commit without DRM_MODE_ATOMIC_ALLOW_MODESET that
+changes it is refused, rather than NVKMS setting the head again where the
+client did not ask for it. With "Limited 16:235" the start and the end of
+the Dolby VSIF change it too: those commits have to allow a mode set. The kernel's log says when a head is set with it
+("Hades: head N (HDMI-A-1): RGB in limited range (16-235), as Broadcast RGB
+asks: ..."), when Dolby Vision leaves it aside, and when the range is NVKMS's
+again.
+---
+ kernel-open/common/inc/nvkms-kapi.h           | 12 +++
+ kernel-open/nvidia-drm/nvidia-drm-connector.c | 91 +++++++++++++++++++
+ kernel-open/nvidia-drm/nvidia-drm-connector.h |  9 ++
+ kernel-open/nvidia-drm/nvidia-drm-modeset.c   | 53 +++++++++++
+ .../kapi/interface/nvkms-kapi.h               | 12 +++
+ src/nvidia-modeset/kapi/src/nvkms-kapi.c      | 14 ++-
+ 6 files changed, 190 insertions(+), 1 deletion(-)
+
+diff --git a/kernel-open/common/inc/nvkms-kapi.h b/kernel-open/common/inc/nvkms-kapi.h
+index c6904ac..30d46c3 100644
+--- a/kernel-open/common/inc/nvkms-kapi.h
++++ b/kernel-open/common/inc/nvkms-kapi.h
+@@ -452,6 +452,17 @@ struct NvKmsKapiHeadModeSetConfig {
+      */
+     NvU32 colorBpc;
+ 
++    /*
++     * Hades: RGB in limited range (16-235) on this head: NVKMS compresses the
++     * range of its pixels and says limited range in the AVI InfoFrame where the
++     * display can select the range (colorRangeSpecified,
++     * NV_KMS_DPY_ATTRIBUTE_COLOR_RANGE_LIMITED). FALSE leaves the range to
++     * NVKMS, as before: full range for RGB, limited range for YCbCr. nvidia-drm
++     * sets it from the connector's "Broadcast RGB" ("Limited 16:235"), never
++     * with Dolby Vision. A change of it is a mode set (ApplyModeSetConfig()).
++     */
++    NvBool hadesColorRangeLimited;
++
+     /*
+      * Hades: HDMI VRR left off in the mode set of this head (allowAdaptiveSync
+      * NVKMS_ALLOW_ADAPTIVE_SYNC_DISABLED; NVKMS_ALLOW_ADAPTIVE_SYNC_ALL
+@@ -486,6 +497,7 @@ struct NvKmsKapiHeadRequestedConfig {
+         NvBool hdmiVsifMetadataDynamic         : 1;
+         NvBool postcompColorPassthroughChanged : 1;
+         NvBool colorBpcChanged                 : 1;
++        NvBool hadesColorRangeChanged : 1; /* Hades: hadesColorRangeLimited */
+     } flags;
+ 
+     struct NvKmsKapiCursorRequestedConfig cursorRequestedConfig;
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.c b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+index 33ce032..b5f2295 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+@@ -923,6 +923,69 @@ static int nv_drm_connector_check_dv_hdmi14b(bool hdmi14b,
+     return 0;
+ }
+ 
++#if NV_DRM_HADES_BROADCAST_RGB
++/*
++ * Hades: the connector state carries Dolby Vision: the Dolby VSIF of the
++ * tunnel (IEEE OUI 00-D0-46 first: Standard or Low-Latency), the signalling
++ * of HDMI 1.4b (nv_drm_vsif_is_dolby_hdmi14b()), or a property that goes with
++ * them. "Broadcast RGB" does not make the head of such a state limited range:
++ * the tunnel goes out bit for bit, in full range.
++ */
++static bool nv_drm_connector_state_has_dolby_vision(
++    const struct nv_drm_connector_state *s)
++{
++    const struct drm_property_blob *blob = s->hdmi_vsif_metadata;
++    const uint8_t *p;
++
++    if (s->hdmi_dv_low_latency || s->hdmi_dv_hdmi14b) {
++        return true;
++    }
++    if ((blob == NULL) || (blob->data == NULL) || (blob->length < 3)) {
++        return false;
++    }
++    p = blob->data;
++    return ((p[0] == 0x46) && (p[1] == 0xd0) && (p[2] == 0x00)) ||
++           nv_drm_vsif_is_dolby_hdmi14b(p, blob->length);
++}
++
++/*
++ * Hades: "Broadcast RGB" (DRM's standard property, as i915 and amdgpu have
++ * it). "Limited 16:235" drives the head in limited range: NVKMS compresses
++ * the RGB pixels to 16-235 and says limited range in the AVI InfoFrame where
++ * the display can select the range (QS), the default range otherwise, as
++ * i915 does (KAPI hadesColorRangeLimited). "Automatic" and "Full" leave the
++ * range to NVKMS, as before: full range for RGB. YCbCr is limited range in
++ * NVKMS whatever this says. Never with Dolby Vision
++ * (nv_drm_connector_state_has_dolby_vision()). Compared with the head's
++ * inherited configuration, as "max bpc" is, so that it follows a connector
++ * that moves to this head. A change of it is a mode set, in KAPI and in DRM
++ * (mode_changed, as for NV_HDMI_VRR_OFF): a commit without
++ * DRM_MODE_ATOMIC_ALLOW_MODESET that changes it is refused
++ * (drm_atomic_check_only()), rather than NVKMS setting the head again where the
++ * client did not ask for it. With "Limited 16:235", Dolby Vision changes it
++ * too: the commits that start and end the Dolby VSIF have to allow a mode set.
++ */
++static void nv_drm_connector_hades_color_range(
++    const struct drm_connector *connector,
++    const struct drm_connector_state *new_connector_state,
++    struct drm_crtc_state *crtc_state,
++    struct NvKmsKapiHeadRequestedConfig *req_config)
++{
++    const NvBool limited =
++        (connector->broadcast_rgb_property != NULL) &&
++        (new_connector_state->hdmi.broadcast_rgb ==
++         DRM_HDMI_BROADCAST_RGB_LIMITED) &&
++        !nv_drm_connector_state_has_dolby_vision(
++            to_nv_drm_connector_state_const(new_connector_state));
++
++    if (req_config->modeSetConfig.hadesColorRangeLimited != limited) {
++        req_config->modeSetConfig.hadesColorRangeLimited = limited;
++        req_config->flags.hadesColorRangeChanged = NV_TRUE;
++        crtc_state->mode_changed = true;
++    }
++}
++#endif
++
+ static int
+ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+                                 nv_drm_atomic_state_base_t *state)
+@@ -996,6 +1059,12 @@ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+         crtc_state->mode_changed = true;
+     }
+ 
++#if NV_DRM_HADES_BROADCAST_RGB
++    /* Hades: "Broadcast RGB" (nv_drm_connector_hades_color_range()) */
++    nv_drm_connector_hades_color_range(connector, new_connector_state, crtc_state,
++                                       req_config);
++#endif
++
+     /*
+      * Hades: HDR10PLUS_VSIF, the HDR10+ vendor InfoFrame of the frame of this
+      * commit (27 bytes, IEEE OUI 90-84-8B first). It goes to NVKMS as the
+@@ -1331,6 +1400,17 @@ nv_drm_connector_new(struct drm_device *dev,
+         }
+     }
+ 
++#if NV_DRM_HADES_BROADCAST_RGB
++    /* Hades: "Broadcast RGB" on HDMI connectors (KAPI hadesColorRangeLimited) */
++    if ((nv_connector->type == NVKMS_CONNECTOR_TYPE_HDMI) &&
++        (drm_connector_attach_broadcast_rgb_property(&nv_connector->base) != 0)) {
++        NV_DRM_DEV_LOG_ERR(
++            nv_dev,
++            "Failed to attach Broadcast RGB to connector created from physical index %u",
++            nv_connector->physicalIndex);
++    }
++#endif
++
+     /* Hades: the depth NVKMS drives the display at (NV_OUTPUT_BPC) */
+     if (nv_dev->nv_connector_output_bpc_property) {
+         drm_object_attach_property(&nv_connector->base.base,
+@@ -1539,6 +1619,17 @@ void nv_drm_connector_add_dual_mode_tmds(struct nv_drm_connector *nv_connector)
+         }
+     }
+ 
++#if NV_DRM_HADES_BROADCAST_RGB
++    /* Hades: "Broadcast RGB", as on HDMI connectors */
++    if ((nv_connector->base.broadcast_rgb_property == NULL) &&
++        (drm_connector_attach_broadcast_rgb_property(&nv_connector->base) != 0)) {
++        NV_DRM_DEV_LOG_ERR(
++            nv_dev,
++            "Failed to attach Broadcast RGB to connector at physical index %u",
++            nv_connector->physicalIndex);
++    }
++#endif
++
+     drm_object_attach_property(&nv_connector->base.base,
+                                nv_dev->nv_connector_dual_mode_tmds_property,
+                                0);
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.h b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+index 063083d..75f9299 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+@@ -33,6 +33,15 @@
+ 
+ #include <drm/drm_connector.h>
+ 
++/*
++ * Hades: DRM's standard "Broadcast RGB" connector property
++ * (drm_connector_attach_broadcast_rgb_property(), drm_connector_state.hdmi),
++ * with which RGB in limited range is asked for (Linux 6.10 and later)
++ */
++#include <linux/version.h>
++#define NV_DRM_HADES_BROADCAST_RGB \
++    (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
++
+ #include "nvtypes.h"
+ #include "nvkms-api-types.h"
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-modeset.c b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+index ffd6224..41c37d1 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-modeset.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+@@ -551,6 +551,59 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
+         }
+     }
+ 
++#if NV_DRM_HADES_BROADCAST_RGB
++    /*
++     * Hades: the RGB range that "Broadcast RGB" gave a head that was set again
++     * in this commit (its mode, its displays or its range changed), in the
++     * kernel's log: limited range made by the head, "Limited 16:235" left aside
++     * while Dolby Vision goes out, or the range of NVKMS again.
++     */
++    if (commit) {
++        struct drm_connector *connector;
++        struct drm_connector_state *connector_state;
++        int j;
++
++        for_each_new_connector_in_state(state, connector, connector_state, j) {
++            struct drm_crtc *head_crtc = connector_state->crtc;
++            const struct NvKmsKapiHeadRequestedConfig *head_config;
++            NvU32 head;
++
++            if ((connector->broadcast_rgb_property == NULL) ||
++                (head_crtc == NULL) || (head_crtc->state == NULL) ||
++                !head_crtc->state->active) {
++                continue;
++            }
++            head_config = &to_nv_crtc_state(head_crtc->state)->req_config;
++            if (!head_config->flags.activeChanged &&
++                !head_config->flags.displaysChanged &&
++                !head_config->flags.modeChanged &&
++                !head_config->flags.hadesColorRangeChanged) {
++                continue;
++            }
++            head = to_nv_crtc(head_crtc)->head;
++            if (head_config->modeSetConfig.hadesColorRangeLimited) {
++                NV_DRM_DEV_LOG_INFO(
++                    nv_dev,
++                    "Hades: head %u (%s): RGB in limited range (16-235), as Broadcast RGB asks: the head compresses the range, and the AVI InfoFrame says limited range where the display can select it (the default range otherwise)",
++                    head, connector->name);
++            } else if (connector_state->hdmi.broadcast_rgb ==
++                       DRM_HDMI_BROADCAST_RGB_LIMITED) {
++                NV_DRM_DEV_LOG_INFO(
++                    nv_dev,
++                    "Hades: head %u (%s): Broadcast RGB \"Limited 16:235\" is left aside while Dolby Vision goes out: the tunnel stays full range",
++                    head, connector->name);
++            } else if (head_config->flags.hadesColorRangeChanged) {
++                NV_DRM_DEV_LOG_INFO(
++                    nv_dev,
++                    "Hades: head %u (%s): the RGB range is NVKMS's again (full range for RGB), with Broadcast RGB \"%s\"",
++                    head, connector->name,
++                    drm_hdmi_connector_get_broadcast_rgb_name(
++                        connector_state->hdmi.broadcast_rgb));
++            }
++        }
++    }
++#endif
++
+ #ifdef NV_DRM_SUPPORT_CONTENT_PROTECTION_PROPERTY
+     if (commit) {
+         struct drm_connector *connector;
+diff --git a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+index c6904ac..30d46c3 100644
+--- a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
++++ b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+@@ -452,6 +452,17 @@ struct NvKmsKapiHeadModeSetConfig {
+      */
+     NvU32 colorBpc;
+ 
++    /*
++     * Hades: RGB in limited range (16-235) on this head: NVKMS compresses the
++     * range of its pixels and says limited range in the AVI InfoFrame where the
++     * display can select the range (colorRangeSpecified,
++     * NV_KMS_DPY_ATTRIBUTE_COLOR_RANGE_LIMITED). FALSE leaves the range to
++     * NVKMS, as before: full range for RGB, limited range for YCbCr. nvidia-drm
++     * sets it from the connector's "Broadcast RGB" ("Limited 16:235"), never
++     * with Dolby Vision. A change of it is a mode set (ApplyModeSetConfig()).
++     */
++    NvBool hadesColorRangeLimited;
++
+     /*
+      * Hades: HDMI VRR left off in the mode set of this head (allowAdaptiveSync
+      * NVKMS_ALLOW_ADAPTIVE_SYNC_DISABLED; NVKMS_ALLOW_ADAPTIVE_SYNC_ALL
+@@ -486,6 +497,7 @@ struct NvKmsKapiHeadRequestedConfig {
+         NvBool hdmiVsifMetadataDynamic         : 1;
+         NvBool postcompColorPassthroughChanged : 1;
+         NvBool colorBpcChanged                 : 1;
++        NvBool hadesColorRangeChanged : 1; /* Hades: hadesColorRangeLimited */
+     } flags;
+ 
+     struct NvKmsKapiCursorRequestedConfig cursorRequestedConfig;
+diff --git a/src/nvidia-modeset/kapi/src/nvkms-kapi.c b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+index 57ae631..be736bf 100644
+--- a/src/nvidia-modeset/kapi/src/nvkms-kapi.c
++++ b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+@@ -3597,6 +3597,17 @@ static NvBool NvKmsKapiRequestedModeSetConfigToKms(
+             paramsHead->colorBpc =
+                 (enum NvKmsDpyAttributeColorBpcValue)headModeSetConfig->colorBpc;
+         }
++
++        /*
++         * Hades: "Broadcast RGB" "Limited 16:235" of nvidia-drm. Specified, the
++         * range is that one or the mode set fails (NVKMS checks that the range
++         * it chose is the one asked for): RGB at 6 bpc, which NVKMS drives in
++         * full range only, is refused rather than sent otherwise.
++         */
++        if (headModeSetConfig->hadesColorRangeLimited) {
++            paramsHead->colorRangeSpecified = NV_TRUE;
++            paramsHead->colorRange = NV_KMS_DPY_ATTRIBUTE_COLOR_RANGE_LIMITED;
++        }
+     }
+ 
+     return NV_TRUE;
+@@ -3946,7 +3957,8 @@ static NvBool ApplyModeSetConfig(
+             headRequestedConfig->flags.activeChanged       ||
+             headRequestedConfig->flags.displaysChanged     ||
+             headRequestedConfig->flags.modeChanged         ||
+-            headRequestedConfig->flags.colorBpcChanged;
++            headRequestedConfig->flags.colorBpcChanged ||
++            headRequestedConfig->flags.hadesColorRangeChanged;
+ 
+         if (!device->caps.supportsFlipSynchronizedInfoframes) {
+             /*
+-- 
+2.53.0
+

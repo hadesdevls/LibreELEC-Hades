@@ -64,21 +64,30 @@ make_target() {
 }
 
 makeinstall_target() {
+  # Hades: test, font, gfxterm, gfxmenu, png, video_colors and bitmap_scale for the look of the boot menu
+  # (theme/, which scripts/mkimage puts next to grub.cfg; grub-9000 says the mode that gfxterm got).
   # Hades: part_msdos as well as part_gpt. The installer of the image (boot entry "Installer")
   # gives a disk an MBR partition table when it runs from a start in legacy BIOS and the disk is
   # under 2.2 TB, and puts this GRUB on it for UEFI; without part_msdos GRUB cannot tell the
   # partition it was started from, its prefix is the whole disk and it stops at its console.
   ${PKG_BUILD}/.${HOST_NAME}/grub-mkimage -d grub-core -o bootia32.efi -O i386-efi -p /EFI/BOOT \
     boot chain configfile ext2 fat linux search efi_gop \
-    part_gpt part_msdos gzio gettext loadenv loadbios memrw
+    part_gpt part_msdos gzio gettext loadenv loadbios memrw \
+    test font gfxterm gfxmenu png video_colors bitmap_scale
 
   ${PKG_BUILD}/.${HOST_NAME}/grub-mkimage -d ${PKG_BUILD}/.x86_64-efi/grub-core -o bootx64.efi -O x86_64-efi -p /EFI/BOOT \
     boot chain configfile ext2 fat linux search efi_gop \
-    part_gpt part_msdos gzio gettext loadenv loadbios memrw
+    part_gpt part_msdos gzio gettext loadenv loadbios memrw \
+    test font gfxterm gfxmenu png video_colors bitmap_scale
 
   mkdir -p ${INSTALL}/usr/share/grub
      cp -P bootia32.efi bootx64.efi ${INSTALL}/usr/share/grub
 
   mkdir -p ${TOOLCHAIN}/share/grub
      cp -P bootia32.efi bootx64.efi ${TOOLCHAIN}/share/grub
+
+  # Hades: the look of the boot menu, for the image (scripts/mkimage puts it next to grub.cfg; the
+  # installer of the image copies it from there)
+  rm -rf ${TOOLCHAIN}/share/grub/hades
+  cp -r ${PKG_DIR}/theme/hades ${TOOLCHAIN}/share/grub/hades
 }

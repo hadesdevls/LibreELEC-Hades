@@ -28,8 +28,11 @@ Elsewhere in the tree:
 | `distributions/LibreELEC/splash/splash-720.png` to `splash-2160.png` | the screen while the system starts, one for each of eleven heights of screen. LibreELEC's five carried its logo and the words "Just enough OS for KODI" |
 | `packages/mediacenter/LibreELEC-settings/brand/logo.png`, `wizard.png` | the logo at the foot of the window of LibreELEC's settings and the side of its first-run wizard, which carried the same; installed by the recipe of that add-on |
 | `packages/mediacenter/kodi/hades/processinfo.png` | not a picture of the build's name: the icon of the button of Estuary's video OSD that opens the player information (`kodi-9005`), drawn for this build by `make-processinfo-icon.py` next to it (a panel with three lines, 128 by 128, white with alpha like Estuary's other OSD buttons); nothing of it comes from Estuary or from any other source. The recipe of Kodi copies it into the skin |
+| `packages/mediacenter/kodi/brand/notice/notice-720.png` to `notice-2160.png` | the notice that the start shows where several displays are connected ("LibreELEC Hades shows on one display..."), in English and Spanish: the splash screen of that height with a card under the name. `kodi-display-notice` draws it with `ply-image` before Kodi starts, so that only the card appears; installed into `/usr/lib/kodi/notice` |
 
 `logo.png` has the size of the file that it replaces. `wizard.png` has not: the add-on draws it into a place of 270 by 676 whatever its proportions, so it has those proportions, at twice that size (LibreELEC's own, 318 by 732, is drawn narrower than it is).
+
+The mark and the name stand 70 lines (of 1080) higher than the middle of the screen in every splash screen, to leave the card of the notice its place (2026-11-03).
 
 A user's own `splash.jpg` or `splash.png` in `/storage/.kodi/media` takes the place of the splash screen of the interface, and an `oemsplash.png` on the boot partition the place of the one of the system, as in Kodi and LibreELEC.
 
@@ -45,7 +48,7 @@ The init takes the picture of the height of the screen, or the one of 1080 lines
 
 ## How they are made
 
-`src/make-brand-images.py` computes them; nothing is traced from another picture. It needs Python 3 with Pillow (built with FreeType) and NumPy, and writes three folders (`kodi`, `boot`, `settings`):
+`src/make-brand-images.py` computes them; nothing is traced from another picture. It needs Python 3 with Pillow (built with FreeType) and NumPy, and writes four folders (`kodi`, `boot`, `settings`, `notice`):
 
     python3 src/make-brand-images.py --jost src/Jost-VariableFont_wght.ttf --out <folder>
 

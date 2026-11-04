@@ -28,6 +28,12 @@ WHAT IS WRITTEN HERE
       (for example, left by an earlier version) is emptied before this start writes there, and start.txt
       then says what it was.
 
+  previous-boot
+      Written right at the start: the journal of the start before this one (journal.txt.gz, and its
+      kernel lines in journal-kernel.txt.gz), up to its last line. It tells how a start ended that hung or
+      lost its power before it could save anything. While the switch is on, the journal of each start is
+      kept in the PC's storage for this (16 MiB at most); once it is off, that journal is deleted.
+
   1-minute, 4-minutes
       About 1 and 4 minutes after the media centre starts: the graphics cards and what is connected to
       each (with the EDID of every display, without its serial number), the kernel log, the last of the

@@ -1,0 +1,667 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:52:29 +0000
+Subject: [PATCH] BD-J titles play in the isolated BD-J host, never in the
+ player's process
+
+With the remote code built (Linux), a disc whose index has BD-J titles is handed over to the host
+when the player starts it with its menus: bd_play(), bd_play_title() of the first play, and
+bd_start_bdj(). From then on every public function that reads or changes the playback state goes
+there (bd_read(), bd_read_ext(), the events, seeks and positions, titles, angles, streams, user
+input, rate, menu call, player settings, overlay registrations, bd_get_clpi() through the clip
+name). What only reads the disc stays in the player, which parses its own copy as before: disc
+info, metadata, title and playlist info, sound effects, files. A disc without BD-J titles, or one
+played by playlist, does not change at all.
+
+The player settings given before the hand-over are recorded and replayed in the host in the same
+order, those given before the disc was opened before the host opens it; the host keeps its own
+Java, cache and persistent storage. BLURAY_DISC_INFO says it (bdj_remote), and libjvm_detected and
+bdj_handled then say whether the host can be reached (its socket, /run/hades-bdj/bdj.sock), not
+whether a JVM loads here.
+
+No Java VM starts in the player's process: if the host is not there or can not start the disc,
+its BD-J titles do not run (BD_ERROR_BDJ), and the rest of the disc plays as before.
+BLURAY_PLAYER_SETTING_BDJ_REMOTE (BLURAY_BDJ_REMOTE_NEVER) is for the host itself, before the disc
+is opened.
+---
+ src/libbluray/bluray.c          | 207 +++++++++++++++++++++++++++++++-
+ src/libbluray/bluray.h          |  36 ++++++
+ src/libbluray/bluray_internal.h |   7 ++
+ src/meson.build                 |  16 ++-
+ 4 files changed, 262 insertions(+), 4 deletions(-)
+
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 2453984..7344642 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -53,6 +53,9 @@
+ #include "file/file.h"
+ #include "bdj/bdj.h"
+ #include "bdj/bdjo_parse.h"
++#ifdef HAVE_BDJ_REMOTE
++#include "remote/bdr_client.h"
++#endif
+ 
+ #include <stdio.h> // SEEK_
+ #include <stdlib.h>
+@@ -173,8 +176,28 @@ struct bluray {
+     bd_argb_overlay_proc_f argb_overlay_proc;
+     BD_ARGB_BUFFER      *argb_buffer;
+     BD_MUTEX             argb_buffer_mutex;
++
++    /* (LibreELEC Hades) BD-J titles in the isolated BD-J host */
++    uint8_t              bdj_remote_mode;   /* bd_player_setting_bdj_remote */
++#ifdef HAVE_BDJ_REMOTE
++    BDR_CLIENT          *remote;            /* set once this BLURAY plays in the host */
++    BDR_RECORD           bdr_rec;           /* player settings to give the host */
++    void                *ov_proc_handle;    /* the HDMV overlay callback, for the host */
++    bd_overlay_proc_f    ov_proc;
++#endif
+ };
+ 
++/*
++ * (LibreELEC Hades) Once a BLURAY plays in the isolated BD-J host, its calls go there.
++ */
++#ifdef HAVE_BDJ_REMOTE
++#define BDR_FORWARD(bd, call)       do { if ((bd) && (bd)->remote) { return call; } } while (0)
++#define BDR_FORWARD_VOID(bd, call)  do { if ((bd) && (bd)->remote) { call; return; } } while (0)
++#else
++#define BDR_FORWARD(bd, call)       do { } while (0)
++#define BDR_FORWARD_VOID(bd, call)  do { } while (0)
++#endif
++
+ /* Stream Packet Number = byte offset / 192. Avoid 64-bit division. */
+ #define SPN(pos) (((uint32_t)((pos) >> 6)) / 3)
+ 
+@@ -998,6 +1021,18 @@ static void _check_bdj(BLURAY *bd)
+     if (!bd->disc_info.bdj_handled) {
+         if (!bd->disc || bd->disc_info.bdj_detected) {
+ 
++#ifdef HAVE_BDJ_REMOTE
++            /* BD-J titles run in the isolated host, never here: can it be reached ? */
++            if (bd->bdj_remote_mode == BLURAY_BDJ_REMOTE_AUTO) {
++                bd->disc_info.bdj_remote = 1;
++                if (bdr_available()) {
++                    bd->disc_info.libjvm_detected = 1;
++                    bd->disc_info.bdj_handled = 1;
++                }
++                return;
++            }
++#endif
++
+             /* Check if jvm + jar can be loaded ? */
+             switch (bdj_jvm_available(&bd->bdj_config)) {
+                 case BDJ_CHECK_OK:
+@@ -1444,6 +1479,13 @@ static int _start_bdj(BLURAY *bd, unsigned title)
+ {
+     if (bd->bdjava == NULL) {
+         const char *root = disc_root(bd->disc);
++#ifdef HAVE_BDJ_REMOTE
++        if (bd->bdj_remote_mode == BLURAY_BDJ_REMOTE_AUTO) {
++            /* the isolated host does not play this disc: its Java titles do not run here either */
++            BD_DEBUG(DBG_BDJ | DBG_CRIT, "BD-J titles run only in the isolated BD-J host\n");
++            return 0;
++        }
++#endif
+         bd->bdjava = bdj_open(root, bd, bd->disc_info.bdj_disc_id, &bd->bdj_config);
+         if (!bd->bdjava) {
+             return 0;
+@@ -1604,12 +1646,57 @@ BLURAY *bd_open(const char *device_path, const char *keyfile_path)
+     return bd;
+ }
+ 
++#ifdef HAVE_BDJ_REMOTE
++/*
++ * (LibreELEC Hades) Hand a disc with BD-J titles over to the isolated BD-J host, once, when the
++ * player starts it with its menus. 1 if this BLURAY now plays there.
++ */
++static int _bdr_hand_over(BLURAY *bd)
++{
++    BDR_START start;
++    BDR_CLIENT *client;
++
++    if (bd->remote || bd->bdj_remote_mode != BLURAY_BDJ_REMOTE_AUTO || !bd->disc ||
++        !bd->disc_info.bdj_detected || !bd->disc_info.bdj_handled) {
++        return 0;
++    }
++
++    memset(&start, 0, sizeof(start));
++    start.disc        = bd->disc;
++    start.rec         = &bd->bdr_rec;
++    start.debug_mask  = bd_get_debug_mask();
++    start.ov_handle   = bd->ov_proc_handle;
++    start.ov_proc     = bd->ov_proc;
++    bd_mutex_lock(&bd->argb_buffer_mutex);
++    start.argb_handle = bd->argb_overlay_proc_handle;
++    start.argb_proc   = bd->argb_overlay_proc;
++    start.argb_buf    = bd->argb_buffer;
++    bd_mutex_unlock(&bd->argb_buffer_mutex);
++
++    client = bdr_client_start(&start);
++    if (!client) {
++        BD_DEBUG(DBG_BDJ | DBG_CRIT, "The isolated BD-J host could not start this disc: its Java titles do not run\n");
++        return 0;
++    }
++
++    bd_mutex_lock(&bd->mutex);
++    bd->remote = client;
++    bd_mutex_unlock(&bd->mutex);
++    return 1;
++}
++#endif
++
+ void bd_close(BLURAY *bd)
+ {
+     if (!bd) {
+         return;
+     }
+ 
++#ifdef HAVE_BDJ_REMOTE
++    bdr_client_close(&bd->remote);
++    bdr_record_free(&bd->bdr_rec);
++#endif
++
+     _close_bdj(bd);
+ 
+     _close_m2ts(&bd->st0);
+@@ -1784,6 +1871,7 @@ static int64_t _seek_time(BLURAY *bd, uint64_t tick, uint8_t is_uo_mask_checked)
+ 
+ int64_t bd_seek_time(BLURAY *bd, uint64_t tick)
+ {
++    BDR_FORWARD(bd, bdr_seek_time(bd->remote, tick));
+     int64_t ret = 0;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -1797,6 +1885,7 @@ int64_t bd_seek_time(BLURAY *bd, uint64_t tick)
+ 
+ uint64_t bd_tell_time(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_tell_time(bd->remote));
+     uint32_t clip_pkt = 0, out_pkt = 0, out_time = 0;
+     const NAV_CLIP *clip;
+ 
+@@ -1820,6 +1909,7 @@ uint64_t bd_tell_time(BLURAY *bd)
+ 
+ int64_t bd_seek_chapter(BLURAY *bd, unsigned chapter)
+ {
++    BDR_FORWARD(bd, bdr_seek_chapter(bd->remote, chapter));
+     int is_uo_mask_checked;
+     uint32_t clip_pkt, out_pkt;
+     const NAV_CLIP *clip;
+@@ -1860,6 +1950,7 @@ int64_t bd_seek_chapter(BLURAY *bd, unsigned chapter)
+ 
+ int64_t bd_chapter_pos(BLURAY *bd, unsigned chapter)
+ {
++    BDR_FORWARD(bd, bdr_chapter_pos(bd->remote, chapter));
+     uint32_t clip_pkt, out_pkt;
+     int64_t ret = -1;
+ 
+@@ -1880,6 +1971,7 @@ int64_t bd_chapter_pos(BLURAY *bd, unsigned chapter)
+ 
+ uint32_t bd_get_current_chapter(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_get_current_chapter(bd->remote));
+     uint32_t ret = 0;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -1895,6 +1987,7 @@ uint32_t bd_get_current_chapter(BLURAY *bd)
+ 
+ int64_t bd_seek_playitem(BLURAY *bd, unsigned clip_ref)
+ {
++    BDR_FORWARD(bd, bdr_seek_playitem(bd->remote, clip_ref));
+     uint32_t clip_pkt, out_pkt;
+     const NAV_CLIP *clip;
+ 
+@@ -1922,6 +2015,7 @@ int64_t bd_seek_playitem(BLURAY *bd, unsigned clip_ref)
+ 
+ int64_t bd_seek_mark(BLURAY *bd, unsigned mark)
+ {
++    BDR_FORWARD(bd, bdr_seek_mark(bd->remote, mark));
+     uint32_t clip_pkt, out_pkt;
+     const NAV_CLIP *clip;
+ 
+@@ -1948,6 +2042,7 @@ int64_t bd_seek_mark(BLURAY *bd, unsigned mark)
+ 
+ int64_t bd_seek(BLURAY *bd, uint64_t pos)
+ {
++    BDR_FORWARD(bd, bdr_seek(bd->remote, pos));
+     uint32_t pkt, clip_pkt, out_pkt, out_time;
+     const NAV_CLIP *clip;
+ 
+@@ -1973,6 +2068,7 @@ int64_t bd_seek(BLURAY *bd, uint64_t pos)
+ 
+ uint64_t bd_get_title_size(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_get_title_size(bd->remote));
+     uint64_t ret = 0;
+ 
+     if (!bd) {
+@@ -1992,6 +2088,7 @@ uint64_t bd_get_title_size(BLURAY *bd)
+ 
+ uint64_t bd_tell(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_tell(bd->remote));
+     uint64_t ret = 0;
+ 
+     if (!bd) {
+@@ -2217,6 +2314,7 @@ static int _bd_read_locked(BLURAY *bd, unsigned char *buf, int len)
+ 
+ int bd_read(BLURAY *bd, unsigned char *buf, int len)
+ {
++    BDR_FORWARD(bd, bdr_read(bd->remote, buf, len));
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2228,6 +2326,7 @@ int bd_read(BLURAY *bd, unsigned char *buf, int len)
+ 
+ int bd_read_skip_still(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_read_skip_still(bd->remote));
+     BD_STREAM *st = &bd->st0;
+     int ret = 0;
+ 
+@@ -2567,6 +2666,7 @@ static int _open_playlist(BLURAY *bd, unsigned playlist, unsigned angle)
+ 
+ int bd_select_playlist(BLURAY *bd, uint32_t playlist)
+ {
++    BDR_FORWARD(bd, bdr_select_playlist(bd->remote, playlist));
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2663,6 +2763,7 @@ static int _select_title(BLURAY *bd, uint32_t title_idx)
+ 
+ int bd_select_title(BLURAY *bd, uint32_t title_idx)
+ {
++    BDR_FORWARD(bd, bdr_select_title(bd->remote, title_idx));
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2674,6 +2775,7 @@ int bd_select_title(BLURAY *bd, uint32_t title_idx)
+ 
+ uint32_t bd_get_current_title(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_get_current_title(bd->remote));
+     return bd->title_idx;
+ }
+ 
+@@ -2717,6 +2819,7 @@ static int _bd_select_angle(BLURAY *bd, unsigned angle, uint8_t is_uo_mask_check
+ 
+ int bd_select_angle(BLURAY *bd, unsigned angle)
+ {
++    BDR_FORWARD(bd, bdr_select_angle(bd->remote, angle));
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2728,6 +2831,7 @@ int bd_select_angle(BLURAY *bd, unsigned angle)
+ 
+ unsigned bd_get_current_angle(BLURAY *bd)
+ {
++    BDR_FORWARD(bd, bdr_get_current_angle(bd->remote));
+     int angle = 0;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2742,6 +2846,7 @@ unsigned bd_get_current_angle(BLURAY *bd)
+ 
+ void bd_seamless_angle_change(BLURAY *bd, unsigned angle)
+ {
++    BDR_FORWARD_VOID(bd, bdr_seamless_angle_change(bd->remote, angle));
+     uint32_t clip_pkt;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -2768,6 +2873,14 @@ uint32_t bd_get_titles(BLURAY *bd, uint8_t flags, uint32_t min_title_length)
+         return 0;
+     }
+ 
++#ifdef HAVE_BDJ_REMOTE
++    if (bd->remote) {
++        bdr_get_titles(bd->remote, flags, min_title_length);
++    } else {
++        bdr_record_titles(&bd->bdr_rec, flags, min_title_length);
++    }
++#endif
++
+     title_list = nav_get_title_list(bd->disc, flags, min_title_length);
+     if (!title_list) {
+         BD_DEBUG(DBG_BLURAY | DBG_CRIT, "nav_get_title_list(%s) failed\n", disc_root(bd->disc));
+@@ -3052,7 +3165,7 @@ void bd_free_title_info(BLURAY_TITLE_INFO *title_info)
+  * player settings
+  */
+ 
+-int bd_set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
++static int _set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
+ {
+     static const struct { uint32_t idx; uint32_t  psr; } map[] = {
+         { BLURAY_PLAYER_SETTING_PARENTAL,       PSR_PARENTAL },
+@@ -3122,16 +3235,44 @@ int bd_set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
+     return 0;
+ }
+ 
++int bd_set_player_setting(BLURAY *bd, uint32_t idx, uint32_t value)
++{
++    if (idx == BLURAY_PLAYER_SETTING_BDJ_REMOTE) {
++        /* where BD-J runs is known before the disc is opened (its disc info says it) */
++        if (value > BLURAY_BDJ_REMOTE_NEVER || bd->disc) {
++            return 0;
++        }
++        bd->bdj_remote_mode = (uint8_t)value;
++        return 1;
++    }
++
++    BDR_FORWARD(bd, bdr_set_player_setting(bd->remote, idx, value));
++#ifdef HAVE_BDJ_REMOTE
++    bdr_record_setting(&bd->bdr_rec, bd->disc != NULL, idx, value, NULL);
++#endif
++
++    return _set_player_setting(bd, idx, value);
++}
++
+ int bd_set_player_setting_str(BLURAY *bd, uint32_t idx, const char *s)
+ {
++    BDR_FORWARD(bd, bdr_set_player_setting_str(bd->remote, idx, s));
++#ifdef HAVE_BDJ_REMOTE
++    /* the host has its own Java, cache and persistent storage */
++    if (s && idx != BLURAY_PLAYER_JAVA_HOME && idx != BLURAY_PLAYER_CACHE_ROOT &&
++        idx != BLURAY_PLAYER_PERSISTENT_ROOT) {
++        bdr_record_setting(&bd->bdr_rec, bd->disc != NULL, idx, 0, s);
++    }
++#endif
++
+     switch (idx) {
+         case BLURAY_PLAYER_SETTING_AUDIO_LANG:
+         case BLURAY_PLAYER_SETTING_PG_LANG:
+         case BLURAY_PLAYER_SETTING_MENU_LANG:
+-            return bd_set_player_setting(bd, idx, str_to_uint32(s, 3));
++            return _set_player_setting(bd, idx, str_to_uint32(s, 3));
+ 
+         case BLURAY_PLAYER_SETTING_COUNTRY_CODE:
+-            return bd_set_player_setting(bd, idx, str_to_uint32(s, 2));
++            return _set_player_setting(bd, idx, str_to_uint32(s, 2));
+ 
+         case BLURAY_PLAYER_CACHE_ROOT:
+             bd_mutex_lock(&bd->mutex);
+@@ -3227,6 +3368,7 @@ static int _select_pg_textst_stream(BLURAY *bd, uint32_t stream_id, uint32_t ena
+ 
+ int bd_select_stream(BLURAY *bd, uint32_t stream_type, uint32_t stream_id, uint32_t enable_flag)
+ {
++    BDR_FORWARD(bd, bdr_select_stream(bd->remote, stream_type, stream_id, enable_flag));
+     int is_checked_uo_mask = 0;
+     int ret = -1;
+ 
+@@ -3267,6 +3409,13 @@ int bd_start_bdj(BLURAY *bd, const char *start_object)
+         return 0;
+     }
+ 
++    BDR_FORWARD(bd, bdr_start_bdj(bd->remote, start_object));
++#ifdef HAVE_BDJ_REMOTE
++    if (_bdr_hand_over(bd)) {
++        return bdr_start_bdj(bd->remote, start_object);
++    }
++#endif
++
+     /* first play object ? */
+     if (bd->disc_info.first_play_supported) {
+         t = bd->disc_info.first_play;
+@@ -3293,6 +3442,7 @@ int bd_start_bdj(BLURAY *bd, const char *start_object)
+ 
+ void bd_stop_bdj(BLURAY *bd)
+ {
++    BDR_FORWARD_VOID(bd, bdr_stop_bdj(bd->remote));
+     bd_mutex_lock(&bd->mutex);
+     _close_bdj(bd);
+     bd_mutex_unlock(&bd->mutex);
+@@ -3644,6 +3794,13 @@ int bd_play(BLURAY *bd)
+ {
+     int result;
+ 
++    BDR_FORWARD(bd, bdr_play(bd->remote));
++#ifdef HAVE_BDJ_REMOTE
++    if (_bdr_hand_over(bd)) {
++        return bdr_play(bd->remote);
++    }
++#endif
++
+     bd_mutex_lock(&bd->mutex);
+ 
+     /* reset player state */
+@@ -3698,6 +3855,13 @@ int bd_play_title(BLURAY *bd, unsigned title)
+ {
+     int ret;
+ 
++    BDR_FORWARD(bd, bdr_play_title(bd->remote, title));
++#ifdef HAVE_BDJ_REMOTE
++    if (title == BLURAY_TITLE_FIRST_PLAY && _bdr_hand_over(bd)) {
++        return bdr_play_title(bd->remote, title);
++    }
++#endif
++
+     if (title == BLURAY_TITLE_TOP_MENU) {
+         /* menu call uses different UO mask */
+         return bd_menu_call(bd, -1);
+@@ -3737,6 +3901,7 @@ static int _try_menu_call(BLURAY *bd, int64_t pts)
+ 
+ int bd_menu_call(BLURAY *bd, int64_t pts)
+ {
++    BDR_FORWARD(bd, bdr_menu_call(bd->remote, pts));
+     int ret;
+     bd_mutex_lock(&bd->mutex);
+     ret = _try_menu_call(bd, pts);
+@@ -3936,6 +4101,7 @@ static int _read_ext(BLURAY *bd, unsigned char *buf, int len, BD_EVENT *event)
+ 
+ int bd_read_ext(BLURAY *bd, unsigned char *buf, int len, BD_EVENT *event)
+ {
++    BDR_FORWARD(bd, bdr_read_ext(bd->remote, buf, len, event));
+     int ret;
+     bd_mutex_lock(&bd->mutex);
+     ret = _read_ext(bd, buf, len, event);
+@@ -3945,6 +4111,7 @@ int bd_read_ext(BLURAY *bd, unsigned char *buf, int len, BD_EVENT *event)
+ 
+ int bd_get_event(BLURAY *bd, BD_EVENT *event)
+ {
++    BDR_FORWARD(bd, bdr_get_event(bd->remote, event));
+     if (!bd->event_queue) {
+         bd->event_queue = event_queue_new(sizeof(BD_EVENT));
+ 
+@@ -3965,6 +4132,7 @@ int bd_get_event(BLURAY *bd, BD_EVENT *event)
+ 
+ void bd_set_scr(BLURAY *bd, int64_t pts)
+ {
++    BDR_FORWARD_VOID(bd, bdr_set_scr(bd->remote, pts));
+     bd_mutex_lock(&bd->mutex);
+     bd->app_scr = 1;
+     _set_scr(bd, pts);
+@@ -4024,6 +4192,7 @@ static int _set_rate(BLURAY *bd, uint32_t rate)
+ 
+ int bd_set_rate(BLURAY *bd, uint32_t rate)
+ {
++    BDR_FORWARD(bd, bdr_set_rate(bd->remote, rate));
+     int result;
+ 
+     bd_mutex_lock(&bd->mutex);
+@@ -4035,6 +4204,7 @@ int bd_set_rate(BLURAY *bd, uint32_t rate)
+ 
+ int bd_mouse_select(BLURAY *bd, int64_t pts, uint16_t x, uint16_t y)
+ {
++    BDR_FORWARD(bd, bdr_mouse_select(bd->remote, pts, x, y));
+     uint32_t param = (x << 16) | y;
+     int result = -1;
+ 
+@@ -4102,6 +4272,7 @@ static int _get_key_uo_index(BLURAY *bd, uint32_t key_id, bd_uo_mask_index_e *uo
+ 
+ int bd_user_input(BLURAY *bd, int64_t pts, uint32_t key)
+ {
++    BDR_FORWARD(bd, bdr_user_input(bd->remote, pts, key));
+     bd_uo_mask_index_e uo_mask_idx = 0;
+     int uo_is_masked = 0;
+     int result = -1;
+@@ -4151,6 +4322,14 @@ void bd_register_overlay_proc(BLURAY *bd, void *handle, bd_overlay_proc_f func)
+         return;
+     }
+ 
++#ifdef HAVE_BDJ_REMOTE
++    bd->ov_proc_handle = handle;
++    bd->ov_proc        = func;
++    if (bd->remote) {
++        bdr_register_overlay_proc(bd->remote, handle, func);
++    }
++#endif
++
+     bd_mutex_lock(&bd->mutex);
+ 
+     gc_free(&bd->graphics_controller);
+@@ -4175,6 +4354,12 @@ void bd_register_argb_overlay_proc(BLURAY *bd, void *handle, bd_argb_overlay_pro
+     bd->argb_buffer              = buf;
+ 
+     bd_mutex_unlock(&bd->argb_buffer_mutex);
++
++#ifdef HAVE_BDJ_REMOTE
++    if (bd->remote) {
++        bdr_register_argb_overlay_proc(bd->remote, handle, func, buf);
++    }
++#endif
+ }
+ 
+ int bd_get_sound_effect(BLURAY *bd, unsigned sound_id, BLURAY_SOUND_EFFECT *effect)
+@@ -4302,8 +4487,24 @@ int bd_get_meta_file(BLURAY *bd, const char *name, void **data, int64_t *size)
+ #include "bdnav/clpi_parse.h"
+ #include "bdnav/mpls_parse.h"
+ 
++int bdpriv_clip_name(BLURAY *bd, unsigned clip_ref, char *name)
++{
++    int ok = 0;
++
++    bd_mutex_lock(&bd->mutex);
++    if (bd->title && clip_ref < bd->title->clip_list.count) {
++        memcpy(name, bd->title->clip_list.clip[clip_ref].name, 5);
++        name[5] = 0;
++        ok = 1;
++    }
++    bd_mutex_unlock(&bd->mutex);
++
++    return ok;
++}
++
+ struct clpi_cl *bd_get_clpi(BLURAY *bd, unsigned clip_ref)
+ {
++    BDR_FORWARD(bd, bdr_get_clpi(bd->remote, clip_ref));
+     if (bd->title && clip_ref < bd->title->clip_list.count) {
+         const NAV_CLIP *clip = &bd->title->clip_list.clip[clip_ref];
+         return clpi_copy(clip->cl);
+diff --git a/src/libbluray/bluray.h b/src/libbluray/bluray.h
+index 95d551a..f685f59 100644
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -131,6 +131,9 @@ typedef struct {
+     /* disc application info (libbluray > 1.2.0) */
+     uint8_t initial_dynamic_range_type; /**< bd_dynamic_range_type_e */
+ 
++    /* (LibreELEC Hades) */
++    uint8_t bdj_remote;   /**< 1 if BD-J titles run in the isolated BD-J host: libjvm_detected and bdj_handled then say whether it can be reached */
++
+ } BLURAY_DISC_INFO;
+ 
+ /*
+@@ -753,11 +756,21 @@ typedef enum {
+     BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE   = 0x101, /**< Enable/disable BD-J persistent storage. Integer. Default: enabled. */
+     BLURAY_PLAYER_SETTING_UO_RESTRICTION_LEVEL = 0x102, /**< Set User Operations (UO) restriction mask enforcement level. bd_player_setting_uo_restriction_level value. Default: BLURAY_PLAYER_SETTING_UO_RESTRICTION_RELAXED. */
+ 
++    BLURAY_PLAYER_SETTING_BDJ_REMOTE           = 0x1101, /**< (LibreELEC Hades) Where BD-J titles run. bd_player_setting_bdj_remote value, before the disc is opened. Default: BLURAY_BDJ_REMOTE_AUTO. */
++
+     BLURAY_PLAYER_PERSISTENT_ROOT              = 0x200, /**< Root path to the BD_J persistent storage location. String. */
+     BLURAY_PLAYER_CACHE_ROOT                   = 0x201, /**< Root path to the BD_J cache storage location. String. */
+     BLURAY_PLAYER_JAVA_HOME                    = 0x202, /**< Location of JRE. String. Default: NULL (autodetect). */
+ } bd_player_setting;
+ 
++/** (LibreELEC Hades) Where the BD-J titles of a disc run (BLURAY_PLAYER_SETTING_BDJ_REMOTE) */
++typedef enum {
++    BLURAY_BDJ_REMOTE_AUTO  = 0,  /**< in the isolated BD-J host (hades-bdj-host), from bd_play() on, never in this process */
++    BLURAY_BDJ_REMOTE_NEVER = 1,  /**< in this process: only the isolated host itself sets this */
++} bd_player_setting_bdj_remote;
++
++#define BD_HAVE_BDJ_REMOTE 1
++
+ /**
+  *
+  *  Update player setting
+@@ -1289,6 +1302,29 @@ BD_PUBLIC struct bd_dir_s *bd_open_dir(BLURAY *bd, const char *dir);
+  */
+ BD_PUBLIC struct bd_file_s *bd_open_file_dec(BLURAY *bd, const char *path);
+ 
++/*
++ * (LibreELEC Hades) The isolated BD-J host
++ */
++
++/** What the isolated BD-J host gives the disc */
++typedef struct bd_bdj_host_config_s {
++    const char *java_home;        /**< Java runtime of the host; NULL: autodetect */
++    const char *persistent_root;  /**< BD-J persistent storage; NULL: none */
++    const char *cache_root;       /**< BD-J cache; NULL: the default */
++} BD_BDJ_HOST_CONFIG;
++
++/**
++ *
++ *  Be the isolated BD-J host for the player on a connected socket: open the disc it plays,
++ *  through it, and play its calls until it closes the disc. Only for hades-bdj-host, in a
++ *  process that has isolated itself.
++ *
++ * @param fd  the connection (SOCK_STREAM)
++ * @param config  what the host gives the disc
++ * @return 0 when the player closed the disc, 1 otherwise
++ */
++BD_PUBLIC int bd_bdj_host_run(int fd, const BD_BDJ_HOST_CONFIG *config);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/libbluray/bluray_internal.h b/src/libbluray/bluray_internal.h
+index a1105c4..91627b9 100644
+--- a/src/libbluray/bluray_internal.h
++++ b/src/libbluray/bluray_internal.h
+@@ -86,4 +86,11 @@ BD_PRIVATE void                     bdpriv_unlock_osd_buffer(struct bluray *bd);
+ BD_PRIVATE void  bdpriv_bdj_osd_cb(struct bluray *bd, const unsigned *img, int w, int h,
+                                    int x0, int y0, int x1, int y1);
+ 
++/*
++ * isolated BD-J host
++ */
++
++/* the 5 digits of the clip of a play item of the current playlist (name[6]); 0 if none */
++BD_PRIVATE int   bdpriv_clip_name(struct bluray *bd, unsigned clip_ref, char *name);
++
+ #endif  /* _BLURAY_INTERNAL_H_ */
+diff --git a/src/meson.build b/src/meson.build
+index b1e3009..31cd9b3 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -94,6 +94,20 @@ else
+     endif
+ endif
+ 
++# LibreELEC Hades: BD-J titles in the isolated BD-J host (Linux)
++libbluray_c_args = []
++if host_machine.system() == 'linux'
++    libbluray_src += files(
++        'libbluray/remote/bdr_client.c',
++        'libbluray/remote/bdr_server.c',
++        'libbluray/remote/bdr_wire.c',
++    )
++    libbluray_c_args += '-DHAVE_BDJ_REMOTE=1'
++    if get_option('hades_bdj_test')
++        libbluray_c_args += '-DBDR_TEST_EXEC=1'
++    endif
++endif
++
+ #
+ # Library definitions
+ #
+@@ -116,7 +130,7 @@ libbluray = library('bluray', libbluray_src,
+         thread_dependency,
+         extra_dependencies,
+     ],
+-    c_args: [api_export_flags],
++    c_args: [api_export_flags, libbluray_c_args],
+     gnu_symbol_visibility: 'hidden',
+     version: libbluray_soname_version,
+     install: true,
+-- 
+2.53.0
+
