@@ -13,7 +13,11 @@
 # once, so that a forced power-off (the display lost after leaving Dolby Vision) does not lose them.
 # Also keeps a storage timeline in RAM, copied by shutdown.sh: every second for up to 4 hours, the uptime, the
 # writes completed, ms spent writing, requests in flight, ms busy, flushes and ms flushing of the device that holds
-# /storage (/sys/block/<dev>/stat), and the Kodi threads in uninterruptible sleep (state D) at that moment with
+# /storage (/sys/block/<dev>/stat); of every other disk (a drive with films under /var/media, a disc drive), as
+# <disk>=reads,sectors read,ms reading,writes,ms writing,requests in flight,ms busy, on each line where one of
+# these changed or a request is in flight (an idle disk takes no room), with a line "# <uptime> other disks: ..."
+# whenever which disks there are, or which of them something is mounted from under /var/media, changes (looked
+# at every 10 s); and the Kodi threads in uninterruptible sleep (state D) at that moment with
 # the kernel function they wait in (wchan: a vblank wait during Dolby Vision is not storage I/O). Every 10 s it
 # also records the GPU performance state, clocks, load, PCIe link, power and what holds its clocks down
 # (nvidia-smi, when present), and, every 10 s and at once when it changes, where the power comes from: the
@@ -37,7 +41,28 @@ if [ -e "/sys/block/$part" ]; then blk=$part; else blk=$(basename "$(readlink -f
 st=/sys/block/$blk/stat
 L=/run/hades-io.log
 [ -r "$st" ] || exit 0
-echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%,pcie_gen,pcie_width,W,clock_event_reasons] [amd=load%,coreMHz] [pwr=supply:status,...] (device $blk)" > $L
+echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%,pcie_gen,pcie_width,W,clock_event_reasons] [amd=load%,coreMHz] [pwr=supply:status,...] [<disk>=reads,sectors_read,read_ms,writes,write_ms,in_flight,busy_ms ...] (device $blk)" > $L
+# The other disks: every block device but the one of /storage, a loop device, a RAM disk, a mapping or a network
+# block device (their names, which are made of letters and digits only)
+others() {
+  o=""
+  for b in /sys/block/*; do
+    n=${b##*/}
+    case $n in "$blk" | loop* | ram* | zram* | dm-* | nbd* | *[!a-z0-9]*) continue ;; esac
+    [ -r $b/stat ] && o="$o $n"
+  done
+  echo "$o"
+}
+# Of those ($1), the ones that something is mounted from under /var/media (the disk or one of its partitions)
+media() {
+  m=""
+  for n in $1; do
+    awk -v n="$n" '$2 ~ /^\/var\/media\// && $1 ~ ("^/dev/" n "(p?[0-9]+)?$") { f = 1 } END { exit !f }' /proc/mounts 2>/dev/null && m="$m $n"
+  done
+  echo "${m:- none}"
+}
+disks=""
+lastdisks=""
 # Where the power comes from: each battery's status (Charging, Discharging, Full, Not_charging) and each mains or
 # USB supply's online (1 or 0), as "BAT0:Charging,ADP1:1"; empty without any (a desktop)
 pwr() {
@@ -79,7 +104,23 @@ while [ $t -lt 14400 ]; do
       g="$g amd=$(cat $c/device/gpu_busy_percent 2>/dev/null)%,$(sed -n 's/^[0-9]*: *\([0-9]*\)Mhz \*.*/\1/p' $c/device/pp_dpm_sclk 2>/dev/null | head -n 1)MHz"
     done
   fi
-  echo "$(cut -d' ' -f1 /proc/uptime) $(awk '{ print $5, $8, $9, $10, $16, $17 }' $st) $d$g" >> $L
+  if [ $((t % 10)) -eq 0 ]; then
+    disks=$(others)
+    dk="other disks:${disks:- none} (mounted under /var/media:$(media "$disks"))"
+    [ "$dk" = "$lastdisks" ] || echo "# $(cut -d' ' -f1 /proc/uptime) $dk" >> $L
+    lastdisks=$dk
+  fi
+  x=""
+  for n in $disks; do
+    # (a disk that went away since the list was made: its file cannot be opened, and it is left out)
+    read -r r1 r2 r3 r4 w1 w2 w3 w4 q k rest 2>/dev/null < /sys/block/$n/stat || continue
+    v="$r1,$r3,$r4,$w1,$w4,$q,$k"
+    eval "pv=\${io_$n:-}"
+    [ "$v" = "$pv" ] && [ "$q" = 0 ] && continue
+    eval "io_$n=\$v"
+    x="$x $n=$v"
+  done
+  echo "$(cut -d' ' -f1 /proc/uptime) $(awk '{ print $5, $8, $9, $10, $16, $17 }' $st) $d$g$x" >> $L
   sleep 1
   t=$((t + 1))
 done

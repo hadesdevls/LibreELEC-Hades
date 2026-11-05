@@ -417,13 +417,47 @@ snapshot() {
     cat $c/edid > $S/edid/$n.bin 2>/dev/null; [ -s $S/edid/$n.bin ] && echo "    edid $(wc -c < $S/edid/$n.bin) bytes" || rm -f $S/edid/$n.bin
     head -8 $c/modes 2>/dev/null | sed 's/^/    mode /'
   done
-  echo "== usb devices (bus-port: vendor:product, speed, name) and the driver of each interface (a drive: uas or usb-storage)"
+  echo "== usb devices (bus-port: vendor:product, speed, name, whether it may sleep and whether it does) and the driver of each interface (a drive: uas or usb-storage)"
   for d in /sys/bus/usb/devices/*; do
     [ -r $d/idVendor ] || continue
-    echo "${d##*/}: $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed 2>/dev/null) [$(cat $d/manufacturer $d/product 2>/dev/null | tr -s ' \n' ' ')]"
+    echo "${d##*/}: $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed 2>/dev/null) [$(cat $d/manufacturer $d/product 2>/dev/null | tr -s ' \n' ' ')] power/control=$(cat $d/power/control 2>/dev/null) runtime_status=$(cat $d/power/runtime_status 2>/dev/null)"
     for i in $d/*:*; do
       [ -e "$i/bInterfaceClass" ] && echo "    ${i##*/}: class=$(cat $i/bInterfaceClass) driver=$(basename "$(readlink $i/driver 2>/dev/null)")"
     done
+  done
+  # Hades: the USB controllers and the USB4 and Thunderbolt host routers, with their power: a controller or a hub
+  # that sleeps, or one that never may (power/control "on"), is what a device that keeps losing its connection or
+  # its range, or a drive that is not seen, can come from. And for USB4 and Thunderbolt, who sets the tunnels up:
+  # the kernel uses its own connection manager when the firmware gave it control of USB4 (the line "USB4 _OSC:
+  # OS controls" with a "+"; tb_acpi_is_native, nhi_select_cm), and otherwise tries the firmware's first. No
+  # identifier of a device is read (unique_id, boot_acl).
+  echo "== usb controllers (PCI class 0c03: UHCI, OHCI, EHCI, xHCI, USB4) and Thunderbolt host routers: driver and power (power/control: on, never sleeps; auto, may sleep while idle), and their root hubs"
+  for d in /sys/bus/pci/devices/*; do
+    c=$(cat $d/class 2>/dev/null)
+    drv=$(basename "$(readlink $d/driver 2>/dev/null)")
+    case "$c" in 0x0c03*) ;; *) [ "$drv" = thunderbolt ] || continue ;; esac
+    echo "${d##*/} class=$c vendor=$(cat $d/vendor 2>/dev/null):$(cat $d/device 2>/dev/null) driver=${drv:-none} power/control=$(cat $d/power/control 2>/dev/null) runtime_status=$(cat $d/power/runtime_status 2>/dev/null) d3cold_allowed=$(cat $d/d3cold_allowed 2>/dev/null)"
+    for h in $d/usb[0-9]*; do
+      [ -r $h/speed ] && echo "    root hub ${h##*/}: speed=$(cat $h/speed) ports=$(cat $h/maxchild 2>/dev/null) power/control=$(cat $h/power/control 2>/dev/null) runtime_status=$(cat $h/power/runtime_status 2>/dev/null)"
+    done
+  done
+  echo "usbcore autosuspend=$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null) (seconds; -1: no USB device is made to sleep by itself, as the kernel command line of the build has it)"
+  echo "== USB4 and Thunderbolt: the agreement with the firmware, who runs the connection manager, and the security level of each domain"
+  dmesg | grep -E 'USB4 _OSC|platform _OSC|thunderbolt' | tail -40
+  o=$(dmesg | grep 'USB4 _OSC: OS controls' | tail -n 1)
+  case "$o" in
+    *+*) echo "connection manager: the kernel's own (software): the firmware gave the system control of USB4 (${o##*controls })" ;;
+    "") echo "connection manager: no USB4 agreement with the firmware (a computer from before USB4, or one whose firmware does not offer it): the kernel tries the firmware's connection manager first, then its own" ;;
+    *) echo "connection manager: the firmware kept control of USB4 (${o##*controls }): the kernel tries the firmware's connection manager first, then its own" ;;
+  esac
+  echo "thunderbolt driver: $([ -d /sys/module/thunderbolt ] && echo loaded || echo 'not loaded')"
+  for t in /sys/bus/thunderbolt/devices/*; do
+    [ -e "$t" ] || continue
+    case ${t##*/} in
+      *:*) continue ;;
+      domain*) echo "${t##*/}: security=$(cat $t/security 2>/dev/null) iommu_dma_protection=$(cat $t/iommu_dma_protection 2>/dev/null) deauthorization=$(cat $t/deauthorization 2>/dev/null)" ;;
+      [0-9]*-[0-9]*) echo "${t##*/}: [$(cat $t/vendor_name $t/device_name 2>/dev/null | tr -s ' \n' ' ')] generation=$(cat $t/generation 2>/dev/null) authorized=$(cat $t/authorized 2>/dev/null) lanes and speed: rx=$(cat $t/rx_lanes 2>/dev/null)x$(cat $t/rx_speed 2>/dev/null) tx=$(cat $t/tx_lanes 2>/dev/null)x$(cat $t/tx_speed 2>/dev/null)" ;;
+    esac
   done
   echo "== kodi"; echo "kodi.bin pid: $(pidof kodi.bin)"
   lim systemctl status kodi --no-pager -l | head -30 | clean

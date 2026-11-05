@@ -37,10 +37,11 @@ WHAT IS WRITTEN HERE
   1-minute, 4-minutes
       About 1 and 4 minutes after the media centre starts: the graphics cards and what is connected to
       each (with the EDID of every display, without its serial number), the kernel log, the last of the
-      media centre's log (kodi.log), the warnings of the system, sound devices, USB devices, the state of
-      the network, services, the clock, and Bluetooth (bluetooth.txt: the controllers and their firmware,
-      the settings, and of each paired device its kind, its state and the connection that it asked for;
-      never a key, and its name only as a marker, below). The first of the two also has:
+      media centre's log (kodi.log), the warnings of the system, sound devices, USB devices and
+      controllers (USB4 and Thunderbolt too), the state of the network, services, the clock, and
+      Bluetooth (bluetooth.txt: the controllers and their firmware, the settings, and of each paired
+      device its kind, its state and the connection that it asked for; never a key, and its name only as
+      a marker, below). The first of the two also has:
         - redetect.txt: what the kernel said when the HDMI and DisplayPort sockets with nothing connected
           were asked again, and whether a graphics card was asleep. An AMD graphics card answers from what
           it last saw: it looks at a socket when it starts, when it wakes up and when something is plugged

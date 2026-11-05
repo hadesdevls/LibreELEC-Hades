@@ -8,7 +8,7 @@ LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.
 
 **Por qué la pantalla dice "LibreELEC Hades".** El centro multimedia de esta compilación es Kodi con cambios que la XBMC Foundation no ha aprobado, y la política de marca de Kodi pide a una compilación así que no use como suyos el nombre y los logos de Kodi. Por debajo es Kodi: complementos, skins y aplicaciones de mando a distancia funcionan como con Kodi, su registro sigue siendo `kodi.log` y los demás programas siguen viendo Kodi. La página "Acerca de esta compilación" de la información del sistema dice qué es y cómo apoyar a Kodi y a LibreELEC.
 
-**Versión 1.0 RC6 (noviembre de 2026).** El Dolby Vision nativo, con el perfil 7 y su capa de mejora completa, ya se ha visto funcionar en gráficas NVIDIA, AMD e Intel, con el Dolby Atmos en paso directo; lo que añade 1.0 RC6 no se ha probado todavía en hardware. Como versión candidata, necesita más hardware: si la pruebas, cuenta lo que veas en los issues. El [registro de cambios](CHANGELOG.md) dice qué cambió en cada versión.
+**Versión 1.0 RC7 (noviembre de 2026).** El Dolby Vision nativo, con el perfil 7 y su capa de mejora completa, ya se ha visto funcionar en gráficas NVIDIA, AMD e Intel, con el Dolby Atmos en paso directo; lo que añade 1.0 RC7 no se ha probado todavía en hardware. Como versión candidata, necesita más hardware: si la pruebas, cuenta lo que veas en los issues. El [registro de cambios](CHANGELOG.md) dice qué cambió en cada versión.
 
 ## Qué añade a LibreELEC
 
@@ -33,13 +33,13 @@ LibreELEC Hades es una compilación no oficial de [LibreELEC](https://libreelec.
 - Una unidad USB de 8 GB o más. Con un SSD por USB va mucho más fluido que con una memoria.
 - Para Dolby Vision:
   - **Una tele que ofrezca Dolby Vision "Standard" en la entrada HDMI que uses.** Muchas teles solo ofrecen Dolby Vision de baja latencia en una entrada preparada para juegos o para un PC; Hades lo dice y envía a esa entrada HDR10, o Dolby Vision de baja latencia si lo activas. En una LG C5, "Quick Frame Transport" tiene que estar desactivado en esa entrada.
-  - **Una gráfica compatible:** NVIDIA GeForce GTX 16, RTX 20 o posterior, y con el controlador 580 de NVIDIA las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V; gráficas AMD Radeon con hardware de pantalla DCN 1.0 o posterior, de Raven, Picasso y Navi 1x a la serie RX 9000, y, nuevo en 1.0 RC5 y sin probar todavía en hardware, las Radeon series RX 400 y RX 500, la Radeon RX Vega M, las Radeon RX Vega 56 y 64 y la Radeon VII (hardware de pantalla DCE 11.2 y 12; no el hardware AMD más antiguo, ni las pocas versiones que nombra [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers), en inglés); gráficas Intel de versión de pantalla 9 o posterior (UHD 6xx y posteriores).
+  - **Una gráfica compatible:** NVIDIA GeForce GTX 16, RTX 20 o posterior, y con el controlador 580 de NVIDIA las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V; gráficas AMD Radeon con hardware de pantalla DCN 1.0 o posterior, de Raven, Picasso y Navi 1x a la serie RX 9000, y, desde 1.0 RC5, las Radeon series RX 400 y RX 500, la Radeon RX Vega M, las Radeon RX Vega 56 y 64 y la Radeon VII (hardware de pantalla DCE 11.2 y 12; no el hardware AMD más antiguo, ni las pocas versiones que nombra [docs/how-it-works.md](docs/how-it-works.md#graphics-drivers), en inglés); gráficas Intel de versión de pantalla 9 o posterior (UHD 6xx y posteriores).
   - **El PC conectado por HDMI directamente a la tele** es lo mejor. Una barra de sonido o un receptor AV en medio tiene que dejar pasar Dolby Vision.
 - Tus propios vídeos o complementos: Hades no trae películas, complementos ni fuentes de contenido.
 
 ## Qué se ha probado
 
-El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER, tanto en la tarjeta como en la gráfica integrada del procesador, con una tele LG C5, un monitor Samsung Odyssey OLED G6 (LS27DG600SLXPE), una barra de sonido TCL Q85H Pro en el eARC de la tele y un SSD USB HIKSEMI HS-USB-SYNC C PRO de 128 GB; y en un portátil con un Intel Core i5-12450H. Lo marcado "usuario" lo contaron personas que lo probaron en su propio hardware, en los issues de este repositorio y en los foros de LibreELEC y de Kodi. Visto funcionar quiere decir con colores correctos y con una vuelta limpia a los menús; el logotipo Dolby Vision de la tele, por sí solo, no cuenta. Los resultados del autor de abajo son de 1.0 RC4 y de versiones anteriores, y los de usuarios llegan hasta 1.0 RC5; lo nuevo que no se ha probado todavía está en "Sin probar todavía".
+El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER, tanto en la tarjeta como en la gráfica integrada del procesador, con una tele LG C5, un monitor Samsung Odyssey OLED G6 (LS27DG600SLXPE), una barra de sonido TCL Q85H Pro (en el eARC de la tele, o entre el PC y la tele) y un SSD USB HIKSEMI HS-USB-SYNC C PRO de 128 GB; y en un portátil con un Intel Core i5-12450H. Lo marcado "usuario" lo contaron personas que lo probaron en su propio hardware, en los issues de este repositorio y en los foros de LibreELEC y de Kodi. Visto funcionar quiere decir con colores correctos y con una vuelta limpia a los menús; el logotipo Dolby Vision de la tele, por sí solo, no cuenta. Los resultados de abajo son de 1.0 RC6 y de versiones anteriores.
 
 ### Gráficas
 
@@ -47,18 +47,18 @@ El autor prueba en un AMD Ryzen 9 7950X3D con una NVIDIA GeForce RTX 4080 SUPER,
 | --- | --- |
 | NVIDIA GeForce serie RTX 50 | RTX 5060 (autor), RTX 5080 y RTX 5090 (usuarios) |
 | NVIDIA GeForce serie RTX 40 | RTX 4080 SUPER (autor), RTX 4080 Laptop GPU (usuario) |
-| NVIDIA GeForce serie RTX 30 | RTX 3070 y RTX 3090 (usuarios) |
-| NVIDIA GeForce series GTX 16 y RTX 20 | Sin probar todavía |
-| NVIDIA GeForce series GTX 900 y GTX 10, TITAN V (controlador 580) | Sin probar todavía |
+| NVIDIA GeForce serie RTX 30 | RTX 3050, RTX 3070 y RTX 3090 (usuarios) |
+| NVIDIA GeForce series GTX 16 y RTX 20 | Sin informes todavía |
+| NVIDIA GeForce series GTX 900 y GTX 10, TITAN V (controlador 580) | GTX 1060 (usuario) |
 | AMD Radeon serie RX 7000 | RX 7600 (usuario) |
-| AMD Radeon series RX 5000, RX 6000 y RX 9000 | Sin probar todavía |
-| AMD Radeon series RX 400 y RX 500, RX Vega M, RX Vega 56 y 64, Radeon VII (nuevo en 1.0 RC5) | Sin probar todavía |
+| AMD Radeon series RX 5000, RX 6000 y RX 9000 | Sin informes todavía |
+| AMD Radeon series RX 400 y RX 500, RX Vega M, RX Vega 56 y 64, Radeon VII (nuevo en 1.0 RC5) | Sin informes todavía |
 | Gráficas integradas de AMD Ryzen | Ryzen 9 7950X3D (autor), Ryzen 7 5800H, Ryzen 5 5600U y Ryzen 3200G (usuarios) |
 | Gráficas integradas de Intel | Core i5-12450H (autor), Core i3-1005G1, Core 5 255H y N100 (usuarios) |
 | Gráficas Intel HD y UHD 6xx | HD Graphics 610, con un Pentium G4560 (usuario) |
-| Gráficas Intel que usan el controlador `xe` (Arc serie B, Core Ultra 200V y posteriores) | Sin probar todavía |
+| Gráficas Intel que usan el controlador `xe` (Arc serie B, Core Ultra 200V y posteriores) | Sin informes todavía |
 
-Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II con Dolby Vision nativo (con su entrada HDMI en "Enhanced format"), una Samsung S90H, una Samsung S95B y un proyector JVC DLA-NZ9 con HDR10+, una LG C3 con Dolby Atmos en paso directo, una LG C1 y una LG G2 con Dolby Vision nativo a través de un receptor AV, y una tele Sony que solo ofrece Dolby Vision de baja latencia (usuarios).
+Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); LG G5, LG C2, una tele Panasonic y una Sony Bravia 8 II con Dolby Vision nativo (con su entrada HDMI en "Enhanced format"), una Samsung S90H, una Samsung S95B y un proyector JVC DLA-NZ9 con HDR10+, una LG C3 con Dolby Atmos en paso directo, una LG C1 y una LG G2 con Dolby Vision nativo a través de un receptor AV, un proyector Titan Noir Max con Dolby Vision nativo y con Dolby Vision mostrado como HDR10 y HDR10+ a través de un receptor AV, una LG OLED B7 que recupera la imagen tras apagarse y encenderse, y una tele Sony que solo ofrece Dolby Vision de baja latencia (usuarios).
 
 ### Funciones
 
@@ -66,15 +66,16 @@ Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); 
 | --- | --- |
 | Dolby Vision perfil 7 con FEL | RTX 4080 SUPER, Ryzen 9 7950X3D y Core i5-12450H (autor); RTX 4080 Laptop GPU, RTX 5080, RX 7600, Ryzen 7 5800H, Core 5 255H y HD Graphics 610 (usuarios; en la HD Graphics 610, medido: la capa de mejora en todos los fotogramas, en el último nivel de la reducción de fidelidad, sin menús sobre la imagen, issue #12) |
 | Dolby Vision perfil 7 con MEL | Ryzen 9 7950X3D (autor); RX 7600 (usuario) |
-| Dolby Vision perfiles 8.1 y 5 | RTX 4080 SUPER y Ryzen 9 7950X3D (autor); RX 7600 (usuario) |
+| Dolby Vision perfiles 8.1 y 5 | RTX 4080 SUPER y Ryzen 9 7950X3D (autor); RX 7600 (usuario); el perfil 8.1 en una RTX 5090 (usuario, issue #16) |
 | Dolby Vision en dos pistas de vídeo | `.m2ts` en la RTX 4080 SUPER (autor); MKV en una RTX 3070, y MP4 en un portátil con gráfica RTX (usuarios) |
 | Menús y subtítulos sobre Dolby Vision sin perder fotogramas | Perfiles 7 FEL y 8.1 en la RTX 4080 SUPER y el Ryzen 9 7950X3D (autor); perfil 7 FEL en una RX 7600 (usuario, medido con los menús sobre la imagen: 240 de 240 imágenes, el mayor hueco de 42,0 ms, issue #3) |
 | Dolby Vision Low-Latency | Ryzen 9 7950X3D, a través de una caja de sincronización HDMI que solo ofrece Dolby Vision de baja latencia (autor) |
-| Dolby Vision a través de un receptor AV | Ryzen 5 5600U a través de un Denon AVC-X3900H a una LG C1 (usuario, issue #15); HD Graphics 610 a través de un receptor Onkyo a una LG G2 (usuario, issue #12) |
-| Dolby Vision mostrado como HDR10 | Perfil 5 en la RTX 4080 SUPER (autor); perfiles 5 y 7 FEL en un Core i3-1005G1 (usuario) |
-| Dolby Vision mostrado como HDR10+ | Perfil 7 FEL en la RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); perfil 7 FEL en una RX 7600 con un JVC DLA-NZ9, mostrado como HDR10+ con su FEL a resolución completa (usuario, issue #10); un Core i3-1005G1 con una Samsung S90H (usuario, issue #2) |
+| Dolby Vision a través de una barra de sonido o un receptor AV | RTX 4080 SUPER a través de la barra de sonido TCL Q85H Pro a la LG C5 (autor); Ryzen 5 5600U a través de un Denon AVC-X3900H a una LG C1 (usuario, issue #15); HD Graphics 610 a través de un receptor Onkyo a una LG G2 (usuario, issue #12); RTX 5090 a través de un Denon X4800H a un proyector Titan Noir Max (usuario, issue #16); GTX 1060 con el controlador 580 a través de un receptor Denon, en todas las frecuencias de refresco (usuario) |
+| Dolby Vision mostrado como HDR10 | Perfil 5 en la RTX 4080 SUPER (autor); perfiles 5 y 7 FEL en un Core i3-1005G1 (usuario); una RTX 5090 con un proyector Titan Noir Max (usuario, issue #16) |
+| Dolby Vision mostrado como HDR10+ | Perfil 7 FEL en la RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); perfil 7 FEL en una RX 7600 con un JVC DLA-NZ9, mostrado como HDR10+ con su FEL a resolución completa, y en 1.0 RC6, medido: el JVC dice HDR10+ todo el tiempo, y DistributionY99, leído de la salida, sigue el pico que los metadatos Dolby Vision dan a cada escena (usuario, issue #10); un Core i3-1005G1 con una Samsung S90H (usuario, issue #2); una RTX 5090 con un proyector Titan Noir Max (usuario, issue #16) |
 | HDR10+ | RTX 4080 SUPER con un Samsung Odyssey OLED G6 (autor); Core i3-1005G1 con una Samsung S90H, Ryzen 3200G con una Samsung S95B, Ryzen 7 5800H, y RX 7600 con un JVC DLA-NZ9 (usuarios; en la RX 7600, medido: los paquetes HDR10+ de cuatro películas HDR10+, byte a byte los de un reproductor con licencia en 10 de 10 muestras, issue #10) |
-| HDR10+ como Dolby Vision | Ryzen 7 5800H (usuario) |
+| HDR10+ como Dolby Vision | RTX 4080 SUPER (autor); Ryzen 7 5800H (usuario) |
+| Una tele que se apaga y se enciende recupera la imagen | RTX 3050 a una LG OLED B7 a 3840x2160 a 50 Hz (usuario, issue #11) |
 | HDR10 a más de 8 bits en NVIDIA | RTX 4080 SUPER (autor) |
 | Un vídeo a 24 fps a 24 Hz exactos en NVIDIA | RTX 4080 SUPER (autor) |
 | Dolby TrueHD con Atmos, en paso directo | RTX 4080 SUPER, Ryzen 9 7950X3D y Core i5-12450H (autor); RTX 3090 (usuario) |
@@ -85,48 +86,7 @@ Teles y monitores: una tele LG C5 y un monitor Samsung Odyssey OLED G6 (autor); 
 | Arrancado desde USB con los discos internos ocultos | El PC del autor |
 | Instalador para Windows | "Actualizar" en una unidad USB real (autor); todas las demás operaciones, solo en un disco virtual |
 
-Sin probar todavía:
-
-- Dolby Vision en vídeo AV1.
-- HDR10 enviado como Dolby Vision, y Dolby Vision sin sus *trims*.
-- HDR, HLG y Dolby Vision adaptados a SDR en una pantalla sin HDR.
-- Dolby Vision nativo en una tele con un bloque Dolby Vision antiguo (versión 1) o con gestión de pantalla 2 o 3.
-- Dolby Vision a través de una barra de sonido.
-- 3D desde un disco Blu-ray, su imagen o su carpeta.
-- Una tele conectada después de arrancar Kodi, los modos nuevos de una tele tomados mientras Kodi funciona (al activar Deep Colour en la tele, por ejemplo), y llevar Kodi a otra pantalla con el ajuste Monitor de *Sistema > Pantalla*.
-- Hades instalado en un disco interno de un PC real (solo en una máquina virtual).
-- Lo nuevo de 1.0 RC4:
-  - las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V con el controlador 580, y las gráficas Intel que usan el controlador `xe`;
-  - el zoom, el desplazamiento vertical y el estiramiento con Dolby Vision nativo;
-  - el perfil 8.4 (capa base HLG, como graban los iPhone);
-  - en NVIDIA, HDR10 a una tele que declara 3D por HDMI, y HDR10 a 3840x2160 a 24, 25 y 30 Hz a una tele que toma esos modos por su VIC de HDMI;
-  - el SDR a 8 bits por HDMI en NVIDIA e Intel, y "Profundidad de la salida HDR (NVIDIA)" en 8 bits;
-  - la salida de audio de la pantalla que usa Kodi, elegida por él mismo;
-  - "Dolby Vision medido de la imagen HDR10" para un vídeo;
-  - Dolby Vision con la señalización antigua de HDMI 1.4b, en una tele que la pide (las de 2016, entre ellas las LG OLED de ese año), y el Low-Latency en un conector DisplayPort de doble modo de NVIDIA;
-  - *Discos internos que se muestran* y *Particiones internas que se muestran*, en los ajustes de LibreELEC;
-  - los demás añadidos de 1.0 RC4 que lista el registro de cambios.
-- Lo nuevo de 1.0 RC5:
-  - Dolby Vision enviado en IPT, el valor por defecto para los perfiles 7 y 8;
-  - la señal Dolby Vision puesta con el cambio de modo, antes de la primera imagen;
-  - Dolby Vision para los menús, la interfaz sobre HDR convertida exactamente, y la caché de la interfaz sobre Dolby Vision nativo;
-  - los saltos que ya no detienen el dibujo, y un flujo que se queda sin datos un momento y conserva su grupo de imágenes y su capa FEL;
-  - el Dolby Vision nativo en sincronía con el sonido como la salida normal;
-  - la entrada de arranque «Installer», que ahora da al sistema instalado los menús de arranque y el GRUB de Hades, arranca también un disco MBR en UEFI y comprueba cada paso de la instalación;
-  - el Dolby Vision nativo en las gráficas AMD con hardware de pantalla DCE 11.2 y 12 (Radeon series RX 400 y RX 500, RX Vega M, RX Vega 56 y 64, Radeon VII), y por un HDMI que NVIDIA saca por una salida DisplayPort;
-  - HDR10+ en las RTX 50, junto a la frecuencia variable por HDMI en las GTX 16 a RTX 30, y a pantallas de versión de aplicación 0;
-  - los MP4 de doble pista cuya pista de mejora es una pista HEVC corriente, y los subtítulos 3D a la profundidad del disco;
-  - los demás añadidos de 1.0 RC5 que lista el registro de cambios.
-- Nuevo en 1.0 RC6:
-  - *Salida Dolby Vision (este vídeo)* aplicada mientras el vídeo se reproduce, HDR10+ elegido para un vídeo que tiene los dos, y el ajuste del mapeo de contenido v4.0;
-  - las opciones para proyectores y pantallas que adaptan el HDR a su manera, el HDR10 enviado como Dolby Vision por el puerto HDMI de las gráficas Intel HD y UHD 6xx, y los menús sobre Dolby Vision en las gráficas más débiles;
-  - una tele que se apaga y se enciende en un modo HDMI de más de 340 MHz, los cambios de HDMI para Intel y AMD, el rango de color limitado comprimido por el controlador, Dolby Vision en los modos que NVIDIA nombra por su HDMI VIC, tres búferes en NVIDIA, y un cambio de resolución por un puerto HDMI que NVIDIA saca por una salida DisplayPort;
-  - los subtítulos de imagen ampliados, movidos y atenuados, los subtítulos de texto tras un salto, las ediciones de los archivos Matroska, y los múltiplos enteros de los fotogramas por segundo;
-  - la normalización de diálogo a 0 dB en el paso directo, los ajustes de mezcla a menos canales, la compresión de Dolby Digital, y CEC con un adaptador Pulse-Eight;
-  - las listas de Blu-ray en una sola línea de tiempo en sus uniones sin cortes, los menús de Blu-ray aparte de los subtítulos, una pantalla 3D simulada para un disco, y la profundidad de los flujos de subtítulos estereoscópicos;
-  - los menús Java de Blu-ray (BD-J) en el servicio BD-J con un disco comercial, y BD-Live;
-  - el menú de arranque nuevo;
-  - los demás añadidos de 1.0 RC6 que lista el registro de cambios.
+Cada cambio se prueba antes de publicarse: en el anfitrión, con el código que ejecuta la imagen (el [registro de cambios](CHANGELOG.md) dice cómo en cada punto), y en el hardware de arriba donde el autor lo tiene. Los informes con el diagnóstico encendido ([diagnóstico](docs/diagnostics.md)) confirman lo nuevo en más hardware.
 
 SDR, HDR10, HLG, el paso directo de audio, los menús y el cambio de frecuencia usan el código de Kodi y se comportan como en LibreELEC, salvo por lo añadido arriba.
 
@@ -135,13 +95,14 @@ SDR, HDR10, HLG, el paso directo de audio, los menús y el cambio de frecuencia 
 - **Dolby Vision necesita una señal HDMI intacta** desde un puerto HDMI de la gráfica (en NVIDIA, también desde un puerto DisplayPort que la gráfica maneja como HDMI, como el puerto HDMI de algunos portátiles). La frecuencia variable, el escalado y los ajustes de color del controlador de la gráfica no son compatibles con él, y un conversor entre DisplayPort o USB-C y HDMI no lo transmite.
 - El Dolby Vision nativo sale a 3840x2160, hasta 60 Hz. En las gráficas Intel UHD 6xx, hasta 30 Hz y solo desde un puerto HDMI de la propia gráfica.
 - En las gráficas integradas de AMD, el primer vídeo Dolby Vision tras instalar una compilación nueva puede dar tirones breves mientras Hades mide cuál de dos formas de dibujar es más rápida ahí.
-- En gráficas integradas, el perfil 5 con la información del reproductor abierta perdía fotogramas en las pruebas. Lo que cambian 1.0 RC3 y 1.0 RC4 para eso está sin probar todavía.
-- **Las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V** usan el controlador 580 de NVIDIA, que Hades elige al arrancar según la tarjeta. Un PC con una de ellas y a la vez una tarjeta NVIDIA más nueva recibe el controlador más nuevo, y la tarjeta antigua se queda sin ninguno. En las GTX 900 y GTX 10, el HDR10 sale a 8 bits por HDMI: el controlador 580 no tiene para ellas una salida HDMI de más bits.
+- En gráficas integradas, el perfil 5 con la información del reproductor abierta perdía fotogramas en las pruebas. Las versiones posteriores hicieron que los menús sobre Dolby Vision gasten menos tiempo de GPU.
+- **Las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V** usan el controlador 580 de NVIDIA, que Hades elige al arrancar según la tarjeta. Un PC con una de ellas y a la vez una tarjeta NVIDIA más nueva recibe el controlador más nuevo, y la tarjeta antigua se queda sin ninguno. El controlador 580 no le ofrece a Kodi ninguna ventana de más de 8 bits, así que Hades dibuja el HDR10 de estas tarjetas en búferes propios de 10 bits (nuevo en 1.0 RC7), y `kodi.log` dice la profundidad que informa entonces el controlador.
 - **Dolby Vision Low-Latency lo adapta Hades, no la gestión de pantalla de Dolby**, que no es pública. La tele está en su modo Dolby Vision y muestra la adaptación de Hades al brillo y los colores que da su bloque Dolby Vision.
 - **HDR10+ solo sale donde el controlador de la gráfica puede enviarlo con cada fotograma;** si no, sale como HDR10. [docs/how-it-works.md](docs/how-it-works.md#hdr10) (en inglés) dice dónde. La información del reproductor dice "HDR10+" mientras salen sus metadatos.
 - **HDR10 enviado como Dolby Vision** lleva metadatos medidos en la imagen mientras se reproduce, no los del estudio: los cortes de escena se detectan en la imagen, y alguno se escapa o se detecta donde no lo hay. **HDR10+ enviado como Dolby Vision** conserva el brillo de cada escena, no la curva de tonos del estudio, su pantalla de destino ni sus ventanas.
 - **BD-Live** llega a Internet solo por IPv4, y libbluray no implementa las actualizaciones que un disco puede traer por BD-Live: a un disco así se le dice que la actualización falló.
 - **El 3D es nuevo.** El autor no lo ha visto en una pantalla 3D, y no se ha probado ningún disco 3D. Si un vídeo 3D sale en negro o roto, desactiva *Sistema > Pantalla > Poner la pantalla en 3D (HDMI)*. Más en [docs/how-it-works.md](docs/how-it-works.md#stereoscopic-3d) (en inglés).
+- **El receptor USB de un teclado, un ratón o un mando inalámbricos** (2,4 GHz) puede perder alcance cerca de puertos, cables y hubs USB 3, cuyos enlaces emiten ruido en esa banda. A un usuario se lo arregló un puerto USB 2.0 (issue #13).
 - Sin Secure Boot.
 - Es una implementación independiente, escrita a partir de especificaciones públicas. Ni Dolby ni HDR10+ Technologies la han probado ni certificado, y puede diferir de un reproductor certificado.
 
@@ -200,7 +161,7 @@ Conviene saber:
 - Cada fuente se descarga de la dirección de su receta (`package.mk`) y se comprueba con el SHA-256 que hay escrito en ella. Ninguna receta tiene el hash vacío, y no se usan los paquetes de herramientas precompilados "reusable" (`USE_REUSABLE="no"`).
 - Los paquetes del controlador de NVIDIA (615 y, para las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V, 580) se descargan de NVIDIA y se desempaquetan sin ejecutarlos. Solo se usan, sin cambios, sus bibliotecas de espacio de usuario y su firmware; los módulos del kernel de 615 y la biblioteca GBM de su EGL (egl-gbm) se compilan desde el código abierto de NVIDIA. El módulo del kernel de 580 se compila como lo entrega NVIDIA, con su núcleo cerrado (`nv-kernel.o_binary`), y su núcleo de modos de pantalla y `nvidia-drm` se compilan desde el código abierto de NVIDIA de la misma versión. Al compilar, aceptas la licencia de NVIDIA para esos archivos. El controlador 580 hace la imagen unos 120 MB más grande.
 - Una compilación limpia tarda de 20 a 45 minutos en una máquina de 32 hilos, mucho más en una pequeña. Las compilaciones del autor se hacen sin acceso a la red, con las fuentes descargadas y comprobadas antes.
-- **Si cambias el árbol y compartes tu compilación, dale un nombre propio** (`BUILDER_NAME=<tu nombre> make image`) y di que es tuya. Sin él, la compilación se llama a sí misma "Hades 1.0 RC6".
+- **Si cambias el árbol y compartes tu compilación, dale un nombre propio** (`BUILDER_NAME=<tu nombre> make image`) y di que es tuya. Sin él, la compilación se llama a sí misma "Hades 1.0 RC7".
 - El instalador para Windows es un programa pequeño aparte, en C#, en `tools/hades-installer/`; `build.ps1` lo compila con el compilador que ya trae Windows.
 
 ## Documentación
@@ -211,7 +172,7 @@ En inglés:
 - [Ajustes](docs/settings.md): todos los ajustes de esta compilación.
 - [Diagnóstico y registros](docs/diagnostics.md): cómo obtenerlos y qué mirar.
 
-Versiones en 1.0 RC6: Linux 7.3.1, Kodi 22 (la rama `Piers` posterior a 22.0rc1, hasta 846211c81d20, y 15 commits del `master` de Kodi), FFmpeg 9.0.2, Mesa 26.2.6, libplacebo (29a56f9290ba), NVIDIA 615.78.08 y, para las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V, NVIDIA 580.196.07, y OpenJDK 27.0.1 para los menús Java de Blu-ray, sobre LibreELEC `master` (desarrollo de 13.0, hasta 2bb0c528e76e). LibreELEC no ha publicado la versión 13.
+Versiones en 1.0 RC7: Linux 7.3.1, Kodi 22 (la rama `Piers` posterior a 22.0rc1, hasta 42848fff43c5, y 15 commits del `master` de Kodi), FFmpeg 9.0.2, Mesa 26.2.6, libplacebo (29a56f9290ba), NVIDIA 615.78.08 y, para las tarjetas GeForce GTX 900 y GTX 10 y la TITAN V, NVIDIA 580.196.07, y OpenJDK 27.0.1 para los menús Java de Blu-ray, sobre LibreELEC `master` (desarrollo de 13.0, hasta ffcc494ea24a). LibreELEC no ha publicado la versión 13.
 
 ## Créditos
 
@@ -225,6 +186,7 @@ Lo que esta compilación añade a LibreELEC se escribió para ella, salvo lo que
 - **CoreELEC** y el código GPL del kernel de Amlogic que lleva, leído como dato: las estructuras del InfoFrame de HDR10+ y de los InfoFrames del fabricante de Dolby, la señal de Low-Latency, y qué InfoFrame se envía a cada pantalla Dolby Vision.
 - **YBLOD** ([dangerouslaser/libreelec-yblod](https://github.com/dangerouslaser/libreelec-yblod)): ideas para algunas funciones, escritas de nuevo aquí; y **big-fella**, por sus parches de HDMI para los controladores del kernel de Intel y de AMD en YBLOD, tomados con su autoría, y una idea para las gráficas AMD.
 - **pannal (p3i), avdvplus, SamuriHL y matthane**, cuyas builds de CoreELEC y cuyo trabajo dieron las ideas de varias funciones, escritas de nuevo aquí; los cambios de SamuriHL en libbluray para los menús BD-J, y los arreglos de CEC del árbol de CoreELEC de pannal (de CoreELEC, pannal y Stuart Marks), se toman como parches con sus autores.
+- **harment**: el archivo que mantiene encendidas las salidas elegidas por su sonido (`hades-keep-outputs`), tomado como su parche, con su autoría.
 - **Arreglos de otros proyectos, tomados como parches con sus autores:** entre ellos avahi, expat, OpenSSL, curl, OpenSSH, glibc, Python, iptables, libdrm, FFmpeg, BlueZ, BusyBox, libbluray (los arreglos de Daniel Oberlin para los menús BD-J), libdvdcss (el cambio de Saifelden Mohamed Ismail para los discos CPXM), las *pull requests* a Kodi de 78andyp, olympia y Markus Härer, los commits de la rama `Piers` y del `master` de Kodi, y el arreglo de User65k al UPnP de Kodi, tomado del Kodi de CoreELEC.
 - **Team LibreELEC y Team Kodi**, y los autores de cada programa de la imagen. Los parches tomados de otros proyectos conservan a sus autores en su cabecera (los dieciséis archivos del fork de CroqueMr que no la tienen se nombran en [NOTICE.es.md](NOTICE.es.md)), y el commit de OpenSSL 4 de Rudi Heitbaum, de LibreELEC, conserva a su autor en el historial de este repositorio.
 
