@@ -8,7 +8,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 **Why the screen says "LibreELEC Hades".** The media centre of this build is Kodi with changes that the XBMC Foundation has not approved, and Kodi's trademark policy asks such a build not to use Kodi's name and logos as its own. Underneath, it is Kodi: add-ons, skins and remote-control apps work as with Kodi, its log is still `kodi.log`, and other programs still see Kodi. The page "About this build" of the system information says what it is and how to support Kodi and LibreELEC.
 
-**Version 1.0 RC7 (November 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through; what 1.0 RC7 adds has not been tried on hardware yet. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
+**Version 1.0 RC8 (November 2026).** Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through; what 1.0 RC7 adds has not been tried on hardware yet. As a release candidate it needs more hardware: if you try it, please report what you see in the issues. The [changelog](CHANGELOG.md) lists what changed in each version.
 
 ## What it adds to LibreELEC
 
@@ -96,7 +96,7 @@ SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's 
 - Native Dolby Vision goes out at 3840x2160, up to 60 Hz. On Intel UHD 6xx graphics, up to 30 Hz and only from an HDMI port of the graphics itself.
 - On AMD integrated graphics, the first Dolby Vision video after installing a new build may stutter briefly while Hades measures which of two ways of drawing is faster there.
 - On integrated graphics, profile 5 with the player information open dropped frames in testing. Later versions made menus over Dolby Vision cost less GPU time.
-- **GeForce GTX 900 and GTX 10 cards and the TITAN V** use NVIDIA's driver 580, which Hades chooses at start by the card. A PC with one of them and a newer NVIDIA card at once gets the newer driver, and the older card gets none. Driver 580 offers Kodi no window of more than 8 bits, so Hades draws HDR10 on these cards into 10-bit buffers of its own (new in 1.0 RC7), and `kodi.log` says the depth that the driver then reports.
+- **GeForce GTX 900 and GTX 10 cards and the TITAN V** use NVIDIA's driver 580, which Hades chooses at start by the card. A PC with one of them and a newer NVIDIA card at once gets the newer driver, and the older card gets none. Driver 580 offers Kodi no window of more than 8 bits, so Hades draws HDR10 on these cards into 10-bit buffers of its own (new in 1.0 RC7), and `kodi.log` says the depth that the driver then reports. Over HDMI the driver sends RGB at 8 bits at most on these cards; on the GTX 10 cards and the TITAN V, the setting *HDR at more than 8 bits where the card sends RGB at 8 (NVIDIA)* sends HDR in YCbCr 4:2:2 at 10 bits instead (off by default until it is confirmed on one). DisplayPort is not under that limit.
 - **Dolby Vision Low-Latency is mapped by Hades, not by Dolby's display management**, which is not public. The TV is in its Dolby Vision mode and shows Hades' mapping to the brightness and colours its Dolby Vision block gives.
 - **HDR10+ goes out only where the graphics driver can send it with each frame,** otherwise as HDR10; [docs/how-it-works.md](docs/how-it-works.md#hdr10) says where. The player information says "HDR10+" while its metadata go out.
 - **HDR10 sent as Dolby Vision** carries metadata measured from the picture as it plays, not the studio's: scene cuts are found from the picture, and a few are missed or found where there is none. **HDR10+ sent as Dolby Vision** keeps the brightness of each scene, not the studio's tone curve, target display or windows.
@@ -170,7 +170,7 @@ Good to know:
 - [Settings](docs/settings.md): every setting of this build.
 - [Diagnostics and logs](docs/diagnostics.md): how to get them, and what to look for.
 
-Versions in 1.0 RC7: Linux 7.3.1, Kodi 22 (the `Piers` branch after 22.0rc1, up to 42848fff43c5, and 15 commits of Kodi's `master`), FFmpeg 9.0.2, Mesa 26.2.6, libplacebo (29a56f9290ba), NVIDIA 615.78.08 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.07, and OpenJDK 27.0.1 for Blu-ray Java menus, on LibreELEC `master` (13.0 development, up to ffcc494ea24a). LibreELEC has not released version 13.
+Versions in 1.0 RC8: Linux 7.3.1, Kodi 22 (the `Piers` branch after 22.0rc1, up to a34a9c4c216b, and 15 commits of Kodi's `master`), FFmpeg 9.0.2, Mesa 26.2.6, libplacebo (29a56f9290ba), NVIDIA 615.78.08 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.07, and OpenJDK 27.0.1 for Blu-ray Java menus, on LibreELEC `master` (13.0 development, up to ffcc494ea24a). LibreELEC has not released version 13.
 
 ## Credits
 

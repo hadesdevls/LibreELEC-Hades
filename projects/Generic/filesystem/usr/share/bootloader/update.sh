@@ -146,6 +146,46 @@ flash_is() {
   awk -v m="$BOOT_ROOT" '$2 == m { o = "," $4 "," } END { if (o == "") print "none"; else if (o ~ /,ro,/) print "ro"; else print "rw" }' "$MOUNTS" 2>/dev/null
 }
 
+# The programs of GRUB (UEFI), EFI/BOOT/bootx64.efi and bootia32.efi. An update in place did not write them
+# before 1.0 RC8, so a drive installed before 1.0 RC6 kept a GRUB without the command "[" (its module test),
+# which the menu uses since 1.0 RC7: each start said "can't find command '['" and waited for a key (issue
+# #17). Each one that is on the boot partition and is not the one of the new system becomes that one, as the
+# menu does: written as <name>.new, written through to the device and read back, and then renamed over it, so
+# a power cut leaves the one of before or the new one. One that is not there stays away; nothing else on the
+# partition is touched. This runs before the menu is changed, so that the menu finds the GRUB it needs.
+efi_update() {
+  local dir="$BOOT_ROOT/EFI/BOOT" src="$SYSTEM_ROOT/usr/share/grub" name todo="" was
+  for name in bootx64.efi bootia32.efi; do
+    if [ -f "$dir/$name" ] && [ -f "$src/$name" ] && ! same "$src/$name" "$dir/$name"; then
+      todo="$todo $name"
+    fi
+  done
+  [ -z "$todo" ] && return 0
+
+  was=$(flash_is)
+  if [ "$was" = ro ] && ! mount -o remount,rw "$BOOT_ROOT"; then
+    say "GRUB is left as it is: the boot partition could not be made writable"
+    return 0
+  fi
+  for name in $todo; do
+    rm -f "$dir/$name.new"
+    if cp "$src/$name" "$dir/$name.new" && sync "$dir/$name.new" && same "$dir/$name.new" "$src/$name" &&
+       mv -f "$dir/$name.new" "$dir/$name" && sync "$dir/$name" "$dir" && same "$dir/$name" "$src/$name"; then
+      say "GRUB: EFI/BOOT/$name is now the one of this system"
+    elif same "$dir/$name" "$src/$name"; then
+      say "GRUB: EFI/BOOT/$name is now the one of this system, but it could not all be written through"
+    else
+      rm -f "$dir/$name.new"
+      say "GRUB: EFI/BOOT/$name could not be replaced: it is the one of before"
+    fi
+  done
+  sync
+  if [ "$was" = ro ] && ! mount -o remount,ro "$BOOT_ROOT"; then
+    say "the boot partition could not be made read-only again"
+  fi
+  return 0
+}
+
 menu_update() {
   local look uuid cr e this was
 
@@ -224,5 +264,6 @@ menu_update() {
   return 0
 }
 
+efi_update
 menu_update
 exit 0
