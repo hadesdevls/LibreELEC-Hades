@@ -1,0 +1,264 @@
+From d62cf6d0b5883a787008c230f206bc1d20e040c3 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:33:41 +0000
+Subject: [PATCH] windowing/gbm: draw the GUI composite under scissor
+ rectangles of the tile mask
+
+Where the GUI pass of a frame was left out (CDVGuiReuse) the GUI over the picture
+is the FBO of the frame before, and the quad of the composite still covered the
+whole 3840x2160 raster: 8.3 million fragments that read the GUI texture and
+discard where the alpha is 0, on a GPU that is also packing the frame. The same
+quad is now drawn once for each rectangle of the tile mask of that GUI, under
+glScissor.
+
+Why the bytes are the same. The scissor test is a per-fragment test after
+rasterisation (OpenGL ES 3.0.6, section 4.1.2, Scissor Test): a fragment outside
+the rectangle is discarded; the rasterisation of a primitive (section 3.5) does
+not depend on it, so every fragment inside a rectangle has the window
+coordinates and the interpolated varyings it has in the whole quad, and the
+fragment shader computes the same value for it. Inside the rectangles the result
+is the whole quad's. Outside them the whole quad writes nothing: the mask marks
+every tile where a sample can have an alpha above 0 (pass 7, with the bilinear
+margin), and the composite discards the other fragments. Rectangles are disjoint,
+so no fragment blends twice. (Smaller quads, one for each tile, would not do: the
+interpolation of the texture coordinates would round another way.)
+
+When it is used, and when the whole quad is drawn as before. The mask is read
+back asynchronously (CDVBridgeGLES::RequestDrawnTiles(), PollDrawnTiles()) from a
+frame whose GUI pass was left out, tagged with the generation of the GUI FBO,
+which counts every GUI pass that draws and every FBO that is made. It is used
+only for a frame whose pass was left out and whose generation is the one the mask
+was asked for in. No mask yet, another generation, the in-place composite, a
+frame with subtitles, a capture or an output that is not the source transport,
+more than 24 rectangles, or more than half of the raster marked: the whole quad.
+<video><dvguiscissor> (on by default; needs dvguireuse) turns it off. The 10 s
+line says how many composites went under how many rectangles.
+
+Host proof (outside the tree): perf_bridge, the bridge's own pass 7 mask of a
+test GUI (a panel with an alpha gradient, lines of one pixel, single pixels at the
+corners and tile edges, a noisy block, a block that ends at a tile edge), Kodi's
+gles_gui_composite shaders and the projection and blend of its Dolby Vision
+frames: the whole quad and the scissored one into two RGBA32F targets over the same picture and
+GUI, compared as floats byte by byte: 0 of 8.3 million pixels differ, with the GUI over
+1319877 of them, on llvmpipe and on zink over lavapipe; with each rectangle one tile
+short, 4802 differ on both.
+---
+ xbmc/settings/AdvancedSettings.cpp            |  2 +
+ xbmc/settings/AdvancedSettings.h              |  5 ++
+ xbmc/windowing/gbm/DVGuiReuse.h               | 14 ++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 67 ++++++++++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  | 10 +++
+ 5 files changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 4888d88..bf17a8a 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -211,6 +211,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVGuiCacheCheck = false;
+   m_videoDVGuiInPlace = true;
+   m_videoDVGuiReuse = true;
++  m_videoDVGuiScissor = true;
+   m_videoDVLLPattern = false;
+   m_videoDVCCMComposer = true;
+   m_videoDVAheadAlways = false;
+@@ -735,6 +736,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvguicachecheck", m_videoDVGuiCacheCheck);
+     XMLUtils::GetBoolean(pElement, "dvguiinplace", m_videoDVGuiInPlace);
+     XMLUtils::GetBoolean(pElement, "dvguireuse", m_videoDVGuiReuse);
++    XMLUtils::GetBoolean(pElement, "dvguiscissor", m_videoDVGuiScissor);
+     XMLUtils::GetBoolean(pElement, "dvllpattern", m_videoDVLLPattern);
+     XMLUtils::GetBoolean(pElement, "dvccmcomposer", m_videoDVCCMComposer);
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 181970b..0b7b881 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -191,6 +191,11 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! dirty and puts the GUI of the frame before over the picture (video/dvguireuse; the same
+     //! bytes). Off for a measurement of what that saves
+     bool m_videoDVGuiReuse;
++    //! Hades: with the GUI pass left out (video/dvguireuse), the composite of the GUI over the picture draws
++    //! its quad under glScissor rectangles of the tile mask of what the GUI can reach, instead of over the
++    //! whole raster (video/dvguiscissor; the same bytes: dvbridge_tiles.h). Off for a measurement of what
++    //! that saves
++    bool m_videoDVGuiScissor;
+     //! Hades: native Dolby Vision Low-Latency shows a test pattern in place of the picture
+     //! (video/dvllpattern), for a first look at a display (dvbridge_render_set_ll_pattern())
+     bool m_videoDVLLPattern;
+diff --git a/xbmc/windowing/gbm/DVGuiReuse.h b/xbmc/windowing/gbm/DVGuiReuse.h
+index 529da1b..005d779 100644
+--- a/xbmc/windowing/gbm/DVGuiReuse.h
++++ b/xbmc/windowing/gbm/DVGuiReuse.h
+@@ -158,6 +158,8 @@ public:
+     unsigned int overlays = 0; //!< ... because of subtitles or debug information alone
+     unsigned int capture = 0; //!< ... because a capture waited for the frame
+     unsigned int passesSkipped = 0; //!< GUI passes left out (drawn directly or not)
++    unsigned int scissored = 0; //!< composites of the GUI drawn under rectangles of the tile mask
++    unsigned int rects = 0; //!< ... and the rectangles of them
+     int window = -1; //!< the window or dialog that was on top when the line was taken
+   };
+ 
+@@ -181,6 +183,13 @@ public:
+   //! The pass of a frame was left out
+   void Skipped() { ++m_counts.passesSkipped; }
+ 
++  //! The composite of a frame was drawn under that many scissor rectangles
++  void Scissored(unsigned int rects)
++  {
++    ++m_counts.scissored;
++    m_counts.rects += rects;
++  }
++
+   //! The reason that the last ask said no, told once when it changes (empty: nothing to tell)
+   //! (an ask is made once a frame: a reason that lasts is not told again)
+   std::string Declined(Why why, bool native)
+@@ -231,6 +240,11 @@ public:
+           "left out), " + std::to_string(c.overlays) +
+           " with subtitles or debug information only, " + std::to_string(c.capture) +
+           " for a capture (the window on top: " + std::to_string(c.window) + ")";
++      if (c.scissored)
++        s += "; " + std::to_string(c.scissored) + " composites of the GUI drawn under " +
++             std::to_string(c.rects) +
++             " scissor rectangles of the tile mask (the same quad, only where the GUI reaches; "
++             "video/dvguiscissor)";
+     }
+     else if (c.passesSkipped)
+       s = "; " + std::to_string(c.passesSkipped) + " GUI passes left out";
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 9a0b920..8dd96d9 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1964,6 +1964,12 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+ 
+   m_guiWillRender = guiWillRender;
+   m_guiReusing = false;
++  // Hades: a GUI that is drawn is another content of the FBO, and the tile mask of the one before
++  // does not tell where it can reach
++  if (guiWillRender)
++    ++m_guiGen;
++  if (!m_dvState.Captured())
++    m_tilesUse = false;
+   int width = m_nWidth;
+   int height = m_nHeight;
+ 
+@@ -1999,6 +2005,8 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+     m_guiFboHeight = height;
+     m_guiFboClean = false; // fresh FBO is undefined, force a clear
+     m_guiSeen = false;
++    ++m_guiGen;
++    m_tilesUse = false;
+     if (!guiWillRender)
+     {
+       // Hades: made after the pass was left out (a change of size between the decision and
+@@ -2250,7 +2258,30 @@ void CWinSystemGbmGLESContext::CompositeGui()
+   glEnableVertexAttribArray(posLoc);
+   glEnableVertexAttribArray(texLoc);
+ 
+-  glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_BYTE, idx);
++#ifdef HAVE_DVBRIDGE
++  // Hades: the same quad, drawn under glScissor for each rectangle of the tile mask of the GUI that
++  // this frame composites (the GUI pass was left out, and the mask is that of its content): the
++  // fragments inside the rectangles are those of the whole quad, and outside them the whole quad
++  // discards (dvbridge_tiles.h). Any doubt (no mask yet, another GUI): the whole quad.
++  if (dvComposite && m_guiReusing && m_tilesUse && m_tilesGen == m_guiGen && !m_tilesRects.empty())
++  {
++    constexpr int TILE = DVBRIDGE_SOURCE_TILE;
++    GLint box[4]{};
++    glGetIntegerv(GL_SCISSOR_BOX, box);
++    glEnable(GL_SCISSOR_TEST);
++    for (const auto& r : m_tilesRects)
++    {
++      glScissor(static_cast<GLint>(r.x) * TILE, static_cast<GLint>(r.y) * TILE,
++                static_cast<GLsizei>(r.w) * TILE, static_cast<GLsizei>(r.h) * TILE);
++      glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_BYTE, idx);
++    }
++    glDisable(GL_SCISSOR_TEST);
++    glScissor(box[0], box[1], box[2], box[3]);
++    m_dvGuiReuse.Scissored(static_cast<unsigned int>(m_tilesRects.size()));
++  }
++  else
++#endif
++    glDrawElements(GL_TRIANGLE_STRIP, 4, GL_UNSIGNED_BYTE, idx);
+ 
+   glDisableVertexAttribArray(posLoc);
+   glDisableVertexAttribArray(texLoc);
+@@ -5620,6 +5651,11 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   }
+   if (m_dvFrame && overlayFree)
+     m_dvPlainDirect = m_dvBridge->Direct() ? 1 : 0;
++  // Hades: the tile mask of what the GUI can reach, for the composite of the frames whose GUI pass is
++  // left out: asked for where this frame has the GUI composited over it, in the source transport
++  DVTilesUpdate(m_dvFrame && m_guiReusing && !overlayFree && !captured && drawnTiles &&
++                guiInPlace <= 0.0f && drawnSettings &&
++                drawnSettings->GetAdvancedSettings()->m_videoDVGuiScissor);
+   if (m_dvFrame)
+     m_dvPrepared = frame;
+   else
+@@ -6163,6 +6199,35 @@ constexpr int64_t DV_MENUS_SETTLE_MS = 3000;
+ constexpr auto DV_MENUS_AFTER_WAKE = std::chrono::seconds(5);
+ } // namespace
+ 
++void CWinSystemGbmGLESContext::DVTilesUpdate(bool wanted)
++{
++  if (!m_dvBridge)
++    return;
++  if (m_tilesPending)
++  {
++    uint8_t mask[DVBRIDGE_SOURCE_TILE_COLUMNS * DVBRIDGE_SOURCE_TILE_ROWS];
++    unsigned int serial = 0;
++    const int polled = m_dvBridge->PollDrawnTiles(mask, serial);
++    if (polled != 0)
++      m_tilesPending = false;
++    // (a mask is the one of a GUI that has not been drawn since it was asked for, else it says
++    // nothing of this one)
++    if (polled == 1 && serial == m_guiGen)
++    {
++      m_tilesRects.assign(DVBRIDGE_TILE_RECTS_MAX, dvbridge_tile_rect{});
++      // (more than 24 rectangles, or marked tiles over half of them: the whole quad, as before)
++      const int n = dvbridge_tiles_merge(mask, DVBRIDGE_SOURCE_TILE_COLUMNS,
++                                         DVBRIDGE_SOURCE_TILE_ROWS, m_tilesRects.data(),
++                                         DVBRIDGE_TILE_RECTS_MAX, 50);
++      m_tilesRects.resize(n > 0 ? static_cast<size_t>(n) : 0);
++      m_tilesUse = n > 0;
++      m_tilesGen = serial;
++    }
++  }
++  if (wanted && !m_tilesPending && m_tilesGen != m_guiGen && m_dvBridge->RequestDrawnTiles(m_guiGen))
++    m_tilesPending = true;
++}
++
+ CDVGuiReuse::Facts CWinSystemGbmGLESContext::GuiReuseFacts() const
+ {
+   CDVGuiReuse::Facts f;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index ac3ad08..7123826 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -54,6 +54,7 @@
+ #include <deque>
+ // (Hades: level 5 offsets that say bars where the picture has content)
+ #include "dvbridge_l5check.h"
++#include "dvbridge_tiles.h"
+ // (Hades: HDR10 measured as Dolby Vision, dvbridge_measure.h and dvbridge_measured.h)
+ struct dvbridge_measure;
+ struct dvbridge_measured;
+@@ -460,6 +461,15 @@ private:
+   //! Hades: RenderDVBridge() ran in this frame, and in the frame before it
+   bool m_guiVideoNow{false};
+   bool m_guiVideoLast{false};
++  //! Hades: the content of the GUI FBO changes with every frame whose GUI pass draws (it counts those),
++  //! and the tile mask of what the GUI can reach (the bridge's pass 7, read back without waiting)
++  //! belongs to one of them (DVTilesUpdate(); the composite under scissor rectangles, CompositeGui())
++  unsigned m_guiGen{1};
++  unsigned m_tilesGen{0};
++  bool m_tilesPending{false};
++  bool m_tilesUse{false};
++  std::vector<dvbridge_tile_rect> m_tilesRects;
++  void DVTilesUpdate(bool wanted);
+   std::chrono::steady_clock::time_point m_guiHdrLogAt{};
+   CDVGuiReuse m_dvGuiReuse;
+   CDVGuiReuse::Facts GuiReuseFacts() const;
+-- 
+2.53.0
+

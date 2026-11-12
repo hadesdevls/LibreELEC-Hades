@@ -127,6 +127,8 @@ namespace Hades.Installer
         public List<string> LeftOut = new List<string>(); // the oldest starts, for want of room
         public List<Patch> Patches = new List<Patch>();
         internal DiagItem Folder;
+        // (an update: what became of the choices of the old boot menus, which the same panel tells: BootMenus)
+        public BootKept Boot;
 
         internal DiagKeep Fail(Outcome state, Cause why, string detail)
         {

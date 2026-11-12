@@ -1,0 +1,372 @@
+From db13687a781898a979a97a220a656b9230706a73 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:33:41 +0000
+Subject: [PATCH] dvbridge: the tile mask of what is drawn over a picture, to
+ the CPU without waiting
+
+Pass 7 of the source packer makes the tiles of the raster (16 x 16 pixels, 240 x
+135) that the composite of Kodi's GUI can draw on: every tile where a sample of
+the GUI texture, with the bilinear margin, can have an alpha above 0. The CPU
+never saw it. dvbridge_source_tiles_request() copies it (RGBA and unsigned bytes,
+which every implementation reads from an 8-bit target, the flag in red) into a
+pixel pack buffer with a fence, as dvbridge_verify_compare() does, and
+dvbridge_source_tiles_poll() takes it back when the fence is signalled, without
+waiting; GL state is saved and restored around the read. The request is refused
+where the last picture has no tiles (not made, or no GUI told) or one is waiting.
+
+dvbridge_tiles.h merges a mask into the fewest rectangles a row-run join gives
+(at most 24; -1 where there are more, or the marked tiles are over a share of the
+raster), and says why drawing the composite's quad under glScissor for each is
+the same bytes as the whole quad. CDVBridgeGLES gets RequestDrawnTiles() and
+PollDrawnTiles(). Nothing uses them yet.
+
+Host tests (outside the tree): tiles_merge_test (random masks, exact cover, the
+limits; a mutant that joins rows of different width fails).
+---
+ tools/dvbridge/dvbridge_render.c              |  10 ++
+ tools/dvbridge/dvbridge_render.h              |   4 +
+ tools/dvbridge/dvbridge_source.c              |  94 ++++++++++++++++
+ tools/dvbridge/dvbridge_source.h              |  11 ++
+ tools/dvbridge/dvbridge_tiles.h               | 105 ++++++++++++++++++
+ .../VideoRenderers/DVBridgeGLES.cpp           |  10 ++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   7 ++
+ 7 files changed, 241 insertions(+)
+ create mode 100644 tools/dvbridge/dvbridge_tiles.h
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 4d2cafb..5e9dd2b 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -2757,6 +2757,16 @@ bool dvbridge_render_can_gui_in_place(const struct dvbridge_renderer *r)
+     return r && dvbridge_source_can_gui_in_place(r->source_packer);
+ }
+ 
++bool dvbridge_render_tiles_request(struct dvbridge_renderer *r, unsigned serial)
++{
++    return r && r->ready && r->source && dvbridge_source_tiles_request(r->source_packer, serial);
++}
++
++int dvbridge_render_tiles_poll(struct dvbridge_renderer *r, uint8_t *mask, unsigned *serial)
++{
++    return r && r->source_packer ? dvbridge_source_tiles_poll(r->source_packer, mask, serial) : -1;
++}
++
+ void dvbridge_render_use_gui_cache(struct dvbridge_renderer *r, bool use)
+ {
+     if (r)
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index eddadd6..9594559 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -515,6 +515,10 @@ void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui,
+ void dvbridge_render_set_gui_in_place(struct dvbridge_renderer *renderer, float peak);
+ bool dvbridge_render_gui_in_place(const struct dvbridge_renderer *renderer);
+ bool dvbridge_render_can_gui_in_place(const struct dvbridge_renderer *renderer);
++/* Hades: the tile mask of what is drawn over the prepared frame (dvbridge_source_tiles_request(), _poll()):
++ * only for a frame prepared in the source transport with its GUI told (dvbridge_render_set_drawn()) */
++bool dvbridge_render_tiles_request(struct dvbridge_renderer *renderer, unsigned serial);
++int dvbridge_render_tiles_poll(struct dvbridge_renderer *renderer, uint8_t *mask, unsigned *serial);
+ /* Hades: the GUI cache of the source transport (dvbridge_source_gui_cache(): the bytes of the
+  * tiles where the GUI is opaque and did not change are copied from the frame before that packed
+  * them, not converted again; the same bytes). Off until asked for; it takes the frames whose
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 7667611..f3fbead 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -1823,6 +1823,12 @@ struct dvbridge_source_packer {
+     struct texture gui_prev, blocks_quarter, blocks, ctiles, state[2], opaque_quarter, cache, again,
+         differ;
+     GLuint tiles_texture;
++    /* Hades: the read-back of the tile mask (dvbridge_source_tiles_request()): the framebuffer that the
++     * tiles are attached to for it, the buffer it is read into, the fence of that read, the serial of
++     * the request that waits */
++    GLuint tr_framebuffer, tr_buffer;
++    GLsync tr_fence;
++    unsigned tr_serial;
+     int state_now, cache_level;
+     struct cache_key key;
+     unsigned stats[4];
+@@ -2225,6 +2231,10 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->gui_tiles);
+     texture_destroy(&p->tiles);
+     texture_destroy(&p->pairs);
++    if (p->tr_fence)
++        glDeleteSync(p->tr_fence);
++    glDeleteFramebuffers(1, &p->tr_framebuffer);
++    glDeleteBuffers(1, &p->tr_buffer);
+     dvbridge_source_gui_release(p);
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+@@ -2835,6 +2845,90 @@ bool dvbridge_source_gui_in_placed(const struct dvbridge_source_packer *p)
+     return p && p->inplace;
+ }
+ 
++_Static_assert(DVBRIDGE_SOURCE_TILE == DRAWN_TILE && DVBRIDGE_SOURCE_TILE_COLUMNS == DRAWN_COLUMNS &&
++                   DVBRIDGE_SOURCE_TILE_ROWS == DRAWN_ROWS,
++               "the tile mask of dvbridge_source.h is that of the passes");
++
++bool dvbridge_source_tiles_request(struct dvbridge_source_packer *p, unsigned serial)
++{
++    /* (the tiles of this picture: made by dvbridge_source_picture(), and still those of it) */
++    if (!p || !p->tiles_mode || !p->tiles_texture || p->tr_fence)
++        return false;
++    const size_t bytes = (size_t)DRAWN_COLUMNS * DRAWN_ROWS * 4;
++    dvbridge_gl_drain_errors();
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    GLint pack = 0, alignment = 4;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++    bool ok = true;
++    if (!p->tr_framebuffer)
++        glGenFramebuffers(1, &p->tr_framebuffer);
++    if (!p->tr_buffer) {
++        glGenBuffers(1, &p->tr_buffer);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, p->tr_buffer);
++        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER, p->tr_framebuffer);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, p->tiles_texture, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++        ok = false;
++    if (ok) {
++        /* (RGBA and unsigned bytes: what every implementation reads from an 8-bit target; the tiles
++         * of the passes are R8 or RGBA8, the flag in red) */
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, p->tr_buffer);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadPixels(0, 0, DRAWN_COLUMNS, DRAWN_ROWS, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        p->tr_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++        glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++        ok = p->tr_fence && glGetError() == GL_NO_ERROR;
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    dvbridge_gl_state_restore(&state);
++    if (!ok) {
++        if (p->tr_fence)
++            glDeleteSync(p->tr_fence);
++        p->tr_fence = NULL;
++        dvbridge_gl_drain_errors();
++        return false;
++    }
++    p->tr_serial = serial;
++    return true;
++}
++
++int dvbridge_source_tiles_poll(struct dvbridge_source_packer *p, uint8_t *mask, unsigned *serial)
++{
++    if (!p || !p->tr_fence)
++        return -1;
++    /* (not waited for: a read that is not done is asked again next time) */
++    const GLenum waited = glClientWaitSync(p->tr_fence, 0, 0);
++    if (waited == GL_TIMEOUT_EXPIRED)
++        return 0;
++    glDeleteSync(p->tr_fence);
++    p->tr_fence = NULL;
++    if (waited != GL_ALREADY_SIGNALED && waited != GL_CONDITION_SATISFIED)
++        return -1;
++    GLint pack = 0;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, p->tr_buffer);
++    const uint8_t *d = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
++                                        (GLsizeiptr)DRAWN_COLUMNS * DRAWN_ROWS * 4, GL_MAP_READ_BIT);
++    if (d && mask) {
++        for (unsigned i = 0; i < DRAWN_COLUMNS * DRAWN_ROWS; ++i)
++            mask[i] = d[4 * i] > 127;
++    }
++    if (d)
++        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    if (!d)
++        return -1;
++    if (serial)
++        *serial = p->tr_serial;
++    return 1;
++}
++
+ void dvbridge_source_forget(struct dvbridge_source_packer *p)
+ {
+     if (!p)
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 1db62c5..619e538 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -29,6 +29,7 @@
+  * as a goes to 0 and the codes of what was drawn at a = 1. */
+ #ifndef DVBRIDGE_SOURCE_H
+ #define DVBRIDGE_SOURCE_H
++#include "dvbridge_tiles.h"
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+@@ -212,6 +213,16 @@ bool dvbridge_source_complete(struct dvbridge_source_packer *packer,
+ void dvbridge_source_gui_in_place(struct dvbridge_source_packer *packer, float peak);
+ bool dvbridge_source_can_gui_in_place(const struct dvbridge_source_packer *packer);
+ bool dvbridge_source_gui_in_placed(const struct dvbridge_source_packer *packer);
++/* Hades: the tile mask of what is drawn over the picture of the last dvbridge_source_picture(), to the CPU
++ * without waiting for it: the tiles of the raster (DVBRIDGE_SOURCE_TILE x DVBRIDGE_SOURCE_TILE pixels, row 0
++ * the top of the raster) that the composite of the GUI texture may draw on (pass 7). request: copies the
++ * mask into a buffer read back by the GPU on its own time (a fence), tagged serial; false where the last
++ * picture has no mask (a picture whose tiles were not made, or a frame with none drawn over it), or where
++ * a request is still waiting. poll: 1 and the mask (one byte a tile, 0 or 1, columns x rows) and the
++ * serial of its request where it is back, 0 where it is not back yet, -1 where nothing waits or the
++ * request was lost. For the composite to draw its quad under glScissor (dvbridge_tiles.h). */
++bool dvbridge_source_tiles_request(struct dvbridge_source_packer *packer, unsigned serial);
++int dvbridge_source_tiles_poll(struct dvbridge_source_packer *packer, uint8_t *mask, unsigned *serial);
+ /* Hades: no picture of dvbridge_source_picture() is taken from now on (another render) */
+ void dvbridge_source_forget(struct dvbridge_source_packer *packer);
+ 
+diff --git a/tools/dvbridge/dvbridge_tiles.h b/tools/dvbridge/dvbridge_tiles.h
+new file mode 100644
+index 0000000..8c7ed39
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_tiles.h
+@@ -0,0 +1,105 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: the rectangles of the tile mask of what is drawn over a picture (dvbridge_source.h,
++ * dvbridge_source_tiles_poll()), for the composite of Kodi's GUI to draw its quad under glScissor.
++ *
++ * Why that is exact. The composite is one quad over the whole raster whose fragment shader samples
++ * the GUI texture and discards a fragment whose sample has an alpha of 0. The tile mask marks every
++ * tile of the raster where a sample can have an alpha above 0 (pass 7 of the source packer: the
++ * texels around those of all its pixels, with a margin, in a tile of the GUI texture that holds
++ * anything drawn). The same quad drawn once for each rectangle of marked tiles, under glScissor,
++ * has the fragments of the whole quad inside the rectangles and none outside: the scissor test is
++ * a per-fragment test after rasterisation that does not change what rasterisation produces or what
++ * the fragment shader computes for a fragment (OpenGL ES 3.0.6, section 4.1.2, Scissor Test: a
++ * fragment outside the scissor rectangle is discarded; the rasterisation of a primitive, section
++ * 3.5, does not depend on it, so the window coordinates and the varyings of each fragment are those
++ * of the draw without it). The bytes inside
++ * the rectangles are the whole quad's, and outside them the whole quad writes nothing (it discards).
++ * Rectangles of tiles are disjoint, so no fragment is drawn twice (it would blend twice). */
++#ifndef DVBRIDGE_TILES_H
++#define DVBRIDGE_TILES_H
++#include <stdint.h>
++
++#define DVBRIDGE_TILE_RECTS_MAX 24
++/* the tiles of the raster of the source transport: DVBRIDGE_SOURCE_TILE x DVBRIDGE_SOURCE_TILE pixels, in
++ * DVBRIDGE_SOURCE_TILE_COLUMNS columns and DVBRIDGE_SOURCE_TILE_ROWS rows (dvbridge_source.c checks them) */
++#define DVBRIDGE_SOURCE_TILE 16
++#define DVBRIDGE_SOURCE_TILE_COLUMNS 240
++#define DVBRIDGE_SOURCE_TILE_ROWS 135
++/* the tiles of the raster of the source transport: DVBRIDGE_SOURCE_TILE x DVBRIDGE_SOURCE_TILE pixels, in
++ * DVBRIDGE_SOURCE_TILE_COLUMNS columns and DVBRIDGE_SOURCE_TILE_ROWS rows (dvbridge_source.c checks them) */
++#define DVBRIDGE_SOURCE_TILE 16
++#define DVBRIDGE_SOURCE_TILE_COLUMNS 240
++#define DVBRIDGE_SOURCE_TILE_ROWS 135
++
++/* in tiles */
++struct dvbridge_tile_rect {
++    unsigned x, y, w, h;
++};
++
++/* The marked tiles of mask (cols x rows, row 0 first, nonzero: marked) as rectangles whose tiles
++ * are all marked and that hold every marked tile once: runs of marked tiles in a row, joined with
++ * the run of the row below where both have the same columns. Returns the number of rectangles
++ * (0: no tile is marked), or -1 where there are more than max (the whole quad is then drawn), or
++ * where the marked tiles are more than percent of all of them (not worth it). */
++static inline int dvbridge_tiles_merge(const uint8_t *mask, unsigned cols, unsigned rows,
++                                       struct dvbridge_tile_rect *out, unsigned max,
++                                       unsigned percent)
++{
++    if (!mask || !out || !cols || !rows || max > DVBRIDGE_TILE_RECTS_MAX)
++        return -1;
++    unsigned marked = 0;
++    for (unsigned i = 0; i < cols * rows; ++i)
++        marked += mask[i] != 0;
++    if (!marked)
++        return 0;
++    if ((unsigned long)marked * 100ul > (unsigned long)cols * rows * percent)
++        return -1;
++    /* open[]: the rectangles whose last row is the row before */
++    unsigned count = 0;
++    unsigned open[DVBRIDGE_TILE_RECTS_MAX], opened = 0;
++    for (unsigned y = 0; y < rows; ++y) {
++        unsigned still[DVBRIDGE_TILE_RECTS_MAX], kept = 0;
++        unsigned x = 0;
++        while (x < cols) {
++            if (!mask[y * cols + x]) {
++                ++x;
++                continue;
++            }
++            unsigned end = x;
++            while (end < cols && mask[y * cols + end])
++                ++end;
++            int joined = -1;
++            for (unsigned k = 0; k < opened; ++k) {
++                const struct dvbridge_tile_rect *r = &out[open[k]];
++                if (r->x == x && r->w == end - x && r->y + r->h == y) {
++                    joined = (int)open[k];
++                    break;
++                }
++            }
++            if (joined >= 0) {
++                ++out[joined].h;
++                still[kept++] = (unsigned)joined;
++            } else {
++                if (count == max)
++                    return -1;
++                out[count].x = x;
++                out[count].y = y;
++                out[count].w = end - x;
++                out[count].h = 1;
++                still[kept++] = count++;
++            }
++            x = end;
++        }
++        opened = kept;
++        for (unsigned k = 0; k < kept; ++k)
++            open[k] = still[k];
++    }
++    return (int)count;
++}
++#endif
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index faaaa02..0e55f32 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1077,6 +1077,16 @@ bool CDVBridgeGLES::GuiInPlace() const
+   return m_prepared && !m_direct && dvbridge_render_gui_in_place(m_renderer);
+ }
+ 
++bool CDVBridgeGLES::RequestDrawnTiles(unsigned int serial)
++{
++  return m_prepared && !m_direct && m_renderer && dvbridge_render_tiles_request(m_renderer, serial);
++}
++
++int CDVBridgeGLES::PollDrawnTiles(uint8_t* mask, unsigned int& serial)
++{
++  return m_renderer ? dvbridge_render_tiles_poll(m_renderer, mask, &serial) : -1;
++}
++
+ bool CDVBridgeGLES::CompletePicture()
+ {
+   // (a frame drawn directly has no picture to draw into; one composed by the converted transport
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 93fef6f..52b9eb5 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -308,6 +308,13 @@ public:
+   //! Hades: the packer composites the GUI over the prepared frame itself (SetDrawnOver()): nothing is
+   //! to be drawn into the PQ picture for it. False once the picture is made whole (CompletePicture()).
+   bool GuiInPlace() const;
++  //! Hades: the tile mask of what is drawn over the prepared frame, to the CPU without waiting
++  //! (dvbridge_render_tiles_request(), _poll()): one byte a tile of 16 x 16 pixels, 240 x 135, row 0 the
++  //! top of the raster. Request only after PrepareHardware() of a frame composed in the source
++  //! transport with its GUI told (SetDrawnOver()); Poll: 1 where it is back (and serial that of its
++  //! request), 0 where not yet, -1 where nothing waits.
++  bool RequestDrawnTiles(unsigned int serial);
++  int PollDrawnTiles(uint8_t* mask, unsigned int& serial);
+   //! Hades: the picture of the prepared frame whole, for what else is drawn into it (PQ subtitles,
+   //! a capture that reads it); false where that could not be done
+   bool CompletePicture();
+-- 
+2.53.0
+

@@ -1,0 +1,309 @@
+From 550c2061986fb46802ec1ba1dc403c2ff1e3f516 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:49:09 +0000
+Subject: [PATCH] VideoPlayer: another file asked for does not wait for the one
+ that holds the thread
+
+While the player plays, OpenFile() only queues the new file: the thread
+takes it between two reads. While it opens a file, or while a read of a
+packet waits (for its drive: the read retries of a local file, up to 15 s;
+for its source: a network stall, which a player now waits out), the new
+file waits for that. And when the open of the file failed while a new
+one was queued, Prepare() ended the thread with the error and the queued
+request was lost: the file asked for was not opened (issue #21).
+
+When OpenFile() has queued a request that the thread has not taken, and
+the thread is held by the file it has (Prepare() runs, or a read of a
+packet has lasted 500 ms), that file's reads and its open end: the
+Abort() of its input, which ends a read that waits for its drive or its
+cache, and the cancel check of its demuxer. A read that waits for its
+source while a request is queued ends itself the same way. The loop then
+takes the request: a failed or ended open (PrepareFailed()) and the end of
+the input go on to it instead of ending the thread, and a file whose
+open has not started when a newer request comes is not opened at all.
+The superseded file reports no error and no position.
+
+A change of file between reads (an ordinary change, a playlist, next)
+is taken as before.
+---
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp | 126 ++++++++++++++++++++++++-
+ xbmc/cores/VideoPlayer/VideoPlayer.h   |  21 +++++
+ 2 files changed, 142 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index c9f3c8e..1e96112 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -850,12 +850,18 @@ bool CVideoPlayer::OpenFile(const CFileItem& file, const CPlayerOptions &options
+     params.m_options = options;
+     params.m_item.SetMimeTypeForInternetFile();
+     m_messenger.Put(std::make_shared<CDVDMsgOpenFile>(params), 1);
++    // Hades: the thread may be held by the file it has (opening it, or a read that waits for its
++    // drive or its source): that file's reads end, so the new one does not wait for them
++    SupersedeHeldFile();
+ 
+     return true;
+   }
+ 
+   m_item = file;
+   m_playerOptions = options;
++  m_supersede = false;
++  m_preparing = false;
++  m_packetReadSince = 0;
+ 
+   m_processInfo->SetPlayTimes(0,0,0,0);
+   m_bAbortRequest = false;
+@@ -923,6 +929,67 @@ bool CVideoPlayer::IsPlaying() const
+   return !m_bStop;
+ }
+ 
++bool CVideoPlayer::OpenFilePending()
++{
++  return m_messenger.GetPacketCount(CDVDMsg::PLAYER_OPENFILE) > 0;
++}
++
++void CVideoPlayer::SupersedeHeldFile()
++{
++  // Hades: from the thread that asks for another file (OpenFile()), right after it queued it. The
++  // thread of the player takes the request between reads; while it opens a file, or while a read
++  // of a packet waits (for its drive: the read retries of a local file; for its source: a stall),
++  // it could take seconds, or minutes, and a request queued while an open failed was lost with the
++  // thread (issue #21). When the request is still queued (the thread has not taken it, so what it
++  // does now is for another file) and the thread is held so, that file's reads and its open end
++  // (its input's Abort(), the cancel check of its demuxer), and the loop takes the request.
++  // Between reads, the request is taken as before.
++  std::unique_lock lock(m_inputAbortSection);
++  if (!OpenFilePending())
++    return;
++  const int64_t since = m_packetReadSince;
++  const bool preparing = m_preparing;
++  const bool reading =
++      since != 0 &&
++      std::chrono::steady_clock::now().time_since_epoch().count() - since >=
++          std::chrono::duration_cast<std::chrono::steady_clock::duration>(HELD_READ).count();
++  if (!preparing && !reading)
++    return;
++  m_supersede = true;
++  if (m_inputForAbort)
++    m_inputForAbort->Abort();
++  CLog::Log(LOGINFO,
++            "VideoPlayer: another file is asked for while this one {}: its reads end, and the "
++            "other one opens",
++            preparing ? "opens" : "waits in a read");
++}
++
++void CVideoPlayer::SetInputForAbort(CDVDInputStream* input)
++{
++  // Hades: the input that SupersedeHeldFile() may abort from another thread; set on this thread
++  // once the input exists, cleared before it goes. An input made after a supersede is aborted at
++  // once: it is for a file that another one replaces.
++  std::unique_lock lock(m_inputAbortSection);
++  m_inputForAbort = input;
++  if (input && m_supersede)
++    input->Abort();
++}
++
++void CVideoPlayer::PrepareFailed()
++{
++  // Hades: a file that could not be opened while another one is asked for (its open was ended for
++  // that one, or failed by itself): the loop opens the other one, and this one reports no error.
++  // Before, the thread ended with the error and the request queued meanwhile was lost (issue #21).
++  if (OpenFilePending())
++  {
++    CLog::Log(LOGINFO, "VideoPlayer: {} was not opened; the file asked for since is opened",
++              CURL::GetRedacted(m_item.GetPath()));
++    return;
++  }
++  m_bAbortRequest = true;
++  m_error = true;
++}
++
+ void CVideoPlayer::OnStartup()
+ {
+   m_syncStartPtsWait.reset();
+@@ -938,6 +1005,7 @@ void CVideoPlayer::OnStartup()
+ 
+ bool CVideoPlayer::OpenInputStream()
+ {
++  SetInputForAbort(nullptr);
+   if (m_pInputStream.use_count() > 1)
+     throw std::runtime_error("m_pInputStream reference count is greater than 1");
+   m_pInputStream.reset();
+@@ -957,6 +1025,7 @@ bool CVideoPlayer::OpenInputStream()
+               CURL::GetRedacted(m_item.GetPath()));
+     return false;
+   }
++  SetInputForAbort(m_pInputStream.get());
+ 
+   if (!m_pInputStream->Open())
+   {
+@@ -1077,7 +1146,10 @@ bool CVideoPlayer::OpenDemuxStream()
+   int attempts = 10;
+   while (!m_bStop && attempts-- > 0)
+   {
+-    m_pDemuxer.reset(CDVDFactoryDemuxer::CreateDemuxer(m_pInputStream));
++    // Hades: its open and its reads end when another file is asked for while they hold the thread
++    // (SupersedeHeldFile())
++    m_pDemuxer.reset(CDVDFactoryDemuxer::CreateDemuxer(m_pInputStream, false,
++                                                       [this] { return m_supersede.load(); }));
+     if(!m_pDemuxer && m_pInputStream->IsStreamType(DVDSTREAM_TYPE_PVRMANAGER))
+     {
+       continue;
+@@ -1482,7 +1554,10 @@ bool CVideoPlayer::ReadPacket(DemuxPacket*& packet, CDemuxStream*& stream)
+     // have done while the players run dry (CFileCache, IOControl::READ_WAIT)
+     if (m_pInputStream)
+       m_pInputStream->SetReadWait(&m_inputWaitFn);
++    // (and since when the read lasts: SupersedeHeldFile())
++    m_packetReadSince = std::chrono::steady_clock::now().time_since_epoch().count();
+     packet = m_pDemuxer->Read();
++    m_packetReadSince = 0;
+     if (m_pInputStream)
+       m_pInputStream->SetReadWait(nullptr);
+     InputWaitEnded();
+@@ -1700,6 +1775,14 @@ void CVideoPlayer::TellDiscDefaultStreams()
+ 
+ void CVideoPlayer::Prepare()
+ {
++  // Hades: while the file opens, another one asked for ends its open (SupersedeHeldFile())
++  m_preparing = true;
++  struct PreparingEnds
++  {
++    std::atomic<bool>& preparing;
++    ~PreparingEnds() { preparing = false; }
++  } preparingEnds{m_preparing};
++
+   // a new file: whether its video is progressive, and its display mode, are chosen again
+   m_renderManager.NewFile();
+   // and its audio output is tried from scratch
+@@ -1741,6 +1824,16 @@ void CVideoPlayer::Prepare()
+   m_CurrentAudio.lastdts = DVD_NOPTS_VALUE;
+   m_CurrentVideo.lastdts = DVD_NOPTS_VALUE;
+ 
++  // Hades: another file asked for already: the loop opens that one, and this one is not opened at
++  // all (its state is clear: no position of it is saved when it is replaced)
++  if (OpenFilePending())
++  {
++    CLog::Log(LOGINFO,
++              "VideoPlayer: another file was asked for before {} opened: that one is opened",
++              CURL::GetRedacted(m_item.GetPath()));
++    return;
++  }
++
+   IPlayerCallback *cb = &m_callback;
+   CFileItem fileItem = m_item;
+   m_outboundEvents->Submit([=]() {
+@@ -1749,8 +1842,7 @@ void CVideoPlayer::Prepare()
+ 
+   if (!OpenInputStream())
+   {
+-    m_bAbortRequest = true;
+-    m_error = true;
++    PrepareFailed();
+     return;
+   }
+ 
+@@ -1783,8 +1875,7 @@ void CVideoPlayer::Prepare()
+                        "opened when it starts one");
+   else if (!OpenDemuxStream())
+   {
+-    m_bAbortRequest = true;
+-    m_error = true;
++    PrepareFailed();
+     return;
+   }
+ 
+@@ -2172,6 +2263,12 @@ void CVideoPlayer::Process()
+         continue;
+       }
+ 
++      // Hades: another file is asked for (the reads of this one ended for it, or it ended
++      // meanwhile): the loop opens that one; before, the thread ended here and the request was
++      // lost (issue #21)
++      if (OpenFilePending())
++        continue;
++
+       // Hades: the input did not end, its source was given up on before the end of the file (no
+       // data for minutes, or a server that refuses the file): playback ends with an error, which
+       // keeps the position, and not as if the whole video had been played
+@@ -2567,6 +2664,16 @@ void CVideoPlayer::OnInputWait(std::chrono::milliseconds waited)
+   m_inputWait.active = true;
+   m_inputWait.waited = waited;
+ 
++  // another file is asked for: this read is not waited for, the loop opens that one
++  if (OpenFilePending())
++  {
++    if (!m_supersede.exchange(true))
++      CLog::Log(LOGINFO, "VideoPlayer: another file is asked for while a read waits for its "
++                         "source: the read ends, and the other one opens");
++    m_pInputStream->Abort();
++    return;
++  }
++
+   const bool tolerateStall =
+       IsInMenuInternal() || (m_CurrentVideo.hint.flags & StreamFlags::FLAG_STILL_IMAGES);
+   if (m_caching == CACHESTATE_DONE && m_playSpeed == DVD_PLAYSPEED_NORMAL && !tolerateStall &&
+@@ -3669,6 +3776,7 @@ void CVideoPlayer::OnExit()
+   m_pSubtitleDemuxer.reset();
+   m_subtitleDemuxerMap.clear();
+   m_pCCDemuxer.reset();
++  SetInputForAbort(nullptr);
+   if (m_pInputStream.use_count() > 1)
+     throw std::runtime_error("m_pInputStream reference count is greater than 1");
+   m_pInputStream.reset();
+@@ -3714,6 +3822,14 @@ void CVideoPlayer::HandleMessages()
+     {
+       CDVDMsgOpenFile& msg(*std::static_pointer_cast<CDVDMsgOpenFile>(pMsg));
+ 
++      // Hades: the file asked for is opened now: what ended the reads of the one it replaces
++      // (SupersedeHeldFile()) does not reach it, and that one is not aborted from now on
++      {
++        std::unique_lock lock(m_inputAbortSection);
++        m_supersede = false;
++        m_inputForAbort = nullptr;
++      }
++
+       IPlayerCallback *cb = &m_callback;
+       CFileItem fileItem(m_item);
+       UpdateFileItemStreamDetails(fileItem, UpdateStreamDetails::UPDATE_IF_FLAGGED);
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 519d472..7720ee2 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -522,6 +522,18 @@ protected:
+   void OnInputWait(std::chrono::milliseconds waited);
+   //! Hades: after the read of a packet: the end of such a wait, in the log
+   void InputWaitEnded();
++  //! Hades: a request for another file (PLAYER_OPENFILE) waits in the queue
++  bool OpenFilePending();
++  /*!
++   * \brief Hades: from OpenFile(), after it queued the request: when the thread is held by the file
++   *        it has (opening it, or a read of a packet that has lasted HELD_READ), that file's reads
++   *        and its open end, so the request is taken now (issue #21)
++   */
++  void SupersedeHeldFile();
++  //! Hades: the input SupersedeHeldFile() may abort (this thread sets it; nullptr before it goes)
++  void SetInputForAbort(CDVDInputStream* input);
++  //! Hades: Prepare() could not open the file: an error, unless another file is asked for
++  void PrepareFailed();
+   bool IsInMenuInternal() const;
+   void SynchronizeDemuxer();
+   bool IsNearStreamEnd(std::chrono::milliseconds time) const;
+@@ -805,6 +817,15 @@ protected:
+     std::optional<std::chrono::milliseconds> toldAt; // the notification, last at this wait
+   } m_inputWait;
+ 
++  //! Hades: SupersedeHeldFile(). A read of a packet takes milliseconds; one that has lasted this
++  //! long waits for its drive or its source.
++  static constexpr std::chrono::milliseconds HELD_READ{500};
++  std::atomic<bool> m_preparing{false}; // Prepare() runs
++  std::atomic<int64_t> m_packetReadSince{0}; // steady_clock ticks at the start of a read of a packet
++  std::atomic<bool> m_supersede{false}; // another file is asked for while this one held the thread
++  CCriticalSection m_inputAbortSection;
++  CDVDInputStream* m_inputForAbort{nullptr};
++
+   CEdl m_Edl;
+   bool m_SkipCommercials;
+ 
+-- 
+2.53.0
+

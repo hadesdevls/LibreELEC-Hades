@@ -9,6 +9,11 @@ PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE="https://libreelec.tv"
 PKG_URL="https://github.com/LibreELEC/service.libreelec.settings/archive/${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_TARGET="toolchain Python3 connman dbussy"
+# Hades: the clips of "Check this setup" (System > Check this setup, LibreELEC-settings-9050), made at
+# build time with x265 for the build host, which the tree has for x86_64 and aarch64
+if [ "${TARGET_ARCH}" = "x86_64" ]; then
+  PKG_DEPENDS_TARGET+=" hades-check"
+fi
 PKG_LONGDESC="LibreELEC-settings: is a settings dialog for LibreELEC"
 
 PKG_MAKE_OPTS_TARGET="ADDON_VERSION=${OS_VERSION} \
@@ -44,4 +49,7 @@ post_makeinstall_target() {
 post_install() {
   enable_service backup-restore.service
   enable_service factory-reset.service
+  # Hades: puts back the sound settings that Check this setup changed for a moment, when Kodi stopped while
+  # its sounds played (it runs nothing unless the check left its journal)
+  enable_service hades-check-restore.service
 }

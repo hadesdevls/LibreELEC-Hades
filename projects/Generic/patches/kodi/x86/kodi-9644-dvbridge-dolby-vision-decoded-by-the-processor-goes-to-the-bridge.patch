@@ -1,0 +1,745 @@
+From 2bcf2a46dbe78d01604524202c5e5f6b644bd5f9 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:14:58 +0000
+Subject: [PATCH] dvbridge: Dolby Vision decoded by the processor goes to the
+ bridge
+
+A graphics card that does not decode the codec of a Dolby Vision stream
+(AV1 on RTX 20 and GTX 16, AMD Renoir and Cezanne, Intel before Tiger
+Lake; or VAAPI turned off) left the stream to Kodi's ordinary renderer:
+it played as its base layer, without Dolby Vision, and profile 10.0
+(an IPT base layer, as profile 5) with the wrong colours where nothing
+reconstructed it.
+
+The pictures of single-layer Dolby Vision that the processor decodes
+(profiles 5, 8 and 10, without an enhancement layer, with their own
+RPU: DVBRIDGE::CpuPicturesEligible()) now go to the bridge, for native
+output, for the reconstruction as HDR10 or SDR, and for the mapping of
+their base layer to SDR, as a VAAPI surface does. They go from the
+three planes that CLinuxRendererGLES already uploads for its own
+drawing (10-bit 4:2:0 in three GL_R16 textures, the samples as the
+decoder gave them), which dvbridge_gl_frame_import() takes as
+DVBRIDGE_YUV420P10: no copy is added, on the processor or on the GPU.
+
+Exact: the composer of ETSI GS CCM 001 reads every sample of the base
+layer as the integer code it holds (texelFetch and rounding to the
+code), so the planes give it the codes that the P010 surface of a
+hardware decoder of the same stream gives (AV1 and HEVC decoding is
+exact). Measured with the software bridge on the host (zink on
+lavapipe): the pictures of the FEL test stream uploaded as three planes
+and as P010 give the same bytes on every way that the render test
+draws. The AV1 decoding itself could not be
+run on the host (no AV1 decoder in its FFmpeg, no AV1 Dolby Vision
+file).
+
+What does not change: a stream of profile 7 (its enhancement layer
+needs VAAPI and is not decoded with a base layer of the processor),
+HDR10 measured as Dolby Vision and HDR10+ sent as it (measured on VAAPI
+surfaces), a picture that a filter made or of another format, one of an
+odd size, larger than 3840x2160 or rotated: those play as before. The
+pictures of a video that is not Dolby Vision are drawn as Kodi draws
+them. When the processor cannot keep up, FFmpeg's AV1 decoder (dav1d)
+drops pictures that are not references (skip_frame): those that come
+are exact, and the bridge sees fewer of them, as it sees any gap.
+DVGeometry() and ManageRenderArea() move from CRendererVAAPIGLES to the
+base renderer, unchanged, so that both renderers have them.
+
+kodi.log: "DVBridge: this Dolby Vision stream (profile N, single-layer)
+is decoded by the processor (...)", once a stream, and "DVBridge: Dolby
+Vision pictures that the processor decoded (WxH, 10-bit 4:2:0) go to
+the bridge from the three planes ..." or "... cannot go to the bridge
+...: <why>" each time the renderer is configured. The player
+information no longer gives "software" as the reason for such a
+stream.
+---
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |   1 +
+ .../DVDCodecs/Video/DVDVideoCodec.h           |   5 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  16 +-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   3 +
+ .../DVDCodecs/Video/DVPlaybackPolicy.h        |  31 ++-
+ .../HwDecRender/RendererVAAPIGLES.cpp         |  61 -----
+ .../HwDecRender/RendererVAAPIGLES.h           |   7 -
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 256 ++++++++++++++++++
+ .../VideoRenderers/LinuxRendererGLES.h        |  45 ++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  24 +-
+ 10 files changed, 368 insertions(+), 81 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index c170bb6..147606a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -72,6 +72,7 @@ void VideoPicture::Reset()
+   doviRpuRepeated = false;
+   doviMeasured = false;
+   doviHdr10Plus = 0;
++  doviFromCpu = false;
+   doviRpu.Reset();
+ #endif
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index 3c7dd0f..87556c0 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -142,6 +142,11 @@ public:
+   //! missing (CDVHdr10PlusFill): what it is (dvbridge_hdr10plus_next_of(): DVBRIDGE_HDR10PLUS_*);
+   //! 0 for any other. One that is not of its own statistics is measured (doviMeasured).
+   unsigned int doviHdr10Plus = 0;
++  //! Hades: the picture was decoded by the processor (it is in system memory, not a VAAPI surface),
++  //! of single-layer Dolby Vision with its own RPU, in 10-bit 4:2:0 as the decoder gave it
++  //! (DVBRIDGE::CpuPicturesEligible()): the bridge takes it from the planes that Kodi's own renderer
++  //! uploads (CLinuxRendererGLES::CanRenderDVBridge())
++  bool doviFromCpu = false;
+   //! the RPU doviMetadata was parsed from, as coded. Empty when doviRpuRepeated, and when no
+   //! enhancement layer is decoded: only its pairing reads it
+   CDVMetadataBuffer doviRpu;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 5283453..096aafc 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -443,6 +443,11 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+       m_dvHdr10PlusScene = dvbridge_hdr10plus_scene_create();
+   }
+   dvbridge_hdr10plus_scene_reset(m_dvHdr10PlusScene);
++  // Hades: single-layer Dolby Vision with its own RPU, decoded for native output or for the
++  // reconstruction: where the processor decodes it, its pictures go to the bridge all the same
++  m_dvCpuPictures = (m_dvNativeOutput || m_dvConvert) &&
++                    DVBRIDGE::CpuPicturesEligible(hints.dovi.dv_profile, hints.dovi.el_present_flag,
++                                                  !m_dvMeasured && !m_dvFromHdr10Plus);
+   m_dvDecoderTold = false;
+   m_dvBaseTold = false;
+   m_dvDisplayMetadata.reset();
+@@ -930,6 +935,7 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvLate = 0;
+   m_dvLateInRow = 0;
+   m_dvSoftware = false;
++  m_dvCpuPictures = false;
+   m_dvRpuBack = DV_RPU_BACK;
+   m_dvRpuReturns = 0;
+   m_dvNativeOutput = false;
+@@ -1459,7 +1465,7 @@ void CDVDVideoCodecFFmpeg::CheckNativeDVPicture(VideoPicture* picture)
+   if (!m_dvDecoderTold)
+   {
+     m_dvDecoderTold = true;
+-    DVBRIDGE::DecoderTook(m_pHardware != nullptr, m_hints);
++    DVBRIDGE::DecoderTook(m_pHardware != nullptr, picture->doviFromCpu, m_hints);
+   }
+   // Pictures without Dolby Vision metadata cannot be drawn natively (a single one is only not
+   // drawn). When the metadata stays missing, this stream uses the ordinary output, and it
+@@ -2164,6 +2170,13 @@ bool CDVDVideoCodecFFmpeg::SetPictureParams(VideoPicture* pVideoPicture)
+   if (!GetPictureCommon(pVideoPicture))
+     return false;
+ 
++#ifdef HAVE_DVBRIDGE
++  // Hades: a picture that the processor decoded, of single-layer Dolby Vision (m_dvCpuPictures), in
++  // 10-bit 4:2:0 as it came from the decoder: the bridge takes it from the renderer's planes. (One
++  // that a filter made, or of another format, is not: it plays as Kodi plays it.)
++  pVideoPicture->doviFromCpu = m_dvCpuPictures && m_pFrame->format == AV_PIX_FMT_YUV420P10 &&
++                               pVideoPicture->hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION;
++#endif
+   pVideoPicture->iFlags |= m_pFrame->data[0] ? 0 : DVP_FLAG_DROPPED;
+ 
+   if (pVideoPicture->videoBuffer)
+@@ -2513,6 +2526,7 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   pVideoPicture->doviNoNative = m_dvNoNative;
+   pVideoPicture->doviRpuRepeated = false;
+   pVideoPicture->doviHdr10Plus = 0;
++  pVideoPicture->doviFromCpu = false;
+   pVideoPicture->doviRpu.Reset();
+ #else
+   pVideoPicture->doviSourcePts = m_pFrame->best_effort_timestamp;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 893a154..573a208 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -106,6 +106,9 @@ protected:
+   unsigned int m_dvVideo{0};
+   bool m_dvVideoTaken{false};
+   bool m_dvSoftware{false}; //!< the base layer is decoded in software: no enhancement layer
++  //! Hades: the pictures that the processor decodes go to the bridge from the renderer's planes
++  //! (DVBRIDGE::CpuPicturesEligible(), VideoPicture::doviFromCpu)
++  bool m_dvCpuPictures{false};
+   unsigned int m_dvPaired{0}; //!< base pictures paired with their enhancement picture
+   unsigned int m_dvLayerRpu{0}; //!< of them, those that took the RPU of that picture, another one
+   unsigned int m_dvLayerOwnRpu{0}; //!< of them, those whose enhancement picture had its own RPU
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+index cea570c..b3c3191 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+@@ -38,6 +38,29 @@ constexpr bool RpuRepeated(bool hevc, bool codedRpu)
+   return hevc && !codedRpu;
+ }
+ 
++/*!
++ * \brief Hades: whether the pictures of a Dolby Vision stream that the processor decodes (VAAPI
++ *        does not: a graphics card without hardware decoding of the codec, such as AV1 on RTX 20
++ *        and GTX 16, AMD Renoir and Cezanne or Intel before Tiger Lake, or VAAPI turned off) go to
++ *        the Dolby Vision bridge, for native output and for the reconstruction as HDR10 or SDR
++ *
++ * They go from the planes that Kodi's own renderer uploads (CLinuxRendererGLES): 10-bit 4:2:0 in
++ * three 16-bit textures as the decoder gave them, which the bridge imports as DVBRIDGE_YUV420P10.
++ * The composer of ETSI GS CCM 001 reads every sample as the integer code it holds (texelFetch,
++ * rounded): the same codes as from the P010 surface of VAAPI, so the same reconstruction (measured
++ * with the software bridge: the same bytes on every way). Single-layer Dolby Vision only:
++ * profiles 5 and 8 (HEVC) and 10 (AV1), without an enhancement layer. A stream of profile 7 has
++ * one, which needs VAAPI and is not decoded with a base layer that the processor decodes: it
++ * plays as before. And only with the stream's own RPU: HDR10 measured as Dolby Vision and HDR10+
++ * sent as it are measured on VAAPI surfaces.
++ * \param profile, enhancementLayer the stream's Dolby Vision configuration (dv_profile,
++ *        el_present_flag); \param ownMetadata its RPU is its own
++ */
++constexpr bool CpuPicturesEligible(int profile, bool enhancementLayer, bool ownMetadata)
++{
++  return ownMetadata && !enhancementLayer && (profile == 5 || profile == 8 || profile == 10);
++}
++
+ // Hades: the size of a frame of the transport of native Dolby Vision, and of its mode: the window,
+ // the buffers that go out, the picture that a capture reads and the viewport of what is drawn
+ // over it are this size (one place for what was written in seven)
+@@ -1201,7 +1224,9 @@ constexpr bool Hdr10PlusFillFor(bool setting, bool measurementUnavailable)
+  *
+  * Both need them: what the bridge imports are the VAAPI surfaces of the base layer and of the
+  * enhancement layer. The pictures of a stream that VAAPI does not decode are drawn by Kodi's
+- * ordinary renderer, as Kodi plays them (and the enhancement layer is not decoded). Kodi's DRM
++ * ordinary renderer, as Kodi plays them (and the enhancement layer is not decoded). (Hades: but for
++ * single-layer Dolby Vision, CpuPicturesEligible(), which that renderer gives to the bridge from
++ * the planes it uploads: no shortfall then.) Kodi's DRM
+  * PRIME decoder does not come into it: the decoder factory gives such a stream to
+  * CDVDVideoCodecFFmpeg, which uses VAAPI, whatever "Allow using DRM PRIME decoder" says.
+  */
+@@ -1239,7 +1264,9 @@ constexpr const char* DecoderShortfallCode(DecoderShortfall shortfall)
+ //! The decoder of a stream that is decoded for native output or for output as HDR10 gave its first
+ //! picture, from VAAPI or not (VideoPlayer, each time the stream opens): in the log when not, and
+ //! for the player information until the next video
+-void DecoderTook(bool hardware, const CDVDStreamInfo& stream);
++//! (Hades: cpuPictures, the pictures that the processor decodes go to the bridge all the same:
++//! VideoPicture::doviFromCpu)
++void DecoderTook(bool hardware, bool cpuPictures, const CDVDStreamInfo& stream);
+ DecoderShortfall DecoderShortfallNow();
+ //! Hades: the decoder of the video that plays refused a picture for its base layer
+ //! (VideoPicture::doviBaseRefused, BaseLayerComposable()): for the player information until the
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index 3c3bc35..b4cdda4 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -9,7 +9,6 @@
+ #include "RendererVAAPIGLES.h"
+ 
+ #ifdef HAVE_DVBRIDGE
+-#include "DVViewGeometry.h"
+ #endif
+ 
+ #include "../RenderFactory.h"
+@@ -204,47 +203,6 @@ bool CRendererVAAPIGLES::DVFrameRejected(const char* stage)
+   return false;
+ }
+ 
+-bool CRendererVAAPIGLES::DVGeometry(dvbridge_geometry& geometry) const
+-{
+-  // Native output draws the whole picture, at its own aspect ratio, inside the 3840x2160
+-  // raster. Hades: zoom (a cropped source), stretching, pixels that are not square or a shift out
+-  // of the raster draw the part of the picture that Kodi shows where Kodi draws it, natively too
+-  // (a view in the geometry: DVBRIDGE::ViewGeometry()); they kept the ordinary output.
+-  if (m_sourceWidth == 0 || m_sourceHeight == 0 || m_sourceWidth > 3840 || m_sourceHeight > 2160)
+-    return false;
+-  const double aspect = static_cast<double>(m_sourceHeight) / m_sourceWidth;
+-  if (m_sourceRect.x1 != 0 || m_sourceRect.y1 != 0 || m_sourceRect.Width() != m_sourceWidth ||
+-      m_sourceRect.Height() != m_sourceHeight || m_destRect.x1 < -0.5f ||
+-      m_destRect.y1 < -0.5f || m_destRect.x2 > 3840.5f || m_destRect.y2 > 2160.5f ||
+-      std::abs(static_cast<double>(m_destRect.Width()) * aspect -
+-               static_cast<double>(m_destRect.Height())) > 1.5)
+-    return DVBRIDGE::ViewGeometry(static_cast<int>(m_sourceWidth),
+-                                  static_cast<int>(m_sourceHeight), m_sourceRect.x1,
+-                                  m_sourceRect.y1, m_sourceRect.x2, m_sourceRect.y2,
+-                                  m_destRect.x1, m_destRect.y1, m_destRect.x2, m_destRect.y2,
+-                                  geometry);
+-  // The 4:2:2 transport needs an even horizontal position and width (for example a 3586-pixel
+-  // wide picture pillarboxed at x = 127): move each side inwards to an even column, at most one
+-  // pixel, and take the height from that width, centred where Kodi placed the picture.
+-  const int left = std::clamp(2 * static_cast<int>(std::ceil(m_destRect.x1 / 2.0f - 0.01f)), 0, 3840);
+-  const int right =
+-      std::clamp(2 * static_cast<int>(std::floor(m_destRect.x2 / 2.0f + 0.01f)), 0, 3840);
+-  const int width = right - left;
+-  if (width <= 0)
+-    return false;
+-  const int height = std::min(2160, static_cast<int>(std::lround(width * aspect)));
+-  if (height <= 0)
+-    return false;
+-  const int top = std::clamp(
+-      static_cast<int>(std::lround(static_cast<double>(m_destRect.y1 + m_destRect.y2) / 2.0 -
+-                                   height / 2.0)),
+-      0, 2160 - height);
+-  // (no view: the whole picture, as before)
+-  geometry = {static_cast<int>(m_sourceWidth), static_cast<int>(m_sourceHeight), left, top, width,
+-              height, {0.0f, 0.0f, 0.0f, 0.0f}};
+-  return true;
+-}
+-
+ bool CRendererVAAPIGLES::CanRenderDVBridge(const VideoPicture& picture) const
+ {
+   // Native decoder textures only. Postprocessed or rotated images need their own explicit
+@@ -373,25 +331,6 @@ int CRendererVAAPIGLES::RenderDVConversion(int idx)
+                                     buffer.doviEpoch, DVConversionShowsBase(idx));
+ }
+ 
+-void CRendererVAAPIGLES::ManageRenderArea()
+-{
+-  CLinuxRendererGLES::ManageRenderArea();
+-  dvbridge_geometry geometry{};
+-  m_dvGeometryUsable = DVGeometry(geometry);
+-  // Hades: for the player information, when it is a view setting of the user (zoom, stretch,
+-  // shift) that keeps a picture that asks for native Dolby Vision output on the ordinary
+-  // output. Not when the geometry is not usable with the view as it comes (a stream whose
+-  // pixels are not square), and not for a rotation, which may be the stream's own.
+-  if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+-          CServiceBroker::GetWinSystem()))
+-  {
+-    const CDisplaySettings& view = CDisplaySettings::GetInstance();
+-    const bool changed = view.GetZoomAmount() != 1.0f || view.GetVerticalShift() != 0.0f ||
+-                         view.GetPixelRatio() != 1.0f || view.IsNonLinearStretched();
+-    window->SetDVBridgeViewKeepsOrdinary(m_dvAsked && !m_dvGeometryUsable && changed);
+-  }
+-}
+-
+ // Hades: a picture of HDR10 measured as Dolby Vision, queued for presentation: mapped and given to the
+ // measurement now, so that what it shows is known before it is shown (once a picture)
+ void CRendererVAAPIGLES::MeasureAhead(int idx)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+index 2e2dd3a..60b93e0 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+@@ -63,13 +63,6 @@ protected:
+   int RenderDVConversion(int idx) override;
+   int RenderPlainMapping(int idx) override;
+   bool CanConvertDV(const VideoPicture& picture) const override;
+-  //! Where the picture goes in the 3840x2160 transport raster; false when it cannot be drawn
+-  //! natively (Hades: nothing of it on the raster; zoom, stretching and shifts are drawn with the
+-  //! part of the picture shown, DVBRIDGE::ViewGeometry()). Render thread.
+-  bool DVGeometry(dvbridge_geometry& geometry) const;
+-  //! Also publishes whether the geometry allows native output, for the player thread.
+-  void ManageRenderArea() override;
+-  std::atomic<bool> m_dvGeometryUsable{false};
+ #endif
+   void AfterRenderHook(int idx) override;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 7a3a2d2..f0bd133 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -30,8 +30,13 @@
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ #ifdef HAVE_DVBRIDGE
++#include "HwDecRender/DVViewGeometry.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h"
+ #include "windowing/gbm/WinSystemGbmGLESContext.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
+ #endif
+ 
+ #include <mutex>
+@@ -225,6 +230,27 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   {
+     m_dvOutputRestores = dvWindow->DVOutputRestores();
+     const bool native = WantsDVBridge(picture);
++    // Hades: a picture that the processor decoded, of single-layer Dolby Vision: whether the bridge
++    // takes it from the planes of this renderer, once each time the renderer is configured
++    if (picture.doviFromCpu)
++    {
++      const char* why = DVCpuWhyNot(picture);
++      if (why)
++        CLog::Log(
++            LOGWARNING,
++            "DVBridge: a Dolby Vision picture that the processor decoded ({}x{}) cannot go to "
++            "the bridge from the planes of Kodi's renderer: {}; it plays as Kodi plays it",
++            picture.iWidth, picture.iHeight, why);
++      else
++        CLog::Log(
++            LOGINFO,
++            "DVBridge: Dolby Vision pictures that the processor decoded ({}x{}, 10-bit 4:2:0) "
++            "go to the bridge from the three planes that Kodi's renderer uploads, as they are "
++            "(no copy): {}",
++            picture.iWidth, picture.iHeight,
++            native ? "drawn natively"
++                   : "for native output when the output allows it, else for the reconstruction");
++    }
+     dvWindow->SetDVBridgeRendererNative(native);
+     // Hades: ... and how Dolby Vision Low-Latency maps its pictures to the display, where it is that
+     // (from the static metadata of the picture: the gamut of its mastering display)
+@@ -488,6 +514,235 @@ bool CLinuxRendererGLES::DVConversionShowsBase(int idx) const
+ }
+ #endif
+ 
++#ifdef HAVE_DVBRIDGE
++// Hades: DVGeometry() and ManageRenderArea() were CRendererVAAPIGLES's; they are the same for a
++// picture that the processor decoded, which this renderer draws natively from its own planes
++// (DVCpuPicture()).
++bool CLinuxRendererGLES::DVGeometry(dvbridge_geometry& geometry) const
++{
++  // Native output draws the whole picture, at its own aspect ratio, inside the 3840x2160
++  // raster. Hades: zoom (a cropped source), stretching, pixels that are not square or a shift out
++  // of the raster draw the part of the picture that Kodi shows where Kodi draws it, natively too
++  // (a view in the geometry: DVBRIDGE::ViewGeometry()); they kept the ordinary output.
++  if (m_sourceWidth == 0 || m_sourceHeight == 0 || m_sourceWidth > 3840 || m_sourceHeight > 2160)
++    return false;
++  const double aspect = static_cast<double>(m_sourceHeight) / m_sourceWidth;
++  if (m_sourceRect.x1 != 0 || m_sourceRect.y1 != 0 || m_sourceRect.Width() != m_sourceWidth ||
++      m_sourceRect.Height() != m_sourceHeight || m_destRect.x1 < -0.5f || m_destRect.y1 < -0.5f ||
++      m_destRect.x2 > 3840.5f || m_destRect.y2 > 2160.5f ||
++      std::abs(static_cast<double>(m_destRect.Width()) * aspect -
++               static_cast<double>(m_destRect.Height())) > 1.5)
++    return DVBRIDGE::ViewGeometry(static_cast<int>(m_sourceWidth), static_cast<int>(m_sourceHeight),
++                                  m_sourceRect.x1, m_sourceRect.y1, m_sourceRect.x2,
++                                  m_sourceRect.y2, m_destRect.x1, m_destRect.y1, m_destRect.x2,
++                                  m_destRect.y2, geometry);
++  // The 4:2:2 transport needs an even horizontal position and width (for example a 3586-pixel
++  // wide picture pillarboxed at x = 127): move each side inwards to an even column, at most one
++  // pixel, and take the height from that width, centred where Kodi placed the picture.
++  const int left =
++      std::clamp(2 * static_cast<int>(std::ceil(m_destRect.x1 / 2.0f - 0.01f)), 0, 3840);
++  const int right =
++      std::clamp(2 * static_cast<int>(std::floor(m_destRect.x2 / 2.0f + 0.01f)), 0, 3840);
++  const int width = right - left;
++  if (width <= 0)
++    return false;
++  const int height = std::min(2160, static_cast<int>(std::lround(width * aspect)));
++  if (height <= 0)
++    return false;
++  const int top =
++      std::clamp(static_cast<int>(std::lround(
++                     static_cast<double>(m_destRect.y1 + m_destRect.y2) / 2.0 - height / 2.0)),
++                 0, 2160 - height);
++  // (no view: the whole picture, as before)
++  geometry = {
++      static_cast<int>(m_sourceWidth), static_cast<int>(m_sourceHeight), left, top, width, height,
++      {0.0f, 0.0f, 0.0f, 0.0f}};
++  return true;
++}
++
++void CLinuxRendererGLES::ManageRenderArea()
++{
++  CBaseRenderer::ManageRenderArea();
++  dvbridge_geometry geometry{};
++  m_dvGeometryUsable = DVGeometry(geometry);
++  // Hades: for the player information, when it is a view setting of the user (zoom, stretch,
++  // shift) that keeps a picture that asks for native Dolby Vision output on the ordinary
++  // output. Not when the geometry is not usable with the view as it comes (a stream whose
++  // pixels are not square), and not for a rotation, which may be the stream's own.
++  if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++          CServiceBroker::GetWinSystem()))
++  {
++    const CDisplaySettings& view = CDisplaySettings::GetInstance();
++    const bool changed = view.GetZoomAmount() != 1.0f || view.GetVerticalShift() != 0.0f ||
++                         view.GetPixelRatio() != 1.0f || view.IsNonLinearStretched();
++    window->SetDVBridgeViewKeepsOrdinary(m_dvAsked && !m_dvGeometryUsable && changed);
++  }
++}
++
++const char* CLinuxRendererGLES::DVCpuWhyNot(const VideoPicture& picture) const
++{
++  if (!picture.doviFromCpu || !picture.videoBuffer)
++    return "";
++  // The planes that CreatePlanarYUVTexture() makes for 10-bit 4:2:0: three GL_R16 textures of the
++  // sizes of the picture's planes (the luma, then each chroma plane at half of them), into which
++  // UploadPlanarYUVTexture() copies the decoder's samples as they are (the 10 bits at the bottom).
++  // dvbridge_gl_frame_import() takes that as DVBRIDGE_YUV420P10, a chroma plane of (width + 1) / 2
++  // samples: the renderer makes width / 2, so the picture is of even sizes. 3840x2160 at most, as
++  // for a VAAPI surface.
++  if (picture.videoBuffer->GetFormat() != AV_PIX_FMT_YUV420P10)
++    return "its pixel format is not 10-bit 4:2:0";
++  if (picture.iWidth < 2 || picture.iHeight < 2 || picture.iWidth > 3840 || picture.iHeight > 2160)
++    return "it is larger than 3840x2160";
++  if (picture.iWidth % 2 || picture.iHeight % 2)
++    return "it is of an odd width or height";
++  if (m_textureTarget != GL_TEXTURE_2D || m_renderOrientation != 0)
++    return "it is rotated";
++#if !defined(GL_R16_EXT)
++  return "this build has no 16-bit textures (GL_R16_EXT)";
++#else
++  return nullptr;
++#endif
++}
++
++bool CLinuxRendererGLES::CanRenderDVBridge(const VideoPicture& picture) const
++{
++  // Called on the player thread: the geometry itself is computed by the render thread.
++  return DVCpuPicture(picture) && m_dvGeometryUsable;
++}
++
++bool CLinuxRendererGLES::CanConvertDV(const VideoPicture& picture) const
++{
++  // (the place and size on the screen are free, as for a VAAPI surface:
++  // CRendererVAAPIGLES::CanConvertDV())
++  return DVCpuPicture(picture);
++}
++
++bool CLinuxRendererGLES::DVCpuPlanes(int idx, dvbridge_gl_plane planes[3])
++{
++  if (idx < 0 || idx >= NUM_BUFFERS || !m_buffers[idx].doviFromCpu ||
++      m_format != AV_PIX_FMT_YUV420P10 || m_textureTarget != GL_TEXTURE_2D ||
++      m_renderOrientation != 0 || !UploadTexture(idx))
++    return false;
++  const CPictureBuffer& buffer = m_buffers[idx];
++  if (buffer.image.bpp != 2)
++    return false;
++  for (int p = 0; p < 3; ++p)
++  {
++    const CYuvPlane& plane = buffer.fields[FIELD_FULL][p];
++    if (!plane.id)
++      return false;
++    planes[p] = {plane.id, static_cast<int>(plane.texwidth), static_cast<int>(plane.texheight)};
++  }
++  return true;
++}
++
++bool CLinuxRendererGLES::DVCpuRejected(const char* stage)
++{
++  const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                       std::chrono::steady_clock::now().time_since_epoch())
++                       .count();
++  if (m_dvCpuRejected.Record(now))
++    CLog::Log(LOGERROR,
++              "DVBridge: a picture that the processor decoded is not usable stage={} failures={} "
++              "format={} source={}x{} orientation={}",
++              stage, m_dvCpuRejected.Count(),
++              m_format == AV_PIX_FMT_NONE ? "none" : av_get_pix_fmt_name(m_format), m_sourceWidth,
++              m_sourceHeight, m_renderOrientation);
++  return false;
++}
++
++bool CLinuxRendererGLES::RenderDVBridge(int idx)
++{
++  // Hades: a picture that the processor decoded (the base renderer has no other that the bridge
++  // takes), drawn as CRendererVAAPIGLES::RenderDVBridge() draws a VAAPI surface: its three planes
++  // in place of the two of P010
++  auto* window =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  if (!window)
++    return DVCpuRejected("window");
++  auto& buffer = m_buffers[idx];
++  if (!buffer.doviMetadata.Data() || buffer.doviPts == DVD_NOPTS_VALUE)
++    return DVCpuRejected("dolby-vision-metadata");
++  CDVBridgeGLES::Layer layer{};
++  if (!DVCpuPlanes(idx, layer.planes))
++    return DVCpuRejected("planes");
++  layer.layout = DVBRIDGE_YUV420P10;
++  layer.width = m_sourceWidth;
++  layer.height = m_sourceHeight;
++  layer.chroma = buffer.doviChroma;
++  layer.baseTransfer = buffer.doviBaseTransfer;
++  layer.video = buffer.doviVideo;
++  layer.pts = buffer.doviPts;
++  layer.duration = buffer.doviDuration;
++  dvbridge_geometry geometry{};
++  if (!DVGeometry(geometry))
++    return DVCpuRejected("geometry");
++  const bool prepared = window->RenderDVBridge(
++      layer, buffer.doviEnhancement.get(), buffer.doviMetadata, geometry, buffer.doviSerial,
++      buffer.doviLayerNotDecoded, buffer.doviMeasured, buffer.doviHdr10Plus);
++  if (prepared && m_dvCpuRejected.Count())
++    m_dvCpuRejected.Reset();
++  return prepared;
++}
++
++int CLinuxRendererGLES::RenderDVConversion(int idx)
++{
++  auto* window =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  CDVBridgeGLES::Layer layer{};
++  if (!window || !DVCpuPlanes(idx, layer.planes))
++    return -1;
++  auto& buffer = m_buffers[idx];
++  layer.layout = DVBRIDGE_YUV420P10;
++  layer.width = m_sourceWidth;
++  layer.height = m_sourceHeight;
++  layer.chroma = buffer.doviChroma;
++  layer.baseTransfer = buffer.doviBaseTransfer;
++  layer.video = buffer.doviVideo;
++  // A picture without a time has no enhancement picture either (they are paired by it)
++  const bool timed = buffer.doviPts != DVD_NOPTS_VALUE;
++  layer.pts = timed ? buffer.doviPts : 0.0;
++  return window->RenderDVConversion(layer, timed ? buffer.doviEnhancement.get() : nullptr,
++                                    buffer.doviMetadata, m_sourceRect, m_destRect,
++                                    buffer.doviSerial, timed && buffer.doviLayerNotDecoded,
++                                    buffer.doviEpoch, DVConversionShowsBase(idx));
++}
++
++int CLinuxRendererGLES::RenderPlainMapping(int idx)
++{
++  // Hades: the base layer of such a picture mapped to SDR where it cannot be reconstructed
++  // (m_dvConvertBaseMapped), as CRendererVAAPIGLES::RenderPlainMapping() maps a VAAPI surface.
++  // Nothing else of the processor's goes this way: the pictures of a video that is not Dolby Vision
++  // are drawn as Kodi draws them.
++  auto* window =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  CDVBridgeGLES::Layer layer{};
++  if (!window || !DVCpuPlanes(idx, layer.planes))
++    return -1;
++  const auto& buffer = m_buffers[idx];
++  layer.layout = DVBRIDGE_YUV420P10;
++  layer.width = m_sourceWidth;
++  layer.height = m_sourceHeight;
++  layer.chroma = buffer.doviChroma;
++  // ... and its colour: its transfer, range and HDR10 metadata (0 where not known)
++  dvbridge_plain plain{};
++  plain.hlg = buffer.m_srcColTransfer == AVCOL_TRC_ARIB_STD_B67;
++  plain.full_range = buffer.m_srcFullRange;
++  if (buffer.hasDisplayMetadata && buffer.displayMetadata.has_luminance &&
++      buffer.displayMetadata.max_luminance.den && buffer.displayMetadata.min_luminance.den)
++  {
++    plain.max_luma = static_cast<float>(av_q2d(buffer.displayMetadata.max_luminance));
++    plain.min_luma = static_cast<float>(av_q2d(buffer.displayMetadata.min_luminance));
++  }
++  if (buffer.hasLightMetadata)
++  {
++    plain.max_cll = static_cast<float>(buffer.lightMetadata.MaxCLL);
++    plain.max_fall = static_cast<float>(buffer.lightMetadata.MaxFALL);
++  }
++  return window->RenderPlainMapping(layer, plain, m_sourceRect, m_destRect, buffer.doviSerial);
++}
++#endif
++
+ int CLinuxRendererGLES::NextYUVTexture()
+ {
+   return (m_iYUVRenderBuffer + 1) % m_NumYUVBuffers;
+@@ -530,6 +785,7 @@ void CLinuxRendererGLES::AddVideoPicture(const VideoPicture &picture, int index)
+   buf.doviMeasured = picture.doviMeasured;
+   buf.doviMeasureQueued = false;
+   buf.doviHdr10Plus = picture.doviHdr10Plus;
++  buf.doviFromCpu = picture.doviFromCpu;
+ #endif
+   buf.m_srcPrimaries = picture.color_primaries;
+   buf.m_srcColSpace = picture.color_space;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 4a5fde4..2669c54 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -29,6 +29,13 @@ extern "C" {
+ #include <libavutil/pixdesc.h>
+ }
+ 
++#ifdef HAVE_DVBRIDGE
++#include "utils/DVBridgeDiagnosticState.h"
++
++struct dvbridge_geometry;
++struct dvbridge_gl_plane;
++#endif
++
+ class CRenderSystemGLES;
+ 
+ class CTexture;
+@@ -137,10 +144,29 @@ protected:
+   virtual bool RenderHook(int idx) { return false; }
+ #ifdef HAVE_DVBRIDGE
+   // Failure is terminal for this frame: never silently use the ordinary shader.
+-  virtual bool RenderDVBridge(int idx) { return false; }
++  virtual bool RenderDVBridge(int idx);
+   //! Whether this renderer can draw the picture natively now: its surface, orientation and
+-  //! geometry. The base renderer (pictures in system memory) cannot.
+-  virtual bool CanRenderDVBridge(const VideoPicture& picture) const { return false; }
++  //! geometry. (Hades: the base renderer, pictures in system memory, can draw one that the
++  //! processor decoded of single-layer Dolby Vision, VideoPicture::doviFromCpu, from the planes that
++  //! it uploads: DVCpuPicture().)
++  virtual bool CanRenderDVBridge(const VideoPicture& picture) const;
++  //! Where the picture goes in the 3840x2160 transport raster; false when it cannot be drawn
++  //! natively (Hades: nothing of it on the raster; zoom, stretching and shifts are drawn with the
++  //! part of the picture shown, DVBRIDGE::ViewGeometry()). Render thread.
++  bool DVGeometry(dvbridge_geometry& geometry) const;
++  //! Also publishes whether the geometry allows native output, for the player thread.
++  void ManageRenderArea() override;
++  std::atomic<bool> m_dvGeometryUsable{false};
++  //! Hades: why a picture that the processor decoded of single-layer Dolby Vision cannot go to the
++  //! bridge from the planes of this renderer (nullptr: it can; "" it is no such picture)
++  const char* DVCpuWhyNot(const VideoPicture& picture) const;
++  bool DVCpuPicture(const VideoPicture& picture) const { return !DVCpuWhyNot(picture); }
++  //! Hades: the three planes of the picture in buffer idx as the bridge imports them
++  //! (DVBRIDGE_YUV420P10), uploaded first where they are not; false where it is no such picture
++  bool DVCpuPlanes(int idx, dvbridge_gl_plane planes[3]);
++  //! Hades: a picture of the processor that the bridge could not prepare (rate-limited log)
++  bool DVCpuRejected(const char* stage);
++  DVBRIDGE::DiagnosticFailures m_dvCpuRejected;
+   //! The picture asks for native output and this renderer can draw it natively.
+   bool WantsDVBridge(const VideoPicture& picture) const;
+   //! Native output starts or ends with this picture: the renderer is configured again.
+@@ -155,10 +181,11 @@ protected:
+    * \return 1: this picture; 0: it could not be reconstructed, and the one before it is shown
+    *         in its place; -1: nothing was drawn
+    */
+-  virtual int RenderDVConversion(int idx) { return -1; }
+-  //! Whether this renderer can draw the picture that way: its surface and orientation. The
+-  //! base renderer (pictures in system memory) cannot.
+-  virtual bool CanConvertDV(const VideoPicture& picture) const { return false; }
++  virtual int RenderDVConversion(int idx);
++  //! Whether this renderer can draw the picture that way: its surface and orientation. (Hades:
++  //! the base renderer, one that the processor decoded of single-layer Dolby Vision:
++  //! DVCpuPicture().)
++  virtual bool CanConvertDV(const VideoPicture& picture) const;
+   //! The picture is not drawn natively, is one that is reconstructed and sent as HDR10, and
+   //! this renderer can draw it so.
+   bool WantsDVConversion(const VideoPicture& picture) const;
+@@ -191,7 +218,7 @@ protected:
+    * \brief Hades: draw a picture that is not reconstructed (HDR10, HLG) mapped to SDR by the bridge
+    * \return as RenderDVConversion(): 1 this picture, 0 the one before it, -1 nothing
+    */
+-  virtual int RenderPlainMapping(int idx) { return -1; }
++  virtual int RenderPlainMapping(int idx);
+   //! The picture is one that the bridge maps to SDR where the method of the video is that of a
+   //! reference display (DVBRIDGE::WantsPlainMapping()), and this renderer can draw it so
+   bool WantsPlainMapping(const VideoPicture& picture) const;
+@@ -306,6 +333,8 @@ protected:
+     bool doviMeasureQueued = false;
+     //! Hades: what the picture is, of HDR10+ sent as Dolby Vision (VideoPicture::doviHdr10Plus)
+     unsigned int doviHdr10Plus = 0;
++    //! Hades: VideoPicture::doviFromCpu
++    bool doviFromCpu = false;
+ #endif
+   };
+ 
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 3f0b011..65c395c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -2600,7 +2600,7 @@ bool DVBRIDGE::BaseLayerRefusedNow()
+   return g_dvBaseRefused;
+ }
+ 
+-void DVBRIDGE::DecoderTook(bool hardware, const CDVDStreamInfo& stream)
++void DVBRIDGE::DecoderTook(bool hardware, bool cpuPictures, const CDVDStreamInfo& stream)
+ {
+   // What decides whether VAAPI decodes a stream (VAAPI.cpp): the hardware decoder "vaapi" is there
+   // (the GPU has VAAPI), "Allow hardware acceleration - VAAPI" is on (CDecoder::Create()), and so
+@@ -2619,9 +2619,29 @@ void DVBRIDGE::DecoderTook(bool hardware, const CDVDStreamInfo& stream)
+   const auto codecSetting = settings && codec ? settings->GetSetting(codec) : nullptr;
+   const bool codecOn = !codecSetting || (settings->GetBool(codec) && codecSetting->IsVisible());
+   const DecoderShortfall shortfall = DecoderShortfallOf(hardware, there, vaapiOn, codecOn);
+-  g_dvDecoderShortfall = static_cast<int>(shortfall);
++  // Hades: single-layer Dolby Vision that the processor decodes goes to the bridge all the same,
++  // from the planes that Kodi's own renderer uploads (DVBRIDGE::CpuPicturesEligible()): no shortfall
++  g_dvDecoderShortfall = static_cast<int>(cpuPictures ? DecoderShortfall::NONE : shortfall);
+   if (shortfall == DecoderShortfall::NONE)
+     return;
++  if (cpuPictures)
++  {
++    CLog::Log(
++        LOGINFO,
++        "DVBridge: this Dolby Vision stream (profile {}, single-layer) is decoded by the "
++        "processor ({}): its pictures go to native Dolby Vision output and to its "
++        "reconstruction from the planes that Kodi uploads for its own renderer, the same "
++        "codes as a VAAPI surface. A processor that cannot keep up drops pictures, as with "
++        "any video that it decodes",
++        stream.dovi.dv_profile,
++        shortfall == DecoderShortfall::VAAPI_OFF
++            ? "\"Allow hardware acceleration - VAAPI\" is off in the settings, Player > Videos"
++        : shortfall == DecoderShortfall::CODEC_OFF
++            ? StringUtils::Format("VAAPI is off for its codec in the settings ({})", codec)
++        : there ? "VAAPI could not decode it"
++                : "there is no VAAPI for this graphics card");
++    return;
++  }
+   CLog::Log(LOGWARNING,
+             "DVBridge: this Dolby Vision stream is decoded by the processor ({}): native Dolby "
+             "Vision output, and its reconstruction for output as HDR10 or mapped to SDR, need its "
+-- 
+2.53.0
+

@@ -11,7 +11,7 @@ PKG_DEPENDS_TARGET="toolchain libdrm eglexternalplatform mesa"
 PKG_LONGDESC="NVIDIA GBM EGL external platform library (libnvidia-egl-gbm)"
 PKG_TOOLCHAIN="meson"
 # Hades: the 1.1.4 tag did not raise the version in meson.build, so the library is still named 1.1.3,
-# as it is in NVIDIA's 615.78.08 installer.
+# as it is in NVIDIA's 620.70.06 installer.
 PKG_EGL_GBM_LIBVERSION="1.1.3"
 
 pre_configure_target() {

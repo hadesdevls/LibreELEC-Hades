@@ -1,0 +1,351 @@
+From c9ed0cf529bde2e898f2587fcc47c8f9e7916b82 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 06:00:48 +0000
+Subject: [PATCH] windowing/gbm: HDR over the tunnel gives a mode up where its
+ frames do not keep up
+
+The tunnel draws with libplacebo into a 3840x2160 picture in floats, composites the GUI and packs
+it: the cost of native Dolby Vision, which on a small graphics processor at 3840x2160 and 50 or 60 Hz
+may be more than the ordinary output, and a tunnel that is on by default must not make HDR10 worse
+there. HDR10TunnelGuard.h (no GL, a host test runs it with timings it makes up): the GPU time of
+each frame, from the timer of native output (GL_EXT_disjoint_timer_query: the frame's drawing and
+packing are timed as native output's are), against the period of the refresh. A frame is late above
+0.85 of the period; the first 30 frames are not counted; the last 90 decide: 36 late, or an average
+above the whole period, and a frame that could not be shown counts as late. Then the mode is given
+up for the tunnel for the session (HDR10_TUNNEL::Why::SLOW in the rule, so the renderer is
+configured again for the ordinary output through the restoration that every change of renderer
+makes, with no black frame of its own), and the log says the average, the maximum, the late count
+and the period. A GPU without the timer queries says so once and keeps the tunnel while its frames
+are shown (the existing failure path still turns it off if they are not).
+
+Host test: 84 checks (frames that keep up never trip it at 50 and 60 Hz over 20000 frames, frames
+that do not trip it at the first frame that can decide, the budget line, bursts below and at the
+threshold, bursts apart that do not add up, the average rule, warm-up, missed frames, unknown
+period, the verdict staying until Reset()); 11 mutants caught (one more is equivalent). The rule
+of HDR10Tunnel.h gets the new reason (655360 combinations, 12 mutants). Not tried on hardware: the
+thresholds are from the period and the window, not from measured iGPUs.
+---
+ xbmc/windowing/gbm/HDR10Tunnel.h              |   8 ++
+ xbmc/windowing/gbm/HDR10TunnelGuard.h         | 120 ++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  70 +++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  10 ++
+ 4 files changed, 204 insertions(+), 4 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/HDR10TunnelGuard.h
+
+diff --git a/xbmc/windowing/gbm/HDR10Tunnel.h b/xbmc/windowing/gbm/HDR10Tunnel.h
+index 4805d19..75a126c 100644
+--- a/xbmc/windowing/gbm/HDR10Tunnel.h
++++ b/xbmc/windowing/gbm/HDR10Tunnel.h
+@@ -50,6 +50,9 @@ struct Input
+ {
+   bool setting = false; //!< the user allows HDR over the tunnel
+   bool disabled = false; //!< a tunnel of this display failed earlier in this session (until it changes)
++  //! the frames of the tunnel in this mode did not keep up earlier in this session (CHdr10TunnelGuard): not
++  //! tried again for the mode
++  bool tooSlow = false;
+   bool formatChosen = false; //!< the user chose a colour format, or RGB at 8 bits for HDR: theirs
+   bool kernelBackend = false; //!< the connector has DVBRIDGE_DV_STANDARD_LAB (i915, xe, amdgpu)
+   bool hasProperty = false; //!< ... and DVBRIDGE_HDR10_TUNNEL_LAB
+@@ -72,6 +75,7 @@ enum class Why
+   USE,
+   SETTING,
+   DISABLED, //!< a tunnel failed on this display; not tried again until it changes
++  SLOW, //!< its frames did not keep up in this mode; not tried again for it in this session
+   CHOICE, //!< the user chose the colour format (or RGB at 8 bits for HDR)
+   DRIVER, //!< no kernel backend, or a kernel without the property
+   LINK, //!< not HDMI over TMDS
+@@ -126,6 +130,8 @@ constexpr Why Decide(const Input& in)
+     return Why::SETTING;
+   if (in.disabled)
+     return Why::DISABLED;
++  if (in.tooSlow)
++    return Why::SLOW;
+   if (in.formatChosen)
+     return Why::CHOICE;
+   if (!in.kernelBackend || !in.hasProperty)
+@@ -158,6 +164,8 @@ constexpr const char* Code(Why why)
+       return "setting";
+     case Why::DISABLED:
+       return "disabled";
++    case Why::SLOW:
++      return "slow";
+     case Why::CHOICE:
+       return "choice";
+     case Why::DRIVER:
+diff --git a/xbmc/windowing/gbm/HDR10TunnelGuard.h b/xbmc/windowing/gbm/HDR10TunnelGuard.h
+new file mode 100644
+index 0000000..88c6a98
+--- /dev/null
++++ b/xbmc/windowing/gbm/HDR10TunnelGuard.h
+@@ -0,0 +1,120 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++namespace KODI::WINDOWING::GBM::HDR10_TUNNEL
++{
++
++/*!
++ * \brief Hades: whether HDR over the tunnel keeps up with its display, by what its frames cost
++ *
++ * The tunnel draws each picture with libplacebo into a 3840x2160 picture in 32-bit floats, composites the
++ * GUI over it and packs it, which costs what native Dolby Vision costs: on a small graphics processor at
++ * 3840x2160 and 50 or 60 Hz that may be more than the ordinary output, which is cheap. Where it does not
++ * keep up, the video must go back to the ordinary output, and not come back for that mode in this session.
++ *
++ * Every frame gives the GPU time of its work (the timer queries of GL_EXT_disjoint_timer_query) and the
++ * period of the refresh. A frame is late when it takes more than BUDGET of the period (it must also leave
++ * room for the other work of the GPU and the flip). The first WARMUP frames are not counted (the programs
++ * are compiled, the first pictures are made); after them, a sliding window of the last WINDOW frames
++ * decides: with TRIP of them late, or with an average above the whole period, the tunnel does not keep up.
++ * A frame that could not be shown counts as late, with the period as its time. A verdict, once given, stays
++ * until Reset(). No GL here, so that a test runs it on the host with timings that it makes up.
++ */
++class CHdr10TunnelGuard
++{
++public:
++  static constexpr unsigned WARMUP = 30;
++  static constexpr unsigned WINDOW = 90; //!< 1.5 s at 60 Hz
++  static constexpr unsigned TRIP = 36; //!< 40 % of the window
++  static constexpr double BUDGET = 0.85; //!< of the refresh period
++
++  struct Numbers
++  {
++    unsigned frames = 0; //!< counted since the warm-up
++    unsigned late = 0; //!< of the window
++    double avgMs = 0.0; //!< of the window
++    double maxMs = 0.0;
++    double periodMs = 0.0;
++  };
++
++  void Reset() { *this = CHdr10TunnelGuard(); }
++
++  //! A frame of the tunnel that took gpuMs, in a refresh of periodMs. True from the frame that the window
++  //! says cannot keep up on (a period that is not known, 0 or less, never says it).
++  bool Frame(double gpuMs, double periodMs)
++  {
++    if (m_tripped)
++      return true;
++    if (!(periodMs > 0.0) || !(gpuMs >= 0.0))
++      return false;
++    if (m_seen < WARMUP)
++    {
++      ++m_seen;
++      return false;
++    }
++    return Push(gpuMs, periodMs);
++  }
++
++  //! A frame of the tunnel that could not be shown
++  bool Missed(double periodMs)
++  {
++    if (m_tripped)
++      return true;
++    if (!(periodMs > 0.0) || m_seen < WARMUP)
++      return false;
++    return Push(periodMs, periodMs);
++  }
++
++  bool Tripped() const { return m_tripped; }
++  const Numbers& Last() const { return m_numbers; }
++
++private:
++  bool Push(double ms, double period)
++  {
++    const unsigned slot = m_next % WINDOW;
++    if (m_count == WINDOW)
++    {
++      m_late -= m_lateFlag[slot] ? 1 : 0;
++      m_sum -= m_ms[slot];
++    }
++    else
++      ++m_count;
++    m_ms[slot] = ms;
++    m_lateFlag[slot] = ms > BUDGET * period;
++    m_late += m_lateFlag[slot] ? 1 : 0;
++    m_sum += ms;
++    ++m_next;
++    m_max = ms > m_max ? ms : m_max;
++    m_numbers.frames = m_next;
++    m_numbers.late = m_late;
++    m_numbers.avgMs = m_sum / m_count;
++    m_numbers.maxMs = m_max;
++    m_numbers.periodMs = period;
++    if (m_count == WINDOW && (m_late >= TRIP || m_numbers.avgMs > period))
++      m_tripped = true;
++    return m_tripped;
++  }
++
++  unsigned m_seen = 0;
++  unsigned m_next = 0;
++  unsigned m_count = 0;
++  unsigned m_late = 0;
++  double m_sum = 0.0;
++  double m_max = 0.0;
++  bool m_tripped = false;
++  std::array<double, WINDOW> m_ms{};
++  std::array<bool, WINDOW> m_lateFlag{};
++  Numbers m_numbers;
++};
++
++} // namespace KODI::WINDOWING::GBM::HDR10_TUNNEL
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 31753f0..076db69 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -4820,13 +4820,51 @@ bool CWinSystemGbmGLESContext::Hdr10TunnelOwnsOutput() const
+ // Hades: what the ordinary output sends of HDR10 in a mode, asked once for each mode with a TEST_ONLY commit of
+ // what a video of HDR10 would set (as ProbeHdr10DepthAhead() does for its depth): the answer of the driver
+ // (DVBRIDGE_LINK_FORMAT) as the link that HDR10Tunnel.h knows, or "not known" (a "no": fail closed)
++namespace
++{
++// Hades: a mode, for what is remembered of the tunnel in it
++uint64_t Hdr10TunnelModeKey(const drmModeModeInfo& mode)
++{
++  return (static_cast<uint64_t>(mode.hdisplay) << 48) ^ (static_cast<uint64_t>(mode.vdisplay) << 36) ^
++         (static_cast<uint64_t>(mode.clock) << 12) ^ mode.htotal ^
++         (static_cast<uint64_t>(mode.vtotal) << 24) ^ 1;
++}
++} // namespace
++
++// Hades: what the frames of the tunnel cost (CHdr10TunnelGuard): where they do not keep up with the refresh, the
++// mode is given up for the tunnel for the rest of the session, with the numbers in the log; the renderer then
++// goes back to the ordinary output (Hdr10TunnelWanted() says no: DVBridgeConfigChanged())
++void CWinSystemGbmGLESContext::Hdr10TunnelGuardFrame(double gpuMs, bool missed)
++{
++  const double period = DVRefreshPeriodMs();
++  const bool trip = missed ? m_hdr10TunnelGuard.Missed(period) : m_hdr10TunnelGuard.Frame(gpuMs, period);
++  if (!trip || m_hdr10TunnelSlowTold)
++    return;
++  m_hdr10TunnelSlowTold = true;
++  const drmModeModeInfo* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
++  if (mode)
++  {
++    std::unique_lock lock(m_hdr10TunnelLock);
++    m_hdr10TunnelSlow.insert(Hdr10TunnelModeKey(*mode));
++  }
++  const auto& n = m_hdr10TunnelGuard.Last();
++  CLog::Log(LOGWARNING,
++            "DVBridge: HDR over the tunnel does not keep up with this display in {}x{} @ {:.3f} Hz: in the last "
++            "{} frames the GPU took {:.1f} ms on average and {:.1f} ms at most for a refresh of {:.1f} ms, and {} "
++            "of them took more than {:.0f} % of it (or were not shown); the video goes back to the ordinary "
++            "output, and the tunnel is not tried again in this mode in this session",
++            mode ? mode->hdisplay : 0, mode ? mode->vdisplay : 0,
++            mode && mode->htotal && mode->vtotal
++                ? mode->clock * 1000.0 / (static_cast<double>(mode->htotal) * mode->vtotal)
++                : 0.0,
++            KODI::WINDOWING::GBM::HDR10_TUNNEL::CHdr10TunnelGuard::WINDOW, n.avgMs, n.maxMs, n.periodMs,
++            n.late, 100.0 * KODI::WINDOWING::GBM::HDR10_TUNNEL::CHdr10TunnelGuard::BUDGET);
++}
++
+ int CWinSystemGbmGLESContext::Hdr10TunnelOrdinaryLink(const drmModeModeInfo& mode)
+ {
+   namespace T = KODI::WINDOWING::GBM::HDR10_TUNNEL;
+-  const uint64_t key = (static_cast<uint64_t>(mode.hdisplay) << 48) ^
+-                       (static_cast<uint64_t>(mode.vdisplay) << 36) ^
+-                       (static_cast<uint64_t>(mode.clock) << 12) ^ mode.htotal ^
+-                       (static_cast<uint64_t>(mode.vtotal) << 24) ^ 1;
++  const uint64_t key = Hdr10TunnelModeKey(mode);
+   std::unique_lock lock(m_hdr10TunnelLock);
+   if (m_hdr10TunnelLinkKey == key)
+     return m_hdr10TunnelLink;
+@@ -4912,6 +4950,12 @@ bool CWinSystemGbmGLESContext::Hdr10TunnelWanted(const VideoPicture& picture)
+   T::Input in;
+   in.setting = BoolSetting(settings, CSettings::SETTING_VIDEOSCREEN_HADESHDR10TUNNEL, true);
+   in.disabled = Hdr10TunnelDisabled();
++  // (the modes where the frames of the tunnel did not keep up: not again in this session)
++  if (m_DRM && m_DRM->GetSelectedMode())
++  {
++    std::unique_lock lock(m_hdr10TunnelLock);
++    in.tooSlow = m_hdr10TunnelSlow.count(Hdr10TunnelModeKey(*m_DRM->GetSelectedMode())) != 0;
++  }
+   // (a choice of the user's for this output is theirs: the colour format, RGB at 8 bits for HDR, the HDR10
+   // picture adapted to the display; the tunnel carries the picture as it is)
+   in.formatChosen =
+@@ -5012,7 +5056,18 @@ int CWinSystemGbmGLESContext::RenderHdr10Tunnel(const CDVBridgeGLES::Layer& laye
+   view.dst_y = place.dstY;
+   view.dst_width = place.dstWidth;
+   view.dst_height = place.dstHeight;
++  // Hades: the GPU time of the frame (the timer of native output; the guard reads it, DVGpuTimerCollect())
++  DVGpuTimerCollect();
++  DVGpuTimerMark(true);
++  if (!m_hdr10TunnelNoTimerTold && m_dvGpuTimerChecked && !m_dvGpuTimers[0].begin)
++  {
++    m_hdr10TunnelNoTimerTold = true;
++    CLog::Log(LOGINFO, "DVBridge: the frames of HDR over the tunnel cannot be timed here (no "
++                       "GL_EXT_disjoint_timer_query): the tunnel is kept while its frames are shown, and "
++                       "turned off only if they are not");
++  }
+   m_dvFrame = m_dvBridge && m_dvBridge->PrepareTunnel(layer, plain, view);
++  DVGpuTimerTag(false, false, false, false, false, 0, true, false, 0, false, 0, false, false);
+   if (!m_dvFrame)
+   {
+     m_dvShown = {};
+@@ -5031,6 +5086,8 @@ void CWinSystemGbmGLESContext::DVNativeOutputBegins()
+   // native output
+   m_dvShown = {};
+   m_dvRepeatFlipPending = false;
++  m_hdr10TunnelGuard.Reset();
++  m_hdr10TunnelSlowTold = false;
+   DVEngineRead();
+   // Hades: what of the metadata the display reads, from its Dolby Vision block
+   m_dvBridge->UseDisplayManagement(DisplayDolbyVisionDmVersion());
+@@ -8340,6 +8397,9 @@ void CWinSystemGbmGLESContext::DVGpuTimerCollect()
+       }
+       m_dvAheadSeeksSeen = seeks;
+       m_dvAheadGui = gui;
++      // Hades: HDR over the tunnel: does it keep up (CHdr10TunnelGuard)
++      if (m_dvState.CapturedHdr10Tunnel())
++        Hdr10TunnelGuardFrame(ms, false);
+       const auto change = m_dvAhead.Measured(ms, period);
+       if (change != CDVAhead::Change::NONE && m_dvAheadModeRead &&
+           m_dvAheadMode == CDVAhead::Mode::NEEDED)
+@@ -9210,6 +9270,8 @@ void CWinSystemGbmGLESContext::DVBridgeFrameShown(bool shown, double pts)
+   if (pts != DVD_NOPTS_VALUE && pts == m_dvLastFailedPts)
+     return;
+   m_dvLastFailedPts = pts;
++  if (m_dvState.CapturedHdr10Tunnel())
++    Hdr10TunnelGuardFrame(0.0, true);
+   const auto now = std::chrono::steady_clock::now();
+   if (m_dvFailedFrames++ == 0)
+     m_dvFirstFailedFrame = now;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 03f92ca..c25758b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -10,6 +10,9 @@
+ 
+ #include "FlipStallRecovery.h"
+ #include "HotplugRelink.h"
++#include "HDR10TunnelGuard.h"
++
++#include <set>
+ #include "WinSystemGbmEGLContext.h"
+ #include "cores/VideoPlayer/VideoRenderers/FrameBufferObject.h"
+ #include "rendering/gles/RenderSystemGLES.h"
+@@ -760,6 +763,13 @@ private:
+   //! Hades: HDR over the tunnel (Hdr10TunnelWanted()): what the ordinary output sends in a mode, asked
+   //! once (TEST_ONLY) for each mode, and the verdict told last
+   std::mutex m_hdr10TunnelLock;
++  //! Hades: the guard of the tunnel (HDR10TunnelGuard.h): what its frames cost, the modes where they did not keep
++  //! up (not tried again in this session), and what was told
++  KODI::WINDOWING::GBM::HDR10_TUNNEL::CHdr10TunnelGuard m_hdr10TunnelGuard;
++  std::set<uint64_t> m_hdr10TunnelSlow;
++  bool m_hdr10TunnelSlowTold = false;
++  bool m_hdr10TunnelNoTimerTold = false;
++  void Hdr10TunnelGuardFrame(double gpuMs, bool missed);
+   uint64_t m_hdr10TunnelLinkKey = 0;
+   int m_hdr10TunnelLink = 0;
+   uint64_t m_hdr10TunnelToldKey = 0;
+-- 
+2.53.0
+

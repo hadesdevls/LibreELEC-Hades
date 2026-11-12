@@ -1,0 +1,750 @@
+From 5555f34e10c9fbc9ef855b9aa36876bf7442f9d5 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:58:13 +0000
+Subject: [PATCH] DVDDemuxFFmpeg, DVD: a film in the fields of interlaced video
+ is told before playback
+
+The display mode of a video is chosen once, before its first picture, and never again within it.
+For a film in the fields of interlaced video (FieldCadence.h) that means telling it before
+playback, which needs its pictures decoded: the flags of an MPEG-2 stream do not say it.
+
+- A file (where its soft telecine is told, PrefetchForSoftTelecine()): the pictures of its start,
+  as the demuxer reads them ahead, are decoded too (72 at the most, within the same 1.5 s and
+  4 MiB), and 2 MiB of the file at 50, 10 and 75 % of its length, read with a handle of their own
+  (its video taken out of a program stream, a transport stream or the blocks of a Matroska file),
+  in 1.5 s at the most and not over the internet. Only an MPEG-2 stream at 25, 29.97 or 30 frames
+  a second that is no soft telecine.
+- A DVD image or folder: the scan of its titles that tells soft telecine (CDiscSoftTelecineScan,
+  on its own navigator and thread) decodes 2 MiB of video at the start of each title and at the
+  same three places, and the navigator gives it with the title when it starts.
+
+Where every place that told says the same film and none says video, the stream says the rate of
+the film (23.976, or 24, for 3:2; 25000/1001 for 25 in 30; its own for 2:2) and the cadence, and
+Kodi's own choice of a refresh rate picks the mode for it. Anything else plays as before, and so
+does every stream with the setting off (the decoder of the probe is not even made then).
+
+Measured on the host on the synthetic corpus (128 clips and containers: VOB, M2V, MKV, TS): every
+film clip is told its cadence, in every container; no clip of video, and no clip that mixes film
+and video, is told film; a cartoon on twos one field off or at 25 in 30, and still pictures, are
+told nothing and play as before.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 199 ++++++++++++++++--
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  14 ++
+ .../DVDInputStreamNavigator.cpp               |  15 +-
+ .../DVDInputStreams/DVDInputStreamNavigator.h |   6 +-
+ .../DVDInputStreams/DiscSoftTelecine.h        |  96 ++++++++-
+ .../DVDInputStreams/DiscSoftTelecineScan.cpp  |  55 ++++-
+ .../DVDInputStreams/DiscSoftTelecineScan.h    |  13 +-
+ 7 files changed, 361 insertions(+), 37 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 3e8cca7..510cf26 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -12,6 +12,7 @@
+ #include "DVDDemuxUtils.h"
+ #include "DVDInputStreams/DVDInputStream.h"
+ #include "DVDInputStreams/DVDInputStreamNavigator.h"
++#include "FieldCadenceProbe.h"
+ #include "Mpeg2SoftTelecine.h"
+ #ifdef HAVE_LIBBLURAY
+ #include "DVDInputStreams/BluraySecondaryStreams.h"
+@@ -2096,19 +2097,33 @@ void CDVDDemuxFFmpeg::ApplyDiscSoftTelecine(CDemuxStream* stream)
+   const auto navigator = std::dynamic_pointer_cast<CDVDInputStreamNavigator>(m_pInput);
+   if (!navigator)
+     return;
++  using KODI::FIELDCADENCE::Cadence;
+   unsigned int generation = 0;
+-  int film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(0));
++  KODI::DISC::FilmFields fields;
++  int film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(0), &fields);
+   if (generation == m_discSoftTelecineGeneration)
+     return;
+   if (film < 0)
+   {
+     // not read yet: wait a little, once for this title (the reading goes on in the background)
+-    film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(1500));
++    film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(1500), &fields);
+   }
+   m_discSoftTelecineGeneration = generation;
+   const bool wanted = film == 1;
+-  if (wanted == video->softTelecine)
++  // (Hades: a film in the fields of interlaced video, CDiscSoftTelecineScan; a soft telecine wins)
++  Cadence cadence = fields.cadence;
++  if (wanted || !FilmCadenceWanted())
++    cadence = Cadence::UNKNOWN;
++  if (wanted == video->softTelecine && cadence == video->filmCadence)
+     return;
++  if (m_discStream.saved)
++  {
++    video->iFpsRate = m_discStream.fpsRate;
++    video->iFpsScale = m_discStream.fpsScale;
++    video->interlaced = m_discStream.interlaced;
++  }
++  video->softTelecine = false;
++  video->filmCadence = Cadence::UNKNOWN;
+   if (wanted)
+   {
+     m_discStream = {true, video->iFpsRate, video->iFpsScale, video->interlaced};
+@@ -2122,20 +2137,53 @@ void CDVDDemuxFFmpeg::ApplyDiscSoftTelecine(CDemuxStream* stream)
+         "film at 23.976 that carry the flags to be shown at 29.97, as read before it started): "
+         "each is shown once, at the pace of the film");
+   }
+-  else
++  else if (cadence != Cadence::UNKNOWN)
+   {
+-    if (m_discStream.saved)
+-    {
+-      video->iFpsRate = m_discStream.fpsRate;
+-      video->iFpsScale = m_discStream.fpsScale;
+-      video->interlaced = m_discStream.interlaced;
+-    }
+-    video->softTelecine = false;
+-    CLog::Log(LOGDEBUG, "CDVDDemuxFFmpeg: this title is shown as the stream says");
++    m_discStream = {true, video->iFpsRate, video->iFpsScale, video->interlaced};
++    if (ApplyFilmCadence(*video, cadence, fields.codedRate, fields.codedScale))
++      CLog::Log(LOGINFO,
++                "CDVDDemuxFFmpeg: this DVD title is a {} (as places of it decoded before it "
++                "started showed): its pictures are put back together and shown at {:.3f}",
++                KODI::FIELDCADENCE::NameOf(cadence),
++                static_cast<double>(video->iFpsRate) / video->iFpsScale);
++    else
++      m_discStream.saved = false;
+   }
++  else
++    CLog::Log(LOGDEBUG, "CDVDDemuxFFmpeg: this title is shown as the stream says");
+   ++video->changes;
+ }
+ 
++// Hades: whether films in the fields of interlaced video are put back together
++// (videoplayer.hadesfilmfields, on by default)
++bool CDVDDemuxFFmpeg::FilmCadenceWanted()
++{
++  const auto settings = CServiceBroker::GetSettingsComponent();
++  return settings && settings->GetSettings() &&
++         settings->GetSettings()->GetBool(CSettings::SETTING_VIDEOPLAYER_HADESFILMFIELDS);
++}
++
++// Hades: what a stream that is a film in its fields says of itself: the rate of the film, not
++// interlaced; false (and nothing changed) where the rate of its coded frames is not one the
++// cadence is of
++bool CDVDDemuxFFmpeg::ApplyFilmCadence(CDemuxStreamVideo& video,
++                                       KODI::FIELDCADENCE::Cadence cadence,
++                                       int codedRate,
++                                       int codedScale)
++{
++  int rate = 0;
++  int scale = 0;
++  if (!KODI::FIELDCADENCE::FilmRateOf(cadence, codedRate, codedScale, rate, scale))
++    return false;
++  video.iFpsRate = rate;
++  video.iFpsScale = scale;
++  video.codedFpsRate = codedRate;
++  video.codedFpsScale = codedScale;
++  video.interlaced = false;
++  video.filmCadence = cadence;
++  return true;
++}
++
+ void CDVDDemuxFFmpeg::ClearPrefetched()
+ {
+   for (AVPacket* packet : m_prefetched)
+@@ -2208,6 +2256,75 @@ KODI::MPEG2::CSoftTelecineDetector::Verdict SampleForSoftTelecine(
+   said += StringUtils::Format(" ({} KiB read in {} ms)", samples.bytes / 1024, ms);
+   return verdict;
+ }
++
++// Hades: the points of a file further on (KODI::MPEG2::SAMPLE_POINTS: 50, 10 and 75 % of its
++// length), each decoded for the cadence of its fields (KODI::FIELDCADENCE::CProbe): 2 MiB of the
++// file at each, read with a handle of their own, its video taken out of the packets of a program
++// or transport stream or the blocks of a Matroska file, or the bytes as they are for an
++// elementary stream. All three are read: a film is only told where they agree
++// (KODI::FIELDCADENCE::Decide()). Not over the internet; 1.5 s at the most, a point not read
++// tells nothing.
++std::vector<KODI::FIELDCADENCE::Cadence> SampleForFieldCadence(
++    const std::string& path,
++    const std::string& format,
++    std::string& said,
++    const std::function<bool()>& aborted)
++{
++  using namespace KODI::FIELDCADENCE;
++  static constexpr auto MAX_TIME = std::chrono::milliseconds(1500);
++  static constexpr size_t POINT_BYTES = 2 * 1024 * 1024;
++  std::vector<Cadence> points;
++  if (URIUtils::IsInternetStream(path))
++    return points;
++  XFILE::CFile file;
++  if (!file.Open(path, XFILE::READ_TRUNCATED | XFILE::READ_NO_CACHE))
++    return points;
++  const int64_t length = file.GetLength();
++  const auto begin = std::chrono::steady_clock::now();
++  size_t bytes = 0;
++  for (const double point : KODI::MPEG2::SAMPLE_POINTS)
++  {
++    Cadence verdict = Cadence::UNKNOWN;
++    const int64_t offset = static_cast<int64_t>(static_cast<double>(length) * point);
++    std::vector<uint8_t> raw(POINT_BYTES);
++    size_t got = 0;
++    if (length > 0 && file.Seek(offset, SEEK_SET) == offset)
++    {
++      while (got < raw.size() && std::chrono::steady_clock::now() - begin < MAX_TIME &&
++             !aborted())
++      {
++        const ssize_t r = file.Read(raw.data() + got, std::min<size_t>(256 * 1024, raw.size() - got));
++        if (r <= 0)
++          break;
++        got += static_cast<size_t>(r);
++      }
++    }
++    raw.resize(got);
++    bytes += got;
++    if (!raw.empty() && std::chrono::steady_clock::now() - begin < MAX_TIME && !aborted())
++    {
++      CProbe probe;
++      if (format == "mpeg")
++        probe.AddStretch(KODI::MPEG2::ProgramStreamVideo(raw.data(), raw.size()));
++      else if (format == "mpegts")
++        probe.AddStretch(TransportStreamVideo(raw.data(), raw.size()));
++      else if (format.starts_with("matroska"))
++        probe.AddStretch(MatroskaVideo(raw.data(), raw.size()));
++      else
++        probe.AddStretch(raw);
++      verdict = probe.Finish();
++      said += StringUtils::Format("; at {:.0f} %: {} ({} pictures)", point * 100.0, NameOf(verdict),
++                                  probe.Pictures());
++    }
++    points.push_back(verdict);
++  }
++  file.Close();
++  said += StringUtils::Format(" ({} KiB read and decoded in {} ms)", bytes / 1024,
++                              std::chrono::duration_cast<std::chrono::milliseconds>(
++                                  std::chrono::steady_clock::now() - begin)
++                                  .count());
++  return points;
++}
+ } // namespace
+ 
+ // Hades: a film on a DVD or from one is MPEG-2 with soft telecine: pictures coded at 23.976 per
+@@ -2254,6 +2371,18 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+   bool progressiveSequence = false;
+   std::vector<PictureFlags> pictures;
+   size_t bytes = 0;
++  // Hades: and a film in the fields of interlaced video (FieldCadence.h): the first pictures are
++  // decoded too, for a stream whose frames are at 25, 29.97 or 30 (frame_rate_code 3 to 5)
++  const bool wantFields = FilmCadenceWanted();
++  const auto fieldRate = [&detector]
++  {
++    const int code = detector.FrameRateCode();
++    return code == 0 || (code >= 3 && code <= 5);
++  };
++  // (its decoder only where the setting is on)
++  std::unique_ptr<KODI::FIELDCADENCE::CProbe> fields;
++  if (wantFields)
++    fields = std::make_unique<KODI::FIELDCADENCE::CProbe>();
+   const auto begin = std::chrono::steady_clock::now();
+   m_timeout.Set(2s);
+   while (m_prefetched.size() < MAX_PACKETS && bytes < MAX_BYTES &&
+@@ -2276,7 +2405,11 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+     CSoftTelecineDetector::Verdict verdict = detector.GetVerdict();
+     for (const PictureFlags& picture : pictures)
+       verdict = detector.Add(picture);
+-    if (verdict != CSoftTelecineDetector::Verdict::UNKNOWN)
++    const bool decoding = fields && fields->IsOpen() && fieldRate();
++    if (decoding && !fields->Enough())
++      fields->AddPacket(packet->data, static_cast<size_t>(std::max(packet->size, 0)));
++    if (verdict != CSoftTelecineDetector::Verdict::UNKNOWN &&
++        (verdict == CSoftTelecineDetector::Verdict::FILM || !decoding || fields->Enough()))
+       break;
+   }
+   m_timeout.SetInfinite();
+@@ -2316,9 +2449,49 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+               "CDVDDemuxFFmpeg: stream {} is MPEG-2 video that does not show soft telecine (its "
+               "first {} pictures: {}{}): shown as the stream says",
+               index, detector.Count(), VerdictName(start), points);
++    PrefetchForFieldCadence(*video, index, fields.get(), fieldRate());
+   }
+ }
+ 
++// Hades: a film whose pictures are in the fields of interlaced video (3:2 pulldown, 2:2) or
++// repeated in its frames (a film at 25 in 29.97): told from its start, decoded as it was read ahead
++// (PrefetchForSoftTelecine()), and from points further on (SampleForFieldCadence()), before the
++// streams are given to the player. Where they agree, the stream says the rate of the film, and the
++// decoder puts each picture back together (CDVDVideoCodecFFmpeg::SetFilters()): the mode is chosen
++// once, for the whole file, and is the film's.
++void CDVDDemuxFFmpeg::PrefetchForFieldCadence(CDemuxStreamVideo& video,
++                                              int index,
++                                              KODI::FIELDCADENCE::CProbe* fields,
++                                              bool rateOfFields)
++{
++  using namespace KODI::FIELDCADENCE;
++  if (!fields || !rateOfFields || !fields->IsOpen())
++    return;
++  const Cadence start = fields->Finish();
++  const Evidence evidence = fields->GetEvidence();
++  int codedRate = 0;
++  int codedScale = 0;
++  if (!fields->CodedRate(codedRate, codedScale))
++    return;
++  std::string said;
++  const std::vector<Cadence> points = SampleForFieldCadence(
++      m_pInput->GetFileName(), m_pFormatContext->iformat->name, said,
++      [this] { return m_abortRequested || (m_cancelCheck && m_cancelCheck()); });
++  const Cadence cadence = Decide(start, points);
++  if (cadence != Cadence::UNKNOWN && ApplyFilmCadence(video, cadence, codedRate, codedScale))
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: stream {} is a {} at {:.3f} coded frames a second (its start: {} "
++              "after {} pictures{}): its pictures are put back together and shown at {:.3f}",
++              index, NameOf(cadence), static_cast<double>(codedRate) / codedScale, NameOf(start),
++              fields->Pictures(), said, static_cast<double>(video.iFpsRate) / video.iFpsScale);
++  else
++    CLog::Log(LOGDEBUG,
++              "CDVDDemuxFFmpeg: stream {} is not told to be a film in its fields (its start: {} "
++              "after {} pictures, {} of them moving, {} combing both ways{}): shown as the stream "
++              "says",
++              index, NameOf(start), fields->Pictures(), evidence.moving, evidence.neither, said);
++}
++
+ int CDVDDemuxFFmpeg::ReadFrame(AVPacket* packet)
+ {
+   // Hades: the packets that were read ahead (PrefetchForSoftTelecine()) come first, as read
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 241c4f8..fbe68c6 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -33,6 +33,10 @@ extern "C" {
+ 
+ class CDVDDemuxFFmpeg;
+ class CDVDInputStream;
++namespace KODI::FIELDCADENCE
++{
++class CProbe;
++}
+ class CDVDInputStreamBluray;
+ class CURL;
+ struct ChapterFFmpeg;
+@@ -311,6 +315,16 @@ protected:
+   //! Hades: a DVD title that was read before it was played (CDiscSoftTelecineScan): what the stream
+   //! says of itself changes as the title does
+   void ApplyDiscSoftTelecine(CDemuxStream* stream);
++  //! Hades: a film in the fields of interlaced video, decoded before playback (FieldCadence.h)
++  void PrefetchForFieldCadence(CDemuxStreamVideo& video,
++                               int index,
++                               KODI::FIELDCADENCE::CProbe* fields,
++                               bool rateOfFields);
++  static bool FilmCadenceWanted();
++  static bool ApplyFilmCadence(CDemuxStreamVideo& video,
++                               KODI::FIELDCADENCE::Cadence cadence,
++                               int codedRate,
++                               int codedScale);
+   unsigned int m_discSoftTelecineGeneration = 0xFFFFFFFFu;
+   struct
+   {
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+index 4abbfcb..cdc0539 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+@@ -366,8 +366,14 @@ bool CDVDInputStreamNavigator::Open()
+   }
+   else
+   {
++    // (Hades: and, with videoplayer.hadesfilmfields, which are films in the fields of interlaced
++    // video: FieldCadence.h)
++    const auto settings = CServiceBroker::GetSettingsComponent();
++    const bool fields =
++        settings && settings->GetSettings() &&
++        settings->GetSettings()->GetBool(CSettings::SETTING_VIDEOPLAYER_HADESFILMFIELDS);
+     m_softTelecineScan =
+-        std::make_unique<CDiscSoftTelecineScan>(m_item, path, m_item.IsDiscImage());
++        std::make_unique<CDiscSoftTelecineScan>(m_item, path, m_item.IsDiscImage(), fields);
+     m_softTelecineScan->Start();
+   }
+ 
+@@ -375,12 +381,15 @@ bool CDVDInputStreamNavigator::Open()
+ }
+ 
+ int CDVDInputStreamNavigator::GetSoftTelecine(unsigned int& generation,
+-                                              std::chrono::milliseconds wait)
++                                              std::chrono::milliseconds wait,
++                                              KODI::DISC::FilmFields* fields)
+ {
+   generation = m_softTelecineGeneration;
++  if (fields)
++    *fields = {};
+   if (!m_softTelecineScan || m_iTitle <= 0 || m_bInMenu)
+     return 0;
+-  switch (m_softTelecineScan->Get(m_iTitle, wait))
++  switch (m_softTelecineScan->Get(m_iTitle, wait, fields))
+   {
+     case CDiscSoftTelecineScan::State::FILM:
+       return 1;
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
+index 62d5f37..8b4f8f5 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
+@@ -136,9 +136,13 @@ public:
+    * played
+    * \param generation changes whenever the title that plays changes (a new title, a new title set)
+    * \param wait how long to wait if the title is being read now
++   * \param fields (Hades) set, where not null, to whether the title is a film in the fields of
++   *        interlaced video (FieldCadence.h), as it was read too; nothing in a menu
+    * \return 1 for soft telecine, 0 if it is not (or this is a menu), -1 if it could not be told
+    */
+-  int GetSoftTelecine(unsigned int& generation, std::chrono::milliseconds wait);
++  int GetSoftTelecine(unsigned int& generation,
++                      std::chrono::milliseconds wait,
++                      KODI::DISC::FilmFields* fields = nullptr);
+ 
+   CDVDInputStream::IPosTime* GetIPosTime() override { return this; }
+   bool PosTime(int iTimeInMsec) override; //seek within current pg(c)
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+index ddf8ef6..3ee53a1 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h"
++#include "cores/VideoPlayer/FieldCadence.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -82,9 +83,31 @@ private:
+   uint8_t m_id = 0;
+ };
+ 
++/*!
++ * \brief (Hades) Whether the video of a title is a film in its fields (FieldCadence.h), and the
++ *        rate of its coded frames
++ */
++struct FilmFields
++{
++  FIELDCADENCE::Cadence cadence = FIELDCADENCE::Cadence::UNKNOWN;
++  int codedRate = 0;
++  int codedScale = 0;
++};
++
++//! \brief No look at the fields: what ScanTitle() takes where they are not wanted
++struct NoFields
++{
++  FilmFields operator()(const std::vector<uint8_t>&) const { return {}; }
++};
++
+ //! \brief What was found of a title
+ struct TitleResult
+ {
++  //! what the fields of its video say, from its start and the points further on
++  //! (FIELDCADENCE::Decide()), where they were looked at
++  FilmFields fields;
++  FIELDCADENCE::Cadence fieldsStart = FIELDCADENCE::Cadence::UNKNOWN;
++  std::vector<FIELDCADENCE::Cadence> fieldsPoints;
+   //! what the title is: its points by majority, else its start (MPEG2::MajorityOf())
+   MPEG2::CSoftTelecineDetector::Verdict verdict = MPEG2::CSoftTelecineDetector::Verdict::UNKNOWN;
+   //! what its start says
+@@ -128,12 +151,20 @@ inline MPEG2::CSoftTelecineDetector::Verdict VerdictOfVideo(const std::vector<ui
+  *         else for an event that does not matter; `void Skip()`; `bool Seek(double part)` to a
+  *         part of the title (0 its start, 1 its end), false where it cannot.
+  * \param stop called often: true to give up (the disc is closed)
++ * \param fields (Hades) where the title is no soft telecine: what a stretch of its video says of
++ *        its fields (FieldCadence.h; Kodi decodes it, FIELDCADENCE::CProbe), called for its start
++ *        and for each of the three points further on, of FIELD_BYTES of video each (all three are
++ *        read: a film is told only where they agree, FIELDCADENCE::Decide())
++ * \param wantFields whether to look at the fields
+  */
+-template<class Nav, class Stop>
+-TitleResult ScanTitle(Nav& nav, int title, Stop&& stop)
++template<class Nav, class Stop, class Fields = NoFields>
++TitleResult ScanTitle(
++    Nav& nav, int title, Stop&& stop, Fields&& fields = Fields{}, bool wantFields = false)
+ {
+   static constexpr size_t MAX_VIDEO_BYTES = 3 * 1024 * 1024; //!< of video read at the start
+   static constexpr size_t MAX_POINT_BYTES = 2 * 1024 * 1024; //!< ... at each point further on
++  //! of video that the fields are looked at in, at the start and at each point (some 2 s of a DVD)
++  static constexpr size_t FIELD_BYTES = 2 * 1024 * 1024;
+   static constexpr size_t CHECK_EVERY = 256 * 1024;
+   static constexpr unsigned MAX_EVENTS = 4000; //!< that are not sectors (a menu that never ends)
+   static constexpr auto MAX_TIME = std::chrono::seconds(4); //!< for the start, and for each point
+@@ -179,32 +210,72 @@ TitleResult ScanTitle(Nav& nav, int title, Stop&& stop)
+     }
+   };
+ 
++  // (with the fields: the soft telecine told, and enough video for the fields unless it is one)
++  const auto enough = [wantFields](Verdict soft, size_t bytes)
++  {
++    return soft != Verdict::UNKNOWN &&
++           (!wantFields || soft == Verdict::FILM || bytes >= FIELD_BYTES);
++  };
+   CVideoCollector start;
+   result.outOfBudget = !read(start, MAX_VIDEO_BYTES,
+-                             [](const std::vector<uint8_t>& v) { return VerdictOfVideo(v); });
++                             [&enough](const std::vector<uint8_t>& v)
++                             {
++                               const Verdict soft = VerdictOfVideo(v);
++                               return enough(soft, v.size()) ? soft : Verdict::UNKNOWN;
++                             });
+   result.videoBytes = start.Video().size();
+   result.start = VerdictOfVideo(start.Video(), &result.pictures);
+   if (result.start != Verdict::UNKNOWN)
+     result.outOfBudget = false;
++  // (Hades: the fields, where the start is no soft telecine)
++  const bool withFields = wantFields && result.start != Verdict::FILM;
++  if (withFields && !stop())
++  {
++    const FilmFields f = fields(start.Video());
++    result.fieldsStart = f.cadence;
++    result.fields.codedRate = f.codedRate;
++    result.fields.codedScale = f.codedScale;
++  }
+ 
+   for (const double point : MPEG2::SAMPLE_POINTS)
+   {
+-    if (stop() || MPEG2::FirstPointAgrees(result.start, result.points))
++    const bool soft = !MPEG2::FirstPointAgrees(result.start, result.points);
++    if (stop() || (!soft && !withFields))
+       break;
+     Verdict verdict = Verdict::UNKNOWN;
++    FIELDCADENCE::Cadence cadence = FIELDCADENCE::Cadence::UNKNOWN;
+     if (nav.Seek(point))
+     {
+       // (from the first sequence header or group of pictures on: MPEG2::SampleVerdict())
+       CVideoCollector at;
+       int film = 0;
+       read(at, MAX_POINT_BYTES,
+-           [&film](const std::vector<uint8_t>& v) { return MPEG2::SampleVerdict(v, 0, film); });
++           [&film, &enough, withFields](const std::vector<uint8_t>& v)
++           {
++             const Verdict told = MPEG2::SampleVerdict(v, 0, film);
++             return !withFields || enough(told, v.size()) ? told : Verdict::UNKNOWN;
++           });
+       result.videoBytes += at.Video().size();
+       verdict = MPEG2::SampleVerdict(at.Video(), 0, film);
++      if (withFields && !stop())
++      {
++        const FilmFields f = fields(at.Video());
++        cadence = f.cadence;
++        if (result.fields.codedRate == 0)
++        {
++          result.fields.codedRate = f.codedRate;
++          result.fields.codedScale = f.codedScale;
++        }
++      }
+     }
+-    result.points.push_back(verdict);
++    if (soft)
++      result.points.push_back(verdict);
++    if (withFields)
++      result.fieldsPoints.push_back(cadence);
+   }
+   result.verdict = MPEG2::MajorityOf(result.start, result.points);
++  if (withFields && result.verdict != Verdict::FILM)
++    result.fields.cadence = FIELDCADENCE::Decide(result.fieldsStart, result.fieldsPoints);
+   return result;
+ }
+ 
+@@ -324,11 +395,12 @@ public:
+     m_planned = true;
+     m_changed.notify_all();
+   }
+-  //! \brief (the thread) what was found for a title
+-  void Set(int title, State state)
++  //! \brief (the thread) what was found for a title (Hades: and of its fields)
++  void Set(int title, State state, const FilmFields& fields = {})
+   {
+     std::lock_guard lock(m_mutex);
+     m_results[title] = state;
++    m_fields[title] = fields;
+     m_changed.notify_all();
+   }
+   //! \brief (the thread) it ends: nothing more is to come
+@@ -362,8 +434,9 @@ public:
+   /*!
+    * \brief (the owner) what was found for a title
+    * \param wait how long to wait, at the most, if the title has not been read yet but will be
++   * \param fields (Hades) set to what was found of its fields, where not null
+    */
+-  State Get(int title, std::chrono::milliseconds wait)
++  State Get(int title, std::chrono::milliseconds wait, FilmFields* fields = nullptr)
+   {
+     std::unique_lock lock(m_mutex);
+     const auto known = [&] { return m_results.contains(title) || m_finished || m_stop; };
+@@ -371,9 +444,13 @@ public:
+     if (!known() && expected() && wait.count() > 0)
+       m_changed.wait_for(lock, wait,
+                          [&] { return known() || (m_planned && !m_plan.contains(title)); });
++    if (fields)
++      *fields = {};
+     if (m_stop)
+       return State::UNKNOWN;
+     const auto it = m_results.find(title);
++    if (fields && it != m_results.end())
++      *fields = m_fields[title];
+     return it == m_results.end() ? State::UNKNOWN : it->second;
+   }
+ 
+@@ -385,6 +462,7 @@ private:
+   bool m_finished = false;
+   std::set<int> m_plan;
+   std::map<int, State> m_results;
++  std::map<int, FilmFields> m_fields;
+ };
+ 
+ /*!
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+index 527cb06..9c201af 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+@@ -11,8 +11,10 @@
+ #include "DVDInputStreamFile.h"
+ #include "DiscSoftTelecine.h"
+ #include "DllDvdNav.h"
++#include "cores/VideoPlayer/DVDDemuxers/FieldCadenceProbe.h"
+ #include "filesystem/IFileTypes.h"
+ #include "filesystem/SpecialProtocol.h"
++#include "utils/StringUtils.h"
+ #include "utils/log.h"
+ 
+ #include <algorithm>
+@@ -150,10 +152,14 @@ struct Nav
+ };
+ } // namespace
+ 
+-CDiscSoftTelecineScan::CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image)
++CDiscSoftTelecineScan::CDiscSoftTelecineScan(const CFileItem& item,
++                                             std::string path,
++                                             bool image,
++                                             bool fields)
+   : m_item(item),
+     m_path(std::move(path)),
+     m_image(image),
++    m_fields(fields),
+     m_results(std::make_shared<KODI::DISC::CScanResults>())
+ {
+ }
+@@ -168,9 +174,10 @@ void CDiscSoftTelecineScan::Start()
+   if (m_started)
+     return;
+   m_started = true;
+-  if (!KODI::DISC::RunDetached(
+-          m_results, [item = m_item, path = m_path, image = m_image](CScanResults& results)
+-          { Run(item, path, image, results); }))
++  if (!KODI::DISC::RunDetached(m_results,
++                               [item = m_item, path = m_path, image = m_image,
++                                fields = m_fields](CScanResults& results)
++                               { Run(item, path, image, fields, results); }))
+     m_results->Finish(); // (Kodi closes: nothing is read, nor waited for)
+ }
+ 
+@@ -199,6 +206,7 @@ void CDiscSoftTelecineScan::StopAll()
+ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+                                 const std::string& path,
+                                 bool isImage,
++                                bool withFields,
+                                 CScanResults& results)
+ {
+   using clock = std::chrono::steady_clock;
+@@ -293,12 +301,25 @@ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+ 
+   Nav reader{dll, nav, {}};
+   size_t films = 0;
++  size_t inFields = 0;
++  // (Hades: a stretch of the video of a title, decoded for the cadence of its fields)
++  const auto fields = [&results](const std::vector<uint8_t>& video)
++  {
++    KODI::DISC::FilmFields found;
++    if (results.Stopped())
++      return found;
++    KODI::FIELDCADENCE::CProbe probe;
++    probe.AddStretch(video);
++    found.cadence = probe.Finish();
++    probe.CodedRate(found.codedRate, found.codedScale);
++    return found;
++  };
+   for (const auto& title : titles)
+   {
+     if (results.Stopped())
+       break;
+-    const KODI::DISC::TitleResult r =
+-        KODI::DISC::ScanTitle(reader, title.second, [&results] { return results.Stopped(); });
++    const KODI::DISC::TitleResult r = KODI::DISC::ScanTitle(
++        reader, title.second, [&results] { return results.Stopped(); }, fields, withFields);
+     CScanResults::State state = CScanResults::State::UNKNOWN;
+     if (r.verdict == CSoftTelecineDetector::Verdict::FILM)
+       state = CScanResults::State::FILM;
+@@ -323,14 +344,30 @@ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+               : r.start == CSoftTelecineDetector::Verdict::NOT_FILM ? "not film"
+                                                                     : "not told",
+               r.pictures, points, r.videoBytes, r.outOfBudget ? " (a limit was reached)" : "");
+-    results.Set(title.second, state);
++    if (withFields && state != CScanResults::State::FILM)
++    {
++      std::string at;
++      for (const auto point : r.fieldsPoints)
++        at += std::string(" ") + KODI::FIELDCADENCE::NameOf(point) + ";";
++      CLog::Log(LOGDEBUG,
++                "CDiscSoftTelecineScan: title {}, its fields: {} (its start: {}; points further "
++                "on:{} coded at {}/{})",
++                title.second, KODI::FIELDCADENCE::NameOf(r.fields.cadence),
++                KODI::FIELDCADENCE::NameOf(r.fieldsStart), at, r.fields.codedRate,
++                r.fields.codedScale);
++      inFields += r.fields.cadence != KODI::FIELDCADENCE::Cadence::UNKNOWN;
++    }
++    results.Set(title.second, state, r.fields);
+   }
+   if (!results.Stopped())
+     CLog::Log(LOGINFO,
+               "CDiscSoftTelecineScan: {} of the {} titles of two minutes or more read in {} ms: {} "
+-              "with soft telecine",
++              "with soft telecine{}",
+               results.Count(), titles.size(),
+               std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - begin).count(),
+-              films);
++              films,
++              withFields ? StringUtils::Format(", {} films in the fields of interlaced video",
++                                               inFields)
++                         : std::string());
+   finish();
+ }
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+index a1fe438..e4b11a8 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+@@ -38,7 +38,9 @@ class CDiscSoftTelecineScan
+ public:
+   using State = KODI::DISC::CScanResults::State;
+ 
+-  CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image);
++  //! \param fields (Hades) also tell which titles are films in the fields of interlaced video
++  //!        (FieldCadence.h): their video is decoded at their start and at three points
++  CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image, bool fields = false);
+   ~CDiscSoftTelecineScan();
+ 
+   void Start();
+@@ -60,18 +62,25 @@ public:
+    * \param title the number of the title as libdvdnav counts them
+    * \param wait how long to wait, at the most, if the title has not been read yet but will be
+    */
+-  State Get(int title, std::chrono::milliseconds wait) { return m_results->Get(title, wait); }
++  State Get(int title,
++            std::chrono::milliseconds wait,
++            KODI::DISC::FilmFields* fields = nullptr)
++  {
++    return m_results->Get(title, wait, fields);
++  }
+ 
+ private:
+   //! The reading, on its own thread, with copies of what it needs
+   static void Run(const CFileItem& item,
+                   const std::string& path,
+                   bool image,
++                  bool fields,
+                   KODI::DISC::CScanResults& results);
+ 
+   CFileItem m_item;
+   std::string m_path;
+   bool m_image;
++  bool m_fields;
+   bool m_started = false;
+   std::shared_ptr<KODI::DISC::CScanResults> m_results;
+ };
+-- 
+2.53.0
+

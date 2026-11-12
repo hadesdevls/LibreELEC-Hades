@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:20:21 +0000
+Subject: [PATCH] avcodec/pgssubdec: ignore an end segment that follows no
+ presentation segment
+
+A PGS display set begins with its presentation composition segment and
+ends with its end segment. decode() outputs a subtitle at every end
+segment, from the composition kept in the context, whether a
+presentation segment came before it or not. An end segment that follows
+none outputs the last composition again:
+
+- Some Matroska files store a copy of each end segment in a block of its
+  own, at the time of its display set (FFmpeg's pgs_frame_merge also
+  passes such a segment through as a packet of its own). Each subtitle
+  then comes out twice with one time, and a player that keeps the
+  subtitles that start at one time, as Kodi does, draws the picture twice
+  over itself, which blends its semi-transparent pixels twice.
+- An end segment in front of a display set in one packet outputs the
+  last composition, and the display set after it is then dropped as a
+  "Duplicate display segment": the old subtitle is shown, not the new.
+- After a seek in a stream of one segment per packet (MPEG-TS, as on a
+  Blu-ray, or SUP), the end segment of a display set whose presentation
+  segment was before the seek outputs a composition from before the
+  seek, at a time after it.
+
+Remember in the context that a presentation segment was read, and output
+a subtitle at an end segment only then; the end segment uses it up. The
+flag is kept in the context because the segments of one display set
+come in separate packets in MPEG-TS and SUP. A flush clears it, so that
+a presentation segment read before a seek is not completed by an end
+segment read after it. It is set before the presentation segment is
+parsed, so that one that does not parse still outputs at its end
+segment what was read, as before. A second end segment in the packet of
+its display set is now skipped like any other, instead of being
+reported as a duplicate (which with err_recognition explode dropped the
+subtitle). The first end segment skipped is logged, once, as a warning.
+
+This follows matthane's patch for CoreELEC (commit 0e28918fc1ca there,
+"ffmpeg: add patch to ignore lone PGS end segments"); here the
+presentation segment is checked before the duplicate, and the warning is
+new.
+
+Tested with libavcodec built from this tree with every patch of the
+image, plain and with AddressSanitizer and UndefinedBehaviorSanitizer,
+with packets given as Kodi gives them, of streams written segment by
+segment in one packet per display set and in one packet per segment,
+and through FFmpeg's Matroska and M2TS muxers and demuxers. A copy of
+each end segment in a packet of its own gave 7 subtitles for 4 display
+sets before and gives 4 now, byte for byte those of the stream without
+the copies. An end segment in front of a display set, the segments of a
+display set without its presentation segment, and the two seeks above
+gave a subtitle from an earlier composition before (and, the first, lost
+the new one) and give what the stream without those segments gives now.
+Streams without such a segment (display sets that show, clear and
+update a palette, with a forced and a cropped object, an object in three
+segments, seven kinds of damaged display set, two display sets in one
+packet), in both layouts and with and without forced_subs_only and
+explode, give the same subtitles, return values and log lines before
+and after.
+---
+ libavcodec/pgssubdec.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/libavcodec/pgssubdec.c b/libavcodec/pgssubdec.c
+index 65d929b..354a297 100644
+--- a/libavcodec/pgssubdec.c
++++ b/libavcodec/pgssubdec.c
+@@ -97,6 +97,8 @@ typedef struct PGSSubContext {
+     PGSSubPalettes     palettes;
+     PGSSubObjects      objects;
+     int forced_subs_only;
++    int composition_pending;
++    int lone_end_logged;
+ } PGSSubContext;
+ 
+ static void flush_cache(AVCodecContext *avctx)
+@@ -149,6 +151,15 @@ static av_cold int close_decoder(AVCodecContext *avctx)
+     return 0;
+ }
+ 
++static void flush_decoder(AVCodecContext *avctx)
++{
++    PGSSubContext *ctx = avctx->priv_data;
++
++    /* A presentation segment read before a seek is not completed by an end
++     * segment read after it. */
++    ctx->composition_pending = 0;
++}
++
+ /**
+  * Decode the RLE data.
+  *
+@@ -618,6 +629,7 @@ static int display_end_segment(AVCodecContext *avctx, AVSubtitle *sub,
+ static int decode(AVCodecContext *avctx, AVSubtitle *sub,
+                   int *got_sub_ptr, const AVPacket *avpkt)
+ {
++    PGSSubContext *ctx = avctx->priv_data;
+     const uint8_t *buf = avpkt->data;
+     int buf_size       = avpkt->size;
+ 
+@@ -664,6 +676,9 @@ static int decode(AVCodecContext *avctx, AVSubtitle *sub,
+             ret = parse_object_segment(avctx, buf, segment_length);
+             break;
+         case PRESENTATION_SEGMENT:
++            /* Also when the segment does not parse: the end segment then
++             * outputs what was read, as before. */
++            ctx->composition_pending = 1;
+             ret = parse_presentation_segment(avctx, buf, segment_length, sub->pts);
+             break;
+         case WINDOW_SEGMENT:
+@@ -677,6 +692,19 @@ static int decode(AVCodecContext *avctx, AVSubtitle *sub,
+              */
+             break;
+         case DISPLAY_SEGMENT:
++            /* An end segment completes the display set that a presentation
++             * segment began. One that follows none, such as the copy of each
++             * end segment that some Matroska files store in a block of its
++             * own, would output the last composition again. */
++            if (!ctx->composition_pending) {
++                if (!ctx->lone_end_logged) {
++                    av_log(avctx, AV_LOG_WARNING, "Ignoring end segments that "
++                           "follow no presentation segment\n");
++                    ctx->lone_end_logged = 1;
++                }
++                break;
++            }
++            ctx->composition_pending = 0;
+             if (*got_sub_ptr) {
+                 av_log(avctx, AV_LOG_ERROR, "Duplicate display segment\n");
+                 ret = AVERROR_INVALIDDATA;
+@@ -724,6 +752,7 @@ const FFCodec ff_pgssub_decoder = {
+     .priv_data_size = sizeof(PGSSubContext),
+     .init           = init_decoder,
+     .close          = close_decoder,
++    .flush          = flush_decoder,
+     FF_CODEC_DECODE_SUB_CB(decode),
+     .p.priv_class   = &pgsdec_class,
+ };

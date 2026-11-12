@@ -1,0 +1,165 @@
+From f071079e9ca31671ab7ebdfe5ccc7d582ea4ef9c Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:44:42 +0000
+Subject: [PATCH] network/TCPServer: answer a client that has closed its
+ sending side
+
+A client may send its requests and close its sending side with
+shutdown(SHUT_WR) before it reads the answers, as OpenBSD netcat does
+with -N at the end of its input. The server took the end of the input
+for a closed connection and dropped it at once. When requests ran on the
+server thread that was harmless: they had been answered before the next
+read. Now they run on a worker of their own, so the connection, and every
+answer still to come, went away while the worker was still busy.
+
+The end of the input now only stops the reading. The connection is
+dropped once nothing it sent is waiting for a worker and its answers are
+written, at once when there was nothing to answer, as before. While such
+a connection waits, the server thread looks again every 50 ms, as it does
+for a connection it has stopped reading, since nothing in the select
+wakes it when the worker is done.
+
+Reported upstream as a regression of the per-connection workers
+(xbmc/xbmc#29887).
+---
+ xbmc/network/TCPServer.cpp | 48 ++++++++++++++++++++++++++++++++++----
+ xbmc/network/TCPServer.h   | 15 ++++++++++++
+ 2 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/network/TCPServer.cpp b/xbmc/network/TCPServer.cpp
+index 0d84f0a..54abe83 100644
+--- a/xbmc/network/TCPServer.cpp
++++ b/xbmc/network/TCPServer.cpp
+@@ -185,6 +185,7 @@ void CTCPServer::Process()
+     fd_set          rfds;
+     struct timeval  to     = {1, 0};
+     bool backlogged = false;
++    bool answering = false;
+     FD_ZERO(&rfds);
+ 
+     fd_set wfds;
+@@ -214,6 +215,14 @@ void CTCPServer::Process()
+           continue;
+         }
+ 
++        if (m_connections[i]->InputEnded() && m_connections[i]->Answered())
++        {
++          CLog::Log(LOGINFO, "JSONRPC Server: Disconnection detected, after the answers");
++          m_connections[i]->Disconnect();
++          m_connections.erase(m_connections.begin() + i);
++          continue;
++        }
++
+         if (m_connections[i]->HasUnwrittenOutput())
+         {
+           FD_SET(m_connections[i]->m_socket, &wfds);
+@@ -221,6 +230,14 @@ void CTCPServer::Process()
+             max_fd = m_connections[i]->m_socket;
+         }
+ 
++        // Nothing more comes from a peer that has closed its sending side. It is kept until what
++        // it asked for is answered and written, which nothing in the select wakes for.
++        if (m_connections[i]->InputEnded())
++        {
++          answering = true;
++          continue;
++        }
++
+         // Reading faster than the worker parses would queue without limit, so a connection
+         // that is far enough ahead is left unread until the worker catches up. Its receive
+         // window closes and the client waits.
+@@ -236,9 +253,10 @@ void CTCPServer::Process()
+       }
+     }
+ 
+-    // A held-back connection is not in the set, so nothing wakes the select when its worker
+-    // drains. Look again soon rather than after the idle timeout.
+-    if (backlogged)
++    // A held-back connection, or one waiting for its answers after its input ended, is not in
++    // the set, so nothing wakes the select when its worker is done. Look again soon rather than
++    // after the idle timeout.
++    if (backlogged || answering)
+       to = {0, 50000};
+ 
+     int res = select((intptr_t)max_fd + 1, &rfds, &wfds, NULL, &to);
+@@ -289,7 +307,14 @@ void CTCPServer::Process()
+               m_connections[i]->Enqueue(m_connections[i], this, buffer, nread);
+             }
+           }
+-          else if (nread < 0 && (WouldBlock() || Interrupted()))
++          else if (nread == 0)
++          {
++            // The peer has closed its sending side. It may still be reading what it asked for,
++            // which a worker may be answering: the connection goes once that is written.
++            m_connections[i]->EndInput();
++            close = m_connections[i]->Answered();
++          }
++          else if (WouldBlock() || Interrupted())
+             continue;
+           else
+             close = true;
+@@ -873,6 +898,20 @@ bool CTCPServer::CTCPClient::Backlogged()
+   return m_inboundBytes >= maxBufferLength;
+ }
+ 
++bool CTCPServer::CTCPClient::Answered()
++{
++  {
++    // A worker clears m_workerStarted only once its last answer is written, or given up on
++    std::unique_lock<std::mutex> lock(m_inboundMutex);
++    if (m_workerStarted || !m_inbound.empty())
++      return false;
++  }
++
++  // What is queued now, an announcement included, is written by the server thread first
++  std::unique_lock<std::mutex> lock(m_outputMutex);
++  return m_output.empty();
++}
++
+ void CTCPServer::CTCPClient::RunWorker(std::shared_ptr<CTCPClient> self,
+                                        std::shared_ptr<CTCPServer> host)
+ {
+@@ -1034,6 +1073,7 @@ void CTCPServer::CTCPClient::Disconnect()
+ void CTCPServer::CTCPClient::Copy(const CTCPClient& client)
+ {
+   m_new               = client.m_new;
++  m_inputEnded = client.m_inputEnded;
+   m_socket            = client.m_socket;
+   m_cliaddr           = client.m_cliaddr;
+   m_addrlen           = client.m_addrlen;
+diff --git a/xbmc/network/TCPServer.h b/xbmc/network/TCPServer.h
+index bd81f97..879efa6 100644
+--- a/xbmc/network/TCPServer.h
++++ b/xbmc/network/TCPServer.h
+@@ -118,6 +118,18 @@ namespace JSONRPC
+       virtual bool IsNew() const { return m_new; }
+       virtual bool Closing() const { return m_closing; }
+ 
++      /*!
++       * \brief The peer has closed its sending side, so nothing more is read from it.
++       *
++       * It may still be reading: a client can send its requests and close its sending side
++       * before it reads the answers. Only the server thread calls this and InputEnded().
++       */
++      void EndInput() { m_inputEnded = true; }
++      bool InputEnded() const { return m_inputEnded; }
++
++      //! \brief Whether everything received has been answered and the answers written
++      bool Answered();
++
+       /*!
+        * \brief Whether this connection has more accepted but unparsed input than it should.
+        *
+@@ -172,6 +184,9 @@ namespace JSONRPC
+ 
+       std::atomic<bool> m_closing{false};
+ 
++      // The server thread's alone
++      bool m_inputEnded{false};
++
+       // Held by whoever writes to the socket, and to close it. Only that writer removes from
+       // m_output, so it writes from the front message without copying it.
+       std::mutex m_writeMutex;
+-- 
+2.53.0
+

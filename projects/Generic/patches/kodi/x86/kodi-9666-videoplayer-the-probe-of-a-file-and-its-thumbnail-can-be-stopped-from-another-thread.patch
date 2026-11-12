@@ -1,0 +1,290 @@
+From 4c8155af45035e9f773529bb4bda8613c247fd16 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:35:07 +0000
+Subject: [PATCH] videoplayer: the probe of a file and its thumbnail can be
+ stopped from another thread
+
+A read of a file that does not come back, or that comes back with zeros one
+page after another (issue #21, the ntfs driver of Linux 7.3), kept
+CDVDFileInfo::GetFileStreamDetails() reading as long as the demuxer did, and
+whoever waited for it, the interface or Kodi closing, waited as long.
+
+GetFileStreamDetails() and GetFileDuration() take a flag, and the demuxers
+they make get a cancel check on it (and on StopReadings()), so that the open,
+the seek and the reads of the probe end when the flag is set. A probe that
+was stopped stores nothing in the item and answers false, and does not write
+the errors of a probe that failed: its stream details are those of the part
+of the file that was read. The extraction of a thumbnail stops with
+StopReadings(), which Kodi will call when it closes. The reads of the
+decoder loop and of the extra access units of a profile 7 stream look at the
+flag too. Callers that give no flag behave as before.
+---
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp | 100 ++++++++++++++++++-------
+ xbmc/cores/VideoPlayer/DVDFileInfo.h   |  27 ++++++-
+ 2 files changed, 97 insertions(+), 30 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index 82472b8..8a448f9 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <string>
+ #include <string_view>
+@@ -58,7 +59,33 @@ extern "C" {
+ 
+ using namespace KODI;
+ 
+-bool CDVDFileInfo::GetFileDuration(const std::string& path, int& duration)
++namespace
++{
++//! Hades: StopReadings()
++std::atomic<bool> g_readingsStopped{false};
++
++//! Hades: whether the reads of a call that was given stop are not wanted any more
++bool ReadingsStopped(const std::atomic<bool>* stop)
++{
++  return g_readingsStopped.load() || (stop && stop->load());
++}
++
++//! Hades: the check a demuxer is given to stop where stop says so (it is called by the thread that
++//! reads, and stop belongs to whoever may set it: it outlives the call)
++std::function<bool()> CancelCheck(const std::atomic<bool>* stop)
++{
++  return [stop] { return ReadingsStopped(stop); };
++}
++} // namespace
++
++void CDVDFileInfo::StopReadings()
++{
++  g_readingsStopped = true;
++}
++
++bool CDVDFileInfo::GetFileDuration(const std::string& path,
++                                   int& duration,
++                                   const std::atomic<bool>* stop)
+ {
+   std::unique_ptr<CDVDDemux> demux;
+ 
+@@ -72,7 +99,7 @@ bool CDVDFileInfo::GetFileDuration(const std::string& path, int& duration)
+   if (input->IsStreamType(DVDSTREAM_TYPE_DVD) || !input->Open())
+     return false;
+ 
+-  demux.reset(CDVDFactoryDemuxer::CreateDemuxer(input, true));
++  demux.reset(CDVDFactoryDemuxer::CreateDemuxer(input, true, CancelCheck(stop)));
+   if (!demux)
+     return false;
+ 
+@@ -281,10 +308,13 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
+     return {};
+   }
+ 
+-  std::unique_ptr<CDVDDemux> demuxer{CDVDFactoryDemuxer::CreateDemuxer(pInputStream, true)};
++  // (Hades: stopped, with Kodi closing, by StopReadings())
++  std::unique_ptr<CDVDDemux> demuxer{
++      CDVDFactoryDemuxer::CreateDemuxer(pInputStream, true, CancelCheck(nullptr))};
+   if (!demuxer)
+   {
+-    CLog::LogF(LOGERROR, "Error creating demuxer");
++    if (!ReadingsStopped(nullptr))
++      CLog::LogF(LOGERROR, "Error creating demuxer");
+     return {};
+   }
+ 
+@@ -400,7 +430,7 @@ bool CDVDFileInfo::CanExtract(const CFileItem& fileItem)
+  * \brief Open the item pointed to by pItem and extract streamdetails
+  * \return true if the stream details have changed
+  */
+-bool CDVDFileInfo::GetFileStreamDetails(CFileItem *pItem)
++bool CDVDFileInfo::GetFileStreamDetails(CFileItem* pItem, const std::atomic<bool>* stop)
+ {
+   if (!pItem)
+     return false;
+@@ -430,25 +460,31 @@ bool CDVDFileInfo::GetFileStreamDetails(CFileItem *pItem)
+     return false;
+   }
+ 
+-  CDVDDemux* pDemuxer = CDVDFactoryDemuxer::CreateDemuxer(pInputStream, true);
+-  if (pDemuxer)
+-  {
+-    // Filled locally and published once, as the item may be shown while its streams are probed
+-    CStreamDetails details;
+-    bool retVal = DemuxerToStreamDetails(pInputStream, pDemuxer, details, strFileNameAndPath);
+-
+-    if (!pInputStream->IsStreamType(DVDSTREAM_TYPE_PVRMANAGER))
+-      ProcessExternalSubtitles(*pItem, details);
++  const std::unique_ptr<CDVDDemux> pDemuxer{
++      CDVDFactoryDemuxer::CreateDemuxer(pInputStream, true, CancelCheck(stop))};
++  if (!pDemuxer)
++    return false;
+ 
+-    pItem->GetVideoInfoTag()->m_streamDetails = details;
++  // Filled locally and published once, as the item may be shown while its streams are probed
++  CStreamDetails details;
++  const bool retVal =
++      DemuxerToStreamDetails(pInputStream, pDemuxer.get(), details, strFileNameAndPath, stop);
+ 
+-    delete pDemuxer;
+-    return retVal;
+-  }
+-  else
++  // Hades: a probe that was stopped has read part of the file; what it found is not the streams of
++  // the file, and nothing of it is kept (the item is probed again when it is next wanted)
++  if (ReadingsStopped(stop))
+   {
++    CLog::LogF(LOGDEBUG, "stopped while reading {}, nothing is stored",
++               CURL::GetRedacted(strFileNameAndPath));
+     return false;
+   }
++
++  if (!pInputStream->IsStreamType(DVDSTREAM_TYPE_PVRMANAGER))
++    ProcessExternalSubtitles(*pItem, details);
++
++  pItem->GetVideoInfoTag()->m_streamDetails = details;
++
++  return retVal;
+ }
+ 
+ bool CDVDFileInfo::DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>& pInputStream,
+@@ -471,7 +507,8 @@ bool CDVDFileInfo::DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>
+ 
+ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+                                 CDVDDemux* demuxer,
+-                                CStreamDetailVideo& vDetail)
++                                CStreamDetailVideo& vDetail,
++                                const std::atomic<bool>* stop)
+ {
+   std::unique_ptr<CProcessInfo> processInfo(CProcessInfo::CreateInstance());
+   std::vector<AVPixelFormat> pixFmts;
+@@ -499,7 +536,8 @@ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+ 
+   if (!demuxer->SeekTime(static_cast<double>(seekTo_ms), true))
+   {
+-    CLog::LogF(LOGERROR, "Unable to seek to pos {} ms", seekTo_ms);
++    if (!ReadingsStopped(stop))
++      CLog::LogF(LOGERROR, "Unable to seek to pos {} ms", seekTo_ms);
+     return false;
+   }
+ 
+@@ -524,6 +562,10 @@ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+ 
+   do
+   {
++    // (Hades: the demuxer stops by itself where it reads; this is for what it has in its buffers)
++    if (ReadingsStopped(stop))
++      return false;
++
+     DemuxPacket* packet = demuxer->Read();
+ 
+     if (!packet)
+@@ -559,6 +601,11 @@ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+ 
+   } while (abort_index--);
+ 
++  // Hades: stopped in the last read: the details are not going to be kept, and what the next
++  // lines would say of the picture is not true
++  if (ReadingsStopped(stop))
++    return false;
++
+   const bool decoded =
+       decoderState == CDVDVideoCodec::VC_PICTURE && !(picture.iFlags & DVP_FLAG_DROPPED);
+ 
+@@ -572,7 +619,7 @@ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+     static constexpr size_t MAX_BYTES = 16 * 1024 * 1024;
+     static constexpr unsigned MAX_READS = 65536;
+     size_t bytes = 0;
+-    for (unsigned read = 0; read < MAX_READS && bytes < MAX_BYTES; ++read)
++    for (unsigned read = 0; read < MAX_READS && bytes < MAX_BYTES && !ReadingsStopped(stop); ++read)
+     {
+       const dvbridge_residual_counts c = dvbridge_residual_probe_counts(probe.get());
+       if (c.residual > 0 || c.packets >= MAX_PACKETS)
+@@ -626,7 +673,8 @@ static bool GetDetailsFromFrame(CDemuxStreamVideo* stream,
+ bool CDVDFileInfo::DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>& pInputStream,
+                                           CDVDDemux* pDemux,
+                                           CStreamDetails& details,
+-                                          const std::string& path)
++                                          const std::string& path,
++                                          const std::atomic<bool>* stop)
+ {
+   bool retVal = false;
+   details.Reset();
+@@ -668,7 +716,7 @@ bool CDVDFileInfo::DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>
+           vstream->hdr_type != StreamHdrType::HDR_TYPE_HLG && vstream->dovi.dv_profile != 5 &&
+           vstream->dovi.dv_profile <= 10 && p->m_strHdrTypeAlt != "hlg")
+       {
+-        if (!GetDetailsFromFrame(vstream, pDemux, *p))
++        if (!GetDetailsFromFrame(vstream, pDemux, *p, stop) && !ReadingsStopped(stop))
+           CLog::LogF(LOGERROR, "Failed to get HDR details from frame");
+       }
+       p->SetSource(CStreamDetail::MEDIA);
+@@ -681,10 +729,10 @@ bool CDVDFileInfo::DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>
+         stack.GetDirectory(pathToUrl, files);
+ 
+         // skip first path as we already know the duration
+-        for (int i = 1; i < files.Size(); i++)
++        for (int i = 1; i < files.Size() && !ReadingsStopped(stop); i++)
+         {
+            int duration = 0;
+-           if (CDVDFileInfo::GetFileDuration(files[i]->GetDynPath(), duration))
++           if (CDVDFileInfo::GetFileDuration(files[i]->GetDynPath(), duration, stop))
+              p->m_iDuration = p->m_iDuration + duration;
+         }
+       }
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.h b/xbmc/cores/VideoPlayer/DVDFileInfo.h
+index d46e7d7..485c97d 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -48,16 +49,34 @@ public:
+   */
+   static bool CanExtract(const CFileItem& fileItem);
+ 
+-  // Probe the files streams and store the info in the VideoInfoTag
+-  static bool GetFileStreamDetails(CFileItem* pItem);
++  /*!
++   * @brief Probe the files streams and store the info in the VideoInfoTag
++   * @param stop Hades: when it becomes true, from any thread, the open, the seek and the reads of
++   *        the probe return at once, nothing is stored in the item, and the answer is false. It has
++   *        to outlive the call. Null: nothing stops the probe but StopReadings()
++   * @return true if the stream details have changed
++   */
++  static bool GetFileStreamDetails(CFileItem* pItem, const std::atomic<bool>* stop = nullptr);
++
++  //! @param stop as of GetFileStreamDetails()
++  static bool GetFileDuration(const std::string& path,
++                              int& duration,
++                              const std::atomic<bool>* stop = nullptr);
+ 
+-  static bool GetFileDuration(const std::string& path, int& duration);
++  /*!
++   * @brief Hades: Kodi is closing. From now on, and for good, every open, seek and read of a file
++   *        by this class returns at once (the demuxers it makes are given a cancel check): a read
++   *        of a file that does not answer would otherwise be waited for by the job that extracts a
++   *        thumbnail, and by the scanner, until Kodi is killed. Called from any thread.
++   */
++  static void StopReadings();
+ 
+ private:
+   static bool DemuxerToStreamDetails(const std::shared_ptr<CDVDInputStream>& pInputStream,
+                                      CDVDDemux* pDemux,
+                                      CStreamDetails& details,
+-                                     const std::string& path = "");
++                                     const std::string& path = "",
++                                     const std::atomic<bool>* stop = nullptr);
+ 
+   /** \brief Probe the file's internal and external streams and store the info in the StreamDetails parameter.
+   *   \param[out] details The file's StreamDetails consisting of internal streams and external subtitle streams.
+-- 
+2.53.0
+

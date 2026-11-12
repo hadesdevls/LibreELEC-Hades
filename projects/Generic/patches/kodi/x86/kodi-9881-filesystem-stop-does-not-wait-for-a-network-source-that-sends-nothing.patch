@@ -1,0 +1,379 @@
+From 9254192bfe95100f72ddc73db6ec9d6cbfeb6d81 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:05:31 +0000
+Subject: [PATCH] filesystem: Stop does not wait for a network source that
+ sends nothing
+
+When the source of a cached file (an HTTP stream) stops sending, the
+cache thread waits in CCurlFile's FillBuffer() until curl's low-speed
+limit ends the transfer (20 s, about 26 s in all on the host test), and
+the player can wait up to 10 s in CFileCache::Read() for data that does
+not come. Stop closes the player from the thread of the interface:
+VideoPlayer waits for its thread, which waits in that read, and then
+closes the file, whose CFileCache::Close() joins the cache thread that
+waits in curl. Nobody called CCurlFile::Cancel(), and Cancel() would
+block until the file is closed. Measured with the read path of
+CCurlFile against a local server that stalls after 1 MiB: the read
+ended by itself after 26.0 s; with the stop flag of this change, 193 ms
+after it is set.
+
+A new IOControl::READ_ABORT gives a file a std::atomic<bool> that ends a
+read that waits for data when it becomes true:
+
+- CFileCache gives its source the stop flag of the cache thread when it
+  opens it, so StopThread() also ends a source read or seek that waits
+  for the network. A read or seek that the stop ended is no end of the
+  file and no error: the thread leaves without logging one, and the
+  reopening of a source that stopped early (a Hades change) logs
+  nothing either when the stop ends it.
+- CCurlFile ends FillBuffer() when the flag is set, and, while it is
+  armed, waits in select() for at most 200 ms at a time (curl's own
+  timer can be a second). CShoutcastFile hands the flag to its Curl
+  file.
+- CFileCache takes the flag of its reader: a read or a seek of the
+  reader that waits for data (a read waits up to 10 s, a seek for as
+  long as the source takes) waits in slices of at most 100 ms and ends,
+  with an error, once the flag is set. Without the flag, and while it is
+  not set, the waits are the same as before.
+- CDVDInputStreamFile gives the file of a player the flag that its
+  Abort() sets (VideoPlayer::CloseFile() calls it), the one it already
+  gives to the read retries of a local drive.
+
+Host test of CFileCache (FileCache.cpp and CircularCache.cpp of the
+tree, with a source that stalls like a network source): a waiting read
+ends within 300 ms of the abort and reports an error, not the end of
+the file (before: 10 s, then the end of the file); Close() returns
+within 400 ms while the source sends nothing (before: until the source
+gave up); a seek that waits for the source ends with the abort; a short
+stall loses no byte; the end of the file is still reported at once; a
+stop logs no warning or error.
+
+The idea comes from primez (pannal's Kodi tree, "FileCache: End a
+stalled source read when the cache thread stops" and
+"DVDInputStreamFile: End a read that waits for cached data when the
+player closes").
+---
+ .../DVDInputStreams/DVDInputStreamFile.cpp    | 10 ++-
+ xbmc/filesystem/CurlFile.cpp                  | 17 +++-
+ xbmc/filesystem/CurlFile.h                    |  5 ++
+ xbmc/filesystem/FileCache.cpp                 | 79 +++++++++++++++++--
+ xbmc/filesystem/FileCache.h                   |  7 ++
+ xbmc/filesystem/IFileTypes.h                  |  2 +
+ xbmc/filesystem/ShoutcastFile.cpp             |  2 +
+ 7 files changed, 115 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+index 5be1fd8..84ad72b 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+@@ -88,6 +88,13 @@ bool CDVDInputStreamFile::Open()
+   }
+ #endif
+ 
++  // Hades: for a player, a read or a seek that waits for data of the cache (a network source that
++  // sends nothing) ends when the player closes (Abort()), instead of after up to 10 s, or for as
++  // long as the source takes to seek. A file without a cache, or a cache-less source, ignores it.
++  if (m_retryReads)
++    m_pFile->IoControl(IOControl::READ_ABORT,
++                       const_cast<std::atomic<bool>*>(m_retryAbort ? m_retryAbort : &m_aborted));
++
+   if (m_pFile->GetImplementation() && (content.empty() || content == "application/octet-stream"))
+     m_content = m_pFile->GetImplementation()->GetProperty(XFILE::FileProperty::CONTENT_TYPE);
+ 
+@@ -111,7 +118,8 @@ void CDVDInputStreamFile::Close()
+ 
+ void CDVDInputStreamFile::Abort()
+ {
+-  // another thread: only the flag, which the reads of m_pFile look at while they wait
++  // another thread: only the flag, which the reads of m_pFile look at while they wait (the read
++  // retries of a local drive, and the waits of a cache: IOControl::READ_ABORT)
+   m_aborted = true;
+ }
+ 
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index d8d7c08..5b487b8 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -1524,6 +1524,7 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
+       m_oldState          = m_state;
+       m_state             = new CReadState();
+       m_state->m_fileSize = m_oldState->m_fileSize;
++      m_state->m_readAbort = m_readAbort;
+       g_curlInterface.easy_acquire(url.GetProtocol().c_str(),
+                                   url.GetHostName().c_str(),
+                                   &m_state->m_easyHandle,
+@@ -1787,7 +1788,7 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
+   // doesn't exceed required size already
+   while (m_buffer.getMaxReadSize() < want && m_buffer.getMaxWriteSize() > 0 )
+   {
+-    if (m_cancelled)
++    if (m_cancelled || (m_readAbort && *m_readAbort))
+       return FILLBUFFER_NO_DATA;
+ 
+     /* if there is data in overflow buffer, try to use that first */
+@@ -1934,6 +1935,10 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
+         long timeout = 0;
+         if (CURLM_OK != g_curlInterface.multi_timeout(m_multiHandle, &timeout) || timeout == -1 || timeout < 200)
+           timeout = 200;
++        // A read that can be aborted (IOControl::READ_ABORT) looks at its flag at least every 200 ms
++        // while the source sends nothing; curl's own timer can be a second.
++        if (m_readAbort && timeout > 200)
++          timeout = 200;
+ 
+         XbmcThreads::EndTime<> endTime{std::chrono::milliseconds(timeout)};
+         int rc;
+@@ -2205,6 +2210,16 @@ int CCurlFile::IoControl(IOControl request, void* param)
+     return 0;
+   }
+ 
++  if (request == IOControl::READ_ABORT)
++  {
++    // on the thread that reads, before the reads: only the flag is looked at from then on
++    m_readAbort = static_cast<const std::atomic<bool>*>(param);
++    m_state->m_readAbort = m_readAbort;
++    if (m_oldState)
++      m_oldState->m_readAbort = m_readAbort;
++    return 0;
++  }
++
+   return -1;
+ }
+ 
+diff --git a/xbmc/filesystem/CurlFile.h b/xbmc/filesystem/CurlFile.h
+index e4eee95..ce3ecfc 100644
+--- a/xbmc/filesystem/CurlFile.h
++++ b/xbmc/filesystem/CurlFile.h
+@@ -12,6 +12,7 @@
+ #include "utils/HttpHeader.h"
+ #include "utils/RingBuffer.h"
+ 
++#include <atomic>
+ #include <map>
+ #include <string>
+ 
+@@ -112,6 +113,8 @@ namespace XFILE
+           unsigned int m_overflowSize; // size of the overflow buffer
+           int m_stillRunning; // Is background url fetch still in progress
+           bool m_cancelled;
++          //! IOControl::READ_ABORT of the file: FillBuffer() ends its wait for the network when true
++          const std::atomic<bool>* m_readAbort = nullptr;
+           int64_t m_fileSize;
+           int64_t m_filePos;
+           bool m_bFirstLoop;
+@@ -191,6 +194,8 @@ namespace XFILE
+       bool m_skipshout;
+       bool m_postdataset;
+       bool m_allowRetry;
++      //! IOControl::READ_ABORT, given to every read state of this file
++      const std::atomic<bool>* m_readAbort = nullptr;
+       bool m_verifyPeer = true;
+       bool m_failOnError = true;
+       curl_slist* m_dnsCacheList = nullptr;
+diff --git a/xbmc/filesystem/FileCache.cpp b/xbmc/filesystem/FileCache.cpp
+index dc19920..ec2e303 100644
+--- a/xbmc/filesystem/FileCache.cpp
++++ b/xbmc/filesystem/FileCache.cpp
+@@ -14,6 +14,7 @@
+ #include "URL.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
++#include "threads/SystemClock.h"
+ #include "threads/Thread.h"
+ #include "utils/log.h"
+ 
+@@ -167,6 +168,11 @@ bool CFileCache::Open(const CURL& url)
+   bool retry = false;
+   m_source->IoControl(IOControl::SET_RETRY, &retry); // We already handle retrying ourselves
+ 
++  // A source read that waits for the network ends when the cache thread is told to stop: whoever
++  // closes the file (on Stop, the thread of the interface) does not wait for the network timeout of
++  // a source that sends nothing. m_bStop is false again once the thread is created.
++  m_source->IoControl(IOControl::READ_ABORT, &m_bStop);
++
+   // check if source can seek
+   m_seekPossible = m_source->IoControl(IOControl::SEEK_POSSIBLE, NULL);
+ 
+@@ -318,6 +324,9 @@ void CFileCache::Process()
+       {
+         const int64_t sourceSeekResult = m_source->Seek(cacheMaxPos, SEEK_SET);
+         const DWORD sourceSeekError = GetLastError();
++        // a seek that StopThread() ended is no error (OnExit() releases whoever waits for it)
++        if (m_bStop)
++          break; // while (!m_bStop)
+         if (sourceSeekResult != cacheMaxPos)
+         {
+           CLog::Log(LOGERROR, "CFileCache::{} - <{}> error {} seeking. Seek returned {}",
+@@ -422,6 +431,10 @@ void CFileCache::Process()
+       iRead = m_source->Read(buffer.get(), maxSourceRead);
+     if (iRead <= 0)
+     {
++      // A read that StopThread() ended is no end of the file and no error of the source
++      if (m_bStop)
++        break; // while (!m_bStop)
++
+       // Check for actual EOF and retry as long as we still have data in our cache
+       if (m_writePos < m_fileSize && m_pCache->WaitForData(0, 0ms) > 0)
+       {
+@@ -466,7 +479,7 @@ void CFileCache::Process()
+         if (m_bStop)
+           break; // while (!m_bStop)
+         const int64_t reopened = m_source->Seek(m_writePos, SEEK_SET);
+-        if (reopened != m_writePos)
++        if (reopened != m_writePos && !m_bStop)
+           CLog::Log(LOGWARNING, "CFileCache::{} - <{}> reopening at {} returned {}", __FUNCTION__,
+                     m_sourcePath, m_writePos, reopened);
+         continue; // while (!m_bStop)
+@@ -613,7 +626,14 @@ retry:
+     }
+ 
+     // just wait for some data to show up
+-    iRc = m_pCache->WaitForData(1, 10s);
++    bool aborted = false;
++    iRc = WaitForCacheData(1, 10s, aborted);
++    if (aborted)
++    {
++      CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> read aborted by the reader", __FUNCTION__,
++                m_sourcePath);
++      return -1;
++    }
+     if (iRc > 0)
+       goto retry;
+     if (!m_sourcePositionValid)
+@@ -696,6 +716,13 @@ int64_t CFileCache::Seek(int64_t iFilePosition, int iWhence)
+       // SeekEnded will never be set if FileCache thread is not running
+       if (!CThread::IsRunning())
+         return -1;
++      // the reader closes: it does not wait for a source seek that the network holds up
++      if (ReadAborted())
++      {
++        CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> seek aborted by the reader", __FUNCTION__,
++                  m_sourcePath);
++        return -1;
++      }
+     }
+ 
+     if (m_nSeekResult != m_seekPos)
+@@ -709,11 +736,16 @@ int64_t CFileCache::Seek(int64_t iFilePosition, int iWhence)
+     {
+       CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> waiting for position {}", __FUNCTION__,
+                 m_sourcePath, iTarget);
+-      if (m_pCache->WaitForData(static_cast<uint32_t>(iTarget - m_seekPos), 10s) <
++      bool aborted = false;
++      if (WaitForCacheData(static_cast<uint32_t>(iTarget - m_seekPos), 10s, aborted) <
+           iTarget - m_seekPos)
+       {
+-        CLog::Log(LOGWARNING, "CFileCache::{} - <{}> failed to get remaining data", __FUNCTION__,
+-                  m_sourcePath);
++        if (aborted)
++          CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> seek aborted by the reader", __FUNCTION__,
++                    m_sourcePath);
++        else
++          CLog::Log(LOGWARNING, "CFileCache::{} - <{}> failed to get remaining data", __FUNCTION__,
++                    m_sourcePath);
+         return -1;
+       }
+       m_pCache->Seek(iTarget);
+@@ -726,6 +758,35 @@ int64_t CFileCache::Seek(int64_t iFilePosition, int iWhence)
+   return iTarget;
+ }
+ 
++int64_t CFileCache::WaitForCacheData(uint32_t minimum,
++                                     std::chrono::milliseconds timeout,
++                                     bool& aborted)
++{
++  aborted = false;
++  if (!m_readAbort)
++    return m_pCache->WaitForData(minimum, timeout);
++
++  // The same wait, in slices of at most 100 ms between which the abort flag of the reader is
++  // looked at. Between the slices nothing is lost: the data stays in the cache. A slice that ends
++  // before its time ended the wait itself (the data is there, or the end of the input), whatever
++  // minimum the cache strategy settled for; one that runs out only goes on to the next.
++  XbmcThreads::EndTime<> deadline{timeout};
++  for (;;)
++  {
++    if (*m_readAbort)
++    {
++      aborted = true;
++      return 0;
++    }
++    const auto left = deadline.GetTimeLeft();
++    const auto slice = std::min(left, 100ms);
++    const auto start = std::chrono::steady_clock::now();
++    const int64_t avail = m_pCache->WaitForData(minimum, slice);
++    if (avail >= minimum || left <= 100ms || std::chrono::steady_clock::now() - start < slice)
++      return avail;
++  }
++}
++
+ void CFileCache::Close()
+ {
+   StopThread();
+@@ -798,5 +859,13 @@ int CFileCache::IoControl(IOControl request, void* param)
+   if (request == IOControl::SEEK_POSSIBLE)
+     return m_seekPossible;
+ 
++  if (request == IOControl::READ_ABORT)
++  {
++    // the reader's flag (set before its reads): its waits for data end when it is true. The
++    // source is not given it: the source stops with the cache thread (StopThread()).
++    m_readAbort = static_cast<const std::atomic<bool>*>(param);
++    return 0;
++  }
++
+   return -1;
+ }
+diff --git a/xbmc/filesystem/FileCache.h b/xbmc/filesystem/FileCache.h
+index 2a38082..1ac7963 100644
+--- a/xbmc/filesystem/FileCache.h
++++ b/xbmc/filesystem/FileCache.h
+@@ -96,6 +96,11 @@ public:
+     // the events
+     friend class ::TestFileCache;
+ 
++    //! true once the reader has aborted its reads (IOControl::READ_ABORT)
++    bool ReadAborted() const { return m_readAbort && *m_readAbort; }
++    //! m_pCache->WaitForData(), ended early (aborted = true) when the reader aborts its reads
++    int64_t WaitForCacheData(uint32_t minimum, std::chrono::milliseconds timeout, bool& aborted);
++
+     std::unique_ptr<CCacheStrategy> m_pCache;
+     int m_seekPossible = 0;
+     std::unique_ptr<IFileCacheSource> m_source;
+@@ -120,6 +125,8 @@ public:
+     unsigned int m_flags;
+     CCriticalSection m_sync;
+     std::chrono::milliseconds m_processWait{100ms};
++    //! IOControl::READ_ABORT of the reader (a player sets it when it closes)
++    const std::atomic<bool>* m_readAbort = nullptr;
+   };
+ 
+ }
+diff --git a/xbmc/filesystem/IFileTypes.h b/xbmc/filesystem/IFileTypes.h
+index ba0eec0..8c90df1 100644
+--- a/xbmc/filesystem/IFileTypes.h
++++ b/xbmc/filesystem/IFileTypes.h
+@@ -74,6 +74,8 @@ enum class IOControl
+   CACHE_SETRATE = 4, /**< unsigned int with speed limit for caching in bytes per second */
+   SET_CACHE = 8, /**< CFileCache */
+   SET_RETRY = 16, /**< Enable/disable retry within the protocol handler (if supported) */
++  READ_ABORT = 32, /**< const std::atomic<bool>*: a read that waits for data ends when it is true,
++                        and so does every later one (nullptr: none). Set before the reads. */
+ };
+ 
+ enum class CURLOptionType
+diff --git a/xbmc/filesystem/ShoutcastFile.cpp b/xbmc/filesystem/ShoutcastFile.cpp
+index 0adf4df..0a35eea 100644
+--- a/xbmc/filesystem/ShoutcastFile.cpp
++++ b/xbmc/filesystem/ShoutcastFile.cpp
+@@ -336,6 +336,8 @@ int CShoutcastFile::IoControl(IOControl control, void* payload)
+     m_cacheReader = static_cast<CFileCache*>(payload);
+     Create();
+   }
++  else if (control == IOControl::READ_ABORT)
++    return m_file.IoControl(control, payload); // the reads wait in the Curl file
+ 
+   return IFile::IoControl(control, payload);
+ }
+-- 
+2.53.0
+

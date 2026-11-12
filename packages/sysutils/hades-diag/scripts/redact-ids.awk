@@ -9,17 +9,23 @@
 #     Left as they are: 0.0.0.0/8, loopback, multicast, 240/4 and 255.x (netmasks, broadcast), and a few
 #     public resolvers (they tell which DNS is set, and nobody by it).
 #   - IPv6 addresses likewise (the first part for the /64 network), but ::, ::1 and multicast.
-#   - MAC and Bluetooth addresses (also in the names connman gives its services, and in the names BlueZ gives
-#     its devices, dev_AA_BB_CC_DD_EE_FF), but all-zero, broadcast and the group addresses of IPv4 and IPv6
-#     multicast and of IEEE 802.1 (01:00:5e, 33:33, 01:80:c2).
+#   - MAC and Bluetooth addresses (also with "-" between the groups, as a MAC typed for Kodi's Wake-on-LAN may
+#     be, in the names connman gives its services, and in the names BlueZ gives its devices,
+#     dev_AA_BB_CC_DD_EE_FF), but all-zero, broadcast and the group addresses of IPv4 and IPv6 multicast and
+#     of IEEE 802.1 (01:00:5e, 33:33, 01:80:c2).
 #   - UUIDs (partitions, the graphics card), and the serial numbers of FAT and NTFS volumes where a UUID
-#     goes; the Bluetooth base UUIDs stay (they name profiles, not devices).
+#     goes (also the one that GRUB's menu looks for, search --fs-uuid); the Bluetooth base UUIDs stay (they
+#     name profiles, not devices).
 #   - Serial numbers that hardware reports (displays, graphics cards, USB devices), the GPU PDI of NVIDIA,
-#     and in an EDID that is printed as rows of hex, its serial number and serial string (see edid()).
+#     and in an EDID that is printed as rows of hex, its serial number and serial string (see edid()); also as
+#     lsusb -v ("iSerial <index> <string>"), lspci -vvv ("Device Serial Number <eight groups>") and the kernel's
+#     list of input devices ("U: Uniq=", a USB device's serial number) print them (hwserials()).
 #   - SSH fingerprints, public keys and the "randomart" of a key.
-#   - Network names (SSID) as iwd, connman and wpa_supplicant write them.
+#   - Network names (SSID) as iwd, connman and wpa_supplicant write them, and in the column of names of
+#     connmanctl services (cmrow()).
 #   - Names of computers of the home network in addresses (no dot, or .local, .lan, .home and the like),
-#     and the name of this system (HOST) wherever it stands as a word.
+#     and the name of this system (HOST): where a line names it as such (host()), and, where it is a name of
+#     its own and no word that the logs use, wherever it stands as a word, in any letter case (hostword()).
 #   - The names of the Bluetooth devices that BlueZ keeps (NAMES), [bt-name-...]: macOS names the keyboard of
 #     a Mac "Magic Keyboard de Juan", and the kernel, systemd-logind and Kodi write that name in their logs.
 #     Each is found by its bytes, never as a regular expression, as a word of its own, the longest first. One
@@ -28,7 +34,9 @@
 #     an input device (btctx()).
 #   - Each name in a path of a drive, of a media folder of /storage and of a share of the network, and the
 #     labels of drives: [volume-...], [share-...] and [name-...], with the extension of a file kept. A drive
-#     is often named after its owner, and the folder of a film after the film (mpaths()).
+#     is often named after its owner, and the folder of a film after the film (mpaths()). So are the share of
+#     a drive in the configuration of Samba ("[<name>]" over "path = /media/<name>", smbsec()) and the folder
+#     of a profile of Kodi (profiles/<name>, profiles()).
 # What stays, because it says what the machine is and not whose: makes and models, the names that devices
 # and drivers give themselves, public server names, ports, prefix lengths, and the time zone.
 # Variables: KEYFILE (its first line is the secret; without it a marker has no second part), TMP (a file
@@ -79,6 +87,12 @@ BEGIN {
 	for (i in T) MKCLS[T[i]] = 1
 	split("hostname randomart redacted redacted-long redacted-line email", T, " ")
 	for (i in T) MKWORD[T[i]] = 1
+	# (Hades: the words that the logs use themselves, and that a system can be named as well: such a name is taken
+	# only where a line names it as the name of the system (host()), never as any word (hostword()). The words of
+	# four characters or more of 18 diagnostics of 17 PCs that name a computer too, and desktop and htpc)
+	split("arch audio black bluetooth cinema client computer control daemon data default delta desktop display empty ethernet false family game generic hades home host htpc input intel kernel kodi libreelec linux local localhost machine main master media monitor multimedia network node none null nvidia output player plex public radeon remote root router samsung screen server service share sound storage stream system test titan true unknown user video white wifi windows xbmc", T, " ")
+	for (i in T) HOSTKEEP[T[i]] = 1
+	HOSTWORD = hostname_word(HOST)
 	# (the digests: made in batches where markers can wait for them, and kept across the files of one run)
 	DEFER = (MODE == "log" || MODE == ""); NQ = 0; NBUF = 0; PHN = 0; NDP = 0
 	if (DGFILE != "" && KEY != "") dgload()
@@ -359,6 +373,22 @@ function macs(s,   out, m, prv, left, right, n, w, j) {
 	}
 	return out s
 }
+# Hades: a MAC address with "-" between its six groups (AA-BB-CC-DD-EE-FF: a MAC typed for Kodi's Wake-on-LAN,
+# which Kodi writes in its log as it was typed), not a part of a longer run of such groups (the serial number of a
+# PCIe device has eight) nor of a word: the marker of the same address written with ":"
+function macsdash(s,   out, m) {
+	if (s !~ /[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-/) return s
+	out = ""
+	while (more() && match(s, /[0-9A-Fa-f][0-9A-Fa-f](-[0-9A-Fa-f][0-9A-Fa-f])+/)) {
+		out = out substr(s, 1, RSTART - 1)
+		m = substr(s, RSTART, RLENGTH)
+		s = substr(s, RSTART + RLENGTH)
+		if (RLENGTH != 17 || lastc(out) ~ /[A-Za-z0-9_-]/ || substr(s, 1, 1) ~ /[A-Za-z0-9_-]/) { out = out m; continue }
+		gsub(/-/, ":", m)
+		out = out macmark(m)
+	}
+	return out s
+}
 function macmark(m,   l) {
 	l = tolower(m)
 	if (l == "00:00:00:00:00:00" || l == "ff:ff:ff:ff:ff:ff") return m
@@ -407,16 +437,17 @@ function uuids(s,   out, m, prv, nxt, l) {
 	}
 	return out s
 }
-# After UUID=, PARTUUID= and by-uuid/ (the kernel's command line, the init, mounts): what is not marked yet,
+# After UUID=, PARTUUID= and by-uuid/ (the kernel's command line, the init, mounts), also with the value between
+# quotes as blkid writes it (UUID="1234-ABCD", in the log of the installer and in Submit Log): what is not marked yet,
 # as the serial number of a FAT volume ("1234-ABCD"), of an NTFS volume (16 hex digits) or the PARTUUID of
 # an MBR partition ("1234abcd-01").
 function uuidvals(s,   out, m, i, v) {
 	out = ""
-	while (more() && match(s, /([Pp][Aa][Rr][Tt])?[Uu][Uu][Ii][Dd][=\/][0-9A-Fa-f][0-9A-Fa-f-]*/)) {
+	while (more() && match(s, /([Pp][Aa][Rr][Tt])?[Uu][Uu][Ii][Dd][=\/]"?[0-9A-Fa-f][0-9A-Fa-f-]*/)) {
 		out = out substr(s, 1, RSTART - 1)
 		m = substr(s, RSTART, RLENGTH)
 		s = substr(s, RSTART + RLENGTH)
-		i = match(m, /[=\/]/)
+		i = match(m, /[=\/]"?/) + RLENGTH - 1
 		v = substr(m, i + 1)
 		if (substr(s, 1, 1) ~ /[A-Za-z0-9_]/ || length(v) < 8) out = out m
 		else out = out substr(m, 1, i) mark("uuid", tolower(v), 6)
@@ -437,6 +468,15 @@ function escuuids(s,   out, m, i, v) {
 	}
 	return out s
 }
+# Hades: GRUB's search for a file system by its identifier, in the menu that Submit Log sends ("search --no-floppy
+# --fs-uuid --set=root --hint=... 1234-ABCD", the serial number of the boot partition): the identifier, the last
+# word of the line, has the marker that the same value has after UUID= on the line of the kernel below it
+function grubsearch(s,   v) {
+	if (s !~ /(^|[ \t])search[ \t]/ || !match(s, /[ \t][0-9A-Fa-f][0-9A-Fa-f-]*[ \t]*$/)) return s
+	v = substr(s, RSTART + 1, RLENGTH - 1); sub(/[ \t]+$/, "", v)
+	if (length(v) < 8 || v !~ /[0-9]/) return s
+	return substr(s, 1, RSTART) mark("uuid", tolower(v), 6) substr(s, RSTART + 1 + length(v))
+}
 # lsblk -f: the serial number of a FAT or NTFS volume is a column of its own
 function lsblk(s,   out, m) {
 	out = ""
@@ -447,6 +487,53 @@ function lsblk(s,   out, m) {
 		out = out mark("uuid", tolower(m), 6)
 	}
 	return out s
+}
+# Hades: a row of the table that lsblk -f prints (Submit Log has lsblk -Afi), after its header. The label of a
+# volume and its UUID are columns of their own there, with no LABEL= or UUID= before them: the label became no
+# marker, and stood beside the marker of the folder that it is mounted on. Now it gets the marker that labels()
+# gives the same label (and the folder), but for the labels of LibreELEC and of Windows; and what stands in the
+# column of the UUID where no rule took it (the serial number of an HFS+ volume, 16 hex digits in lower case),
+# the marker of a UUID. LBK_L and LBK_U: the characters at which the columns LABEL and UUID start, as the header
+# has them. lsblk pads each column to its width in characters, not bytes: a label, and the tree of the column
+# NAME without -i, may have characters of more than one byte, so the place of a column in a row is counted in
+# characters (colbyte()), and the label ends where the marker of its UUID stands, where it has one. The table ends
+# at a line that is no row of it: an empty one, a line of "=", or one whose character before the column of the
+# label is not blank.
+function lsblkrow(s,   lb, pre, rest, lab, ub, i, t) {
+	lb = colbyte(s, LBK_L)
+	if (s == "" || substr(s, 1, 1) == "=" || (lb <= length(s) && substr(s, lb - 1, 1) != " ")) { LBK_L = 0; return s }
+	if (lb > length(s)) return s
+	pre = substr(s, 1, lb - 1); rest = substr(s, lb)
+	if (match(rest, / +\[uuid-[^]]*\]/)) { lab = substr(rest, 1, RSTART - 1); rest = substr(rest, RSTART) }
+	else {
+		ub = colbyte(rest, LBK_U - LBK_L + 1)
+		lab = substr(rest, 1, ub - 1); rest = substr(rest, ub)
+		if (match(rest, /^[^ ]+/) && !ismarker(substr(rest, 1, RLENGTH))) rest = mark("uuid", tolower(substr(rest, 1, RLENGTH)), 6) substr(rest, RLENGTH + 1)
+	}
+	# (the label without the blanks around it)
+	match(lab, /^ */); i = RLENGTH; t = substr(lab, i + 1); sub(/ +$/, "", t)
+	if (t == "" || ismarker(t) || (tolower(t) in LABELKEEP)) return pre lab rest
+	return pre substr(lab, 1, i) mark("volume", t, 6) substr(lab, i + length(t) + 1) rest
+}
+# The byte at which the character n of s starts (a byte of UTF-8 that goes on a character is no character of its
+# own); one past the end where s has fewer characters
+function colbyte(s, n,   b, k, c) {
+	k = 0
+	for (b = 1; b <= length(s); b++) {
+		c = ORD[substr(s, b, 1)]
+		if ((c < 128 || c >= 192) && ++k == n) return b
+	}
+	return length(s) + 1
+}
+# Hades: a row of a partition that parted -m prints (the log of the installer has parted -s -m -l): its name, the
+# field before the flags, as labels() takes PARTLABEL= of blkid, with the same marker
+function partedrow(s,   p, r, v) {
+	if (!match(s, /^([^:]*:){5}/)) return s
+	p = substr(s, 1, RLENGTH); r = substr(s, RLENGTH + 1)
+	if (!match(r, /:[^:]*;$/)) return s
+	v = substr(r, 1, RSTART - 1)
+	if (v == "" || ismarker(v) || (tolower(v) in LABELKEEP)) return s
+	return p mark("volume", v, 6) substr(r, RSTART)
 }
 
 # ---- serial numbers that hardware reports
@@ -464,6 +551,44 @@ function serials(s,   l, out, k, v, r) {
 		s = substr(s, length(v) + 1); l = substr(l, length(v) + 1)
 	}
 	return out s
+}
+
+# ---- Hades: serial numbers as tools of the system print them, in what createlog collects (the share Logfiles):
+# lsusb -v, "  iSerial                 3 0123456789AB" (the index of the string, then the string to the end of the
+# line; a root hub's is the PCI address of its controller, which stays), lspci -vvv, "Capabilities: [100 v1] Device
+# Serial Number 00-11-22-ff-ff-33-44-55", and the kernel's list of input devices, "U: Uniq=<value>" (a USB device's
+# serial number; a Bluetooth device's address has its marker already)
+function hwserials(s,   v, p) {
+	if (match(s, /^[ \t]*iSerial[ \t]+[0-9]+[ \t]+/)) {
+		p = substr(s, 1, RLENGTH); v = substr(s, RLENGTH + 1); sub(/[ \t\r]+$/, "", v)
+		if (v == "" || ismarker(v) || v ~ /^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$/) return s
+		return p mark("serial", v, 6) substr(s, length(p) + length(v) + 1)
+	}
+	if (match(s, /Device Serial Number[ \t]+/)) {
+		p = substr(s, 1, RSTART + RLENGTH - 1); v = substr(s, RSTART + RLENGTH)
+		if (!match(v, /^[0-9A-Fa-f][0-9A-Fa-f](-[0-9A-Fa-f][0-9A-Fa-f])+/)) return s
+		return p mark("serial", tolower(substr(v, 1, RLENGTH)), 6) substr(v, RLENGTH + 1)
+	}
+	if (substr(s, 1, 8) == "U: Uniq=") {
+		v = substr(s, 9); sub(/[ \t\r]+$/, "", v)
+		if (v == "" || ismarker(v)) return s
+		return "U: Uniq=" mark("serial", v, 6) substr(s, 9 + length(v))
+	}
+	return s
+}
+# ---- Hades: a row of connmanctl services, "%c%c%c %-20s %s": the favourite, autoconnect and state flags, the name of
+# the service (for Wi-Fi, the name of the network), and the service, wifi_<MAC>_<SSID in hex>_<security> last. The
+# name takes the marker of the SSID of the service (the one that connman() gives the service and ssids() the name):
+# so a report still tells which rows and lines are of one network. A hidden network has no name.
+function cmrow(s,   i, n, F) {
+	if (substr(s, 1, 3) !~ /^[* ][A ][ORacd ]$/ || substr(s, 4, 1) != " ") return s
+	i = match(s, / wifi_[0-9A-Fa-f]+_[0-9A-Fa-f]+_[A-Za-z0-9_]+$/)
+	if (i < 5) return s
+	split(substr(s, i + 1), F, "_")
+	if (length(F[2]) != 12 || length(F[3]) % 2) return s
+	n = substr(s, 5, i - 5); sub(/ +$/, "", n)
+	if (n == "" || ismarker(n)) return s
+	return substr(s, 1, 4) mark("ssid", tolower(F[3]), 6) substr(s, 5 + length(n))
 }
 
 # ---- connman's names of its services: wifi_<MAC>_<SSID in hex>_managed_psk, ethernet_<MAC>_cable,
@@ -554,23 +679,57 @@ function lanname(h,   l) {
 	return l ~ /\.(local|lan|home|home\.arpa|localdomain|internal|intranet|private|fritz\.box)$/
 }
 # The name of this system where a line names it as such: the field of the journal and of syslog that holds
-# it, "Linux NAME ..." of uname, after "hostname", "host name is", "hostname set to <", "netbios name =",
-# "@" or "//", and before ".local", ".lan" and the like. Not as any word of a line: a name such as "kodi",
-# "media" or "tv" would take every ".kodi/", "/var/media" or "LG TV" with it.
+# it (after the time as journalctl writes it: to the second, to the microsecond as Submit Log has it, or the
+# seconds since the start in brackets as the diagnostics of a start of the installer have it), "Linux NAME ..."
+# of uname, after "hostname" or "host name" (with "is" or not: connman says "System hostname is NAME"),
+# "hostname set to <", "netbios name =", "@" or "//", the value of a key "fqdn", "host", "hostname", "node" or
+# "nodename" (the TXT record that avahi publishes for PulseAudio, "fqdn=NAME"; Python's
+# platform.uname() in the log of an add-on, "node='NAME'"; Hades: also a key between quotes, as JSON and Python
+# write it, "hostname": "NAME"), and before ".local", ".lan" and the like. Not as
+# any word of a line here: a name such as "kodi", "media" or "tv" would take every ".kodi/", "/var/media" or
+# "LG TV" with it (hostword() takes it anywhere, last, where it is a name that no log uses as a word).
 function host(s,   out, i, L, pre, nxt) {
 	L = length(HOST)
-	if (match(s, /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] /) && substr(s, RLENGTH + 1, L + 1) == HOST " ")
+	if (match(s, /^([A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)?|\[ *[0-9]+\.[0-9]+\]) /) && substr(s, RLENGTH + 1, L + 1) == HOST " ")
 		s = substr(s, 1, RLENGTH) "[hostname]" substr(s, RLENGTH + L + 1)
 	if (substr(s, 1, L + 7) == "Linux " HOST " ") s = "Linux [hostname]" substr(s, L + 7)
 	out = ""
 	while (more() && (i = index(s, HOST)) > 0) {
 		pre = out substr(s, 1, i - 1)
 		nxt = substr(s, i + L, 1)
-		if (nxt !~ /[A-Za-z0-9_-]/ && (pre ~ /([Hh]ost ?name[:=]? ?|[Hh]ost name is |[Hh]ostname set to <|[Nn]etbios name = |@|\/\/)$/ ||
+		if (nxt !~ /[A-Za-z0-9_-]/ && (pre ~ /([Hh]ost ?name( is)?[:=]? ?|[Hh]ostname set to <|[Nn]etbios name = |(^|[^A-Za-z0-9_])([Ff][Qq][Dd][Nn]|[Hh]ost(_?[Nn]ame)?|[Nn]ode(name)?)['"]?[:=] ?['"]?|@|\/\/)$/ ||
 		    (substr(pre, length(pre), 1) !~ /[A-Za-z0-9_.-]/ && substr(s, i + L) ~ /^\.(local|lan|home|localdomain|home\.arpa|internal)([^A-Za-z0-9-]|$)/)))
 			out = pre "[hostname]"
 		else out = pre HOST
 		s = substr(s, i + L)
+	}
+	return out s
+}
+# Hades: the name of this system as the last pass looks for it (hostword()), in lower case: one of four characters
+# or more, with a letter from g to z (a digest of a marker, or a number, has none), that is no word of the logs
+# (HOSTKEEP) nor of the markers; "" for any other, which only host() takes
+function hostname_word(h,   l) {
+	l = tolower(h)
+	if (length(l) < 4 || l !~ /[g-z]/ || (l in HOSTKEEP) || (l in MKWORD) || (l in MKCLS)) return ""
+	return l
+}
+# (a character that a word of a name goes on with: a letter, a digit, "_" or "-", a byte of UTF-8, or the byte of
+# the placeholder of a digest)
+function hostwc(c) { return c != "" && (c ~ /[A-Za-z0-9_-]/ || ORD[c] >= 128 || c == "\034") }
+# Hades: the last pass, after every other rule: the name of this system wherever it stands as a word of its own, in
+# any letter case (NetBIOS writes it in capitals), for the forms of lines that the rules above do not know yet
+# (connman's "System hostname is", avahi's "fqdn=" and Python's "node=" were found so, one after another, in
+# diagnostics that users sent). Only a name of its own (HOSTWORD): one that the logs use as a word ("media",
+# "kodi", "server") would take that word everywhere. Linear in the length of a line; counted in NHOSTW.
+function hostword(s,   l, out, i, L, b) {
+	l = tolower(s)
+	if (!index(l, HOSTWORD)) return s
+	L = length(HOSTWORD); out = ""
+	while ((i = index(l, HOSTWORD)) > 0) {
+		b = i > 1 ? substr(s, i - 1, 1) : lastc(out)
+		if (!hostwc(b) && !hostwc(substr(s, i + L, 1))) { out = out substr(s, 1, i - 1) "[hostname]"; NHOSTW++ }
+		else out = out substr(s, 1, i - 1 + L)
+		s = substr(s, i + L); l = substr(l, i + L)
 	}
 	return out s
 }
@@ -915,7 +1074,7 @@ function unitp(s,   out, m, g, pre, name, suf, k, res, i, t, v) {
 # the partitions of LibreELEC and the ones that Windows and its tools give
 function labels(s,   out, m, i, v, q) {
 	out = ""
-	while (more() && match(s, /(^|[^A-Za-z0-9_])((PART)?LABEL(_FATBOOT)?="[^"]*"|ID_FS_LABEL(_ENC)?=[^ \t]+|by-(part)?label\/[^ \t"'<>]+|by\\x2d(part)?label-[^ \t"'<>.]+)/)) {
+	while (more() && match(s, /(^|[^A-Za-z0-9_])((PART)?LABEL(_FATBOOT)?="([^"\\]|\\.)*"|ID_FS_LABEL(_ENC)?=[^ \t]+|by-(part)?label\/[^ \t"'<>]+|by\\x2d(part)?label-[^ \t"'<>.]+)/)) {
 		m = substr(s, RSTART, RLENGTH)
 		out = out substr(s, 1, RSTART - 1)
 		s = substr(s, RSTART + RLENGTH)
@@ -925,10 +1084,35 @@ function labels(s,   out, m, i, v, q) {
 		if (m ~ /^by/) { i = (m ~ /^by-/) ? index(m, "/") : index(m, "label-") + 5 }
 		else i = index(m, "=")
 		v = substr(m, i + 1); q = ""
-		if (substr(v, 1, 1) == "\"") { q = "\""; v = substr(v, 2, length(v) - 2) }
+		# (Hades: blkid writes a " of a label as \" and a \ as \\: the marker is the one of the label itself)
+		if (substr(v, 1, 1) == "\"") { q = "\""; v = substr(v, 2, length(v) - 2); if (index(v, "\\")) v = bsunq(v) }
 		if (m ~ /_ENC=|^by/) { v = pxdec(v); if (m ~ /^by\\/) v = pxdec(v) }
 		if (v == "" || ismarker(v) || (tolower(v) in LABELKEEP)) out = out m
 		else out = out substr(m, 1, i) q mark("volume", v, 6) q
+	}
+	return out s
+}
+# (Hades: what blkid escapes in a value between quotes, \" and \\, as it is)
+function bsunq(v,   out, i, c) {
+	out = ""
+	for (i = 1; i <= length(v); i++) {
+		c = substr(v, i, 1)
+		if (c == "\\" && i < length(v)) c = substr(v, ++i, 1)
+		out = out c
+	}
+	return out
+}
+# Hades: the folder of a profile of Kodi, which whoever made the profile names, often after a person
+# (/storage/.kodi/userdata/profiles/<name>/, special://masterprofile/profiles/<name>/): the name, the marker of
+# the same name in a path; the rest of the path stays as the paths of the system in /storage stay (mpaths())
+function profiles(s,   out, m, n) {
+	out = ""
+	while (more() && match(s, /(userdata|masterprofile)\/profiles\/[^\/"'<>|\t]+/)) {
+		m = substr(s, RSTART, RLENGTH)
+		out = out substr(s, 1, RSTART - 1)
+		s = substr(s, RSTART + RLENGTH)
+		n = substr(m, index(m, "profiles/") + 9)
+		out = out substr(m, 1, length(m) - length(n)) pnamec(n, "name", "")
 	}
 	return out s
 }
@@ -1074,19 +1258,28 @@ function ids(s) {
 		s = macs(s)
 		s = ip6(s)
 	}
-	if (index(s, "-")) s = uuids(s)
+	if (index(s, "-")) { s = uuids(s); s = macsdash(s) }
 	if (index(s, ".")) s = ip4(s)
 	if (s ~ /[Uu][Uu][Ii][Dd][=\/]/) s = uuidvals(s)
 	if (index(s, "x2duuid-") || index(s, "x2dpartuuid-")) s = escuuids(s)
+	if (index(s, "--fs-uuid")) s = grubsearch(s)
 	if (s ~ / (vfat|exfat|ntfs3?|fuseblk) /) s = lsblk(s)
 	if (s ~ /[Ss][Ee][Rr][Ii][Aa][Ll]|PDI/) s = serials(s)
+	if (index(s, "iSerial") || index(s, "Device Serial Number") || substr(s, 1, 8) == "U: Uniq=") s = hwserials(s)
+	if (substr(s, 4, 1) == " " && index(s, " wifi_")) s = cmrow(s)
 	if (index(s, "dev_")) s = bluez(s)
 	if (index(s, "_")) s = connman(s)
 	if (index(s, "ssid: ") || index(s, "SSID ")) s = ssids(s)
 	if (index(s, "://")) s = lannames(s)
 	if (HOST != "" && index(s, HOST)) s = host(s)
+	if (index(s, "/profiles/")) s = profiles(s)
 	# (the paths last: the server of an address has its marker then, and is not taken for a name)
 	if (index(s, "/media/") || index(s, "/mnt/") || index(s, "/storage/") || index(s, "://") || index(s, "%2") || index(s, "media-") || index(s, "mnt-") || index(s, "LABEL") || index(s, "label")) s = mpaths(s)
+	# (Hades: the columns of a table of lsblk -f, after the markers of its UUIDs and of the folders it is mounted
+	# on, and the name of a partition in a row of parted -m)
+	if (substr(s, 1, 5) == "NAME " && s ~ /^NAME +FSTYPE +(FSVER +)?LABEL +UUID /) { LBK_L = index(s, " LABEL ") + 1; LBK_U = index(s, " UUID ") + 1 }
+	else if (LBK_L) s = lsblkrow(s)
+	if (index(s, ";") && s ~ /^[0-9]+:[0-9.,]+[A-Za-z%]*:[0-9.,]+[A-Za-z%]*:[0-9.,]+[A-Za-z%]*:[^:;]*:[^;]*:[^:;]*;$/) s = partedrow(s)
 	return s
 }
 
@@ -1153,6 +1346,33 @@ function flush(   i, j, n, r, ind, t) {
 	} else for (i = 1; i <= NROWS; i++) emit(ROW[i])
 	NROWS = 0
 }
+# One line of a log (MODE "log") or of a file of the system (MODE ""), through every rule, out
+function oneline(x,   r) {
+	NM = 0; NMN = 0; TOOMANY = 0
+	r = (MODE == "log") ? paths(ids(x)) : ids(x)
+	# (Hades: the name of this system as a word anywhere, last)
+	if (HOSTWORD != "" && !TOOMANY) r = hostword(r)
+	emit(TOOMANY == 2 ? "[left out, a line with more than 4096 names in its paths]" : TOOMANY ? "[left out, a line with more than 1024 addresses, names or paths]" : r)
+}
+# Hades: a line that is a section of its own ("[<name>]") is held until the next one (SMBH), which says whether it is
+# the share of a drive in the configuration of Samba (/run/samba/smb.conf, which Submit Log sends): samba-config writes
+# "[<name>]" and then "  path = /media/<name>" for each drive, the name of its folder in /var/media, which is often
+# its label ("Juan's Disk"). Such a section has the marker of the drive in the path below it; any other goes through
+# the rules as any line ("[global]", "[Logfiles]", a line of a crash log such as "[New LWP 1234]"). n: the next line,
+# "" where there is none.
+function smbsec(n,   h, v, p) {
+	h = SMBH; SMBH = ""
+	v = substr(h, 2, index(h, "]") - 2)
+	if (match(n, /^[ \t]*path[ \t]*=[ \t]*/)) {
+		p = substr(n, RLENGTH + 1); sub(/[ \t]+$/, "", p)
+		if (p == "/media/" v || p == "/var/media/" v) {
+			NM = 0; NMN = 0; TOOMANY = 0
+			emit("[" pnamec(v, "volume", "") substr(h, index(h, "]")))
+			return
+		}
+	}
+	oneline(h)
+}
 # What comes out is held one line, so that a last line that had no line end gets none: redact.sh puts a line
 # end and the line LAST (a random word of its run) after its input, and the line before LAST is then empty
 # where the input ended with a line end, and is the last line of the input where it did not.
@@ -1193,18 +1413,38 @@ MODE == "btlist" || MODE == "btmark" {
 	}
 	next
 }
-LAST != "" && $0 == LAST { ENDED = 1; next }
+# Hades: what the filter left of the name of this system in files that went through it (redact.sh hostnote): the
+# times it stands as a word of its own, and the times it is inside a longer word. Nothing of the input is printed
+MODE == "hostleft" {
+	if (HOSTWORD == "") next
+	l = tolower($0); k = 0; L = length(HOSTWORD)
+	while ((i = index(substr(l, k + 1), HOSTWORD)) > 0) {
+		p = k + i
+		if (!hostwc(p > 1 ? substr($0, p - 1, 1) : "") && !hostwc(substr($0, p + L, 1))) NLEFTW++
+		else NLEFTIN++
+		k = p + L - 1
+	}
+	next
+}
+LAST != "" && $0 == LAST { if (SMBH != "") smbsec(""); ENDED = 1; next }
 {
 	# (the byte 034 is what the placeholders of digests are made with: none comes from the input)
 	if (index($0, "\034")) gsub(/\034/, "?")
+	# (Hades: a section held by the line before: this line says what it is)
+	if (SMBH != "") smbsec($0)
 	if (length($0) >= 32767) { flush(); emit("[left out, a line of 32767 characters or more]"); next }
 	if ($0 ~ /^[ \t]*[0-9a-f]{32}[ \t]*$/ || $0 ~ /^([0-9a-f][0-9a-f] ){15}[0-9a-f][0-9a-f] *$/) { hold($0); next }
 	flush()
-	NM = 0; NMN = 0; TOOMANY = 0
-	r = (MODE == "log") ? paths(ids($0)) : ids($0)
-	emit(TOOMANY == 2 ? "[left out, a line with more than 4096 names in its paths]" : TOOMANY ? "[left out, a line with more than 1024 addresses, names or paths]" : r)
+	if (substr($0, 1, 1) == "[" && $0 ~ /^\[[^]]+\][ \t]*$/) { SMBH = $0; next }
+	oneline($0)
 }
 END {
+	# (Hades: the kind of name, and the counts: "word" a name of its own, "plain" one that only host() takes,
+	# "none" no name to take)
+	if (MODE == "hostleft") {
+		printf "%s %d %d\n", HOST == "" ? "none" : HOSTWORD == "" ? "plain" : "word", NLEFTW, NLEFTIN
+		exit
+	}
 	if (MODE == "edid") {
 		# (a copy that an earlier version damaged, putting a folder of a start through the filter for text:
 		# each byte 0 a line end, so its header is 0a ff ff ff ff ff ff 0a. Its bytes 0 cannot be told from
@@ -1215,12 +1455,14 @@ END {
 		for (i = 0; i < NB; i++) printf "\\%03o", E[i]
 		exit
 	}
+	if (SMBH != "") smbsec("")
 	flush()
 	flushq()
 	if (DGFILE != "" && KEY != "") dgsave()
 	# (with STATS, what it did, for a measure: lines, names worked out and taken from the cache, digests made, lines
-	# held back behind a digest still to make, digests that sha256sum did not give)
-	if (STATS != "") printf "redact-ids: %d lines, %d names worked out, %d from the cache, %d digests made, %d lines held (%d bytes at most), %d digests failed\n", NR, NPN, NPC, NDG, NHELD, HBMAX, NFAIL > "/dev/stderr"
+	# held back behind a digest still to make, digests that sha256sum did not give, and the names of this system
+	# that the last pass took, hostword())
+	if (STATS != "") printf "redact-ids: %d lines, %d names worked out, %d from the cache, %d digests made, %d lines held (%d bytes at most), %d digests failed, %d names of the system taken by the last pass\n", NR, NPN, NPC, NDG, NHELD, HBMAX, NFAIL, NHOSTW > "/dev/stderr"
 	if (!ENDED) { if (HELD) print PREV }
 	# (a last line with no line end: where the input was cut while it was written (DROPCUT, from shutdown.sh), it is
 	# left out: it may end in the middle of an address or a name, which no rule then sees whole)

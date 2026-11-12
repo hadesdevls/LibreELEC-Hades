@@ -1,0 +1,926 @@
+From 091e6fd7d3a9ecdda624d4fe4f9ecef2116217ba Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:34:41 +0000
+Subject: [PATCH] windowing/gbm: an output kept on for its sound is asked of
+ the driver first, and found by its atomic state
+
+The outputs that hades-keep-outputs names (the commit before this one) were
+left on in two ways that nothing checked:
+
+- On the device that Kodi uses, the CRTC of such an output stayed on with its
+  planes detached, in the same commit as Kodi's frame and as the turning off of
+  the other unused outputs. A driver that does not keep a CRTC on with no plane
+  refuses that whole commit, which falls back to the request before it: the
+  other outputs then stayed on for good (the turning off was never asked for
+  again), the kept one as it was.
+- On another device, the CRTC of the output was found through the connector's
+  encoder_id only: where a driver leaves it 0 the output was turned off with
+  the others, and nothing said so. Nor was an entry of the file that names no
+  output ("HDMI-1" for "HDMI-A-1") ever told.
+
+Read in the drivers of this build (Linux 7.3.1, nvidia-open 615.78.08):
+amdgpu refuses a CRTC that is on without its primary plane
+(amdgpu_dm_crtc_helper_atomic_check(): "Can't enable a CRTC without enabling
+the primary plane"), which Kodi knows as QUIRK_NEEDSPRIMARY; i915 and xe (the
+same display code) keep a pipe on with no plane (they handle active_planes == 0,
+gen2 only turns its underrun reports off for it); nvidia-drm asks nothing of the
+planes of a CRTC (nv_drm_crtc_atomic_check()) and gives NVKMS a layer without a
+surface as disabled. None of this is taken on trust: the driver is asked.
+
+On the device that Kodi uses, where an output is kept on, the turning off of
+the others is now asked first in a request of its own (TEST_ONLY), in this
+order (KEEP_OUTPUTS::KeepModes()): the kept output black, with its planes
+detached (not with QUIRK_NEEDSPRIMARY); as it was, with what it showed; and
+last off, as without the file, so that the other outputs never stay on because
+one is kept. The first way that the driver takes goes out with the frame. A
+commit that carried the turning off and was refused (its test, or the commit)
+asks for it again 10 s later, three times at most for a mode; this also holds
+without the file, where the request is the one of before, property for property. A move
+to another output (TestOutputMove()) asks the same ways in the same order, and
+its commit goes with the one that the driver took; the output that Kodi leaves
+goes off as it always did. Nothing is asked again when nothing would change:
+the outputs kept on are told once, and again only when that changes.
+
+On another device the CRTC of the output is the one that its atomic state
+names (the connector's CRTC_ID, read on a handle that asks for atomic
+modesetting, which changes nothing else: the outputs are turned off with the
+legacy call as before), and the one of its encoder where the driver has no
+atomic modesetting (KEEP_OUTPUTS::CrtcOfOutput()). An output named in the file
+that drives nothing is said so, with whether a display is connected.
+
+Once per start, each entry of the file that names none of the outputs of the
+devices that drive a display is told, with the names of those outputs.
+
+kodi.log, at info level unless a warning is said:
+  "turning off N output(s) not used by Kodi" (as before)
+  "DP-1 stay(s) on, black, for its sound (hades-keep-outputs)"
+  "DP-1 stay(s) on as it was, with what it showed, for its sound
+   (hades-keep-outputs; the driver needs a plane on a CRTC that is on)" (amdgpu)
+  "... (hades-keep-outputs; the driver did not take it on with nothing on it:
+   <error>)"
+  warning "DP-1 go(es) off although hades-keep-outputs keeps it on: the driver
+   would take turning off the outputs Kodi does not use only with it (<error>)"
+  warning "the commit that turns off the outputs not used by Kodi was refused
+   (<error>): it is asked for again in 10 s" / "... refused 3 times (<error>):
+   they stay on"
+  "/dev/dri/card1: HDMI-A-1 stay(s) on as it was, for its sound
+   (hades-keep-outputs)"
+  "/dev/dri/card1: DP-2 (hades-keep-outputs) drives nothing now (nothing
+   connected, no CRTC in its atomic state): nothing to keep on"
+  warning "hades-keep-outputs: "hdmi-1" names none of the outputs of the
+   graphics devices that drive a display (card1-HDMI-A-1, ...): nothing is
+   kept on for it"
+
+Tested on the host: the parser, the report of entries that name nothing, the
+order of the ways and the choice of the CRTC (50 checks; ten mutations of the
+header, each caught). The rest is read and syntax-checked against the build's
+own compile commands; whether each driver takes each way, and what the
+receiver hears, only hardware shows.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp    | 340 ++++++++++++++++++------
+ xbmc/windowing/gbm/drm/DRMAtomic.h      |  41 ++-
+ xbmc/windowing/gbm/drm/DRMKeepOutputs.h |  85 ++++++
+ xbmc/windowing/gbm/drm/DRMUtils.cpp     | 100 ++++++-
+ xbmc/windowing/gbm/drm/DRMUtils.h       |   8 +
+ 5 files changed, 478 insertions(+), 96 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 33f5a2f..4b7e2b2 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -22,6 +22,7 @@
+ #include "settings/Settings.h"
+ #include "utils/DRMHelpers.h"
+ #include "utils/ModeChangeTime.h"
++#include "utils/StringUtils.h"
+ #include "utils/log.h"
+ 
+ #include <chrono>
+@@ -155,6 +156,9 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     m_moveFrom = nullptr;
+     m_moveResult = taken;
+   };
++  // Hades: this commit carries the turning off of the outputs that Kodi does not use: a refusal of
++  // it asks for that again later (OtherOutputsOffRefused())
++  bool othersOff = false;
+   if (!strict && !moving && m_otherOutputsOff &&
+       std::chrono::steady_clock::now() >= *m_otherOutputsOff)
+   {
+@@ -162,7 +166,12 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     // (the outputs of the graphics devices that Kodi does not use: not part of this commit)
+     DisableOtherDevices();
+     if (DisableOtherOutputs(flags))
++    {
+       tells = false;
++      othersOff = true;
++    }
++    // (Hades: what of hades-keep-outputs named nothing, once)
++    ReportKeptOutputs();
+   }
+ 
+   // Hades: a commit that changes "Broadcast RGB" allows a mode set (CRgbRange::ChangesRange()).
+@@ -211,7 +220,10 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+         std::ranges::any_of(GetCrtcs(), [this](const auto& crtc)
+                             { return crtc.get() != m_crtc &&
+                                      crtc->GetPropertyValue("ACTIVE").value_or(0) != 0; }))
++    {
+       m_otherOutputsOff = std::chrono::steady_clock::now() + noticeTime;
++      m_otherOutputsTries = 0; // (Hades: OtherOutputsOffRefused())
++    }
+     m_old_crtc = nullptr;
+   }
+ 
+@@ -224,7 +236,11 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     // show Kodi too: TestOutputMove() asked the driver for the same)
+     if (m_moveFrom != m_connector)
+       AddProperty(m_moveFrom, "CRTC_ID", 0);
+-    DisableOtherOutputs(flags);
++    // (Hades: an output that the user keeps on, as TestOutputMove() found that the driver takes
++    // it; as it was where nothing asked, which is no more than the move asks without it)
++    DisableOtherOutputs(flags, m_moveKeepMode.value_or(KEEP_OUTPUTS::KeepMode::UNTOUCHED));
++    m_moveKeepMode.reset();
++    m_moveKeepError = 0;
+     for (const auto& plane : m_planes)
+     {
+       if (plane.get() != m_gui_plane && plane.get() != m_video_plane &&
+@@ -384,10 +400,14 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+       moved(false, errno);
+       return reject();
+     }
++    const int refused = errno; // (Hades)
+     CLog::LogF(LOGERROR,
+                "test commit failed: ({}) - falling back to last successful atomic "
+                "request",
+-               strerror(errno));
++               strerror(refused));
++    // (Hades: the outputs that it turned off stay on: asked for again later)
++    if (othersOff)
++      OtherOutputsOffRefused(refused);
+ 
+     m_flipRefused = m_flipRefused || tells;
+     m_flipDropped = m_flipDropped || m_active;
+@@ -452,6 +472,9 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     else
+     {
+       CLog::LogF(LOGERROR, "atomic commit failed: {}", strerror(error));
++      // (Hades: the outputs that it turned off stay on: asked for again later)
++      if (othersOff)
++        OtherOutputsOffRefused(error);
+       // not when the driver was only busy with the commit before this one
+       if (error != EBUSY && tells)
+       {
+@@ -485,71 +508,204 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   return true;
+ }
+ 
+-bool CDRMAtomic::DisableOtherOutputs(int& flags)
++CDRMAtomic::OtherOutputsOff CDRMAtomic::AddOtherOutputsOff(const AddFunction& add,
++                                                           const CDRMCrtc* except,
++                                                           const CDRMConnector* exceptConnector,
++                                                           const CDRMConnector* leaving,
++                                                           KEEP_OUTPUTS::KeepMode mode) const
+ {
+-  int disabled = 0;
+-  int keptOn = 0;
++  using KEEP_OUTPUTS::KeepMode;
++  OtherOutputsOff result;
+   for (const auto& crtc : GetCrtcs())
+   {
+-    if (crtc.get() == m_crtc || crtc->GetPropertyValue("ACTIVE").value_or(0) == 0)
++    if (crtc.get() == except || crtc->GetPropertyValue("ACTIVE").value_or(0) == 0)
+       continue;
+     const uint64_t id = crtc->GetId();
+ 
+-    // Hades: an output that the user keeps on (hades-keep-outputs) stays lit with nothing on it,
+-    // black, which is how Kodi left its unused outputs before this build turned them off: the
+-    // sound of a receiver or a sound bar on it goes on, which needs the output on. Its planes
+-    // are detached, but not where the driver needs one to keep a CRTC on (QUIRK_NEEDSPRIMARY);
+-    // its CRTC, mode and connector are not touched.
+-    if (KeepsAnyOutputOn() &&
+-        std::ranges::any_of(
+-            GetConnectors(), [this, id](const auto& connector)
+-            { return connector.get() != m_connector &&
+-                     connector->GetPropertyValue("CRTC_ID").value_or(0) == id &&
+-                     KeepsOutputOn(GetNode(), connector->GetName()); }))
++    // Hades: an output that the user keeps on (hades-keep-outputs) stays lit, for the sound of a
++    // receiver or a sound bar on it, which needs the output on: with nothing on it, black, which
++    // is how Kodi left its unused outputs before this build turned them off; or, where the driver
++    // does not take that, as it was. Its CRTC, mode and connector are not touched.
++    std::vector<std::string> kept;
++    if (KeepsAnyOutputOn())
++    {
++      for (const auto& connector : GetConnectors())
++      {
++        if (connector.get() != exceptConnector && connector.get() != leaving &&
++            connector->GetPropertyValue("CRTC_ID").value_or(0) == id &&
++            KeepsOutputOn(GetNode(), connector->GetName()))
++          kept.emplace_back(connector->GetName());
++      }
++    }
++    if (!kept.empty() && mode != KeepMode::OFF)
+     {
+-      if (!HasQuirk(QUIRK_NEEDSPRIMARY))
++      if (mode == KeepMode::DETACHED)
+       {
+         for (const auto& plane : m_planes)
+         {
+           if (plane->GetPropertyValue("CRTC_ID").value_or(0) == id)
+           {
+-            AddProperty(plane.get(), "CRTC_ID", 0);
+-            AddProperty(plane.get(), "FB_ID", 0);
++            add(plane.get(), "CRTC_ID", 0);
++            add(plane.get(), "FB_ID", 0);
++            result.changes = true;
+           }
+         }
+       }
+-      ++keptOn;
++      result.kept.insert(result.kept.end(), kept.begin(), kept.end());
+       continue;
+     }
++    result.keptOff.insert(result.keptOff.end(), kept.begin(), kept.end());
+ 
+     for (const auto& plane : m_planes)
+     {
+       if (plane->GetPropertyValue("CRTC_ID").value_or(0) == id)
+       {
+-        AddProperty(plane.get(), "CRTC_ID", 0);
+-        AddProperty(plane.get(), "FB_ID", 0);
++        add(plane.get(), "CRTC_ID", 0);
++        add(plane.get(), "FB_ID", 0);
+       }
+     }
+     for (const auto& connector : GetConnectors())
+     {
+-      if (connector.get() != m_connector &&
++      if (connector.get() != exceptConnector &&
+           connector->GetPropertyValue("CRTC_ID").value_or(0) == id)
+-        AddProperty(connector.get(), "CRTC_ID", 0);
++        add(connector.get(), "CRTC_ID", 0);
++    }
++    add(crtc.get(), "ACTIVE", 0);
++    add(crtc.get(), "MODE_ID", 0);
++    result.off++;
++    result.changes = true;
++  }
++  return result;
++}
++
++bool CDRMAtomic::DisableOtherOutputs(int& flags, std::optional<KEEP_OUTPUTS::KeepMode> mode)
++{
++  using KEEP_OUTPUTS::KeepMode;
++  const AddFunction nothing = [](CDRMObject*, const char*, uint64_t) {};
++  // (Hades: in the commit of a move, the output that Kodi leaves goes off as it always did; and
++  // what the driver said of the last way it did not take, there as TestOutputMove() heard it)
++  const bool inMove = mode.has_value();
++  const CDRMConnector* leaving = inMove ? m_moveFrom : nullptr;
++  int refusedError = inMove ? m_moveKeepError : 0;
++
++  // Hades: where an output is kept on, how it can be left is asked of the driver first, in a
++  // request of its own, so that a way that the driver does not take neither goes out with the
++  // frame nor keeps the other outputs on (KEEP_OUTPUTS::KeepMode). Without one, the request is
++  // what it always was, and is asked with the frame.
++  if (!mode)
++  {
++    if (AddOtherOutputsOff(nothing, m_crtc, m_connector, nullptr, KeepMode::UNTOUCHED).kept.empty())
++      mode = KeepMode::OFF;
++    else
++    {
++      mode = KEEP_OUTPUTS::FirstTaken(
++          HasQuirk(QUIRK_NEEDSPRIMARY),
++          [this, &refusedError](KeepMode way)
++          {
++            CDRMAtomicRequest request;
++            bool made = true;
++            const OtherOutputsOff asked = AddOtherOutputsOff(
++                [&request, &made](CDRMObject* object, const char* name, uint64_t value)
++                { made = request.AddProperty(object, name, value) && made; }, m_crtc, m_connector,
++                nullptr, way);
++            if (!made)
++            {
++              refusedError = EINVAL;
++              return false;
++            }
++            if (!asked.changes)
++              return true;
++            if (drmModeAtomicCommit(m_fd, request.Get(),
++                                    DRM_MODE_ATOMIC_TEST_ONLY |
++                                        (asked.off > 0 ? DRM_MODE_ATOMIC_ALLOW_MODESET : 0),
++                                    nullptr) == 0)
++              return true;
++            refusedError = errno;
++            return false;
++          });
++      if (!mode)
++      {
++        // (the other outputs are asked again later: nothing of it goes out with this frame)
++        const OtherOutputsOff all =
++            AddOtherOutputsOff(nothing, m_crtc, m_connector, nullptr, KeepMode::OFF);
++        CLog::LogF(LOGWARNING,
++                   "the driver refused turning off {} output(s) not used by Kodi, also with {} "
++                   "that hades-keep-outputs keeps on ({})",
++                   all.off, StringUtils::Join(all.keptOff, ", "), strerror(refusedError));
++        OtherOutputsOffRefused(refusedError);
++        return false;
++      }
+     }
+-    AddProperty(crtc.get(), "ACTIVE", 0);
+-    AddProperty(crtc.get(), "MODE_ID", 0);
+-    disabled++;
+   }
+-  if (disabled > 0)
++
++  const OtherOutputsOff done = AddOtherOutputsOff(
++      [this](CDRMObject* object, const char* name, uint64_t value)
++      { AddProperty(object, name, value); }, m_crtc, m_connector, leaving, *mode);
++  if (done.off > 0)
+   {
+     flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
++    CLog::LogF(LOGINFO, "turning off {} output(s) not used by Kodi", done.off);
++  }
++  if (done.changes)
+     flags &= ~DRM_MODE_ATOMIC_NONBLOCK;
+-    CLog::LogF(LOGINFO, "turning off {} output(s) not used by Kodi", disabled);
++  LogKeptOutputs(done, *mode, refusedError);
++  return done.changes;
++}
++
++void CDRMAtomic::LogKeptOutputs(const OtherOutputsOff& done,
++                                KEEP_OUTPUTS::KeepMode mode,
++                                int refusedError)
++{
++  using KEEP_OUTPUTS::KeepMode;
++  std::string text;
++  if (!done.kept.empty())
++  {
++    const std::string names = StringUtils::Join(done.kept, ", ");
++    if (mode == KeepMode::DETACHED)
++      text = fmt::format("{} stay(s) on, black, for its sound (hades-keep-outputs)", names);
++    else if (HasQuirk(QUIRK_NEEDSPRIMARY))
++      text = fmt::format("{} stay(s) on as it was, with what it showed, for its sound "
++                         "(hades-keep-outputs; the driver needs a plane on a CRTC that is on)",
++                         names);
++    else if (refusedError != 0)
++      text = fmt::format("{} stay(s) on as it was, with what it showed, for its sound "
++                         "(hades-keep-outputs; the driver did not take it on with nothing on it: "
++                         "{})",
++                         names, strerror(refusedError));
++    else
++      text = fmt::format("{} stay(s) on as it was, with what it showed, for its sound "
++                         "(hades-keep-outputs)",
++                         names);
++  }
++  if (!done.keptOff.empty())
++    text += fmt::format("{}{} go(es) off although hades-keep-outputs keeps it on: the driver "
++                        "would take turning off the outputs Kodi does not use only with it ({})",
++                        text.empty() ? "" : "; ", StringUtils::Join(done.keptOff, ", "),
++                        refusedError != 0 ? strerror(refusedError) : "no other way was asked");
++  if (text.empty() || text == m_keptLogged)
++    return;
++  m_keptLogged = text;
++  CLog::LogF(done.keptOff.empty() ? LOGINFO : LOGWARNING, "{}", text);
++}
++
++void CDRMAtomic::OtherOutputsOffRefused(int error)
++{
++  // (a mode that comes asks again on its own: the count is of the one the outputs went off with)
++  constexpr int tries = 3;
++  constexpr auto later = std::chrono::seconds(10);
++  if (++m_otherOutputsTries < tries)
++  {
++    m_otherOutputsOff = std::chrono::steady_clock::now() + later;
++    CLog::LogF(LOGWARNING,
++               "the commit that turns off the outputs not used by Kodi was refused ({}): it is "
++               "asked for again in {} s",
++               strerror(error), later.count());
+   }
+-  if (keptOn > 0)
+-    CLog::LogF(LOGINFO, "{} output(s) stay on, black, for their sound (hades-keep-outputs)",
+-               keptOn);
+-  return disabled > 0;
++  else
++    CLog::LogF(LOGWARNING,
++               "the commit that turns off the outputs not used by Kodi was refused {} times ({}): "
++               "they stay on",
++               tries, strerror(error));
+ }
+ 
+ void CDRMAtomic::FinishRequest(bool accepted)
+@@ -703,19 +859,34 @@ bool CDRMAtomic::TestOutputMove(const OutputMove& move, struct gbm_bo* bo, std::
+   }
+ 
+   // What the commit of the move carries (DrmAtomicCommit()), in its order: a property named twice
+-  // goes with the value it was added with last
+-  CDRMAtomicRequest request;
+-  bool made = true;
+-  const auto add = [&request, &made](CDRMObject* object, const char* name, uint64_t value)
+-  { made = made && request.AddProperty(object, name, value); };
+-  // every other CRTC that is on goes off, with its planes and its outputs (DisableOtherOutputs())
+-  for (const auto& crtc : GetCrtcs())
++  // goes with the value it was added with last. (Hades: once for each way of leaving an output that
++  // the user keeps on, in the order of KEEP_OUTPUTS::KeepModes(), where there is one: the commit
++  // of the move then goes with the first one that the driver takes, as DisableOtherOutputs() is
++  // told; a move is never refused for an output kept on, which goes off as it did without the
++  // file where the driver takes the move only so.)
++  using KEEP_OUTPUTS::KeepMode;
++  const auto nothing = [](CDRMObject*, const char*, uint64_t) {};
++  const bool keeps =
++      !AddOtherOutputsOff(nothing, move.crtc, move.connector, m_connector, KeepMode::UNTOUCHED)
++           .kept.empty();
++  m_moveKeepMode.reset();
++  m_moveKeepError = 0;
++  int refused = 0;
++  const auto asks = [&](KeepMode way) -> bool
+   {
+-    if (crtc.get() == move.crtc || crtc->GetPropertyValue("ACTIVE").value_or(0) == 0)
+-      continue;
++    CDRMAtomicRequest request;
++    bool made = true;
++    const auto add = [&request, &made](CDRMObject* object, const char* name, uint64_t value)
++    { made = made && request.AddProperty(object, name, value); };
++    // every other CRTC that is on goes off, with its planes and its outputs (DisableOtherOutputs())
++    AddOtherOutputsOff(add, move.crtc, move.connector, m_connector, way);
++    // the output in use leaves its CRTC, and the planes of the CRTC of the move but its own go off,
++    // and the outputs that it feeds but the one Kodi moves to (one that fed another display)
++    add(m_connector, "CRTC_ID", 0);
+     for (const auto& plane : m_planes)
+     {
+-      if (plane->GetPropertyValue("CRTC_ID").value_or(0) == crtc->GetId())
++      if (plane.get() != move.plane &&
++          plane->GetPropertyValue("CRTC_ID").value_or(0) == move.crtc->GetId())
+       {
+         add(plane.get(), "CRTC_ID", 0);
+         add(plane.get(), "FB_ID", 0);
+@@ -724,56 +895,49 @@ bool CDRMAtomic::TestOutputMove(const OutputMove& move, struct gbm_bo* bo, std::
+     for (const auto& connector : GetConnectors())
+     {
+       if (connector.get() != move.connector &&
+-          connector->GetPropertyValue("CRTC_ID").value_or(0) == crtc->GetId())
++          connector->GetPropertyValue("CRTC_ID").value_or(0) == move.crtc->GetId())
+         add(connector.get(), "CRTC_ID", 0);
+     }
+-    add(crtc.get(), "ACTIVE", 0);
+-    add(crtc.get(), "MODE_ID", 0);
+-  }
+-  // the output in use leaves its CRTC, and the planes of the CRTC of the move but its own go off,
+-  // and the outputs that it feeds but the one Kodi moves to (one that fed another display)
+-  add(m_connector, "CRTC_ID", 0);
+-  for (const auto& plane : m_planes)
+-  {
+-    if (plane.get() != move.plane &&
+-        plane->GetPropertyValue("CRTC_ID").value_or(0) == move.crtc->GetId())
++    // the output it moves to, in the mode of its display, and the buffer on its plane
++    add(move.connector, "CRTC_ID", move.crtc->GetCrtcId());
++    add(move.crtc, "MODE_ID", mode.Get());
++    add(move.crtc, "ACTIVE", 1);
++    add(move.plane, "FB_ID", fb->fb_id);
++    add(move.plane, "CRTC_ID", move.crtc->GetCrtcId());
++    add(move.plane, "SRC_X", 0);
++    add(move.plane, "SRC_Y", 0);
++    add(move.plane, "SRC_W", static_cast<uint64_t>(move.width) << 16);
++    add(move.plane, "SRC_H", static_cast<uint64_t>(move.height) << 16);
++    add(move.plane, "CRTC_X", 0);
++    add(move.plane, "CRTC_Y", 0);
++    add(move.plane, "CRTC_W", move.mode.hdisplay);
++    add(move.plane, "CRTC_H", move.mode.vdisplay);
++    if (!made)
+     {
+-      add(plane.get(), "CRTC_ID", 0);
+-      add(plane.get(), "FB_ID", 0);
++      why = "the request could not be made";
++      refused = EINVAL;
++      return false;
+     }
+-  }
+-  for (const auto& connector : GetConnectors())
+-  {
+-    if (connector.get() != move.connector &&
+-        connector->GetPropertyValue("CRTC_ID").value_or(0) == move.crtc->GetId())
+-      add(connector.get(), "CRTC_ID", 0);
+-  }
+-  // the output it moves to, in the mode of its display, and the buffer on its plane
+-  add(move.connector, "CRTC_ID", move.crtc->GetCrtcId());
+-  add(move.crtc, "MODE_ID", mode.Get());
+-  add(move.crtc, "ACTIVE", 1);
+-  add(move.plane, "FB_ID", fb->fb_id);
+-  add(move.plane, "CRTC_ID", move.crtc->GetCrtcId());
+-  add(move.plane, "SRC_X", 0);
+-  add(move.plane, "SRC_Y", 0);
+-  add(move.plane, "SRC_W", static_cast<uint64_t>(move.width) << 16);
+-  add(move.plane, "SRC_H", static_cast<uint64_t>(move.height) << 16);
+-  add(move.plane, "CRTC_X", 0);
+-  add(move.plane, "CRTC_Y", 0);
+-  add(move.plane, "CRTC_W", move.mode.hdisplay);
+-  add(move.plane, "CRTC_H", move.mode.vdisplay);
+-  if (!made)
+-  {
+-    why = "the request could not be made";
+-    return false;
+-  }
+ 
+-  if (drmModeAtomicCommit(m_fd, request.Get(),
+-                          DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) != 0)
+-  {
+-    why = std::string("the driver would not take it: ") + strerror(errno);
++    if (drmModeAtomicCommit(m_fd, request.Get(),
++                            DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET,
++                            nullptr) != 0)
++    {
++      refused = errno;
++      why = std::string("the driver would not take it: ") + strerror(refused);
++      return false;
++    }
++    return true;
++  };
++
++  if (!keeps)
++    return asks(KeepMode::OFF);
++  const std::optional<KeepMode> way = KEEP_OUTPUTS::FirstTaken(HasQuirk(QUIRK_NEEDSPRIMARY), asks);
++  if (!way)
+     return false;
+-  }
++  // (what the driver said of the ways before the one it took, for the log of the move)
++  m_moveKeepMode = way;
++  m_moveKeepError = refused;
+   return true;
+ }
+ 
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index a9a3845..d7ee305 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "DRMCommittedMode.h"
++#include "DRMKeepOutputs.h"
+ #include "DRMModesetRetry.h"
+ #include "DRMUtils.h"
+ #include "DVFrameTest.h"
+@@ -18,6 +19,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -177,7 +179,35 @@ private:
+                        bool strict = false);
+   void FinishRequest(bool accepted);
+   //! \return whether there was an output to turn off: the commit then carries that too
+-  bool DisableOtherOutputs(int& flags);
++  //! \param mode (Hades) how an output that the user keeps on is left (KEEP_OUTPUTS::KeepMode):
++  //! the one that TestOutputMove() found, in the commit of a move; none otherwise, and it is then
++  //! asked of the driver first, in a request of its own
++  bool DisableOtherOutputs(int& flags, std::optional<KEEP_OUTPUTS::KeepMode> mode = std::nullopt);
++  //! Hades: what turning off the outputs that Kodi does not use asks for (AddOtherOutputsOff())
++  struct OtherOutputsOff
++  {
++    int off{0}; //!< CRTCs that go off
++    bool changes{false}; //!< whether anything is asked at all
++    std::vector<std::string> kept; //!< outputs the user keeps on that stay on
++    std::vector<std::string> keptOff; //!< outputs the user keeps on that go off (KeepMode::OFF)
++  };
++  using AddFunction = std::function<void(CDRMObject*, const char*, uint64_t)>;
++  /*!
++   * \brief Hades: gives add what turns off the outputs that Kodi does not use: every CRTC that is
++   *        on but except, with its planes and the outputs on it but exceptConnector. A CRTC that
++   *        drives an output that the user keeps on (hades-keep-outputs) is left as mode says.
++   * \param leaving the output that Kodi leaves in a move, which is never one kept on (nullptr)
++   */
++  OtherOutputsOff AddOtherOutputsOff(const AddFunction& add,
++                                     const CDRMCrtc* except,
++                                     const CDRMConnector* exceptConnector,
++                                     const CDRMConnector* leaving,
++                                     KEEP_OUTPUTS::KeepMode mode) const;
++  //! Hades: the commit that carried the turning off of those outputs was refused: it is asked for
++  //! again a while later, three times at most for a mode
++  void OtherOutputsOffRefused(int error);
++  //! Hades: says what became of the outputs the user keeps on, when it is not what it said last
++  void LogKeptOutputs(const OtherOutputsOff& done, KEEP_OUTPUTS::KeepMode mode, int refusedError);
+   void LogDVFailure(const char* stage, int error);
+   //! A transport commit was refused: what the driver said of it is kept for DVRefused()
+   void KeepDVRefused();
+@@ -216,6 +246,15 @@ private:
+   int m_refusedFlags = 0;
+   //! When to turn off the outputs Kodi does not use (a second monitor)
+   std::optional<std::chrono::steady_clock::time_point> m_otherOutputsOff;
++  //! Hades: how many commits that turned them off were refused since the last mode
++  //! (OtherOutputsOffRefused())
++  int m_otherOutputsTries{0};
++  //! Hades: how the next move leaves the outputs the user keeps on, as TestOutputMove() found that
++  //! the driver takes it
++  std::optional<KEEP_OUTPUTS::KeepMode> m_moveKeepMode;
++  int m_moveKeepError{0}; //!< Hades: what the driver said of the last way it did not take there
++  //! Hades: what LogKeptOutputs() said last
++  std::string m_keptLogged;
+ 
+   class CDRMAtomicRequest
+   {
+diff --git a/xbmc/windowing/gbm/drm/DRMKeepOutputs.h b/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
+index 8a46b02..06cbd12 100644
+--- a/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
++++ b/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
+@@ -1,5 +1,6 @@
+ /*
+  *  Copyright (C) 2026 harment
++ *  Copyright (C) 2026 Hades
+  *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
+  *
+  *  SPDX-License-Identifier: GPL-2.0-or-later
+@@ -10,8 +11,11 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdint>
+ #include <istream>
++#include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ namespace KODI
+@@ -100,6 +104,34 @@ public:
+     return slash == std::string::npos ? node : node.substr(slash + 1);
+   }
+ 
++  /*!
++   * \brief Hades: the entries that name none of the outputs that were looked at, in the order of
++   *        the file, for the log: a name with a typing error, or of an output that is not there
++   *        ("*" names any output, and is in the list only when no output was looked at)
++   * \param seen the outputs, as (node of the device, name of the output): those of the device
++   *        that Kodi uses and of each other one that drives a display
++   */
++  std::vector<std::string> Unmatched(
++      const std::vector<std::pair<std::string, std::string>>& seen) const
++  {
++    std::vector<std::string> unmatched;
++    if (m_all && seen.empty())
++      unmatched.emplace_back("*");
++    for (const std::string& entry : m_entries)
++    {
++      const bool named = std::ranges::any_of(
++          seen,
++          [&entry](const auto& output)
++          {
++            const std::string name = Lower(output.second);
++            return entry == name || entry == Lower(CardOfNode(output.first)) + "-" + name;
++          });
++      if (!named && std::ranges::find(unmatched, entry) == unmatched.end())
++        unmatched.emplace_back(entry);
++    }
++    return unmatched;
++  }
++
+ private:
+   static std::string Trim(const std::string& text)
+   {
+@@ -120,6 +152,59 @@ private:
+   std::vector<std::string> m_entries;
+ };
+ 
++/*!
++ * \brief Hades: how an output of the device that Kodi uses, which the user keeps on, is left by the
++ *        commit that turns the other outputs off (CDRMAtomic::DisableOtherOutputs())
++ *
++ * Read in the drivers (Linux 7.3.1, nvidia-open 615.78.08): amdgpu refuses a CRTC that is on
++ * without its primary plane (amdgpu_dm_crtc_helper_atomic_check(): "Can't enable a CRTC without
++ * enabling the primary plane"), which Kodi knows as QUIRK_NEEDSPRIMARY; i915 and xe (the same
++ * display code) keep a pipe on with no plane, black; nvidia-drm asks nothing of the planes of a
++ * CRTC (nv_drm_crtc_atomic_check()) and gives NVKMS a layer without a surface as disabled. What a
++ * driver takes is asked of it all the same, in a commit that only asks (TEST_ONLY), in the order
++ * of KeepModes().
++ */
++enum class KeepMode
++{
++  DETACHED, //!< on, with its planes detached: black
++  UNTOUCHED, //!< on, as it was: it shows what it showed (the console)
++  OFF, //!< off, as without the file
++};
++
++//! \brief Hades: the ways to ask the driver for, in that order: black, where the driver can keep
++//! a CRTC on with no plane on it (not where it needs a primary plane); then as it was; then off,
++//! as without the file, so that the other outputs never stay on because one is kept
++inline std::vector<KeepMode> KeepModes(bool needsPrimary)
++{
++  if (needsPrimary)
++    return {KeepMode::UNTOUCHED, KeepMode::OFF};
++  return {KeepMode::DETACHED, KeepMode::UNTOUCHED, KeepMode::OFF};
++}
++
++//! \brief Hades: the first of KeepModes() that takes() says the driver takes; none when it takes
++//! none of them
++template<typename Takes>
++std::optional<KeepMode> FirstTaken(bool needsPrimary, Takes&& takes)
++{
++  for (const KeepMode mode : KeepModes(needsPrimary))
++  {
++    if (takes(mode))
++      return mode;
++  }
++  return std::nullopt;
++}
++
++//! \brief Hades: the CRTC that drives an output of another graphics device: the one its atomic
++//! state names (its property CRTC_ID), where the driver tells it, which is what the driver itself
++//! goes by; else the one of its encoder (legacy, and 0 where a driver leaves encoder_id 0);
++//! 0 when it drives none
++inline uint32_t CrtcOfOutput(std::optional<uint64_t> atomicCrtc, uint32_t encoderCrtc)
++{
++  if (atomicCrtc)
++    return static_cast<uint32_t>(*atomicCrtc);
++  return encoderCrtc;
++}
++
+ } // namespace KEEP_OUTPUTS
+ } // namespace GBM
+ } // namespace WINDOWING
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index f99efc7..68d62e1 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -23,7 +23,9 @@
+ #include "PlatformDefs.h"
+ #include "filesystem/SpecialProtocol.h"
+ 
++#include <cstring>
+ #include <fstream>
++#include <map>
+ #include <set>
+ #include <stdexcept>
+ 
+@@ -54,6 +56,26 @@ const KEEP_OUTPUTS::CKeepOutputs& KeptOutputs()
+   return kept;
+ }
+ 
++// Hades: the CRTC that the atomic state of a connector names (its property CRTC_ID), on a handle
++// that asked for atomic modesetting; none where the driver does not have that property
++std::optional<uint64_t> AtomicCrtcOf(int fd, uint32_t connectorId)
++{
++  drmModeObjectPropertiesPtr properties =
++      drmModeObjectGetProperties(fd, connectorId, DRM_MODE_OBJECT_CONNECTOR);
++  if (!properties)
++    return std::nullopt;
++  std::optional<uint64_t> crtc;
++  for (uint32_t i = 0; i < properties->count_props && !crtc; i++)
++  {
++    drmModePropertyPtr property = drmModeGetProperty(fd, properties->props[i]);
++    if (property && strcmp(property->name, "CRTC_ID") == 0)
++      crtc = properties->prop_values[i];
++    drmModeFreeProperty(property);
++  }
++  drmModeFreeObjectProperties(properties);
++  return crtc;
++}
++
+ // DRMStereo.h has the values of drm_mode.h without including it
+ static_assert(STEREO::FLAG_INTERLACE == DRM_MODE_FLAG_INTERLACE);
+ static_assert(STEREO::FLAG_DBLSCAN == DRM_MODE_FLAG_DBLSCAN);
+@@ -1289,6 +1311,39 @@ bool CDRMUtils::KeepsOutputOn(const std::string& node, const std::string& connec
+   return KeptOutputs().Keeps(node, connector);
+ }
+ 
++void CDRMUtils::ReportKeptOutputs()
++{
++  if (m_keepReported || !KeepsAnyOutputOn())
++    return;
++  m_keepReported = true;
++
++  // (the outputs of this device, and those of the other ones that DisableOtherDevices() looked at)
++  std::vector<std::pair<std::string, std::string>> seen = std::move(m_keepSeen);
++  m_keepSeen.clear();
++  for (const auto& connector : m_connectors)
++  {
++    const std::string name = connector->GetName();
++    seen.emplace_back(m_node, name);
++    if (connector.get() != m_connector && KeepsOutputOn(m_node, name) &&
++        connector->GetPropertyValue("CRTC_ID").value_or(0) == 0)
++      CLog::LogF(LOGINFO, "{}: {} (hades-keep-outputs) drives nothing now ({}): nothing to keep on",
++                 m_node, name, connector->IsConnected() ? "connected" : "nothing connected");
++  }
++
++  const std::vector<std::string> unmatched = KeptOutputs().Unmatched(seen);
++  if (unmatched.empty())
++    return;
++  std::string outputs;
++  for (const auto& [node, name] : seen)
++    outputs +=
++        (outputs.empty() ? "" : ", ") + KEEP_OUTPUTS::CKeepOutputs::CardOfNode(node) + "-" + name;
++  for (const std::string& entry : unmatched)
++    CLog::LogF(LOGWARNING,
++               "hades-keep-outputs: \"{}\" names none of the outputs of the graphics devices that "
++               "drive a display ({}): nothing is kept on for it",
++               entry, outputs.empty() ? "none" : outputs);
++}
++
+ void CDRMUtils::DisableOtherDevices()
+ {
+   for (const std::string& node : m_otherDeviceNodes)
+@@ -1305,15 +1360,23 @@ void CDRMUtils::DisableOtherDevices()
+     int off = 0;
+     int kept = 0;
+     int byUser = 0; // Hades: outputs left on because the user keeps them on (hades-keep-outputs)
++    std::string keptOn; // (Hades: their names, for the log)
+     int refused = 0; // why the driver refused, the last time it did
+     if (drmModeResPtr resources = drmModeGetResources(fd))
+     {
+       // Hades: the CRTCs that drive an output the user keeps on. Only asked when the user keeps
+       // any, so that nothing is read from the device otherwise: the question is of the state
+       // that the driver already has (drmModeGetConnectorCurrent() does not probe the display).
++      // (Hades: the CRTC of such an output is the one that its atomic state names, as the driver
++      // tells it to a client that asks for atomic modesetting, which takes nothing else of this
++      // handle: the outputs are turned off below with the legacy call as before. Where the
++      // driver has no atomic modesetting, the CRTC of the encoder of the output, which a driver
++      // may leave unnamed: the output is then said not to be kept, KEEP_OUTPUTS::CrtcOfOutput().)
+       std::set<uint32_t> keep;
++      std::map<uint32_t, std::string> keptNames;
+       if (KeepsAnyOutputOn())
+       {
++        const bool atomic = drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0;
+         for (int i = 0; i < resources->count_connectors; i++)
+         {
+           drmModeConnectorPtr connector = drmModeGetConnectorCurrent(fd, resources->connectors[i]);
+@@ -1322,14 +1385,36 @@ void CDRMUtils::DisableOtherDevices()
+           const char* type = drmModeGetConnectorTypeName(connector->connector_type);
+           const std::string name =
+               std::string(type ? type : "unknown") + "-" + std::to_string(connector->connector_type_id);
+-          if (connector->encoder_id != 0 && KeepsOutputOn(node, name))
++          m_keepSeen.emplace_back(node, name);
++          if (KeepsOutputOn(node, name))
+           {
+-            if (drmModeEncoderPtr encoder = drmModeGetEncoder(fd, connector->encoder_id))
++            const std::optional<uint64_t> atomicCrtc =
++                atomic ? AtomicCrtcOf(fd, connector->connector_id) : std::nullopt;
++            uint32_t encoderCrtc = 0;
++            if (!atomicCrtc && connector->encoder_id != 0)
++            {
++              if (drmModeEncoderPtr encoder = drmModeGetEncoder(fd, connector->encoder_id))
++              {
++                encoderCrtc = encoder->crtc_id;
++                drmModeFreeEncoder(encoder);
++              }
++            }
++            const uint32_t crtc = KEEP_OUTPUTS::CrtcOfOutput(atomicCrtc, encoderCrtc);
++            if (crtc != 0)
+             {
+-              if (encoder->crtc_id != 0)
+-                keep.insert(encoder->crtc_id);
+-              drmModeFreeEncoder(encoder);
++              keep.insert(crtc);
++              keptNames[crtc] += (keptNames[crtc].empty() ? "" : ", ") + name;
+             }
++            else
++              CLog::LogF(LOGINFO,
++                         "{}: {} (hades-keep-outputs) drives nothing now ({}, {}): nothing to "
++                         "keep on",
++                         node, name,
++                         connector->connection == DRM_MODE_CONNECTED ? "connected"
++                                                                     : "nothing connected",
++                         atomicCrtc ? "no CRTC in its atomic state"
++                                    : (atomic ? "the driver does not tell its CRTC"
++                                              : "no CRTC through its encoder"));
+           }
+           drmModeFreeConnector(connector);
+         }
+@@ -1347,6 +1432,7 @@ void CDRMUtils::DisableOtherDevices()
+         if (keep.count(resources->crtcs[i]) != 0)
+         {
+           ++byUser;
++          keptOn += (keptOn.empty() ? "" : ", ") + keptNames[resources->crtcs[i]];
+           continue;
+         }
+ 
+@@ -1365,8 +1451,8 @@ void CDRMUtils::DisableOtherDevices()
+     }
+ 
+     if (byUser > 0)
+-      CLog::LogF(LOGINFO, "{}: {} output(s) stay on for their sound (hades-keep-outputs)", node,
+-                 byUser);
++      CLog::LogF(LOGINFO, "{}: {} stay(s) on as it was, for its sound (hades-keep-outputs)", node,
++                 keptOn);
+ 
+     if (off > 0 || byUser > 0)
+     {
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index e7dad60..324b890 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -317,6 +317,14 @@ protected:
+   //! Hades: whether the user keeps this output on for its sound. \param node the device
+   //! ("/dev/dri/card1"), \param connector the name of the output ("DP-1")
+   static bool KeepsOutputOn(const std::string& node, const std::string& connector);
++  //! Hades: says, once, which entries of hades-keep-outputs name none of the outputs of this
++  //! device and of those that DisableOtherDevices() looked at, and which outputs of this device
++  //! that it names drive nothing (DisableOtherOutputs() says what became of the others)
++  void ReportKeptOutputs();
++  //! Hades: the outputs of the other devices that DisableOtherDevices() looked at, as (node,
++  //! name), for ReportKeptOutputs()
++  std::vector<std::pair<std::string, std::string>> m_keepSeen;
++  bool m_keepReported{false}; //!< Hades: see ReportKeptOutputs()
+ 
+   int m_fd{-1};
+   CDRMConnector* m_connector{nullptr};
+-- 
+2.53.0
+

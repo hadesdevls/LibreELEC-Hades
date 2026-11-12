@@ -15,8 +15,11 @@ namespace Hades.Installer
     sealed class ConfirmForm : Form
     {
         readonly TextBox box = new TextBox();
-        readonly Button ok = new Button(), cancel = new Button();
+        readonly PillButton ok = new PillButton(), cancel = new PillButton();
         readonly Label what = new Label();
+        readonly Panel top = new Panel();
+        readonly string banner;
+        readonly bool danger;
 
         // word: what has to be typed before the button of the action can be pressed. null: nothing is typed
         // (a second question about something that was confirmed that way already), and it is Cancel that
@@ -24,48 +27,90 @@ namespace Hades.Installer
         public ConfirmForm(string banner, bool danger, string details, string word, string action)
         {
             bool typed = word != null;
+            this.banner = banner;
+            this.danger = danger;
             Text = L.T("Confirm", "Confirmar");
-            Font = new Font("Segoe UI", 9.75f);
+            Font = Ui.F(13f);
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = MinimizeBox = false;
+            ShowIcon = false;
             StartPosition = FormStartPosition.CenterParent;
-            // as tall as what it has to say (and without the room of what is not typed)
-            int more = Math.Max(0, TextRenderer.MeasureText(details, Font, new Size(492, 0), TextFormatFlags.WordBreak).Height + 10 - 156);
-            if (!typed) more -= 62;
-            ClientSize = new Size(540, 350 + more);
-            AutoScaleMode = AutoScaleMode.Font;
+            AutoScaleMode = AutoScaleMode.None;
+            int width = 560, inner = width - 48;
+            // as tall as what it has to say
+            int say = TextRenderer.MeasureText(details, Font, new Size(Ui.S(inner), 0), TextFormatFlags.WordBreak).Height;
+            say = Math.Max(Ui.S(60), say + Ui.S(6));
+            int y = Ui.S(56 + 18);
+            ClientSize = new Size(Ui.S(width), y + say + (typed ? Ui.S(14 + 24 + 4 + 30) : 0) + Ui.S(18 + 40 + 22));
 
-            var top = new Label();
-            top.Text = banner;
-            top.Font = new Font("Segoe UI Semibold", 12f);
-            top.ForeColor = Color.White;
-            top.BackColor = danger ? Color.FromArgb(176, 32, 32) : Color.FromArgb(34, 108, 214);
-            top.TextAlign = ContentAlignment.MiddleCenter;
-            top.Dock = DockStyle.Top;
-            top.Height = 54;
+            top.SetBounds(0, 0, Ui.S(width), Ui.S(56));
+            top.BackColor = danger ? Color.FromArgb(150, 28, 30) : Ui.Ink;
+            top.Paint += PaintBanner;
 
             what.Text = details;
-            what.SetBounds(24, 68, 492, 156 + more + (typed ? 0 : 62));
+            what.ForeColor = Ui.Text;
+            what.SetBounds(Ui.S(24), y, Ui.S(inner), say);
+            y += say;
 
             var ask = new Label();
             ask.Text = L.T("To continue, type ", "Para continuar, escribe ") + word + ":";
-            ask.SetBounds(24, 228 + more, 492, 24);
-            box.SetBounds(24, 254 + more, 200, 28);
+            ask.Font = Ui.F(13f, "semi");
+            ask.SetBounds(Ui.S(24), y + Ui.S(14), Ui.S(inner), Ui.S(24));
+            box.Font = Ui.F(15f);
+            box.BackColor = Ui.Field;
+            box.ForeColor = Ui.Text;
+            box.SetBounds(Ui.S(24), y + Ui.S(14 + 28), Ui.S(220), Ui.S(30));
             box.CharacterCasing = CharacterCasing.Upper;
             box.TextChanged += delegate { ok.Enabled = box.Text.Trim() == word; };
             ask.Visible = box.Visible = typed;
+            if (typed) y += Ui.S(14 + 24 + 4 + 30);
 
+            y += Ui.S(18);
             ok.Text = action;
             ok.Enabled = !typed;
             ok.DialogResult = DialogResult.OK;
-            ok.SetBounds(256, 300 + more, 170, 34);
+            ok.Font = Ui.F(14f, "semi");
+            ok.BackColor = danger ? Ui.Danger : Ui.Primary;
+            ok.ForeColor = danger ? Color.White : Ui.PrimaryText;
+            ok.SetBounds(Ui.S(width - 24 - 108 - 10 - 210), y, Ui.S(210), Ui.S(40));
             cancel.Text = L.T("Cancel", "Cancelar");
             cancel.DialogResult = DialogResult.Cancel;
-            cancel.SetBounds(434, 300 + more, 90, 34);
+            cancel.Font = Ui.F(14f);
+            cancel.Outline = true;
+            cancel.ForeColor = Ui.Text;
+            cancel.SetBounds(Ui.S(width - 24 - 108), y, Ui.S(108), Ui.S(40));
             AcceptButton = typed ? ok : cancel;
             CancelButton = cancel;
             Controls.AddRange(new Control[] { what, ask, box, ok, cancel, top });
             if (!typed) ActiveControl = cancel;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Ui.DarkTitleBar(Handle);
+        }
+
+        void PaintBanner(object sender, PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            if (!danger) Ui.DrawMark(g, Ui.Sf(36), top.Height / 2f, Ui.Sf(11), Ui.Disc, true, false);
+            else
+            {
+                // a triangle with a bar and a point: this one erases
+                float cx = Ui.Sf(36), cy = top.Height / 2f, s = Ui.Sf(13);
+                using (var pen = new Pen(Color.White, Math.Max(1.5f, Ui.Sf(2f))) { LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                {
+                    g.DrawPolygon(pen, new[] { new PointF(cx, cy - s), new PointF(cx + s * 1.15f, cy + s * 0.85f), new PointF(cx - s * 1.15f, cy + s * 0.85f) });
+                    g.DrawLine(pen, cx, cy - s * 0.3f, cx, cy + s * 0.3f);
+                }
+                using (var b = new SolidBrush(Color.White)) g.FillEllipse(b, cx - Ui.Sf(1.3f), cy + s * 0.5f, Ui.Sf(2.6f), Ui.Sf(2.6f));
+            }
+            TextRenderer.DrawText(g, banner, Ui.F(17f, "semi"), new Rectangle(Ui.S(64), 0, top.Width - Ui.S(80), top.Height), Color.White,
+                                  TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
         }
 
         // (for the tests) whether the button of the action can be pressed without typing anything, whether
@@ -135,38 +180,49 @@ namespace Hades.Installer
                 OtherDisksText(plan, false);
         }
 
-        readonly Label title = new Label();
-        readonly Label subtitle = new Label();
+        readonly Panel header = new Panel();     // the band at the top; in direction B the bar at the left
         readonly LinkLabel language = new LinkLabel();
-        readonly Label one, two;
+        readonly StepHead one = new StepHead(), two = new StepHead();
+        readonly Panel line1 = new Panel();
         readonly Label imageLabel = new Label();
-        readonly Button imageButton = new Button();
-        readonly RadioButton usb = new RadioButton();
-        readonly RadioButton inside = new RadioButton();
+        readonly PillButton imageButton = new PillButton();
+        readonly RadioButton usb = new ThemedRadio();
+        readonly RadioButton inside = new ThemedRadio();
+        readonly Panel listFrame = new Panel();
         readonly ListBox list = new ListBox();
         readonly LinkLabel missing = new LinkLabel();
-        readonly Button refresh = new Button();
+        readonly PillButton refresh = new PillButton();
         readonly Panel options = new Panel();
-        readonly Label notice = new Label();
-        readonly RadioButton beside = new RadioButton();
-        readonly RadioButton whole = new RadioButton();
-        readonly Label explain = new Label();
+        readonly Callout notice = new Callout();
+        readonly RadioButton beside = new ThemedRadio();
+        readonly RadioButton whole = new ThemedRadio();
+        readonly Callout explain = new Callout();
         readonly Label volumeLabel = new Label();
         readonly ComboBox volumeBox = new ComboBox();
         readonly Label sizeLabel = new Label();
         readonly NumericUpDown sizeBox = new NumericUpDown();
         readonly Label sizeUnit = new Label();
         readonly LinkLabel remove = new LinkLabel();
-        readonly CheckBox diagnostics = new CheckBox();
-        readonly ProgressBar bar = new ProgressBar();
+        readonly CheckBox diagnostics = new ThemedCheck();
+        readonly SlimBar bar = new SlimBar();
         readonly Label status = new Label();
-        readonly Button go = new Button();
-        readonly Button update = new Button();
+        readonly PillButton go = new PillButton();
+        readonly PillButton update = new PillButton();
         readonly Panel donePanel = new Panel();
-        readonly Label doneText = new Label();
-        readonly Button close = new Button();
+        readonly PillButton close = new PillButton();
+        readonly WorkList stages = new WorkList();
+        bool showSteps;          // the stages are on show instead of the options while a disk is worked on
+        // The panel of "done" is on show. Then what is behind it is not made again, neither for a device that comes or goes
+        // nor for a display of another scale: UpdateState would put back what the panel hides, and the keyboard would reach
+        // it behind the panel. What was skipped is done when the panel goes (HideDone).
+        bool done, doneSkippedDevices, doneSkippedState;
+        readonly List<Control> doneHid = new List<Control>();   // what ShowDone hid, to put back
+        int disksLoaded;         // (for the tests) how many times the list of disks was made
         readonly Timer deviceTimer = new Timer();
         readonly Stopwatch clock = new Stopwatch();
+        readonly int[] stepState = new int[3];  // of the three steps: 0 not yet, 1 now, 2 done
+        readonly string[] stepSub = new string[] { "", "", "" };
+        Icon bigIcon;
 
         string imagePath;
         ImagePlan plan;          // of imagePath; scanned once an internal disk is wanted
@@ -190,154 +246,269 @@ namespace Hades.Installer
 
         public MainForm(string image)
         {
-            Font = new Font("Segoe UI", 9.75f);
-            AutoScaleMode = AutoScaleMode.Font;
+            if (!Ui.FixedScale) Ui.Scale = Ui.SystemScale();
+            Ui.Apply();
+            AutoScaleMode = AutoScaleMode.None;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(760, 688);
-            BackColor = Color.White;
+            BackColor = Ui.Back;
+            ForeColor = Ui.Text;
+            Icon = Ui.AppIcon(true);
 
-            var header = new Panel();
-            header.BackColor = Color.FromArgb(22, 24, 30);
-            header.SetBounds(0, 0, 760, 60);
-            title.Font = new Font("Segoe UI Semibold", 17f);
-            title.ForeColor = Color.White;
-            title.SetBounds(22, 4, 480, 36);
-            subtitle.ForeColor = Color.FromArgb(190, 196, 208);
-            subtitle.SetBounds(25, 37, 480, 20);
-            // the other language, at the right of the header
-            language.SetBounds(598, 21, 140, 20);
-            language.TextAlign = ContentAlignment.MiddleRight;
-            language.LinkColor = language.VisitedLinkColor = Color.FromArgb(190, 196, 208);
-            language.ActiveLinkColor = Color.White;
-            language.DisabledLinkColor = Color.FromArgb(96, 100, 110);
+            header.Paint += PaintHeader;
             language.LinkClicked += delegate { SwitchLanguage(); };
-            header.Controls.Add(title);
-            header.Controls.Add(subtitle);
+            language.BackColor = Color.Transparent;
             header.Controls.Add(language);
 
-            one = Heading(68);
-            imageLabel.SetBounds(24, 92, 590, 42);
-            imageButton.SetBounds(616, 94, 120, 30);
+            one.Number = 1;
+            two.Number = 2;
             imageButton.Click += delegate { ChooseImage(); };
+            imageButton.Outline = true;
+            refresh.Outline = true;
 
-            two = Heading(136);
-            usb.SetBounds(26, 162, 300, 24);
             usb.Checked = true;
-            inside.SetBounds(336, 162, 400, 24);
             usb.CheckedChanged += delegate { if (usb.Checked) PlaceChanged(); };
             inside.CheckedChanged += delegate { if (inside.Checked) PlaceChanged(); };
 
-            list.SetBounds(24, 190, 712, 132);
+            listFrame.Controls.Add(list);
+            list.Dock = DockStyle.Fill;
             list.DrawMode = DrawMode.OwnerDrawFixed;
-            list.ItemHeight = 62;
             list.IntegralHeight = false;
-            list.BorderStyle = BorderStyle.FixedSingle;
+            list.BorderStyle = BorderStyle.None;
             list.DrawItem += DrawDisk;
             list.SelectedIndexChanged += delegate { DiskChanged(); };
-            missing.SetBounds(24, 328, 300, 22);
             missing.LinkClicked += delegate { ShowExcluded(); };
-            refresh.SetBounds(606, 326, 130, 28);
             refresh.Click += delegate { LoadDisks(); };
 
-            options.SetBounds(24, 360, 712, 186);
-            notice.SetBounds(0, 0, 712, 60);
-            notice.BackColor = Color.FromArgb(255, 247, 214);
-            notice.Padding = new Padding(10, 8, 10, 8);
-            notice.BorderStyle = BorderStyle.FixedSingle;
-            beside.SetBounds(2, 0, 330, 24);
             beside.Checked = true;
-            whole.SetBounds(338, 0, 330, 24);
             beside.CheckedChanged += delegate { if (beside.Checked) UpdateState(); };
             whole.CheckedChanged += delegate { if (whole.Checked) UpdateState(); };
-            explain.SetBounds(0, 26, 712, 96);
-            explain.BackColor = Color.FromArgb(244, 246, 250);
-            explain.Padding = new Padding(8, 5, 8, 5);
-            volumeLabel.SetBounds(0, 132, 176, 22);
             volumeBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            volumeBox.SetBounds(178, 128, 250, 26);
+            volumeBox.HandleCreated += delegate { Ui.DarkControl(volumeBox); };
+            sizeBox.HandleCreated += delegate { Ui.DarkControl(sizeBox); };
             volumeBox.SelectedIndexChanged += delegate { VolumeChanged(); };
-            sizeLabel.SetBounds(446, 132, 132, 22);
-            sizeBox.SetBounds(580, 129, 72, 26);
             sizeBox.Minimum = 9;
             sizeBox.Maximum = 9;
             sizeBox.ValueChanged += delegate { UpdateState(); };
             sizeUnit.Text = "GB";
-            sizeUnit.SetBounds(656, 132, 50, 22);
-            remove.SetBounds(0, 162, 400, 22);
             remove.LinkClicked += delegate { StartRemove(); };
             options.Controls.AddRange(new Control[] { notice, beside, whole, explain, volumeLabel, volumeBox, sizeLabel, sizeBox,
                                                       sizeUnit, remove });
 
             // (for every way of installing and for an update: under what each of them asks)
-            diagnostics.SetBounds(26, 552, 710, 24);
             // (a click or the space bar, not a change that this program makes)
             diagnostics.Click += delegate { diagnosticsAsked = diagnostics.Checked; };
 
-            bar.SetBounds(24, 582, 712, 16);
             bar.Maximum = 1000;
-            status.SetBounds(24, 602, 712, 22);
-            status.ForeColor = Color.FromArgb(70, 70, 70);
-
-            go.Font = new Font("Segoe UI Semibold", 11f);
-            go.SetBounds(24, ButtonsAt, 712, 44);
-            go.ForeColor = Color.White;
-            go.FlatStyle = FlatStyle.Flat;
-            go.FlatAppearance.BorderSize = 0;
             go.Click += delegate { Start(); };
-            update.Font = go.Font;
-            update.SetBounds(24, ButtonsAt, 372, 44);
-            update.ForeColor = Color.White;
-            update.BackColor = Color.FromArgb(22, 132, 74);
-            update.FlatStyle = FlatStyle.Flat;
-            update.FlatAppearance.BorderSize = 0;
             update.Visible = false;
             update.Click += delegate { StartUpdate(); };
 
-            donePanel.SetBounds(0, 60, 760, 628);
-            donePanel.BackColor = Color.White;
             donePanel.Visible = false;
-            doneText.SetBounds(32, 22, 696, 480);
-            doneText.Font = new Font("Segoe UI", 10.5f);
-            close.SetBounds(606, 540, 130, 40);
             close.Click += delegate { Close(); };
-            donePanel.Controls.Add(doneText);
             donePanel.Controls.Add(close);
 
-            Controls.AddRange(new Control[] { donePanel, header, one, imageLabel, imageButton, two, usb, inside, list, missing,
-                                              refresh, options, diagnostics, bar, status, go, update });
+            Controls.AddRange(new Control[] { donePanel, header, one, line1, imageLabel, imageButton, two, usb, inside, listFrame, missing,
+                                              refresh, options, stages, diagnostics, bar, status, go, update });
             // the header is the last stop of the Tab key: the keyboard starts where it did, not at the language link
             header.TabIndex = Controls.Count;
 
             deviceTimer.Interval = 1200;
-            deviceTimer.Tick += delegate { deviceTimer.Stop(); if (!busy) LoadDisks(); };
+            deviceTimer.Tick += delegate { deviceTimer.Stop(); DevicesChanged(); };
 
             if (!Native.Uefi) inside.Enabled = false;
+            LayoutAll();
             SetTexts();
             SetImage(image);
             LoadDisks();
         }
 
-        const int ButtonsAt = 630; // the top of the two buttons at the bottom
+        // Where things go. Every number is in pixels of a display at 100 % and goes through Ui.S: this is run
+        // again when the window is moved to a display of another scale.
+        int X0 { get { return 216; } }   // the bar at the side
+        int Top0 { get { return 36; } }   // the top of the first step
+        const int WindowHeight = 700;
 
-        Label Heading(int y)
+        // a control of the content, x and y from the left of the content
+        void B(Control c, int x, int y, int w, int h) { c.SetBounds(Ui.S(X0 + x), Ui.S(y), Ui.S(w), Ui.S(h)); }
+        // a control inside another one
+        static void R(Control c, int x, int y, int w, int h) { c.SetBounds(Ui.S(x), Ui.S(y), Ui.S(w), Ui.S(h)); }
+
+        void LayoutAll()
         {
-            var l = new Label();
-            l.Font = new Font("Segoe UI Semibold", 11f);
-            l.SetBounds(24, y, 600, 24);
-            return l;
+            int T = Top0;
+            SuspendLayout();
+            Font = Ui.F(13f);
+            ClientSize = new Size(Ui.S(X0 + 760), Ui.S(WindowHeight));
+            header.BackColor = Ui.Ink;
+            header.SetBounds(0, 0, Ui.S(216), Ui.S(WindowHeight));
+            language.Font = Ui.F(13f);
+            language.LinkColor = language.VisitedLinkColor = Ui.InkSoft;
+            language.ActiveLinkColor = Color.White;
+            language.DisabledLinkColor = Color.FromArgb(128, 134, 150);
+            R(language, 24, WindowHeight - 44, 168, 22);
+            language.TextAlign = ContentAlignment.MiddleLeft;
+
+            one.Numbered = two.Numbered = false; // the steps are numbered in the bar at the side
+            B(one, 24, T, 560, 28);
+            one.Font = two.Font = Ui.F(15f, "semi");
+            imageLabel.Font = Ui.F(13f);
+            B(imageLabel, 24, T + 30, 580, 38);
+            B(imageButton, 596, T - 2, 140, 32);
+            imageButton.Font = Ui.F(13f);
+            line1.BackColor = Ui.Hair;
+            B(line1, 24, T + 72, 712, 1);
+            B(two, 24, T + 82, 560, 28);
+            B(usb, 26, T + 114, 300, 24);
+            B(inside, 336, T + 114, 400, 24);
+            usb.ForeColor = inside.ForeColor = Ui.Text;
+            B(listFrame, 24, T + 142, 712, 134);
+            listFrame.BackColor = Ui.Hair;
+            listFrame.Padding = new Padding(1);
+            list.BackColor = Ui.Back;
+            list.ItemHeight = Ui.S(66);
+            B(missing, 24, T + 286, 300, 22);
+            missing.LinkColor = missing.VisitedLinkColor = Ui.Dark ? Ui.WarmText : Color.FromArgb(40, 80, 170);
+            missing.ActiveLinkColor = Ui.Text;
+            missing.DisabledLinkColor = Ui.TextOff;
+            B(refresh, 606, T + 282, 130, 30);
+            refresh.Font = Ui.F(13f);
+
+            B(options, 24, T + 318, 712, 194);
+            B(stages, 24, T + 320, 712, 150);
+            stages.Visible = false;
+            R(notice, 0, 0, 712, 60);
+            notice.Padding = new Padding(Ui.S(16), Ui.S(8), Ui.S(10), Ui.S(8));
+            notice.BackColor = Ui.CalloutBack;
+            notice.ForeColor = Ui.Dark ? Ui.Text : Color.FromArgb(70, 50, 10);
+            notice.Bar = Ui.CalloutBar;
+            R(beside, 2, 0, 330, 24);
+            R(whole, 338, 0, 330, 24);
+            beside.ForeColor = whole.ForeColor = Ui.Text;
+            R(explain, 0, 28, 712, 102);
+            explain.BackColor = Ui.Surface;
+            explain.ForeColor = Ui.Text;
+            explain.Bar = Ui.Hair;
+            explain.Padding = new Padding(Ui.S(16), Ui.S(6), Ui.S(8), Ui.S(5));
+            R(volumeLabel, 0, 142, 176, 22);
+            R(volumeBox, 178, 138, 250, 26);
+            R(sizeLabel, 446, 142, 132, 22);
+            R(sizeBox, 580, 139, 72, 26);
+            R(sizeUnit, 656, 142, 50, 22);
+            R(remove, 0, 172, 400, 22);
+            volumeLabel.ForeColor = sizeLabel.ForeColor = sizeUnit.ForeColor = Ui.Text;
+            volumeBox.BackColor = sizeBox.BackColor = Ui.Field;
+            volumeBox.ForeColor = sizeBox.ForeColor = Ui.Text;
+            volumeBox.FlatStyle = FlatStyle.Standard;
+            remove.LinkColor = remove.VisitedLinkColor = Ui.Dark ? Ui.WarmText : Color.FromArgb(40, 80, 170);
+            remove.ActiveLinkColor = Ui.Text;
+            remove.DisabledLinkColor = Ui.TextOff;
+
+            B(diagnostics, 26, T + 512, 710, 24);
+            diagnostics.ForeColor = Ui.Text;
+            B(bar, 24, T + 540, 712, 16);
+            B(status, 24, T + 558, 712, 22);
+            status.ForeColor = Ui.Soft;
+
+            go.Font = Ui.F(15f, "semi");
+            go.ForeColor = Ui.PrimaryText;
+            update.Font = go.Font;
+            update.ForeColor = Color.White;
+            update.BackColor = Ui.Green;
+            B(update, 24, T + 586, 372, 46);
+            B(go, 24, T + 586, 712, 46); // (UpdateState sets where it is)
+
+            donePanel.SetBounds(Ui.S(X0), 0, Ui.S(760), Ui.S(WindowHeight));
+            donePanel.BackColor = Ui.Back;
+            if (donePanel.Visible) BuildDone();
+            close.Font = Ui.F(13f);
+            close.Outline = true;
+            close.ForeColor = Ui.Text;
+            BackColor = Ui.Back;
+            ResumeLayout(true);
+            header.Invalidate();
         }
+
+        // The bar at the side: the mark, the name and the three steps.
+        void PaintHeader(object sender, PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            Color text = Ui.InkText, soft = Ui.InkSoft;
+            using (var b = new System.Drawing.Drawing2D.LinearGradientBrush(new Rectangle(0, 0, header.Width, header.Height),
+                       Ui.Ink, Color.FromArgb(18, 20, 28), System.Drawing.Drawing2D.LinearGradientMode.Vertical))
+                g.FillRectangle(b, 0, 0, header.Width, header.Height);
+            Ui.DrawMark(g, header.Width / 2f, Ui.Sf(92), Ui.Sf(40), Ui.Disc, true, true);
+            string small = "LibreELEC", big = "HADES";
+            Font fs = Ui.F(12f, "semi"), fb = Ui.F(36f, "light");
+            float ws = MeasureTracked(g, small, fs, 0.42f), wb = MeasureTracked(g, big, fb, 0.34f);
+            Ui.DrawTracked(g, small, fs, soft, (header.Width - ws) / 2f, Ui.Sf(160), 0.42f);
+            Ui.DrawTracked(g, big, fb, text, (header.Width - wb) / 2f, Ui.Sf(180), 0.34f);
+            TextRenderer.DrawText(g, L.T("Installer", "Instalador"), Ui.F(12.5f), new Rectangle(0, Ui.S(236), header.Width, Ui.S(20)), soft,
+                                  TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding);
+            // the steps
+            string[] names = { L.T("Image", "Imagen"), Where == Place.Internal ? L.T("Disk", "Disco") : L.T("Drive", "Unidad"), L.T("Install", "Instalar") };
+            int y0 = 300, gap = 84;
+            for (int i = 0; i < 3; ++i)
+            {
+                float cx = Ui.Sf(40), cy = Ui.Sf(y0 + i * gap + 14), d = Ui.Sf(26);
+                if (i < 2)
+                    using (var pen = new Pen(stepState[i] == 2 ? Color.FromArgb(120, 84, 200, 124) : Color.FromArgb(60, 255, 255, 255), Math.Max(1f, Ui.Sf(1.5f))))
+                        g.DrawLine(pen, cx, cy + d / 2f + Ui.Sf(5), cx, cy + Ui.Sf(gap) - d / 2f - Ui.Sf(5));
+                var box = new RectangleF(cx - d / 2f, cy - d / 2f, d, d);
+                if (stepState[i] == 2)
+                {
+                    using (var b = new SolidBrush(Color.FromArgb(84, 200, 124))) g.FillEllipse(b, box);
+                    using (var pen = new Pen(Ui.Ink, Math.Max(1.6f, Ui.Sf(2f))) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                        g.DrawLines(pen, new[] { new PointF(box.Left + d * 0.27f, box.Top + d * 0.53f), new PointF(box.Left + d * 0.44f, box.Top + d * 0.69f), new PointF(box.Left + d * 0.73f, box.Top + d * 0.33f) });
+                }
+                else
+                {
+                    if (stepState[i] == 1) using (var b = new SolidBrush(Ui.Silver)) g.FillEllipse(b, box);
+                    else using (var pen = new Pen(Color.FromArgb(110, 255, 255, 255), Math.Max(1f, Ui.Sf(1.4f)))) g.DrawEllipse(pen, box);
+                    TextRenderer.DrawText(g, (i + 1).ToString(), Ui.F(12.5f, "semi"), Rectangle.Round(box), stepState[i] == 1 ? Ui.Ink : soft,
+                                          TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                }
+                TextRenderer.DrawText(g, names[i], Ui.F(15f, "semi"), new Point(Ui.S(66), Ui.S(y0 + i * gap + 3)), stepState[i] == 0 ? soft : text, TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(g, stepSub[i], Ui.F(12f), new Rectangle(Ui.S(66), Ui.S(y0 + i * gap + 26), header.Width - Ui.S(82), Ui.S(34)), soft,
+                                      TextFormatFlags.WordBreak | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding);
+            }
+        }
+
+        static float MeasureTracked(Graphics g, string s, Font f, float tracking)
+        {
+            float w = 0;
+            using (var fmt = new StringFormat(StringFormat.GenericTypographic))
+                foreach (char ch in s) w += g.MeasureString(ch.ToString(), f, 1000, fmt).Width + tracking * f.Size;
+            return w - tracking * f.Size;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Ui.DarkTitleBar(Handle);
+            if (!Ui.FixedScale)
+            {
+                float now = Ui.WindowScale(Handle);
+                if (Math.Abs(now - Ui.Scale) > 0.001f) ScaleChanged(now);
+            }
+            // the icon of the taskbar and of Alt+Tab, at its own size
+            bigIcon = Ui.AppIcon(false);
+            if (bigIcon != null) SendMessage(Handle, 0x0080, (IntPtr)1, bigIcon.Handle);
+        }
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hwnd, int msg, IntPtr wparam, IntPtr lparam);
 
         // The texts that do not depend on what is chosen, in the language of now. (UpdateState sets the rest.)
         void SetTexts()
         {
-            Text = title.Text = L.T("LibreELEC Hades · Installer", "LibreELEC Hades · Instalador");
-            subtitle.Text = L.T("Dolby Vision on your PC", "Dolby Vision en tu PC");
+            Text = L.T("LibreELEC Hades · Installer", "LibreELEC Hades · Instalador");
             language.Text = L.Spanish ? "English" : "Español"; // each in its own language
-            one.Text = L.T("1.  LibreELEC Hades image", "1.  Imagen de LibreELEC Hades");
+            one.Text = L.T("LibreELEC Hades image", "Imagen de LibreELEC Hades");
             imageButton.Text = L.T("Choose another…", "Elegir otra…");
-            two.Text = L.T("2.  Where do you want it?", "2.  ¿Dónde lo quieres?");
+            two.Text = L.T("Where do you want it?", "¿Dónde lo quieres?");
             usb.Text = L.T("On a USB drive (recommended)", "En una unidad USB (recomendado)");
             inside.Text = Native.Uefi ? L.T("On a secondary internal disk", "En un disco interno secundario")
                                       : L.T("On an internal disk (this PC does not start by UEFI)",
@@ -350,12 +521,13 @@ namespace Hades.Installer
             remove.Text = L.T("Remove LibreELEC Hades from an internal disk…", "Quitar LibreELEC Hades de un disco interno…");
             update.Text = L.T("Update LibreELEC Hades  (keeps your settings)", "Actualizar LibreELEC Hades  (conserva tus ajustes)");
             close.Text = L.T("Close", "Cerrar");
+            header.Invalidate();
         }
 
         // The other language: every text of the window again. What was kept as a text is made again.
         public void SwitchLanguage()
         {
-            if (busy) return; // (the link is off then: what is done to a disk says all its steps in one language)
+            if (busy) return; // (the link is only dimmed then, and does nothing: what is done to a disk says all its steps in one language)
             L.Spanish = !L.Spanish;
             ++wordings;
             SetTexts();
@@ -366,7 +538,7 @@ namespace Hades.Installer
                 d.Excluded = Disks.Classify(d, Where, plan == null ? 0 : plan.Size, keep, guarded) ?? d.Excluded;
             if (donePanel.Visible)
             {
-                doneText.Text = DoneText();
+                BuildDone();
                 return; // nothing else is on show, and nothing else will be
             }
             list.Invalidate();
@@ -396,12 +568,46 @@ namespace Hades.Installer
 
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == 0x02E0 && !Ui.FixedScale) // WM_DPICHANGED: the window is now on a display of another scale
+            {
+                float now = (m.WParam.ToInt64() & 0xFFFF) / 96f;
+                if (Math.Abs(now - Ui.Scale) > 0.001f)
+                {
+                    ScaleChanged(now);
+                    // (where Windows suggests that it goes: its left and top)
+                    int left = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 0);
+                    int top = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 4);
+                    Location = new Point(left, top);
+                }
+                m.Result = IntPtr.Zero;
+                return;
+            }
             base.WndProc(ref m);
             if (m.Msg == 0x0219 && !busy) // a device came or went
             {
                 deviceTimer.Stop();
                 deviceTimer.Start();
             }
+        }
+
+        // A device came or went (WM_DEVICECHANGE, a moment later: deviceTimer): the list of disks again. Not while a disk is
+        // worked on; and while the panel of "done" is on show, only once it is gone (see done).
+        void DevicesChanged()
+        {
+            if (busy) return;
+            if (done) { doneSkippedDevices = true; return; }
+            LoadDisks();
+        }
+
+        // The window on a display of another scale (WM_DPICHANGED, or a handle made on one): everything is laid out again,
+        // the panel of "done" too (LayoutAll makes it again); what is behind that panel waits until it is gone.
+        void ScaleChanged(float now)
+        {
+            Ui.Scale = now;
+            LayoutAll();
+            if (done) doneSkippedState = true;
+            else UpdateState();
+            list.Invalidate();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -525,6 +731,7 @@ namespace Hades.Installer
 
         void LoadDisks()
         {
+            ++disksLoaded;
             var selected = list.SelectedItem as DiskInfo;
             list.BeginUpdate();
             list.Items.Clear();
@@ -664,37 +871,54 @@ namespace Hades.Installer
             UpdateState();
         }
 
+        // The serial number is part of what says which disk this is: it is on every row, and in what is asked before it is erased.
+        public static string SerialLine(DiskInfo d)
+        {
+            return d.Serial.Length > 0 ? L.T("Serial number: ", "N.º de serie: ") + d.Serial
+                                       : L.T("Serial number: not reported by this drive", "N.º de serie: este disco no lo da");
+        }
+
         void DrawDisk(object sender, DrawItemEventArgs e)
         {
-            e.DrawBackground();
             if (e.Index < 0) return;
             var d = (DiskInfo)list.Items[e.Index];
             bool selected = (e.State & DrawItemState.Selected) != 0;
-            Color main = selected ? SystemColors.HighlightText : Color.FromArgb(20, 20, 20);
-            Color soft = selected ? SystemColors.HighlightText : Color.FromArgb(96, 96, 96);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
             Rectangle r = e.Bounds;
-            using (var big = new Font("Segoe UI Semibold", 11f))
-            using (var mainBrush = new SolidBrush(main))
-            using (var softBrush = new SolidBrush(soft))
-            using (var pen = new Pen(selected ? SystemColors.HighlightText : Color.FromArgb(120, 120, 120), 2f))
+            Color back = selected ? Ui.Pick : Ui.Back;
+            Color main = selected ? Ui.PickText : Ui.Text;
+            Color soft = selected ? Ui.Blend(Ui.PickText, Ui.Pick, 0.22f) : Ui.Soft;
+            Color faint = selected ? Ui.Blend(Ui.PickText, Ui.Pick, 0.42f) : Ui.Faint;
+            using (var b = new SolidBrush(back)) g.FillRectangle(b, r);
+            if (selected)
+                using (var b = new SolidBrush(Ui.FirstLight)) g.FillRectangle(b, r.Left, r.Top, Math.Max(3, Ui.S(4)), r.Height);
+            else
+                using (var pen = new Pen(Ui.Hair)) g.DrawLine(pen, r.Left + Ui.S(16), r.Bottom - 1, r.Right - Ui.S(16), r.Bottom - 1);
+            // a small drawing of the drive: a USB stick, or a disk inside the PC
+            float x = r.Left + Ui.Sf(20), y = r.Top + r.Height / 2f;
+            using (var pen = new Pen(selected ? main : Ui.Faint, Math.Max(1.5f, Ui.Sf(2f))) { LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
             {
-                int x = r.Left + 16, y = r.Top + r.Height / 2;
                 if (d.Removable)
                 {
-                    // a small drawing of a USB drive
-                    e.Graphics.DrawRectangle(pen, x, y - 9, 26, 18);
-                    e.Graphics.DrawRectangle(pen, x + 26, y - 5, 9, 10);
+                    using (var p = Ui.Round(new RectangleF(x, y - Ui.Sf(9), Ui.Sf(26), Ui.Sf(18)), Ui.Sf(3))) g.DrawPath(pen, p);
+                    g.DrawRectangle(pen, x + Ui.Sf(26), y - Ui.Sf(5), Ui.Sf(9), Ui.Sf(10));
                 }
                 else
                 {
-                    // ... and of a disk inside the PC
-                    e.Graphics.DrawRectangle(pen, x, y - 12, 34, 24);
-                    e.Graphics.DrawLine(pen, x + 6, y + 5, x + 16, y + 5);
+                    using (var p = Ui.Round(new RectangleF(x, y - Ui.Sf(12), Ui.Sf(34), Ui.Sf(24)), Ui.Sf(4))) g.DrawPath(pen, p);
+                    g.DrawLine(pen, x + Ui.Sf(6), y + Ui.Sf(5), x + Ui.Sf(16), y + Ui.Sf(5));
+                    using (var b = new SolidBrush(selected ? Ui.FirstLight : Ui.Faint)) g.FillEllipse(b, x + Ui.Sf(26), y + Ui.Sf(3), Ui.Sf(4), Ui.Sf(4));
                 }
-                e.Graphics.DrawString(d.Title, big, mainBrush, r.Left + 64, r.Top + 9);
-                e.Graphics.DrawString(d.Detail, Font, softBrush, r.Left + 65, r.Top + 34);
             }
-            e.DrawFocusRectangle();
+            int tx = r.Left + Ui.S(72), tw = r.Width - Ui.S(72) - Ui.S(14);
+            const TextFormatFlags flags = TextFormatFlags.Left | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine;
+            TextRenderer.DrawText(g, d.Title, Ui.F(15f, "semi"), new Rectangle(tx, r.Top + Ui.S(8), tw, Ui.S(22)), main, flags);
+            TextRenderer.DrawText(g, d.Detail, Ui.F(13f), new Rectangle(tx, r.Top + Ui.S(29), tw, Ui.S(18)), soft, flags);
+            TextRenderer.DrawText(g, SerialLine(d), Ui.F(12f), new Rectangle(tx, r.Top + Ui.S(47), tw, Ui.S(16)), faint, flags);
+            if ((e.State & DrawItemState.Focus) != 0 && selected)
+                using (var pen = new Pen(Color.FromArgb(120, main)) { DashStyle = System.Drawing.Drawing2D.DashStyle.Dot })
+                    g.DrawRectangle(pen, r.Left + 2, r.Top + 2, r.Width - 5, r.Height - 5);
         }
 
         void ShowExcluded()
@@ -732,13 +956,13 @@ namespace Hades.Installer
         void UpdateState()
         {
             string name = imagePath == null ? "" : Path.GetFileName(imagePath) + "\r\n";
-            Color color = Color.FromArgb(40, 40, 40);
+            Color color = Ui.Text;
             bool usable = false;
             switch (imageState)
             {
                 case "ok":
                     imageLabel.Text = name + Words.Size(plan.Size) + L.T("  ·  checked: it arrived complete", "  ·  comprobada: ha llegado entera");
-                    color = Color.FromArgb(18, 120, 50);
+                    color = Ui.Ok;
                     usable = true;
                     break;
                 case "checking":
@@ -748,12 +972,12 @@ namespace Hades.Installer
                     imageLabel.Text = name + Words.Size(plan.Size) +
                                       L.T("  ·  its .sha256 file is missing: there is no way to check that it arrived complete",
                                           "  ·  sin su archivo .sha256: no se puede comprobar que llegó entera");
-                    color = Color.FromArgb(160, 100, 0);
+                    color = Ui.Warn;
                     usable = true;
                     break;
                 default:
                     imageLabel.Text = name + ImageTrouble();
-                    color = Color.FromArgb(176, 32, 32);
+                    color = Ui.Danger;
                     break;
             }
             imageLabel.ForeColor = color;
@@ -762,6 +986,8 @@ namespace Hades.Installer
             var choice = volumeBox.SelectedItem as VolumeChoice;
             bool internalPlace = Where == Place.Internal;
             bool besideMode = internalPlace && beside.Checked;
+            options.Visible = !(busy && showSteps);
+            stages.Visible = busy && showSteps;
             notice.Visible = !internalPlace;
             beside.Visible = whole.Visible = explain.Visible = internalPlace;
             volumeLabel.Visible = volumeBox.Visible = sizeLabel.Visible = sizeBox.Visible = sizeUnit.Visible = besideMode && disk != null;
@@ -833,8 +1059,8 @@ namespace Hades.Installer
             bool has = disk != null && disk.HasHades;
             update.Visible = has;
             update.Enabled = !busy && has && usable && plan != null && plan.Scanned;
-            update.BackColor = update.Enabled ? Color.FromArgb(22, 132, 74) : Color.FromArgb(170, 176, 186);
-            go.SetBounds(has ? 404 : 24, ButtonsAt, has ? 332 : 712, 44);
+            update.BackColor = Ui.Green;
+            B(go, has ? 404 : 24, Top0 + 586, has ? 332 : 712, 46);
             go.Text = has ? (!internalPlace ? L.T("Install from scratch  (erases the drive)", "Instalar de cero  (borra la unidad)")
                              : besideMode ? L.T("Make room and install", "Hacer sitio e instalar")
                              : L.T("Erase the disk and install from scratch", "Borrar el disco e instalar de cero"))
@@ -843,14 +1069,18 @@ namespace Hades.Installer
                                          "Hacer sitio e instalar LibreELEC Hades en el disco elegido")
                       : L.T("Erase the chosen disk and install LibreELEC Hades", "Borrar el disco elegido e instalar LibreELEC Hades");
             go.Enabled = !busy && problem == null;
-            go.BackColor = go.Enabled ? Color.FromArgb(34, 108, 214) : Color.FromArgb(170, 176, 186);
+            go.BackColor = Ui.Primary;
             // (with an image that cannot be used, what is wrong with it is said next to the image)
             if (has && usable && !busy && !donePanel.Visible && (problem == null || problem.Length == 0 || besideMode))
                 status.Text = scanning || plan == null || !plan.Scanned
                     ? L.T("Reading the image…", "Leyendo la imagen…")
                     : L.T("This drive already has Hades. Updating replaces the system and keeps your settings and add-ons.",
                           "Esta unidad ya tiene Hades. Actualizar cambia el sistema y conserva tus ajustes y addons.");
-            imageButton.Enabled = refresh.Enabled = list.Enabled = usb.Enabled = language.Enabled = !busy;
+            imageButton.Enabled = refresh.Enabled = list.Enabled = usb.Enabled = !busy;
+            // (the two links stay enabled while a disk is worked on, only dimmed: Windows would draw them in a grey that cannot be
+            // read; what they do is refused while busy, SwitchLanguage and StartRemove)
+            language.LinkColor = language.VisitedLinkColor = busy ? Ui.TextOffOnInk : Ui.InkSoft;
+            remove.LinkColor = remove.VisitedLinkColor = busy ? Ui.TextOff : (Ui.Dark ? Ui.WarmText : Color.FromArgb(40, 80, 170));
             // The box of the diagnostics. An image from before them has no switch to turn on: the box is off
             // and says why. One that has them on already writes them on whatever is asked: the box is on,
             // cannot be changed, and says so. Else it is what the user set it to, and until then what the
@@ -867,7 +1097,21 @@ namespace Hades.Installer
                 : L.T("Save diagnostics there (this image cannot: a more recent one is needed)",
                       "Guardar diagnóstico ahí (esta imagen no sabe: hace falta una más reciente)");
             inside.Enabled = !busy && Native.Uefi;
-            beside.Enabled = whole.Enabled = volumeBox.Enabled = sizeBox.Enabled = remove.Enabled = !busy;
+            beside.Enabled = whole.Enabled = volumeBox.Enabled = sizeBox.Enabled = !busy;
+
+            // where the user is in the three steps: the headings and the bar at the side say it
+            bool ready = usable && disk != null && problem == null;
+            stepState[0] = usable ? 2 : 1;
+            stepState[1] = !usable ? 0 : ready ? 2 : 1;
+            stepState[2] = busy ? 1 : ready ? 1 : 0;
+            if (donePanel.Visible) stepState[0] = stepState[1] = stepState[2] = 2;
+            stepSub[0] = imagePath == null ? "" : Path.GetFileName(imagePath);
+            stepSub[1] = disk == null ? (internalPlace ? L.T("Choose a disk", "Elige un disco") : L.T("Choose a drive", "Elige una unidad")) : disk.Title;
+            stepSub[2] = donePanel.Visible ? L.T("Done", "Hecho") : busy ? L.T("Working…", "Trabajando…")
+                         : ready ? L.T("Ready", "Listo") : "";
+            one.SetState(stepState[0]);
+            two.SetState(stepState[1]);
+            header.Invalidate();
         }
 
         // Why the image cannot be used, when it cannot.
@@ -895,6 +1139,8 @@ namespace Hades.Installer
         void Run(DoWorkEventHandler work, Action<object> done, Func<Exception, bool> failed = null)
         {
             busy = true;
+            stages.Permille = 0;
+            SetStages(removing);
             UpdateState();
             clock.Restart();
             var worker = new BackgroundWorker();
@@ -902,12 +1148,16 @@ namespace Hades.Installer
             worker.ProgressChanged += delegate(object s, ProgressChangedEventArgs e)
             {
                 bar.Value = Math.Max(0, Math.Min(1000, e.ProgressPercentage));
+                stages.Permille = bar.Value;
+                stages.Invalidate();
                 status.Text = (string)e.UserState;
             };
             worker.DoWork += work;
             worker.RunWorkerCompleted += delegate(object s, RunWorkerCompletedEventArgs e)
             {
                 busy = false;
+                showSteps = false;
+                removing = false;
                 if (e.Error != null)
                 {
                     Log.Line("failed: " + e.Error);
@@ -924,6 +1174,28 @@ namespace Hades.Installer
             };
             current = worker;
             worker.RunWorkerAsync();
+        }
+
+        bool removing;           // what is done is removing Hades: its two stages, not those of writing an image
+
+        // The stages that are on show while a disk is worked on, and where in the progress each of them starts (the
+        // operations report writing as the first part of the bar, and reading it back as the rest).
+        void SetStages(bool removal)
+        {
+            if (removal)
+            {
+                stages.Stages = new[] { L.T("Deleting the Hades partitions", "Borrando las particiones de Hades"),
+                                        L.T("Giving the space back, or leaving the disk ready for Windows", "Devolviendo el espacio, o dejando el disco listo para Windows") };
+                stages.Cuts = new[] { 600 };
+            }
+            else
+            {
+                stages.Stages = new[] { L.T("Preparing the drive", "Preparando la unidad"),
+                                        L.T("Checking the image and writing it", "Comprobando la imagen y escribiéndola"),
+                                        L.T("Reading it back and comparing it with the image", "Releyéndolo y comparándolo con la imagen") };
+                stages.Cuts = new[] { 50, 600 };
+            }
+            stages.Warning = L.T("Do not unplug the drive or turn the PC off.", "No desconectes la unidad ni apagues el PC.");
         }
 
         BackgroundWorker current;
@@ -951,6 +1223,7 @@ namespace Hades.Installer
                 using (ConfirmForm confirm = AskBeside(disk, choice.Partition.Letter, storage + chosen.System.Size))
                     if (confirm.ShowDialog(this) != DialogResult.OK) return;
                 Log.Line("start beside: disk " + disk.Number + " " + disk.Name + ", volume " + choice.Partition.Letter + ", storage " + storage);
+                showSteps = true;
                 Run(delegate { Operations.InstallBeside(disk, choice.Partition, storage, chosen, diagnose, Report); },
                     delegate { ShowDone(disk, place, false); });
                 return;
@@ -961,6 +1234,7 @@ namespace Hades.Installer
             using (ConfirmForm confirm = AskErase(disk))
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
             Log.Line("start whole " + place + ": disk " + disk.Number + " " + disk.Name + " <- " + image);
+            showSteps = true;
             Run(delegate { Operations.InstallWhole(disk, chosen, place, diagnose, Report); }, delegate { ShowDone(disk, place, false); });
         }
 
@@ -983,6 +1257,7 @@ namespace Hades.Installer
         {
             Log.Line("start update " + place + (take ? ", taking the partition" : "") + ": disk " + disk.Number + " " + disk.Name +
                      " <- " + image);
+            showSteps = true;
             Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Update(disk, chosen, place, diagnose, Report, take); },
                 delegate(object result) { ShowDone(disk, place, true, result as DiagKeep); },
                 delegate(Exception error)
@@ -1022,6 +1297,7 @@ namespace Hades.Installer
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
             Log.Line("start uninstall: disk " + disk.Number + " " + disk.Name);
             string image = imagePath; // (the image that is chosen is not erased either)
+            showSteps = removing = true;
             Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Uninstall(disk, image, Report); },
                 delegate(object result)
                 {
@@ -1038,7 +1314,7 @@ namespace Hades.Installer
         public static ConfirmForm AskErase(DiskInfo disk)
         {
             var sb = new StringBuilder();
-            sb.AppendLine(disk.Title).AppendLine(disk.Detail);
+            sb.AppendLine(disk.Title).AppendLine(disk.Detail).AppendLine(SerialLine(disk));
             if (disk.UsedBytes > 0)
                 sb.AppendLine().AppendLine(L.T("It holds " + Words.Size(disk.UsedBytes) + " of files, which will be lost.",
                                                "Tiene " + Words.Size(disk.UsedBytes) + " de archivos, que se perderán."));
@@ -1050,7 +1326,7 @@ namespace Hades.Installer
         // smaller: how much smaller the partition of that letter will be
         public static ConfirmForm AskBeside(DiskInfo disk, char letter, long smaller)
         {
-            string details = disk.Title + "\r\n\r\n" + L.T(
+            string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "Partition " + letter + ": will be made " + Words.Size(smaller) + " smaller, and the two Hades partitions will be " +
                 "created in the space that frees up.\r\n\r\n" +
                 "Your files on " + letter + ": are not erased. No other disk is touched.\r\n" +
@@ -1073,7 +1349,7 @@ namespace Hades.Installer
                 "start menu shows them, read-only.",
                 "\r\n\r\nCon esta versión, Hades dentro del PC no ve los demás discos NVMe y SATA. Una entrada de su menú de " +
                 "inicio los muestra, en solo lectura.");
-            string details = disk.Title + "\r\n\r\n" + L.T(
+            string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "The Hades system on this drive is replaced by the one in the image (" + imageName + ").\r\n\r\n" +
                 "Your settings, your add-ons and whatever you have saved in Hades are not touched. No other disk is touched.\r\n\r\n" +
                 "The boot partition of Hades (Windows calls it LIBREELEC) is replaced whole: if you put anything there by hand, " +
@@ -1097,7 +1373,7 @@ namespace Hades.Installer
         public static ConfirmForm AskTake(DiskInfo disk, char letter, bool wsl)
         {
             string where = letter == '\0' ? "" : " (" + letter + ":)";
-            string details = disk.Title + "\r\n\r\n" + L.T(
+            string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "A program has the Hades system partition of this drive" + where + " open, and Windows does not let it be " +
                 "replaced meanwhile. Nothing has been written.\r\n\r\n",
                 "Un programa tiene abierta la partición de sistema de Hades de esta unidad" + where + ", y Windows no deja " +
@@ -1129,7 +1405,7 @@ namespace Hades.Installer
 
         public static ConfirmForm AskRemove(DiskInfo disk)
         {
-            string details = disk.Title + "\r\n\r\n" + L.T(
+            string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "The Hades partitions on this disk are deleted, with everything Hades has stored (settings, add-ons).\r\n\r\n" +
                 "If Hades shares the disk with your files, they are not touched and their partition gets the space back. " +
                 "If the whole disk was for Hades, it is left empty and ready for Windows.",
@@ -1140,62 +1416,165 @@ namespace Hades.Installer
                                    L.T("REMOVE", "QUITAR"), L.T("Remove LibreELEC Hades", "Quitar LibreELEC Hades"));
         }
 
-        // What the last panel says: that it is done, and how to start it.
-        string DoneText()
+        // What the last panel says: that it is done, how to start it, and what the entries of the start menu of Hades do.
+        // It is made again when the language or the scale changes.
+        void BuildDone()
         {
             DiskInfo disk = doneDisk;
+            if (disk == null) return;
             Place place = donePlace;
             bool updated = doneUpdated;
             string name = disk.ShownName;
-            var sb = new StringBuilder();
-            sb.AppendLine(updated ? L.T("LibreELEC Hades has been updated on " + name + ", with your settings as they were, and this was " +
-                                        "checked by reading back what was written.",
-                                        "LibreELEC Hades está actualizado en " + name + ", con tus ajustes como estaban, y se ha " +
-                                        "comprobado releyendo lo escrito.")
-                                  : L.T("LibreELEC Hades is installed on " + name + ", and this was checked by reading back what was written.",
-                                        "LibreELEC Hades está instalado en " + name + " y se ha comprobado releyendo lo escrito."));
+            for (int i = donePanel.Controls.Count - 1; i >= 0; --i)
+            {
+                Control c = donePanel.Controls[i];
+                if (c == close) continue;
+                donePanel.Controls.RemoveAt(i);
+                c.Dispose();
+            }
+            int W = 696, x = 32, y = 24;
+            Func<string, float, string, Color, Label> text = delegate(string t, float size, string kind, Color color)
+            {
+                var l = new Label();
+                l.Text = t;
+                l.Font = Ui.F(size, kind);
+                l.ForeColor = color;
+                l.BackColor = Ui.Back;
+                donePanel.Controls.Add(l);
+                return l;
+            };
+            // the check, and what is done
+            var badge = new Panel();
+            badge.BackColor = Ui.Back;
+            R(badge, x, y, 48, 48);
+            badge.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                float d = Ui.Sf(46);
+                using (var b = new SolidBrush(Ui.Ok)) e.Graphics.FillEllipse(b, 1, 1, d, d);
+                using (var pen = new Pen(Color.White, Math.Max(2f, Ui.Sf(3.2f))) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round, LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                    e.Graphics.DrawLines(pen, new[] { new PointF(1 + d * 0.27f, 1 + d * 0.53f), new PointF(1 + d * 0.43f, 1 + d * 0.68f), new PointF(1 + d * 0.74f, 1 + d * 0.34f) });
+            };
+            donePanel.Controls.Add(badge);
+            Label head = text(updated ? L.T("LibreELEC Hades is updated", "LibreELEC Hades está actualizado")
+                                      : L.T("LibreELEC Hades is installed", "LibreELEC Hades está instalado"), 21f, "semi", Ui.Text);
+            R(head, x + 64, y - 2, W - 64 - 140, 30);
+            Label sub = text((updated ? L.T("On " + name + ", with your settings as they were. ", "En " + name + ", con tus ajustes como estaban. ")
+                                      : L.T("On " + name + ". ", "En " + name + ". ")) +
+                             L.T("Checked by reading back what was written.", "Comprobado releyendo lo escrito."), 13f, "", Ui.Soft);
+            R(sub, x + 64, y + 30, W - 64 - 140, 40);
+            y += 76;
             string diag = updated && doneDiag != null ? doneDiag.Text() : "";
-            if (diag.Length > 0) sb.AppendLine(diag);
-            sb.AppendLine();
-            sb.AppendLine(L.T("How to start it", "Cómo arrancarlo"));
-            sb.AppendLine(place == Place.Usb ? L.T("  1.  Leave the drive plugged in and restart the PC.", "  1.  Deja la unidad conectada y reinicia el PC.")
-                                             : L.T("  1.  Restart the PC.", "  1.  Reinicia el PC."));
-            sb.AppendLine(L.T("  2.  As soon as it turns on, press the key of the boot menu several times:",
-                              "  2.  Nada más encender, pulsa varias veces la tecla del menú de arranque:"));
-            sb.AppendLine(L.T("       ASUS F8  ·  MSI F11  ·  Gigabyte F12  ·  ASRock F11  ·  laptops: F12 or Esc",
-                              "       ASUS F8  ·  MSI F11  ·  Gigabyte F12  ·  ASRock F11  ·  portátiles: F12 o Esc"));
-            sb.AppendLine(place == Place.Usb ? L.T("  3.  Choose the USB drive (the entry that says UEFI).", "  3.  Elige la unidad USB (la entrada que diga UEFI).")
-                                             : L.T("  3.  Choose the disk " + name + " (not “Windows Boot Manager”).",
-                                                   "  3.  Elige el disco " + name + " (no «Windows Boot Manager»)."));
-            sb.AppendLine();
+            // (and what became of the choices of the old boot menus: BootMenus)
+            string boot = updated && doneDiag != null && doneDiag.Boot != null ? doneDiag.Boot.Text() : "";
+            if (boot.Length > 0) diag = diag.Length > 0 ? boot + " " + diag : boot;
+            if (diag.Length > 0)
+            {
+                Label d = text(diag, 12.5f, "", Ui.Soft);
+                int h = TextRenderer.MeasureText(diag, d.Font, new Size(Ui.S(W), 0), TextFormatFlags.WordBreak).Height;
+                d.SetBounds(Ui.S(x), Ui.S(y), Ui.S(W), h + Ui.S(2));
+                y += (int)Math.Ceiling(h / Ui.Scale) + 8;
+            }
+
+            // how to start it
+            y += 8;
+            Label how = text(L.T("How to start it", "Cómo arrancarlo"), 15f, "semi", Ui.Text);
+            R(how, x, y, W, 24);
+            y += 32;
+            int cw = (W - 24) / 3;
+            string[] titles =
+            {
+                L.T("Restart the PC", "Reinicia el PC"),
+                L.T("Open the boot menu", "Abre el menú de arranque"),
+                place == Place.Usb ? L.T("Choose the USB drive", "Elige la unidad USB") : L.T("Choose the disk", "Elige el disco")
+            };
+            string[] bodies =
+            {
+                place == Place.Usb ? L.T("Leave the drive plugged in.", "Deja la unidad conectada.") : L.T("Nothing else to do first.", "No hay que hacer nada antes."),
+                L.T("As soon as it turns on, press the key of the boot menu several times.", "Nada más encender, pulsa varias veces la tecla del menú de arranque."),
+                place == Place.Usb ? L.T("The entry that says UEFI.", "La entrada que diga UEFI.")
+                                   : L.T(name + ", not “Windows Boot Manager”.", name + ", no «Windows Boot Manager».")
+            };
+            for (int i = 0; i < 3; ++i)
+            {
+                var card = new StepCard();
+                card.Number = i + 1;
+                card.Title = titles[i];
+                card.Body = bodies[i];
+                R(card, x + i * (cw + 12), y, cw, 116);
+                donePanel.Controls.Add(card);
+            }
+            y += 116 + 10;
+            var chips = new Chips();
+            chips.Items = new[] { "ASUS  F8", "MSI  F11", "Gigabyte  F12", "ASRock  F11", L.T("Laptops  F12 / Esc", "Portátiles  F12 / Esc") };
+            chips.BackColor = Ui.Back;
+            R(chips, x, y, W, 32);
+            int chipH;
+            using (Graphics g = chips.CreateGraphics()) chipH = chips.Flow(g, null);
+            chips.Height = chipH;
+            donePanel.Controls.Add(chips);
+            y += (int)Math.Ceiling(chipH / Ui.Scale) + 12;
             if (!updated)
-                sb.AppendLine(L.T("The first time, Hades prepares its space and restarts by itself: choose it again in the menu.",
-                                  "La primera vez, Hades prepara su espacio y se reinicia solo: vuelve a elegirlo en el menú."));
+            {
+                var first = new Callout();
+                first.Text = L.T("The first time, Hades prepares its space and restarts by itself: choose it again in the menu.",
+                                 "La primera vez, Hades prepara su espacio y se reinicia solo: vuelve a elegirlo en el menú.");
+                first.Font = Ui.F(13f);
+                first.ForeColor = Ui.Dark ? Ui.Text : Color.FromArgb(70, 50, 10);
+                first.BackColor = Ui.CalloutBack;
+                first.Bar = Ui.CalloutBar;
+                first.Padding = new Padding(Ui.S(16), Ui.S(5), Ui.S(8), Ui.S(4));
+                first.TextAlign = ContentAlignment.MiddleLeft;
+                R(first, x, y, W, 30);
+                donePanel.Controls.Add(first);
+                y += 30 + 14;
+            }
+
+            // what the entries of its menu do (the words of the menu itself; as the image says it)
+            Label menu = text(L.T("What each entry of the Hades menu does", "Qué hace cada entrada del menú de Hades"), 15f, "semi", Ui.Text);
+            R(menu, x, y, W, 24);
+            y += 30;
+            bool hides = plan != null && plan.HidesOtherDisks;
+            var rows = new List<string[]>();
+            rows.Add(new[] { L.T("Run (recommended)", "Run (recomendado)"),
+                             hides ? L.T("The normal start. The other NVMe and SATA disks stay hidden.", "El arranque normal. Los demás discos NVMe y SATA quedan ocultos.")
+                                   : L.T("The normal start.", "El arranque normal.") });
+            if (hides)
+                rows.Add(new[] { L.T("Run (internal disks read-only)", "Run (discos internos en solo lectura)"),
+                                 L.T("Like Run, and shows the internal disks, mounted read-only.", "Como Run, y muestra los discos internos, montados en solo lectura.") });
+            rows.Add(new[] { "Live", L.T("Settings and add-ons stay in memory only, gone at power off.", "Los ajustes y addons solo quedan en memoria: se pierden al apagar.") });
+            rows.Add(new[] { "Installer", L.T("Installs Hades on a disk you choose, erasing it. Asks twice first.", "Instala Hades en un disco que elijas, borrándolo. Pregunta dos veces antes.") });
+            foreach (string[] row in rows)
+            {
+                Label a = text(row[0], 13f, "semi", Ui.Text);
+                R(a, x + 8, y, 230, 22);
+                Label b = text(row[1], 13f, "", Ui.Soft);
+                R(b, x + 244, y, W - 244, 22);
+                y += 26;
+            }
+            y += 10;
+
+            // the rest
+            var sb = new StringBuilder();
             sb.AppendLine(L.T("To go back to Windows, shut Hades down and turn the PC on without pressing anything.",
                               "Para volver a Windows, apaga Hades y enciende el PC sin pulsar nada."));
-            sb.AppendLine();
             if (Pc.SecureBoot == 1)
-            {
-                sb.AppendLine(L.T("Secure Boot is turned on in this PC: Hades will not start until it is turned off in the BIOS.",
-                                  "Secure Boot está activado en este PC: Hades no arrancará hasta desactivarlo en la BIOS."));
-                sb.AppendLine(L.T("Turn it back on whenever you want to play something that requires it.",
-                                  "Vuelve a activarlo cuando quieras jugar a algo que lo exija."));
-                sb.AppendLine();
-            }
+                sb.AppendLine(L.T("Secure Boot is turned on in this PC: Hades will not start until it is turned off in the BIOS. Turn it back on whenever you want to play something that requires it.",
+                                  "Secure Boot está activado en este PC: Hades no arrancará hasta desactivarlo en la BIOS. Vuelve a activarlo cuando quieras jugar a algo que lo exija."));
             if (place == Place.Usb)
-            {
-                sb.AppendLine(L.T("If Windows says that a drive has to be formatted, press Cancel: it is the part of Hades,",
-                                  "Si Windows dice que hay que formatear una unidad, pulsa Cancelar: es la parte de Hades,"));
-                sb.AppendLine(L.T("which Windows cannot read.", "que Windows no sabe leer."));
-            }
+                sb.Append(L.T("If Windows says that a drive has to be formatted, press Cancel: it is the part of Hades, which Windows cannot read.",
+                              "Si Windows dice que hay que formatear una unidad, pulsa Cancelar: es la parte de Hades, que Windows no sabe leer."));
             else
             {
                 sb.AppendLine(L.T("To remove it: open this program, choose “internal disk”, the disk, and “Remove LibreELEC Hades”.",
                                   "Para quitarlo: abre este programa, elige «disco interno», el disco, y «Quitar LibreELEC Hades»."));
-                sb.AppendLine(L.T("If you ever reinstall Windows, unplug this disk first, or Windows may put its own startup files on it.",
-                                  "Si algún día reinstalas Windows, desconecta antes este disco o Windows puede usar su arranque."));
+                sb.Append(L.T("If you ever reinstall Windows, unplug this disk first, or Windows may put its own startup files on it.",
+                              "Si algún día reinstalas Windows, desconecta antes este disco o Windows puede usar su arranque."));
             }
-            return sb.ToString();
+            Label notes = text(sb.ToString().TrimEnd(), 12.5f, "", Ui.Soft);
+            R(notes, x, y, W, 100);
+            R(close, 598, 30, 130, 38);
+            close.BringToFront();
         }
 
         // diag: what became of the folder hades-diag in an update
@@ -1205,12 +1584,40 @@ namespace Hades.Installer
             donePlace = place;
             doneUpdated = updated;
             doneDiag = diag;
-            doneText.Text = DoneText();
-            language.Enabled = !busy; // (it was off while the disk was worked on, and nothing else puts it on again here)
+            done = true;
             foreach (Control c in Controls)
-                if (c != donePanel && c.Top >= donePanel.Top) c.Visible = false;
+                if (c != donePanel && c != header && c.Top >= donePanel.Top)
+                {
+                    if (c.Visible) doneHid.Add(c);
+                    c.Visible = false;
+                }
+            language.LinkColor = language.VisitedLinkColor = Ui.InkSoft;
             donePanel.Visible = true;
+            BuildDone();
             donePanel.BringToFront();
+            // the steps of the bar at the side: all done (UpdateState is not called: it would put back what is hidden)
+            stepState[0] = stepState[1] = stepState[2] = 2;
+            stepSub[2] = L.T("Done", "Hecho");
+            one.SetState(2);
+            two.SetState(2);
+            header.Invalidate();
+        }
+
+        // The panel of "done" goes: what it hid comes back, and what was skipped while it was on show is done now (the list of
+        // disks again where a device came or went, else the state of what is chosen). Nothing in this window takes the panel
+        // away yet (its button closes the window); this is the one way to do it.
+        public void HideDone()
+        {
+            if (!done) return;
+            done = false;
+            donePanel.Visible = false;
+            foreach (Control c in doneHid) c.Visible = true;
+            doneHid.Clear();
+            bool devices = doneSkippedDevices;
+            doneSkippedDevices = doneSkippedState = false;
+            if (devices) LoadDisks();
+            else UpdateState();
+            list.Invalidate();
         }
 
         // For the screenshots of the tests: disks that are not those of this PC.
@@ -1232,6 +1639,47 @@ namespace Hades.Installer
                 if (((DiskInfo)list.Items[i]).SameAs(disk)) { list.SelectedIndex = i; return true; }
             return false;
         }
+        // (for the screenshots) the window as it is while a disk is worked on, at that point of the progress; and back
+        public void ShowWorking(int permille, bool removal = false)
+        {
+            busy = true;
+            showSteps = true;
+            stages.Permille = permille;
+            SetStages(removal);
+            bar.Value = permille;
+            UpdateState();
+            // (what Operations says: the stage and its own byte count, as the step that is marked)
+            long total = 3000L << 20, part = permille < 600 ? (permille - 50) * total / 550 : (permille - 600) * total / 400;
+            if (removal) { status.Text = stages.Stages[stages.Stage]; return; }
+            status.Text = permille < 600 ? L.T("Writing…  ", "Escribiendo…  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total)
+                                         : L.T("Verifying…  ", "Verificando…  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total);
+        }
+        public void EndWorking()
+        {
+            busy = false;
+            showSteps = false;
+            bar.Value = 0;
+            UpdateState();
+        }
+        // (for the tests) a device that came or went, and a display of another scale, as the window takes them from Windows
+        public void DevicesChangedForTest() { DevicesChanged(); }
+        public void ScaleChangedForTest(float scale) { ScaleChanged(scale); }
+        // whether all that is on show is the panel of "done" and the bar at the side; whether something waits for the panel to go;
+        // how many times the list of disks was made; where the panel and its button are
+        public bool OnlyDoneShows
+        {
+            get
+            {
+                foreach (Control c in Controls)
+                    if (c != donePanel && c != header && c.Visible) return false;
+                return donePanel.Visible && close.Visible;
+            }
+        }
+        public bool DoneWaits { get { return doneSkippedDevices || doneSkippedState; } }
+        public int DisksLoaded { get { return disksLoaded; } }
+        public Rectangle DoneBounds { get { return donePanel.Bounds; } }
+        public Rectangle CloseBounds { get { return close.Bounds; } }
+        public bool ListShows { get { return listFrame.Visible && list.Items.Count > 0; } }
         public bool GoReady { get { return go.Enabled; } }
         // the box of the diagnostics: what it shows, whether it can be set, and a click of the user on it
         public bool DiagnosticsTicked { get { return diagnostics.Checked; } }

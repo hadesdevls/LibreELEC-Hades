@@ -1,0 +1,344 @@
+From cceb5ffd69212f65b570369b93c702b584cf4103 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:23:38 +0000
+Subject: [PATCH] VideoPlayer: soft telecine is told only in a sequence at
+ 30000/1001 or 30, and a film at 24 is shown at 24
+
+2:3 pulldown carries a film at 24 pictures a second in a sequence at 30: the
+detector did not look at the frame rate of the sequence, so repeated fields
+that alternate in a sequence at 25 or 50 (which is no 3:2 pulldown) could be
+taken for a film at 23.976, and a film at 24 in a sequence at 30 was given
+23.976 too, which the times of its pictures then left every 25 s.
+
+The picture headers now carry the frame_rate_code of the last sequence header
+(PictureFlags::frameRateCode; the detector keeps it from one packet to the
+next, and the demuxer gives it the rate of the container for a stream whose
+packets carry no sequence header). A window is film only in a sequence at
+30000/1001 (the film is at 24000/1001) or at 30 (the film is at 24), the same
+for all of its pictures (FilmRateOf()). The demuxer gives the stream the rate
+of that film, and the film timer of VideoPlayerVideo takes the duration of a
+picture from it (CFilmTimer::SetDuration(); 1001/24000 s as before for the
+other).
+
+Tested on the host with streams whose sequence headers are set to another
+frame_rate_code: 30000/1001 is film at 24000/1001, 30 film at 24/1, 25 and 50
+are not film, video at 30 is not film; the 25 cases of the corpus of the
+detector, 29 files read ahead as a plain read, and t_softfilm with a film at
+24 in a sequence at 30 (1/24 s apart) pass. A detector without the frame rate
+in its test takes the sequences at 25 and 50 for film.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 19 ++++--
+ .../DVDDemuxers/Mpeg2SoftTelecine.h           | 65 ++++++++++++++++++-
+ xbmc/cores/VideoPlayer/FilmTimer.h            | 36 ++++++----
+ xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp   |  4 ++
+ 4 files changed, 106 insertions(+), 18 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 0027ed3..6144a8e 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -2066,6 +2066,11 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+     return;
+ 
+   CSoftTelecineDetector detector;
++  // (the rate that the container says, for pictures before the first sequence header of the stream)
++  const AVRational containerRate = m_pFormatContext->streams[index]->codecpar->framerate;
++  detector.SetFrameRateCode(containerRate.num == 30000 && containerRate.den == 1001 ? 4
++                            : containerRate.num == 30 && containerRate.den == 1     ? 5
++                                                                                    : 0);
+   bool progressiveSequence = false;
+   std::vector<PictureFlags> pictures;
+   size_t bytes = 0;
+@@ -2098,17 +2103,21 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+   // (only the groups of pictures that are complete: the last one is cut where the reading stopped)
+   const CSoftTelecineDetector::Verdict verdict = detector.GetVerdict();
+ 
+-  if (verdict == CSoftTelecineDetector::Verdict::FILM)
++  int rate = 0;
++  int scale = 0;
++  if (verdict == CSoftTelecineDetector::Verdict::FILM &&
++      FilmRateOf(detector.FilmFrameRateCode(), rate, scale))
+   {
+-    video->iFpsRate = 24000;
+-    video->iFpsScale = 1001;
++    video->iFpsRate = rate;
++    video->iFpsScale = scale;
+     video->interlaced = false;
+     video->softTelecine = true;
+     CLog::Log(LOGINFO,
+               "CDVDDemuxFFmpeg: stream {} is MPEG-2 video with soft telecine (the pictures of a "
+-              "film at 23.976 that carry the flags to be shown at 29.97, as seen in its first {} "
++              "film at {:.3f} that carry the flags to be shown at {:.3f}, as seen in its first {} "
+               "pictures): each is shown once, at the pace of the film",
+-              index, detector.Count());
++              index, static_cast<double>(rate) / scale, static_cast<double>(rate) * 1.25 / scale,
++              detector.Count());
+   }
+   else
+   {
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h b/xbmc/cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h
+index 42b2bd8..4fdccea 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h
+@@ -33,6 +33,10 @@
+  *   (the temporal reference), and says "film" only when a run of pictures shows the cadence
+  *   exactly. Real video, a hard telecine, a stream of 29.97 progressive pictures without repeated
+  *   fields, and a stream whose flags do not follow the cadence are never "film".
++ * - The cadence is the 2:3 pulldown of a film at 24 pictures per second into a sequence at 30:
++ *   only a sequence whose frame_rate_code says 30000/1001 (4: the film is at 24000/1001) or 30 (5:
++ *   the film is at 24) can be one (FilmRateOf()). A sequence at 25 or 50 with repeated fields is
++ *   no 3:2 pulldown, and one whose rate is not known is never "film".
+  */
+ 
+ namespace KODI::MPEG2
+@@ -49,8 +53,32 @@ struct PictureFlags
+   bool progressiveSequence = false; //!< of the sequence the picture is in
+   bool hasExtension = false; //!< the picture coding extension was found
+   bool groupStart = false; //!< a group of pictures or a sequence header came before it
++  //! frame_rate_code of the sequence header before it in its packet (0: none there; the detector
++  //! keeps the last one it had, CSoftTelecineDetector::Add())
++  int frameRateCode = 0;
+ };
+ 
++/*!
++ * \brief The rate of the film that a sequence of this frame_rate_code carries with 2:3 pulldown:
++ *        24000/1001 in 30000/1001 (4), 24 in 30 (5); false for any other
++ */
++inline bool FilmRateOf(int frameRateCode, int& rate, int& scale)
++{
++  switch (frameRateCode)
++  {
++    case 4:
++      rate = 24000;
++      scale = 1001;
++      return true;
++    case 5:
++      rate = 24;
++      scale = 1;
++      return true;
++    default:
++      return false;
++  }
++}
++
+ /*!
+  * \brief Reads the pictures that a packet of an MPEG-2 video stream holds
+  *
+@@ -59,7 +87,8 @@ struct PictureFlags
+  * 000001B3 (sequence header), 000001B5 (extension), 000001B8 (group of pictures) and 00000100
+  * (picture) matter here. The sequence extension sets progressive_sequence for the pictures after
+  * it (state kept in \p progressiveSequence); a picture with no picture coding extension
+- * (MPEG-1 video) is returned with hasExtension false.
++ * (MPEG-1 video) is returned with hasExtension false. A picture after a sequence header of the
++ * packet has its frame_rate_code (PictureFlags::frameRateCode).
+  *
+  * \param data the packet
+  * \param size its size
+@@ -75,6 +104,7 @@ inline size_t ParsePictures(const uint8_t* data,
+ {
+   size_t found = 0;
+   bool groupStart = false;
++  int frameRateCode = 0;
+   for (size_t i = 0; i + 4 <= size;)
+   {
+     if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1)
+@@ -89,6 +119,10 @@ inline size_t ParsePictures(const uint8_t* data,
+     if (code == 0xB3 || code == 0xB8)
+     {
+       groupStart = true;
++      // sequence header: horizontal and vertical size (12 bits each), aspect ratio (4),
++      // frame_rate_code (4)
++      if (code == 0xB3 && left >= 4)
++        frameRateCode = p[3] & 0x0F;
+     }
+     else if (code == 0x00 && left >= 2)
+     {
+@@ -96,6 +130,7 @@ inline size_t ParsePictures(const uint8_t* data,
+       picture.temporalReference = (p[0] << 2) | (p[1] >> 6);
+       picture.codingType = (p[1] >> 3) & 7;
+       picture.progressiveSequence = progressiveSequence;
++      picture.frameRateCode = frameRateCode;
+       picture.groupStart = groupStart;
+       groupStart = false;
+       pictures.push_back(picture);
+@@ -136,7 +171,10 @@ inline size_t ParsePictures(const uint8_t* data,
+  * - the fields follow each other in the order top, bottom, top, bottom across all the pictures
+  *   (the first field of each is the other parity than the last field of the one before it);
+  * - top_field_first changes between the pairs of pictures as the pulldown wants: four pictures
+- *   have fields 3, 2, 3, 2 and the parity of the first field follows from the order above.
++ *   have fields 3, 2, 3, 2 and the parity of the first field follows from the order above;
++ * - every picture is of a sequence at 30000/1001 or at 30, the same for all (FilmRateOf()): the
++ *   frame_rate_code of the last sequence header, or the one that the container said
++ *   (SetFrameRateCode()) where the stream has carried none.
+  * (repeat_first_field alternating gives the repeated field to half of the pictures.)
+  *
+  * "Film" starts after the first window that is and ends when a stretch of pictures that is long
+@@ -167,10 +205,24 @@ public:
+   {
+     if (picture.groupStart && !m_group.empty())
+       CloseGroup();
++    // (the frame rate of the sequence it is in: the last one that a sequence header said)
++    if (picture.frameRateCode)
++      m_frameRateCode = picture.frameRateCode;
+     m_group.push_back(picture);
++    m_group.back().frameRateCode = m_frameRateCode;
+     return m_verdict;
+   }
+ 
++  //! \brief The frame_rate_code that the container says, for the pictures before the first
++  //!        sequence header in the stream (0: not known)
++  void SetFrameRateCode(int frameRateCode) { m_frameRateCode = frameRateCode; }
++
++  //! \brief The frame_rate_code of the last window that was film (FilmRateOf()), 0 before any
++  int FilmFrameRateCode() const { return m_filmFrameRateCode; }
++
++  //! \brief The frame_rate_code of the sequence of the last picture (0: not known)
++  int FrameRateCode() const { return m_frameRateCode; }
++
+   //! \brief The pictures of the group that is open count too (at the end of the stream, or to
+   //!        decide with what has been read)
+   Verdict Finish()
+@@ -195,12 +247,17 @@ public:
+   {
+     if (run.size() < WINDOW)
+       return false;
++    int rate = 0;
++    int scale = 0;
+     for (size_t i = 0; i < run.size(); ++i)
+     {
+       const PictureFlags& p = run[i];
+       // (a field picture and a picture with no extension, MPEG-1 video, are not progressive frames)
+       if (p.progressiveSequence || !p.progressiveFrame)
+         return false;
++      // 2:3 pulldown is of a sequence at 30000/1001 or 30, the same for all the pictures
++      if (!FilmRateOf(p.frameRateCode, rate, scale) || p.frameRateCode != run[0].frameRateCode)
++        return false;
+       if (i > 0)
+       {
+         const PictureFlags& before = run[i - 1];
+@@ -243,6 +300,7 @@ private:
+       {
+         m_verdict = Verdict::FILM;
+         m_sinceFilm = 0;
++        m_filmFrameRateCode = window.front().frameRateCode;
+       }
+       else if (m_verdict == Verdict::FILM)
+       {
+@@ -259,5 +317,8 @@ private:
+   Verdict m_verdict = Verdict::UNKNOWN;
+   size_t m_count = 0;
+   size_t m_sinceFilm = 0;
++  int m_frameRateCode = 0; //!< of the sequence of the pictures that come
++  int m_filmFrameRateCode = 0;
+ };
++
+ } // namespace KODI::MPEG2
+diff --git a/xbmc/cores/VideoPlayer/FilmTimer.h b/xbmc/cores/VideoPlayer/FilmTimer.h
+index 7499282..ad7ba43 100644
+--- a/xbmc/cores/VideoPlayer/FilmTimer.h
++++ b/xbmc/cores/VideoPlayer/FilmTimer.h
+@@ -26,13 +26,14 @@ namespace KODI::VIDEOPLAYER
+  * apart from the first, as long as the time of the stream stays near it; if it does not (the
+  * stream jumps, or it does not run at the pace of the film) the times start again from the
+  * time of the stream. The pictures are the ones that were decoded; only when each is shown is
+- * made even.
++ * made even. A film at 24 in a sequence at 30 (KODI::MPEG2::FilmRateOf()) has its pictures 1/24 s
++ * apart (SetDuration()).
+  */
+ class CFilmTimer
+ {
+ public:
+   static constexpr double DURATION =
+-      1000000.0 * 1001.0 / 24000.0; //!< of a film picture, in DVD_TIME_BASE units
++      1000000.0 * 1001.0 / 24000.0; //!< of a film picture, in DVD_TIME_BASE units (24000/1001)
+   //! of a picture of the stream as it is coded, 1001/30000 s: the pulldown codes four pictures of
+   //! the film as five of the stream, in fields
+   static constexpr double CODED_DURATION = DURATION * 4.0 / 5.0;
+@@ -41,6 +42,17 @@ public:
+ 
+   void Reset() { m_anchored = false; }
+ 
++  //! \brief The duration of a picture of the film (DURATION, or 1/24 s for a film at 24); one that
++  //!        is no duration of a film between 20 and 30 pictures a second gives DURATION
++  void SetDuration(double duration)
++  {
++    m_duration = duration >= 1000000.0 / 30.0 && duration <= 1000000.0 / 20.0 ? duration : DURATION;
++    m_anchored = false;
++  }
++  //! \brief ... of a picture of the film, and of one of the stream as it is coded (four fifths)
++  double Duration() const { return m_duration; }
++  double CodedDuration() const { return m_duration * 4.0 / 5.0; }
++
+   /*!
+    * \brief The time of the next film picture
+    * \param pts the time of the picture in the stream, or the running guess (the end of the picture
+@@ -50,7 +62,7 @@ public:
+   double Next(double pts, bool hasTimestamp)
+   {
+     if (m_anchored && hasTimestamp &&
+-        std::fabs(pts - (m_anchor + static_cast<double>(m_count) * DURATION)) > TOLERANCE)
++        std::fabs(pts - (m_anchor + static_cast<double>(m_count) * m_duration)) > TOLERANCE)
+       m_anchored = false;
+     if (!m_anchored)
+     {
+@@ -58,10 +70,11 @@ public:
+       m_count = 0;
+       m_anchored = true;
+     }
+-    return m_anchor + static_cast<double>(m_count++) * DURATION;
++    return m_anchor + static_cast<double>(m_count++) * m_duration;
+   }
+ 
+ private:
++  double m_duration = DURATION;
+   bool m_anchored = false;
+   double m_anchor = 0.0;
+   int64_t m_count = 0;
+@@ -75,11 +88,12 @@ private:
+  * picture that is not interlaced) takes the next of the times of the film (CFilmTimer) and lasts a
+  * picture of the film. Every other picture is timed as Kodi times a picture with repeated fields
+  * (RepeatedFieldTiming()), from the duration of a picture of the stream: \p frameDuration, which
+- * in such a film is a coded picture (CFilmTimer::CODED_DURATION), not the 1001/24000 s of the film
+- * that the stream says. With the film's, the video in a film (its interlaced pictures, at 29.97)
+- * and every picture at a speed other than normal lasted a quarter more each, and those of them
+- * without a time of their own (a disc gives one to some pictures only) came later and later until
+- * the next picture with a time went back. After such a picture the times of the film start again
++ * in such a film is a coded picture (CFilmTimer::CodedDuration(), 1001/30000 s), not the
++ * 1001/24000 s of the film that the stream says. With the film's, the video in a film (its
++ * interlaced pictures, at 29.97) and every picture at a speed other than normal lasted a quarter
++ * more each, and those of them without a time of their own (a disc gives one to some pictures
++ * only) came later and later until the next picture with a time went back. After such a picture
++ * the times of the film start again
+  * from the picture that resumes it: without a time of its own, it took the n-th time after the
+  * last stretch of film, seconds before the video that came between.
+  * \param asFilm set to whether the picture took a time of the film (the running guess of the time
+@@ -96,9 +110,9 @@ inline PictureTime PictureTimeOf(CFilmTimer& timer,
+ {
+   asFilm = film && atFilmPace;
+   if (asFilm)
+-    return {timer.Next(pts, hasTimestamp), CFilmTimer::DURATION};
++    return {timer.Next(pts, hasTimestamp), timer.Duration()};
+   timer.Reset();
+-  return RepeatedFieldTiming(pts, film ? CFilmTimer::CODED_DURATION : frameDuration, repeatPicture);
++  return RepeatedFieldTiming(pts, film ? timer.CodedDuration() : frameDuration, repeatPicture);
+ }
+ 
+ /*!
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+index e5149cf..4bd61d1 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayerVideo.cpp
+@@ -195,6 +195,10 @@ void CVideoPlayerVideo::OpenStream(CDVDStreamInfo& hint, std::unique_ptr<CDVDVid
+   ResetFrameRateCalc();
+   m_softTelecine = hint.softTelecine;
+   m_filmTimer.Reset();
++  // (Hades: the film is at the rate that the stream says: 24000/1001, or 24 in a sequence at 30)
++  m_filmTimer.SetDuration(hint.softTelecine && hint.fpsrate > 0 && hint.fpsscale > 0
++                              ? static_cast<double>(DVD_TIME_BASE) * hint.fpsscale / hint.fpsrate
++                              : KODI::VIDEOPLAYER::CFilmTimer::DURATION);
+ 
+   m_iDroppedRequest = 0;
+   m_iLateFrames = 0;
+-- 
+2.53.0
+

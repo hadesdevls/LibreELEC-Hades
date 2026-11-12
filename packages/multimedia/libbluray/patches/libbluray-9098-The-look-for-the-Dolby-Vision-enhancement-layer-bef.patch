@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 21:50:35 +0000
+Subject: [PATCH] The look for the Dolby Vision enhancement layer before an
+ entry point reads its units in runs
+
+The look of "A reading from an entry point gets the Dolby Vision
+enhancement layer's picture before it" went back from an entry point one
+aligned unit (6 KiB) at a time, and read each unit by itself: a seek back
+of 6 KiB for each, from the one before the entry point's on. On a disc
+image or a file of a local drive that costs next to nothing; on an
+optical drive each is a turn of the disc, and over a network share a
+round trip. With the Dolby Vision profile 7 FEL test stream as a disc
+tree, a seek to each of its 119 entry points sought back 589 times (23 at
+most in one seek), and 842 times (40 at most) with the stream muxed
+again with the enhancement layer's access unit before each entry
+picture.
+
+The units are now read in runs, each in the order of the disc and ending
+at the unit that the look needs next: 8 units (48 KiB) first, which hold
+the lead of most entry points, then 32 (192 KiB); the first run is read
+into the buffer of the later ones, which the build checks. What the look finds,
+and so what the reader gives, is the same; a unit that cannot be read
+ends the look where it did before (a unit before it that cannot be read
+leaves it out of the run, and the look reads it again when it gets
+there).
+
+Checked with the same disc trees, a seek to each entry point and the
+first MiB that bd_read() gives after it, against the library before this
+change: the same bytes after all 119 seeks of both trees; seeks back
+589 and 842 before, 156 and 184 now (2 at most in one seek), for 4 and
+5 % more bytes read. A disc tree of the same stream without the
+enhancement layer in its STN reads exactly what it read without the
+look (the same reads, the same bytes). The tests of the library of
+libbluray-9089 to 9095 pass (59 checks).
+---
+ src/libbluray/bluray.c | 63 +++++++++++++++++++++++++++++++++---------
+ 1 file changed, 50 insertions(+), 13 deletions(-)
+
+diff --git a/src/libbluray/bluray.c b/src/libbluray/bluray.c
+index 35cdb38..18cdded 100644
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -1140,6 +1140,45 @@ static int64_t _seek_stream(BLURAY *bd, BD_STREAM *st,
+ 
+ #define LEAD_MAX_ATS     (27000000u * 3 / 2)  /* 1.5 s at 27 MHz: one second (T-STD), and half of it */
+ #define LEAD_MAX_PACKETS (24u * 1024 * 1024 / 192)  /* and never more than 24 MiB (1.5 s at 128 Mbit/s) */
++/* The units before the entry point are read in runs, each in the order of the disc and ending at the unit that the
++   look needs next: 8 units (48 KiB) first, which hold the lead of most entry points, then 32 (192 KiB). Read one by
++   one, each unit before the one read last would be a seek back for 6 KiB: on an optical drive, a turn of the disc
++   for each. */
++#define LEAD_RUN_FIRST   8
++#define LEAD_RUN_UNITS   32
++#if LEAD_RUN_FIRST > LEAD_RUN_UNITS
++#error "the first run of the look is read into the buffer of the later runs: LEAD_RUN_FIRST <= LEAD_RUN_UNITS"
++#endif
++
++/* The unit u of the clip: from the run in buf (the units *first to *last, of which those from *ok on were read), or
++   read with the n - 1 units before it, in their order; NULL where u cannot be read. A unit before it that cannot be
++   read leaves the run from the next one on: the look reads it again when it gets there, and ends there as before. */
++static const uint8_t *_lead_unit(BD_STREAM *st, uint8_t *buf, int64_t u, int64_t n,
++                                 int64_t *first, int64_t *ok, int64_t *last)
++{
++    int64_t i;
++
++    if (u >= *ok && u <= *last) {
++        return buf + (u - *first) * 6144;
++    }
++    *first = u - n + 1 > 0 ? u - n + 1 : 0;
++    *last = u;
++    *ok = *first;
++    if (file_seek(st->fp, *first * 6144, SEEK_SET) < 0) {
++        *ok = u + 1;
++        return NULL;
++    }
++    for (i = *first; i <= u; i++) {
++        if (file_read(st->fp, buf + (i - *first) * 6144, 6144) != 6144) {
++            *ok = i + 1;
++            if (i < u && file_seek(st->fp, (i + 1) * 6144, SEEK_SET) < 0) {
++                *ok = u + 1;
++                return NULL;
++            }
++        }
++    }
++    return *ok <= u ? buf + (u - *first) * 6144 : NULL;
++}
+ 
+ static int _pes_times(const uint8_t *p, int64_t *pts, int64_t *dts)
+ {
+@@ -1167,8 +1206,9 @@ static int _pes_times(const uint8_t *p, int64_t *pts, int64_t *dts)
+ static void _dv_lead(BLURAY *bd, BD_STREAM *st)
+ {
+     uint32_t ep = SPN(st->clip_pos);
+-    uint8_t *unit;
+-    int64_t unit_spn = -1;
++    uint8_t *run;
++    const uint8_t *unit;
++    int64_t first = 0, ok = 0, last = -1;
+     int64_t base_pts, base_dts, pts, dts, delta;
+     uint32_t ep_ats, spn, found = 0, scanned = 0;
+     int have = 0;
+@@ -1176,14 +1216,14 @@ static void _dv_lead(BLURAY *bd, BD_STREAM *st)
+     if (!st->lead_pid || ep == 0 || !st->fp) {
+         return;
+     }
+-    unit = malloc(6144);
+-    if (!unit) {
++    run = malloc(LEAD_RUN_UNITS * 6144);
++    if (!run) {
+         return;
+     }
+ 
+     /* the base layer's random-access picture at the entry point */
+-    unit_spn = (ep / 32) * 32;
+-    if (file_seek(st->fp, (int64_t)unit_spn * 192, SEEK_SET) < 0 || file_read(st->fp, unit, 6144) != 6144) {
++    unit = _lead_unit(st, run, ep / 32, LEAD_RUN_FIRST, &first, &ok, &last);
++    if (!unit) {
+         goto done;
+     }
+     {
+@@ -1199,12 +1239,9 @@ static void _dv_lead(BLURAY *bd, BD_STREAM *st)
+         const uint8_t *p;
+         uint32_t ats;
+         spn--;
+-        if ((int64_t)(spn / 32) * 32 != unit_spn) {
+-            unit_spn = (spn / 32) * 32;
+-            if (file_seek(st->fp, (int64_t)unit_spn * 192, SEEK_SET) < 0 ||
+-                file_read(st->fp, unit, 6144) != 6144) {
+-                break;
+-            }
++        unit = _lead_unit(st, run, spn / 32, LEAD_RUN_UNITS, &first, &ok, &last);
++        if (!unit) {
++            break;
+         }
+         p = unit + (spn % 32) * 192;
+         if (p[4] != 0x47) {
+@@ -1243,7 +1280,7 @@ done:
+     if (file_seek(st->fp, st->clip_block_pos, SEEK_SET) < 0) {
+         BD_DEBUG(DBG_BLURAY | DBG_CRIT, "Unable to seek clip %s!\n", st->clip->name);
+     }
+-    X_FREE(unit);
++    X_FREE(run);
+ }
+ 
+ /*
+-- 
+2.53.0
+

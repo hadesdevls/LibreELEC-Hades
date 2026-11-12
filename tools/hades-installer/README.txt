@@ -16,8 +16,8 @@ What you need
   - Windows 10 or 11.
   - A USB stick or a USB disk of 8 GB or more that can be erased. With an SSD on USB it runs much more
     smoothly than with a stick.
-  - For Dolby Vision: a TV that supports it and an NVIDIA RTX 20 or later graphics card (or a GTX 16), or
-    a recent AMD or Intel one, connected by HDMI straight to the TV.
+  - For Dolby Vision: a TV that supports it and NVIDIA graphics (a GeForce GTX 900 or later), or recent
+    AMD or Intel graphics, connected by HDMI straight to the TV.
 
 Installing
   1. Double-click LibreELEC-Hades-Installer.exe. Windows warns you twice, and that is normal:
@@ -25,8 +25,8 @@ Installing
          program does not carry a paid signature.
        - "Do you want to allow this app to make changes to your device?": Yes. It is needed to write to
          the drive.
-     The installer is in English, or in Spanish when Windows is in Spanish. The link at the top right
-     ("Español" / "English") changes it.
+     The installer is in English, or in Spanish when Windows is in Spanish. The link at the bottom left
+     of the dark side bar ("Español" / "English") changes it. It also follows Windows, light or dark.
   2. Choose where you want it:
        - On a USB drive (recommended). The whole drive is erased. No disk of the PC is touched, and from
          there Hades does not even see the disks of the PC.
@@ -38,7 +38,8 @@ Installing
          disks) makes that entry the one that starts by itself: it is off until you turn it on, it
          explains what it means first, and updating with this installer turns it off again.
   3. The program asks you to type a word before it touches anything, writes, and reads back what it wrote
-     to check it.
+     to check it. Each drive in the list shows its model, size and serial number, to be sure it is the
+     right one. At the end, the window tells you how to start Hades and what each entry of its menu does.
   Films on a USB disk or stick: plug it in. Hades opens USB drives by itself, however it was installed.
 
 Starting Hades
@@ -46,6 +47,10 @@ Starting Hades
        ASUS F8, MSI F11, Gigabyte F12, ASRock F11; laptops: F12 or Esc
   2. Choose the USB drive (the entry that says UEFI) or the disk where you installed it.
   3. The first time it prepares its space and restarts by itself: choose it again in the menu.
+  Hades shows its own boot menu, which starts the entry Run by itself after 5 seconds (a key stops it, to
+  choose another entry); how long it waits is changed in the LibreELEC settings (System, Boot menu: 10, 5,
+  3 or 1 second), and updating with this installer keeps it (the 10 seconds that versions before 1.0
+  waited by themselves become 5).
   To go back to Windows: shut Hades down and turn the PC on without pressing anything.
 
 Updating to a new version
@@ -63,14 +68,16 @@ Updating to a new version
 
 If something does not work: diagnostics
   Hades can keep what is needed to find out why: which graphics cards and displays the PC has, the logs
-  of the system and of Hades with every password, key and address path removed, and what is sent to the TV
-  during Dolby Vision. It is off unless you turn it on, and it sends nothing anywhere: it all stays on the
-  drive, in a folder named hades-diag.
+  of the system and of Hades with passwords, keys, network addresses and the names of your files and
+  folders replaced by markers, and what is sent to the TV during Dolby Vision. It is off unless you turn
+  it on, and it sends nothing anywhere: it all stays on the drive, in a folder named hades-diag.
   1. Turn it on: tick "Save diagnostics there" in the installer, when you install or when you update. On
      a USB drive it can also be done by hand: Windows shows a part of the drive as LIBREELEC, and there
      the file DIAG-OFF.TXT is the switch. Change OFF to ON in its name, so that it is DIAG-ON.TXT. (If
      Windows shows it as DIAG-OFF, without the ending, name it DIAG-ON: the ending stays as it is.)
-  2. Start Hades, do what does not work, wait five minutes, and turn the PC off from its menu.
+  2. Start Hades, do what does not work, wait five minutes, and turn the PC off from its menu. If what
+     fails is the entry Installer of the boot menu, start that entry with the diagnostics on: it keeps
+     its log too, as it goes.
   3. Back in Windows, a USB drive has the folder hades-diag on LIBREELEC. With Hades on an internal disk,
      Windows does not show that part. Get the folder onto a USB stick (one that Windows reads: FAT32,
      exFAT or NTFS) in one of two ways:

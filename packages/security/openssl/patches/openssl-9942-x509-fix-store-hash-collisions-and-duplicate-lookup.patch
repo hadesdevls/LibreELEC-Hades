@@ -1,0 +1,303 @@
+From 5667c99849cf3bed58b5da9acfae925d0adfc64f Mon Sep 17 00:00:00 2001
+From: Mounir IDRASSI <mounir.idrassi@idrix.fr>
+Date: Wed, 23 Sep 2026 15:47:10 +0900
+Subject: [PATCH] x509: fix store hash collisions and duplicate lookup
+
+Use canonical name bytes as the X509_STORE hash key and enable collision
+checking, as suggested by @npajkovsky in the review of PR #32659.
+
+Correct match_key so keys with different lengths don't compare equal
+when their hashes collide. Give empty names a nonnull key buffer so
+copying a zero length key doesn't pass a null source to memcpy.
+
+Continue duplicate lookup past objects with a different type or name.
+They can sit between matching entries when the store stack isn't sorted.
+Keep the collector name checks for the flat representation.
+
+Extend the store tests to reinsert duplicates in both representations
+and to look up equivalent or empty names. Add forced collision coverage
+for keys of different lengths, with RCU enabled and disabled.
+
+Assisted-by: Codex:gpt-6-astra
+Reviewed-by: Nikola Pajkovsky <nikolap@openssl.org>
+Reviewed-by: Richard Levitte <levitte@openssl.foundation>
+Merge-date: Tue Nov 10 10:43:59 2026
+Merged-from: https://github.com/openssl/openssl/pull/32659
+(cherry picked from commit 967814b4c183c4753e5b05733cb41d2f97f172fc)
+---
+ crypto/hashtable/hashtable.c    |  5 ++--
+ crypto/x509/x509_local.h        |  7 ++---
+ crypto/x509/x509_lu.c           | 25 +++++++---------
+ test/lhash_test.c               | 51 +++++++++++++++++++++++++++++++++
+ test/x509_load_cert_file_test.c | 38 ++++++++++++++++++++----
+ 5 files changed, 100 insertions(+), 26 deletions(-)
+
+diff --git a/crypto/hashtable/hashtable.c b/crypto/hashtable/hashtable.c
+index 1cce15e..132e3ad 100644
+--- a/crypto/hashtable/hashtable.c
++++ b/crypto/hashtable/hashtable.c
+@@ -590,8 +590,9 @@ static ossl_inline int match_key(HT_KEY *a, HT_KEY *b)
+      */
+     PREFETCH(a->keybuf);
+     PREFETCH(b->keybuf);
+-    if (a->keybuf != NULL && b->keybuf != NULL && a->keysize == b->keysize)
+-        return !memcmp(a->keybuf, b->keybuf, a->keysize);
++    if (a->keybuf != NULL && b->keybuf != NULL)
++        return a->keysize == b->keysize
++            && !memcmp(a->keybuf, b->keybuf, a->keysize);
+ 
+     return 1;
+ }
+diff --git a/crypto/x509/x509_local.h b/crypto/x509/x509_local.h
+index a343333..1f19414 100644
+--- a/crypto/x509/x509_local.h
++++ b/crypto/x509/x509_local.h
+@@ -127,10 +127,9 @@ struct x509_lookup_st {
+     X509_STORE *store_ctx; /* who owns us */
+ };
+ 
+-HT_START_KEY_DEFN(objs_key)
+-HT_DEF_KEY_FIELD(xn_canon, unsigned char *)
+-HT_DEF_KEY_FIELD(xn_canon_enclen, int)
+-HT_END_KEY_DEFN(OBJS_KEY)
++typedef struct {
++    HT_KEY key_header;
++} OBJS_KEY;
+ 
+ /*
+  * This is used to hold everything.  It is used for all certificate
+diff --git a/crypto/x509/x509_lu.c b/crypto/x509/x509_lu.c
+index 5138462..be7bc5d 100644
+--- a/crypto/x509/x509_lu.c
++++ b/crypto/x509/x509_lu.c
+@@ -10,7 +10,6 @@
+ #include <stdio.h>
+ #include "internal/cryptlib.h"
+ #include "internal/hashtable.h"
+-#include "internal/hashfunc.h"
+ #include "internal/refcount.h"
+ #include <openssl/x509.h>
+ #include "crypto/x509.h"
+@@ -190,11 +189,12 @@ static void objs_ht_free(HT_VALUE *v)
+     sk_X509_OBJECT_pop_free(objs, X509_OBJECT_free);
+ }
+ 
+-static uint64_t obj_ht_hash(HT_KEY *key)
++static void objs_ht_init_key(OBJS_KEY *key, const X509_NAME *xn)
+ {
+-    OBJS_KEY *k = (OBJS_KEY *)key;
+-
+-    return ossl_fnv1a_hash(k->keyfields.xn_canon, k->keyfields.xn_canon_enclen);
++    /* Empty names have no canonical buffer, but the hash table copies the key. */
++    HT_INIT_KEY(key);
++    key->key_header.keybuf = xn->canon_enc != NULL ? xn->canon_enc : (unsigned char *)"";
++    key->key_header.keysize = xn->canon_enclen;
+ }
+ 
+ X509_STORE *X509_STORE_new(void)
+@@ -202,7 +202,7 @@ X509_STORE *X509_STORE_new(void)
+     X509_STORE *ret = OPENSSL_zalloc(sizeof(*ret));
+     HT_CONFIG htconf = {
+         .ht_free_fn = objs_ht_free,
+-        .ht_hash_fn = obj_ht_hash,
++        .collision_check = 1,
+         .init_neighborhoods = X509_OBJS_HT_BUCKETS,
+         .no_rcu = 1,
+     };
+@@ -353,9 +353,7 @@ STACK_OF(X509_OBJECT) *ossl_x509_store_ht_get_by_name(const X509_STORE *store,
+             return NULL;
+     }
+ 
+-    HT_INIT_KEY(&key);
+-    HT_SET_KEY_FIELD(&key, xn_canon, xn->canon_enc);
+-    HT_SET_KEY_FIELD(&key, xn_canon_enclen, xn->canon_enclen);
++    objs_ht_init_key(&key, xn);
+     v = ossl_ht_get(store->objs_ht, TO_HT_KEY(&key));
+     if (v == NULL)
+         return NULL;
+@@ -392,9 +390,7 @@ static int x509_name_objs_ht_insert(const X509_STORE *store, const X509_NAME *xn
+         return 0;
+     }
+ 
+-    HT_INIT_KEY(&key);
+-    HT_SET_KEY_FIELD(&key, xn_canon, xn->canon_enc);
+-    HT_SET_KEY_FIELD(&key, xn_canon_enclen, xn->canon_enclen);
++    objs_ht_init_key(&key, xn);
+     val.value = (void *)objs;
+     ret = ossl_ht_insert(store->objs_ht, TO_HT_KEY(&key), &val, NULL);
+     if (ret != 1) {
+@@ -949,9 +945,8 @@ STACK_OF(X509) *X509_STORE_CTX_get1_certs(const X509_STORE_CTX *ctx,
+         x = obj->data.x509;
+         /*
+          * x509_object_idx_cnt() returns the exact number of matches, but they
+-         * need not be contiguous when |objs| is unsorted.  Hash collisions
+-         * can likewise mix several names into one hash-table stack. Re-check
+-         * the subject name and stop once all |cnt| matches have been added.
++         * need not be contiguous in the unsorted flat store. Check the
++         * subject name and stop once all |cnt| matches have been added.
+          */
+         if (X509_NAME_cmp(X509_get_subject_name(x), nm) != 0)
+             continue;
+diff --git a/test/lhash_test.c b/test/lhash_test.c
+index a626510..ed41f4c 100644
+--- a/test/lhash_test.c
++++ b/test/lhash_test.c
+@@ -213,6 +213,56 @@ static uint64_t hashtable_hash(HT_KEY *key)
+     return (uint64_t)(*(uint32_t *)key->keybuf);
+ }
+ 
++static uint64_t hashtable_collision_hash(HT_KEY *key)
++{
++    return 42;
++}
++
++static int test_hashtable_collisions(int idx)
++{
++    static unsigned char keys[][5] = { "aaa", "bbb", "bbbb", "" };
++    HT_CONFIG hash_conf = {
++        .ht_hash_fn = hashtable_collision_hash,
++        .collision_check = 1,
++        .no_rcu = idx,
++    };
++    struct {
++        HT_KEY key_header;
++    } key;
++    HT *ht = NULL;
++    HT_VALUE value = { 0 }, *found;
++    size_t i;
++    int ret = 0;
++
++    if (!TEST_ptr(ht = ossl_ht_new(&hash_conf)))
++        goto end;
++
++    /* Distinct keys must survive a collision even when their lengths differ. */
++    for (i = 0; i < OSSL_NELEM(keys); i++) {
++        HT_INIT_KEY(&key);
++        key.key_header.keybuf = keys[i];
++        key.key_header.keysize = strlen((char *)keys[i]);
++        value.value = keys[i];
++        if (!TEST_int_eq(ossl_ht_insert(ht, TO_HT_KEY(&key), &value, NULL), 1))
++            goto end;
++    }
++
++    for (i = 0; i < OSSL_NELEM(keys); i++) {
++        HT_INIT_KEY(&key);
++        key.key_header.keybuf = keys[i];
++        key.key_header.keysize = strlen((char *)keys[i]);
++        if (!TEST_ptr(found = ossl_ht_get(ht, TO_HT_KEY(&key)))
++            || !TEST_ptr_eq(found->value, keys[i]))
++            goto end;
++    }
++
++    ret = 1;
++
++end:
++    ossl_ht_free(ht);
++    return ret;
++}
++
+ static int test_int_hashtable(int idx)
+ {
+     static struct {
+@@ -920,6 +970,7 @@ int setup_tests(void)
+     ADD_TEST(test_int_lhash);
+     ADD_TEST(test_stress);
+     ADD_ALL_TESTS(test_int_hashtable, 2);
++    ADD_ALL_TESTS(test_hashtable_collisions, 2);
+     ADD_ALL_TESTS(test_hashtable_stress, 4);
+     ADD_ALL_TESTS(test_hashtable_multithread, 2);
+     ADD_MFAIL_TEST(test_hashtable_insert_replace_mfail);
+diff --git a/test/x509_load_cert_file_test.c b/test/x509_load_cert_file_test.c
+index b1c205e..1d3eb4b 100644
+--- a/test/x509_load_cert_file_test.c
++++ b/test/x509_load_cert_file_test.c
+@@ -180,21 +180,35 @@ static int check_store_get1_by_name(X509_STORE_CTX *ctx, const X509_NAME *name1,
+ }
+ 
+ /* Check exact lookup results in hash table and flat store representations. */
+-static int test_load_same_cn_certs(void)
++static int test_load_certs_by_name(int idx)
+ {
+     X509 *cert1 = NULL, *cert2 = NULL, *certA = NULL;
+     X509_CRL *crl1 = NULL, *crl2 = NULL, *crlA = NULL;
+     X509_STORE *store = NULL;
+     X509_STORE_CTX *ctx = NULL;
+-    const X509_NAME *name1;
+-    X509_NAME *nameA = NULL;
++    X509_NAME *name1 = NULL, *nameA = NULL;
+     int ret = 0;
+ 
+     if (!TEST_ptr(cert1 = X509_from_strings(cn_cert1))
+         || !TEST_ptr(cert2 = X509_from_strings(cn_cert2))
+         || !TEST_ptr(crl1 = CRL_from_strings(cn_crl2))
+-        || !TEST_ptr(name1 = X509_get_subject_name(cert1))
+-        || !TEST_ptr(nameA = X509_NAME_new())
++        || !TEST_ptr(name1 = X509_NAME_new()))
++        goto err;
++
++    if (idx == 0) {
++        /* Look up a separately encoded but equivalent name. */
++        if (!TEST_true(X509_NAME_add_entry_by_txt(name1, "CN", MBSTRING_ASC,
++                (unsigned char *)" WWW.EXAMPLE.TEST ", -1, -1, 0)))
++            goto err;
++    } else {
++        /* Empty names have a null canonical encoding with length zero. */
++        if (!TEST_true(X509_set_subject_name(cert1, name1))
++            || !TEST_true(X509_set_subject_name(cert2, name1))
++            || !TEST_true(X509_CRL_set_issuer_name(crl1, name1)))
++            goto err;
++    }
++
++    if (!TEST_ptr(nameA = X509_NAME_new())
+         || !TEST_true(X509_NAME_add_entry_by_txt(nameA, "CN", MBSTRING_ASC,
+             (unsigned char *)"alpha.test", -1, -1, 0))
+         || !TEST_ptr(certA = X509_dup(cert1))
+@@ -212,6 +226,9 @@ static int test_load_same_cn_certs(void)
+         || !TEST_true(X509_STORE_add_crl(store, crl2))
+         || !TEST_true(X509_STORE_add_cert(store, certA))
+         || !TEST_true(X509_STORE_add_crl(store, crlA))
++        /* An object of the other type precedes each existing duplicate. */
++        || !TEST_true(X509_STORE_add_cert(store, cert2))
++        || !TEST_true(X509_STORE_add_crl(store, crl2))
+         || !check_store_get1_by_name(ctx, name1, nameA, cert1, cert2, certA,
+             crl1, crl2, crlA))
+         goto err;
+@@ -219,6 +236,8 @@ static int test_load_same_cn_certs(void)
+ #ifndef OPENSSL_NO_DEPRECATED_4_0
+     /* Exercise conversion of an already populated store. */
+     if (!TEST_ptr(X509_STORE_get0_objects(store))
++        || !TEST_true(X509_STORE_add_cert(store, cert2))
++        || !TEST_true(X509_STORE_add_crl(store, crl2))
+         || !check_store_get1_by_name(ctx, name1, nameA, cert1, cert2, certA,
+             crl1, crl2, crlA))
+         goto err;
+@@ -240,6 +259,9 @@ static int test_load_same_cn_certs(void)
+         || !TEST_true(X509_STORE_add_crl(store, crl1))
+         || !TEST_true(X509_STORE_add_crl(store, crlA))
+         || !TEST_true(X509_STORE_add_crl(store, crl2))
++        /* Here the intervening objects have a different name. */
++        || !TEST_true(X509_STORE_add_cert(store, cert2))
++        || !TEST_true(X509_STORE_add_crl(store, crl2))
+         || !check_store_get1_by_name(ctx, name1, nameA, cert1, cert2, certA,
+             crl1, crl2, crlA))
+         goto err;
+@@ -248,6 +270,7 @@ static int test_load_same_cn_certs(void)
+     ret = 1;
+ 
+ err:
++    X509_NAME_free(name1);
+     X509_NAME_free(nameA);
+     X509_STORE_CTX_free(ctx);
+     X509_STORE_free(store);
+@@ -333,6 +356,11 @@ static int test_x509_pem_read_mfail(void)
+ 
+ OPT_TEST_DECLARE_USAGE("cert.pem [crl.pem]\n")
+ 
++static int test_load_same_cn_certs(void)
++{
++    return test_load_certs_by_name(0) && test_load_certs_by_name(1);
++}
++
+ int setup_tests(void)
+ {
+     if (!test_skip_common_options()) {

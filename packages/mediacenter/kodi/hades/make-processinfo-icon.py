@@ -3,7 +3,7 @@
 # Copyright (C) 2026-present Hades
 #
 # Draws processinfo.png, next to this script: the icon of the button of the video OSD of Estuary that opens the
-# player information (kodi-9005), which the recipe of kodi copies into the skin (post_patch). Drawn for this build;
+# player information (kodi-9027), which the recipe of kodi copies into the skin (post_patch). Drawn for this build;
 # nothing of it is taken from Estuary or any other source. Usage: make-processinfo-icon.py <file to write>
 # Draw the Estuary OSD icon "player process info": a white panel outline with three text lines, 128x128,
 # 8-bit grey + alpha like the other OSD button textures, antialiased by 8x8 supersampling. Standard library only.

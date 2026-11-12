@@ -1,0 +1,514 @@
+From 6e0450db30829641e65775dd6181f2720572c418 Mon Sep 17 00:00:00 2001
+From: olympia <olympia@xbmc.org>
+Date: Thu, 29 Oct 2026 12:50:24 +0100
+Subject: [PATCH] [BackgroundInfoLoader] Allow an item to be held back from the
+ loader
+
+The loader thread sets art, properties and other details on the items
+of a list without a lock, so another thread could only read or change an
+item safely after stopping the loader. Stopping waits for the item the
+loader is working on, however long its lookup takes. An item can now be
+held instead, and the hold only waits while the loader thread is working
+on that very item. The loader thread puts a held item aside, goes on with
+the other items, and loads the held item between them once it is
+released, at the latest after them, still the cached stuff before the
+lookup.
+
+The observer is now called before the loader thread lets go of the item,
+as it may change the item as well.
+
+The tests cover that a held item is loaded once it is released, that a
+hold waits only for the item the loader is working on, and that stopping
+the loader wakes it while it waits for a held item.
+---
+ xbmc/BackgroundInfoLoader.cpp          | 229 ++++++++++++++++++++-----
+ xbmc/BackgroundInfoLoader.h            |  48 ++++++
+ xbmc/test/CMakeLists.txt               |   1 +
+ xbmc/test/TestBackgroundInfoLoader.cpp | 130 ++++++++++++++
+ 4 files changed, 368 insertions(+), 40 deletions(-)
+ create mode 100644 xbmc/test/TestBackgroundInfoLoader.cpp
+
+diff --git a/xbmc/BackgroundInfoLoader.cpp b/xbmc/BackgroundInfoLoader.cpp
+index 5f35cf4..92f70dd 100644
+--- a/xbmc/BackgroundInfoLoader.cpp
++++ b/xbmc/BackgroundInfoLoader.cpp
+@@ -39,46 +39,7 @@ void CBackgroundInfoLoader::Run()
+     if (!m_vecItems.empty())
+     {
+       OnLoaderStart();
+-
+-      // Stage 1: All "fast" stuff we have already cached
+-      for (const auto& pItem : m_vecItems)
+-      {
+-        // Ask the callback if we should abort
+-        if ((m_pProgressCallback && m_pProgressCallback->Abort()) || m_bStop)
+-          break;
+-
+-        try
+-        {
+-          if (LoadItemCached(pItem.get()) && m_pObserver)
+-            m_pObserver->OnItemLoaded(pItem.get());
+-        }
+-        catch (...)
+-        {
+-          CLog::Log(LOGERROR,
+-                    "CBackgroundInfoLoader::LoadItemCached - Unhandled exception for item {}",
+-                    CURL::GetRedacted(pItem->GetPath()));
+-        }
+-      }
+-
+-      // Stage 2: All "slow" stuff that we need to lookup
+-      for (const auto& pItem : m_vecItems)
+-      {
+-        // Ask the callback if we should abort
+-        if ((m_pProgressCallback && m_pProgressCallback->Abort()) || m_bStop)
+-          break;
+-
+-        try
+-        {
+-          if (LoadItemLookup(pItem.get()) && m_pObserver)
+-            m_pObserver->OnItemLoaded(pItem.get());
+-        }
+-        catch (...)
+-        {
+-          CLog::Log(LOGERROR,
+-                    "CBackgroundInfoLoader::LoadItemLookup - Unhandled exception for item {}",
+-                    CURL::GetRedacted(pItem->GetPath()));
+-        }
+-      }
++      RunStages();
+     }
+ 
+     OnLoaderFinish();
+@@ -91,6 +52,140 @@ void CBackgroundInfoLoader::Run()
+   Reset();
+ }
+ 
++void CBackgroundInfoLoader::RunStages()
++{
++  std::vector<CFileItemPtr> heldBeforeCached;
++  std::vector<CFileItemPtr> heldBeforeLookup;
++  const auto putAside{[](std::vector<CFileItemPtr>& items, const CFileItemPtr& item)
++                      {
++                        if (std::ranges::find(items, item) == items.end())
++                          items.emplace_back(item);
++                      }};
++
++  // Stage 1: All "fast" stuff we have already cached
++  for (const auto& item : m_vecItems)
++  {
++    const ItemState state{ProcessItem(Stage::CACHED, item.get(), false)};
++    if (state == ItemState::STOPPED)
++      return;
++    if (state == ItemState::HELD)
++      putAside(heldBeforeCached, item);
++  }
++
++  // their lookup follows their cached stuff, in LoadReleasedItems() or in stage 3
++  const std::vector<CFileItemPtr> heldInStage1{heldBeforeCached};
++
++  // Stage 2: All "slow" stuff that we need to lookup
++  for (const auto& item : m_vecItems)
++  {
++    if (!LoadReleasedItems(heldBeforeCached, heldBeforeLookup))
++      return;
++
++    if (std::ranges::find(heldInStage1, item) != heldInStage1.end())
++      continue;
++
++    const ItemState state{ProcessItem(Stage::LOOKUP, item.get(), false)};
++    if (state == ItemState::STOPPED)
++      return;
++    if (state == ItemState::HELD)
++      putAside(heldBeforeLookup, item);
++  }
++
++  // Stage 3: The items still held, once they are released
++  for (const auto& item : heldBeforeCached)
++  {
++    if (ProcessItem(Stage::CACHED, item.get(), true) == ItemState::STOPPED ||
++        ProcessItem(Stage::LOOKUP, item.get(), true) == ItemState::STOPPED)
++      return;
++  }
++  for (const auto& item : heldBeforeLookup)
++  {
++    if (ProcessItem(Stage::LOOKUP, item.get(), true) == ItemState::STOPPED)
++      return;
++  }
++}
++
++bool CBackgroundInfoLoader::LoadReleasedItems(std::vector<CFileItemPtr>& heldBeforeCached,
++                                              std::vector<CFileItemPtr>& heldBeforeLookup)
++{
++  for (auto it = heldBeforeCached.begin(); it != heldBeforeCached.end();)
++  {
++    const ItemState state{ProcessItem(Stage::CACHED, it->get(), false)};
++    if (state == ItemState::STOPPED)
++      return false;
++    if (state == ItemState::HELD)
++    {
++      ++it;
++      continue;
++    }
++
++    const CFileItemPtr item{*it};
++    it = heldBeforeCached.erase(it);
++
++    const ItemState lookupState{ProcessItem(Stage::LOOKUP, item.get(), false)};
++    if (lookupState == ItemState::STOPPED)
++      return false;
++    if (lookupState == ItemState::HELD)
++      heldBeforeLookup.emplace_back(item);
++  }
++
++  for (auto it = heldBeforeLookup.begin(); it != heldBeforeLookup.end();)
++  {
++    const ItemState state{ProcessItem(Stage::LOOKUP, it->get(), false)};
++    if (state == ItemState::STOPPED)
++      return false;
++    if (state == ItemState::HELD)
++      ++it;
++    else
++      it = heldBeforeLookup.erase(it);
++  }
++
++  return true;
++}
++
++CBackgroundInfoLoader::ItemState CBackgroundInfoLoader::ProcessItem(Stage stage,
++                                                                    CFileItem* item,
++                                                                    bool waitWhileHeld)
++{
++  // Ask the callback if we should abort
++  if ((m_pProgressCallback && m_pProgressCallback->Abort()) || m_bStop)
++    return ItemState::STOPPED;
++
++  const ItemState state{BeginItem(item, waitWhileHeld)};
++  if (state != ItemState::STARTED)
++    return state;
++
++  // released after the observer, which may change the item as well
++  class CItemEnd
++  {
++  public:
++    explicit CItemEnd(CBackgroundInfoLoader& loader) : m_loader(loader) {}
++    ~CItemEnd() { m_loader.EndItem(); }
++
++    CItemEnd(const CItemEnd&) = delete;
++    CItemEnd& operator=(const CItemEnd&) = delete;
++
++  private:
++    CBackgroundInfoLoader& m_loader;
++  };
++  const CItemEnd itemEnd{*this};
++
++  const char* name{stage == Stage::CACHED ? "LoadItemCached" : "LoadItemLookup"};
++  try
++  {
++    const bool loaded{stage == Stage::CACHED ? LoadItemCached(item) : LoadItemLookup(item)};
++    if (loaded && m_pObserver)
++      m_pObserver->OnItemLoaded(item);
++  }
++  catch (...)
++  {
++    CLog::Log(LOGERROR, "CBackgroundInfoLoader::{} - Unhandled exception for item {}", name,
++              CURL::GetRedacted(item->GetPath()));
++  }
++
++  return ItemState::STARTED;
++}
++
+ void CBackgroundInfoLoader::Load(CFileItemList& items)
+ {
+   // Never start a background load while the application is shutting down.
+@@ -117,7 +212,10 @@ void CBackgroundInfoLoader::Load(CFileItemList& items)
+ 
+ void CBackgroundInfoLoader::StopAsync()
+ {
++  std::unique_lock lock(m_itemLock);
+   m_bStop = true;
++  // a loader thread waiting for a held item has to stop as well
++  m_itemChanged.notifyAll();
+ }
+ 
+ void CBackgroundInfoLoader::StopThread()
+@@ -132,6 +230,57 @@ void CBackgroundInfoLoader::StopThread()
+   Reset();
+ }
+ 
++CBackgroundInfoLoader::ItemState CBackgroundInfoLoader::BeginItem(const CFileItem* item,
++                                                                  bool waitWhileHeld)
++{
++  std::unique_lock lock(m_itemLock);
++  const auto isHeld{[this, item]
++                    { return std::ranges::find(m_heldItems, item) != m_heldItems.end(); }};
++  if (waitWhileHeld)
++    m_itemChanged.wait(lock, [this, &isHeld] { return m_bStop || !isHeld(); });
++
++  if (m_bStop)
++    return ItemState::STOPPED;
++  if (isHeld())
++    return ItemState::HELD;
++
++  m_currentItem = item;
++  return ItemState::STARTED;
++}
++
++void CBackgroundInfoLoader::EndItem()
++{
++  std::unique_lock lock(m_itemLock);
++  m_currentItem = nullptr;
++  m_itemChanged.notifyAll();
++}
++
++CBackgroundInfoLoader::CItemHold::CItemHold(CBackgroundInfoLoader& loader, const CFileItem* item)
++  : m_loader(loader),
++    m_item(item)
++{
++  if (!m_item)
++    return;
++
++  std::unique_lock lock(m_loader.m_itemLock);
++  m_loader.m_heldItems.emplace_back(m_item);
++  // the loader thread may be in the middle of this item
++  m_loader.m_itemChanged.wait(lock, [this] { return m_loader.m_currentItem != m_item; });
++}
++
++CBackgroundInfoLoader::CItemHold::~CItemHold()
++{
++  if (!m_item)
++    return;
++
++  std::unique_lock lock(m_loader.m_itemLock);
++  // the same item can be held more than once, release this hold only
++  if (const auto it{std::ranges::find(m_loader.m_heldItems, m_item)};
++      it != m_loader.m_heldItems.end())
++    m_loader.m_heldItems.erase(it);
++  m_loader.m_itemChanged.notifyAll();
++}
++
+ bool CBackgroundInfoLoader::IsLoading()
+ {
+   return m_bIsLoading;
+diff --git a/xbmc/BackgroundInfoLoader.h b/xbmc/BackgroundInfoLoader.h
+index 39836b2..0224bd6 100644
+--- a/xbmc/BackgroundInfoLoader.h
++++ b/xbmc/BackgroundInfoLoader.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "IProgressCallback.h"
++#include "threads/Condition.h"
+ #include "threads/CriticalSection.h"
+ #include "threads/IRunnable.h"
+ 
+@@ -44,6 +45,29 @@ public:
+   void StopThread(); // will actually stop the loader thread.
+   void StopAsync();  // will ask loader to stop as soon as possible, but not block
+ 
++  /*!
++   \brief Keeps the loader thread away from an item for as long as it lives, so that another thread
++   can read or change the item meanwhile. Waits only while the loader thread is working on that
++   very item. The loader thread puts a held item aside and goes on with the other items, and loads
++   it between them once it is released, at the latest after them.
++   \note The item has to outlive the hold. A null item is not held.
++   \note While the loader thread waits for a held item after the others, only stopping the loader
++   wakes it; an abort of the progress callback does not.
++   */
++  class CItemHold
++  {
++  public:
++    CItemHold(CBackgroundInfoLoader& loader, const CFileItem* item);
++    ~CItemHold();
++
++    CItemHold(const CItemHold&) = delete;
++    CItemHold& operator=(const CItemHold&) = delete;
++
++  private:
++    CBackgroundInfoLoader& m_loader;
++    const CFileItem* m_item{nullptr};
++  };
++
+ protected:
+   virtual void OnLoaderStart() {}
+   virtual void OnLoaderFinish() {}
+@@ -60,6 +84,30 @@ protected:
+   IProgressCallback* m_pProgressCallback{nullptr};
+ 
+ private:
++  enum class Stage
++  {
++    CACHED,
++    LOOKUP
++  };
++
++  enum class ItemState
++  {
++    STARTED,
++    HELD,
++    STOPPED
++  };
++
+   void Reset();
++  void RunStages();
++  bool LoadReleasedItems(std::vector<CFileItemPtr>& heldBeforeCached,
++                         std::vector<CFileItemPtr>& heldBeforeLookup);
++  ItemState ProcessItem(Stage stage, CFileItem* item, bool waitWhileHeld);
++  ItemState BeginItem(const CFileItem* item, bool waitWhileHeld);
++  void EndItem();
++
++  CCriticalSection m_itemLock;
++  XbmcThreads::ConditionVariable m_itemChanged;
++  const CFileItem* m_currentItem{nullptr}; //!< item the loader thread is working on
++  std::vector<const CFileItem*> m_heldItems; //!< items the loader thread has to leave alone
+ };
+ 
+diff --git a/xbmc/test/CMakeLists.txt b/xbmc/test/CMakeLists.txt
+index b0c82e5..7b1c8ae 100644
+--- a/xbmc/test/CMakeLists.txt
++++ b/xbmc/test/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ set(SOURCES TestAutoSwitch.cpp
++            TestBackgroundInfoLoader.cpp
+             TestBasicEnvironment.cpp
+             TestCueDocument.cpp
+             TestDateTime.cpp
+diff --git a/xbmc/test/TestBackgroundInfoLoader.cpp b/xbmc/test/TestBackgroundInfoLoader.cpp
+new file mode 100644
+index 0000000..7521396
+--- /dev/null
++++ b/xbmc/test/TestBackgroundInfoLoader.cpp
+@@ -0,0 +1,130 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "BackgroundInfoLoader.h"
++#include "FileItem.h"
++#include "FileItemList.h"
++#include "test/MtTestUtils.h"
++#include "threads/Event.h"
++
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++using namespace std::chrono_literals;
++
++namespace
++{
++class CRecordingLoader : public CBackgroundInfoLoader
++{
++public:
++  ~CRecordingLoader() override { StopThread(); }
++
++  bool LoadItemCached(CFileItem* item) override { return Record("cached:", *item); }
++  bool LoadItemLookup(CFileItem* item) override
++  {
++    if (item == m_blockLookupOf)
++    {
++      m_lookupStarted.Set();
++      m_continueLookup.Wait();
++    }
++    return Record("lookup:", *item);
++  }
++
++  std::vector<std::string> Calls()
++  {
++    std::unique_lock lock(m_callsLock);
++    return m_calls;
++  }
++
++  const CFileItem* m_blockLookupOf{nullptr};
++  CEvent m_lookupStarted;
++  CEvent m_continueLookup;
++
++private:
++  bool Record(const std::string& stage, const CFileItem& item)
++  {
++    std::unique_lock lock(m_callsLock);
++    m_calls.emplace_back(stage + item.GetPath());
++    return false;
++  }
++
++  CCriticalSection m_callsLock;
++  std::vector<std::string> m_calls;
++};
++
++void AddItems(CFileItemList& items)
++{
++  items.Add(std::make_shared<CFileItem>("a", false));
++  items.Add(std::make_shared<CFileItem>("b", false));
++}
++} // namespace
++
++TEST(TestBackgroundInfoLoader, HeldItemIsLoadedAfterRelease)
++{
++  CFileItemList items;
++  AddItems(items);
++  CRecordingLoader loader;
++  {
++    const CBackgroundInfoLoader::CItemHold hold{loader, items[0].get()};
++    loader.Load(items);
++    ASSERT_TRUE(ConditionPoll::poll([&loader] { return loader.Calls().size() >= 2; }));
++    EXPECT_EQ(loader.Calls(), (std::vector<std::string>{"cached:b", "lookup:b"}));
++  }
++  ASSERT_TRUE(ConditionPoll::poll([&loader] { return !loader.IsLoading(); }));
++  EXPECT_EQ(loader.Calls(),
++            (std::vector<std::string>{"cached:b", "lookup:b", "cached:a", "lookup:a"}));
++}
++
++TEST(TestBackgroundInfoLoader, HoldWaitsOnlyForItemInProgress)
++{
++  CFileItemList items;
++  AddItems(items);
++  CRecordingLoader loader;
++  loader.m_blockLookupOf = items[0].get();
++  loader.Load(items);
++  ASSERT_TRUE(loader.m_lookupStarted.Wait(5s));
++
++  {
++    // not the item in progress, so no wait
++    const CBackgroundInfoLoader::CItemHold hold{loader, items[1].get()};
++  }
++
++  std::atomic<bool> held{false};
++  std::thread holder(
++      [&]
++      {
++        const CBackgroundInfoLoader::CItemHold hold{loader, items[0].get()};
++        held = true;
++      });
++  std::this_thread::sleep_for(200ms);
++  EXPECT_FALSE(held);
++  loader.m_continueLookup.Set();
++  holder.join();
++  EXPECT_TRUE(held);
++}
++
++TEST(TestBackgroundInfoLoader, StopWakesWaitForHeldItem)
++{
++  CFileItemList items;
++  AddItems(items);
++  CRecordingLoader loader;
++  const CBackgroundInfoLoader::CItemHold hold{loader, items[0].get()};
++  loader.Load(items);
++  ASSERT_TRUE(ConditionPoll::poll([&loader] { return loader.Calls().size() >= 2; }));
++
++  // the loader thread waits for the held item now and must return without it
++  loader.StopThread();
++  EXPECT_FALSE(loader.IsLoading());
++  EXPECT_EQ(loader.Calls(), (std::vector<std::string>{"cached:b", "lookup:b"}));
++}
+-- 
+2.53.0
+

@@ -1,0 +1,826 @@
+From 682fd8326e3cc32af086b33f1030e64a2539c84d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 11:00:00 +0000
+Subject: [PATCH] DVDInputStreamNavigator: the soft telecine of the titles of a
+ DVD image or folder is read before they play
+
+The read ahead of the previous commit cannot be done for a disc: its
+navigation (menus, stills, a change of title set) runs inside the reads of
+the player. Here the titles are read by a navigator of their own.
+
+CDiscSoftTelecineScan opens a second libdvdnav on the same image (a second
+CDVDInputStreamFile) or folder when the player's navigator has opened the
+disc, in a thread: it takes the titles of two minutes or more (the longest
+twelve), plays each from its start with dvdnav_title_play(), takes the video
+of the program stream (KODI::DISC::CVideoCollector: pack header with its
+stuffing, packets of the first video stream, the PES header skipped) and
+gives the picture headers to the detector of the previous commit, until it
+knows or reaches 3 MiB of video, 4 s or 4000 events. Stills and waits are
+skipped. A disc in a drive (a path of an optical device) is not read ahead:
+a second reader would move the head against the player's.
+
+CDVDInputStreamNavigator::GetSoftTelecine() answers for the title that plays
+(waiting up to 1.5 s, once, if that title is being read now; a menu is "no").
+The generation it gives changes with the title set and the title. The
+demuxer asks at the first MPEG-2 video packet after a change
+(ApplyDiscSoftTelecine()): for film the stream says 24000/1001, not
+interlaced and softTelecine, and the player, which has not opened that
+video yet, picks 23.976 Hz once, with the line in kodi.log; for what is not
+film the stream is as it was, and what it said before is put back.
+
+The detector is not told the end of a stretch: its last group of pictures
+is cut where the reading stopped, and its last pictures in display order are
+missing; counted, it looked like a break in the cadence (a closed-GOP film
+was "not film" from the stretch, "film" from the file). Only complete groups
+count, here and in the read ahead of files.
+
+Tested with the real libdvdnav 7.0.0 and libdvdread 7.1.1 (built on the host
+from LibreELEC's sources) on discs authored with dvdauthor and mkisofs from
+MPEG-2 streams of the test corpus, as an ISO and as a VIDEO_TS folder: one
+title of film; and a disc with a menu (VMGM that jumps to a title) and eight
+titles: film with B pictures, hard telecine, video, film and then video,
+video and then film, closed-GOP film, every flag set, 2:2. The ISO and the
+folder give the same for all: film in the three that are film and in "film
+then video"; not film in the rest; each in 28 to 34 pictures and about
+1 MB of video. Six mutants of the collector and the scan fail the tests
+(a unit test with sectors made by hand: stuffing, PES header length, audio
+and a second video stream; the discs). The soft telecine timing of what
+plays is the one of the previous commit (kodisim: 1 refresh per picture in 8
+of 8 phases).
+
+Not tested: a disc with audio (the corpus encoder of the host has no AC-3),
+multi-angle titles, a disc in a drive, the player itself (nothing of Kodi runs
+on the host): the demuxer and navigator parts compile and were read.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  58 +++-
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  11 +
+ .../DVDInputStreams/CMakeLists.txt            |   3 +
+ .../DVDInputStreamNavigator.cpp               |  35 +++
+ .../DVDInputStreams/DVDInputStreamNavigator.h |  12 +
+ .../DVDInputStreams/DiscSoftTelecine.h        | 165 +++++++++++
+ .../DVDInputStreams/DiscSoftTelecineScan.cpp  | 260 ++++++++++++++++++
+ .../DVDInputStreams/DiscSoftTelecineScan.h    |  70 +++++
+ 8 files changed, 613 insertions(+), 1 deletion(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+ create mode 100644 xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 60552e3..608e5b6 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "DVDDemuxUtils.h"
+ #include "Mpeg2SoftTelecine.h"
++#include "DVDInputStreams/DVDInputStreamNavigator.h"
+ #include "DVDInputStreams/DVDInputStream.h"
+ #ifdef HAVE_LIBBLURAY
+ #include "DVDInputStreams/DVDInputStreamBluray.h"
+@@ -877,6 +878,8 @@ void CDVDDemuxFFmpeg::Dispose()
+   m_pkt.result = -1;
+   av_packet_unref(&m_pkt.pkt);
+   ClearPrefetched();
++  m_discSoftTelecineGeneration = 0xFFFFFFFFu;
++  m_discStream = {};
+ #ifdef HAVE_DVBRIDGE
+   ReportDVLayers();
+   m_dvMerge.Restart();
+@@ -1951,6 +1954,56 @@ void CDVDDemuxFFmpeg::TellDVOffset()
+ }
+ #endif
+ 
++// Hades: the player's navigator knows, when a title starts, whether it was read as soft telecined film
++// (CDiscSoftTelecineScan). Told here, at the first picture of the title, before the player has
++// opened its video: the stream says 23.976, not interlaced, and the mode is chosen for it once.
++void CDVDDemuxFFmpeg::ApplyDiscSoftTelecine(CDemuxStream* stream)
++{
++  auto* video = dynamic_cast<CDemuxStreamVideo*>(stream);
++  if (!video || !m_pInput || !m_pInput->IsStreamType(DVDSTREAM_TYPE_DVD))
++    return;
++  const auto navigator = std::dynamic_pointer_cast<CDVDInputStreamNavigator>(m_pInput);
++  if (!navigator)
++    return;
++  unsigned int generation = 0;
++  int film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(0));
++  if (generation == m_discSoftTelecineGeneration)
++    return;
++  if (film < 0)
++  {
++    // not read yet: wait a little, once for this title (the reading goes on in the background)
++    film = navigator->GetSoftTelecine(generation, std::chrono::milliseconds(1500));
++  }
++  m_discSoftTelecineGeneration = generation;
++  const bool wanted = film == 1;
++  if (wanted == video->softTelecine)
++    return;
++  if (wanted)
++  {
++    m_discStream = {true, video->iFpsRate, video->iFpsScale, video->interlaced};
++    video->iFpsRate = 24000;
++    video->iFpsScale = 1001;
++    video->interlaced = false;
++    video->softTelecine = true;
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: this DVD title is MPEG-2 video with soft telecine (the pictures of a "
++              "film at 23.976 that carry the flags to be shown at 29.97, as read before it started): "
++              "each is shown once, at the pace of the film");
++  }
++  else
++  {
++    if (m_discStream.saved)
++    {
++      video->iFpsRate = m_discStream.fpsRate;
++      video->iFpsScale = m_discStream.fpsScale;
++      video->interlaced = m_discStream.interlaced;
++    }
++    video->softTelecine = false;
++    CLog::Log(LOGDEBUG, "CDVDDemuxFFmpeg: this title is shown as the stream says");
++  }
++  ++video->changes;
++}
++
+ void CDVDDemuxFFmpeg::ClearPrefetched()
+ {
+   for (AVPacket* packet : m_prefetched)
+@@ -2022,7 +2075,8 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+       break;
+   }
+   m_timeout.SetInfinite();
+-  const CSoftTelecineDetector::Verdict verdict = detector.Finish();
++  // (only the groups of pictures that are complete: the last one is cut where the reading stopped)
++  const CSoftTelecineDetector::Verdict verdict = detector.GetVerdict();
+ 
+   if (verdict == CSoftTelecineDetector::Verdict::FILM)
+   {
+@@ -2386,6 +2440,8 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+       if (stream && stream->codec == AV_CODEC_ID_H264)
+         pPacket->recoveryPoint = m_seekToKeyFrame;
+       m_seekToKeyFrame = false;
++      if (stream && stream->codec == AV_CODEC_ID_MPEG2VIDEO)
++        ApplyDiscSoftTelecine(stream);
+ #ifdef HAVE_DVBRIDGE
+       ProbeDolbyVision(stream, pPacket->iStreamId, pPacket->pData, pPacket->iSize);
+ #endif
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 12f8c84..3b06d82 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -300,6 +300,17 @@ protected:
+   //! (PrefetchForSoftTelecine()); ReadFrame() gives them first, as if they had not been read
+   std::deque<AVPacket*> m_prefetched;
+   void PrefetchForSoftTelecine();
++  //! Hades: a DVD title that was read before it was played (CDiscSoftTelecineScan): what the stream
++  //! says of itself changes as the title does
++  void ApplyDiscSoftTelecine(CDemuxStream* stream);
++  unsigned int m_discSoftTelecineGeneration = 0xFFFFFFFFu;
++  struct
++  {
++    bool saved = false;
++    int fpsRate = 0;
++    int fpsScale = 0;
++    bool interlaced = false;
++  } m_discStream;
+   void ClearPrefetched();
+   //! Hades: says that the source of the file stopped delivering data (ReadInternal())
+   void LogReadTimeout() const;
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
+index 8e250e1..977456e 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
+@@ -5,6 +5,7 @@ set(SOURCES BlurayStateSerializer.cpp
+             DVDInputStreamFile.cpp
+             DVDInputStreamMemory.cpp
+             DVDInputStreamNavigator.cpp
++            DiscSoftTelecineScan.cpp
+             DVDStateSerializer.cpp
+             InputStreamAddon.cpp
+             InputStreamMultiSource.cpp
+@@ -19,6 +20,8 @@ set(HEADERS BlurayStateSerializer.h
+             DVDInputStreamFile.h
+             DVDInputStreamMemory.h
+             DVDInputStreamNavigator.h
++            DiscSoftTelecine.h
++            DiscSoftTelecineScan.h
+             DVDStateSerializer.h
+             DllDvdNav.h
+             InputStreamAddon.h
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+index e78e94a..050eac5 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+@@ -327,11 +327,42 @@ bool CDVDInputStreamNavigator::Open()
+   // For playlist/chapter watch time
+   m_startWatchTime = std::chrono::steady_clock::now();
+ 
++  // Hades: which titles are soft telecined film, read apart from the playing
++  // (not a disc in a drive: a second reader would move the head of the drive against the player's)
++  if (URIUtils::IsDVD(path) || StringUtils::StartsWith(path, "/dev/"))
++  {
++    CLog::Log(LOGDEBUG, "CDVDInputStreamNavigator: the titles of a disc in a drive are not read ahead");
++  }
++  else
++  {
++    m_softTelecineScan =
++        std::make_unique<CDiscSoftTelecineScan>(m_item, path, m_item.IsDiscImage());
++    m_softTelecineScan->Start();
++  }
++
+   return true;
+ }
+ 
++int CDVDInputStreamNavigator::GetSoftTelecine(unsigned int& generation,
++                                              std::chrono::milliseconds wait)
++{
++  generation = m_softTelecineGeneration;
++  if (!m_softTelecineScan || m_iTitle <= 0 || m_bInMenu)
++    return 0;
++  switch (m_softTelecineScan->Get(m_iTitle, wait))
++  {
++    case CDiscSoftTelecineScan::State::FILM:
++      return 1;
++    case CDiscSoftTelecineScan::State::NOT_FILM:
++      return 0;
++    default:
++      return -1;
++  }
++}
++
+ void CDVDInputStreamNavigator::Close()
+ {
++  m_softTelecineScan.reset();
+   if (!m_dvdnav) return;
+ 
+   // finish off by closing the dvdnav device
+@@ -523,6 +554,7 @@ int CDVDInputStreamNavigator::ProcessBlock(uint8_t* dest_buffer, int* read)
+         if(m_holdmode == HOLDMODE_NONE)
+         {
+           CLog::Log(LOGDEBUG, " - DVDNAV_VTS_CHANGE (HOLDING)");
++          ++m_softTelecineGeneration;
+           m_holdmode = HOLDMODE_HELD;
+           iNavresult = NAVRESULT_HOLD;
+         }
+@@ -548,7 +580,10 @@ int CDVDInputStreamNavigator::ProcessBlock(uint8_t* dest_buffer, int* read)
+         uint32_t pos = 0;
+         uint32_t len = 0;
+ 
++        const int titleBefore = m_iTitle;
+         m_dll.dvdnav_current_title_info(m_dvdnav, &m_iTitle, &m_iPart);
++        if (m_iTitle != titleBefore)
++          ++m_softTelecineGeneration;
+         m_dll.dvdnav_get_number_of_titles(m_dvdnav, &m_iTitleCount);
+         if(m_iTitle > 0)
+           m_dll.dvdnav_get_number_of_parts(m_dvdnav, m_iTitle, &m_iPartCount);
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
+index 95471c1..fe19c02 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.h
+@@ -14,6 +14,7 @@
+ #include "DVDInputStream.h"
+ #include "DVDInputStreamFile.h"
+ #include "DVDStateSerializer.h"
++#include "DiscSoftTelecineScan.h"
+ #include "DllDvdNav.h"
+ #include "cores/MenuType.h"
+ #include "threads/CriticalSection.h"
+@@ -130,6 +131,14 @@ public:
+ 
+   float GetVideoAspectRatio();
+ 
++  /*!
++   * \brief (Hades) Whether the title that plays is a film with soft telecine, read before it was played
++   * \param generation changes whenever the title that plays changes (a new title, a new title set)
++   * \param wait how long to wait if the title is being read now
++   * \return 1 for soft telecine, 0 if it is not (or this is a menu), -1 if it could not be told
++   */
++  int GetSoftTelecine(unsigned int& generation, std::chrono::milliseconds wait);
++
+   CDVDInputStream::IPosTime* GetIPosTime() override { return this; }
+   bool PosTime(int iTimeInMsec) override; //seek within current pg(c)
+ 
+@@ -186,6 +195,9 @@ protected:
+ 
+   int m_iTitleCount;
+   int m_iTitle;
++  //! Hades: the first video of the titles, read by a navigator of its own (DiscSoftTelecineScan.h)
++  std::unique_ptr<CDiscSoftTelecineScan> m_softTelecineScan;
++  unsigned int m_softTelecineGeneration = 0;
+ 
+   int m_iPartCount;
+   int m_iPart;
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+new file mode 100644
+index 0000000..c5013a3
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+@@ -0,0 +1,165 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++/*!
++ * \file DiscSoftTelecine.h
++ * \brief (Hades) Soft telecine of a DVD title, read from its first video before it is played
++ *
++ * A disc cannot be read ahead from the demuxer: its navigation (menus, stills, a change of title
++ * set) runs inside the reads of the player. The titles are therefore read by a navigator of their
++ * own, on a copy of the disc that nothing else uses (CDiscSoftTelecineScan), which plays each title
++ * from its start, takes the video of the program stream and gives its picture headers to
++ * KODI::MPEG2::CSoftTelecineDetector, with no decoding. The player's navigator only asks, when a
++ * title starts, what was found for it.
++ *
++ * Nothing here depends on Kodi or on a library: the navigator is a template parameter, so that the
++ * same file is tested outside of Kodi against libdvdnav and authored discs.
++ */
++
++namespace KODI::DISC
++{
++/*!
++ * \brief The video elementary stream of the DVD sectors that are added
++ *
++ * A sector of a DVD is 2048 bytes: a pack header, and packets (a system header, the navigation
++ * packet, audio, subpictures, video). The payload of the packets of the video stream (0xE0 to
++ * 0xEF, the first one seen) is kept, in the order it comes in.
++ */
++class CVideoCollector
++{
++public:
++  void AddSector(const uint8_t* s, size_t size)
++  {
++    size_t i = 0;
++    if (size < 14 || s[0] != 0 || s[1] != 0 || s[2] != 1 || s[3] != 0xBA)
++      return;
++    i = 14 + (s[13] & 7); // pack header (MPEG-2: 14 bytes and the stuffing)
++    while (i + 6 <= size)
++    {
++      if (s[i] != 0 || s[i + 1] != 0 || s[i + 2] != 1)
++        return;
++      const uint8_t id = s[i + 3];
++      const size_t length = (static_cast<size_t>(s[i + 4]) << 8) | s[i + 5];
++      const size_t end = std::min(size, i + 6 + length);
++      if (id >= 0xE0 && id <= 0xEF && (m_id == 0 || m_id == id) && i + 9 <= end)
++      {
++        m_id = id;
++        const size_t payload = i + 9 + s[i + 8];
++        if (payload < end)
++          m_video.insert(m_video.end(), s + payload, s + end);
++      }
++      i = i + 6 + length;
++    }
++  }
++
++  const std::vector<uint8_t>& Video() const { return m_video; }
++
++private:
++  std::vector<uint8_t> m_video;
++  uint8_t m_id = 0;
++};
++
++//! \brief What was found of a title
++struct TitleResult
++{
++  MPEG2::CSoftTelecineDetector::Verdict verdict = MPEG2::CSoftTelecineDetector::Verdict::UNKNOWN;
++  size_t pictures = 0; //!< pictures that were read
++  size_t videoBytes = 0;
++  bool outOfBudget = false; //!< stopped by a limit, with no verdict
++};
++
++//! \brief What the picture headers of a stretch of video say
++inline MPEG2::CSoftTelecineDetector::Verdict VerdictOfVideo(const std::vector<uint8_t>& video,
++                                                            size_t* pictures = nullptr)
++{
++  MPEG2::CSoftTelecineDetector detector;
++  bool progressiveSequence = false;
++  std::vector<MPEG2::PictureFlags> found;
++  MPEG2::ParsePictures(video.data(), video.size(), progressiveSequence, found);
++  // Only the groups of pictures that are complete count: the end of what was read is in the middle of
++  // one, whose last pictures (in display order) are not there, and which would look like a break
++  // in the cadence.
++  MPEG2::CSoftTelecineDetector::Verdict verdict = detector.GetVerdict();
++  for (const MPEG2::PictureFlags& p : found)
++    verdict = detector.Add(p);
++  if (pictures)
++    *pictures = detector.Count();
++  return verdict;
++}
++
++/*!
++ * \brief Reads the start of a title with a navigator and tells whether its video is soft telecine
++ *
++ * \tparam Nav needs: `bool Play(int title)`; `Nav::Event Next(const uint8_t*& data, int& size)` that
++ *         returns Nav::Event::BLOCK for a sector (2048 bytes), STILL or WAIT for a still frame or a
++ *         wait (they are skipped with `Skip()`), STOP or ERROR to end, and anything else for an event
++ *         that does not matter; `void Skip()`.
++ * \param stop called often: true to give up (the disc is closed)
++ */
++template<class Nav, class Stop>
++TitleResult ScanTitle(Nav& nav, int title, Stop&& stop)
++{
++  static constexpr size_t MAX_VIDEO_BYTES = 3 * 1024 * 1024; //!< of video read
++  static constexpr size_t CHECK_EVERY = 256 * 1024;
++  static constexpr unsigned MAX_EVENTS = 4000; //!< that are not sectors (a menu that never ends)
++  static constexpr auto MAX_TIME = std::chrono::seconds(4);
++
++  TitleResult result;
++  if (!nav.Play(title))
++    return result;
++  CVideoCollector collector;
++  const auto begin = std::chrono::steady_clock::now();
++  size_t checked = 0;
++  unsigned events = 0;
++  for (;;)
++  {
++    if (stop() || std::chrono::steady_clock::now() - begin > MAX_TIME ||
++        collector.Video().size() >= MAX_VIDEO_BYTES || events > MAX_EVENTS)
++    {
++      result.outOfBudget = true;
++      break;
++    }
++    const uint8_t* data = nullptr;
++    int size = 0;
++    const auto ev = nav.Next(data, size);
++    if (ev == Nav::Event::BLOCK)
++    {
++      collector.AddSector(data, static_cast<size_t>(size));
++      if (collector.Video().size() >= checked + CHECK_EVERY)
++      {
++        checked = collector.Video().size();
++        if (VerdictOfVideo(collector.Video()) != MPEG2::CSoftTelecineDetector::Verdict::UNKNOWN)
++          break;
++      }
++    }
++    else if (ev == Nav::Event::STOP || ev == Nav::Event::ERROR)
++      break;
++    else
++    {
++      ++events;
++      if (ev == Nav::Event::STILL || ev == Nav::Event::WAIT)
++        nav.Skip();
++    }
++  }
++  result.videoBytes = collector.Video().size();
++  result.verdict = VerdictOfVideo(collector.Video(), &result.pictures);
++  if (result.verdict != MPEG2::CSoftTelecineDetector::Verdict::UNKNOWN)
++    result.outOfBudget = false;
++  return result;
++}
++} // namespace KODI::DISC
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+new file mode 100644
+index 0000000..2681c60
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+@@ -0,0 +1,260 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "DiscSoftTelecineScan.h"
++
++#include "DVDInputStreamFile.h"
++#include "DiscSoftTelecine.h"
++#include "DllDvdNav.h"
++#include "filesystem/IFileTypes.h"
++#include "utils/log.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <utility>
++#include <vector>
++
++namespace
++{
++using KODI::MPEG2::CSoftTelecineDetector;
++
++constexpr uint64_t MIN_TITLE_TICKS = 120ULL * 90000ULL; // two minutes, in 90 kHz ticks
++constexpr size_t MAX_TITLES = 12;
++
++// the reads of an image, as the player's navigator does them (its callbacks are private to it)
++int cbSeek(void* stream, uint64_t pos)
++{
++  return static_cast<CDVDInputStreamFile*>(stream)->Seek(pos, SEEK_SET) >= 0 ? 0 : -1;
++}
++
++int cbRead(void* stream, void* buffer, int count)
++{
++  auto* file = static_cast<CDVDInputStreamFile*>(stream);
++  int done = 0;
++  while (done < count)
++  {
++    const int r = file->Read(static_cast<uint8_t*>(buffer) + done, count - done);
++    if (r < 0)
++      return r;
++    if (r == 0)
++      break;
++    done += r;
++  }
++  return done;
++}
++
++// what libdvdnav's reads of the second navigator say goes to the log at debug level
++#if DVDNAV_VERSION >= 60100
++void cbLog(void* /*priv*/, dvdnav_logger_level_t /*level*/, const char* fmt, va_list va)
++{
++  char text[512];
++  vsnprintf(text, sizeof(text), fmt, va);
++  CLog::Log(LOGDEBUG, "CDiscSoftTelecineScan: libdvdnav: {}", text);
++}
++#endif
++
++//! The navigator that DiscSoftTelecine.h reads a title with
++struct Nav
++{
++  enum class Event
++  {
++    BLOCK,
++    STILL,
++    WAIT,
++    STOP,
++    ERROR,
++    OTHER,
++  };
++
++  DllDvdNav& dll;
++  dvdnav_t* nav;
++  uint8_t block[DVD_VIDEO_LB_LEN];
++
++  bool Play(int title) { return dll.dvdnav_title_play(nav, title) == DVDNAV_STATUS_OK; }
++
++  Event Next(const uint8_t*& data, int& size)
++  {
++    int32_t event = 0;
++    int32_t length = 0;
++    if (dll.dvdnav_get_next_block(nav, block, &event, &length) != DVDNAV_STATUS_OK)
++      return Event::ERROR;
++    data = block;
++    size = length;
++    switch (event)
++    {
++      case DVDNAV_BLOCK_OK:
++        return Event::BLOCK;
++      case DVDNAV_STILL_FRAME:
++        return Event::STILL;
++      case DVDNAV_WAIT:
++        return Event::WAIT;
++      case DVDNAV_STOP:
++        return Event::ERROR;
++      default:
++        return Event::OTHER;
++    }
++  }
++
++  void Skip()
++  {
++    dll.dvdnav_still_skip(nav);
++    dll.dvdnav_wait_skip(nav);
++  }
++};
++} // namespace
++
++CDiscSoftTelecineScan::CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image)
++  : m_item(item), m_path(std::move(path)), m_image(image)
++{
++}
++
++CDiscSoftTelecineScan::~CDiscSoftTelecineScan()
++{
++  Stop();
++}
++
++void CDiscSoftTelecineScan::Start()
++{
++  if (!m_thread.joinable())
++    m_thread = std::thread([this] { Run(); });
++}
++
++void CDiscSoftTelecineScan::Stop()
++{
++  m_stop = true;
++  m_changed.notify_all();
++  if (m_thread.joinable())
++    m_thread.join();
++}
++
++CDiscSoftTelecineScan::State CDiscSoftTelecineScan::Get(int title,
++                                                        std::chrono::milliseconds wait)
++{
++  std::unique_lock lock(m_mutex);
++  const auto known = [&] { return m_results.contains(title) || m_finished || m_stop; };
++  const auto expected = [&] { return !m_planned || m_plan.contains(title); };
++  if (!known() && expected() && wait.count() > 0)
++    m_changed.wait_for(lock, wait, [&] { return known() || (m_planned && !m_plan.contains(title)); });
++  const auto it = m_results.find(title);
++  return it == m_results.end() ? State::UNKNOWN : it->second;
++}
++
++void CDiscSoftTelecineScan::Run()
++{
++  using clock = std::chrono::steady_clock;
++  const auto begin = clock::now();
++
++  DllDvdNav dll;
++  dvdnav_t* nav = nullptr;
++  std::unique_ptr<CDVDInputStreamFile> stream;
++  dvdnav_stream_cb callbacks{};
++  callbacks.pf_read = cbRead;
++  callbacks.pf_seek = cbSeek;
++
++  const auto finish = [&]
++  {
++    if (nav)
++      dll.dvdnav_close(nav);
++    if (stream)
++      stream->Close();
++    std::lock_guard lock(m_mutex);
++    m_planned = true;
++    m_finished = true;
++    m_changed.notify_all();
++  };
++
++  if (!dll.Load())
++    return finish();
++  if (m_image)
++  {
++    stream = std::make_unique<CDVDInputStreamFile>(m_item, XFILE::READ_TRUNCATED | XFILE::READ_BITRATE);
++    if (!stream->Open())
++      return finish();
++#if DVDNAV_VERSION >= 60100
++    dvdnav_logger_cb logger;
++    logger.pf_log = cbLog;
++    if (dll.dvdnav_open_stream2(&nav, stream.get(), &logger, &callbacks) != DVDNAV_STATUS_OK)
++#else
++    if (dll.dvdnav_open_stream(&nav, stream.get(), &callbacks) != DVDNAV_STATUS_OK)
++#endif
++      return finish();
++  }
++  else
++  {
++#if DVDNAV_VERSION >= 60100
++    dvdnav_logger_cb logger;
++    logger.pf_log = cbLog;
++    if (dll.dvdnav_open2(&nav, nullptr, &logger, m_path.c_str()) != DVDNAV_STATUS_OK)
++#else
++    if (dll.dvdnav_open(&nav, m_path.c_str()) != DVDNAV_STATUS_OK)
++#endif
++      return finish();
++  }
++
++  int32_t mask = 0;
++  if (dll.dvdnav_get_disk_region_mask(nav, &mask) == DVDNAV_STATUS_ERR || mask == 0)
++    mask = 0xff;
++  dll.dvdnav_set_region_mask(nav, mask);
++  dll.dvdnav_set_readahead_flag(nav, 0);
++
++  int32_t count = 0;
++  dll.dvdnav_get_number_of_titles(nav, &count);
++  std::vector<std::pair<uint64_t, int>> titles; // duration, number
++  for (int t = 1; t <= count && t <= 99 && !m_stop; ++t)
++  {
++    uint64_t* times = nullptr;
++    uint64_t duration = 0;
++    dll.dvdnav_describe_title_chapters(nav, t, &times, &duration);
++    free(times);
++    if (duration >= MIN_TITLE_TICKS)
++      titles.emplace_back(duration, t);
++  }
++  std::sort(titles.begin(), titles.end(), [](const auto& a, const auto& b) { return a > b; });
++  if (titles.size() > MAX_TITLES)
++    titles.resize(MAX_TITLES);
++  {
++    std::lock_guard lock(m_mutex);
++    for (const auto& title : titles)
++      m_plan.insert(title.second);
++    m_planned = true;
++    m_changed.notify_all();
++  }
++
++  Nav reader{dll, nav, {}};
++  size_t films = 0;
++  for (const auto& title : titles)
++  {
++    if (m_stop)
++      break;
++    const KODI::DISC::TitleResult r =
++        KODI::DISC::ScanTitle(reader, title.second, [this] { return m_stop.load(); });
++    State state = State::UNKNOWN;
++    if (r.verdict == CSoftTelecineDetector::Verdict::FILM)
++      state = State::FILM;
++    else if (r.verdict == CSoftTelecineDetector::Verdict::NOT_FILM)
++      state = State::NOT_FILM;
++    films += state == State::FILM;
++    CLog::Log(LOGDEBUG,
++              "CDiscSoftTelecineScan: title {} ({:.0f} s): {} after {} pictures, {} bytes of video{}",
++              title.second, static_cast<double>(title.first) / 90000.0,
++              state == State::FILM       ? "soft telecine"
++              : state == State::NOT_FILM ? "not soft telecine"
++                                         : "not told",
++              r.pictures, r.videoBytes, r.outOfBudget ? " (a limit was reached)" : "");
++    std::lock_guard lock(m_mutex);
++    m_results[title.second] = state;
++    m_changed.notify_all();
++  }
++  CLog::Log(LOGINFO,
++            "CDiscSoftTelecineScan: {} of the {} titles of two minutes or more read in {} ms: {} "
++            "with soft telecine",
++            m_results.size(), titles.size(),
++            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - begin).count(),
++            films);
++  finish();
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+new file mode 100644
+index 0000000..34f716a
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+@@ -0,0 +1,70 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "FileItem.h"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <thread>
++
++/*!
++ * \brief (Hades) Reads the first video of the titles of a DVD, with a navigator of its own, to tell
++ *        which ones are films with soft telecine (DiscSoftTelecine.h)
++ *
++ * Started when the player's navigator has opened the disc, on a second navigator on the same image
++ * or folder (nothing is shared with the first one: not the virtual machine, not the reads). It takes
++ * the titles of at least two minutes, the longest twelve, and plays each from its start until the
++ * cadence is known or a limit is reached. The player asks, when a title starts, what was found for
++ * it, and waits a little if that title is being read now.
++ */
++class CDiscSoftTelecineScan
++{
++public:
++  enum class State
++  {
++    UNKNOWN, //!< not read, not readable, or not enough to tell
++    FILM,
++    NOT_FILM,
++  };
++
++  CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image);
++  ~CDiscSoftTelecineScan();
++
++  void Start();
++  //! \brief Stop and wait for the thread (the disc is closed, or the player ends)
++  void Stop();
++
++  /*!
++   * \brief What was found for a title
++   * \param title the number of the title as libdvdnav counts them
++   * \param wait how long to wait, at the most, if the title has not been read yet but will be
++   */
++  State Get(int title, std::chrono::milliseconds wait);
++
++private:
++  void Run();
++
++  CFileItem m_item;
++  std::string m_path;
++  bool m_image;
++  std::thread m_thread;
++  std::atomic<bool> m_stop{false};
++  std::mutex m_mutex;
++  std::condition_variable m_changed;
++  bool m_planned = false; //!< which titles will be read is known
++  bool m_finished = false;
++  std::set<int> m_plan;
++  std::map<int, State> m_results;
++};
+-- 
+2.53.0
+

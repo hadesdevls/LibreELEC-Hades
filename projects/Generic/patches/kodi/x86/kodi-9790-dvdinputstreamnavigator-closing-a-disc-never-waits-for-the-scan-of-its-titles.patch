@@ -1,0 +1,551 @@
+From 7853058d5e7878ce3279618b8a58a121cd2834f2 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:23:39 +0000
+Subject: [PATCH] DVDInputStreamNavigator: closing a disc never waits for the
+ scan of its titles
+
+CDiscSoftTelecineScan::Stop() joined the thread that reads the titles of the
+disc, from the destructor, from the Close() of the player's navigator. A read
+of a disc image on a share of the network that stopped answering kept the
+stop of the video waiting until that read gave up.
+
+The results of the scan are now shared by the thread and the navigator
+(KODI::DISC::CScanResults); the thread owns what it reads with and runs
+detached (RunDetached()). Stop() tells it to stop and returns at once; the
+reads of the image fail from then on, the thread ends on its own when the read
+it is in returns, and it touches nothing of the closed navigator; what it
+found after the stop is neither told nor logged.
+
+The titles are read one after the other, never several at once, and not at
+all for a disc in a drive, as before, nor now for an image or a folder on an
+optical disc (a device of the SCSI CD-ROM driver, major 11): a second reader
+moves the head of the drive against the player's, and reading the titles
+before the playing would keep it waiting seconds.
+
+t_scanlife (built with the address and undefined behaviour sanitizers): with a
+read that hangs 1.5 s, Stop() returns in under 1 ms and the stopped results
+keep nobody waiting; the thread ends on its own, keeps the results while it
+runs and lets them go; a title that is not planned is not waited for, one being
+read is. A Stop() that waits for the thread takes 1.4 s and fails it.
+---
+ .../DVDInputStreamNavigator.cpp               |  25 +++-
+ .../DVDInputStreams/DiscSoftTelecine.h        | 114 +++++++++++++++
+ .../DVDInputStreams/DiscSoftTelecineScan.cpp  | 135 +++++++++---------
+ .../DVDInputStreams/DiscSoftTelecineScan.h    |  48 +++----
+ 4 files changed, 227 insertions(+), 95 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+index 0733186..fc034c0 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+@@ -37,6 +37,11 @@
+ #include <memory>
+ #include <string>
+ 
++#if defined(TARGET_LINUX)
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
++#endif
++
+ /*****************************************************************************
+ * iovec structure: vectored data entry
+ *****************************************************************************/
+@@ -55,6 +60,19 @@ using namespace std::chrono_literals;
+ 
+ namespace
+ {
++//! Hades: a local path on an optical disc in a drive (a device of the SCSI CD-ROM driver, major
++//! 11: every optical drive of Linux); a path of the network or of another system is not
++bool OnOpticalDisc(const std::string& path)
++{
++#if defined(TARGET_LINUX)
++  struct stat st;
++  return !path.empty() && path[0] == '/' && stat(path.c_str(), &st) == 0 && major(st.st_dev) == 11;
++#else
++  (void)path;
++  return false;
++#endif
++}
++
+ constexpr int HOLDMODE_NONE = 0;
+ /* set internally when we wish to flush demuxer */
+ constexpr int HOLDMODE_HELD = 1;
+@@ -327,9 +345,10 @@ bool CDVDInputStreamNavigator::Open()
+   // For playlist/chapter watch time
+   m_startWatchTime = std::chrono::steady_clock::now();
+ 
+-  // Hades: which titles are soft telecined film, read apart from the playing
+-  // (not a disc in a drive: a second reader would move the head of the drive against the player's)
+-  if (URIUtils::IsDVD(path) || StringUtils::StartsWith(path, "/dev/"))
++  // Hades: which titles are soft telecined film, read apart from the playing (not a disc in a
++  // drive, nor an image or a folder on one: a second reader would move the head of the drive
++  // against the player's, and reading the titles before the playing would make it wait seconds)
++  if (URIUtils::IsDVD(path) || StringUtils::StartsWith(path, "/dev/") || OnOpticalDisc(path))
+   {
+     CLog::Log(LOGDEBUG,
+               "CDVDInputStreamNavigator: the titles of a disc in a drive are not read ahead");
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+index 9b6f12a..bf19d4a 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+@@ -11,9 +11,17 @@
+ #include "cores/VideoPlayer/DVDDemuxers/Mpeg2SoftTelecine.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <utility>
+ #include <vector>
+ 
+ /*!
+@@ -165,4 +173,110 @@ TitleResult ScanTitle(Nav& nav, int title, Stop&& stop)
+     result.outOfBudget = false;
+   return result;
+ }
++
++/*!
++ * \brief What a scan of the titles of a disc found, shared by the thread that reads them and the
++ *        player's navigator that asks
++ *
++ * The navigator can close at any time: Stop() returns at once, and the thread ends on its own
++ * when what it is in returns (a read of a disc image over the network that does not come back is
++ * not waited for). The thread owns what it reads with, and these results through a shared
++ * pointer (RunDetached()): nothing of the closed navigator is touched.
++ */
++class CScanResults
++{
++public:
++  enum class State
++  {
++    UNKNOWN, //!< not read, not readable, or not enough to tell
++    FILM,
++    NOT_FILM,
++  };
++
++  //! \brief (the thread) which titles will be read
++  void Plan(const std::set<int>& titles)
++  {
++    std::lock_guard lock(m_mutex);
++    m_plan = titles;
++    m_planned = true;
++    m_changed.notify_all();
++  }
++  //! \brief (the thread) what was found for a title
++  void Set(int title, State state)
++  {
++    std::lock_guard lock(m_mutex);
++    m_results[title] = state;
++    m_changed.notify_all();
++  }
++  //! \brief (the thread) it ends: nothing more is to come
++  void Finish()
++  {
++    std::lock_guard lock(m_mutex);
++    m_planned = true;
++    m_finished = true;
++    m_changed.notify_all();
++  }
++  //! \brief (the owner) give up: the thread stops at its next look, and nobody waits for it
++  void Stop()
++  {
++    m_stop = true;
++    std::lock_guard lock(m_mutex);
++    m_changed.notify_all();
++  }
++  bool Stopped() const { return m_stop.load(); }
++  bool Finished() const
++  {
++    std::lock_guard lock(m_mutex);
++    return m_finished;
++  }
++  size_t Count() const
++  {
++    std::lock_guard lock(m_mutex);
++    return m_results.size();
++  }
++
++  /*!
++   * \brief (the owner) what was found for a title
++   * \param wait how long to wait, at the most, if the title has not been read yet but will be
++   */
++  State Get(int title, std::chrono::milliseconds wait)
++  {
++    std::unique_lock lock(m_mutex);
++    const auto known = [&] { return m_results.contains(title) || m_finished || m_stop; };
++    const auto expected = [&] { return !m_planned || m_plan.contains(title); };
++    if (!known() && expected() && wait.count() > 0)
++      m_changed.wait_for(lock, wait,
++                         [&] { return known() || (m_planned && !m_plan.contains(title)); });
++    if (m_stop)
++      return State::UNKNOWN;
++    const auto it = m_results.find(title);
++    return it == m_results.end() ? State::UNKNOWN : it->second;
++  }
++
++private:
++  std::atomic<bool> m_stop{false};
++  mutable std::mutex m_mutex;
++  std::condition_variable m_changed;
++  bool m_planned = false;
++  bool m_finished = false;
++  std::set<int> m_plan;
++  std::map<int, State> m_results;
++};
++
++/*!
++ * \brief Runs a scan on a thread of its own that nobody joins: \a job(results) reads, looks at
++ *        CScanResults::Stopped() as often as it can, and keeps what it needs; the results end
++ *        finished whatever it did
++ */
++template<class Job>
++void RunDetached(std::shared_ptr<CScanResults> results, Job job)
++{
++  std::thread(
++      [results = std::move(results), job = std::move(job)]() mutable
++      {
++        job(*results);
++        results->Finish();
++      })
++      .detach();
++}
+ } // namespace KODI::DISC
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+index 9cc6ec2..2dcc3c9 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+@@ -21,24 +21,43 @@
+ 
+ namespace
+ {
++using KODI::DISC::CScanResults;
+ using KODI::MPEG2::CSoftTelecineDetector;
+ 
+ constexpr uint64_t MIN_TITLE_TICKS = 120ULL * 90000ULL; // two minutes, in 90 kHz ticks
+ constexpr size_t MAX_TITLES = 12;
+ 
+-// the reads of an image, as the player's navigator does them (its callbacks are private to it)
++//! The image that the scan reads, with what tells it to stop
++struct Image
++{
++  Image(const CFileItem& item, const CScanResults& scan)
++    : file(item, XFILE::READ_TRUNCATED | XFILE::READ_BITRATE),
++      results(scan)
++  {
++  }
++  CDVDInputStreamFile file;
++  const CScanResults& results;
++};
++
++// the reads of an image, as the player's navigator does them (its callbacks are private to it);
++// once the scan is told to stop, no read more
+ int cbSeek(void* stream, uint64_t pos)
+ {
+-  return static_cast<CDVDInputStreamFile*>(stream)->Seek(pos, SEEK_SET) >= 0 ? 0 : -1;
++  auto* image = static_cast<Image*>(stream);
++  if (image->results.Stopped())
++    return -1;
++  return image->file.Seek(pos, SEEK_SET) >= 0 ? 0 : -1;
+ }
+ 
+ int cbRead(void* stream, void* buffer, int count)
+ {
+-  auto* file = static_cast<CDVDInputStreamFile*>(stream);
++  auto* image = static_cast<Image*>(stream);
+   int done = 0;
+   while (done < count)
+   {
+-    const int r = file->Read(static_cast<uint8_t*>(buffer) + done, count - done);
++    if (image->results.Stopped())
++      return -1;
++    const int r = image->file.Read(static_cast<uint8_t*>(buffer) + done, count - done);
+     if (r < 0)
+       return r;
+     if (r == 0)
+@@ -111,7 +130,8 @@ struct Nav
+ CDiscSoftTelecineScan::CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image)
+   : m_item(item),
+     m_path(std::move(path)),
+-    m_image(image)
++    m_image(image),
++    m_results(std::make_shared<KODI::DISC::CScanResults>())
+ {
+ }
+ 
+@@ -122,38 +142,30 @@ CDiscSoftTelecineScan::~CDiscSoftTelecineScan()
+ 
+ void CDiscSoftTelecineScan::Start()
+ {
+-  if (!m_thread.joinable())
+-    m_thread = std::thread([this] { Run(); });
++  if (m_started)
++    return;
++  m_started = true;
++  KODI::DISC::RunDetached(m_results,
++                          [item = m_item, path = m_path, image = m_image](CScanResults& results)
++                          { Run(item, path, image, results); });
+ }
+ 
+ void CDiscSoftTelecineScan::Stop()
+ {
+-  m_stop = true;
+-  m_changed.notify_all();
+-  if (m_thread.joinable())
+-    m_thread.join();
++  m_results->Stop();
+ }
+ 
+-CDiscSoftTelecineScan::State CDiscSoftTelecineScan::Get(int title, std::chrono::milliseconds wait)
+-{
+-  std::unique_lock lock(m_mutex);
+-  const auto known = [&] { return m_results.contains(title) || m_finished || m_stop; };
+-  const auto expected = [&] { return !m_planned || m_plan.contains(title); };
+-  if (!known() && expected() && wait.count() > 0)
+-    m_changed.wait_for(lock, wait,
+-                       [&] { return known() || (m_planned && !m_plan.contains(title)); });
+-  const auto it = m_results.find(title);
+-  return it == m_results.end() ? State::UNKNOWN : it->second;
+-}
+-
+-void CDiscSoftTelecineScan::Run()
++void CDiscSoftTelecineScan::Run(const CFileItem& item,
++                                const std::string& path,
++                                bool isImage,
++                                CScanResults& results)
+ {
+   using clock = std::chrono::steady_clock;
+   const auto begin = clock::now();
+ 
+   DllDvdNav dll;
+   dvdnav_t* nav = nullptr;
+-  std::unique_ptr<CDVDInputStreamFile> stream;
++  std::unique_ptr<Image> image;
+   dvdnav_stream_cb callbacks{};
+   callbacks.pf_read = cbRead;
+   callbacks.pf_seek = cbSeek;
+@@ -162,28 +174,23 @@ void CDiscSoftTelecineScan::Run()
+   {
+     if (nav)
+       dll.dvdnav_close(nav);
+-    if (stream)
+-      stream->Close();
+-    std::lock_guard lock(m_mutex);
+-    m_planned = true;
+-    m_finished = true;
+-    m_changed.notify_all();
++    if (image)
++      image->file.Close();
+   };
+ 
+   if (!dll.Load())
+     return finish();
+-  if (m_image)
++  if (isImage)
+   {
+-    stream =
+-        std::make_unique<CDVDInputStreamFile>(m_item, XFILE::READ_TRUNCATED | XFILE::READ_BITRATE);
+-    if (!stream->Open())
++    image = std::make_unique<Image>(item, results);
++    if (results.Stopped() || !image->file.Open())
+       return finish();
+ #if DVDNAV_VERSION >= 60100
+     dvdnav_logger_cb logger;
+     logger.pf_log = cbLog;
+-    if (dll.dvdnav_open_stream2(&nav, stream.get(), &logger, &callbacks) != DVDNAV_STATUS_OK)
++    if (dll.dvdnav_open_stream2(&nav, image.get(), &logger, &callbacks) != DVDNAV_STATUS_OK)
+ #else
+-    if (dll.dvdnav_open_stream(&nav, stream.get(), &callbacks) != DVDNAV_STATUS_OK)
++    if (dll.dvdnav_open_stream(&nav, image.get(), &callbacks) != DVDNAV_STATUS_OK)
+ #endif
+       return finish();
+   }
+@@ -192,9 +199,9 @@ void CDiscSoftTelecineScan::Run()
+ #if DVDNAV_VERSION >= 60100
+     dvdnav_logger_cb logger;
+     logger.pf_log = cbLog;
+-    if (dll.dvdnav_open2(&nav, nullptr, &logger, m_path.c_str()) != DVDNAV_STATUS_OK)
++    if (dll.dvdnav_open2(&nav, nullptr, &logger, path.c_str()) != DVDNAV_STATUS_OK)
+ #else
+-    if (dll.dvdnav_open(&nav, m_path.c_str()) != DVDNAV_STATUS_OK)
++    if (dll.dvdnav_open(&nav, path.c_str()) != DVDNAV_STATUS_OK)
+ #endif
+       return finish();
+   }
+@@ -208,7 +215,7 @@ void CDiscSoftTelecineScan::Run()
+   int32_t count = 0;
+   dll.dvdnav_get_number_of_titles(nav, &count);
+   std::vector<std::pair<uint64_t, int>> titles; // duration, number
+-  for (int t = 1; t <= count && t <= 99 && !m_stop; ++t)
++  for (int t = 1; t <= count && t <= 99 && !results.Stopped(); ++t)
+   {
+     uint64_t* times = nullptr;
+     uint64_t duration = 0;
+@@ -220,45 +227,43 @@ void CDiscSoftTelecineScan::Run()
+   std::sort(titles.begin(), titles.end(), [](const auto& a, const auto& b) { return a > b; });
+   if (titles.size() > MAX_TITLES)
+     titles.resize(MAX_TITLES);
+-  {
+-    std::lock_guard lock(m_mutex);
+-    for (const auto& title : titles)
+-      m_plan.insert(title.second);
+-    m_planned = true;
+-    m_changed.notify_all();
+-  }
++  std::set<int> plan;
++  for (const auto& title : titles)
++    plan.insert(title.second);
++  results.Plan(plan);
+ 
+   Nav reader{dll, nav, {}};
+   size_t films = 0;
+   for (const auto& title : titles)
+   {
+-    if (m_stop)
++    if (results.Stopped())
+       break;
+     const KODI::DISC::TitleResult r =
+-        KODI::DISC::ScanTitle(reader, title.second, [this] { return m_stop.load(); });
+-    State state = State::UNKNOWN;
++        KODI::DISC::ScanTitle(reader, title.second, [&results] { return results.Stopped(); });
++    CScanResults::State state = CScanResults::State::UNKNOWN;
+     if (r.verdict == CSoftTelecineDetector::Verdict::FILM)
+-      state = State::FILM;
++      state = CScanResults::State::FILM;
+     else if (r.verdict == CSoftTelecineDetector::Verdict::NOT_FILM)
+-      state = State::NOT_FILM;
+-    films += state == State::FILM;
++      state = CScanResults::State::NOT_FILM;
++    films += state == CScanResults::State::FILM;
++    if (results.Stopped())
++      break; // (the player is gone: what was read of this title is not told, nor logged)
+     CLog::Log(
+         LOGDEBUG,
+         "CDiscSoftTelecineScan: title {} ({:.0f} s): {} after {} pictures, {} bytes of video{}",
+         title.second, static_cast<double>(title.first) / 90000.0,
+-        state == State::FILM       ? "soft telecine"
+-        : state == State::NOT_FILM ? "not soft telecine"
+-                                   : "not told",
++        state == CScanResults::State::FILM       ? "soft telecine"
++        : state == CScanResults::State::NOT_FILM ? "not soft telecine"
++                                                 : "not told",
+         r.pictures, r.videoBytes, r.outOfBudget ? " (a limit was reached)" : "");
+-    std::lock_guard lock(m_mutex);
+-    m_results[title.second] = state;
+-    m_changed.notify_all();
++    results.Set(title.second, state);
+   }
+-  CLog::Log(LOGINFO,
+-            "CDiscSoftTelecineScan: {} of the {} titles of two minutes or more read in {} ms: {} "
+-            "with soft telecine",
+-            m_results.size(), titles.size(),
+-            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - begin).count(),
+-            films);
++  if (!results.Stopped())
++    CLog::Log(LOGINFO,
++              "CDiscSoftTelecineScan: {} of the {} titles of two minutes or more read in {} ms: {} "
++              "with soft telecine",
++              results.Count(), titles.size(),
++              std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - begin).count(),
++              films);
+   finish();
+ }
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+index 41aef27..5aef8a1 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+@@ -8,16 +8,12 @@
+ 
+ #pragma once
+ 
++#include "DiscSoftTelecine.h"
+ #include "FileItem.h"
+ 
+-#include <atomic>
+ #include <chrono>
+-#include <condition_variable>
+-#include <map>
+-#include <mutex>
+-#include <set>
++#include <memory>
+ #include <string>
+-#include <thread>
+ 
+ /*!
+  * \brief (Hades) Reads the first video of the titles of a DVD, with a navigator of its own, to tell
+@@ -25,26 +21,26 @@
+  *
+  * Started when the player's navigator has opened the disc, on a second navigator on the same image
+  * or folder (nothing is shared with the first one: not the virtual machine, not the reads). It
+- * takes
+- * the titles of at least two minutes, the longest twelve, and plays each from its start until the
+- * cadence is known or a limit is reached. The player asks, when a title starts, what was found for
+- * it, and waits a little if that title is being read now.
++ * takes the titles of at least two minutes, the longest twelve, and plays each from its start,
++ * one after the other, until the cadence is known or a limit is reached. The player asks, when a
++ * title starts, what was found for it, and waits a little if that title is being read now.
++ *
++ * The reading runs on a thread that nobody waits for (KODI::DISC::RunDetached()): Stop() returns
++ * at once, also where a read of the image hangs (a share of the network that went away), and the
++ * thread ends on its own with what it owns. Not started for a disc in a drive, nor for an image or
++ * a folder on one (CDVDInputStreamNavigator::Open()): a second reader would move the head of the
++ * drive against the player's.
+  */
+ class CDiscSoftTelecineScan
+ {
+ public:
+-  enum class State
+-  {
+-    UNKNOWN, //!< not read, not readable, or not enough to tell
+-    FILM,
+-    NOT_FILM,
+-  };
++  using State = KODI::DISC::CScanResults::State;
+ 
+   CDiscSoftTelecineScan(const CFileItem& item, std::string path, bool image);
+   ~CDiscSoftTelecineScan();
+ 
+   void Start();
+-  //! \brief Stop and wait for the thread (the disc is closed, or the player ends)
++  //! \brief The disc is closed, or the player ends: the thread is told to stop, and not waited for
+   void Stop();
+ 
+   /*!
+@@ -52,20 +48,18 @@ public:
+    * \param title the number of the title as libdvdnav counts them
+    * \param wait how long to wait, at the most, if the title has not been read yet but will be
+    */
+-  State Get(int title, std::chrono::milliseconds wait);
++  State Get(int title, std::chrono::milliseconds wait) { return m_results->Get(title, wait); }
+ 
+ private:
+-  void Run();
++  //! The reading, on its own thread, with copies of what it needs
++  static void Run(const CFileItem& item,
++                  const std::string& path,
++                  bool image,
++                  KODI::DISC::CScanResults& results);
+ 
+   CFileItem m_item;
+   std::string m_path;
+   bool m_image;
+-  std::thread m_thread;
+-  std::atomic<bool> m_stop{false};
+-  std::mutex m_mutex;
+-  std::condition_variable m_changed;
+-  bool m_planned = false; //!< which titles will be read is known
+-  bool m_finished = false;
+-  std::set<int> m_plan;
+-  std::map<int, State> m_results;
++  bool m_started = false;
++  std::shared_ptr<KODI::DISC::CScanResults> m_results;
+ };
+-- 
+2.53.0
+

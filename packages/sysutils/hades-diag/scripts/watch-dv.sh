@@ -11,6 +11,8 @@
 # 5 s and 30 s later: the kernel log (NVIDIA Xid and display errors), the connectors, the connector
 # properties, the atomic state, the GPU state and the end of Kodi's log, each copied to the boot partition at
 # once, so that a forced power-off (the display lost after leaving Dolby Vision) does not lose them.
+# With amdgpu.dvbridge_dce=1 on the kernel line, the capture during Dolby Vision also has crc.txt: the CRC that the
+# amdgpu card computes of its output, for 12 frames (crc_dce()).
 # Also keeps a storage timeline in RAM, copied by shutdown.sh: every second for up to 4 hours, the uptime, the
 # writes completed, ms spent writing, requests in flight, ms busy, flushes and ms flushing of the device that holds
 # /storage (/sys/block/<dev>/stat); of every other disk (a drive with films under /var/media, a disc drive), as
@@ -19,15 +21,19 @@
 # whenever which disks there are, or which of them something is mounted from under /var/media, changes (looked
 # at every 10 s); and the Kodi threads in uninterruptible sleep (state D) at that moment with
 # the kernel function they wait in (wchan: a vblank wait during Dolby Vision is not storage I/O). Every 10 s it
-# also records the GPU performance state, clocks, load, PCIe link, power and what holds its clocks down
-# (nvidia-smi, when present), and, every 10 s and at once when it changes, where the power comes from: the
-# status of each battery and whether each mains or USB supply is online (power_supply; a laptop on its charger).
-# The same for an AMD GPU (amdgpu: load and current core clock, every 10 s in the timeline), and during
-# Dolby Vision a file gpu-amd.txt with five readings a second apart of its load, clocks, temperature, power
-# and power policy. With the NVIDIA driver loaded, the capture during Dolby Vision starts with one query of
+# also records the GPU performance state, clocks, load, PCIe link, power, what holds its clocks down and its
+# video memory used and total (nvidia-smi, when present, at the lowest processor and disk priority), and, every
+# 10 s and at once when it changes, where
+# the power comes from: the status of each battery and whether each mains or USB supply is online
+# (power_supply; a laptop on its charger).
+# The same for an AMD GPU (amdgpu: load, current core clock, and the video memory and the GTT in use, every 10 s
+# in the timeline), and during Dolby Vision a file gpu-amd.txt with five readings a second apart of its load,
+# clocks, temperature, power, the video memory, the part of it that the processor reaches and the GTT, each used
+# and total, and power policy. With the NVIDIA driver loaded, the capture during Dolby Vision starts with one query of
 # nvidia-smi (nvidia-smi.txt: performance state, clocks, what holds them down, power and its limits,
-# temperatures), at the lowest processor and disk priority, stopped after 10 s, and state.txt says when it
-# began and ended; the rest of that capture waits 12 s after it, so that the 10-s lines of kodi.log tell
+# temperatures, video memory and what each process takes of it), at the lowest processor and disk priority,
+# stopped after 10 s, and state.txt says when it began and ended; the rest of that capture waits 12 s after
+# it, so that the 10-s lines of kodi.log tell
 # what the query cost the video, if anything, apart from what the rest of the capture costs.
 # Each capture has build.txt, the build that made it (folder.sh).
 # Every file of a capture goes through the filter of the diagnostics (redact.sh tree: addresses, serial
@@ -41,7 +47,15 @@ if [ -e "/sys/block/$part" ]; then blk=$part; else blk=$(basename "$(readlink -f
 st=/sys/block/$blk/stat
 L=/run/hades-io.log
 [ -r "$st" ] || exit 0
-echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%,pcie_gen,pcie_width,W,clock_event_reasons] [amd=load%,coreMHz] [pwr=supply:status,...] [<disk>=reads,sectors_read,read_ms,writes,write_ms,in_flight,busy_ms ...] (device $blk)" > $L
+echo "# uptime writes write_ms in_flight busy_ms flushes flush_ms kodi_D_threads(name:wchan) [gpu=pstate,MHz,memMHz,load%,dec%,pcie_gen,pcie_width,W,clock_event_reasons,memUsedMiB,memTotalMiB] [amd=load%,coreMHz,vramUsedMiB,gttUsedMiB] [pwr=supply:status,...] [<disk>=reads,sectors_read,read_ms,writes,write_ms,in_flight,busy_ms ...] (device $blk)" > $L
+# Hades: a file of amdgpu that holds a number of bytes (mem_info_vram_used and the like), in MiB, rounded down;
+# nothing where it is not there or holds no number
+mib() {
+  local v
+  v=$(cat "$1" 2>/dev/null)
+  case "$v" in ''|*[!0-9]*) return 0 ;; esac
+  echo $((v / 1048576))
+}
 # The other disks: every block device but the one of /storage, a loop device, a RAM disk, a mapping or a network
 # block device (their names, which are made of letters and digits only)
 others() {
@@ -90,8 +104,10 @@ while [ $t -lt 14400 ]; do
     done
   fi
   g=""
+  # (the query of NVIDIA at the lowest priority of the processor and of the disk, as the one during Dolby Vision: the
+  # video comes first; what it answers is the same)
   if [ $((t % 10)) -eq 0 ] && command -v nvidia-smi >/dev/null; then
-    g=" gpu=$(nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,utilization.gpu,utilization.decoder,pcie.link.gen.current,pcie.link.width.current,power.draw,clocks_event_reasons.active --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)"
+    g=" gpu=$(nice -n 19 ionice -c 3 nvidia-smi --query-gpu=pstate,clocks.gr,clocks.mem,utilization.gpu,utilization.decoder,pcie.link.gen.current,pcie.link.width.current,power.draw,clocks_event_reasons.active,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' | head -1)"
   fi
   w=$(pwr)
   if [ -n "$w" ] && { [ "$w" != "$lastw" ] || [ $((t % 10)) -eq 0 ]; }; then
@@ -102,6 +118,9 @@ while [ $t -lt 14400 ]; do
     for c in /sys/class/drm/card[0-9]; do
       [ -r $c/device/gpu_busy_percent ] || continue
       g="$g amd=$(cat $c/device/gpu_busy_percent 2>/dev/null)%,$(sed -n 's/^[0-9]*: *\([0-9]*\)Mhz \*.*/\1/p' $c/device/pp_dpm_sclk 2>/dev/null | head -n 1)MHz"
+      # (Hades: the video memory in use, and the system memory that the card has mapped for itself (GTT): on an
+      # integrated card the first is the part of the memory that the firmware sets aside for it)
+      g="$g,$(mib $c/device/mem_info_vram_used),$(mib $c/device/mem_info_gtt_used)"
     done
   fi
   if [ $((t % 10)) -eq 0 ]; then
@@ -254,8 +273,9 @@ after_dv() {
 # How an NVIDIA GPU is clocked and held back while it draws Dolby Vision, into $1/nvidia-smi.txt: one query
 # for the performance state, the clocks (with the least, the most and the average of the samples that the
 # driver keeps), the reasons that hold the clocks down and how long each has held them so far, the power
-# drawn and its limits, and the temperatures. The timeline has only the performance state and two clocks,
-# every 10 s. Only where the NVIDIA driver is loaded (an image has nvidia-smi on every PC). Its first 400
+# drawn and its limits, the temperatures, and the video memory: total, used and free, and what each process
+# takes of it. The timeline has only the performance state, two clocks and the memory used and total, every
+# 10 s. Only where the NVIDIA driver is loaded (an image has nvidia-smi on every PC). Its first 400
 # lines are kept, as of the other tails of a capture (one GPU gives about a hundred). The query is run
 # at the lowest priority of the processor and of the disk and stopped after 10 s, and when it began and
 # ended goes into $1/state.txt, to the millisecond in the local time of the system (with its offset from
@@ -265,7 +285,7 @@ after_dv() {
 nvidia_during() {
   command -v nvidia-smi >/dev/null && [ -d /sys/module/nvidia ] || return 1
   na=$(cut -d' ' -f1 /proc/uptime); ta=$(date '+%F %T.%N')
-  nice -n 19 ionice -c 3 nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE > $1/nvidia-smi.all 2>&1 &
+  nice -n 19 ionice -c 3 nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE,MEMORY,PIDS > $1/nvidia-smi.all 2>&1 &
   np=$!
   ( sleep 10; kill $np 2>/dev/null ) >/dev/null 2>&1 &
   nw=$!
@@ -278,8 +298,44 @@ nvidia_during() {
   nt=$(awk -v a="$na" -v b="$nb" 'BEGIN { printf "%.2f", b - a }')
   ns=""
   [ $nr -gt 128 ] && ns=", stopped after 10 s"
-  echo "== nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE (nice 19, disk idle): from ${ta%??????} to ${tb%??????} (local time, UTC$(date +%z)), uptime $na s to $nb s, $nt s, exit status $nr$ns" >> $1/state.txt
+  echo "== nvidia-smi -q -d PERFORMANCE,CLOCK,POWER,TEMPERATURE,MEMORY,PIDS (nice 19, disk idle): from ${ta%??????} to ${tb%??????} (local time, UTC$(date +%z)), uptime $na s to $nb s, $nt s, exit status $nr$ns" >> $1/state.txt
   return 0
+}
+# With amdgpu.dvbridge_dce=1 on the kernel line (the Dolby Vision tunnel on Polaris and Vega, issue 20): the CRC
+# that each amdgpu card that Kodi shows on computes of the output of its active CRTC, for 12 frames (about half a
+# second), into $1/crc.txt. The CRC is read from debugfs crtc-N/crc/data with its default source "auto", which a
+# kernel locked down still lets open; with a stream of the tunnel, amdgpu leaves its truncation to 8 bits as it is
+# (linux-9910, amdgpu_dm_crc.c), so the picture does not change. A still picture gives one value frame after frame
+# where the output is stable; whether it is exact is measured by the check in System > Submit Log.
+crc_dce() {
+  grep -qi '^[y1]' /sys/module/amdgpu/parameters/dvbridge_dce 2>/dev/null || return 0
+  for c in $(kodi_cards); do
+    [ "$(basename "$(readlink /sys/class/drm/$c/device/driver)")" = amdgpu ] || continue
+    m=${c#card}
+    # the index of the active CRTC: the CRTCs of the state are listed in the order of their index
+    i=$(awk '/^crtc\[/ { k = n++ } /^[ \t]*active=1$/ { if (n) { print k; exit } }' /sys/kernel/debug/dri/$m/state 2>/dev/null)
+    [ -n "$i" ] || continue
+    d=/sys/kernel/debug/dri/$m/crtc-$i/crc/data
+    [ -r $d ] || continue
+    {
+      echo "== $c, crtc-$i: CRC of the output, frame and values (red, green, blue), 12 frames, at uptime $(cut -d' ' -f1 /proc/uptime) s"
+      lim head -n 12 $d
+    } >> $1/crc.txt 2>&1
+  done
+}
+# Hades: the memory of an AMD card ($1, its device in sysfs) as amdgpu tells it, each used and total in MiB: the
+# video memory (vram; on an integrated card, the part of the memory that the firmware sets aside for it), the part of
+# it that the processor can reach (vis_vram), and the system memory that the card has mapped for itself (gtt). Only
+# the ones that are there; nothing where none is.
+amd_memory() {
+  local m="" k u t
+  for k in vram vis_vram gtt; do
+    u=$(cat $1/mem_info_${k}_used 2>/dev/null); t=$(cat $1/mem_info_${k}_total 2>/dev/null)
+    case "$u" in ''|*[!0-9]*) continue ;; esac
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    m="$m, $k $((u / 1048576)) of $((t / 1048576)) MiB"
+  done
+  [ -z "$m" ] || echo "   memory used:${m#,}"
 }
 # The capture about 15 s into Dolby Vision ($1 = slot).
 during_dv() {
@@ -316,11 +372,13 @@ during_dv() {
         for h in $c/device/hwmon/hwmon*; do
           [ -d $h ] && echo "   hwmon: core clock $(cat $h/freq1_input 2>/dev/null) Hz, temperature $(cat $h/temp1_input 2>/dev/null) mC, power $(cat $h/power1_average $h/power1_input 2>/dev/null | head -n 1) uW"
         done
+        amd_memory $c/device
         sleep 1
         q=$((q + 1))
       done
     } >> $S/gpu-amd.txt 2>&1
   done
+  crc_dce $S
   to_flash $S during-dv-$1
   rm -rf $S $S.filtered
 }

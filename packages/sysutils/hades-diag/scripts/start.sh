@@ -21,7 +21,7 @@ rm -rf /run/hades-during-dv-[1-6] /run/hades-after-dv-[1-6]
 N=$(next_start)
 echo $N > /run/hades-diag-start
 start_mark > /dev/null
-gone=$(start_folders | awk '{ a[NR] = $2 } END { for (i = 1; i <= NR - 7; i++) print a[i] }')
+gone=$(old_starts 7)
 # A test drive made for an earlier build carried a collector of its own, which the init ran from the boot
 # partition: its scripts go (the image does that work now), what it collected stays. Its launcher in
 # /storage/.config removes itself when it finds them gone: it is run after this one.

@@ -1,0 +1,233 @@
+From c3c68d49974a620d3c30280d07349333f2ee6e5d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 00:51:01 +0000
+Subject: [PATCH] DVLayerMerge: learn the offset of the decoding times at a
+ later random-access picture too
+
+The offset between the decoding times of the two tracks is learned at a
+base packet of a random-access picture, from the enhancement packet of
+a random-access picture presented at the same time, if it is still in
+the queue. With the enhancement layer ahead in decoding time and the
+offset not learned yet (the confirmation at the first random-access
+picture failed, or the offset changed in the middle of a stream), the
+base packet just before the random-access one pairs by its decoding
+time with exactly that enhancement packet and takes it: when the
+random-access base packet reaches the front its partner is gone, and
+the offset was never learned, at every random-access picture after it,
+until a seek. Found by the independent review of the second round
+(read in the code); reproduced with made-up packets: with a base unit
+missing after the first random-access picture, 0 of 47 base units with
+their own enhancement unit.
+
+The enhancement packets that leave the queue (joined or dropped) are
+now kept in short, their decoding and presentation times and whether
+they hold a random-access picture (the last 256: a second at 120
+pictures a second, with the four of the confirmation), and emptied by
+Clear(). LearnOffset() looks for the random-access picture of the same
+time in the queue first, as before, and then among them; the access
+units after it for the confirmation come from both, in decoding order.
+The other way round the review proposed (base packets waiting for the
+random-access one to be looked at, so that the queue is not consumed)
+would make every base packet that pairs with a random-access
+enhancement packet wait, also in files whose layers have the same
+decoding times and groups of pictures that do not line up (the
+two-track test stream); this adds no wait.
+
+Nothing changes for two tracks with the same decoding times: there the
+enhancement packet of a random-access base packet can only be taken by
+that base packet. The pair dumps of fel_tracks_test on the two-track
+test stream and on the dual-track MP4 are byte for byte those of the
+join before.
+---
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.cpp  | 66 ++++++++++++++-----
+ .../VideoPlayer/DVDDemuxers/DVLayerMerge.h    | 20 +++++-
+ 2 files changed, 70 insertions(+), 16 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+index 699cad0..23f0d54 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.cpp
+@@ -685,6 +685,7 @@ void CDVLayerMerge::Clear()
+   m_end = false;
+   // (Hades: the offset of the decoding times stays, and is checked again: CONFIRM)
+   m_joinedSinceClear = false;
++  m_seen.clear();
+ }
+ 
+ void CDVLayerMerge::SetSilent(unsigned int packets)
+@@ -824,6 +825,7 @@ bool CDVLayerMerge::PushEnhancement(AVPacket* packet)
+   // (the oldest packet has its time: fewer than MAX_QUEUED wait for theirs, see GiveTimes())
+   if (m_enhancement.waiting.size() >= MAX_QUEUED)
+   {
++    Remember(m_enhancement.waiting.front());
+     av_packet_free(&m_enhancement.waiting.front().packet);
+     m_enhancement.waiting.pop_front();
+     m_counts.dropped++;
+@@ -1136,17 +1138,37 @@ bool CDVLayerMerge::LearnOffset(bool end)
+   }
+   const int64_t most =
+       KnownTimeBase(m_timeBase) ? av_rescale(MAX_OFFSET, m_timeBase.den, m_timeBase.num) : 0;
+-  // the enhancement packet of a random-access picture presented with it (it may still come: then
+-  // this is looked at again while the base packet waits)
++  // The enhancement packets in decoding order: those that left the queue last (m_seen), then the
++  // queue. The one of a random-access picture presented with the base packet: in the queue (it may
++  // still come: then this is looked at again while the base packet waits), or, with the
++  // enhancement layer ahead, taken already by a base packet before this one.
+   std::deque<Waiting>& layer = m_enhancement.waiting;
+-  auto at = layer.begin();
+-  for (; at != layer.end(); ++at)
++  const size_t seen = m_seen.size();
++  const size_t total = seen + layer.size();
++  const auto entry = [this, &layer, seen](size_t n)
+   {
+-    if (at->time != AV_NOPTS_VALUE && SamePresentation(base.pts, at->pts) &&
+-        IsRandomAccess(*at, m_enhancement.lengthSize))
+-      break;
++    if (n >= seen)
++      return layer[n - seen];
++    Waiting w;
++    w.time = m_seen[n].time;
++    w.slack = m_seen[n].slack;
++    w.pts = m_seen[n].pts;
++    return w;
++  };
++  size_t first = total;
++  for (size_t i = 0; i < layer.size() && first == total; ++i)
++  {
++    if (layer[i].time != AV_NOPTS_VALUE && SamePresentation(base.pts, layer[i].pts) &&
++        IsRandomAccess(layer[i], m_enhancement.lengthSize))
++      first = seen + i;
++  }
++  for (size_t i = seen; i-- > 0 && first == total;)
++  {
++    if (m_seen[i].random && m_seen[i].time != AV_NOPTS_VALUE &&
++        SamePresentation(base.pts, m_seen[i].pts))
++      first = i;
+   }
+-  if (at == layer.end())
++  if (first == total)
+   {
+     // None yet. The enhancement packet that it pairs with now: where that is of a random-access
+     // picture too, both layers start a group of pictures at this offset, and there is nothing to
+@@ -1170,9 +1192,10 @@ bool CDVLayerMerge::LearnOffset(bool end)
+     return false;
+   }
+ 
+-  const bool fits = base.time >= 0 ? at->time >= std::numeric_limits<int64_t>::min() + base.time
+-                                   : at->time <= std::numeric_limits<int64_t>::max() + base.time;
+-  const int64_t offset = fits ? at->time - base.time : 0;
++  const int64_t taken = entry(first).time;
++  const bool fits = base.time >= 0 ? taken >= std::numeric_limits<int64_t>::min() + base.time
++                                   : taken <= std::numeric_limits<int64_t>::max() + base.time;
++  const int64_t offset = fits ? taken - base.time : 0;
+   if (!fits || offset == m_offset || most <= 0 || offset > most || offset < -most)
+   {
+     base.checked = true;
+@@ -1181,15 +1204,14 @@ bool CDVLayerMerge::LearnOffset(bool end)
+ 
+   // the CONFIRM access units after the two, pairwise presented at the same time and of the same
+   // access unit by that offset
+-  const size_t first = static_cast<size_t>(at - layer.begin());
+-  const size_t have = std::min(m_base.waiting.size() - 1, layer.size() - 1 - first);
++  const size_t have = std::min(m_base.waiting.size() - 1, total - 1 - first);
+   if (have < CONFIRM && !end && m_silent < m_silentAfter && m_base.waiting.size() < MAX_WAITING &&
+       layer.size() < MAX_QUEUED)
+     return true;
+   bool same = have >= CONFIRM;
+   for (size_t k = 1; same && k <= CONFIRM; ++k)
+-    same = SamePresentation(m_base.waiting[k].pts, layer[first + k].pts) &&
+-           SameUnit(m_base.waiting[k], ShiftedBy(layer[first + k], offset));
++    same = SamePresentation(m_base.waiting[k].pts, entry(first + k).pts) &&
++           SameUnit(m_base.waiting[k], ShiftedBy(entry(first + k), offset));
+   base.checked = true;
+   if (!same)
+   {
+@@ -1202,6 +1224,18 @@ bool CDVLayerMerge::LearnOffset(bool end)
+   return false;
+ }
+ 
++// Hades: an enhancement packet leaves the queue (joined, or dropped): what LearnOffset() looks at
++// of it is kept (CONFIRM).
++void CDVLayerMerge::Remember(Waiting& enhancement)
++{
++  if (m_fromPresentation)
++    return;
++  m_seen.push_back({enhancement.time, enhancement.slack, enhancement.pts,
++                    IsRandomAccess(enhancement, m_enhancement.lengthSize)});
++  if (m_seen.size() > SEEN)
++    m_seen.pop_front();
++}
++
+ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+ {
+   if (m_verification == Verification::PENDING &&
+@@ -1263,12 +1297,14 @@ bool CDVLayerMerge::Pop(AVPacket* packet, bool end)
+     // what the enhancement layer has before it belongs to base packets that are gone
+     for (auto it = m_enhancement.waiting.begin(); it != match; ++it)
+     {
++      Remember(*it);
+       av_packet_free(&it->packet);
+       m_counts.dropped++;
+       if (!m_joinedSinceClear)
+         m_counts.droppedFirst++;
+     }
+     m_joinedSinceClear = true;
++    Remember(*match);
+     AVPacket* enhancement = match->packet;
+     m_enhancement.waiting.erase(m_enhancement.waiting.begin(), match + 1);
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+index 3e36b72..ed77409 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVLayerMerge.h
+@@ -333,7 +333,11 @@ public:
+    * the base packet waits for those packets where it is not the difference in use. Where the
+    * enhancement packet that it pairs with by the difference in use is no random-access one, the
+    * one of its picture may come later (an enhancement layer behind): the base packet waits for
+-   * the enhancement packets of up to MAX_OFFSET seconds after it. Two layers
++   * the enhancement packets of up to MAX_OFFSET seconds after it. Where the enhancement layer is
++   * ahead and the offset is not learned yet (its first random-access picture did not tell it, or
++   * it changed), the base packet before the random-access one has already taken the enhancement
++   * packet of its picture: so the enhancement packets that left the queue are kept in short
++   * (SEEN), and the picture and the access units after it are looked for there too. Two layers
+    * coded in different orders (the two-track test stream of Hades: the same decoding times, and
+    * random-access pictures of the two layers at other access units, one of them presented at the
+    * time of one of the other layer) give no run of times, and nothing is learned. The difference
+@@ -342,6 +346,9 @@ public:
+    */
+   static constexpr size_t CONFIRM = 4;
+   static constexpr int MAX_OFFSET = 1;
++  //! Hades: the enhancement packets that left the queue last that are kept for that (CONFIRM): a
++  //! second of them at 120 pictures a second, with CONFIRM more
++  static constexpr size_t SEEN = 256;
+ 
+   /*!
+    * \brief After how many base packets without any enhancement packet the enhancement layer is
+@@ -437,6 +444,7 @@ private:
+   bool SamePresentation(int64_t base, int64_t enhancement) const;
+   static bool IsRandomAccess(Waiting& waiting, int lengthSize);
+   bool LearnOffset(bool end);
++  void Remember(Waiting& enhancement);
+ 
+   Track m_base;
+   Track m_enhancement;
+@@ -454,6 +462,16 @@ private:
+   bool m_layerRpu = false; //!< a packet of the second track had the RPU of a dual-layer stream
+   bool m_verifyDone = false; //!< the packets said it (VERIFIED or REFUSED)
+   int64_t m_offset = 0; //!< Hades: see CONFIRM
++  //! Hades: an enhancement packet that left the queue (joined or dropped), as LearnOffset() looks
++  //! at it: oldest first, at most SEEN, none from before the last Clear()
++  struct Seen
++  {
++    int64_t time;
++    int64_t slack;
++    int64_t pts;
++    bool random;
++  };
++  std::deque<Seen> m_seen;
+   bool m_joinedSinceClear = false; //!< Hades: an access unit was joined since the last Clear()
+   Counts m_counts;
+ };
+-- 
+2.53.0
+

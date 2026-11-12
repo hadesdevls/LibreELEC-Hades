@@ -4,7 +4,7 @@
 #
 # Hades diagnostics: the folders of the starts, hades-diag/start-N on the boot partition: how they are numbered
 # and whose they are. Read by start.sh, collect.sh, watch-dv.sh and shutdown.sh (D is /flash/hades-diag in all of
-# them). Nothing of it runs by itself.
+# them, and installer.sh). Nothing of it runs by itself.
 # The number of a start goes on from the start before it, also where the folders of the starts are gone: an update
 # of the system that did not keep them, a new image written to the drive, folders deleted by hand. The last number
 # is kept in /storage/.cache/hades-diag/last-start, which an update keeps, and a start is one more than it or than
@@ -21,13 +21,18 @@ FC=/storage/.cache/hades-diag/last-start
 FM=/run/hades-diag-mark
 # What the file .filtered of a folder holds: the filter that the folder went through. 2: with the names of the
 # Bluetooth devices; 3: with a marker for each name in the paths of drives, media folders and shares, and for the
-# labels of drives. An empty file, or an earlier number, is of a filter before them: collect.sh puts such a folder
-# through the filter again, and to-usb.sh leaves it out until then (it has FILTERED of its own: it does not read
-# this file).
-FILTERED=3
+# labels of drives; 4: with the name of this system after "hostname is" and as the value of fqdn, host, node and
+# nodename, and as a word anywhere where it is a name of its own. An empty file, or an earlier number, is of a
+# filter before them: collect.sh puts such a folder through the filter again, and to-usb.sh leaves it out until
+# then (it has FILTERED of its own: it does not read this file).
+FILTERED=4
 
 # The folders of the starts that are here, "<number> <name>" a line, by their numbers (start-07 is start 7)
 start_folders() { ls $D 2>/dev/null | sed -n 's/^[Ss][Tt][Aa][Rr][Tt]-0*\([0-9]\{1,9\}\)$/\1 &/p' | sort -n; }
+
+# The names of the folders of the starts before the last $1 of them, oldest first: a start that is being made
+# keeps the last $1 and itself (start.sh and installer.sh: 7, so that 8 are kept)
+old_starts() { start_folders | awk -v k="$1" '{ a[NR] = $2 } END { for (i = 1; i <= NR - k; i++) print a[i] }'; }
 
 # The number of a new start, kept in storage at once (a start that writes nothing has its number all the same)
 next_start() {

@@ -329,7 +329,7 @@ makeinstall_host() {
 }
 
 post_patch() {
-  # Hades: texture of the player information button in the Estuary OSD (kodi-9005); a binary file,
+  # Hades: texture of the player information button in the Estuary OSD (kodi-9027); a binary file,
   # which GNU patch cannot add, packed into Textures.xbt with the rest of the skin media.
   cp ${PKG_DIR}/hades/processinfo.png \
      ${PKG_BUILD}/addons/skin.estuary/media/osd/fullscreen/buttons/processinfo.png

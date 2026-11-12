@@ -1,0 +1,414 @@
+From f56f6c9af418066cf6d5b17e1a5fddc8e52702ed Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:40:33 +0000
+Subject: [PATCH] DiscSoftTelecineScan: Kodi closing stops the scans of a disc,
+ and one left in a read touches nothing of Kodi when it comes back
+
+The scan of the titles of a disc runs on a thread that nobody joins. Where Kodi
+closed while that thread was in a read of the image that did not come back,
+the thread could come back while Kodi takes down what it reads with: the
+clients of the network (CApplication::Stop(): smb.Deinit(), the NFS
+connection), the libraries (CSectionLoader::UnloadAll() at exit unloads
+libdvdnav, which the thread is in when its read was made by libdvdread), the
+log; and on its way out it would close its image (CFile) and libdvdnav
+(dvdnav_close(), the DllDvdNav that it loaded): a crash at exit.
+
+Now:
+- The scans that run are counted (KODI::DISC::ScanRegistry, never freed).
+  CApplication::Stop() calls CDiscSoftTelecineScan::StopAll() next to the
+  other readings that it stops, before the clients of SMB and NFS go: every
+  scan stops (Stopped()), none starts, the ones that run are waited for up to
+  2 s, and one that is closing what it read with up to 1 s more. Where no scan
+  runs, it returns at once: Kodi closes as fast as before.
+- A scan still left is given up: when its read comes back (the callbacks of
+  the image, the opening of it, the start of its last steps) it parks for good
+  (KODI::DISC::Park()) and touches nothing of Kodi again; the process ends with
+  it parked. Its log of libdvdnav says nothing once Kodi closes.
+- libdvdnav stays loaded until the process ends (a reference of its own,
+  never let go), for a scan of a folder whose read is made by libdvdread.
+- A scan is started only for an image on this system or on a share of SMB, and
+  a folder on this system. A read of SMB holds the lock of the SMB client that
+  smb.Deinit() takes, so the client waits for it, as it does for a read of the
+  player (at most its timeout, sambaclienttimeout). The NFS client is taken
+  down under a read without waiting for it: an image on NFS is no longer read
+  ahead.
+
+t_scanexit (address and undefined behaviour sanitizers, one process a case):
+with no scan the shutdown does not wait (0.1 ms); a scan in a read that comes
+back after 1.5 s is left after the 300 ms of the test and touches nothing when
+it comes back; a scan that reads ends within the wait and closes what it read
+with first; one that closes when the wait ends is waited for (651 ms); no scan
+starts once Kodi closes. Mutants: a scan that does not park touches "Kodi"
+twice after the shutdown; a shutdown without a limit waits 1.4 s; one without
+the moment more leaves the closing scan.
+---
+ xbmc/application/Application.cpp              |   3 +
+ .../DVDInputStreamNavigator.cpp               |  13 +-
+ .../DVDInputStreams/DiscSoftTelecine.h        | 116 +++++++++++++++++-
+ .../DVDInputStreams/DiscSoftTelecineScan.cpp  |  55 ++++++++-
+ .../DVDInputStreams/DiscSoftTelecineScan.h    |  13 +-
+ 5 files changed, 189 insertions(+), 11 deletions(-)
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 33e87ac..52b8edf 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -51,6 +51,7 @@
+ #include "cores/AudioEngine/Engines/ActiveAE/ActiveAE.h"
+ #include "cores/FFmpeg.h"
+ #include "cores/VideoPlayer/DVDFileInfo.h"
++#include "cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h"
+ #include "cores/VideoPlayer/MatroskaEditionChoice.h"
+ #include "cores/VideoPlayer/SubtitleSeekSearch.h"
+ #include "cores/playercorefactory/PlayerCoreFactory.h"
+@@ -2214,6 +2215,8 @@ bool CApplication::Stop(int exitCode)
+     MKV_EDITIONS::StopReadings();
+     // and the searches for the subtitle lines on screen after a seek
+     SUBTITLE_SEEK::StopSearches();
++    // and the scans of the titles of a disc for soft telecine (3 s at most, at once with none)
++    CDiscSoftTelecineScan::StopAll();
+ 
+     CServiceBroker::GetAppMessenger()->Cleanup();
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+index fc034c0..4abbfcb 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamNavigator.cpp
+@@ -347,12 +347,23 @@ bool CDVDInputStreamNavigator::Open()
+ 
+   // Hades: which titles are soft telecined film, read apart from the playing (not a disc in a
+   // drive, nor an image or a folder on one: a second reader would move the head of the drive
+-  // against the player's, and reading the titles before the playing would make it wait seconds)
++  // against the player's, and reading the titles before the playing would make it wait seconds).
++  // Only an image on this system or on a share of SMB, and a folder on this system: a read of one
++  // that does not come back can be left when Kodi closes (CDiscSoftTelecineScan::StopAll()), or is
++  // waited for by the SMB client itself, whose read holds the lock that its teardown takes. The NFS
++  // client is taken down under a read without waiting for it: an image there is not read ahead.
++  const bool local = StringUtils::StartsWith(path, "/");
++  const bool image = m_item.IsDiscImage();
+   if (URIUtils::IsDVD(path) || StringUtils::StartsWith(path, "/dev/") || OnOpticalDisc(path))
+   {
+     CLog::Log(LOGDEBUG,
+               "CDVDInputStreamNavigator: the titles of a disc in a drive are not read ahead");
+   }
++  else if (!local && !(image && URIUtils::IsSmb(path)))
++  {
++    CLog::Log(LOGDEBUG, "CDVDInputStreamNavigator: the titles of {} are not read ahead",
++              image ? "an image of that source" : "a folder that is not on this system");
++  }
+   else
+   {
+     m_softTelecineScan =
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+index 7523468..ddf8ef6 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecine.h
+@@ -208,6 +208,95 @@ TitleResult ScanTitle(Nav& nav, int title, Stop&& stop)
+   return result;
+ }
+ 
++/*!
++ * \brief The scans of the titles of discs whose thread runs, for Kodi to stop them when it closes
++ *        (StopAllScans()), before it takes down what they read with (the clients of SMB and NFS,
++ *        the loaded libraries, the log)
++ *
++ * A scan is in one of three places: it reads, it closes what it read with (finishing), or, where
++ * Kodi gave it up in a read that did not come back in time, it is parked for good when it comes
++ * back (Park()): from then on it touches nothing of Kodi, and the process ends with it parked.
++ * Never freed, so that a parked scan touches nothing freed either.
++ */
++struct ScanRegistry
++{
++  std::mutex mutex;
++  std::condition_variable changed;
++  int running = 0; //!< scans whose thread runs and is not parked
++  int finishing = 0; //!< ... of which closing what they read with
++  std::atomic<bool> closing{false}; //!< Kodi closes: every scan stops, and none starts
++  std::atomic<bool> abandoned{false}; //!< ... and the scans left were given up
++};
++
++inline ScanRegistry& Scans()
++{
++  static ScanRegistry* scans = new ScanRegistry;
++  return *scans;
++}
++
++//! \brief Kodi closes (StopAllScans())
++inline bool Closing()
++{
++  return Scans().closing.load();
++}
++
++//! \brief (a thread of a scan) Kodi gave the scan up: it stays here, touching nothing, until the
++//!        process ends
++[[noreturn]] inline void Park()
++{
++  for (;;)
++    std::this_thread::sleep_for(std::chrono::hours(24));
++}
++
++//! \brief (a thread of a scan) where it comes back from what can block (a read, the opening of an
++//!        image): parks if Kodi gave it up meanwhile
++inline void ParkIfAbandoned()
++{
++  if (Scans().abandoned.load())
++    Park();
++}
++
++//! (a thread of a scan) it counts as finishing (BeginFinish()), until it ends (RunDetached())
++inline thread_local bool t_scanFinishing = false;
++
++//! \brief (a thread of a scan) the scan is about to close what it read with: parks if Kodi gave it
++//!        up, else counts as finishing (StopAllScans() waits a moment more for it)
++inline void BeginFinish()
++{
++  ScanRegistry& scans = Scans();
++  std::unique_lock lock(scans.mutex);
++  if (scans.abandoned)
++  {
++    lock.unlock();
++    Park();
++  }
++  if (!t_scanFinishing)
++    ++scans.finishing;
++  t_scanFinishing = true;
++}
++
++/*!
++ * \brief (Kodi, closing) every scan stops (CScanResults::Stopped()) and none starts; the ones that
++ *        run are waited for up to \a wait, and those closing what they read with then up to
++ *        \a finishing more. Those still left are in a read that does not come back: they are given
++ *        up and park when they come back (Park()).
++ * \return the scans left (0: all ended); where none runs, at once
++ */
++inline int StopAllScans(std::chrono::milliseconds wait, std::chrono::milliseconds finishing)
++{
++  ScanRegistry& scans = Scans();
++  std::unique_lock lock(scans.mutex);
++  scans.closing = true;
++  if (scans.running == 0)
++    return 0;
++  if (!scans.changed.wait_for(lock, wait, [&scans] { return scans.running == 0; }) &&
++      scans.finishing > 0)
++    scans.changed.wait_for(lock, finishing, [&scans] { return scans.finishing == 0; });
++  if (scans.running > 0)
++    scans.abandoned = true;
++  return scans.running;
++}
++
+ /*!
+  * \brief What a scan of the titles of a disc found, shared by the thread that reads them and the
+  *        player's navigator that asks
+@@ -257,7 +346,8 @@ public:
+     std::lock_guard lock(m_mutex);
+     m_changed.notify_all();
+   }
+-  bool Stopped() const { return m_stop.load(); }
++  //! \brief told to stop, by the owner or by Kodi closing (StopAllScans())
++  bool Stopped() const { return m_stop.load() || Closing(); }
+   bool Finished() const
+   {
+     std::lock_guard lock(m_mutex);
+@@ -299,18 +389,36 @@ private:
+ 
+ /*!
+  * \brief Runs a scan on a thread of its own that nobody joins: \a job(results) reads, looks at
+- *        CScanResults::Stopped() as often as it can, and keeps what it needs; the results end
+- *        finished whatever it did
++ *        CScanResults::Stopped() as often as it can, keeps what it needs, comes back from what can
++ *        block through ParkIfAbandoned() and calls BeginFinish() before it closes what it read
++ *        with; the results end finished whatever it did. The scan counts in ScanRegistry while it
++ *        runs.
++ * \return false where Kodi closes: no scan starts then
+  */
+ template<class Job>
+-void RunDetached(std::shared_ptr<CScanResults> results, Job job)
++bool RunDetached(std::shared_ptr<CScanResults> results, Job job)
+ {
++  ScanRegistry& scans = Scans();
++  {
++    std::lock_guard lock(scans.mutex);
++    if (scans.closing)
++      return false;
++    ++scans.running;
++  }
+   std::thread(
+       [results = std::move(results), job = std::move(job)]() mutable
+       {
+         job(*results);
+         results->Finish();
++        ScanRegistry& registry = Scans();
++        std::lock_guard lock(registry.mutex);
++        if (t_scanFinishing)
++          --registry.finishing;
++        t_scanFinishing = false;
++        --registry.running;
++        registry.changed.notify_all();
+       })
+       .detach();
++  return true;
+ }
+ } // namespace KODI::DISC
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+index 73cb2e8..cfc80b1 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.cpp
+@@ -12,13 +12,19 @@
+ #include "DiscSoftTelecine.h"
+ #include "DllDvdNav.h"
+ #include "filesystem/IFileTypes.h"
++#include "filesystem/SpecialProtocol.h"
+ #include "utils/log.h"
+ 
+ #include <algorithm>
+ #include <cstdlib>
++#include <mutex>
+ #include <utility>
+ #include <vector>
+ 
++#if defined(TARGET_POSIX)
++#include <dlfcn.h>
++#endif
++
+ namespace
+ {
+ using KODI::DISC::CScanResults;
+@@ -40,13 +46,16 @@ struct Image
+ };
+ 
+ // the reads of an image, as the player's navigator does them (its callbacks are private to it);
+-// once the scan is told to stop, no read more
++// once the scan is told to stop, no read more; and where Kodi, closing, gave the scan up while a
++// read did not come back, the scan parks when it does (KODI::DISC::ParkIfAbandoned())
+ int cbSeek(void* stream, uint64_t pos)
+ {
+   auto* image = static_cast<Image*>(stream);
+   if (image->results.Stopped())
+     return -1;
+-  return image->file.Seek(pos, SEEK_SET) >= 0 ? 0 : -1;
++  const bool done = image->file.Seek(pos, SEEK_SET) >= 0;
++  KODI::DISC::ParkIfAbandoned();
++  return done ? 0 : -1;
+ }
+ 
+ int cbRead(void* stream, void* buffer, int count)
+@@ -58,6 +67,7 @@ int cbRead(void* stream, void* buffer, int count)
+     if (image->results.Stopped())
+       return -1;
+     const int r = image->file.Read(static_cast<uint8_t*>(buffer) + done, count - done);
++    KODI::DISC::ParkIfAbandoned();
+     if (r < 0)
+       return r;
+     if (r == 0)
+@@ -71,6 +81,8 @@ int cbRead(void* stream, void* buffer, int count)
+ #if DVDNAV_VERSION >= 60100
+ void cbLog(void* /*priv*/, dvdnav_logger_level_t /*level*/, const char* fmt, va_list va)
+ {
++  if (KODI::DISC::Closing())
++    return; // (the log goes away with Kodi)
+   char text[512];
+   vsnprintf(text, sizeof(text), fmt, va);
+   CLog::Log(LOGDEBUG, "CDiscSoftTelecineScan: libdvdnav: {}", text);
+@@ -156,9 +168,10 @@ void CDiscSoftTelecineScan::Start()
+   if (m_started)
+     return;
+   m_started = true;
+-  KODI::DISC::RunDetached(m_results,
+-                          [item = m_item, path = m_path, image = m_image](CScanResults& results)
+-                          { Run(item, path, image, results); });
++  if (!KODI::DISC::RunDetached(
++          m_results, [item = m_item, path = m_path, image = m_image](CScanResults& results)
++          { Run(item, path, image, results); }))
++    m_results->Finish(); // (Kodi closes: nothing is read, nor waited for)
+ }
+ 
+ void CDiscSoftTelecineScan::Stop()
+@@ -166,6 +179,23 @@ void CDiscSoftTelecineScan::Stop()
+   m_results->Stop();
+ }
+ 
++void CDiscSoftTelecineScan::StopAll()
++{
++  // (where no scan runs, a lock and nothing else: Kodi closes as fast as it did)
++  const auto begin = std::chrono::steady_clock::now();
++  const int left =
++      KODI::DISC::StopAllScans(std::chrono::milliseconds(2000), std::chrono::milliseconds(1000));
++  if (left > 0)
++    CLog::Log(LOGWARNING,
++              "CDiscSoftTelecineScan: {} scan(s) of the titles of a disc did not stop within {} "
++              "ms, in a read of the disc that does not come back: left, and parked when it does "
++              "(nothing of Kodi is touched then)",
++              left,
++              std::chrono::duration_cast<std::chrono::milliseconds>(
++                  std::chrono::steady_clock::now() - begin)
++                  .count());
++}
++
+ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+                                 const std::string& path,
+                                 bool isImage,
+@@ -181,8 +211,11 @@ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+   callbacks.pf_read = cbRead;
+   callbacks.pf_seek = cbSeek;
+ 
++  // (where Kodi, closing, gave the scan up meanwhile, it parks here: nothing that it read with is
++  // closed, KODI::DISC::BeginFinish())
+   const auto finish = [&]
+   {
++    KODI::DISC::BeginFinish();
+     if (nav)
+       dll.dvdnav_close(nav);
+     if (image)
+@@ -191,6 +224,18 @@ void CDiscSoftTelecineScan::Run(const CFileItem& item,
+ 
+   if (!dll.Load())
+     return finish();
++#if defined(TARGET_POSIX)
++  // the library stays loaded until the process ends: Kodi, closing, unloads every library
++  // (CSectionLoader::UnloadAll()), also one that a scan it gave up is in, in a read of libdvdread
++  static std::once_flag pinned;
++  std::call_once(pinned,
++                 []
++                 {
++                   if (!dlopen(CSpecialProtocol::TranslatePath(DLL_PATH_LIBDVDNAV).c_str(),
++                               RTLD_LAZY | RTLD_NOLOAD))
++                     CLog::Log(LOGDEBUG, "CDiscSoftTelecineScan: libdvdnav is not kept loaded");
++                 });
++#endif
+   if (isImage)
+   {
+     image = std::make_unique<Image>(item, results);
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+index 5aef8a1..25e223d 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DiscSoftTelecineScan.h
+@@ -29,7 +29,9 @@
+  * at once, also where a read of the image hangs (a share of the network that went away), and the
+  * thread ends on its own with what it owns. Not started for a disc in a drive, nor for an image or
+  * a folder on one (CDVDInputStreamNavigator::Open()): a second reader would move the head of the
+- * drive against the player's.
++ * drive against the player's. Only for an image on this system or on a share of SMB, and a folder
++ * on this system: reads that can be left when Kodi closes (StopAll()), or that the SMB client waits
++ * for itself.
+  */
+ class CDiscSoftTelecineScan
+ {
+@@ -43,6 +45,15 @@ public:
+   //! \brief The disc is closed, or the player ends: the thread is told to stop, and not waited for
+   void Stop();
+ 
++  /*!
++   * \brief Kodi closes (CApplication::Stop(), before the clients of SMB and NFS, the libraries and
++   *        the log go away): every scan stops and none starts; those that run are waited for up to
++   *        2 s, and those closing what they read with up to 1 s more. One still in a read of the
++   *        disc that does not come back is left, and parks for good when it does: it touches
++   *        nothing of Kodi from then on (KODI::DISC::StopAllScans()). Where no scan runs, at once.
++   */
++  static void StopAll();
++
+   /*!
+    * \brief What was found for a title
+    * \param title the number of the title as libdvdnav counts them
+-- 
+2.53.0
+

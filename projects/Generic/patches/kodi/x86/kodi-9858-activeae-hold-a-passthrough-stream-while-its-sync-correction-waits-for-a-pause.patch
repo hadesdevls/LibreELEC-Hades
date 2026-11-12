@@ -1,0 +1,168 @@
+From 3eb04782e3cc16d5367de25040d381b65fd622d7 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:56:42 +0000
+Subject: [PATCH] ActiveAE: hold a passthrough stream while its sync correction
+ waits for a pause
+
+The pauses that put a passthrough stream ahead of the picture back in sync come from a pool of
+500 ms (25 pauses of TrueHD, CActiveAE::Configure()). With TrueHD the engine puts packets out as
+fast as the stream has them, so a correction longer than the pool takes all of it at once, and
+SyncStream() then returned nothing: both callers put the stream's next packet out in the middle of
+the correction, and the pauses went on after it. The receiver gets sound, a cut, sound, a cut. In
+the host harness the code as it was put 13 packets out between pauses in corrections of 1.2 and
+2 s; with the correction counted in its unit (the commit before the previous one) a resume with
+TrueHD needs more than the pool from about 0.5 s.
+
+A passthrough stream now waits, its packet kept, until the sink gives a pause back (RETURNSAMPLE
+wakes the engine), and the correction goes on with silence only. The wait is bounded: if no pause
+comes back in 500 ms the stream goes on as before, and that is logged once. Said once a correction,
+and counted in its log line when it is in sync again. Decoded sound is not changed: its corrections
+do not wait.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp | 49 ++++++++++++++++++-
+ .../Engines/ActiveAE/ActiveAEStream.h         |  9 ++++
+ 2 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index a52a451..dd56d0c 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -53,6 +53,10 @@ constexpr float BUFFER_LEVEL_INCREMENT = 0.0001f; // increment step for ramp-up
+ constexpr double MAX_BUFFER_TIME = 0.1; // max time of a buffer in seconds;
+ constexpr double MAX_LATE_START_MS = 500.0; // late start of audio left to the player's clock
+ 
++// Hades: the longest a passthrough stream waits for the sink to give back a pause of the silence
++// pool in the middle of a correction (SyncStream()): about the length of the pool
++constexpr std::chrono::milliseconds RAW_SILENCE_WAIT_MAX{500};
++
+ // Hades: in the error state, the longest wait for a lost display to be back (DISPLAYRESET) before
+ // the sink is tried again all the same. The longest change of mode measured on Hades' hardware took
+ // 6.2 s (NVIDIA, leaving native Dolby Vision for a mode on FRL).
+@@ -2680,6 +2684,9 @@ bool CActiveAE::RunStages()
+           m_stats.UpdateStream(*it);
+           if (!buffer)
+           {
++            // Hades: the stream waits for a pause to come back from the sink (SyncStream())
++            if ((*it)->m_rawSilenceWait)
++              continue;
+             buffer = (*it)->m_processingBuffers->m_outputSamples.front();
+             (*it)->m_processingBuffers->m_outputSamples.pop_front();
+           }
+@@ -2740,6 +2747,7 @@ bool CActiveAE::IsTrueHDPassthrough() const
+ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+ {
+   CSampleBuffer *ret = NULL;
++  stream->m_rawSilenceWait = false; // (Hades)
+ 
+   if (!stream->m_pClock)
+     return ret;
+@@ -2814,6 +2822,9 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+       stream->m_rawAdjustSince = std::chrono::steady_clock::now();
+       stream->m_rawPauseMs = 0;
+       stream->m_rawDropped = 0;
++      stream->m_rawSilenceWaits = 0;
++      stream->m_rawSilenceWaitSince.reset();
++      stream->m_rawSilenceGaveUp = false;
+       CLog::Log(LOGINFO,
+                 "ActiveAE::SyncStream - the passthrough stream ({}) is {:.0f} ms {} the video, "
+                 "more than the {:.0f} ms allowed: it is put back with {}, each a cut in the sound",
+@@ -2848,6 +2859,9 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+         stream->m_rawAdjustSince = std::chrono::steady_clock::now();
+         stream->m_rawPauseMs = 0;
+         stream->m_rawDropped = 0;
++        stream->m_rawSilenceWaits = 0;
++        stream->m_rawSilenceWaitSince.reset();
++        stream->m_rawSilenceGaveUp = false;
+         if (stream->m_rawAdjusting)
+           CLog::Log(LOGINFO,
+                     "ActiveAE::SyncStream - the passthrough stream ({}) starts {:.0f} ms {} the "
+@@ -2887,6 +2901,7 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+       ret = m_silenceBuffers->GetFreeBuffer();
+       if (ret)
+       {
++        stream->m_rawSilenceWaitSince.reset(); // (Hades)
+         ret->pkt->nb_samples = 0;
+         ret->pkt->pause_burst_ms = 0;
+         int framesToDelay = error / 1000 * ret->pkt->config.sample_rate;
+@@ -2927,6 +2942,32 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+           ret = nullptr;
+         }
+       }
++      else if (m_mode == MODE_RAW)
++      {
++        // Hades: every pause of the silence pool is in the sink. The packet in hand is not put out
++        // in the middle of the pauses, which would cut the sound once more when they go on: the
++        // stream waits for the sink to give a pause back (RETURNSAMPLE wakes the engine), for at
++        // most about the length of the pool, and then goes on as Kodi has it.
++        const auto now = std::chrono::steady_clock::now();
++        if (!stream->m_rawSilenceWaitSince)
++        {
++          stream->m_rawSilenceWaitSince = now;
++          if (stream->m_rawSilenceWaits++ == 0)
++            CLog::Log(LOGINFO, "ActiveAE::SyncStream - every pause of the engine is in the sink: the "
++                               "passthrough stream waits for one to come back, so that its sound "
++                               "is not put in the middle of the pauses");
++        }
++        if (now - *stream->m_rawSilenceWaitSince <= RAW_SILENCE_WAIT_MAX)
++          stream->m_rawSilenceWait = true;
++        else if (!stream->m_rawSilenceGaveUp)
++        {
++          stream->m_rawSilenceGaveUp = true;
++          CLog::Log(LOGWARNING,
++                    "ActiveAE::SyncStream - no pause came back from the sink in {} ms: the "
++                    "passthrough stream goes on in the middle of the pauses",
++                    RAW_SILENCE_WAIT_MAX.count());
++        }
++      }
+     }
+     else
+     {
+@@ -2974,11 +3015,15 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
+         stream->m_rawAdjusting = false;
+         CLog::Log(LOGINFO,
+                   "ActiveAE::SyncStream - the passthrough stream is in sync with the video again "
+-                  "after {} ms: {:.0f} ms of pauses, {} packets left out, {:+.0f} ms off",
++                  "after {} ms: {:.0f} ms of pauses, {} packets left out, {:+.0f} ms off{}",
+                   std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - stream->m_rawAdjustSince)
+                       .count(),
+-                  stream->m_rawPauseMs, stream->m_rawDropped, error / scale);
++                  stream->m_rawPauseMs, stream->m_rawDropped, error / scale,
++                  stream->m_rawSilenceWaits
++                      ? StringUtils::Format(", {} wait(s) for a pause to come back from the sink",
++                                            stream->m_rawSilenceWaits)
++                      : std::string());
+       }
+       if (stream->m_lastSyncError > threshold * 2)
+       {
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+index 17595b5..a24b6c2 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+@@ -16,7 +16,9 @@
+ #include "threads/Event.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <deque>
++#include <optional>
+ 
+ namespace ActiveAE
+ {
+@@ -264,6 +266,13 @@ protected:
+   std::chrono::steady_clock::time_point m_rawAdjustSince{};
+   double m_rawPauseMs{0};
+   unsigned int m_rawDropped{0};
++  //! Hades: in such a correction, every pause of the silence pool was in the sink: the stream waits
++  //! for one to come back, and CActiveAE::RunStages() does not put its packet out; since when it
++  //! waits, how many times it waited in the correction, and whether it stopped waiting
++  bool m_rawSilenceWait{false};
++  std::optional<std::chrono::steady_clock::time_point> m_rawSilenceWaitSince;
++  unsigned int m_rawSilenceWaits{0};
++  bool m_rawSilenceGaveUp{false};
+ };
+ }
+ 
+-- 
+2.53.0
+

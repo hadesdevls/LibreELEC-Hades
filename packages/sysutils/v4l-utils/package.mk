@@ -10,7 +10,7 @@ PKG_SHA256="6828828a17775526eb93fb258a9294d1d1073d633c344dd71ecd4e7a1ffb7dfc"
 PKG_LICENSE="GPL-2.0-or-later AND LGPL-2.1-or-later"
 PKG_SITE="https://linuxtv.org/"
 PKG_URL="https://linuxtv.org/downloads/v4l-utils/${PKG_NAME}-${PKG_VERSION}.tar.xz"
-PKG_DEPENDS_TARGET="toolchain alsa-lib elfutils ir-bpf-decoders libbpf systemd zlib"
+PKG_DEPENDS_TARGET="toolchain alsa-lib elfutils libbpf llvm:host systemd zlib"
 PKG_LONGDESC="Linux V4L2 and DVB API utilities and v4l libraries (libv4l)."
 
 PKG_MESON_OPTS_TARGET="-Dbpf=enabled \
@@ -30,6 +30,23 @@ create_multi_keymap() {
       [ -e "${map}" ] && cat "${map}"
     done
   ) >${INSTALL}/usr/lib/udev/rc_keymaps/${name}.toml
+}
+
+pre_configure_target() {
+  local p
+
+  # the IR BPF decoders are compiled from this source by the toolchain's clang
+  # (BPF target of llvm:host), the compiler upstream uses for them. meson would
+  # take a bpf-gcc first if one were on the PATH, and decoders built with
+  # bpf-gcc did not pass the kernel verifier when LibreELEC tried it in 2022
+  for p in bpf-gcc bpf-none-gcc bpf-unknown-none-gcc; do
+    if command -v ${p} >/dev/null; then
+      die "v4l-utils: ${p} found on the PATH; the IR BPF decoders are built with the toolchain's clang"
+    fi
+  done
+  if [ "$(command -v clang)" != "${TOOLCHAIN}/bin/clang" ]; then
+    die "v4l-utils: the clang on the PATH is not the toolchain's: $(command -v clang)"
+  fi
 }
 
 post_makeinstall_target() {

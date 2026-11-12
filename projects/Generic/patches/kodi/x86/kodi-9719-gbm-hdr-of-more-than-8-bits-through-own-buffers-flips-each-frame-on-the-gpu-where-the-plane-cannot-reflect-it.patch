@@ -1,0 +1,450 @@
+From d4ba21b44a5286ce11390419e486db48786918dd Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:46:14 +0000
+Subject: [PATCH] gbm: HDR of more than 8 bits through own buffers flips each
+ frame on the GPU where the plane cannot reflect it
+
+With NVIDIA's 580 driver (GeForce GTX 900 and 10, TITAN V) EGL offers no window
+of more than 8 bits, so such video is drawn into buffers that Kodi allocates itself
+(COwnScanout). OpenGL draws into a framebuffer object with the bottom row of the
+picture first, so a frame in those buffers is upside down for the display. The plane
+reflected it (rotation, reflect-y); the plane of nvidia-drm 580 has no such property,
+and there the video went out at 8 bits (hadesdevls/LibreELEC-Hades#17: "the plane
+can't flip a picture").
+
+Where the plane cannot reflect, the frames are now drawn upright into a framebuffer
+object of their own, in the format of the buffers (RGB10_A2 or RGBA16F), and the GPU
+flips each one into the buffer that goes to the screen when the frame is swapped: one
+glBlitFramebuffer with NEAREST filtering and the destination rows reversed (OpenGL
+ES 3.0), which copies every value as it is. Before use, with the other checks of the
+buffers, four pixels written with values of more than 8 bits are flipped into a
+buffer and read back from its top row, with the bottom row still black (FlipProbe());
+a failure there leaves the video at 8 bits as before, with the step that failed in
+kodi.log. Where the plane can reflect, nothing changes.
+
+Tested on the host (Mesa llvmpipe, OpenGL ES 3.2): a frame of 384 different pixels is
+flipped bit for bit in both formats, the probe passes, and with a blit that does not
+flip the probe and the frame comparison fail.
+---
+ xbmc/windowing/gbm/OwnScanout.cpp             | 222 +++++++++++++++++-
+ xbmc/windowing/gbm/OwnScanout.h               |  27 +++
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp |  34 +--
+ 3 files changed, 264 insertions(+), 19 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/OwnScanout.cpp b/xbmc/windowing/gbm/OwnScanout.cpp
+index f63f3aa..1546dfc 100644
+--- a/xbmc/windowing/gbm/OwnScanout.cpp
++++ b/xbmc/windowing/gbm/OwnScanout.cpp
+@@ -208,6 +208,163 @@ bool COwnScanout::MakeTarget(EGLImageKHR image, unsigned int& renderbuffer,
+   return true;
+ }
+ 
++void COwnScanout::FlipBlit(unsigned int source, unsigned int target, int width, int height)
++{
++  GLint draw = 0, read = 0;
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glDisable(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target);
++  // The destination rectangle runs from the top row to the bottom one: OpenGL ES 3.0 reverses the
++  // picture in that direction (NEAREST: each value is copied as it is, 1:1)
++  glBlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++}
++
++bool COwnScanout::FlipProbe(unsigned int frame, unsigned int target, int width, int height,
++                            bool floating, std::string& failed)
++{
++  GLint draw = 0, read = 0, box[4]{}, packAlignment = 4, packBuffer = 0;
++  GLfloat clear[4]{};
++  GLboolean mask[4]{};
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glGetIntegerv(GL_SCISSOR_BOX, box);
++  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
++  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++  glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
++  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++  while (glGetError() != GL_NO_ERROR)
++  {
++  }
++
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++  glPixelStorei(GL_PACK_ALIGNMENT, 4);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++
++  // Black in both, then the four pixels in the bottom row of the frame
++  glDisable(GL_SCISSOR_TEST);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  glBindFramebuffer(GL_FRAMEBUFFER, target);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glBindFramebuffer(GL_FRAMEBUFFER, frame);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glEnable(GL_SCISSOR_TEST);
++  for (int pixel = 0; pixel < 4; ++pixel)
++  {
++    glScissor(pixel, 0, 1, 1);
++    if (floating)
++      glClearColor(PROBE_FLOATS[pixel][0], PROBE_FLOATS[pixel][1], PROBE_FLOATS[pixel][2], 1.0f);
++    else
++      glClearColor(PROBE_CODES[pixel][0] / 1023.0f, PROBE_CODES[pixel][1] / 1023.0f,
++                   PROBE_CODES[pixel][2] / 1023.0f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++  }
++  glDisable(GL_SCISSOR_TEST);
++
++  FlipBlit(frame, target, width, height);
++  const GLenum blitError = glGetError();
++
++  bool same = true;
++  char text[200] = "";
++  if (blitError != GL_NO_ERROR)
++  {
++    snprintf(text, sizeof(text), "the GPU could not flip a frame into the buffer (GL error 0x%x)",
++             blitError);
++    failed = text;
++    same = false;
++  }
++
++  // (row 0 is the bottom row of the picture in OpenGL: the pixels went to the top row, height - 1,
++  // and nothing is left in the row where they were)
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, target);
++  for (int pass = 0; same && pass < 2; ++pass)
++  {
++    const int row = pass == 0 ? height - 1 : 0;
++    for (int pixel = 0; same && pixel < 4; ++pixel)
++    {
++      double value[3]{};
++      double expected[3]{};
++      if (floating)
++      {
++        float values[4]{};
++        glReadPixels(pixel, row, 1, 1, GL_RGBA, GL_FLOAT, values);
++        if (glGetError() != GL_NO_ERROR)
++        {
++          GLint format = 0, type = 0;
++          glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &format);
++          glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &type);
++          uint16_t halves[4]{};
++          if (format == GL_RGBA && type == GL_HALF_FLOAT)
++            glReadPixels(pixel, row, 1, 1, GL_RGBA, GL_HALF_FLOAT, halves);
++          if (format != GL_RGBA || type != GL_HALF_FLOAT || glGetError() != GL_NO_ERROR)
++          {
++            failed = "the buffer cannot be read back as floats";
++            same = false;
++            break;
++          }
++          for (int i = 0; i < 4; ++i)
++            values[i] = HalfToFloat(halves[i]);
++        }
++        for (int c = 0; c < 3; ++c)
++        {
++          value[c] = static_cast<double>(values[c]);
++          expected[c] = pass == 0 ? static_cast<double>(PROBE_FLOATS[pixel][c]) : 0.0;
++        }
++      }
++      else
++      {
++        GLuint packed = 0;
++        glReadPixels(pixel, row, 1, 1, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, &packed);
++        if (glGetError() != GL_NO_ERROR)
++        {
++          failed = "the buffer cannot be read back as 10-bit values";
++          same = false;
++          break;
++        }
++        for (int c = 0; c < 3; ++c)
++        {
++          value[c] = static_cast<double>((packed >> (10 * c)) & 0x3ff);
++          expected[c] = pass == 0 ? PROBE_CODES[pixel][c] : 0.0;
++        }
++      }
++      for (int c = 0; c < 3; ++c)
++        if (value[c] != expected[c])
++        {
++          snprintf(text, sizeof(text),
++                   "the GPU's flip of a frame did not give the values written (%.9g for %.9g in "
++                   "the %s row, pixel %d component %d)",
++                   value[c], expected[c], pass == 0 ? "top" : "bottom", pixel, c);
++          failed = text;
++          same = false;
++          break;
++        }
++    }
++  }
++
++  // Black, before anything is shown through it
++  glBindFramebuffer(GL_FRAMEBUFFER, target);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  glClear(GL_COLOR_BUFFER_BIT);
++
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
++  glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
++  glColorMask(mask[0], mask[1], mask[2], mask[3]);
++  glClearColor(clear[0], clear[1], clear[2], clear[3]);
++  glScissor(box[0], box[1], box[2], box[3]);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  return same;
++}
++
+ bool COwnScanout::Probe(unsigned int framebuffer, bool floating, std::string& failed)
+ {
+   GLint draw = 0, read = 0, box[4]{}, packAlignment = 4, packBuffer = 0;
+@@ -347,6 +504,7 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+                                                  int height,
+                                                  uint32_t format,
+                                                  const std::vector<uint64_t>& modifiers,
++                                                 bool flipOnGpu,
+                                                  std::string& failed)
+ {
+   if (!Supported(format))
+@@ -356,6 +514,8 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+   }
+   std::shared_ptr<COwnScanout> own(new COwnScanout());
+   own->m_display = display;
++  own->m_width = width;
++  own->m_height = height;
+   own->m_format = format;
+ 
+   for (unsigned int i = 0; i < BUFFERS; ++i)
+@@ -425,6 +585,47 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+     if (!Probe(buffer.framebuffer, IsFloat(format), failed))
+       return nullptr;
+   }
++
++  if (flipOnGpu)
++  {
++    // Where the frame is drawn, upright, in the format of the buffers (RGB10_A2 or RGBA16F)
++    const bool floating = IsFloat(format);
++    GLint previousFramebuffer = 0, previousRenderbuffer = 0;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
++    glGetIntegerv(GL_RENDERBUFFER_BINDING, &previousRenderbuffer);
++    while (glGetError() != GL_NO_ERROR)
++    {
++    }
++    GLuint rb = 0, fb = 0;
++    glGenRenderbuffers(1, &rb);
++    glBindRenderbuffer(GL_RENDERBUFFER, rb);
++    glRenderbufferStorage(GL_RENDERBUFFER, floating ? GL_RGBA16F : GL_RGB10_A2, width, height);
++    const GLenum storageError = glGetError();
++    glGenFramebuffers(1, &fb);
++    glBindFramebuffer(GL_FRAMEBUFFER, fb);
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
++    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previousFramebuffer));
++    glBindRenderbuffer(GL_RENDERBUFFER, static_cast<GLuint>(previousRenderbuffer));
++    if (storageError != GL_NO_ERROR || status != GL_FRAMEBUFFER_COMPLETE)
++    {
++      char text[200];
++      snprintf(text, sizeof(text),
++               "GL cannot make the framebuffer that the frames are drawn into before the GPU "
++               "flips them (storage error 0x%x, framebuffer status 0x%x)",
++               storageError, status);
++      failed = text;
++      glDeleteFramebuffers(1, &fb);
++      glDeleteRenderbuffers(1, &rb);
++      return nullptr;
++    }
++    own->m_frameRenderbuffer = rb;
++    own->m_frameFramebuffer = fb;
++    if (!Probe(fb, floating, failed))
++      return nullptr;
++    if (!FlipProbe(fb, own->m_buffers.front().framebuffer, width, height, floating, failed))
++      return nullptr;
++  }
+   return own;
+ }
+ 
+@@ -432,6 +633,14 @@ COwnScanout::~COwnScanout()
+ {
+   const auto destroy =
+       reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
++  if (m_frameFramebuffer)
++  {
++    if (KODI::RENDERING::OutputFramebuffer() == m_frameFramebuffer)
++      KODI::RENDERING::SetOutputFramebuffer(0);
++    glDeleteFramebuffers(1, &m_frameFramebuffer);
++  }
++  if (m_frameRenderbuffer)
++    glDeleteRenderbuffers(1, &m_frameRenderbuffer);
+   for (auto& buffer : m_buffers)
+   {
+     if (buffer.framebuffer)
+@@ -470,6 +679,11 @@ void COwnScanout::Release(gbm_bo* bo)
+ 
+ bool COwnScanout::Swap(bool finish)
+ {
++  // The frame was drawn upright into the framebuffer of its own: the GPU flips it into the buffer
++  // that was chosen for it, which goes to the screen (a frame with no buffer chosen is not
++  // flipped anywhere: below)
++  if (m_frameFramebuffer && m_ring.BackIndex() >= 0)
++    FlipBlit(m_frameFramebuffer, m_buffers[m_ring.BackIndex()].framebuffer, m_width, m_height);
+   if (finish)
+     glFinish();
+   else
+@@ -487,8 +701,12 @@ bool COwnScanout::BindBack()
+   const int index = m_ring.Back();
+   if (index < 0)
+     return false;
+-  glBindFramebuffer(GL_FRAMEBUFFER, m_buffers[index].framebuffer);
+-  KODI::RENDERING::SetOutputFramebuffer(m_buffers[index].framebuffer);
++  // (flipping on the GPU: the frame is drawn into the framebuffer that stands for the window; the
++  // buffer chosen here is the one it is flipped into)
++  const unsigned int framebuffer =
++      m_frameFramebuffer ? m_frameFramebuffer : m_buffers[index].framebuffer;
++  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++  KODI::RENDERING::SetOutputFramebuffer(framebuffer);
+   return true;
+ }
+ 
+diff --git a/xbmc/windowing/gbm/OwnScanout.h b/xbmc/windowing/gbm/OwnScanout.h
+index d50712e..9b8becb 100644
+--- a/xbmc/windowing/gbm/OwnScanout.h
++++ b/xbmc/windowing/gbm/OwnScanout.h
+@@ -163,6 +163,13 @@ struct OwnDmaBuf
+  * (KODI::RENDERING::OutputFramebuffer()), "swapped" (Swap()), and Kodi's commit takes the front
+  * buffer, as it takes one of the window's (CGBMSurface::LockFrontBuffer()).
+  * GLES only. Made and destroyed on the render thread, with its GL context current.
++ *
++ * A framebuffer object holds the bottom row of the picture first, so a frame drawn into one of these
++ * buffers is upside down for the display. Where the plane can reflect it (rotation, reflect-y) it
++ * does (CDRMUtils::SetReflectY()); where it cannot (the 580 driver of NVIDIA), the frame is drawn
++ * into a framebuffer object of the same format that stands for the window, and the GPU flips it
++ * into the buffer that goes to the screen when the frame is swapped (flipOnGpu: one blit of the
++ * picture, which copies each value as it is).
+  */
+ class COwnScanout : public IOwnBuffers
+ {
+@@ -177,6 +184,8 @@ public:
+    * \brief Buffers of this format, each imported into EGL, bound to a framebuffer object, and
+    * checked: the framebuffer is complete, and keeps values of more than 8 bits (Probe())
+    * \param modifiers those the plane takes for the format (none: linear, or the driver's choice)
++   * \param flipOnGpu the frames are drawn upright into a framebuffer object of their own and
++   * flipped into the buffers by the GPU (Swap()), checked before use with the rest (FlipProbe())
+    * \param[out] failed which step failed, in plain words
+    * \return nullptr when a step failed; nothing is left of what was made
+    */
+@@ -186,6 +195,7 @@ public:
+                                              int height,
+                                              uint32_t format,
+                                              const std::vector<uint64_t>& modifiers,
++                                             bool flipOnGpu,
+                                              std::string& failed);
+ 
+   //! The format is one these buffers can be made of (10-bit or half-float RGB)
+@@ -204,6 +214,16 @@ public:
+   //! the same values, or the step that failed. The framebuffer is then cleared to black. The GL
+   //! state that it touches is put back.
+   static bool Probe(unsigned int framebuffer, bool floating, std::string& failed);
++  //! \brief The flip of the GPU: four pixels of the bottom row of \p frame, cleared to values that
++  //! 8 bits cannot hold, are blitted flipped into \p target (both width x height, of the same
++  //! format) and read back from its top row, where they have to be the same values, with the
++  //! bottom row of \p target still black (a copy that did not flip fails). \p target is then
++  //! cleared to black. The GL state that it touches is put back.
++  static bool FlipProbe(unsigned int frame, unsigned int target, int width, int height,
++                        bool floating, std::string& failed);
++  //! \brief The whole of \p source blitted, flipped from top to bottom, into \p target (the
++  //! scissor test is off for it, and put back)
++  static void FlipBlit(unsigned int source, unsigned int target, int width, int height);
+ 
+   // IOwnBuffers (the GBM surface of the window, CGBMSurface)
+   gbm_bo* LockFront() override;
+@@ -219,6 +239,8 @@ public:
+   bool BindBack();
+   //! The window's framebuffer (0) is bound again, and stands for the window again
+   static void UnbindAll();
++  //! The frames are flipped by the GPU (Create(): flipOnGpu)
++  bool FlipsOnGpu() const { return m_frameFramebuffer != 0; }
+ 
+   //! The first buffer, for the driver's test before anything is shown through these
+   gbm_bo* FirstBuffer() const { return m_buffers.empty() ? nullptr : m_buffers.front().bo; }
+@@ -240,6 +262,11 @@ private:
+     unsigned int framebuffer{0};
+   };
+   EGLDisplay m_display{EGL_NO_DISPLAY};
++  int m_width{0};
++  int m_height{0};
++  //! flipOnGpu: where the frame is drawn, upright, before it is flipped into a buffer (Swap())
++  unsigned int m_frameRenderbuffer{0};
++  unsigned int m_frameFramebuffer{0};
+   uint32_t m_format{0};
+   uint64_t m_modifier{0};
+   std::vector<Buffer> m_buffers;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index ffaa90f..5b80e9e 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -829,16 +829,10 @@ bool CWinSystemGbmEGLContext::OwnScanoutStart(int bitDepth)
+   if (!plane || !m_DRM->GetCrtc())
+     return false;
+   // OpenGL draws into a framebuffer object with the bottom row of the picture first, so a frame in
+-  // these buffers is upside down for the display: the plane reflects it (CDRMUtils::SetReflectY()).
+-  // A plane that cannot never takes them: the video then goes out upright, at 8 bits.
+-  if (!CDRMUtils::CanReflectY(plane))
+-  {
+-    if (m_ownFailedKeys.insert("no-reflect").second)
+-      CLog::LogF(LOGINFO, "HDR output: the plane cannot reflect a frame from top to bottom "
+-                          "(rotation, reflect-y), which Kodi's own buffers need: video of more "
+-                          "than 8 bits goes out at 8 bits");
+-    return false;
+-  }
++  // these buffers is upside down for the display: the plane reflects it (CDRMUtils::SetReflectY()),
++  // or, where the plane cannot, the GPU flips each frame when it is swapped (COwnScanout, one
++  // blit of the picture that copies every value as it is).
++  const bool flipOnGpu = !CDRMUtils::CanReflectY(plane);
+ 
+   std::vector<const outputformat*> candidates;
+   for (const auto& format : m_DRM->GetOutputFormats())
+@@ -875,12 +869,14 @@ bool CWinSystemGbmEGLContext::OwnScanoutStart(int bitDepth)
+       continue;
+     std::string failed;
+     auto own = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), m_nWidth,
+-                                   m_nHeight, format->drm, format->modifiers, failed);
+-    if (own)
++                                   m_nHeight, format->drm, format->modifiers, flipOnGpu, failed);
++    if (own && !flipOnGpu)
+       m_DRM->SetReflectY(true);
+     if (own && !m_DRM->TestFramebuffer(own->FirstBuffer()))
+     {
+-      failed = "the driver refused, in a test, a commit of the plane with one of them";
++      failed = flipOnGpu ? "the driver refused, in a test, a commit of the plane with one of them"
++                         : "the driver refused, in a test, a commit of the plane with one of them "
++                           "and its reflection";
+       own.reset();
+     }
+     if (!own)
+@@ -923,14 +919,18 @@ bool CWinSystemGbmEGLContext::OwnScanoutStart(int bitDepth)
+       m_DRM->AllowModeset();
+     CLog::LogF(LOGINFO,
+                "HDR output: video of more than 8 bits goes out at {} bits through {} buffers of {} "
+-               "(modifier {}) that Kodi allocates itself and draws into, {}x{}, reflected from top "
+-               "to bottom by the plane: {}; checked before use (values of more than 8 bits written "
+-               "and read back, and a test commit with the reflection)",
++               "(modifier {}) that Kodi allocates itself and draws into, {}x{}, {}: {}; checked "
++               "before use (values of more than 8 bits written and read back, {})",
+                own->OutputBits() == 16 ? "more than 10" : "10", COwnScanout::BUFFERS,
+                DRMHELPERS::FourCCToString(own->Format()),
+                DRMHELPERS::ModifierToString(own->Modifier()), m_nWidth, m_nHeight,
++               flipOnGpu ? "flipped from top to bottom by the GPU when each frame is swapped (the "
++                           "plane cannot reflect them)"
++                         : "reflected from top to bottom by the plane",
+                m_floatOutputSupported ? "the EGL of nvidia-drm offers no window of that depth"
+-                                      : "asked for in advancedsettings.xml (hdrownbuffersalways)");
++                                      : "asked for in advancedsettings.xml (hdrownbuffersalways)",
++               flipOnGpu ? "a frame flipped by the GPU and read back, and a test commit"
++                         : "and a test commit with the reflection");
+     return true;
+   }
+   return false;
+-- 
+2.53.0
+

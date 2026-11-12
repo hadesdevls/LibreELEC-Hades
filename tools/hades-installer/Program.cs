@@ -15,6 +15,7 @@ namespace Hades.Installer
         {
             string here = Path.GetDirectoryName(Application.ExecutablePath);
             Application.EnableVisualStyles();
+            Ui.Dark = Ui.WindowsIsDark();
             Application.SetCompatibleTextRenderingDefault(false);
             // the tests: none of them asks for administrator rights by itself. (Each has its first, Spanish, name too.)
             string test = args.Length > 0 ? args[0] : "";

@@ -1,0 +1,723 @@
+From 8a022165598c81dd377cb194acd9278c1df9c6fb Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 23:28:27 +0000
+Subject: [PATCH] [Blu-ray] Show the HAVi background plane and a BD-J screen
+ that plays no playlist
+
+The Kodi side of libbluray-9070 (SamuriHL's libbluray patch 07), which draws the
+HAVi background plane of BD-J discs and adds bd_bdj_waiting_for_playback().
+
+The background plane. libbluray delivers it through the ARGB overlay callback
+on plane 2 (BD_OVERLAY_BG). The callback took only planes 0 and 1, and any
+CLOSE closed all of them: a disc that sets its background colour to
+transparent would have wiped its own menu. Now:
+- plane 2 is kept with the others, and a CLOSE closes its own plane (the whole
+  composition when nothing is left, as before);
+- the composition goes back to front: background, PG, IG;
+- the background lies behind the video and the overlays are drawn over it, so
+  it is shown only while no playlist is open (hidden on BD_EVENT_PLAYLIST and
+  when a video stream opens, shown when BD-J waits with no playlist). With
+  full-screen video, which is all libbluray presents (it does not implement
+  BD-J video scaling), that is exactly what a player composites;
+- a flush that carries the background alone does not count as menu graphics
+  (IsInMenu()), and an IG close that leaves only the background ends them.
+The planes are now changed under a lock of their own: the BD-J callbacks run
+on the JVM's graphics thread and the background is re-posted from the player
+thread. m_hasOverlay, read by the player and the GUI, is atomic.
+
+A BD-J screen with no playlist (a disc's own resume prompt, John Wick 3).
+bd_read() has nothing to give then, and the demuxer probe kept the player
+thread in the input stream's idle loop: no player message was handled, the
+streams never became ready, the busy dialog took every key and nothing was
+drawn, because disc overlays are drawn only with a decoded picture. Now:
+- Prepare() does not open the demuxer while the disc waits
+  (GetBdjWaitState()), and the main loop keeps running and opens it once the
+  disc starts a playlist; a resume position is not applied then (logged);
+- once the disc has kept menu graphics up with no playlist for 3 s (a normal
+  BD-J start draws a logo first), playback start is announced: busy dialog
+  gone, fullscreen video window, keys to the disc; HasVideo() says so;
+- with no video configured, the render manager draws the latest disc menu
+  composition by itself, full screen, in the fullscreen video window only
+  (SetDiscMenuWithoutPicture(), OVERLAY::CRenderer::NO_PICTURE, a slot after
+  the render buffers). A video stream ends it.
+
+Not covered: a screen with no playlist that a BD-J title shows after its video
+played (the demuxer is open then and the read idles as before).
+
+Design from SamuriHL's coreelec-xbmc 54b2c4bec6ff, commits bfa8ea9bd559 and
+6ad6c5edd48d (read as data; SHA256 of the patches kept with the sources of the
+change): the deferred demuxer, the wait state with its event drain, the 3 s
+menu-only start, SignalStreamsReady() and SetBackgroundVisible() are his,
+adapted to this VideoPlayer. His drawing without a picture relies on a
+presentation-time overlay composition this tree does not have; here it is a
+slot of its own in the overlay renderer. The overlay lock, the IsInMenu() rule
+and the per-plane close are written again for this tree.
+
+Co-developed-by: SamuriHL <samurihl@msn.com>
+---
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  |  91 +++++++++++-
+ .../DVDInputStreams/DVDInputStreamBluray.h    |  34 ++++-
+ .../cores/VideoPlayer/DVDOverlayContainer.cpp |  11 ++
+ xbmc/cores/VideoPlayer/DVDOverlayContainer.h  |   7 +
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 135 +++++++++++++++---
+ xbmc/cores/VideoPlayer/VideoPlayer.h          |  19 +++
+ .../VideoRenderers/OverlayRenderer.cpp        |  22 +++
+ .../VideoRenderers/OverlayRenderer.h          |  17 ++-
+ .../VideoRenderers/RenderManager.cpp          |  28 ++++
+ .../VideoRenderers/RenderManager.h            |  11 ++
+ 10 files changed, 346 insertions(+), 29 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index 15703c6..b92977a 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -676,6 +676,8 @@ void CDVDInputStreamBluray::ProcessEvent() {
+   }
+   case BD_EVENT_PLAYLIST:
+     CLog::Log(LOGDEBUG, "CDVDInputStreamBluray - BD_EVENT_PLAYLIST {}", m_event.param);
++    // Hades: the background plane lies behind the video, which now covers it
++    SetBackgroundVisible(false);
+     m_playlist = m_event.param;
+     FreeTitleInfo();
+     m_titleInfo = bd_get_playlist_info(m_bd, m_playlist, m_angle);
+@@ -898,6 +900,7 @@ static uint32_t build_rgba(const BD_PG_PALETTE_ENTRY &e)
+ void CDVDInputStreamBluray::OverlayClose()
+ {
+ #if(BD_OVERLAY_INTERFACE_VERSION >= 2)
++  std::unique_lock lock(m_overlayLock);
+   for(SPlane& plane : m_planes)
+     plane.o.clear();
+   auto group = std::make_shared<CDVDOverlayGroup>();
+@@ -967,20 +970,48 @@ void CDVDInputStreamBluray::OverlayFlush(int64_t pts)
+   group->SetDiscMenu(true);
+   group->SetOverlayContainerFlushable(false);
+ 
+-  for(SPlane& plane : m_planes)
++  std::unique_lock lock(m_overlayLock);
++  // Hades: back to front - the HAVi background (2), when shown, then PG (0), then IG (1)
++  for (const int planeIdx : {2, 0, 1})
+   {
+-    for(SOverlays::iterator it = plane.o.begin(); it != plane.o.end(); ++it)
+-      group->m_overlays.push_back(*it);
++    if (planeIdx == 2 && !m_bgVisible)
++      continue;
++    for (const SOverlay& o : m_planes[planeIdx].o)
++      group->m_overlays.push_back(o);
+   }
+ 
+   m_player->OnDiscNavResult(static_cast<void*>(&group), BD_EVENT_MENU_OVERLAY);
+-  m_hasOverlay = true;
++  // Hades: as before, a flush says menu graphics are up - except one that carries the
++  // background plane alone, which is a picture behind the video, not a menu
++  if (!(m_planes[0].o.empty() && m_planes[1].o.empty() && !m_planes[2].o.empty()))
++    m_hasOverlay = true;
++#endif
++}
++
++void CDVDInputStreamBluray::SetBackgroundVisible(bool visible)
++{
++#if(BD_OVERLAY_INTERFACE_VERSION >= 2)
++  if (m_bgVisible.exchange(visible) == visible)
++    return;
++
++  bool hasBackground;
++  {
++    std::unique_lock lock(m_overlayLock);
++    hasBackground = !m_planes[2].o.empty();
++  }
++  CLog::Log(LOGDEBUG, "CDVDInputStreamBluray - background plane {}{}",
++            visible ? "shown (no playlist open)" : "hidden behind the video",
++            hasBackground ? "" : " (empty)");
++  // posted again so the change shows without waiting for the disc to draw
++  if (hasBackground)
++    OverlayFlush(-1);
+ #endif
+ }
+ 
+ void CDVDInputStreamBluray::OverlayCallback(const BD_OVERLAY * const ov)
+ {
+ #if(BD_OVERLAY_INTERFACE_VERSION >= 2)
++  std::unique_lock lock(m_overlayLock);
+   if(ov == nullptr || ov->cmd == BD_OVERLAY_CLOSE)
+   {
+     OverlayClose();
+@@ -1050,15 +1081,37 @@ void CDVDInputStreamBluray::OverlayCallback(const BD_OVERLAY * const ov)
+ #ifdef HAVE_LIBBLURAY_BDJ
+ void CDVDInputStreamBluray::OverlayCallbackARGB(const struct bd_argb_overlay_s * const ov)
+ {
+-  if(ov == nullptr || ov->cmd == BD_ARGB_OVERLAY_CLOSE)
++  std::unique_lock lock(m_overlayLock);
++  if (ov == nullptr)
+   {
+     OverlayClose();
+     return;
+   }
+ 
+-  if (ov->plane > 1)
++  // Hades: 0 PG, 1 IG (BD-J's graphics), 2 the HAVi background (BD_OVERLAY_BG, from libbluray
++  // 1.5.0; drawn by SamuriHL's libbluray patch 07)
++  if (ov->plane > 2)
+   {
+-    CLog::Log(LOGWARNING, "CDVDInputStreamBluray - Ignoring overlay with multiple planes");
++    CLog::Log(LOGWARNING, "CDVDInputStreamBluray - Ignoring ARGB overlay on unknown plane {}",
++              ov->plane);
++    return;
++  }
++
++  if (ov->cmd == BD_ARGB_OVERLAY_CLOSE)
++  {
++    // Hades: one plane closes; the background opens and closes apart from BD-J's graphics, so
++    // closing one must not wipe the other. With nothing left, the whole composition closes
++    // as before.
++    m_planes[ov->plane].o.clear();
++    if (m_planes[0].o.empty() && m_planes[1].o.empty() && m_planes[2].o.empty())
++      OverlayClose();
++    else
++    {
++      OverlayFlush(-1);
++      // the menu graphics closed and the background stays: no menu, as a close said before
++      if (m_planes[0].o.empty() && m_planes[1].o.empty())
++        m_hasOverlay = false;
++    }
+     return;
+   }
+ 
+@@ -1571,6 +1624,30 @@ CDVDInputStream::ENextStream CDVDInputStreamBluray::NextStream()
+   return NEXTSTREAM_OPEN;
+ }
+ 
++int CDVDInputStreamBluray::GetBdjWaitState(bool drain)
++{
++#if defined(BD_HAVE_BDJ_WAITING_FOR_PLAYBACK)
++  if (m_bd == nullptr || !m_navmode || m_aborted || m_hold == HOLD_ERROR)
++    return 0;
++
++  // BD-J starts playlists (and changes titles) on its own threads; the events it queues are
++  // what move us on, so consume them before asking
++  if (drain)
++  {
++    while (bd_get_event(m_bd, &m_event))
++      ProcessEvent();
++  }
++
++  const int state = bd_bdj_waiting_for_playback(m_bd);
++  // the background is behind the video: shown only while no playlist is open, not while one
++  // is selected and about to start
++  SetBackgroundVisible(state == 1);
++  return state;
++#else
++  return 0;
++#endif
++}
++
+ void CDVDInputStreamBluray::UserInput(bd_vk_key_e vk)
+ {
+   if(m_bd == nullptr || !m_navmode)
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index 886ab3a..4365880 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -250,6 +250,28 @@ public:
+ 
+   void ProcessEvent();
+ 
++  /*!
++   * \brief Hades: whether a BD-J title waits for playback (libbluray's
++   *        bd_bdj_waiting_for_playback(), from SamuriHL's libbluray patch 07).
++   *
++   * Read() has nothing to give then: it only idles inside its loop. The player keeps its own
++   * loop running instead (keys reach the disc, its graphics are shown) and opens the demuxer
++   * once a playlist starts. The HAVi background plane is shown only while no playlist is open.
++   * \param drain consume the queued disc events first (not before the first demuxer probe: that
++   *        would move the hold state that Open() set)
++   * \return 0 not waiting, 1 a screen with no playlist open, 2 a playlist selected (prefetched)
++   *         but not started; 0 with a libbluray without the query. Player thread only.
++   */
++  int GetBdjWaitState(bool drain);
++  //! Hades: PG or IG menu graphics are up (the background plane alone does not count)
++  bool HasOverlayGraphics() const { return m_hasOverlay; }
++  /*!
++   * \brief Hades: show or hide the HAVi background plane (plane 2). It lies behind the video,
++   *        and the overlays of this stream are drawn over it, so it is shown only while no
++   *        playlist is open; the video covers it otherwise.
++   */
++  void SetBackgroundVisible(bool visible);
++
+   void SaveCurrentState(const CStreamDetails& details) override;
+   UpdateState UpdateItemFromSavedStates(CFileItem& item, double time, bool& closed) override;
+   void UpdateStack(CFileItem& item) override;
+@@ -275,7 +297,11 @@ protected:
+   uint32_t m_angle = 0;
+   bool m_menu = false;
+   bool m_isInMainMenu = false;
+-  bool m_hasOverlay = false;
++  // Hades: written by the overlay callbacks (BD-J's on the JVM's graphics thread), read by the
++  // player and the GUI
++  std::atomic<bool> m_hasOverlay{false};
++  //! Hades: the HAVi background plane is shown (no playlist open); read by OverlayFlush()
++  std::atomic<bool> m_bgVisible{true};
+   //! Hades: what was found for the BD-J titles of the disc when it was opened (none without)
+   std::optional<KODI::BLURAYJAVA::BdjReport> m_bdjReport;
+   //! Hades: a BD-J error of this disc was told to the user
+@@ -293,7 +319,11 @@ protected:
+     int h = 0;
+   };
+ 
+-  SPlane m_planes[2];
++  // PG (0), IG (1, also BD-J's graphics) and, Hades, the HAVi background (2, BD_OVERLAY_BG)
++  SPlane m_planes[3];
++  // Hades: the planes are changed by the HDMV overlay callback (player thread), the BD-J one
++  // (JVM graphics thread) and SetBackgroundVisible() (player thread)
++  CCriticalSection m_overlayLock;
+   enum EHoldState
+   {
+     HOLD_NONE = 0,
+diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+index 10b1e79..626c039 100644
+--- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
++++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.cpp
+@@ -148,6 +148,17 @@ size_t CDVDOverlayContainer::GetSubtitleSize()
+       m_overlays, [](const std::shared_ptr<CDVDOverlay>& ov) { return !ov->IsDiscMenu(); }));
+ }
+ 
++std::shared_ptr<CDVDOverlay> CDVDOverlayContainer::GetLatestDiscMenu()
++{
++  std::unique_lock lock(*this);
++  for (auto it = m_overlays.rbegin(); it != m_overlays.rend(); ++it)
++  {
++    if ((*it)->IsDiscMenu() && (*it)->IsOverlayType(DVDOVERLAY_TYPE_GROUP))
++      return *it;
++  }
++  return nullptr;
++}
++
+ bool CDVDOverlayContainer::ContainsOverlayType(DVDOverlayType type)
+ {
+   bool result = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+index 09651b7..c63e30c 100644
+--- a/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
++++ b/xbmc/cores/VideoPlayer/DVDOverlayContainer.h
+@@ -54,6 +54,13 @@ public:
+   size_t GetSize();
+   size_t GetSubtitleSize(); // number of overlays that are not disc menus
+ 
++  /*!
++   * \brief Hades: the latest disc menu composition (the group a disc's navigation posted
++   *        last), or nullptr. Shown by itself while there is no picture (a BD-J screen with no
++   *        playlist).
++   */
++  std::shared_ptr<CDVDOverlay> GetLatestDiscMenu();
++
+   void UpdateOverlayInfo(const std::shared_ptr<CDVDInputStreamNavigator>& pStream,
+                          CDVDDemuxSPU* pSpu,
+                          int iAction);
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index c62bc36..7d3b6b9 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -871,6 +871,7 @@ bool CVideoPlayer::CloseFile(bool reopen)
+   // set the abort request so that other threads can finish up
+   m_bAbortRequest = true;
+   m_bCloseRequest = true;
++  m_discMenuOnly = false;
+ 
+   // tell demuxer to abort
+   if(m_pDemuxer)
+@@ -936,6 +937,8 @@ bool CVideoPlayer::OpenInputStream()
+ 
+   // Flushes keep disc menu overlays, and the closed input stream can no longer remove them
+   m_overlayContainer.Clear();
++  // Hades: and what the closed one showed with no picture
++  m_renderManager.SetDiscMenuWithoutPicture(nullptr);
+ 
+   CLog::Log(LOGINFO, "Creating InputStream");
+ 
+@@ -1593,6 +1596,8 @@ void CVideoPlayer::Prepare()
+   m_processInfo->SetTempo(1.0);
+   m_processInfo->SetFrameAdvance(false);
+   m_State.Clear();
++  m_discMenuOnly = false;
++  m_menuOnlyCandidateSince = {};
+   m_CurrentVideo.hint.Clear();
+   m_CurrentAudio.hint.Clear();
+   m_CurrentSubtitle.hint.Clear();
+@@ -1636,7 +1641,15 @@ void CVideoPlayer::Prepare()
+     }
+   }
+ 
+-  if (!OpenDemuxStream())
++  // Hades: a BD-J title can open on a screen with no playlist (a disc's own resume prompt, a
++  // menu over its background plane). Probing a demuxer then would keep this thread in the input
++  // stream's idle loop, where no key reaches the disc and nothing is shown, until the disc
++  // starts a playlist. The main loop opens the demuxer then (SamuriHL's design).
++  const bool deferDemux = DiscWaitState(false) != 0;
++  if (deferDemux)
++    CLog::Log(LOGINFO, "VideoPlayer: the disc shows a screen with no playlist, the demuxer is "
++                       "opened when it starts one");
++  else if (!OpenDemuxStream())
+   {
+     m_bAbortRequest = true;
+     m_error = true;
+@@ -1654,7 +1667,7 @@ void CVideoPlayer::Prepare()
+   // give players a chance to reconsider now codecs are known
+   CreatePlayers();
+ 
+-  if (!discStateRestored)
++  if (!discStateRestored && !deferDemux)
+     OpenDefaultStreams();
+ 
+   // Update stack and offsets in fileItem (for Blurays/DVDs)
+@@ -1738,6 +1751,14 @@ void CVideoPlayer::Prepare()
+     }
+   }
+ 
++  // Hades: nothing to seek yet; the disc decides where its playback starts
++  if (starttime > 0ms && deferDemux)
++  {
++    CLog::Log(LOGINFO, "{} - start position {} ms not applied: the disc has no playlist yet",
++              __FUNCTION__, starttime.count());
++    starttime = 0ms;
++  }
++
+   if (starttime > 0ms)
+   {
+     double startpts = DVD_NOPTS_VALUE;
+@@ -1815,6 +1836,21 @@ void CVideoPlayer::Process()
+     // should we open a new demuxer?
+     if (!m_pDemuxer)
+     {
++      // Hades: a BD-J screen with no playlist: keep handling input and showing the disc's
++      // graphics until it starts one (see Prepare())
++      if (const int waitState = DiscWaitState(true))
++      {
++        UpdatePlayState(200);
++        CheckMenuOnlyStart(waitState == 1);
++        // no picture: the latest composition of the disc is drawn by itself
++        m_renderManager.SetDiscMenuWithoutPicture(m_discMenuOnly
++                                                      ? m_overlayContainer.GetLatestDiscMenu()
++                                                      : nullptr);
++        CThread::Sleep(20ms);
++        continue;
++      }
++      m_menuOnlyCandidateSince = {};
++
+       if (m_pInputStream->NextStream() == CDVDInputStream::NEXTSTREAM_NONE)
+         break;
+ 
+@@ -1844,6 +1880,11 @@ void CVideoPlayer::Process()
+     // handle eventual seeks due to playspeed
+     HandlePlaySpeed();
+ 
++    // Hades: a BD-J screen shown with no picture that goes on without video (an audio-only
++    // playlist): its graphics are still drawn by themselves
++    if (m_discMenuOnly && m_CurrentVideo.id < 0)
++      m_renderManager.SetDiscMenuWithoutPicture(m_overlayContainer.GetLatestDiscMenu());
++
+     // update player state
+     UpdatePlayState(200);
+ 
+@@ -2624,22 +2665,7 @@ void CVideoPlayer::HandlePlaySpeed()
+       m_syncTimer.Set(3000ms);
+ 
+       if (!m_State.streamsReady)
+-      {
+-        // Activate the fullscreen-video skin now that streams are ready, so
+-        // video frames will fully paint the swap chain from the first frame
+-        // the skin is visible.
+-        if (m_playerOptions.fullscreen)
+-        {
+-          CServiceBroker::GetAppMessenger()->PostMsg(TMSG_SWITCHTOFULLSCREEN);
+-        }
+-
+-        IPlayerCallback *cb = &m_callback;
+-        CFileItem fileItem = m_item;
+-        m_outboundEvents->Submit([=]() {
+-          cb->OnAVStarted(fileItem);
+-        });
+-        m_State.streamsReady = true;
+-      }
++        SignalStreamsReady();
+     }
+     else
+     {
+@@ -4163,9 +4189,73 @@ void CVideoPlayer::Pause()
+   }
+ }
+ 
++void CVideoPlayer::SignalStreamsReady()
++{
++  // Activate the fullscreen-video skin now that streams are ready, so
++  // video frames will fully paint the swap chain from the first frame
++  // the skin is visible.
++  if (m_playerOptions.fullscreen)
++  {
++    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_SWITCHTOFULLSCREEN);
++  }
++
++  IPlayerCallback *cb = &m_callback;
++  CFileItem fileItem = m_item;
++  m_outboundEvents->Submit([=]() {
++    cb->OnAVStarted(fileItem);
++  });
++  m_State.streamsReady = true;
++}
++
++int CVideoPlayer::DiscWaitState(bool drain)
++{
++#if defined(HAVE_LIBBLURAY)
++  if (const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream))
++    return bluray->GetBdjWaitState(drain);
++#endif
++  return 0;
++}
++
++void CVideoPlayer::CheckMenuOnlyStart(bool noPlaylist)
++{
++  // Playback start is announced when the streams sync. A disc screen with no playlist has no
++  // streams, and a player shows it over black: once the disc has put menu graphics up, and
++  // kept them up with no playlist for a while (most BD-J discs draw something, a logo, before
++  // their first playlist), the start is announced, so the busy dialog lets the remote go and
++  // the fullscreen video window shows the screen.
++  constexpr auto MENU_ONLY_GRACE = 3s;
++
++  bool candidate = !m_State.streamsReady && noPlaylist && m_CurrentVideo.id < 0 &&
++                   m_CurrentAudio.id < 0;
++#if defined(HAVE_LIBBLURAY)
++  const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream);
++  candidate = candidate && bluray && bluray->HasOverlayGraphics();
++#else
++  candidate = false;
++#endif
++  if (!candidate)
++  {
++    m_menuOnlyCandidateSince = {};
++    return;
++  }
++
++  const auto now = std::chrono::steady_clock::now();
++  if (m_menuOnlyCandidateSince == std::chrono::steady_clock::time_point{})
++    m_menuOnlyCandidateSince = now;
++  if (now - m_menuOnlyCandidateSince < MENU_ONLY_GRACE)
++    return;
++
++  CLog::Log(LOGINFO, "VideoPlayer: the disc shows a screen with no playlist, playback starts "
++                     "on it");
++  m_discMenuOnly = true;
++  SetCaching(CACHESTATE_DONE);
++  SignalStreamsReady();
++}
++
+ bool CVideoPlayer::HasVideo() const
+ {
+-  return m_HasVideo;
++  // Hades: a BD-J screen with no playlist is shown by the fullscreen video window too
++  return m_HasVideo || m_discMenuOnly;
+ }
+ 
+ bool CVideoPlayer::HasAudio() const
+@@ -5141,6 +5231,13 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+     player->SendMessage(std::make_shared<CDVDMsg>(CDVDMsg::GENERAL_RESET), 0);
+ 
+   m_HasVideo = true;
++  // Hades: a video stream ends a screen shown with no picture, and covers the background plane
++  m_discMenuOnly = false;
++  m_renderManager.SetDiscMenuWithoutPicture(nullptr);
++#if defined(HAVE_LIBBLURAY)
++  if (const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream))
++    bluray->SetBackgroundVisible(false);
++#endif
+ 
+   static_cast<IDVDStreamPlayerVideo*>(player)->SendMessage(
+       std::make_shared<CDVDMsg>(CDVDMsg::PLAYER_REQUEST_STATE), 1);
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 33cc993..b3c749f 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -532,6 +532,19 @@ protected:
+ 
+   bool OpenInputStream();
+   bool OpenDemuxStream();
++  /*!
++   * \brief Hades: a Blu-ray's BD-J title waits for playback: nothing to demux yet.
++   * \return 0 no, 1 a screen with no playlist, 2 a playlist selected, not started
++   */
++  int DiscWaitState(bool drain);
++  /*!
++   * \brief Hades: present a BD-J screen with no playlist (busy dialog gone, fullscreen video
++   *        window, keys to the disc) once it has stayed so with menu graphics up for a while,
++   *        so that a normal start drawing a logo first is not announced early.
++   */
++  void CheckMenuOnlyStart(bool noPlaylist);
++  //! Hades: playback has started (fullscreen video window, OnAVStarted)
++  void SignalStreamsReady();
+   void CloseDemuxer();
+   void OpenDefaultStreams(bool reset = true);
+   void UpdateHasVideoAudio();
+@@ -750,6 +763,12 @@ protected:
+ 
+   std::atomic<bool> m_displayLost;
+ 
++  /*! Hades: playback started on a BD-J screen with no stream behind it (a screen with no
++      playlist); HasVideo() says so, so that the fullscreen video window owns the screen and
++      the remote. Read from the GUI thread. */
++  std::atomic<bool> m_discMenuOnly{false};
++  std::chrono::steady_clock::time_point m_menuOnlyCandidateSince{};
++
+   double m_messageQueueTimeSize{0.0};
+ 
+   /*! Blu-ray 3D: the offset sequence the subtitle stream being shown follows, which is
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index a637372..85a1394 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -147,6 +147,27 @@ void CRenderer::AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts, int index
+   m_buffers[index].push_back(e);
+ }
+ 
++bool CRenderer::SetNoPicture(const std::shared_ptr<CDVDOverlay>& group)
++{
++  std::unique_lock lock(m_section);
++  if (group == m_noPictureGroup)
++    return false;
++
++  m_noPictureGroup = group;
++  Release(m_buffers[NO_PICTURE]);
++  if (group && group->IsOverlayType(DVDOVERLAY_TYPE_GROUP))
++  {
++    for (const std::shared_ptr<CDVDOverlay>& o : static_cast<CDVDOverlayGroup&>(*group).m_overlays)
++    {
++      SElement e;
++      e.pts = 0;
++      e.overlay_dvd = o;
++      m_buffers[NO_PICTURE].push_back(e);
++    }
++  }
++  return true;
++}
++
+ void CRenderer::Release(std::vector<SElement>& list)
+ {
+   list.clear();
+@@ -170,6 +191,7 @@ void CRenderer::Flush()
+ 
+   for(std::vector<SElement>& buffer : m_buffers)
+     Release(buffer);
++  m_noPictureGroup.reset();
+ 
+   ReleaseCache();
+   Reset();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+index 4d8188e..2eec15c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+@@ -126,6 +126,18 @@ namespace OVERLAY {
+ 
+     void AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts, int index);
+ 
++    /*!
++     * \brief Hades: the slot of what is drawn while no picture is presented (a BD-J screen
++     *        with no playlist): Render(NO_PICTURE) draws it.
++     */
++    static constexpr int NO_PICTURE = NUM_BUFFERS;
++    /*!
++     * \brief Hades: what NO_PICTURE draws - the overlays of a disc's menu composition (a group),
++     *        or nothing.
++     * \return true when it changed
++     */
++    bool SetNoPicture(const std::shared_ptr<CDVDOverlay>& group);
++
+     /*!
+      * \brief Set the shift the disc asks the subtitle plane to carry, in video pixels.
+      *
+@@ -292,7 +304,10 @@ namespace OVERLAY {
+     };
+ 
+     mutable CCriticalSection m_section;
+-    std::vector<SElement> m_buffers[NUM_BUFFERS];
++    // one per render buffer, and (Hades) NO_PICTURE after them
++    std::vector<SElement> m_buffers[NUM_BUFFERS + 1];
++    //! Hades: the composition NO_PICTURE holds the overlays of
++    std::shared_ptr<CDVDOverlay> m_noPictureGroup;
+     std::map<unsigned int, std::shared_ptr<COverlay>> m_textureCache;
+     static unsigned int m_textureid;
+     CRect m_rv; // Frame size
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 3188d72..a5af380 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -669,6 +669,27 @@ RESOLUTION CRenderManager::GetResolution()
+   return res;
+ }
+ 
++void CRenderManager::SetDiscMenuWithoutPicture(std::shared_ptr<CDVDOverlay> group)
++{
++  m_menuWithoutPicture = group != nullptr;
++  if (m_overlays.SetNoPicture(group))
++    OVERLAY::MarkDirty();
++}
++
++void CRenderManager::RenderWithoutPicture()
++{
++  auto& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
++  // the fullscreen video window owns it: a skin's video control does not get the disc's
++  // full-screen graphics
++  if (!gfx.IsFullScreenVideo())
++    return;
++
++  CRect view(0, 0, static_cast<float>(gfx.GetWidth()), static_cast<float>(gfx.GetHeight()));
++  m_overlays.SetVideoRect(view, view, view);
++  m_overlays.SetSubtitlePlaneOffset(std::nullopt);
++  m_overlays.Render(OVERLAY::CRenderer::NO_PICTURE);
++}
++
+ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+ {
+   CSingleExit exitLock(CServiceBroker::GetWinSystem()->GetGfxContext());
+@@ -676,7 +697,14 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+   {
+     std::unique_lock lock(m_statelock);
+     if (m_renderState != STATE_CONFIGURED)
++    {
++      lock.unlock();
++      // Hades: no video, and a disc shows a screen with no playlist: its graphics, over the
++      // black of the fullscreen video window
++      if (gui && m_menuWithoutPicture)
++        RenderWithoutPicture();
+       return;
++    }
+   }
+ 
+   if (!gui && m_pRenderer->IsGuiLayer())
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index 35117c7..5eeae95 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -148,6 +148,12 @@ public:
+                  bool progressive = false);
+   bool AddVideoPicture(const VideoPicture& picture, volatile std::atomic_bool& bStop, EINTERLACEMETHOD deintMethod, bool wait);
+   void AddOverlay(std::shared_ptr<CDVDOverlay> o, double pts);
++  /*!
++   * \brief Hades: a disc's menu composition (a group) to draw while no video is configured - a
++   *        BD-J screen with no playlist, which a player shows over black - or nullptr. Drawn
++   *        full screen in the fullscreen video window only. Player thread; cheap when unchanged.
++   */
++  void SetDiscMenuWithoutPicture(std::shared_ptr<CDVDOverlay> group);
+   void ShowVideo(bool enable);
+ 
+   /*!
+@@ -192,6 +198,11 @@ public:
+ 
+ protected:
+ 
++  //! Hades: draw the composition of SetDiscMenuWithoutPicture() (GUI pass, no video configured)
++  void RenderWithoutPicture();
++  //! Hades: SetDiscMenuWithoutPicture() holds a composition
++  std::atomic<bool> m_menuWithoutPicture{false};
++
+   void PresentSingle(bool clear, DWORD flags, DWORD alpha);
+   void PresentFields(bool clear, DWORD flags, DWORD alpha);
+   void PresentBlend(bool clear, DWORD flags, DWORD alpha);
+-- 
+2.53.0
+

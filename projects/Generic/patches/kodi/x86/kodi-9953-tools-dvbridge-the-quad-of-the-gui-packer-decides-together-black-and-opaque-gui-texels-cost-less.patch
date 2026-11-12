@@ -1,0 +1,392 @@
+From 7bb768d45d25187bc49ee2176a2364cee70deec6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 07:47:45 +0000
+Subject: [PATCH] tools/dvbridge: the quad of the GUI packer decides together;
+ black and opaque GUI texels cost less
+
+A quad that went apart before its values were swapped showed wrong chroma on a few odd pixels
+(12 of a frame, under black and opaque GUI, on zink): subgroup operations after divergent control
+flow are not defined to see their neighbours. The packer that reads the GUI in place (PACK_GUI)
+now keeps each quad together until the swap: what may be skipped is skipped only where the whole
+quad can skip it (quad_any(), quad_all(): swaps with the horizontal and vertical neighbour, outside
+any branch), the reads of the planes take the value outside the picture after a clamped fetch, and
+each pixel's own case is chosen after. PACK (the picture composited first) is made as written
+again: its quad form measured no faster (56.0 against 59.7 ms with a GUI over half the raster).
+
+Two savings, the same values:
+- a black GUI texel is light 0, which the sRGB EOTF, the matrix and the GUI white leave exactly +0:
+  its PQ signal is gui_pq() of that 0, taken from the texel itself, once for the three components
+  (two powers of the nine). CroqueMr's composite skips the transfer work of black GUI pixels too.
+- an opaque one (alpha 1): the picture under it times 1 - a = 0 is nothing; it is not read, in the
+  composite of the GUI and in drawn_over(), whose two forms then return the conversion of what was
+  drawn over.
+In the programs without quad operations both are taken pixel by pixel; with them, quad by quad.
+
+Bytes, host: the 18 cases of the matrix (profile 7 FEL, its base layer alone, HDR10+ as Dolby
+Vision; GUI in place and composited first; black panel, black alpha ramp, black and white strokes,
+an opaque panel with marks) identical to before on llvmpipe and zink. Mutants: the black value
+off by 1e-4 (each form), the opaque composite scaled, quad_all() taken as quad_any(), the chroma
+codes swapped, all change the bytes; with the even pixel's values never taken from the quad, the
+same bytes.
+
+GPU time of the packing, before this series and after it: zink, GUI in place over half the raster
+93.5 to 80.7 ms (FEL), 112.5 to 81.1 (HDR10+ as DV); a band 77.4 to 65.3, base layer alone 80.2
+to 66.8; composited first 59.2 to 56.9; nothing drawn over 18.0 and 17.4. llvmpipe (no quad
+operations): 87.6 to 78.5, 98.4 to 92.4, 65.6 to 58.2, 74.0 to 66.0, composited first 45.6 to 44.1.
+---
+ tools/dvbridge/dvbridge_render.h |   5 +-
+ tools/dvbridge/dvbridge_source.c | 185 ++++++++++++++++++++++++-------
+ tools/dvbridge/dvbridge_source.h |   7 +-
+ 3 files changed, 149 insertions(+), 48 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index a770421..513c5d9 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -594,8 +594,9 @@ bool dvbridge_render_ipt(const struct dvbridge_renderer *renderer);
+ void dvbridge_render_use_compute_rows(struct dvbridge_renderer *renderer, bool use);
+ bool dvbridge_render_compute_rows_usable(const struct dvbridge_renderer *renderer);
+ /* Hades: which forms of pass 4 of the source transport take the even pixel's codes of a pair drawn
+- * over from the invocation next to it (dvbridge_source_quad(): bit 0 the composited picture, bit 1
+- * the GUI read in place); 0 without quad operations, and in the reference of a check of the bytes */
++ * over from the invocation next to it (dvbridge_source_quad(): bit 1, the GUI read in place; bit 0,
++ * the composited picture, is never set); 0 without quad operations, and in the reference of a check
++ * of the bytes */
+ #define DVBRIDGE_RENDER_SOURCE_QUAD 1
+ unsigned dvbridge_render_source_quad(const struct dvbridge_renderer *renderer);
+ bool dvbridge_render_rows_computed(const struct dvbridge_renderer *renderer);
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 164f465..0c8fe6b 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -549,6 +549,35 @@ static const char SCALE_CHROMA_ROWS[] =
+     "           y >= picture_rect.y && y < picture_rect.y + picture_rect.w &&\n"                  \
+     "           x >= active_rect.x && x < active_rect.z && y >= active_rect.y && y < active_rect.w;\n" \
+     "}\n"                                                                                         \
++    /* (Hades: in the programs with quad operations (DVBRIDGE_SOURCE_QUAD) the reads below are made    \
++     * without a branch, the value outside the picture chosen after the fetch (of a clamped texel): no   \
++     * invocation of a quad takes another way than the others before the quad's values are swapped     \
++     * (PAIR_CODES); the same values) */                                                            \
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                                \
++    "uint luma_code(ivec2 p)\n"                                                                   \
++    "{\n"                                                                                         \
++    "    ivec2 q = clamp(p - picture_rect.xy, ivec2(0), textureSize(luma_plane, 0) - 1);\n"        \
++    "    uint v = uint(floor(texelFetch(luma_plane, q, 0).r * code_scale + 0.5));\n"              \
++    "    return inside(p.x, p.y) ? v : uint(black.x);\n"                                          \
++    "}\n"                                                                                         \
++    "uvec2 pair_chroma(int ex, int y)\n"                                                          \
++    "{\n"                                                                                         \
++    "    int r = y - picture_rect.y;\n"                                                           \
++    "    ivec2 q = clamp(ivec2((ex - picture_rect.x) >> 1, r >> 1), ivec2(0),\n"                  \
++    "                    textureSize(chroma_rows, 0) - 1);\n"                                    \
++    "    uvec4 t = texelFetch(chroma_rows, q, 0);\n"                                              \
++    "    uvec2 c = (r & 1) != 0 ? t.ba : t.rg;\n"                                                 \
++    "    return inside(ex, y) ? c : uvec2(black.yz);\n"                                           \
++    "}\n"                                                                                         \
++    "vec3 codes_at(ivec2 p)\n"                                                                    \
++    "{\n"                                                                                         \
++    "    int ex = p.x & ~1;\n"                                                                    \
++    "    vec2 c = vec2(pair_chroma(ex, p.y));\n"                                                  \
++    "    vec2 next = vec2(pair_chroma(ex + 2, p.y));\n"                                           \
++    "    c = (p.x & 1) != 0 && inside(ex + 2, p.y) ? (c + next) * 0.5 : c;\n"                     \
++    "    return vec3(float(luma_code(p)), c);\n"                                                  \
++    "}\n"                                                                                         \
++    "#else\n"                                                                                     \
+     "uint luma_code(ivec2 p)\n"                                                                   \
+     "{\n"                                                                                         \
+     "    return inside(p.x, p.y) ? uint(floor(texelFetch(luma_plane, p - picture_rect.xy, 0).r *\n" \
+@@ -573,6 +602,7 @@ static const char SCALE_CHROMA_ROWS[] =
+     "        c = (c + vec2(pair_chroma(ex + 2, p.y))) * 0.5;\n"                                   \
+     "    return vec3(float(luma_code(p)), c);\n"                                                  \
+     "}\n"                                                                                         \
++    "#endif\n"                                                                                    \
+     /* the PQ EOTF and OETF, odd functions, so that negative components (a colour out of the gamut \
+      * of BT.2020) go there and back; the divisor kept positive where the signal is beyond 1.99 */ \
+     "vec3 pq_eotf(vec3 v)\n"                                                                      \
+@@ -600,7 +630,12 @@ static const char SCALE_CHROMA_ROWS[] =
+      * outside the active picture */                                                              \
+     "vec3 picture_at(ivec2 p)\n"                                                                  \
+     "{\n"                                                                                         \
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                                \
++    "    vec3 v = clamp(decode(codes_at(p)), 0.0, 1.0);\n"                                        \
++    "    return inside(p.x, p.y) ? v : vec3(0.0);\n"                                              \
++    "#else\n"                                                                                     \
+     "    return inside(p.x, p.y) ? clamp(decode(codes_at(p)), 0.0, 1.0) : vec3(0.0);\n"           \
++    "#endif\n"                                                                                    \
+     "}\n"
+ 
+ /* Hades: the vertices of passes 3 and 4: the triangle over the whole raster, as for the other passes
+@@ -689,12 +724,24 @@ static const char PICTURE[] =
+     "vec3 drawn_over(ivec2 p, vec4 d)\n"                                                          \
+     "{\n"                                                                                         \
+     "    float a = 2.0 - d.a;\n"                                                                  \
++    /* (Hades: opaque, a = 1: both forms below add the picture under it times 1 - a = 0 to the     \
++     * conversion of d.rgb (and divide d.rgb by 1): what they return, without reading the codes    \
++     * under it and converting them; the same codes) */                                           \
++    "#ifndef DVBRIDGE_SOURCE_QUAD\n"                                                               \
++    "    if (a == 1.0)\n"                                                                          \
++    "        return to_source(d.rgb);\n"                                                           \
++    "#endif\n"                                                                                    \
+     /* (Hades: the picture under the pixel, as picture_at() has it, from the decode() that the    \
+      * test below takes, not from a second one: compilers need not merge the two, and the D3D12   \
+      * one of an integrated Radeon made both, a tenth of the packing's time under a GUI over the  \
+      * whole raster) */                                                                           \
+     "    vec3 codes = codes_at(p);\n"                                                             \
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                                \
++    "    vec3 decoded = decode(codes);\n"                                                          \
++    "    vec3 raw = inside(p.x, p.y) ? decoded : vec3(0.0);\n"                                     \
++    "#else\n"                                                                                     \
+     "    vec3 raw = inside(p.x, p.y) ? decode(codes) : vec3(0.0);\n"                              \
++    "#endif\n"                                                                                    \
+     "    vec3 under = clamp(raw, 0.0, 1.0);\n"                                                    \
+     /* the first form where decoding is invertible: affine, whatever the picture clamps; else with \
+      * T' within [0, 1] and the picture not clamped */                                            \
+@@ -803,6 +850,29 @@ static const char PICTURE[] =
+     "    color = ccm_rgb888(y, c);\n" \
+     "}\n"
+ 
++/* Hades: what the four invocations of a quad say together (any of them, all of them), from the
++ * quad operations of GL_KHR_shader_subgroup: each swaps with its horizontal and its vertical
++ * neighbour, outside any branch of its own. A decision taken on it is the same in the whole quad, so
++ * no invocation of a quad leaves the others before a swap (PAIR_CODES). Only in the programs with
++ * quad operations (DVBRIDGE_SOURCE_QUAD). */
++#define QUAD_HELPERS                                                                              \
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                                \
++    "bool quad_any(bool b)\n"                                                                     \
++    "{\n"                                                                                         \
++    "    uint v = b ? 1u : 0u;\n"                                                                  \
++    "    v |= subgroupQuadSwapHorizontal(v);\n"                                                   \
++    "    v |= subgroupQuadSwapVertical(v);\n"                                                     \
++    "    return v != 0u;\n"                                                                       \
++    "}\n"                                                                                         \
++    "bool quad_all(bool b)\n"                                                                     \
++    "{\n"                                                                                         \
++    "    uint v = b ? 1u : 0u;\n"                                                                  \
++    "    v &= subgroupQuadSwapHorizontal(v);\n"                                                   \
++    "    v &= subgroupQuadSwapVertical(v);\n"                                                     \
++    "    return v != 0u;\n"                                                                       \
++    "}\n"                                                                                         \
++    "#endif\n"
++
+ /* Hades: the codes of a pixel of pass 4 (its luma, and the chroma of its pair) from own, what is drawn
+  * over it, and even, what is drawn over the even pixel of its pair (alpha 2: nothing), in PACK and
+  * PACK_GUI. Where fragment shaders have the quad operations of GL_KHR_shader_subgroup
+@@ -810,17 +880,27 @@ static const char PICTURE[] =
+  * pixel takes what its even pixel made of it (the two chroma codes, and whether anything is drawn
+  * over it) from the invocation next to it, instead of making the even pixel's picture again (EVEN:
+  * the composite of the GUI, or a fetch of pass 3) and converting it again: a pair drawn over is made
+- * and converted twice, not three or four times (a frame with nothing drawn over it is packed by PACK
+- * as it is written). The swap is outside any branch, so that every invocation of the quad takes part
+- * in it; what comes with it is tagged with the raster position it is of (below 2^24: exact in a
+- * float), and where the invocation next to an odd pixel is not its even pixel, the odd pixel makes
+- * it as before. The same expressions on the same values: the same codes, which a check of the bytes
+- * compares with the form without quads (dvbridge_source_packer_create_plain()). The idea of handing
++ * and converted twice, not three or four times. Only PACK_GUI (the GUI read in place, where the GPU
++ * presents a frame ahead) is made so: PACK in that form (the picture composited first) measured no
++ * faster on zink (56.0 against 59.7 ms with a GUI over half the raster) and is made as written; its
++ * text keeps the form, which only DVBRIDGE_SOURCE_QUAD compiles. The swap is outside any branch, and
++ * no invocation of a quad takes another way than the others before it: what may be skipped (nothing
++ * drawn over, an opaque or a black GUI texel) is skipped only where the whole quad can skip it
++ * (quad_any(), quad_all()), the reads of the planes choose the value outside the picture after the
++ * fetch, and each pixel's own case is chosen after; a quad that went apart there showed wrong chroma
++ * on a few odd pixels in a software GPU. What comes with the swap is tagged with the raster position
++ * it is of (below 2^24: exact in a float), and where the invocation next to an odd pixel is not its
++ * even pixel, the odd pixel makes it as before. The same expressions on the same values: the
++ * same codes, which a check of the bytes compares with the form without quads (dvbridge_source_packer_create_plain()). The idea of handing
+  * the pair's value through the quad is that of CroqueMr's composite of the GUI (CB1_GUI_QUAD,
+  * cb1_composite_glsl.h); the form without it is the one PACK and PACK_GUI had. */
+ #define PAIR_CODES(EVEN)                                                                          \
+     "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                               \
+-    "    vec3 mine = own.a != 2.0 ? drawn_over(p, own) : vec3(0.0);\n"                            \
++    "    bool some = quad_any(own.a != 2.0);\n"                                                    \
++    "    bool opaque = quad_all(own.a == 1.0);\n"                                                  \
++    "    vec3 mine = vec3(0.0);\n"                                                                 \
++    "    if (some)\n"                                                                              \
++    "        mine = opaque ? to_source(own.rgb) : drawn_over(p, own);\n"                           \
+     "    vec4 got = subgroupQuadSwapHorizontal(vec4(mine.yz, own.a, float(p.y * 4096 + p.x)));\n"  \
+     "    uint y = own.a != 2.0 ? code(mine.x) : luma_code(p);\n"                                  \
+     "    vec3 e = mine;\n"                                                                        \
+@@ -866,6 +946,7 @@ static const char PACK[] =
+     "flat in int tile_drawn;\n" /* Hades: (TILED_VERTEX) something may be drawn over this tile */
+     "out vec4 color;\n"
+     CCM_HELPERS
++    QUAD_HELPERS
+     DRAWN_OVER_CODE
+     "void main()\n"
+     "{\n"
+@@ -922,14 +1003,52 @@ static const char PACK[] =
+     "    vec4 g = textureLod(gui, vec2((float(p.x) + 0.5) / 3840.0, 1.0 - (float(p.y) + 0.5) / 2160.0), 0.0);\n" \
+     "    if (g.a == 0.0)\n"                                                                       \
+     "        return vec4(0.0, 0.0, 0.0, 2.0);\n"                                                  \
+-    "    vec3 colour = gui_pq((bt709_to_bt2020 * srgb_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);\n" \
++    /* (Hades: a black texel (the shade behind a panel, the border of a subtitle) is light 0, which \
++     * the sRGB EOTF, the matrix and the GUI white leave exactly +0: its PQ signal is gui_pq() of   \
++     * that 0, taken from the texel itself (its red, +0: a value no compiler can fold) and made once \
++     * for the three components: the same function of the same values, without the sRGB EOTF and   \
++     * with two powers of the nine. CroqueMr's composite skips that work for black GUI pixels too.) */ \
++    "    vec3 colour = all(equal(g.rgb, vec3(0.0)))\n"                                             \
++    "        ? vec3(gui_pq(vec3(g.r)).x)\n"                                                        \
++    "        : gui_pq((bt709_to_bt2020 * srgb_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);\n"   \
+     "    float a = g.a * g.a;\n"                                                                  \
++    /* (Hades: opaque, a = 1: the picture under it times 1 - a = 0 is nothing; not read) */       \
++    "    if (a == 1.0)\n"                                                                          \
++    "        return vec4(colour, 1.0);\n"                                                          \
+     "    return vec4(colour * a + picture_at(p) * (1.0 - a), a + 2.0 * (1.0 - a));\n"             \
+-    "}\n"
++    "}\n"                                                                                         \
++    /* (Hades: composited(), for the programs with quad operations: the same values, each saving   \
++     * taken only where the whole quad takes it (nothing drawn, black, opaque), and the pixel's own  \
++     * case chosen after, so that the quad keeps together until PAIR_CODES swaps its values) */     \
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"                                                                \
++    "vec4 composited_quad(ivec2 p)\n"                                                             \
++    "{\n"                                                                                         \
++    "    vec4 g = textureLod(gui, vec2((float(p.x) + 0.5) / 3840.0, 1.0 - (float(p.y) + 0.5) / 2160.0), 0.0);\n" \
++    "    vec4 r = vec4(0.0, 0.0, 0.0, 2.0);\n"                                                    \
++    "    if (quad_any(g.a != 0.0)) {\n"                                                           \
++    "        bool black = quad_all(all(equal(g.rgb, vec3(0.0))));\n"                              \
++    "        vec3 colour;\n"                                                                      \
++    "        if (black)\n"                                                                        \
++    "            colour = vec3(gui_pq(vec3(g.r)).x);\n"                                           \
++    "        else\n"                                                                              \
++    "            colour = gui_pq((bt709_to_bt2020 * srgb_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);\n" \
++    "        float a = g.a * g.a;\n"                                                              \
++    "        bool opaque = quad_all(a == 1.0);\n"                                                 \
++    "        vec4 mixed;\n"                                                                       \
++    "        if (opaque)\n"                                                                       \
++    "            mixed = vec4(colour, 1.0);\n"                                                    \
++    "        else\n"                                                                              \
++    "            mixed = vec4(colour * a + picture_at(p) * (1.0 - a), a + 2.0 * (1.0 - a));\n"    \
++    "        r = g.a == 0.0 ? vec4(0.0, 0.0, 0.0, 2.0) : mixed;\n"                                \
++    "    }\n"                                                                                     \
++    "    return r;\n"                                                                             \
++    "}\n"                                                                                         \
++    "#endif\n"
+ 
+ static const char PACK_GUI[] =
+     "#version 300 es\n"
+     COMMON
++    QUAD_HELPERS
+     GUI_COMPOSITE
+     "uniform int has_layer, code_max;\n"
+     "uniform mat3 ycc_inverse, lms_inverse;\n"
+@@ -948,8 +1067,10 @@ static const char PACK_GUI[] =
+     "    bool odd = (p.x & 1) != 0;\n"
+     "    vec4 own = vec4(0.0, 0.0, 0.0, 2.0), even = own;\n"
+     "    if (has_layer != 0 && tile_drawn != 0) {\n"
++    "#ifdef DVBRIDGE_SOURCE_QUAD\n"
++    "        own = composited_quad(p);\n"
++    "#else\n"
+     "        own = composited(p);\n"
+-    "#ifndef DVBRIDGE_SOURCE_QUAD\n"
+     "        even = odd ? composited(ivec2(ex, p.y)) : own;\n"
+     "#endif\n"
+     "    }\n"
+@@ -1756,14 +1877,8 @@ struct dvbridge_source_packer {
+      * the GUI texture, its size and white; inplace_failed: a pack so failed on this GPU (never again). */
+     GLuint pack_gui;
+     struct common_uniforms gc;
+-    /* Hades: PACK made with quad operations (PAIR_CODES), for the frames with something drawn over
+-     * them (pack_quad, its uniforms qpc, qu and those of its tiles; 0: not made), and whether it and
+-     * PACK_GUI were made so (dvbridge_source_quad()) */
+-    GLuint pack_quad;
+-    struct common_uniforms qpc;
+-    struct pack_uniforms qu;
+-    GLint qpc_tiles, qpc_mode, qpc_flip;
+-    bool quad_pack, quad_gui;
++    /* Hades: PACK_GUI was made with quad operations (PAIR_CODES, dvbridge_source_quad()) */
++    bool quad_gui;
+     struct {
+         GLint has_layer, code_max, ycc_inverse, lms_inverse, words, count, flip, gui, peak, tiles,
+             mode, tflip;
+@@ -2050,7 +2165,7 @@ struct dvbridge_source_packer *dvbridge_source_packer_create_plain(void)
+ 
+ unsigned dvbridge_source_quad(const struct dvbridge_source_packer *p)
+ {
+-    return p ? (p->quad_pack ? 1u : 0u) | (p->quad_gui ? 2u : 0u) : 0u;
++    return p && p->quad_gui ? 2u : 0u;
+ }
+ 
+ static struct dvbridge_source_packer *create_packer(bool allow_quad)
+@@ -2091,21 +2206,8 @@ static struct dvbridge_source_packer *create_packer(bool allow_quad)
+     _Static_assert(sizeof(p->s_more) == COUNT(pairs_simple) * sizeof(GLint), "pairs_simple uniforms");
+     /* (Hades: passes 3 and 4 over the raster or over its tiles) */
+     p->pack = link_with(TILED_VERTEX, PACK);
+-    /* (Hades: and PACK with quad operations, for the frames with something drawn over them, where it
+-     * is made and has every uniform: PAIR_CODES; a frame with nothing drawn over it is packed by PACK
+-     * as it is written, as before) */
++    /* (Hades: PACK_GUI below with quad operations where they are made: PAIR_CODES) */
+     const bool quad_ops = allow_quad && dvbridge_gl_fragment_quad();
+-    p->pack_quad = quad_ops ? link_quad(TILED_VERTEX, PACK) : 0;
+-    if (p->pack_quad &&
+-        (!locate(p->pack_quad, &p->qpc.luma, COMMON_NAMES, COUNT(COMMON_NAMES)) ||
+-         !locate(p->pack_quad, &p->qu.drawn, pack, COUNT(pack)) ||
+-         (p->qpc_tiles = glGetUniformLocation(p->pack_quad, "drawn_tiles")) < 0 ||
+-         (p->qpc_mode = glGetUniformLocation(p->pack_quad, "tiles_mode")) < 0 ||
+-         (p->qpc_flip = glGetUniformLocation(p->pack_quad, "tiles_flip")) < 0)) {
+-        glDeleteProgram(p->pack_quad);
+-        p->pack_quad = 0;
+-    }
+-    p->quad_pack = p->pack_quad != 0;
+     p->picture = link_with(TILED_VERTEX, PICTURE);
+     p->resite = link(RESITE);
+     p->rows = link(ROWS);
+@@ -2375,7 +2477,6 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+     glDeleteProgram(p->pack);
+-    glDeleteProgram(p->pack_quad);
+     glDeleteProgram(p->pack_gui);
+     glDeleteProgram(p->picture);
+     glDeleteProgram(p->resite);
+@@ -3621,13 +3722,11 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+         return end(&state, ok);
+     }
+     p->inplace = false;
+-    /* Hades: PACK_PAIRS with the codes of pass 8; PACK, as it was, for every other frame (Hades: with
+-     * quad operations where something is drawn over it and they were made: PAIR_CODES) */
+-    const bool quad = !pairs && layer && p->pack_quad;
+-    const struct pack_uniforms *u = pairs ? &p->w : quad ? &p->qu : &p->u;
++    /* Hades: PACK_PAIRS with the codes of pass 8; PACK, as it was, for every other frame */
++    const struct pack_uniforms *u = pairs ? &p->w : &p->u;
+     glViewport(0, 0, 3840, 2160);
+-    glUseProgram(pairs ? p->pack_pairs : quad ? p->pack_quad : p->pack);
+-    set_common(p, pairs ? &p->wc : quad ? &p->qpc : &p->pc, params, luma, width, height, x, y, margins);
++    glUseProgram(pairs ? p->pack_pairs : p->pack);
++    set_common(p, pairs ? &p->wc : &p->pc, params, luma, width, height, x, y, margins);
+     bind(p, 2, layer);
+     glUniform1i(u->drawn, 2);
+     glUniform1i(u->has_layer, layer != 0);
+@@ -3640,9 +3739,9 @@ bool dvbridge_source_pack(struct dvbridge_source_packer *p,
+      * tiles drawn, each knowing whether something may be drawn over it. Hades: with the GUI cache,
+      * all but those copied from it or packed into it */
+     const int how = layer && p->tiles_mode ? (cached ? 6 : 3) : 0;
+-    const GLint tiles_mode = pairs ? p->w_more.mode : quad ? p->qpc_mode : p->pc_mode;
+-    const GLint tiles_flip = pairs ? p->w_more.flip : quad ? p->qpc_flip : p->pc_flip;
+-    set_tiles(p, pairs ? p->w_more.tiles : quad ? p->qpc_tiles : p->pc_tiles, tiles_mode, how);
++    const GLint tiles_mode = pairs ? p->w_more.mode : p->pc_mode;
++    const GLint tiles_flip = pairs ? p->w_more.flip : p->pc_flip;
++    set_tiles(p, pairs ? p->w_more.tiles : p->pc_tiles, tiles_mode, how);
+     glUniform1i(tiles_flip, flip_y);
+     set_inverse(u->ycc_inverse, u->lms_inverse, u->code_max, params);
+     glUniform4uiv(u->words, 128, packets);
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 9620a24..a6a8a2b 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -150,9 +150,10 @@ struct dvbridge_source_packer *dvbridge_source_packer_create(void);
+  * (PAIR_CODES in dvbridge_source.c), as it was before: the reference of a check of the bytes
+  * (dvbridge_render_reference()), and a renderer made to measure on hardware what that saves
+  * (dvbridge_renderer_create_plain()). dvbridge_source_quad(): which forms of pass 4 this packer made
+- * with quad operations (bit 0: PACK, the picture of pass 3 with what was composited over it; bit 1:
+- * PACK_GUI, the GUI read in place); 0 where fragment shaders have none (dvbridge_gl_fragment_quad()),
+- * for a plain packer, and for none. The same bytes either way. */
++ * with quad operations: bit 1, PACK_GUI (the GUI read in place); bit 0, PACK (the picture of pass 3
++ * with what was composited over it), is never set: it is made as written. 0 where fragment shaders
++ * have none (dvbridge_gl_fragment_quad()), for a plain packer, and for none. The same bytes either
++ * way. */
+ #define DVBRIDGE_SOURCE_PACKER_PLAIN 1
+ struct dvbridge_source_packer *dvbridge_source_packer_create_plain(void);
+ unsigned dvbridge_source_quad(const struct dvbridge_source_packer *packer);
+-- 
+2.53.0
+

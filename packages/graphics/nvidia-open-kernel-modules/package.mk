@@ -2,9 +2,9 @@
 # Copyright (C) 2026-present Hades
 
 PKG_NAME="nvidia-open-kernel-modules"
-PKG_VERSION="615.78.08"
-PKG_COMMIT="1a82fbfda8f321b056eb3568850f9316c5e465c5"
-PKG_SHA256="590ee6a5a780f946322edd17f9d235c6664eb7e6839073ac0d68c0f263e7184f"
+PKG_VERSION="620.70.06"
+PKG_COMMIT="e6a2e01579fbbd1ca2ed43fef2ee2589e9bd8bd9"
+PKG_SHA256="b10b72830aa2c1367f0013d3d31fad3d0865330f37da2ed893f0a726125d4175"
 PKG_ARCH="x86_64"
 PKG_LICENSE="MIT OR GPL-2.0-only"
 PKG_SITE="https://github.com/NVIDIA/open-gpu-kernel-modules"
@@ -21,6 +21,11 @@ make_target() {
   # compiler as the kernel and without the target's user-space flags.
   unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
 
+  # Hades: the "nvidia id" that the modules carry names the user and host of BUILD_IDENTITY_USER and
+  # BUILD_IDENTITY_HOST and the time of SOURCE_DATE_EPOCH (config/options), not those of this build
+  local nvid=(NV_BUILD_USER="${BUILD_IDENTITY_USER}" NV_BUILD_HOST="${BUILD_IDENTITY_HOST}")
+  [ -n "${SOURCE_DATE_EPOCH}" ] && nvid+=(DATE="LC_ALL=C date -u -d @${SOURCE_DATE_EPOCH}")
+
   make modules \
     TARGET_ARCH=x86_64 \
     ARCH=x86_64 \
@@ -30,7 +35,8 @@ make_target() {
     CXX=${CXX} \
     OBJCOPY=${OBJCOPY} \
     SYSSRC=$(kernel_path) \
-    SYSOUT=$(kernel_path)
+    SYSOUT=$(kernel_path) \
+    "${nvid[@]}"
 
   ${STRIP} --strip-debug kernel-open/nvidia.ko \
                          kernel-open/nvidia-modeset.ko \

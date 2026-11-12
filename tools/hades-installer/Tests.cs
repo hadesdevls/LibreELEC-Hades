@@ -45,7 +45,7 @@ namespace Hades.Installer
         }
     }
 
-    static class SelfTest
+    static partial class SelfTest
     {
         static StreamWriter output;
         static int failures;
@@ -404,6 +404,9 @@ namespace Hades.Installer
 
                 long[] unused;
                 Newer(directory);
+                BootText();
+                BootMarked();
+                BootPatches(directory);
                 File.WriteAllBytes(raw, MakeImage(3, false, out unused));
                 ImagePlan odd = Engine.Plan(raw, true, null, null);
                 Check("an image whose menus are not the known ones (3 entries that hide disks) is not installed on an internal disk, " +
@@ -1515,6 +1518,7 @@ namespace Hades.Installer
                       parts[0].Result.Verified && parts[1].Result.Verified);
             }
             DiagReal(directory, plan, sys);
+            BootReal(directory, plan, sys);
         }
 
         // An image like the ones that the self-test makes, with what a current image has (it says that it hides the other
@@ -1537,9 +1541,15 @@ namespace Hades.Installer
             ImagePlan plan = Engine.Plan(image, true, null, null);
             List<Patch> patches = Engine.Patches(plan, inside, false, existing, diagnostics);
             DiagKeep kept = null;
+            BootChoices boot = null;
             if (old != null)
                 using (var o = new FileStream(old, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    // (and the choices of its boot menus, as Operations.Update carries them)
+                    boot = BootMenus.Read(DiagFolder.Reader(o, o.Length), o.Length);
+                    patches = Engine.Patches(plan, inside, false, existing, diagnostics, boot);
                     kept = DiagFolder.Prepare(plan, o, o.Length, patches);
+                }
             var all = new List<Patch>(patches);
             if (kept != null) all.AddRange(kept.Patches);
             using (var f = new FileStream(Path.Combine(directory, "sistema-actualizado.bin"), FileMode.Create, FileAccess.ReadWrite))
@@ -1552,7 +1562,9 @@ namespace Hades.Installer
                                   "image " + Path.GetFileName(image) + " names " + plan.StorageUuid + "; written for " + existing +
                                   (inside ? "; for a disk inside the PC" : "") + (diagnostics ? "; diagnostics on" : "") +
                                   "; verified " + part.Result.Verified + "; " + part.Result.Written +
-                                  (kept != null ? "\r\nhades-diag: " + kept.Summary() : "") + "\r\n");
+                                  (kept != null ? "\r\nhades-diag: " + kept.Summary() : "") +
+                                  (boot != null ? "\r\nboot menus: " + boot.Summary() + (plan.HasBootChoices ? ", carried" : ", the image writes its own") : "") +
+                                  "\r\n");
                 return part.Result.Verified && (kept == null || kept.State == DiagKeep.Outcome.NoFolder ||
                                                 (kept.State == DiagKeep.Outcome.Kept && kept.Verified)) ? 0 : 1;
             }
@@ -1590,10 +1602,22 @@ namespace Hades.Installer
         public static int Capture(string directory, string image)
         {
             captureFailures = 0;
-            foreach (bool spanish in new[] { false, true })
+            // the window in each language, at the three scales that matter, light and dark. The first (100 %, light) is
+            // in the folders "en" and "es"; the others in "en-150", "en-200", "en-dark" and so on. The scale is the one
+            // that is drawn: what the display has is not asked.
+            Ui.FixedScale = true;
+            var sets = new[] { new { Name = "", Scale = 1f, Dark = false }, new { Name = "-125", Scale = 1.25f, Dark = false },
+                               new { Name = "-150", Scale = 1.5f, Dark = false }, new { Name = "-200", Scale = 2f, Dark = false },
+                               new { Name = "-dark", Scale = 1f, Dark = true } };
+            foreach (var set in sets)
             {
-                L.Spanish = spanish;
-                CaptureIn(Path.Combine(directory, spanish ? "es" : "en"), image);
+                Ui.Scale = set.Scale;
+                Ui.Dark = set.Dark;
+                foreach (bool spanish in new[] { false, true })
+                {
+                    L.Spanish = spanish;
+                    CaptureIn(Path.Combine(directory, (spanish ? "es" : "en") + set.Name), image);
+                }
             }
             return captureFailures;
         }
@@ -1660,6 +1684,18 @@ namespace Hades.Installer
                 form.SelectDisk(second);
                 Pump(delegate { return true; }, 1);
                 bool otherWholeReady = form.GoReady;
+                form.SelectDisk(stick);
+                form.ShowWorking(700);
+                Save(form, Path.Combine(directory, "15-working.png"));
+                form.EndWorking();
+                // ... and while something is done to a disk that shows its options (removing Hades): all of them off
+                form.SelectDisk(second);
+                form.ChooseBeside();
+                form.ShowWorking(300, true);
+                Save(form, Path.Combine(directory, "16-removing.png"));
+                form.EndWorking();
+                form.SelectDisk(second);
+                Pump(delegate { return true; }, 1);
                 // (without an image nothing can be installed anywhere and the window says only that the image is
                 // missing: all that can be looked at then is that the disk is listed and its button is off)
                 bool ok = offered && !wholeReady &&
@@ -1672,6 +1708,35 @@ namespace Hades.Installer
                                   wholeReady + " (" + wholeStatus + "); another disk whole, the button is on: " + otherWholeReady + "\r\n");
                 form.ShowDone(second, Place.Internal, false);
                 Save(form, Path.Combine(directory, "5-done.png"));
+                // With the panel of "done" on show, a device that comes or goes and a display of another scale: what is behind
+                // the panel stays hidden (the keyboard cannot reach it there), the list of disks is not made again, and the
+                // panel is laid out again at the new scale (18-done-rescaled.png). Once the panel goes, what waited is done.
+                {
+                    float scale = Ui.Scale, other = scale >= 2f ? 1.25f : scale * 1.5f;
+                    int loaded = form.DisksLoaded;
+                    form.DevicesChangedForTest();
+                    Pump(delegate { return true; }, 1);
+                    bool afterDevice = form.OnlyDoneShows && form.DisksLoaded == loaded && form.DoneWaits;
+                    form.ScaleChangedForTest(other);
+                    Pump(delegate { return true; }, 1);
+                    bool afterScale = form.OnlyDoneShows && form.DisksLoaded == loaded;
+                    bool laidOut = form.DoneBounds.Width == Ui.S(760) &&
+                                   form.CloseBounds == new Rectangle(Ui.S(598), Ui.S(30), Ui.S(130), Ui.S(38));
+                    Save(form, Path.Combine(directory, "18-done-rescaled.png"));
+                    form.ScaleChangedForTest(scale);
+                    Pump(delegate { return true; }, 1);
+                    laidOut &= form.DoneBounds.Width == Ui.S(760) && form.OnlyDoneShows;
+                    form.HideDone();
+                    Pump(delegate { return true; }, 1);
+                    bool afterGone = !form.DoneWaits && form.DisksLoaded == loaded + 1 && form.ListShows && !form.OnlyDoneShows;
+                    bool doneOk = afterDevice && afterScale && laidOut && afterGone;
+                    if (!doneOk) ++captureFailures;
+                    File.WriteAllText(Path.Combine(directory, "18-done-state.txt"),
+                                      (doneOk ? "ok:   " : "FAIL: ") + "the panel of \"done\": after a device came or went, only the panel shows " +
+                                      "and the list waits: " + afterDevice + "; after a display of another scale (" + other + "), the same: " +
+                                      afterScale + "; the panel laid out at that scale and back: " + laidOut + "; once the panel goes, " +
+                                      "the list is made again and shows: " + afterGone + "\r\n");
+                }
             }
             // a unit that already has Hades: updating it comes first
             DiskInfo has = Make(5, "Portable SSD", 7, 117, '\0');
@@ -1771,6 +1836,9 @@ namespace Hades.Installer
                 File.WriteAllText(Path.Combine(directory, "6-state.txt"), "update ready: " + form.UpdateReady + "; scanning: " +
                                   form.Scanning + "; status: " + form.StatusText + "\r\n");
                 Save(form, Path.Combine(directory, "6-usb-with-hades.png"));
+                form.ShowWorking(300);
+                Save(form, Path.Combine(directory, "17-updating.png"));
+                form.EndWorking();
                 using (ConfirmForm confirm = MainForm.AskUpdate(has, Path.GetFileName(image ?? L.T("image", "imagen"))))
                 {
                     confirm.Show();
@@ -1795,6 +1863,22 @@ namespace Hades.Installer
                 kept.Files = 137;
                 form.ShowDone(has, Place.Usb, true, kept);
                 Save(form, Path.Combine(directory, "8-updated.png"));
+                // (and with the choices of its boot menus carried: 3 s and HDR over HDMI on the Intel graphics)
+                kept.Boot = new BootKept();
+                kept.Boot.Old = BootMenus.FromText(Syslinux("TIMEOUT 030\n", BootMenus.Words(3), "1"), Grub("set timeout=\"03\"\n", "1"));
+                kept.Boot.ImageKnows = true;
+                kept.Boot.ImageWait = 5;
+                kept.Boot.Patches = 9;
+                form.ShowDone(has, Place.Usb, true, kept);
+                Save(form, Path.Combine(directory, "8b-updated-boot-menu.png"));
+                // (and from menus of before 1.0, which waited 10 s by themselves: the image's 5 s, and where to change it)
+                kept.Boot = new BootKept();
+                kept.Boot.Old = BootMenus.FromText(Unmarked(Syslinux("TIMEOUT 100\n", BootMenus.Words(10))), Unmarked(Grub("set timeout=\"10\"\n")));
+                kept.Boot.ImageKnows = true;
+                kept.Boot.ImageWait = 5;
+                kept.Boot.Patches = 0;
+                form.ShowDone(has, Place.Usb, true, kept);
+                Save(form, Path.Combine(directory, "8c-updated-boot-menu-before-1.0.png"));
             }
         }
 

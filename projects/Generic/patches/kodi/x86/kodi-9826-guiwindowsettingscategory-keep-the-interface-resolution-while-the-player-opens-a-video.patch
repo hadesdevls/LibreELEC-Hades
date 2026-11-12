@@ -1,0 +1,227 @@
+From 980eef1d2dfda5f205aea7a3ef3491d46612cae8 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 16:15:40 +0000
+Subject: [PATCH] GUIWindowSettingsCategory: keep the interface resolution
+ while the player opens a video
+
+A video started while a settings window was the active window (JSON-RPC
+Player.Open from a phone, a script, the GUI smoke test) asked "Save this
+resolution? Would you like to keep this change?", and either started
+15 s late or never started:
+
+- VideoPlayer asks for the mode of the video from its own thread before
+  it opens the video stream, and waits until the interface thread has
+  set it (CGraphicContext::SetVideoResolution(): SendMsg of
+  TMSG_SETVIDEORESOLUTION).
+- The change of mode is told to every window (GUI_MSG_WINDOW_RESIZE).
+  The active settings window saves the mode as the resolution of the
+  interface (CDisplaySettings::SetCurrentResolution(mode, true), as Kodi
+  does), and changing videoscreen.screenmode asks the user to keep it
+  (CDisplaySettings::OnSettingChanging(), 15 s) in a modal dialog whose
+  loop runs inside the handling of that message: the player waits for
+  it. Nobody answers, the old mode is put back, the video starts after
+  15 s and the player changes the mode once more.
+- When the request was handled in the same pass as PlayMedia, before
+  "playback started" (a slow interface thread, other messages queued),
+  "playback started" came to the interface inside the loop of the
+  question, and its busy dialog (CGUIDialogBusy::WaitOnEvent() on
+  m_playerEvent, set once the player shows its video) ran its own loop
+  above it. The question could never return, so the player never got its
+  mode and never showed a video; the busy dialog turned for good, and
+  Stop waited for the player thread for good (CVideoPlayer::CloseFile(),
+  StopThread()), freezing the interface.
+
+The window kept the interface resolution only while a video plays
+(IsPlayingVideo(), commit "keep the interface resolution while a video
+plays"), which is not true yet when the mode for the first video of a
+file is set: m_HasVideo is set once the video stream is open, after the
+mode. It now keeps it while the player is active at all (IsPlaying(),
+true from CVideoPlayer::OpenFile() on), the rule in
+SettingsWindowResize.h; nobody is asked, and kodi.log says it
+("Settings: the display went to <mode> while the player is active,
+before it has a video (...); the resolution of the interface stays
+<screenmode>, and nobody is asked to keep that mode"). Outside playback
+nothing changes: a mode that the window system set by itself is saved
+and asked about as before.
+
+Kodi 22.0rc2 has the same save without any condition: the same start
+asks there, and can hang the same way.
+
+Seen in the GUI smoke test in QEMU (virgl), image of 1.0 RC8, with a busy
+host: in 2 runs of 4 the player thread stopped after "Display
+resolution ADJUST", the interface turned the busy dialog, and stopping
+waited in CloseFile() (the stall report of the interface thread). Made
+again on purpose with that image: a start from Settings > System showed
+the question 0.3 to 0.6 s after PlayMedia and the video 15.6 to 16.7 s
+after it, 19 times; once more, with the processors of the VM shared with
+busy loops, it hung as in the smoke test, and the stacks taken in the
+guest showed the player thread in SendMsg() from
+CVideoPlayer::OpenVideoStream(), and the interface thread in
+CGUIDialogBusy::WaitOnEvent(), inside CGUIDialogYesNo::ShowAndGetInput(),
+inside CDisplaySettings::OnSettingChanging(), inside
+CGUIWindowSettingsCategory::OnMessage(), inside the handling of
+TMSG_SETVIDEORESOLUTION. From the home window: the video 0.1 to 0.7 s
+after PlayMedia and no question, 4 times in 4.
+
+The rule is checked by a host test that models the threads and messages
+above (settings_resize_test): both orders show the video at once with
+it, and with the rule of before the first order hangs and the second
+asks and waits.
+---
+ xbmc/settings/windows/CMakeLists.txt          |  3 +-
+ .../windows/GUIWindowSettingsCategory.cpp     | 57 +++++++++++++------
+ xbmc/settings/windows/SettingsWindowResize.h  | 52 +++++++++++++++++
+ 3 files changed, 94 insertions(+), 18 deletions(-)
+ create mode 100644 xbmc/settings/windows/SettingsWindowResize.h
+
+diff --git a/xbmc/settings/windows/CMakeLists.txt b/xbmc/settings/windows/CMakeLists.txt
+index c1b69ac..edf3d04 100644
+--- a/xbmc/settings/windows/CMakeLists.txt
++++ b/xbmc/settings/windows/CMakeLists.txt
+@@ -6,6 +6,7 @@ set(SOURCES GUIControlSettings.cpp
+ set(HEADERS GUIControlSettings.h
+             GUIWindowSettings.h
+             GUIWindowSettingsCategory.h
+-            GUIWindowSettingsScreenCalibration.h)
++            GUIWindowSettingsScreenCalibration.h
++            SettingsWindowResize.h)
+ 
+ core_add_library(settings_windows)
+diff --git a/xbmc/settings/windows/GUIWindowSettingsCategory.cpp b/xbmc/settings/windows/GUIWindowSettingsCategory.cpp
+index c541710..5fca167 100644
+--- a/xbmc/settings/windows/GUIWindowSettingsCategory.cpp
++++ b/xbmc/settings/windows/GUIWindowSettingsCategory.cpp
+@@ -11,6 +11,7 @@
+ #include "GUIPassword.h"
+ #include "GUIUserMessages.h"
+ #include "ServiceBroker.h"
++#include "SettingsWindowResize.h"
+ #include "application/ApplicationComponents.h"
+ #include "application/ApplicationPlayer.h"
+ #include "input/actions/Action.h"
+@@ -111,25 +112,47 @@ bool CGUIWindowSettingsCategory::OnMessage(CGUIMessage &message)
+       {
+         const RESOLUTION videoResolution =
+             CServiceBroker::GetWinSystem()->GetGfxContext().GetVideoResolution();
+-        if (IsActive() && CDisplaySettings::GetInstance().GetCurrentResolution() != videoResolution)
++        // Hades: while the player is active, the mode is the one it chose for its video (its
++        // frame rate, Dolby Vision): saved here it would become the resolution of the interface,
++        // which the player goes back to when the video stops (the settings window open over a
++        // video whose mode changes, the next one of a list: a case CroqueMr found). A resolution
++        // the user chose is saved by its own setting (CDisplaySettings::OnSettingChanged()). Also
++        // while the player opens a file, before it has a video: VideoPlayer waits for that mode,
++        // and saving it asked the user to keep it inside the change, which held the player, for
++        // good when its busy dialog came above the question (CSettingsWindowResize).
++        const bool active = IsActive();
++        const bool differs =
++            active && CDisplaySettings::GetInstance().GetCurrentResolution() != videoResolution;
++        const auto appPlayer =
++            differs ? CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>()
++                    : nullptr;
++        switch (CSettingsWindowResize::Of(active, differs, appPlayer && appPlayer->IsPlaying()))
+         {
+-          // Hades: while a video plays, the mode is the one the player chose for it (its frame
+-          // rate, Dolby Vision): saved here it would become the resolution of the interface, which
+-          // the player goes back to when the video stops. The settings window open over a video
+-          // whose mode changes (the next one of a list) must not do that; a resolution the user
+-          // chose is saved by its own setting (CDisplaySettings::OnSettingChanged()). After a case
+-          // CroqueMr found.
+-          const auto appPlayer = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+-          if (appPlayer && appPlayer->IsPlayingVideo())
+-            CLog::Log(LOGINFO,
+-                      "Settings: the display went to {} while a video plays; that is the video's "
+-                      "mode, and the resolution of the interface stays {}",
+-                      CDisplaySettings::GetInstance().GetResolutionInfo(videoResolution).strMode,
+-                      CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
+-                          CSettings::SETTING_VIDEOSCREEN_SCREENMODE));
+-          else
++          case CSettingsWindowResize::Step::NOTHING:
++            break;
++          case CSettingsWindowResize::Step::KEEP:
++            if (appPlayer->HasVideo())
++              CLog::Log(LOGINFO,
++                        "Settings: the display went to {} while a video plays; that is the video's "
++                        "mode, and the resolution of the interface stays {}",
++                        CDisplaySettings::GetInstance().GetResolutionInfo(videoResolution).strMode,
++                        CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
++                            CSettings::SETTING_VIDEOSCREEN_SCREENMODE));
++            else
++              CLog::Log(
++                  LOGINFO,
++                  "Settings: the display went to {} while the player is active, before it "
++                  "has a video (the mode VideoPlayer asks for the video it opens); the "
++                  "resolution of the interface stays {}, and nobody is asked to keep that mode",
++                  CDisplaySettings::GetInstance().GetResolutionInfo(videoResolution).strMode,
++                  CServiceBroker::GetSettingsComponent()->GetSettings()->GetString(
++                      CSettings::SETTING_VIDEOSCREEN_SCREENMODE));
++            CreateSettings();
++            break;
++          case CSettingsWindowResize::Step::SAVE:
+             CDisplaySettings::GetInstance().SetCurrentResolution(videoResolution, true);
+-          CreateSettings();
++            CreateSettings();
++            break;
+         }
+       }
+       break;
+diff --git a/xbmc/settings/windows/SettingsWindowResize.h b/xbmc/settings/windows/SettingsWindowResize.h
+new file mode 100644
+index 0000000..41426f2
+--- /dev/null
++++ b/xbmc/settings/windows/SettingsWindowResize.h
+@@ -0,0 +1,52 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++/*!
++ * \brief Hades: what the settings window does when the display mode changes while it is the
++ * active window (GUI_MSG_WINDOW_RESIZE, CGUIWindowSettingsCategory::OnMessage())
++ *
++ * Kodi saves the mode of the graphics context there as the resolution of the interface
++ * (videoscreen.screenmode), so that the settings show a mode that the window system set by itself.
++ * That changes the setting, and a change of that setting asks the user whether to keep the mode
++ * (CDisplaySettings::OnSettingChanging(): "Keep display mode?", 15 s), in a dialog that runs a
++ * loop of its own on the thread of the interface, inside the change of mode.
++ *
++ * While the player is active, the mode is the player's: the one it chose for the video (its frame
++ * rate, Dolby Vision). Saved, it became the resolution of the interface that the player goes back
++ * to when the video stops. And VideoPlayer asks for the mode of a video it opens from its own
++ * thread, before the video stream is open, waiting until the thread of the interface has set it
++ * (TMSG_SETVIDEORESOLUTION): the question held the player in that wait, 15 s with the question on
++ * the screen, or for good where the message that playback started reached the interface inside
++ * the loop of the question. Its busy dialog (CGUIDialogBusy::WaitOnEvent(), which ends once the
++ * player shows the video) then ran its own loop above that one, and the question could never
++ * return: no video was ever shown, and stopping waited for the player for good, the interface
++ * frozen with it.
++ *
++ * The player is active from the moment it opens a file (IsPlaying()), and has a video only once
++ * that mode is set (IsPlayingVideo(), which was what was asked before, and is not true yet when
++ * the mode for the first video of a file changes).
++ */
++class CSettingsWindowResize
++{
++public:
++  enum class Step
++  {
++    NOTHING, //!< the window is not active, or the mode is the resolution of the interface already
++    KEEP, //!< the mode is the player's: the resolution of the interface stays (said in kodi.log)
++    SAVE, //!< the mode becomes the resolution of the interface, as Kodi does
++  };
++
++  static constexpr Step Of(bool windowActive, bool modeDiffers, bool playerActive)
++  {
++    if (!windowActive || !modeDiffers)
++      return Step::NOTHING;
++    return playerActive ? Step::KEEP : Step::SAVE;
++  }
++};
+-- 
+2.53.0
+

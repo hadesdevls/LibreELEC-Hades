@@ -78,6 +78,10 @@ post_makeinstall_target() {
 
   mkdir -p ${INSTALL}/usr/bin
     cp ${PKG_BUILD}/tools/btmgmt ${INSTALL}/usr/bin
+    # Hades: a Bluetooth controller over TCP (btproxy -c <host>: a virtual controller through
+    # hci_vhci, as proxmox-bluetooth uses in a virtual machine); BlueZ builds it and does not
+    # install it
+    cp ${PKG_BUILD}/tools/btproxy ${INSTALL}/usr/bin
 
   mkdir -p ${INSTALL}/usr/share/services
     cp -P ${PKG_DIR}/default.d/*.conf ${INSTALL}/usr/share/services

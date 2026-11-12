@@ -1,0 +1,790 @@
+From 83eb0f88d820271f9760caf3b2682d33ac1bcf2c Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:01:01 +0000
+Subject: [PATCH] dvbridge: the trim pass (level 2) of a picture mapped to a
+ display, as SMPTE ST 2094-10 and ETSI TS 103 572 publish it
+
+A Dolby Vision picture mapped to a display (HDR10 output, SDR output, Low-Latency)
+was mapped from its level 1 alone; the trims of its level 2 blocks were left
+out because how Dolby's display management applies them is not public. What is
+public is what the codes of a level 2 block mean (ETSI TS 103 572 4.3, equations
+(4) to (8): slope, offset, power, chroma weight and saturation gain, 2048 when
+absent) and what they do to a picture already mapped to the targeted display
+(SMPTE ST 2094-10:2021 Annex B.3, equations (8) and (9): the clamp of the
+component times the gain plus the offset, to the power, relative to the target's
+peak; then the chroma compensation and the saturation gain by the luminance of
+the display's primaries). Both texts are free since June 2026.
+
+dvbridge_trims.h has the arithmetic (decoding, the pass in double precision as
+the reference the tests use, the matrices of the display's primaries) and the
+GLSL of the pass. dvbridge_trim_select() picks the block: the one whose
+target_max_PQ is the display's peak in 12-bit PQ, to within one code. The standard
+defines no way to take a pass to a display it was not made for (ST 2094-1 only says
+a receiver can select the sets that fit best), so with no such block, or two
+(a tie, or two of one target), the picture is mapped as before, bit for bit: no
+interpolation between the targets of two blocks. ms_weight is reserved in
+TS 103 572 and ignored (the streams at hand carry 2048 and 512, not the -1 its
+text says). Level 8 is not applied: no public document defines it.
+
+The pass is a hook of its own on the output of the render, before the clamp to the
+display's peak (the HDR10 and SDR renders) or before the hook that blanks the bars,
+writes the test pattern and lifts the black (Low-Latency), in the display's own RGB
+(from the container's by the two matrices). dvbridge_hdr10_mapping::trims asks for
+it; zero, as before, changes nothing: the shaders and hooks are the ones of before.
+A pass that cannot be drawn on a GPU does not lose the picture: the render is made
+again without it, for the rest of the stream, and the notes say so
+(dvbridge_render_notes::trim_*, once each in a stream: the pass drawn, a block of
+the target with nothing to do, level 2 blocks and none for the display's peak).
+Never on native Dolby Vision output: the display does its own mapping there.
+---
+ tools/dvbridge/dvbridge_placebo.c |  46 ++++++
+ tools/dvbridge/dvbridge_placebo.h |  15 +-
+ tools/dvbridge/dvbridge_render.c  | 183 +++++++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h  |  13 ++
+ tools/dvbridge/dvbridge_trims.h   | 246 ++++++++++++++++++++++++++++++
+ 5 files changed, 496 insertions(+), 7 deletions(-)
+ create mode 100644 tools/dvbridge/dvbridge_trims.h
+
+diff --git a/tools/dvbridge/dvbridge_placebo.c b/tools/dvbridge/dvbridge_placebo.c
+index 58b3e44..f33bf68 100644
+--- a/tools/dvbridge/dvbridge_placebo.c
++++ b/tools/dvbridge/dvbridge_placebo.c
+@@ -346,3 +346,49 @@ bool dvbridge_level1_effective(const void *metadata, size_t bytes, struct dvbrid
+     out->avg += out->offset[2] / 2048.0f;
+     return true;
+ }
++
++bool dvbridge_trim_select(const void *metadata, size_t bytes, float peak, struct dvbridge_trim *out)
++{
++    if (!out || !metadata || (uintptr_t)metadata % _Alignof(AVDOVIMetadata) ||
++        !dvbridge_dv_readable(metadata, bytes))
++        return false;
++    *out = (struct dvbridge_trim){0};
++    if (!(peak >= 1.0f) || peak > 10000.0f)
++        return true;
++    const AVDOVIMetadata *m = metadata;
++    const unsigned want = dvbridge_trim_pq12(peak);
++    int best = -1;
++    unsigned best_distance = 2;
++    bool tie = false;
++    for (int i = 0; i < m->num_ext_blocks; ++i) {
++        const AVDOVIDmData *e = av_dovi_get_ext(m, i);
++        if (e->level != 2)
++            continue;
++        const unsigned target = e->l2.target_max_pq;
++        if (out->blocks < 8)
++            out->targets[out->blocks] = target;
++        ++out->blocks;
++        const unsigned distance = target > want ? target - want : want - target;
++        if (distance > 1)
++            continue;
++        if (best < 0 || distance < best_distance) {
++            best = i;
++            best_distance = distance;
++            tie = false;
++        } else if (distance == best_distance) {
++            tie = true; /* two blocks of one target, or of the codes either side of it: no pass */
++        }
++    }
++    if (best < 0 || tie)
++        return true;
++    const AVDOVIDmData *e = av_dovi_get_ext(m, best);
++    const unsigned code[5] = {e->l2.trim_slope, e->l2.trim_offset, e->l2.trim_power,
++                              e->l2.trim_chroma_weight, e->l2.trim_saturation_gain};
++    const struct dvbridge_trim listed = *out;
++    if (!dvbridge_trim_decode(out, e->l2.target_max_pq, code))
++        *out = (struct dvbridge_trim){0};
++    out->blocks = listed.blocks;
++    for (int i = 0; i < 8; ++i)
++        out->targets[i] = listed.targets[i];
++    return true;
++}
+diff --git a/tools/dvbridge/dvbridge_placebo.h b/tools/dvbridge/dvbridge_placebo.h
+index bf95fb7..6c8b97a 100644
+--- a/tools/dvbridge/dvbridge_placebo.h
++++ b/tools/dvbridge/dvbridge_placebo.h
+@@ -14,6 +14,7 @@
+ #include <stddef.h>
+ #include <libplacebo/colorspace.h>
+ #include "dvbridge_core.h"
++#include "dvbridge_trims.h"
+ 
+ struct dvbridge_color {
+     struct pl_color_space color;
+@@ -42,8 +43,10 @@ bool dvbridge_hdr10_static(struct dvbridge_hdr10_static *out, const void *metada
+  * display, with nothing above that peak. The black of the source is kept (that of the display is
+  * not known). How the tones below the peak change depends on the curve; and libplacebo lowers a
+  * whole shot a little when its brightest is above the peak (to a virtual target between the two),
+- * more when its average is bright too. The creative trims of the metadata (levels 2 and 8) are not
+- * applied: how Dolby's display management applies them is not public. */
++ * more when its average is bright too. The creative trims of the metadata: level 2 is applied as
++ * SMPTE ST 2094-10 and ETSI TS 103 572 publish it, for a display of the target that a level 2 block is
++ * for (dvbridge_hdr10_mapping::trims, dvbridge_trims.h); level 8 is not: no public document defines
++ * what it does. */
+ enum dvbridge_hdr10_gamut {
+     DVBRIDGE_HDR10_GAMUT_BT2020 = 0,
+     DVBRIDGE_HDR10_GAMUT_P3_D65 = 1,
+@@ -111,6 +114,9 @@ struct dvbridge_hdr10_mapping {
+     /* Hades: an SDR target with the pure 2.2 power as its EOTF, not BT.1886's 2.4 (dvbridge_sdr_mapping_for()).
+      * Of an SDR target only. false where nothing sets it: as before, bit for bit. */
+     bool gamma22;
++    /* Hades: the trim pass (level 2) of a picture's metadata is applied where one is for this display's peak
++     * (dvbridge_trim_select(), dvbridge_trims.h). false where nothing sets it: as before, bit for bit. */
++    bool trims;
+ };
+ #define DVBRIDGE_HDR10_BLACK_MAX 1.0f
+ /* A mapping that dvbridge_render_hdr10_mapping() takes: off, or on with values it can use (an SDR
+@@ -160,4 +166,9 @@ const char *dvbridge_map_color_refused(const void *metadata, size_t bytes);
+  * (pl_map_avdovi_metadata(): code / 4095.0f). false where the metadata do not read or have no level 1. */
+ #define DVBRIDGE_LEVEL1_EFFECTIVE 1
+ bool dvbridge_level1_effective(const void *metadata, size_t bytes, struct dvbridge_level1 *out);
++/* Hades: the trim pass of the metadata of a picture for a display whose peak is `peak` cd/m2
++ * (dvbridge_trims.h says which block and why). false: the metadata do not read. true: out->found says
++ * whether a block of that target was found (out->blocks: how many level 2 blocks there are), out->active
++ * whether it changes the picture (a block of all codes 2048 does not). */
++bool dvbridge_trim_select(const void *metadata, size_t bytes, float peak, struct dvbridge_trim *out);
+ #endif
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 4861c32..cb7d116 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -33,6 +33,10 @@ enum {
+     NOTE_LEVEL3_REFUSED = 128,
+     NOTE_CM40_ADDED = 256,
+     NOTE_L5_IGNORED = 512,
++    NOTE_TRIM = 1024,
++    NOTE_TRIM_IDENTITY = 2048,
++    NOTE_TRIM_NONE = 4096,
++    NOTE_TRIM_FAILED = 8192,
+ };
+ 
+ /* Hades: the bridge's own passes that are timed (dvbridge_render_time_passes()), each with a few
+@@ -156,6 +160,9 @@ struct dvbridge_renderer {
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+     struct dvbridge_hdr10_mapping ll_mapping;
++    /* Hades: the trim pass (dvbridge_trims.h): the render in hand has one (trim_tried); one could not be drawn on
++     * this GPU, and pictures are mapped without it from here on (trim_failed; trim_retry()) */
++    bool trim_tried, trim_failed;
+     /* Hades: the table of the gamut mapping (dvbridge_render_set_gamut_table()): asked for, whether the
+      * finer one failed, and what the last render that mapped a picture took (gamut_last) */
+     int gamut_asked;
+@@ -174,6 +181,13 @@ struct dvbridge_renderer {
+  * take the colour; what captures read of it is clamped to 1. */
+ #define PICTURE_ALPHA "2.0"
+ 
++/* Hades: the trim pass of a picture mapped to a display (dvbridge_trims.h): what the shader of the pass takes. */
++struct trim_pass {
++    bool on, called;
++    struct dvbridge_trim trim;
++    float a[4], b[4], luma[3], to[9], from[9]; /* the variables of DVBRIDGE_TRIM_GLSL, the matrices by rows */
++};
++
+ struct active_mask {
+     float rect[4];
+     bool called, failed;
+@@ -450,6 +464,20 @@ static struct pl_hook_res pack_active_area(void *priv, const struct pl_hook_para
+     return (struct pl_hook_res) { .failed = mask->failed, .output = PL_HOOK_SIG_NONE };
+ }
+ 
++/* Hades: the variables of DVBRIDGE_TRIM_GLSL (DVBRIDGE_TRIM_VARIABLES of them) */
++static void trim_variables(struct trim_pass *t, struct pl_shader_var *v)
++{
++    v[0] = (struct pl_shader_var){.var = pl_var_vec4("dvbridge_trim_a"), .data = t->a, .dynamic = true};
++    v[1] = (struct pl_shader_var){.var = pl_var_vec4("dvbridge_trim_b"), .data = t->b, .dynamic = true};
++    v[2] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_luma"), .data = t->luma, .dynamic = true};
++    v[3] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_to0"), .data = &t->to[0], .dynamic = true};
++    v[4] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_to1"), .data = &t->to[3], .dynamic = true};
++    v[5] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_to2"), .data = &t->to[6], .dynamic = true};
++    v[6] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_from0"), .data = &t->from[0], .dynamic = true};
++    v[7] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_from1"), .data = &t->from[3], .dynamic = true};
++    v[8] = (struct pl_shader_var){.var = pl_var_vec3("dvbridge_trim_from2"), .data = &t->from[6], .dynamic = true};
++}
++
+ /* Hades: the test pattern of Low-Latency (dvbridge_render_set_ll_pattern()), in the converted
+  * transport's own terms: PQ R'G'B' in BT.2020 that it packs as BT.2020 YCbCr of the narrow range at
+  * 12 bits (Y = 256 + 3504 Y', C = 2048 + 3584 (B' or R' - Y') / 1.8814 or 1.4746). The staircases are
+@@ -564,8 +592,13 @@ static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hd
+                            const struct dvbridge_level1 *level1);
+ static const struct dvbridge_level1 *level1_noted(struct dvbridge_renderer *r, const void *metadata,
+                                                   size_t bytes, struct dvbridge_level1 *level1);
++static bool trim_prepare(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                         const void *metadata, size_t bytes, struct trim_pass *t);
++static struct pl_hook_res trim_hook_run(void *priv, const struct pl_hook_params *p);
+ static bool fine_gamut_table(const struct dvbridge_renderer *r, bool ll);
+ static bool gamut_table_retry(struct dvbridge_renderer *r, bool fine, bool ok);
++static bool trim_retry(struct dvbridge_renderer *r, bool ok);
++static void trim_kept(struct dvbridge_renderer *r, bool ok);
+ static void gamut_table_kept(struct dvbridge_renderer *r, bool ok);
+ 
+ struct dvbridge_renderer *dvbridge_renderer_create(pl_gpu gpu, pl_log log)
+@@ -641,6 +674,7 @@ void dvbridge_renderer_reset(struct dvbridge_renderer *r)
+         pl_renderer_flush_cache(r->renderer);
+     dvbridge_reset(r->context);
+     r->noted = r->fresh = 0;
++    r->trim_failed = false;
+ }
+ 
+ void dvbridge_render_set_frame_period(struct dvbridge_renderer *r, double period)
+@@ -676,6 +710,10 @@ bool dvbridge_render_take_notes(struct dvbridge_renderer *r, struct dvbridge_ren
+     notes->level3_added = r->fresh & NOTE_LEVEL3;
+     notes->level3_refused = r->fresh & NOTE_LEVEL3_REFUSED;
+     notes->cm40_added = r->fresh & NOTE_CM40_ADDED;
++    notes->trim_used = r->fresh & NOTE_TRIM;
++    notes->trim_identity = r->fresh & NOTE_TRIM_IDENTITY;
++    notes->trim_none = r->fresh & NOTE_TRIM_NONE;
++    notes->trim_failed = r->fresh & NOTE_TRIM_FAILED;
+     r->fresh = 0;
+     return true;
+ }
+@@ -1437,6 +1475,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     /* Hades: Low-Latency: mapped to the display (as dvbridge_render_hdr10() maps a picture with the
+      * same mapping) and within its peak; the test pattern covers the raster, bars too */
+     struct pl_color_map_params ll_color;
++    struct trim_pass trim = {0};
+     if (r->low_latency) {
+         struct dvbridge_level1 level1;
+         map_to_display(r, &r->ll_mapping, &image.color, &target.color, &ll_color,
+@@ -1449,6 +1488,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                          ? pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->ll_mapping.black) / mask.peak
+                          : 0.0f;
+         mask.pattern = r->ll_pattern;
++        trim_prepare(r, &r->ll_mapping, metadata, bytes, &trim);
+     }
+     /* Only a picture that is not scaled is one shader from its planes to the target. */
+     mask.early_mask = early && !mask.pattern && dvbridge_geometry_whole(&geometry) &&
+@@ -1477,9 +1517,15 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         .signature = packed            ? (mask.early_mask ? 0x4456425246555302ULL : 0x4456425246555301ULL)
+                      : mask.low_latency ? (mask.early_mask ? 0x445642524c4c0002ULL : 0x445642524c4c0001ULL)
+                                        : (mask.early_mask ? 0x445642524c350002ULL : 0x445642524c350001ULL)};
+-    const struct pl_hook *hooks[] = {&hook};
+-    params.hooks = hooks;
+-    params.num_hooks = 1;
++    /* Hades: a Low-Latency render's trim pass (dvbridge_trims.h) is a hook of its own before the one above, which
++     * then blanks the bars, writes the test pattern, lifts the black and holds the peak over it (the pass is
++     * neither over the bars nor under the pattern). The same hook as the HDR10 render's. */
++    const struct pl_hook trim_hook = {
++        .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &trim, .hook = trim_hook_run,
++        .signature = 0x4456424844525431ULL};
++    const struct pl_hook *hooks[] = {&trim_hook, &hook};
++    params.hooks = trim.on ? hooks : hooks + 1;
++    params.num_hooks = trim.on ? 2 : 1;
+     /* The area outside the place of a picture that does not fill the raster is black: libplacebo
+      * writes the place alone (PL_CLEAR_SKIP), all of it, every frame. Hades: so the texture is
+      * cleared only when what is outside is not known to be black: a new texture, a picture at
+@@ -1497,7 +1543,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     }
+     time_render(r, &params);
+     const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
+-    r->ready = rendered && mask.called && !mask.failed;
++    r->ready = rendered && mask.called && !mask.failed && (!trim.on || trim.called);
+     /* An EL sampling failure can otherwise return a successfully rendered BL-only frame. A composer of
+      * ETSI GS CCM 001 that failed on this GPU is not one: libplacebo composed the picture by its own
+      * reshaping, as with it turned off, and said so in the log. */
+@@ -1568,12 +1614,19 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
+     const bool fine = r && fine_gamut_table(r, true);
++    if (r)
++        r->trim_tried = false;
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+     if (r && gamut_table_retry(r, fine, ok)) {
+         ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+         gamut_table_kept(r, ok);
+     }
++    /* Hades: without the trim pass where it could not be drawn */
++    if (r && trim_retry(r, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++        trim_kept(r, ok);
++    }
+     restore_gl_state(&state);
+     /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
+     if (r) {
+@@ -1620,12 +1673,18 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
+     const bool fine = fine_gamut_table(r, true);
++    r->trim_tried = false;
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+     if (gamut_table_retry(r, fine, ok)) {
+         ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
+         gamut_table_kept(r, ok);
+     }
++    /* Hades: without the trim pass where it could not be drawn */
++    if (trim_retry(r, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, target, flip);
++        trim_kept(r, ok);
++    }
+     const bool gl_clean = glGetError() == GL_NO_ERROR;
+     if (ok && !gl_clean)
+         r->not_drawn = WHY_DIRECT_GL;
+@@ -1700,6 +1759,22 @@ static struct pl_hook_res clamp_to_display(void *priv, const struct pl_hook_para
+     return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
+ }
+ 
++/* Hades: the trim pass (dvbridge_trims.h) of a picture mapped to a display, as a hook of its own on the output of
++ * the render, before the clamp to the display's peak. */
++static struct pl_hook_res trim_hook_run(void *priv, const struct pl_hook_params *p)
++{
++    struct trim_pass *t = priv;
++    struct pl_shader_var vars[DVBRIDGE_TRIM_VARIABLES];
++    trim_variables(t, vars);
++    const struct pl_custom_shader shader = {
++        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++        .body = DVBRIDGE_TRIM_GLSL,
++        .variables = vars, .num_variables = DVBRIDGE_TRIM_VARIABLES,
++        .description = "DV trim pass (level 2) of the display's target"};
++    t->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    return (struct pl_hook_res){.failed = !t->called, .output = PL_HOOK_SIG_NONE};
++}
++
+ static bool view_fits(struct dvbridge_view view, const struct pl_frame *source, int width,
+                       int height)
+ {
+@@ -1874,6 +1949,62 @@ static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hd
+     params->lut3d_size[2] = size[2];
+ }
+ 
++/* Hades: the trim pass of the metadata of a picture mapped to a display (dvbridge_hdr10_mapping::trims): the pass
++ * to draw, or false: none (the picture is mapped as before, bit for bit). The log notes (once each in a stream):
++ * a pass drawn; a block of the display's target that changes nothing; level 2 blocks and none for the peak. */
++static bool trim_prepare(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                         const void *metadata, size_t bytes, struct trim_pass *t)
++{
++    *t = (struct trim_pass){0};
++    if (!m->trims || r->trim_failed || !metadata || !dvbridge_trim_select(metadata, bytes, m->peak, &t->trim) ||
++        !t->trim.blocks)
++        return false;
++    if (!t->trim.found) {
++        if (note(r, NOTE_TRIM_NONE)) {
++            r->notes.trim = t->trim;
++            r->notes.trim_peak = m->peak;
++        }
++        return false;
++    }
++    if (!t->trim.active) {
++        if (note(r, NOTE_TRIM_IDENTITY)) {
++            r->notes.trim = t->trim;
++            r->notes.trim_peak = m->peak;
++        }
++        return false;
++    }
++    /* The container is BT.2020 for an HDR10 output and BT.709 for an SDR one; the display's own primaries are
++     * inside it (what the gamut mapping wrote). Where they cannot be had, no pass. */
++    const bool sdr = m->target == DVBRIDGE_HDR10_TARGET_SDR;
++    float display[8], container[8];
++    struct dvbridge_trim_space space;
++    if (!(m->gamut == DVBRIDGE_HDR10_GAMUT_CUSTOM ? dvbridge_hdr10_custom_xy(m, display)
++                                                  : dvbridge_hdr10_gamut_xy(m->gamut, display)) ||
++        !dvbridge_hdr10_gamut_xy(sdr ? DVBRIDGE_HDR10_GAMUT_BT709 : DVBRIDGE_HDR10_GAMUT_BT2020, container) ||
++        !dvbridge_trim_space(container, display, &space))
++        return false;
++    t->a[0] = t->trim.gain;
++    t->a[1] = t->trim.offset;
++    t->a[2] = t->trim.power;
++    t->a[3] = 1.0f / t->trim.target_nits;
++    t->b[0] = t->trim.chroma;
++    t->b[1] = t->trim.saturation;
++    t->b[2] = sdr ? (m->gamma22 ? 2.2f : 2.4f) : 0.0f;
++    for (int i = 0; i < 3; ++i)
++        t->luma[i] = (float)space.luma[i];
++    for (int i = 0; i < 9; ++i) {
++        t->to[i] = (float)space.to_display[i];
++        t->from[i] = (float)space.from_display[i];
++    }
++    t->on = true;
++    r->trim_tried = true;
++    if (note(r, NOTE_TRIM)) {
++        r->notes.trim = t->trim;
++        r->notes.trim_peak = m->peak;
++    }
++    return true;
++}
++
+ /* Hades: the render about to be made maps a picture with the finer gamut table: Low-Latency (ll) or
+  * a mapping of the picture for output as HDR10 */
+ static bool fine_gamut_table(const struct dvbridge_renderer *r, bool ll)
+@@ -1901,6 +2032,28 @@ static void gamut_table_kept(struct dvbridge_renderer *r, bool ok)
+         r->gamut_fine_failed = false;
+ }
+ 
++/* Hades: after a render with a trim pass that failed: whether to make it again without the pass (the pass is noted
++ * as failed, for the rest of the stream, and the errors that libplacebo keeps reset). The caller makes it again;
++ * if that fails as well, the pass was not why (trim_kept()). A picture is never lost to a pass that this GPU
++ * cannot draw. */
++static bool trim_retry(struct dvbridge_renderer *r, bool ok)
++{
++    if (ok || !r->trim_tried)
++        return false;
++    r->trim_failed = true;
++    r->trim_tried = false;
++    note(r, NOTE_TRIM_FAILED);
++    pl_renderer_reset_errors(r->renderer, NULL);
++    dvbridge_gl_drain_errors();
++    return true;
++}
++
++static void trim_kept(struct dvbridge_renderer *r, bool ok)
++{
++    if (!ok)
++        r->trim_failed = false;
++}
++
+ void dvbridge_render_set_gamut_table(struct dvbridge_renderer *r, int table)
+ {
+     if (!r)
+@@ -2109,16 +2262,28 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     const struct pl_hook *display_hooks[] = {&display_hook};
+     const bool peak_hook =
+         r->hdr10_mapping.enabled && r->hdr10_mapping.target != DVBRIDGE_HDR10_TARGET_SDR;
++    struct trim_pass trim = {0};
+     if (r->hdr10_mapping.enabled) {
+         struct dvbridge_level1 level1;
+         map_to_display(r, &r->hdr10_mapping, &image.color, &target.color, &mapping,
+                        level1_noted(r, metadata, bytes, &level1));
+         params.color_map_params = &mapping;
++        if (!plain)
++            trim_prepare(r, &r->hdr10_mapping, metadata, bytes, &trim);
+     }
+     if (peak_hook) {
+         to_display.peak = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->hdr10_mapping.peak);
+         params.hooks = display_hooks;
+     }
++    /* Hades: the trim pass of the display's target, before the clamp (dvbridge_trims.h) */
++    const struct pl_hook trim_hook = {
++        .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &trim, .hook = trim_hook_run,
++        .signature = 0x4456424844525431ULL};
++    const struct pl_hook *trim_hooks[] = {&trim_hook, params.hooks[0]};
++    if (trim.on) {
++        params.hooks = trim_hooks;
++        params.num_hooks = 2;
++    }
+     /* (Hades: the hook of the output, either of them, and the one of a plain picture's signal) */
+     const struct pl_hook *plain_hooks[] = {params.hooks[0], &signal_hook};
+     if (plain) {
+@@ -2131,7 +2296,8 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         r->hdr10_whole = false;
+     time_render(r, &params);
+     const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
+-    bool ok = rendered && (peak_hook ? to_display.called : clamped.called) && (!plain || signal_clamped);
++    bool ok = rendered && (peak_hook ? to_display.called : clamped.called) && (!plain || signal_clamped) &&
++              (!trim.on || trim.called);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     const bool clean = !(errors.errors & ~PL_RENDER_ERR_DOVI_COMPOSER) && !errors.num_disabled_hooks;
+     if (!rendered)
+@@ -2167,6 +2333,7 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *s
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
+     const bool fine = fine_gamut_table(r, false);
++    r->trim_tried = false;
+     r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
+                                   NULL);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+@@ -2175,6 +2342,12 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *s
+                                       NULL);
+         gamut_table_kept(r, r->hdr10_ready);
+     }
++    /* Hades: without the trim pass where it could not be drawn */
++    if (trim_retry(r, r->hdr10_ready)) {
++        r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
++                                      NULL);
++        trim_kept(r, r->hdr10_ready);
++    }
+     restore_gl_state(&state);
+     return r->hdr10_ready;
+ }
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 9594559..96fc181 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -13,6 +13,7 @@
+ #include <libplacebo/renderer.h>
+ #include "dvbridge_core.h"
+ #include "dvbridge_passtime.h"
++#include "dvbridge_trims.h"
+ 
+ struct dvbridge_renderer;
+ /* log: where libplacebo reports why a render or a GPU object failed (may be NULL). */
+@@ -44,6 +45,7 @@ void dvbridge_render_set_display_management(struct dvbridge_renderer *renderer,
+ void dvbridge_render_texture_drawn(struct dvbridge_renderer *renderer);
+ /* Hades: what the renderer noticed of a stream, once each between two resets. */
+ #define DVBRIDGE_RENDER_DEPTH_NOTES 1
++#define DVBRIDGE_RENDER_TRIM_NOTE 1
+ #define DVBRIDGE_RENDER_PAIRS_NOTE 1
+ #define DVBRIDGE_RENDER_CM40_NOTE 1
+ struct dvbridge_render_notes {
+@@ -70,6 +72,17 @@ struct dvbridge_render_notes {
+      * dvbridge_level1_effective() */
+     bool level3_added, level3_refused;
+     struct dvbridge_level1 level3, level3_not_used;
++    /* Hades: the trim pass (level 2) of the metadata of a picture mapped to the display
++     * (dvbridge_hdr10_mapping::trims, dvbridge_trims.h), once each in a stream, of the first picture that has it:
++     * trim_used, a pass was drawn (trim: its block); trim_identity, a block of the display's target was found
++     * and every code of it is neutral, nothing to draw; trim_none, the metadata have level 2 blocks and none is
++     * for the display's peak (trim_peak, cd/m2; trim.targets, trim.blocks: the targets there are). */
++    bool trim_used, trim_identity, trim_none;
++    /* ... and trim_failed: a pass could not be drawn on this GPU; the pictures of the rest of the stream are mapped
++     * without it (they were not lost) */
++    bool trim_failed;
++    struct dvbridge_trim trim;
++    float trim_peak;
+ };
+ /* false when there is nothing new since the last call */
+ bool dvbridge_render_take_notes(struct dvbridge_renderer *renderer, struct dvbridge_render_notes *notes);
+diff --git a/tools/dvbridge/dvbridge_trims.h b/tools/dvbridge/dvbridge_trims.h
+new file mode 100644
+index 0000000..04662b4
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_trims.h
+@@ -0,0 +1,246 @@
++/*
++ *  Copyright (C) 2026 Hades.
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_TRIMS_H
++#define DVBRIDGE_TRIMS_H
++/* Hades: the trim pass (level 2) of the metadata of a picture mapped to a display, as it is published.
++ *
++ * Sources, all public: ETSI TS 103 572 V1.2.1 (2020-10) 4.3 (what the 12-bit codes of a level 2 block
++ * mean, its equations (4) to (8)); SMPTE ST 2094-10:2021 (6.2.1 equation (1), 6.2.2 to 6.2.4, 6.3.1,
++ * 6.3.2; Annex B.3 equations (8) and (9), informative); SMPTE ST 2094-1:2016 (the introduction: "a
++ * receiver of the metadata can use the targeted system display metadata to select the metadata sets
++ * that are most applicable to the actual output device").
++ *
++ *   code (ETSI TS 103 572 (4) to (8))              meaning (SMPTE ST 2094-10)
++ *   trim_slope             = (S  - 0.5) * 4096     S  = ToneMappingGain          [0.5, 1.5]  6.2.3
++ *   trim_offset            = (O  + 0.5) * 4096     O  = ToneMappingOffset        [-0.5, 0.5] 6.2.2
++ *   trim_power             = (P  - 0.5) * 4096     P  = ToneMappingGamma         [0.5, 1.5]  6.2.4
++ *   trim_chroma_weight     = (CW + 0.5) * 4096     CW = ChromaCompensationWeight [-0.5, 0.5] 6.3.1
++ *   trim_saturation_gain   = (SG + 0.5) * 4096     SG = SaturationGain           [-0.5, 0.5] 6.3.2
++ *   all of them 2048 (= 1, 0, 1, 0, 0) when absent: no change.
++ *
++ * What it does to the colour components E of the picture already mapped to the targeted display
++ * (SMPTE ST 2094-10 Annex B.3, with y3 = TargetedSystemDisplayMaximumLuminance, the target_max_PQ of the
++ * block):
++ *   F_i = ( min( max( 0, (E_i / y3) * S + O ), 1 ) ) ^ P * y3                           (8)
++ *   G_i = F_i * ( (1 + CW) * F_i / Y ) ^ SG,  Y = the luminance of F from the primaries    (9)
++ * (Y = 0.22897 R + 0.69174 G + 0.07929 B for DCI-P3 primaries with a D65 white, ST 2094-10 Annex B.3
++ * quoting SMPTE EG 432-1; here from the primaries of the display it is mapped to.)
++ *
++ * Which block: the standard defines no way to take a trim pass to a display that is not the one it was
++ * made for (ST 2094-1 only says that a receiver can select the sets that fit the display best), so a
++ * pass is used only for the display it was made for: the block whose target_max_PQ is the display's
++ * peak in 12-bit PQ, to within one code (what the rounding of a peak in cd/m2 to a code is). With no
++ * such block the picture is mapped as it was before, bit for bit; no interpolation between the targets
++ * of two blocks, which no public document defines. ms_weight is reserved in TS 103 572 (a decoder
++ * ignores it; the streams at hand carry 2048 there, not the -1 that its text says).
++ *
++ * Header-only, no libplacebo or FFmpeg, so that the host tests include it; the metadata are read in
++ * dvbridge_placebo.c (dvbridge_trim_select()), the pass is drawn in dvbridge_render.c.
++ */
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++#define DVBRIDGE_TRIM_NEUTRAL 2048u
++
++struct dvbridge_trim {
++    bool active;          /* a pass to draw (a block was found, and it is not the identity) */
++    bool found;           /* a block of this display's target was found */
++    unsigned blocks;      /* the level 2 blocks of the metadata */
++    unsigned targets[8];  /* ... the target_max_PQ of the first eight of them, for the log */
++    unsigned target_pq;   /* 12-bit PQ code of the block's target_max_PQ */
++    unsigned code[5];     /* slope, offset, power, chroma weight, saturation gain: as in the block */
++    float target_nits;    /* y3: the block's target_max_PQ as luminance */
++    float gain, offset, power, chroma, saturation; /* S, O, P, CW, SG */
++};
++
++/* SMPTE ST 2084 */
++static inline double dvbridge_trim_pq_to_nits(double pq)
++{
++    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0, c1 = 3424.0 / 4096.0,
++                 c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
++    const double p = pow(pq < 0 ? 0 : pq > 1 ? 1 : pq, 1.0 / m2);
++    const double n = p - c1 > 0 ? p - c1 : 0;
++    return 10000.0 * pow(n / (c2 - c3 * p), 1.0 / m1);
++}
++static inline double dvbridge_trim_nits_to_pq(double nits)
++{
++    const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0, c1 = 3424.0 / 4096.0,
++                 c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
++    const double y = pow((nits < 0 ? 0 : nits > 10000 ? 10000 : nits) / 10000.0, m1);
++    return pow((c1 + c2 * y) / (1 + c3 * y), m2);
++}
++/* the 12-bit code of a luminance, as TS 103 572 (2) to (3) round PQ values */
++static inline unsigned dvbridge_trim_pq12(double nits)
++{
++    return (unsigned)floor(dvbridge_trim_nits_to_pq(nits) * 4095.0 + 0.5);
++}
++
++/* The meaning of the codes of one block (TS 103 572 (4) to (8) turned round). false: a code over 12 bits. */
++static inline bool dvbridge_trim_decode(struct dvbridge_trim *t, unsigned target_pq,
++                                        const unsigned code[5])
++{
++    if (target_pq > 4095)
++        return false;
++    for (int i = 0; i < 5; ++i)
++        if (code[i] > 4095)
++            return false;
++    t->target_pq = target_pq;
++    for (int i = 0; i < 5; ++i)
++        t->code[i] = code[i];
++    t->target_nits = (float)dvbridge_trim_pq_to_nits(target_pq / 4095.0);
++    t->gain = (float)(code[0] / 4096.0 + 0.5);
++    t->offset = (float)(code[1] / 4096.0 - 0.5);
++    t->power = (float)(code[2] / 4096.0 + 0.5);
++    t->chroma = (float)(code[3] / 4096.0 - 0.5);
++    t->saturation = (float)(code[4] / 4096.0 - 0.5);
++    t->found = true;
++    t->active = false;
++    for (int i = 0; i < 5; ++i)
++        t->active = t->active || code[i] != DVBRIDGE_TRIM_NEUTRAL;
++    return true;
++}
++
++/* The pass on a pixel in linear light, normalised so that 1 is the target's peak (E / y3), in the RGB of
++ * the display: equations (8) and (9), with the luminance coefficients yc of its primaries. Double
++ * precision: the reference the GLSL of the renderer is tested against. */
++static inline void dvbridge_trim_apply(const struct dvbridge_trim *t, const double yc[3],
++                                       const double in[3], double out[3])
++{
++    double f[3];
++    for (int i = 0; i < 3; ++i) {
++        double v = in[i] * (double)t->gain + (double)t->offset;
++        v = v < 0 ? 0 : v > 1 ? 1 : v;
++        f[i] = pow(v, (double)t->power);
++    }
++    const double y = yc[0] * f[0] + yc[1] * f[1] + yc[2] * f[2];
++    for (int i = 0; i < 3; ++i)
++        /* a component or a luminance of 0 stays 0: (0/0)^SG and 0^-SG are not numbers a pixel has */
++        out[i] = f[i] > 0 && y > 0 ? f[i] * pow((1.0 + (double)t->chroma) * f[i] / y, (double)t->saturation) : f[i];
++}
++
++/* The rows of the matrix that takes linear RGB of primaries a (CIE 1931 xy of red, green, blue, white) to
++ * XYZ, as SMPTE RP 177 derives it; row 1 is the luminance coefficients. false: primaries that are no gamut. */
++static inline bool dvbridge_trim_rgb2xyz(const float xy[8], double m[9])
++{
++    double p[3][3]; /* columns: X, Y, Z of each primary at Y = 1 */
++    for (int i = 0; i < 3; ++i) {
++        const double x = (double)xy[2 * i], y = (double)xy[2 * i + 1];
++        if (!(y > 0))
++            return false;
++        p[0][i] = x / y;
++        p[1][i] = 1.0;
++        p[2][i] = (1.0 - x - y) / y;
++    }
++    const double wx = (double)xy[6], wy = (double)xy[7];
++    if (!(wy > 0))
++        return false;
++    const double w[3] = {wx / wy, 1.0, (1.0 - wx - wy) / wy};
++    /* solve p * s = w (Cramer) */
++    const double det = p[0][0] * (p[1][1] * p[2][2] - p[1][2] * p[2][1]) -
++                       p[0][1] * (p[1][0] * p[2][2] - p[1][2] * p[2][0]) +
++                       p[0][2] * (p[1][0] * p[2][1] - p[1][1] * p[2][0]);
++    if (!(fabs(det) > 1e-12))
++        return false;
++    double s[3];
++    for (int k = 0; k < 3; ++k) {
++        double q[3][3];
++        for (int r = 0; r < 3; ++r)
++            for (int c = 0; c < 3; ++c)
++                q[r][c] = c == k ? w[r] : p[r][c];
++        s[k] = (q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) -
++                q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) +
++                q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0])) / det;
++    }
++    for (int r = 0; r < 3; ++r)
++        for (int c = 0; c < 3; ++c)
++            m[3 * r + c] = p[r][c] * s[c];
++    return true;
++}
++
++/* 3x3 inverse (row-major); false when singular */
++static inline bool dvbridge_trim_inverse(const double a[9], double o[9])
++{
++    const double c00 = a[4] * a[8] - a[5] * a[7], c01 = a[5] * a[6] - a[3] * a[8], c02 = a[3] * a[7] - a[4] * a[6];
++    const double det = a[0] * c00 + a[1] * c01 + a[2] * c02;
++    if (!(fabs(det) > 1e-12))
++        return false;
++    o[0] = c00 / det;
++    o[1] = (a[2] * a[7] - a[1] * a[8]) / det;
++    o[2] = (a[1] * a[5] - a[2] * a[4]) / det;
++    o[3] = c01 / det;
++    o[4] = (a[0] * a[8] - a[2] * a[6]) / det;
++    o[5] = (a[2] * a[3] - a[0] * a[5]) / det;
++    o[6] = c02 / det;
++    o[7] = (a[1] * a[6] - a[0] * a[7]) / det;
++    o[8] = (a[0] * a[4] - a[1] * a[3]) / det;
++    return true;
++}
++static inline void dvbridge_trim_mul(const double a[9], const double b[9], double o[9])
++{
++    for (int r = 0; r < 3; ++r)
++        for (int c = 0; c < 3; ++c)
++            o[3 * r + c] = a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c];
++}
++
++/* The pass for a signal of linear RGB of the container primaries (xy) shown on a display of its own
++ * primaries (xy): the matrix into the display's RGB, the one back, and the luminance coefficients of the
++ * display's RGB. false: primaries that give none (or a container that does not hold the display's). */
++struct dvbridge_trim_space {
++    double to_display[9], from_display[9], luma[3];
++};
++static inline bool dvbridge_trim_space(const float container_xy[8], const float display_xy[8],
++                                       struct dvbridge_trim_space *s)
++{
++    double c[9], d[9], di[9];
++    if (!dvbridge_trim_rgb2xyz(container_xy, c) || !dvbridge_trim_rgb2xyz(display_xy, d) ||
++        !dvbridge_trim_inverse(d, di))
++        return false;
++    dvbridge_trim_mul(di, c, s->to_display);
++    dvbridge_trim_inverse(s->to_display, s->from_display);
++    s->luma[0] = d[3];
++    s->luma[1] = d[4];
++    s->luma[2] = d[5];
++    return true;
++}
++
++/* GLSL of the pass, as a body of a libplacebo custom shader over the signal in color.rgb (encoded: PQ, or
++ * for an SDR output the power law of its EOTF). Variables, all dynamic: vec4 dvbridge_trim_a = (S, O, P,
++ * 1 / y3 with y3 in cd/m2: PQ only), vec4 dvbridge_trim_b = (CW, SG, the power of an SDR output's EOTF, 0
++ * for PQ, 0), vec3 dvbridge_trim_luma, and the rows of the two matrices, vec3 dvbridge_trim_to0..2 (the
++ * container's linear RGB into the display's) and dvbridge_trim_from0..2 (back). The pixel comes out held
++ * within [0, 1] (the peak of the display: what a gain or a saturation gain can push above it is clipped
++ * there, as the display clamp that follows does for everything else). */
++#define DVBRIDGE_TRIM_VARIABLES 9
++#define DVBRIDGE_TRIM_GLSL \
++    "{\n" \
++    "    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n" \
++    "    bool pq = dvbridge_trim_b.z == 0.0;\n" \
++    "    vec3 s = clamp(color.rgb, 0.0, 1.0);\n" \
++    "    vec3 lin;\n" \
++    "    if (pq) {\n" \
++    "        vec3 p = pow(s, vec3(1.0 / m2));\n" \
++    "        lin = pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1)) * (10000.0 * dvbridge_trim_a.w);\n" \
++    "    } else {\n" \
++    "        lin = pow(s, vec3(dvbridge_trim_b.z));\n" \
++    "    }\n" \
++    "    vec3 e = vec3(dot(dvbridge_trim_to0, lin), dot(dvbridge_trim_to1, lin), dot(dvbridge_trim_to2, lin));\n" \
++    "    vec3 f = pow(clamp(e * dvbridge_trim_a.x + dvbridge_trim_a.y, 0.0, 1.0), vec3(dvbridge_trim_a.z));\n" \
++    "    float y = dot(dvbridge_trim_luma, f);\n" \
++    "    vec3 g = f;\n" \
++    "    if (y > 0.0)\n" \
++    "        g = mix(f, f * pow((1.0 + dvbridge_trim_b.x) * f / y, vec3(dvbridge_trim_b.y)), greaterThan(f, vec3(0.0)));\n" \
++    "    lin = clamp(vec3(dot(dvbridge_trim_from0, g), dot(dvbridge_trim_from1, g), dot(dvbridge_trim_from2, g)), 0.0, 1.0);\n" \
++    "    if (pq) {\n" \
++    "        vec3 y1 = pow(lin * (1.0 / (10000.0 * dvbridge_trim_a.w)), vec3(m1));\n" \
++    "        color.rgb = pow((c1 + c2 * y1) / (1.0 + c3 * y1), vec3(m2));\n" \
++    "    } else {\n" \
++    "        color.rgb = pow(lin, vec3(1.0 / dvbridge_trim_b.z));\n" \
++    "    }\n" \
++    "}\n"
++#endif
+-- 
+2.53.0
+

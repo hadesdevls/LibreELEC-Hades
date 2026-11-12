@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:43:01 +0000
+Subject: [PATCH] Decide under one lock who deletes a callback whose result is
+ awaited
+
+QueueMenuStateChanged() and QueueCommandHandler() queue a CCallbackWrap
+for the callback thread and wait up to a second for its result. When the
+callback is late, Result() marks the wrap as abandoned and the callback
+thread deletes it once the callback returns. Two reads of m_keepResult
+were not under the wrap's lock:
+
+- the caller read it again after Result() had returned, to know whether
+  to delete the wrap; by then the callback thread may already have
+  reported and deleted it;
+- the callback thread read it when it took the wrap from the queue, while
+  the caller could be setting it in Result().
+
+Result() now tells the caller, under the lock that Report() takes, whether
+the wrap is the caller's to delete: it is when the callback thread has
+reported (it no longer touches the wrap after Report()), and it is not
+after a timeout. The callback thread no longer reads m_keepResult itself:
+for these two callbacks it reports, and Report() tells it whether the
+caller is still there; every other callback is the thread's to delete, as
+before.
+
+A callback that throws now reports 0 to a caller that still waits, instead
+of deleting the wrap that the caller is waiting on.
+
+Idea: pannal (CoreELEC), who holds these wraps by shared_ptr.
+
+Tests (outside the tree): libCEC built on the host with ThreadSanitizer; a
+menu callback and a command handler that answer after the second (a data
+race on m_keepResult before, none after); the late callback still runs and
+a prompt one still returns its answer.
+---
+ src/libcec/CECClient.cpp | 40 +++++++++++++++++++++++++---------------
+ src/libcec/CECClient.h   | 15 ++++++++++++++-
+ 2 files changed, 39 insertions(+), 16 deletions(-)
+
+diff --git a/src/libcec/CECClient.cpp b/src/libcec/CECClient.cpp
+index 989528d..b779c18 100644
+--- a/src/libcec/CECClient.cpp
++++ b/src/libcec/CECClient.cpp
+@@ -1806,9 +1806,10 @@ int CCECClient::QueueMenuStateChanged(const cec_menu_state newState)
+ {
+   CCallbackWrap *wrapState = new CCallbackWrap(newState);
+   m_callbackCalls.Push(wrapState);
+-  int result(wrapState->Result(1000));
++  bool bDelete(false);
++  int result(wrapState->Result(1000, bDelete));
+ 
+-  if (wrapState->m_keepResult)
++  if (bDelete)
+     delete wrapState;
+   return result;
+ }
+@@ -1822,9 +1823,10 @@ int CCECClient::QueueCommandHandler(const cec_command& command)
+ {
+   CCallbackWrap *wrapState = new CCallbackWrap(command, true);
+   m_callbackCalls.Push(wrapState);
+-  int result(wrapState->Result(1000));
++  bool bDelete(false);
++  int result(wrapState->Result(1000, bDelete));
+ 
+-  if (wrapState->m_keepResult)
++  if (bDelete)
+     delete wrapState;
+   return result;
+ }
+@@ -1836,10 +1838,11 @@ void* CCECClient::Process(void)
+   {
+     if (m_callbackCalls.Pop(cb, 500))
+     {
+-      bool keepResult = cb->m_keepResult;
++      const CCallbackWrap::callbackWrapType type(cb->m_type);
++      int iResult(0);
+       try
+       {
+-        switch (cb->m_type)
++        switch (type)
+         {
+         case CCallbackWrap::CEC_CB_LOG_MESSAGE:
+           CallbackAddLog(cb->m_message);
+@@ -1857,27 +1860,34 @@ void* CCECClient::Process(void)
+           CallbackConfigurationChanged(cb->m_config);
+           break;
+         case CCallbackWrap::CEC_CB_MENU_STATE:
+-          keepResult = cb->Report(CallbackMenuStateChanged(cb->m_menuState));
++          iResult = CallbackMenuStateChanged(cb->m_menuState);
+           break;
+         case CCallbackWrap::CEC_CB_SOURCE_ACTIVATED:
+           CallbackSourceActivated(cb->m_bActivated, cb->m_logicalAddress);
+           break;
+         case CCallbackWrap::CEC_CB_COMMAND_HANDLER:
+-          keepResult = cb->Report(CallbackCommandHandler(cb->m_command));
+-          if (!keepResult)
+-            LIB_CEC->AddLog(CEC_LOG_WARNING, "Command callback timeout occurred !");
+-	  break;
++          iResult = CallbackCommandHandler(cb->m_command);
++          break;
+         default:
+           break;
+         }
+-
+-        if (!keepResult)
+-          delete cb;
+       } catch (...)
+       {
+          // don't log a warning but let the app deal with this
+-         delete cb;
+       }
++
++      // a callback whose result a caller waits for goes back to it with Report(), which tells,
++      // under the lock that the caller decides under, whether the caller is still there to delete
++      // it. after that this thread does not touch it again. any other callback is this thread's.
++      bool keepResult(false);
++      if (type == CCallbackWrap::CEC_CB_MENU_STATE || type == CCallbackWrap::CEC_CB_COMMAND_HANDLER)
++      {
++        keepResult = cb->Report(iResult);
++        if (!keepResult && type == CCallbackWrap::CEC_CB_COMMAND_HANDLER)
++          LIB_CEC->AddLog(CEC_LOG_WARNING, "Command callback timeout occurred !");
++      }
++      if (!keepResult)
++        delete cb;
+     }
+   }
+   return NULL;
+diff --git a/src/libcec/CECClient.h b/src/libcec/CECClient.h
+index e995e81..a9cc4a7 100644
+--- a/src/libcec/CECClient.h
++++ b/src/libcec/CECClient.h
+@@ -140,17 +140,30 @@ namespace CEC
+         (void)unused;
+       }
+ 
+-    int Result(uint32_t iTimeout)
++    /*!
++     * @brief Wait for the callback thread to report the result.
++     * @param iTimeout how long to wait, in ms.
++     * @param bDelete set to true when the caller is to delete this object: the callback thread has
++     *        reported, and no longer uses it. It is false after a timeout: the callback thread then
++     *        deletes it once the callback ran. Decided under the lock that Report() takes, so that
++     *        the two never both, or neither, delete it.
++     * @return the result, or 0 after a timeout.
++     */
++    int Result(uint32_t iTimeout, bool &bDelete)
+     {
+       CLockObject lock(m_mutex);
+ 
+       bool bReturn = m_bSucceeded ? true : m_condition.Wait(lock, m_bSucceeded, iTimeout);
++      bDelete = bReturn;
+       if (bReturn)
+         return m_result;
+       m_keepResult = false;
+       return 0;
+     }
+ 
++    /*!
++     * @return true when the caller still waits for the result, and deletes this object itself.
++     */
+     bool Report(int result)
+     {
+       CLockObject lock(m_mutex);

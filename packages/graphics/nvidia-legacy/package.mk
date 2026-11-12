@@ -23,8 +23,8 @@ unpack() {
   # The extraction of nvidia, without executing the .run: its makeself header checks the
   # payload with cksum and md5sum over "tail -n +4" and extracts it with
   # "tail -n +${skip} | zstd -d | tar x"; do the same, and stop on any mismatch. (The header of
-  # 580.196.07 differs from that of 615.78.08 in versions, sums, sizes, dates and the help of
-  # two options.)
+  # 580.196.07 has the form of that of nvidia's .run, with its own sums, sizes and dates and the
+  # help of some options worded otherwise.)
   local run="${SOURCES}/${PKG_NAME}/${PKG_SOURCE_NAME}"
   local skip crc md5
   skip=$(head -n 20 "${run}" | sed -n 's/^skip=\([0-9]\+\)$/\1/p')
@@ -101,7 +101,7 @@ makeinstall_target() {
   local open_version="$(get_pkg_version nvidia)"
   local name file
 
-  # The agreement of this driver is the one in licenses/ (that of 615.78.08, byte for byte).
+  # The agreement of this driver is the one in licenses/ (that of nvidia, byte for byte).
   cmp -s LICENSE ${ROOT}/licenses/LicenseRef-NVIDIA-Driver-License-Agreement.txt || \
     die "nvidia-legacy: licenses/LicenseRef-NVIDIA-Driver-License-Agreement.txt is not the LICENSE of this driver"
   mkdir -p ${INSTALL}/usr/share/licenses/nvidia-legacy
@@ -122,7 +122,7 @@ makeinstall_target() {
     die "nvidia-legacy: no list of PCI IDs"
 
   # User space: the files of nvidia, of this release (their names carry the version, so they
-  # are next to those of 615.78.08). libnvidia-egl-gbm (nvidia_egl-gbm, from source) and the
+  # are next to those of nvidia's). libnvidia-egl-gbm (nvidia_egl-gbm, from source) and the
   # JSON files of EGL are those of nvidia (the same bytes in both installers).
   mkdir -p ${INSTALL}/usr/lib
   for name in libnvidia-allocator libEGL_nvidia libnvidia-eglcore libnvidia-glsi \

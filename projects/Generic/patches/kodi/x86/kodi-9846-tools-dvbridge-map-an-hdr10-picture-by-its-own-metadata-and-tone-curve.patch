@@ -1,0 +1,428 @@
+From f855149fb71b5a09bc7cd7c98df30d479f778594 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:28:39 +0000
+Subject: [PATCH] tools/dvbridge: map an HDR10+ picture by its own metadata and
+ tone curve
+
+An HDR10 or HDR10+ picture that the bridge maps to a display itself ("HDR10 and
+HDR10+ adapted to the display", the mapping to SDR) was mapped by the static
+HDR10 metadata of the stream: BT.2390 (or the spline) from the peak of the
+mastering display, the same for every scene. The HDR10+ metadata of each
+picture (SMPTE ST 2094-40) were not used, and neither was the tone curve that
+the studio made for a display of a given peak.
+
+struct dvbridge_plain now carries them (dvbridge_hdr10plus_map.h), as
+dvbridge_hdr10plus_plain() takes them from FFmpeg's, checked against the
+standard: application version 0 or 1, every value in its range, a targeted
+display of 1 to 10000 cd/m2, at most 15 anchors (9 in version 1), and a curve
+that never goes down (8.7.4, equation (2)). The mapping is then guided by the
+scene: its brightest is the highest MaxSCL (or the last percentile of maxRGB,
+B.3), given to libplacebo in all three components, and where the picture
+carries a curve, the curve is libplacebo's pl_tone_map_st2094_40 with that
+Bezier curve, on a table of 1024 entries. Without HDR10+ metadata nothing
+changes: the same parameters, the same bytes.
+
+Measured on Mesa's software OpenGL ES (llvmpipe and zink) against an
+independent computation of ST 2094-40 8.7.4 (a neutral ramp of every 10-bit
+code): on a display of the curve's target, 0.04 to 0.56 codes of 12-bit PQ at
+most, 0.01 to 0.02 on average, in 21 curves and displays. Without HDR10+, the
+same bytes as before in five mappings and both drivers. A frame costs the
+same; the table is made again once a scene.
+
+libplacebo takes the range of the curve as the luminance of the three MaxSCL
+before it raises it to the highest, and caps the output peak by the former: a
+display brighter than that luminance was mapped to it (1698 instead of 1783
+cd/m2 in a measured case). Giving the brightest in all three avoids it.
+---
+ tools/dvbridge/dvbridge_hdr10plus.c     | 109 ++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_hdr10plus.h     |  15 ++++
+ tools/dvbridge/dvbridge_hdr10plus_map.h |  74 ++++++++++++++++
+ tools/dvbridge/dvbridge_render.c        |  67 +++++++++++++++
+ tools/dvbridge/dvbridge_render.h        |  17 ++++
+ 5 files changed, 282 insertions(+)
+ create mode 100644 tools/dvbridge/dvbridge_hdr10plus_map.h
+
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.c b/tools/dvbridge/dvbridge_hdr10plus.c
+index 5bc1d7c..2b84540 100644
+--- a/tools/dvbridge/dvbridge_hdr10plus.c
++++ b/tools/dvbridge/dvbridge_hdr10plus.c
+@@ -434,6 +434,115 @@ const AVDOVIMetadata *dvbridge_hdr10plus_next_of(struct dvbridge_hdr10plus_scene
+     return made;
+ }
+ 
++bool dvbridge_hdr10plus_plain(const AVDynamicHDRPlus *m, struct dvbridge_plain_hdr10plus *out,
++                              const char **why, const char **curve_why)
++{
++    const char *unused = NULL;
++    if (!why)
++        why = &unused;
++    if (!curve_why)
++        curve_why = &unused;
++    *why = NULL;
++    *curve_why = NULL;
++    if (!out)
++        return false;
++    memset(out, 0, sizeof(*out));
++    if (!m || m->num_windows < 1) {
++        *why = "the metadata have no processing window";
++        return false;
++    }
++    if (m->application_version > 1) {
++        *why = "an application version above 1";
++        return false;
++    }
++    const AVHDRPlusColorTransformParams *w = &m->params[0];
++    double scl[3], top = 0, average;
++    for (int c = 0; c < 3; ++c) {
++        if (!value(w->maxscl[c], &scl[c])) {
++            *why = "a MaxSCL out of its range";
++            return false;
++        }
++        if (scl[c] > top)
++            top = scl[c];
++    }
++    if (!value(w->average_maxrgb, &average)) {
++        *why = "an average of maxRGB out of its range";
++        return false;
++    }
++    /* ST 2094-40 B.3: the brightest is the highest MaxSCL, or, where that is 0, the last percentile of maxRGB */
++    if (!(top > 0)) {
++        const unsigned n = w->num_distribution_maxrgb_percentiles;
++        double last = 0;
++        if (n >= 1 && n <= 15 && value(w->distribution_maxrgb[n - 1].percentile, &last) && last > 0)
++            scl[0] = scl[1] = scl[2] = top = last;
++    }
++    if (!(top > 0)) {
++        *why = "no brightest (every MaxSCL is 0, and so is the last percentile of maxRGB)";
++        return false;
++    }
++    if (!(average > 0)) {
++        *why = "an average of maxRGB of 0";
++        return false;
++    }
++    out->present = true;
++    for (int c = 0; c < 3; ++c)
++        out->scene_max[c] = (float)(scl[c] * 10000.0);
++    out->scene_avg = (float)(average * 10000.0);
++
++    if (!w->tone_mapping_flag)
++        return true;
++    struct dvbridge_plain_hdr10plus c = *out;
++    const AVRational t = m->targeted_system_display_maximum_luminance;
++    const double target = t.den > 0 ? av_q2d(t) : 0;
++    const int anchors = w->num_bezier_curve_anchors;
++    double kx, ky;
++    if (!(target >= 1 && target <= 10000))
++        *curve_why = "its targeted system display has no luminance of 1 to 10000 cd/m2";
++    else if (anchors < 0 || anchors > (m->application_version == 1 ? 9 : 15))
++        *curve_why = "more Bezier curve anchors than its application version allows";
++    else if (!value(w->knee_point_x, &kx) || !value(w->knee_point_y, &ky))
++        *curve_why = "a knee point out of its range";
++    if (*curve_why)
++        return true;
++    c.curve = true;
++    c.target = (float)target;
++    c.knee_x = (float)kx;
++    c.knee_y = (float)ky;
++    if (anchors == 0) {
++        /* (N = 1, B1(t) = t: the same curve of order 2, dvbridge_hdr10plus_map.h) */
++        c.anchors = 1;
++        c.anchor[0] = 0.5f;
++    } else {
++        c.anchors = (unsigned)anchors;
++        for (int i = 0; i < anchors; ++i) {
++            double a;
++            if (!value(w->bezier_curve_anchors[i], &a)) {
++                *curve_why = "a Bezier curve anchor out of its range";
++                return true;
++            }
++            c.anchor[i] = (float)a;
++        }
++    }
++    /* never going down (8.7.4 (2)): anchors that never go down are enough; else the curve itself is checked */
++    bool rising = c.anchor[0] >= 0;
++    for (unsigned i = 1; i < c.anchors; ++i)
++        rising = rising && c.anchor[i] >= c.anchor[i - 1];
++    rising = rising && c.anchor[c.anchors - 1] <= 1;
++    if (!rising) {
++        double before = dvbridge_hdr10plus_curve_at(&c, 0);
++        for (int i = 1; i <= 1024 && !*curve_why; ++i) {
++            const double now = dvbridge_hdr10plus_curve_at(&c, i / 1024.0);
++            if (now < before - 1e-9)
++                *curve_why = "a tone curve that goes down (ST 2094-40 8.7.4, equation (2))";
++            before = now;
++        }
++        if (*curve_why)
++            return true;
++    }
++    *out = c;
++    return true;
++}
++
+ void dvbridge_hdr10plus_units(const uint8_t *data, size_t size, int length_size,
+                               bool (*found)(const uint8_t *unit, size_t size, void *context), void *context)
+ {
+diff --git a/tools/dvbridge/dvbridge_hdr10plus.h b/tools/dvbridge/dvbridge_hdr10plus.h
+index 8b8b9c3..8ff4f5e 100644
+--- a/tools/dvbridge/dvbridge_hdr10plus.h
++++ b/tools/dvbridge/dvbridge_hdr10plus.h
+@@ -23,6 +23,8 @@
+ #include <libavutil/hdr_dynamic_metadata.h>
+ #include <libavutil/mastering_display_metadata.h>
+ 
++#include "dvbridge_hdr10plus_map.h"
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -115,6 +117,19 @@ const AVDOVIMetadata *dvbridge_hdr10plus_next_of(struct dvbridge_hdr10plus_scene
+                                                  const AVContentLightMetadata *light, size_t *size,
+                                                  bool *repeated, unsigned *of);
+ 
++/* Hades: the HDR10+ metadata of a picture that the bridge maps to a display itself, as the mapping takes them
++ * (dvbridge_hdr10plus_map.h), from those of processing window 0. false, and *out all 0, where there are no
++ * statistics to map by: no metadata or no window, an application version above 1 (ST 2094-40 9.1: 0 or 1), a
++ * value out of its range (8.3 to 8.5: [0, 1] of 10000 cd/m2), no brightest (every MaxSCL 0 and no last
++ * percentile above 0) or an average of maxRGB of 0; *why then says which (a fixed text). The tone curve is
++ * taken where the metadata carry one (tone_mapping_flag) that ST 2094-40 allows: a targeted system display of
++ * 1 to 10000 cd/m2 (7.1), at most 15 anchors and at most 9 in application version 1 (8.7.3), every value in
++ * [0, 1] (8.7.2, 8.7.3), and a curve that never goes down (the condition of 8.7.4, equation (2): f_N checked at
++ * 1025 points of s where its anchors go down anywhere). A curve that is not taken leaves the statistics
++ * (out->curve false) and *curve_why says why (NULL: there was none). why and curve_why may be NULL. */
++bool dvbridge_hdr10plus_plain(const AVDynamicHDRPlus *metadata, struct dvbridge_plain_hdr10plus *out,
++                              const char **why, const char **curve_why);
++
+ /* The units of an access unit (a length of length_size bytes before each, or start codes with 0), each to
+  * found(unit, size, context) from its header, until it returns false (dvbridge_rpu_units()): for the probe of a
+  * stream's HDR10+ metadata, which reads its SEI with Kodi's own parser. */
+diff --git a/tools/dvbridge/dvbridge_hdr10plus_map.h b/tools/dvbridge/dvbridge_hdr10plus_map.h
+new file mode 100644
+index 0000000..3c7618a
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_hdr10plus_map.h
+@@ -0,0 +1,74 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_HDR10PLUS_MAP_H
++#define DVBRIDGE_HDR10PLUS_MAP_H
++/* Hades: the HDR10+ metadata (SMPTE ST 2094-40:2020) of a picture that the bridge maps to a display itself
++ * (dvbridge_render_plain() with a mapping on: an HDR10+ video adapted to the display, or mapped to SDR), as
++ * dvbridge_hdr10plus_plain() takes them from FFmpeg's. Header-only and with no libplacebo or FFmpeg, so that
++ * the renderer's header and the host tests include it.
++ *
++ * What the mapping does with them (dvbridge_render.c, map_to_display()):
++ *  - the statistics: the scene's brightest is the highest MaxSCL (8.3), or, where every MaxSCL is 0, the last
++ *    percentile of maxRGB (8.5), as ST 2094-40 Annex B.3 normalizes a picture; the curve maps from that
++ *    brightest, not from the peak of the mastering display, so that a scene that the display can show goes out
++ *    as mastered and a bright one is compressed by what it holds. The average of maxRGB (8.4) is the scene's
++ *    average.
++ *  - the tone curve (8.7: the knee point and the Bezier curve anchors, for a display of
++ *    TargetedSystemDisplayMaximumLuminance, 7.1), where the picture carries one: the picture is mapped by it,
++ *    with libplacebo's pl_tone_map_st2094_40, which is the curve of 8.7.4 on the maxRGB of each pixel
++ *    normalized as B.3 (B.4.2: the same gain on the three components), its 1.0 the target. On a display of
++ *    the target's peak that is the curve as the studio made it. On a display of another peak the standard
++ *    defines no adaptation (B.4.1 leaves it to the device); libplacebo's moves the curve towards the identity
++ *    as the display's peak goes up towards the scene's brightest (a scene that fits is not mapped) and towards
++ *    a clip as it goes down.
++ */
++#include <math.h>
++#include <stdbool.h>
++
++#define DVBRIDGE_HDR10PLUS_ANCHORS_MAX 15
++
++struct dvbridge_plain_hdr10plus {
++    /* usable statistics of processing window 0 (dvbridge_hdr10plus_plain()); false, and every value 0, for
++     * none: the picture is mapped by its static HDR10 metadata, as before, bit for bit */
++    bool present;
++    float scene_max[3]; /* the brightest of each component, cd/m2 (MaxSCL; see above where it is 0) */
++    float scene_avg;    /* the average of maxRGB, cd/m2 */
++    /* a usable tone curve: the picture is mapped by it */
++    bool curve;
++    float target; /* cd/m2: the display the curve is for */
++    float knee_x, knee_y;
++    /* the anchors P1..P(N-1) of 8.7.4. A curve of order 1 (no anchors: N = 1, B1(t) = t) is given as the same
++     * curve of order 2, whose one anchor is 0.5 (2t(1-t) 0.5 + t^2 = t): libplacebo takes a curve without
++     * anchors for no curve at all */
++    unsigned anchors;
++    float anchor[DVBRIDGE_HDR10PLUS_ANCHORS_MAX];
++};
++
++/* The tone mapping function f_N(s) of ST 2094-40 8.7.4, equations (1) to (5), on s in [0, 1] (0 below, 1
++ * above), in double precision: for the check of a curve before it is used (dvbridge_hdr10plus_plain()). */
++static inline double dvbridge_hdr10plus_curve_at(const struct dvbridge_plain_hdr10plus *h, double s)
++{
++    s = s < 0 ? 0 : s > 1 ? 1 : s;
++    const double kx = h->knee_x, ky = h->knee_y;
++    if (kx >= 1)
++        return ky * s; /* (5) */
++    if (kx > 0 && s < kx)
++        return ky / kx * s; /* (4), the linear part */
++    const unsigned n = h->anchors + 1;
++    const double t = kx > 0 ? (s - kx) / (1 - kx) : s;
++    /* B_N(t) = sum over k of C(N, k) t^k (1 - t)^(N - k) P_k, with P_0 = 0 and P_N = 1 */
++    double b = 0, c = 1; /* c: C(N, k) */
++    for (unsigned k = 0; k <= n; ++k) {
++        const double p = k == 0 ? 0.0 : k == n ? 1.0 : (double)h->anchor[k - 1];
++        b += c * pow(t, (double)k) * pow(1 - t, (double)(n - k)) * p;
++        c = c * (double)(n - k) / (double)(k + 1);
++    }
++    return ky + (1 - ky) * b; /* (3), (4) */
++}
++
++#endif
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 00650be..1fe8691 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -40,6 +40,8 @@ enum {
+     NOTE_TRIM_IDENTITY = 2048,
+     NOTE_TRIM_NONE = 4096,
+     NOTE_TRIM_FAILED = 8192,
++    NOTE_HDR10PLUS_CURVE = 16384,
++    NOTE_HDR10PLUS_STATISTICS = 32768,
+ };
+ 
+ /* Hades: the bridge's own passes that are timed (dvbridge_render_time_passes()), each with a few
+@@ -634,6 +636,9 @@ static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hd
+                            struct pl_color_space *source, struct pl_color_space *target,
+                            struct pl_color_map_params *params,
+                            const struct dvbridge_level1 *level1);
++static void map_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                          struct pl_color_space *source, struct pl_color_map_params *params,
++                          const struct dvbridge_plain_hdr10plus *h);
+ static const struct dvbridge_level1 *level1_noted(struct dvbridge_renderer *r, const void *metadata,
+                                                   size_t bytes, struct dvbridge_level1 *level1);
+ static bool trim_prepare(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
+@@ -768,6 +773,8 @@ bool dvbridge_render_take_notes(struct dvbridge_renderer *r, struct dvbridge_ren
+     notes->trim_identity = r->fresh & NOTE_TRIM_IDENTITY;
+     notes->trim_none = r->fresh & NOTE_TRIM_NONE;
+     notes->trim_failed = r->fresh & NOTE_TRIM_FAILED;
++    notes->hdr10plus_curve = r->fresh & NOTE_HDR10PLUS_CURVE;
++    notes->hdr10plus_statistics = r->fresh & NOTE_HDR10PLUS_STATISTICS;
+     r->fresh = 0;
+     return true;
+ }
+@@ -2221,6 +2228,63 @@ bool dvbridge_render_gamut_made(const struct dvbridge_renderer *r, struct dvbrid
+     return true;
+ }
+ 
++/* Hades: the mapping of a plain picture (map_to_display(), already made) guided by its HDR10+ metadata
++ * (dvbridge_plain::hdr10plus; dvbridge_hdr10plus_map.h says what this does and why). libplacebo is given the
++ * statistics as HDR10+ dynamic metadata and told to map by them (PL_HDR_METADATA_HDR10PLUS): it takes the
++ * scene's brightest as the brightest of the three MaxSCL (pl_shader_color_map_ex(): the tone curve covers the
++ * channel values, not only their luminance) and the average from the average of maxRGB; the static HDR10
++ * metadata are no longer what the curve maps from (the gamut of the mastering display still bounds the
++ * colours). With a tone curve, the curve of the mapping is the picture's own (pl_tone_map_st2094_40, its
++ * Bezier curve given as the reference OOTF); without one, the curve of the mapping (BT.2390 or the spline) from
++ * that brightest. Nothing changes for a picture without them: the same parameters as before, bit for bit. The
++ * table of the curve (in PQ, libplacebo's: 1024 entries for the picture's own curve, below, else 256) is made
++ * again only where the metadata change, once a scene, not for each frame (pl_tone_map_params_equal()); the gamut
++ * table does not depend on them. */
++static void map_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                          struct pl_color_space *source, struct pl_color_map_params *params,
++                          const struct dvbridge_plain_hdr10plus *h)
++{
++    if (!h || !h->present)
++        return;
++    /* The brightest is given in all three components. libplacebo takes the range of the curve as the luminance
++     * of the three (CIE Y) before it raises it to the highest of them, and caps the peak of the output by the
++     * former (pl_tone_map_params_infer(), pl_shader_color_map_ex()): a display brighter than that luminance was
++     * mapped to it. Measured on the software bridge with MaxSCL 1783, 1689.5 and 1425.2 cd/m2 on a display of
++     * 1783: its peak came out at 1698 (the luminance of the three), every picture 5 % darker, where nothing is
++     * to be mapped; a saturated scene (MaxSCL 1000, 200, 100: 404) would have gone out at less than half of a
++     * display of 1000 that holds it. The highest of the three is what ST 2094-40 B.3 normalizes by, and what
++     * libplacebo's curve is applied to (the maxRGB of each pixel); the average of maxRGB is then the average of
++     * that same measure. */
++    float brightest = h->scene_max[0];
++    for (int i = 1; i < 3; ++i)
++        brightest = h->scene_max[i] > brightest ? h->scene_max[i] : brightest;
++    for (int i = 0; i < 3; ++i)
++        source->hdr.scene_max[i] = brightest;
++    source->hdr.scene_avg = h->scene_avg;
++    params->metadata = PL_HDR_METADATA_HDR10PLUS;
++    const bool curve = h->curve && h->anchors >= 1 && h->anchors <= DVBRIDGE_HDR10PLUS_ANCHORS_MAX;
++    if (curve) {
++        source->hdr.ootf = (struct pl_hdr_bezier){
++            .target_luma = h->target, .knee_x = h->knee_x, .knee_y = h->knee_y,
++            .num_anchors = (uint8_t)h->anchors};
++        for (unsigned i = 0; i < h->anchors; ++i)
++            source->hdr.ootf.anchors[i] = h->anchor[i];
++        params->tone_mapping_function = &pl_tone_map_st2094_40;
++        /* the table of the curve at 1024 entries instead of 256: a Bezier curve with a knee is not one that 256
++         * entries interpolated linearly in PQ follow closely. Measured on the software bridge against the curve
++         * of ST 2094-40 computed exactly (a neutral ramp of every 10-bit code, 21 curves and displays): at
++         * most 0.10 to 2.55 codes of 12-bit PQ with 256 (the largest at a knee point), 0.04 to 0.56 with 1024;
++         * the mean 0.01 to 0.02 either way. The table is made once a scene; a frame costs the same. */
++        params->lut_size = 1024;
++    }
++    if (note(r, curve ? NOTE_HDR10PLUS_CURVE : NOTE_HDR10PLUS_STATISTICS)) {
++        r->notes.hdr10plus = *h;
++        r->notes.hdr10plus.curve = curve;
++        r->notes.hdr10plus_peak = m->peak;
++        r->notes.hdr10plus_sdr = m->target == DVBRIDGE_HDR10_TARGET_SDR;
++    }
++}
++
+ /* Hades: the trim pass of the metadata of a picture mapped to a display
+    (dvbridge_hdr10_mapping::trims): the pass
+  * to draw, or false: none (the picture is mapped as before, bit for bit). The log notes (once each
+@@ -2570,6 +2634,9 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         struct dvbridge_level1 level1;
+         map_to_display(r, &r->hdr10_mapping, &image.color, &target.color, &mapping,
+                        level1_noted(r, metadata, bytes, &level1));
++        /* Hades: a plain PQ picture with HDR10+ metadata: guided by them (dvbridge_hdr10plus_map.h) */
++        if (plain && !plain->hlg)
++            map_hdr10plus(r, &r->hdr10_mapping, &image.color, &mapping, &plain->hdr10plus);
+         params.color_map_params = &mapping;
+         if (!plain)
+             trim_prepare(r, &r->hdr10_mapping, metadata, bytes, &trim);
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 7641d82..5063429 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -12,6 +12,7 @@
+ #define DVBRIDGE_RENDER_H
+ #include <libplacebo/renderer.h>
+ #include "dvbridge_core.h"
++#include "dvbridge_hdr10plus_map.h"
+ #include "dvbridge_passtime.h"
+ #include "dvbridge_trims.h"
+ 
+@@ -88,6 +89,16 @@ struct dvbridge_render_notes {
+     bool trim_failed;
+     struct dvbridge_trim trim;
+     float trim_peak;
++    /* Hades: the first picture of the stream mapped by its HDR10+ metadata (dvbridge_plain::hdr10plus), once
++     * each: hdr10plus_curve, by its tone curve; hdr10plus_statistics, by the curve of the mapping from the
++     * scene's brightest of its statistics (a picture whose HDR10+ metadata carry no usable curve). hdr10plus:
++     * that picture's metadata, hdr10plus_peak the peak of the display it was mapped to (cd/m2; for SDR, the
++     * white), hdr10plus_sdr whether to SDR. */
++#define DVBRIDGE_RENDER_HDR10PLUS_NOTE 1
++    bool hdr10plus_curve, hdr10plus_statistics;
++    struct dvbridge_plain_hdr10plus hdr10plus;
++    float hdr10plus_peak;
++    bool hdr10plus_sdr;
+ };
+ /* false when there is nothing new since the last call */
+ bool dvbridge_render_take_notes(struct dvbridge_renderer *renderer, struct dvbridge_render_notes *notes);
+@@ -140,6 +151,12 @@ struct dvbridge_plain {
+     float min_luma;     /* ... and black */
+     float max_cll;      /* the content light levels, cd/m2 (0: not known) */
+     float max_fall;
++    /* Hades: the HDR10+ metadata of the picture, which guide its mapping to a display where it is mapped
++     * (dvbridge_hdr10plus_map.h; of a PQ picture only). All 0 (present false): none, and the picture is mapped
++     * by its static HDR10 metadata above, as before, bit for bit. Not read where the picture is drawn as it
++     * is (no mapping). */
++#define DVBRIDGE_RENDER_PLAIN_HDR10PLUS 1
++    struct dvbridge_plain_hdr10plus hdr10plus;
+ };
+ bool dvbridge_render_plain(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+                           const struct dvbridge_plain *plain, struct dvbridge_view view,
+-- 
+2.53.0
+

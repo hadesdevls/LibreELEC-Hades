@@ -1,0 +1,398 @@
+From 5ec5c33c6248fa02afc7c4fed6f7a6d860430777 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:39:55 +0000
+Subject: [PATCH] dvbridge: the tile mask of a GUI texture, made from the
+ texture itself
+
+For the composite of the GUI over HDR10 and HLG there is no packer of the source
+transport to make the tiles of pass 7. dvbridge_guimask makes the mask from the
+GUI texture: two small draws as pass 6 does them (4 x 4 texels for each fragment
+of a quarter of its size, then of that: about 8.8 million texel reads for a 4K
+texture, a little over half of what the whole quad of the composite reads and
+discards), the result read back into a pixel pack buffer with a fence and taken
+without waiting. A tile is marked where a texel of it, or of one of the eight
+tiles around it, has an alpha above 0, which covers every pixel whose bilinear
+sample can take such a texel (dvbridge_tiles.h says why the quad under glScissor
+rectangles of the mask is the same bytes). The GUI texture is read with its own
+nearest, clamped sampler object: texelFetch of a texture whose filter wants
+mipmaps reads nothing. GL state is saved and restored.
+
+Cost against saving. The mask is made once for a content of the GUI that stays
+for a frame; the first frame of a content whose GUI pass is left out asks for it.
+At 2 Hz updates of the player information a content lasts about 30 frames at 60
+Hz, and each frame after the mask comes back (one or two) draws about 5 to 20 %
+of the quad: the mask costs about half a quad, once, and saves most of a quad in
+each of about 28 frames.
+
+Host proof (outside the tree), perf_bridge with DV_SCISSOR_HDR: Kodi's own
+gles_gui_composite shaders, the ordinary projection and blend, 8-bit targets of
+3840x2160, 2560x1440, 1920x1080 and 1366x768 (not a multiple of 16), the whole
+quad and the quad under the rectangles of this mask over the same picture and a
+GUI with a gradient of alpha, lines of one pixel, single pixels at the corners
+and on tile edges, a noisy block and a block that ends on a tile edge, compared
+byte by byte: 0 pixels differ on llvmpipe and on zink over lavapipe at every
+size; with each rectangle one tile short, 2 or 3 differ at every size on both.
+---
+ tools/dvbridge/CMakeLists.txt     |   2 +-
+ tools/dvbridge/dvbridge_guimask.c | 285 ++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_guimask.h |  43 +++++
+ 3 files changed, 329 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_guimask.c
+ create mode 100644 tools/dvbridge/dvbridge_guimask.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 7d81c14..88cb18b 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -13,7 +13,7 @@ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ pkg_check_modules(DVVa REQUIRED IMPORTED_TARGET libva)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+-                                dvbridge_cache.c dvbridge_verify.c
++                                dvbridge_cache.c dvbridge_verify.c dvbridge_guimask.c
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+                                 dvbridge_measure.c dvbridge_measured.c
+                                 dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c)
+diff --git a/tools/dvbridge/dvbridge_guimask.c b/tools/dvbridge/dvbridge_guimask.c
+new file mode 100644
+index 0000000..51766b7
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_guimask.c
+@@ -0,0 +1,285 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: the tile mask of a GUI texture (dvbridge_guimask.h) */
++#include "dvbridge_guimask.h"
++#include "dvbridge_gl_pack.h"
++#include <GLES3/gl31.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define TILE 16
++
++/* 4 x 4 texels of what it reads for a fragment, the greatest of them: of the alpha of the GUI texture
++ * (from_alpha) to a quarter of its size, and of the red of that to the tiles. A texel beyond the texture
++ * is the last one of its row or column. (As pass 6 of the source packer does it.) */
++static const char VERTEX[] =
++    "#version 300 es\n"
++    "void main()\n"
++    "{\n"
++    "    vec2 position = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
++    "    gl_Position = vec4(position * 2.0 - 1.0, 0.0, 1.0);\n"
++    "}\n";
++static const char FRAGMENT[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "precision highp int;\n"
++    "uniform highp sampler2D gui;\n"
++    "uniform ivec2 gui_size;\n"
++    "uniform int from_alpha;\n"
++    "out vec4 color;\n"
++    "void main()\n"
++    "{\n"
++    "    ivec2 b0 = ivec2(gl_FragCoord.xy) * 4;\n"
++    "    ivec2 last = gui_size - 1;\n"
++    "    float most = 0.0;\n"
++    "    for (int y = 0; y < 4; ++y)\n"
++    "        for (int x = 0; x < 4; ++x) {\n"
++    "            vec4 t = texelFetch(gui, min(b0 + ivec2(x, y), last), 0);\n"
++    "            most = max(most, from_alpha != 0 ? t.a : t.r);\n"
++    "        }\n"
++    "    color = vec4(most > 0.0 ? 1.0 : 0.0);\n"
++    "}\n";
++
++struct target {
++    GLuint texture, framebuffer;
++    int w, h;
++};
++
++struct dvbridge_guimask {
++    GLuint program, vao, sampler;
++    GLint gui, size, alpha;
++    struct target quarter, tiles;
++    GLuint buffer;
++    size_t buffer_bytes;
++    GLsync fence;
++    unsigned serial;
++    int cols, rows;
++};
++
++static GLuint compile(GLenum type, const char *source)
++{
++    const GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &source, NULL);
++    glCompileShader(s);
++    GLint ok = 0;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        glDeleteShader(s);
++        return 0;
++    }
++    return s;
++}
++
++struct dvbridge_guimask *dvbridge_guimask_create(void)
++{
++    dvbridge_gl_drain_errors();
++    struct dvbridge_guimask *m = calloc(1, sizeof(*m));
++    if (!m)
++        return NULL;
++    const GLuint vs = compile(GL_VERTEX_SHADER, VERTEX), fs = compile(GL_FRAGMENT_SHADER, FRAGMENT);
++    if (vs && fs) {
++        m->program = glCreateProgram();
++        glAttachShader(m->program, vs);
++        glAttachShader(m->program, fs);
++        glLinkProgram(m->program);
++        GLint ok = 0;
++        glGetProgramiv(m->program, GL_LINK_STATUS, &ok);
++        if (!ok) {
++            glDeleteProgram(m->program);
++            m->program = 0;
++        }
++    }
++    if (vs)
++        glDeleteShader(vs);
++    if (fs)
++        glDeleteShader(fs);
++    if (m->program) {
++        m->gui = glGetUniformLocation(m->program, "gui");
++        m->size = glGetUniformLocation(m->program, "gui_size");
++        m->alpha = glGetUniformLocation(m->program, "from_alpha");
++        glGenVertexArrays(1, &m->vao);
++        /* (nearest, no mipmaps, clamped: texelFetch of a texture whose own filter wants mipmaps reads
++         * nothing) */
++        glGenSamplers(1, &m->sampler);
++        glSamplerParameteri(m->sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glSamplerParameteri(m->sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glSamplerParameteri(m->sampler, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glSamplerParameteri(m->sampler, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    }
++    if (!m->program || m->gui < 0 || m->size < 0 || m->alpha < 0 || glGetError() != GL_NO_ERROR) {
++        dvbridge_guimask_destroy(m);
++        dvbridge_gl_drain_errors();
++        return NULL;
++    }
++    return m;
++}
++
++static void target_destroy(struct target *t)
++{
++    if (t->framebuffer)
++        glDeleteFramebuffers(1, &t->framebuffer);
++    if (t->texture)
++        glDeleteTextures(1, &t->texture);
++    memset(t, 0, sizeof(*t));
++}
++
++void dvbridge_guimask_destroy(struct dvbridge_guimask *m)
++{
++    if (!m)
++        return;
++    if (m->fence)
++        glDeleteSync(m->fence);
++    target_destroy(&m->quarter);
++    target_destroy(&m->tiles);
++    glDeleteBuffers(1, &m->buffer);
++    glDeleteSamplers(1, &m->sampler);
++    glDeleteVertexArrays(1, &m->vao);
++    glDeleteProgram(m->program);
++    free(m);
++}
++
++static bool target_make(struct target *t, int w, int h)
++{
++    if (t->texture && t->w == w && t->h == h)
++        return true;
++    target_destroy(t);
++    glGenTextures(1, &t->texture);
++    glBindTexture(GL_TEXTURE_2D, t->texture);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, w, h);
++    glGenFramebuffers(1, &t->framebuffer);
++    glBindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++        target_destroy(t);
++        return false;
++    }
++    t->w = w;
++    t->h = h;
++    return true;
++}
++
++bool dvbridge_guimask_request(struct dvbridge_guimask *m, unsigned gui, int width, int height,
++                              unsigned serial)
++{
++    if (!m || !gui || m->fence || width < TILE || height < TILE || width > 8192 || height > 4608)
++        return false;
++    const int qw = (width + 3) / 4, qh = (height + 3) / 4;
++    const int cols = (qw + 3) / 4, rows = (qh + 3) / 4;
++    dvbridge_gl_drain_errors();
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    GLint pack = 0, alignment = 4;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
++    static const GLenum caps[] = {GL_BLEND, GL_DEPTH_TEST, GL_STENCIL_TEST, GL_SCISSOR_TEST,
++        GL_DITHER, GL_CULL_FACE, GL_RASTERIZER_DISCARD, GL_SAMPLE_ALPHA_TO_COVERAGE,
++        GL_SAMPLE_COVERAGE};
++    for (unsigned i = 0; i < sizeof(caps) / sizeof(*caps); ++i)
++        glDisable(caps[i]);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    bool ok = target_make(&m->quarter, qw, qh) && target_make(&m->tiles, cols, rows);
++    const size_t bytes = (size_t)cols * rows * 4;
++    if (ok && (!m->buffer || m->buffer_bytes < bytes)) {
++        if (!m->buffer)
++            glGenBuffers(1, &m->buffer);
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, m->buffer);
++        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)bytes, NULL, GL_STREAM_READ);
++        m->buffer_bytes = bytes;
++    }
++    if (ok) {
++        glUseProgram(m->program);
++        glBindVertexArray(m->vao);
++        glActiveTexture(GL_TEXTURE0);
++        glBindSampler(0, m->sampler);
++        glUniform1i(m->gui, 0);
++        /* the GUI texture to a quarter of its size */
++        glBindFramebuffer(GL_FRAMEBUFFER, m->quarter.framebuffer);
++        glViewport(0, 0, qw, qh);
++        glBindTexture(GL_TEXTURE_2D, gui);
++        glUniform2i(m->size, width, height);
++        glUniform1i(m->alpha, 1);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        /* ... and that to the tiles */
++        glBindFramebuffer(GL_FRAMEBUFFER, m->tiles.framebuffer);
++        glViewport(0, 0, cols, rows);
++        glBindTexture(GL_TEXTURE_2D, m->quarter.texture);
++        glUniform2i(m->size, qw, qh);
++        glUniform1i(m->alpha, 0);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        /* (RGBA and unsigned bytes: what every implementation reads from an 8-bit target) */
++        glBindBuffer(GL_PIXEL_PACK_BUFFER, m->buffer);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadPixels(0, 0, cols, rows, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++        m->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush();
++        glPixelStorei(GL_PACK_ALIGNMENT, alignment);
++        ok = m->fence && glGetError() == GL_NO_ERROR;
++    }
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    dvbridge_gl_state_restore(&state);
++    if (!ok) {
++        if (m->fence)
++            glDeleteSync(m->fence);
++        m->fence = NULL;
++        dvbridge_gl_drain_errors();
++        return false;
++    }
++    m->serial = serial;
++    m->cols = cols;
++    m->rows = rows;
++    return true;
++}
++
++int dvbridge_guimask_poll(struct dvbridge_guimask *m, uint8_t *tiles, unsigned *columns,
++                          unsigned *rows, unsigned *serial)
++{
++    if (!m || !m->fence)
++        return -1;
++    const GLenum waited = glClientWaitSync(m->fence, 0, 0);
++    if (waited == GL_TIMEOUT_EXPIRED)
++        return 0;
++    glDeleteSync(m->fence);
++    m->fence = NULL;
++    if (waited != GL_ALREADY_SIGNALED && waited != GL_CONDITION_SATISFIED)
++        return -1;
++    GLint pack = 0;
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, m->buffer);
++    const uint8_t *d = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)m->cols * m->rows * 4,
++                                        GL_MAP_READ_BIT);
++    bool ok = d != NULL && tiles != NULL;
++    if (ok) {
++        /* the tiles with something drawn, and the eight around each (what a bilinear sample can take) */
++        const int cols = m->cols, rws = m->rows;
++        memset(tiles, 0, (size_t)cols * rws);
++        for (int y = 0; y < rws; ++y)
++            for (int x = 0; x < cols; ++x) {
++                if (d[4 * (y * cols + x)] <= 127)
++                    continue;
++                for (int dy = -1; dy <= 1; ++dy)
++                    for (int dx = -1; dx <= 1; ++dx) {
++                        const int xx = x + dx, yy = y + dy;
++                        if (xx >= 0 && xx < cols && yy >= 0 && yy < rws)
++                            tiles[yy * cols + xx] = 1;
++                    }
++            }
++    }
++    if (d)
++        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack);
++    if (!ok)
++        return -1;
++    if (columns)
++        *columns = (unsigned)m->cols;
++    if (rows)
++        *rows = (unsigned)m->rows;
++    if (serial)
++        *serial = m->serial;
++    return 1;
++}
+diff --git a/tools/dvbridge/dvbridge_guimask.h b/tools/dvbridge/dvbridge_guimask.h
+new file mode 100644
+index 0000000..deba5ab
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_guimask.h
+@@ -0,0 +1,43 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: the tile mask of a GUI texture, made from the texture itself, for the composite of Kodi's GUI
++ * over HDR10 or HLG video (where no packer of the source transport makes the tiles of pass 7:
++ * dvbridge_source_tiles_request()).
++ *
++ * A tile of 16 x 16 texels is marked where a texel of it, or of one of the eight tiles around it, has an
++ * alpha above 0. The composite of the GUI draws a fragment only where the bilinear sample of the texture
++ * at the centre of its pixel has an alpha above 0; with the texture and the window of one size the sample
++ * of a pixel takes the texels around its own, so a pixel can be drawn only in a tile with such a texel
++ * within a tile: the mask holds every tile where the composite can draw (dvbridge_tiles.h says why that
++ * makes the quad under glScissor rectangles of it the same bytes).
++ *
++ * The cost is two small draws of the GUI texture (4 x 4 texels for each fragment of a quarter of its
++ * size, then of that) and the read-back of the result (60 x 34 .. 240 x 135 bytes), once for a content of
++ * the texture. The read is not waited for: a fence. All calls on the GL context of the texture, GLES 3. */
++#ifndef DVBRIDGE_GUIMASK_H
++#define DVBRIDGE_GUIMASK_H
++#include <stdbool.h>
++#include <stdint.h>
++
++struct dvbridge_guimask;
++
++/* NULL where the programs cannot be made (not a GLES 3 context) */
++struct dvbridge_guimask *dvbridge_guimask_create(void);
++void dvbridge_guimask_destroy(struct dvbridge_guimask *mask);
++/* The most tiles a mask has (a texture of up to 8192 x 4608 texels) */
++#define DVBRIDGE_GUIMASK_TILES_MAX (512u * 288u)
++/* Asks for the mask of the texture gui (width x height texels, 16 to 8192 by 16 to 4608), tagged serial.
++ * false where it cannot be asked for (the size, a request still waiting, GL errors). */
++bool dvbridge_guimask_request(struct dvbridge_guimask *mask, unsigned gui, int width, int height,
++                              unsigned serial);
++/* 1: it is back: tiles holds columns x rows bytes (0 or 1, row 0 the first row of the texture), with the
++ * tiles around those with something drawn already marked, and the serial of its request; 0: not back yet;
++ * -1: nothing waits, or the request was lost. tiles: DVBRIDGE_GUIMASK_TILES_MAX bytes. */
++int dvbridge_guimask_poll(struct dvbridge_guimask *mask, uint8_t *tiles, unsigned *columns,
++                          unsigned *rows, unsigned *serial);
++#endif
+-- 
+2.53.0
+

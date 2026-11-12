@@ -1,0 +1,183 @@
+From 49e7d2d725f19362d6faebee71f82c3f3c256959 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 00:33:40 +0000
+Subject: [PATCH] VAAPI: with nvidia-vaapi-driver the surface given back last
+ goes out first
+
+nvidia-vaapi-driver gives each surface that is decoded into an image of
+its own in video memory (about 24 MB for 2160p in p010) and keeps it while
+the surface lives. CVideoSurfaces handed its surfaces out in turn, so every
+one of them got one: 28 for HEVC, about 680 MB, which with the rest of a
+profile 7 film was more than a 2 GB GT 1030 has (1247 failed exports of the
+base layer in 46 s of one diagnostic). With that driver the surface given
+back last now goes out first, and only as many get an image as are held at
+once. Other drivers allocate a surface when it is made, and keep the order
+they had.
+
+The driver does not wait, when a surface is decoded into again on the same
+decoder, for the copy of its last picture into its image (nvBeginPicture()).
+A surface handed out right after it was given back can still have that copy
+pending, so FFGetBuffer() syncs it first; that returns at once when nothing
+is pending.
+
+A surface given back at once is decoded into at once, so whatever the GPU
+still reads of its picture has to be fenced. A drawn frame is
+(AfterRenderHook() after Render()); a picture measured ahead of its
+presentation (HDR10 measured as Dolby Vision, MeasureAhead()) was not: its
+planes are read on the GPU after the measurement is sent, and one dropped
+as late kept the fence of an earlier frame and was given back at once. The
+measurement now sets the fence of its buffer too. And when the decoder
+closes, kodi.log says how many surfaces it handed out so and how many of
+them waited more than 0.1 ms in that sync, to see on the hardware whether
+the wait ever happens.
+---
+ .../VideoPlayer/DVDCodecs/Video/VAAPI.cpp     | 47 ++++++++++++++++++-
+ .../cores/VideoPlayer/DVDCodecs/Video/VAAPI.h |  8 ++++
+ .../HwDecRender/RendererVAAPIGLES.cpp         |  6 +++
+ 3 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+index 17d9b55..7205a13 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.cpp
+@@ -26,8 +26,10 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <mutex>
+ #include <optional>
++#include <string_view>
+ #ifdef HAVE_DVBRIDGE
+ #include "DVDVideoCodecFFmpeg.h"
+ #endif
+@@ -388,8 +390,11 @@ VASurfaceID CVideoSurfaces::GetFree(VASurfaceID surf)
+ 
+   if (!m_freeSurfaces.empty())
+   {
+-    VASurfaceID freeSurf = m_freeSurfaces.front();
+-    m_freeSurfaces.pop_front();
++    VASurfaceID freeSurf = m_reuseLast ? m_freeSurfaces.back() : m_freeSurfaces.front();
++    if (m_reuseLast)
++      m_freeSurfaces.pop_back();
++    else
++      m_freeSurfaces.pop_front();
+     m_state[freeSurf] = SURFACE_USED_FOR_REFERENCE;
+     return freeSurf;
+   }
+@@ -397,6 +402,12 @@ VASurfaceID CVideoSurfaces::GetFree(VASurfaceID surf)
+   return VA_INVALID_SURFACE;
+ }
+ 
++void CVideoSurfaces::SetReuseLast(bool last)
++{
++  std::unique_lock lock(m_section);
++  m_reuseLast = last;
++}
++
+ VASurfaceID CVideoSurfaces::GetAtIndex(int idx)
+ {
+   if ((size_t) idx >= m_state.size())
+@@ -832,6 +843,15 @@ void CDecoder::Close()
+ 
+   std::unique_lock lock(m_DecoderSection);
+ 
++  // Hades: what the sync of a surface handed out again found (FFGetBuffer())
++  if (m_reuseLast && m_reuseHanded)
++    CLog::Log(LOGINFO,
++              "VAAPI: the surface given back last went out first (nvidia-vaapi-driver): {} of {} "
++              "surfaces handed out waited more than 0.1 ms in their sync before they were decoded "
++              "into (the copy of their last picture was still pending)",
++              m_reuseWaited, m_reuseHanded);
++  m_reuseHanded = m_reuseWaited = 0;
++
+   FiniVAAPIOutput();
+ 
+   m_deviceRef.reset();
+@@ -918,6 +938,20 @@ int CDecoder::FFGetBuffer(AVCodecContext *avctx, AVFrame *pic, int flags)
+ 
+   va->m_getBufferError = 0;
+ 
++  // Hades: nvidia-vaapi-driver does not wait, when a surface is decoded into again on the same
++  // decoder, for the copy of its last picture into its image (nvBeginPicture()); that copy can then
++  // end after the new picture began. A surface handed out right after it was given back can still
++  // have it pending (a picture dropped after a seek), so it is waited for here.
++  if (va->m_reuseLast)
++  {
++    const auto syncStart = std::chrono::steady_clock::now();
++    vaSyncSurface(va->m_vaapiConfig.dpy, surf);
++    // (a wait of more than a tenth of a millisecond: a copy was pending; told in Close())
++    ++va->m_reuseHanded;
++    if (std::chrono::steady_clock::now() - syncStart > std::chrono::microseconds(100))
++      ++va->m_reuseWaited;
++  }
++
+   pic->data[1] = pic->data[2] = NULL;
+   pic->data[0] = (uint8_t*)(uintptr_t)surf;
+   pic->data[3] = (uint8_t*)(uintptr_t)surf;
+@@ -1311,6 +1345,15 @@ bool CDecoder::ConfigVAAPI()
+   {
+     m_videoSurfaces.AddSurface(surfaces[i]);
+   }
++  // Hades: nvidia-vaapi-driver gives each surface that is decoded into an image of its own in
++  // video memory (about 24 MB for 2160p in p010) and keeps it while the surface lives. Handed
++  // out in turn, every surface got one: 28 of them for HEVC with its DPB, which a 2 GB card has
++  // no room for beside the rest of a profile 7 film. Handed out last given back first, only as
++  // many get one as are held at once. Other drivers allocate a surface when it is made: nothing
++  // changes for them.
++  const char* vendor = vaQueryVendorString(m_vaapiConfig.dpy);
++  m_reuseLast = vendor && std::string_view(vendor).find("NVDEC") != std::string_view::npos;
++  m_videoSurfaces.SetReuseLast(m_reuseLast);
+ 
+   // initialize output
+   std::unique_lock lock(CServiceBroker::GetWinSystem()->GetGfxContext());
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
+index 682eb74..aee4811 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/VAAPI.h
+@@ -407,10 +407,13 @@ public:
+   bool HasFree();
+   bool HasRefs();
+   int NumFree();
++  //! Hades: GetFree() hands out the surface given back last instead of the one given back first
++  void SetReuseLast(bool last);
+ protected:
+   std::map<VASurfaceID, int> m_state;
+   std::list<VASurfaceID> m_freeSurfaces;
+   CCriticalSection m_section;
++  bool m_reuseLast = false;
+ };
+ 
+ //-----------------------------------------------------------------------------
+@@ -598,6 +601,11 @@ protected:
+   bool m_vaapiConfigured;
+   CVaapiConfig  m_vaapiConfig;
+   CVideoSurfaces m_videoSurfaces;
++  //! Hades: surfaces go out last given back first, each synced as it goes out (ConfigVAAPI())
++  bool m_reuseLast = false;
++  //! Hades: ... the surfaces handed out so, and those whose sync waited (Close())
++  unsigned int m_reuseHanded = 0;
++  unsigned int m_reuseWaited = 0;
+   int m_getBufferError;
+ 
+   COutput m_vaapiOutput;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index b4cdda4..52e7dca 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -361,6 +361,12 @@ void CRendererVAAPIGLES::MeasureAhead(int idx)
+                       static_cast<int>(plane.texheight)};
+   }
+   window->DVMeasurePicture(layer);
++  // Hades: the GPU reads its planes for the measurement after this, whether or not the picture
++  // is drawn: one let go without being drawn (late) keeps its buffer, and so its surface, until
++  // that read is done (NeedBuffer()), as a drawn one does until its frame is (AfterRenderHook()
++  // after Render()). With nvidia-vaapi-driver a surface given back is decoded into again at once
++  // (CVideoSurfaces::SetReuseLast()).
++  AfterRenderHook(idx);
+ }
+ 
+ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
+-- 
+2.53.0
+

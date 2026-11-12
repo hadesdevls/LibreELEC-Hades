@@ -1,0 +1,383 @@
+From 886f132f75675d810875b485d4e8d1c5d3aee351 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:20:12 +0000
+Subject: [PATCH] VaapiEGL: the probe of the formats imports every layer as the
+ import of a picture does, with the modifier of its layout
+
+At start, CVaapi2Texture::TestInteropFormats() decides which VA formats
+the EGL interop offers: NV12 decides whether Kodi has a VAAPI renderer at
+all, P010 whether it takes 10-bit video (RendererVAAPIGLES::Register(),
+RendererVAAPIGL::Register()). Its probe, TestEsh(), made attributes of
+its own: of the first layer alone, without
+EGL_DMA_BUF_PLANE0_MODIFIER_LO/HI_EXT, and without the layout that the
+import gives packed 4:2:2 (ABGR16161616 at half width). Import() passed
+the modifier wherever EGL takes modifiers. With a driver that exports a
+layout other than linear (those of Intel and AMD can), the probe could fail where
+the import of a picture works, and Kodi was left without its VAAPI
+renderer, or without 10-bit video in it; or it could pass where the
+import does not (a chroma layer that EGL refuses). Import() also passed
+DRM_FORMAT_MOD_INVALID as a modifier, which is no layout but the
+driver's word that it gives none.
+
+One description of a layer is now made for both (DescribeLayer(),
+ImportAttributes()): its DRM format, the size of its picture (the chroma
+of 4:2:0 at half size, packed 4:2:2 at half width), its object, offset
+and pitch, and the modifier of its object where EGL takes modifiers
+(EGL_EXT_image_dma_buf_import_modifiers), DRM_FORMAT_MOD_LINEAR too.
+DRM_FORMAT_MOD_INVALID is never passed: the buffer is imported with the
+layout it has of its own. A layout with a modifier other than linear is
+not imported where EGL takes no modifiers, as the bridge decides
+(tools/dvbridge/dvbridge_dmabuf.c, make_planes()): the probe says so in
+kodi.log at WARNING and the format is not offered, the import says so at
+ERROR. The probe tries every layer of the surface. The index of the
+object of a layer is checked against the objects that the descriptor can
+hold too, and the probe closes the descriptors of those alone.
+
+The idea of probing with the exported modifier is CroqueMr's
+(libreelec-x86-DV, preview/rc4-update3, d332f0799c, "Probe VAAPI EGL
+surfaces with their exported DMA-BUF modifier"); written for this tree,
+with one description of the layer for the probe and the import.
+---
+ .../VideoRenderers/HwDecRender/VaapiEGL.cpp   | 286 +++++++++++-------
+ 1 file changed, 177 insertions(+), 109 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.cpp
+index 05b369e..c59286a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/VaapiEGL.cpp
+@@ -15,6 +15,8 @@
+ #include "platform/posix/utils/FileHandle.h"
+ 
+ #include <algorithm>
++#include <iterator>
++#include <optional>
+ 
+ #include <drm_fourcc.h>
+ #include <unistd.h>
+@@ -22,10 +24,132 @@
+ 
+ using namespace VAAPI;
+ 
++namespace
++{
++
++constexpr const char* MODIFIERS_EXTENSION = "EGL_EXT_image_dma_buf_import_modifiers";
++
++/*!
++ * \brief Hades: one layer of a VA surface exported as DRM PRIME (vaExportSurfaceHandle(), separate
++ *        layers of one plane each), as the EGL image of a picture of a given size takes it
++ *
++ * One description for the probe of the formats (CVaapi2Texture::TestEsh()) and for the import of
++ * each picture (CVaapi2Texture::Import()), so that a format is offered where its pictures import.
++ * The probe made attributes of its own: of the first layer alone, without the modifier of the
++ * surface, and without the layout that the import gives packed 4:2:2. With a driver that exports a
++ * layout other than linear, it could fail where the import works, and Kodi was left without its
++ * VAAPI renderer, or without 10-bit video in it (RendererVAAPIGLES::Register(),
++ * RendererVAAPIGL::Register()); or pass where the import does not.
++ */
++struct LayerImport
++{
++  EGLint fourcc = 0;
++  EGLint width = 0;
++  EGLint height = 0;
++  int fd = -1;
++  uint32_t offset = 0;
++  uint32_t pitch = 0;
++  uint64_t modifier = DRM_FORMAT_MOD_INVALID;
++};
++
++enum class LayerFault
++{
++  NONE,
++  PLANES, //!< the layer has more than one plane
++  OBJECT, //!< its plane names an object that the surface does not have
++  LAYERS, //!< the surface has a number of layers that is not imported (one or two are)
++};
++
++LayerFault DescribeLayer(const VADRMPRIMESurfaceDescriptor& surface,
++                         uint32_t layerNo,
++                         EGLint width,
++                         EGLint height,
++                         LayerImport& out)
++{
++  auto const& layer = surface.layers[layerNo];
++  if (layer.num_planes != 1)
++    return LayerFault::PLANES;
++  // Driver-supplied object_index is untrusted; reject OOB before indexing (Hades: of the objects
++  // that the descriptor can hold, too).
++  if (layer.object_index[0] >= surface.num_objects ||
++      layer.object_index[0] >= std::size(surface.objects))
++    return LayerFault::OBJECT;
++  if (surface.num_layers != 1 && surface.num_layers != 2)
++    return LayerFault::LAYERS;
++  auto const& object = surface.objects[layer.object_index[0]];
++
++  // Single-plane packed formats (YUY2, Y210/Y212/Y216) have one layer, bound to m_y: the DMA-BUF
++  // carries Y/Cb/Y/Cr (or wider) interleaved, and the shader (XBMC_Y210 in
++  // gles_yuv2rgb_basic.frag) decodes the packed layout. With two, the second is the chroma.
++  out.fourcc = static_cast<EGLint>(layer.drm_format);
++  out.width = width;
++  out.height = height;
++  if (surface.num_layers == 2 && layerNo == 1 &&
++      (surface.fourcc == VA_FOURCC_NV12 || surface.fourcc == VA_FOURCC_P010 ||
++       surface.fourcc == VA_FOURCC_P012 || surface.fourcc == VA_FOURCC_P016))
++  {
++    // Adjust w/h for 4:2:0 subsampling on UV plane
++    out.width = (width + 1) >> 1;
++    out.height = (height + 1) >> 1;
++  }
++
++  // Mesa Y210 / Y212 / Y216 import quirk: Mesa imports those DRM fourccs
++  // as a two-plane internal layout (RG_UNORM16 luma + RGBA16 chroma)
++  // whose chroma plane is only reachable via the samplerExternalOES NIR
++  // lowering pass. sampler2D sees only the luma plane (RG with B=0 and
++  // A=1), losing chroma. Re-import the same DMA-BUF as a flat
++  // ABGR16161616 texture at half width so sampler2D returns the four
++  // 16-bit slots Y0 / Cb / Y1 / Cr directly.
++  if (surface.fourcc == VA_FOURCC_Y210 || surface.fourcc == VA_FOURCC_Y212 ||
++      surface.fourcc == VA_FOURCC_Y216)
++  {
++    out.fourcc = DRM_FORMAT_ABGR16161616;
++    out.width = (out.width + 1) >> 1;
++  }
++
++  out.fd = object.fd;
++  out.offset = layer.offset[0];
++  out.pitch = layer.pitch[0];
++  out.modifier = object.drm_format_modifier;
++  return LayerFault::NONE;
++}
++
++/*!
++ * \brief The attributes of the EGL image of a layer
++ *
++ * The modifier of its object goes with them where EGL takes modifiers (MODIFIERS_EXTENSION), linear
++ * too. DRM_FORMAT_MOD_INVALID is no layout but the driver's word that it gives none: it is never
++ * passed as a modifier, and the buffer is imported with the layout it has of its own. A layout with
++ * a modifier other than linear where EGL takes no modifiers is not imported (nothing): EGL would
++ * take the buffer without its layout. The bridge decides the same
++ * (tools/dvbridge/dvbridge_dmabuf.c, make_planes()).
++ */
++std::optional<CEGLAttributes<8>> ImportAttributes(const LayerImport& layer, bool modifiers)
++{
++  if (!modifiers && layer.modifier != DRM_FORMAT_MOD_INVALID &&
++      layer.modifier != DRM_FORMAT_MOD_LINEAR)
++    return std::nullopt;
++
++  CEGLAttributes<8> attribs; // 6 static + 2 modifiers
++  attribs.Add({{EGL_LINUX_DRM_FOURCC_EXT, layer.fourcc},
++               {EGL_WIDTH, layer.width},
++               {EGL_HEIGHT, layer.height},
++               {EGL_DMA_BUF_PLANE0_FD_EXT, layer.fd},
++               {EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(layer.offset)},
++               {EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(layer.pitch)}});
++  if (modifiers && layer.modifier != DRM_FORMAT_MOD_INVALID)
++    attribs.Add(
++        {{EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, static_cast<EGLint>(layer.modifier & 0xffffffffu)},
++         {EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLint>(layer.modifier >> 32)}});
++  return attribs;
++}
++
++} // namespace
++
+ void CVaapi2Texture::Init(InteropInfo& interop)
+ {
+   m_interop = interop;
+-  m_hasPlaneModifiers = CEGLUtils::HasExtension(m_interop.eglDisplay, "EGL_EXT_image_dma_buf_import_modifiers");
++  m_hasPlaneModifiers = CEGLUtils::HasExtension(m_interop.eglDisplay, MODIFIERS_EXTENSION);
+ }
+ 
+ bool CVaapi2Texture::Import(CVaapiRenderPicture* pic)
+@@ -73,99 +197,43 @@ bool CVaapi2Texture::Import(CVaapiRenderPicture* pic)
+ 
+   for (uint32_t layerNo = 0; layerNo < surface.num_layers; layerNo++)
+   {
+-    int plane = 0;
+-    auto const& layer = surface.layers[layerNo];
+-    if (layer.num_planes != 1)
+-    {
+-      CLog::Log(LOGDEBUG,
+-                "CVaapi2Texture::Import: DRM-exported layer has {} planes - only 1 supported",
+-                layer.num_planes);
+-      return failImport();
+-    }
+-    // Driver-supplied object_index is untrusted; reject OOB before indexing.
+-    if (layer.object_index[plane] >= surface.num_objects)
+-    {
+-      CLog::Log(LOGERROR,
+-                "CVaapi2Texture::Import: layer {} plane {} object_index {} >= num_objects {}",
+-                layerNo, plane, layer.object_index[plane], surface.num_objects);
+-      return failImport();
+-    }
+-    auto const& object = surface.objects[layer.object_index[plane]];
+-
+-    MappedTexture* texture{};
+-    EGLint width{m_textureSize.Width()};
+-    EGLint height{m_textureSize.Height()};
+-
+-    switch (surface.num_layers)
++    // Hades: the layer as the probe of its format took it (DescribeLayer(), ImportAttributes())
++    LayerImport layer;
++    switch (DescribeLayer(surface, layerNo, m_textureSize.Width(), m_textureSize.Height(), layer))
+     {
+-      case 1:
+-        // Single-plane packed formats (YUY2, Y210/Y212/Y216). The DMA-BUF
+-        // carries Y/Cb/Y/Cr (or wider) interleaved; bind to m_y and leave
+-        // m_vu unused. The shader (XBMC_Y210 in gles_yuv2rgb_basic.frag)
+-        // decodes the packed layout.
+-        texture = &m_y;
++      case LayerFault::NONE:
+         break;
+-      case 2:
+-        switch (layerNo)
+-        {
+-          case 0:
+-            texture = &m_y;
+-            break;
+-          case 1:
+-            texture = &m_vu;
+-            if (surface.fourcc == VA_FOURCC_NV12 || surface.fourcc == VA_FOURCC_P010 ||
+-                surface.fourcc == VA_FOURCC_P012 || surface.fourcc == VA_FOURCC_P016)
+-            {
+-              // Adjust w/h for 4:2:0 subsampling on UV plane
+-              width = (width + 1) >> 1;
+-              height = (height + 1) >> 1;
+-            }
+-            break;
+-          default:
+-            failImport();
+-            throw std::logic_error("Impossible layer number");
+-        }
+-        break;
+-      default:
++      case LayerFault::PLANES:
++        CLog::Log(LOGDEBUG,
++                  "CVaapi2Texture::Import: DRM-exported layer has {} planes - only 1 supported",
++                  surface.layers[layerNo].num_planes);
++        return failImport();
++      case LayerFault::OBJECT:
++        CLog::Log(LOGERROR,
++                  "CVaapi2Texture::Import: layer {} plane {} object_index {} >= num_objects {}",
++                  layerNo, 0, surface.layers[layerNo].object_index[0], surface.num_objects);
++        return failImport();
++      case LayerFault::LAYERS:
+         CLog::Log(LOGDEBUG,
+                   "CVaapi2Texture::Import: DRM-exported surface {} layers - only 1 or 2 supported",
+                   surface.num_layers);
+         return failImport();
+     }
+ 
+-    // Mesa Y210 / Y212 / Y216 import quirk: Mesa imports those DRM fourccs
+-    // as a two-plane internal layout (RG_UNORM16 luma + RGBA16 chroma)
+-    // whose chroma plane is only reachable via the samplerExternalOES NIR
+-    // lowering pass. sampler2D sees only the luma plane (RG with B=0 and
+-    // A=1), losing chroma. Re-import the same DMA-BUF as a flat
+-    // ABGR16161616 texture at half width so sampler2D returns the four
+-    // 16-bit slots Y0 / Cb / Y1 / Cr directly.
+-    EGLint eglFourcc = static_cast<EGLint>(layer.drm_format);
+-    EGLint eglWidth = width;
+-    if (surface.fourcc == VA_FOURCC_Y210 || surface.fourcc == VA_FOURCC_Y212 ||
+-        surface.fourcc == VA_FOURCC_Y216)
++    const auto attribs = ImportAttributes(layer, m_hasPlaneModifiers);
++    if (!attribs)
+     {
+-      eglFourcc = DRM_FORMAT_ABGR16161616;
+-      eglWidth = (width + 1) >> 1;
+-    }
+-
+-    CEGLAttributes<8> attribs; // 6 static + 2 modifiers
+-    attribs.Add({{EGL_LINUX_DRM_FOURCC_EXT, eglFourcc},
+-                 {EGL_WIDTH, eglWidth},
+-                 {EGL_HEIGHT, height},
+-                 {EGL_DMA_BUF_PLANE0_FD_EXT, object.fd},
+-                 {EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(layer.offset[plane])},
+-                 {EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(layer.pitch[plane])}});
+-
+-    if (m_hasPlaneModifiers)
+-    {
+-      attribs.Add({{EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, static_cast<EGLint>(object.drm_format_modifier)},
+-        {EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLint>(object.drm_format_modifier >> 32)}});
++      CLog::Log(LOGERROR,
++                "CVaapi2Texture::Import: the surface has a layout of DRM format modifier {:#x}, "
++                "and EGL takes no modifiers ({}): not imported",
++                layer.modifier, MODIFIERS_EXTENSION);
++      return failImport();
+     }
+ 
+-    texture->eglImage = m_interop.eglCreateImageKHR(m_interop.eglDisplay,
+-      EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr,
+-      attribs.Get());
++    // (one layer: a packed format, bound to m_y and m_vu left unused; two: luma and chroma)
++    MappedTexture* texture = layerNo == 0 ? &m_y : &m_vu;
++    texture->eglImage = m_interop.eglCreateImageKHR(m_interop.eglDisplay, EGL_NO_CONTEXT,
++                                                    EGL_LINUX_DMA_BUF_EXT, nullptr, attribs->Get());
+     if (!texture->eglImage)
+     {
+       CEGLUtils::Log(LOGERROR, "Failed to import VA DRM surface into EGL image");
+@@ -386,37 +454,37 @@ bool CVaapi2Texture::TestEsh(VADisplay vaDpy, EGLDisplay eglDisplay, std::uint32
+ 
+   if (status == VA_STATUS_SUCCESS)
+   {
+-    auto const& layer = drmPrimeSurface.layers[0];
+-    if (layer.object_index[0] < drmPrimeSurface.num_objects)
++    // Hades: every layer of the surface, as Import() takes it (DescribeLayer(), ImportAttributes()):
++    // the probe imported the first layer alone, with attributes of its own
++    const bool modifiers = CEGLUtils::HasExtension(eglDisplay, MODIFIERS_EXTENSION);
++    result = drmPrimeSurface.num_layers > 0;
++    for (uint32_t layerNo = 0; result && layerNo < drmPrimeSurface.num_layers; layerNo++)
+     {
+-      auto const& object = drmPrimeSurface.objects[layer.object_index[0]];
+-      EGLint attribs[] = {EGL_LINUX_DRM_FOURCC_EXT,
+-                          static_cast<EGLint>(drmPrimeSurface.layers[0].drm_format),
+-                          EGL_WIDTH,
+-                          width,
+-                          EGL_HEIGHT,
+-                          height,
+-                          EGL_DMA_BUF_PLANE0_FD_EXT,
+-                          static_cast<EGLint>(object.fd),
+-                          EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+-                          static_cast<EGLint>(layer.offset[0]),
+-                          EGL_DMA_BUF_PLANE0_PITCH_EXT,
+-                          static_cast<EGLint>(layer.pitch[0]),
+-                          EGL_NONE};
+-
+-      EGLImageKHR eglImage =
+-          eglCreateImageKHR(eglDisplay, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attribs);
++      LayerImport layer;
++      const LayerFault fault = DescribeLayer(drmPrimeSurface, layerNo, width, height, layer);
++      if (fault == LayerFault::OBJECT)
++        CLog::Log(LOGERROR, "CVaapi2Texture::TestEsh: object_index {} >= num_objects {}",
++                  drmPrimeSurface.layers[layerNo].object_index[0], drmPrimeSurface.num_objects);
++      const auto attribs =
++          fault == LayerFault::NONE ? ImportAttributes(layer, modifiers) : std::nullopt;
++      if (fault == LayerFault::NONE && !attribs)
++        CLog::Log(LOGWARNING,
++                  "CVaapi2Texture::TestEsh: the surface of VA fourcc {:#010x} has a layout of DRM "
++                  "format modifier {:#x}, and EGL takes no modifiers ({}): not offered",
++                  static_cast<uint32_t>(pixelFormat), layer.modifier, MODIFIERS_EXTENSION);
++      EGLImageKHR eglImage = attribs
++                                 ? eglCreateImageKHR(eglDisplay, EGL_NO_CONTEXT,
++                                                     EGL_LINUX_DMA_BUF_EXT, nullptr, attribs->Get())
++                                 : EGL_NO_IMAGE_KHR;
+       if (eglImage)
+-      {
+         eglDestroyImageKHR(eglDisplay, eglImage);
+-        result = true;
+-      }
++      else
++        result = false;
+     }
+-    else
+-      CLog::Log(LOGERROR, "CVaapi2Texture::TestEsh: object_index {} >= num_objects {}",
+-                layer.object_index[0], drmPrimeSurface.num_objects);
+ 
+-    for (uint32_t object = 0; object < drmPrimeSurface.num_objects; object++)
++    for (uint32_t object = 0;
++         object < drmPrimeSurface.num_objects && object < std::size(drmPrimeSurface.objects);
++         object++)
+     {
+       close(drmPrimeSurface.objects[object].fd);
+     }
+-- 
+2.53.0
+

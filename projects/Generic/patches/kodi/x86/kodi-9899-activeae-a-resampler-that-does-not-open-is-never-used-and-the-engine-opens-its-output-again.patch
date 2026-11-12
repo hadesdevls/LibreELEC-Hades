@@ -1,0 +1,448 @@
+From eb1da48bcb4d7e33cc86c9be32b76aab30a99ebf Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:16:02 +0000
+Subject: [PATCH] ActiveAE: a resampler that does not open is never used, and
+ the engine opens its output again
+
+CActiveAEBufferPoolResample::ChangeResampler() dropped what
+CActiveAEResampleFFMPEG::Init() returned, and Create() always said it
+worked. A resampler that did not open was then used all the same: after
+a failed swr_alloc_set_opts2() (FFmpeg 9 refuses a channel layout of no
+channel there, and frees the context) GetBufferedSamples() went into
+swr_get_delay() with a null context, a SIGSEGV on the next pass of the
+engine; after a failed swr_init() (a sample rate of 0) the same call
+divided by that rate; and where neither happened, each Resample() that
+failed on it had the pool open it again, at every pass, with no sound.
+
+- CActiveAEResampleFFMPEG frees the context wherever Init() fails, and
+  Resample(), GetDelay() and GetBufferedSamples() do nothing without one
+  (-1, 0 and 0).
+- A pool says when its resampler did not open (ResamplerFailed(),
+  Create() returns false, and kodi.log names both formats), and passes
+  nothing on: neither resampled, nor its input as it is, which would be
+  another format than the pool's. It does not try again by itself.
+- CActiveAE::ResamplerFailed(), at the end of Configure() and in the
+  states that run the stages, treats a pool of the sink or of a stream
+  that did not open as a sink that did not open: the engine goes to
+  AE_TOP_ERROR, opens its output again after the retry interval it
+  already has, and makes every resampler anew. Draining before a
+  reconfiguration does not wait for a pool that drains nothing.
+  The player sees no sink meanwhile: it plays the video, drops the
+  sound of the stream as its time comes, and if that lasts it closes the
+  stream and says so on screen; without the stream the engine tries
+  again at once.
+- The other users of a resampler: the remapper of a stream whose
+  channels are not in FFmpeg's order is left out where it does not open
+  (the samples go on in the decoder's order, not as an empty packet); a
+  GUI sound whose resampler does not open stays silent once, instead of
+  being mixed with a count of -1; the sink's packet of silence with
+  noise is plain silence instead of what av_samples_alloc() left in it;
+  and paplayer fails the stream as for a format it cannot read.
+
+A resampler that opens works as before: the same samples, byte for byte.
+
+Reported by dangerouslaser.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp | 62 ++++++++++++++++---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.h   |  4 ++
+ .../Engines/ActiveAE/ActiveAEBuffer.cpp       | 38 ++++++++++--
+ .../Engines/ActiveAE/ActiveAEBuffer.h         |  4 ++
+ .../ActiveAE/ActiveAEResampleFFMPEG.cpp       | 14 +++++
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 18 ++++--
+ .../Engines/ActiveAE/ActiveAEStream.cpp       | 22 ++++++-
+ .../Engines/ActiveAE/ActiveAEStream.h         |  1 +
+ xbmc/cores/paplayer/VideoPlayerCodec.cpp      | 11 +++-
+ 9 files changed, 149 insertions(+), 25 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index 5535ccb..a6e6264 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -743,6 +743,14 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CActiveAEControlProtocol::TIMEOUT:
++          // (Hades: a resampler that did not open drains nothing, and waiting for it was for good)
++          if (ResamplerFailed())
++          {
++            m_state = AE_TOP_ERROR;
++            m_extTimeout = 500ms;
++            m_extDeferData = false;
++            return;
++          }
+           // drain
+           if (RunStages())
+           {
+@@ -1211,7 +1219,7 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CActiveAEControlProtocol::TIMEOUT:
+-          if (m_extError)
++          if (m_extError || ResamplerFailed()) // (Hades: ResamplerFailed())
+           {
+             m_state = AE_TOP_ERROR;
+             m_extTimeout = 100ms;
+@@ -1669,7 +1677,8 @@ void CActiveAE::Configure(AEAudioFormat *desiredFmt)
+ 
+   // resample buffers for sink
+   if (m_sinkBuffers &&
+-     (!CompareFormat(m_sinkBuffers->m_format,m_sinkFormat) ||
++     (m_sinkBuffers->ResamplerFailed() || // (Hades: ResamplerFailed())
++      !CompareFormat(m_sinkBuffers->m_format,m_sinkFormat) ||
+       !CompareFormat(m_sinkBuffers->m_inputFormat, sinkInputFormat) ||
+       m_sinkBuffers->m_format.m_frames != m_sinkFormat.m_frames))
+   {
+@@ -1703,6 +1712,33 @@ void CActiveAE::Configure(AEAudioFormat *desiredFmt)
+ 
+   ClearDiscardedBuffers();
+   m_extDrain = false;
++
++  // (Hades: every caller of Configure() goes to AE_TOP_ERROR on m_extError)
++  ResamplerFailed();
++}
++
++bool CActiveAE::ResamplerFailed()
++{
++  // Hades: a resampler that did not open passes nothing on. Its stream would have waited for good,
++  // in silence, or the engine would have ended on a SIGSEGV in libswresample (reported by
++  // dangerouslaser). As after a sink that did not open, the engine goes to AE_TOP_ERROR,
++  // opens its output again after its retry interval and makes every resampler anew. The player
++  // sees no sink meanwhile: it plays the video, drops the sound of the stream as its time comes,
++  // and if that lasts it closes the stream and says so (CVideoPlayerAudio::OutputPacket());
++  // without the stream (FREESTREAM) the engine tries again at once.
++  bool failed = m_sinkBuffers && m_sinkBuffers->ResamplerFailed();
++  for (const CActiveAEStream* stream : m_streams)
++    failed = failed ||
++             (stream->m_processingBuffers && stream->m_processingBuffers->ResamplerFailed());
++  if (!failed)
++    return false;
++
++  if (!m_extError)
++    CLog::Log(LOGERROR, "CActiveAE - a resampler did not open: the output is opened again, and "
++                        "every resampler is made anew");
++  m_sinkInitFailed = true;
++  m_extError = true;
++  return true;
+ }
+ 
+ CActiveAEStream* CActiveAE::CreateStream(MsgStreamNew *streamMsg)
+@@ -4516,9 +4552,15 @@ bool CActiveAE::ResampleSound(CActiveAESound *sound)
+   std::unique_ptr<IAEResample> resampler =
+       CAEResampleFactory::Create(AERESAMPLEFACTORY_QUICK_RESAMPLE);
+ 
+-  resampler->Init(dst_config, orig_config, false, true, M_SQRT1_2,
+-                  outChannels.Count() > 0 ? &outChannels : nullptr, m_settings.resampleQuality,
+-                  false, 0.0f);
++  // Hades: a sound whose resampler does not open is converted to no samples: it stays silent,
++  // once, instead of being mixed with a count of -1 (and converted again at each mix)
++  const bool opened =
++      resampler->Init(dst_config, orig_config, false, true, M_SQRT1_2,
++                      outChannels.Count() > 0 ? &outChannels : nullptr, m_settings.resampleQuality,
++                      false, 0.0f);
++  if (!opened)
++    CLog::Log(LOGERROR, "CActiveAE::{} - the resampler of a GUI sound did not open: it stays silent",
++              __FUNCTION__);
+ 
+   dst_samples = resampler->CalcDstSampleCount(sound->GetSound(true)->nb_samples,
+                                               m_internalFormat.m_sampleRate,
+@@ -4528,12 +4570,12 @@ bool CActiveAE::ResampleSound(CActiveAESound *sound)
+   if (!dst_buffer)
+     return false;
+ 
+-  int samples = resampler->Resample(dst_buffer, dst_samples,
+-                                    sound->GetSound(true)->data,
+-                                    sound->GetSound(true)->nb_samples,
+-                                    1.0);
++  int samples = opened ? resampler->Resample(dst_buffer, dst_samples,
++                                             sound->GetSound(true)->data,
++                                             sound->GetSound(true)->nb_samples, 1.0)
++                       : 0;
+ 
+-  sound->GetSound(false)->nb_samples = samples;
++  sound->GetSound(false)->nb_samples = std::max(samples, 0);
+ 
+   sound->SetConverted(true);
+   return true;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+index a15a96a..3ce109e 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+@@ -320,6 +320,10 @@ protected:
+   void Process() override;
+   void StateMachine(int signal, Protocol *port, Message *msg);
+   bool InitSink();
++  //! Hades: a resampler of the sink or of a stream did not open (CActiveAEBufferPoolResample::
++  //! ResamplerFailed()): the engine is set to open its output again, as after a sink that did not
++  //! open (m_sinkInitFailed, m_extError), which makes every resampler anew
++  bool ResamplerFailed();
+   bool SendYieldDevice(bool yield);
+   void DrainSink();
+   void UnconfigureSink();
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.cpp
+index c657dee..b4e7473 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.cpp
+@@ -14,11 +14,24 @@
+ #include "cores/AudioEngine/Utils/AEPackIEC61937.h"
+ #include "cores/AudioEngine/Utils/AEUtil.h"
+ #include "cores/AudioEngine/Utils/AudioSettingsLive.h"
++#include "utils/log.h"
+ 
+ #include <memory>
++#include <string>
+ 
+ using namespace ActiveAE;
+ 
++namespace
++{
++std::string SampleConfigText(const SampleConfig& config)
++{
++  const char* format = av_get_sample_fmt_name(config.fmt);
++  return std::to_string(config.channels) + " channels (layout " +
++         std::to_string(config.channel_layout) + "), " + (format ? format : "no format") + ", " +
++         std::to_string(config.sample_rate) + " Hz";
++}
++} // namespace
++
+ CSoundPacket::CSoundPacket(const SampleConfig& conf, int samples) : config(conf)
+ {
+   data = CActiveAE::AllocSoundSample(config, samples, bytes_per_sample, planes, linesize);
+@@ -166,7 +179,8 @@ bool CActiveAEBufferPoolResample::Create(
+   {
+     ChangeResampler();
+   }
+-  return true;
++  // Hades: and false where the resampler did not open (ChangeResampler())
++  return !m_resamplerFailed;
+ }
+ 
+ void CActiveAEBufferPoolResample::ChangeResampler()
+@@ -188,9 +202,18 @@ void CActiveAEBufferPoolResample::ChangeResampler()
+   srcConfig.bits_per_sample = CAEUtil::DataFormatToUsedBits(m_inputFormat.m_dataFormat);
+   srcConfig.dither_bits = CAEUtil::DataFormatToDitherBits(m_inputFormat.m_dataFormat);
+ 
+-  m_resampler->Init(dstConfig, srcConfig, m_stereoUpmix, m_normalize, m_centerMixLevel,
+-                    m_remap ? &m_format.m_channelLayout : nullptr, m_resampleQuality,
+-                    m_forceResampler, m_mixSubLevel);
++  // Hades: a resampler that did not open is never used: the input would go on in another format
++  // than the pool's (the samples of a stream into the sink as they are), or into libswresample
++  // without a context. The engine opens its output again (CActiveAE::ResamplerFailed()).
++  m_resamplerFailed = !m_resampler->Init(dstConfig, srcConfig, m_stereoUpmix, m_normalize,
++                                         m_centerMixLevel,
++                                         m_remap ? &m_format.m_channelLayout : nullptr,
++                                         m_resampleQuality, m_forceResampler, m_mixSubLevel);
++  if (m_resamplerFailed)
++    CLog::Log(LOGERROR,
++              "CActiveAEBufferPoolResample - the resampler from {} to {} did not open: nothing "
++              "goes through it",
++              SampleConfigText(srcConfig), SampleConfigText(dstConfig));
+ 
+   m_changeResampler = false;
+ }
+@@ -200,6 +223,10 @@ bool CActiveAEBufferPoolResample::ResampleBuffers(int64_t timestamp)
+   bool busy = false;
+   CSampleBuffer *in;
+ 
++  // (Hades: see ChangeResampler())
++  if (m_resamplerFailed)
++    return false;
++
+   if (!m_resampler)
+   {
+     if (m_changeResampler)
+@@ -421,7 +448,8 @@ void CActiveAEBufferPoolResample::Flush()
+     m_outputSamples.front()->Return();
+     m_outputSamples.pop_front();
+   }
+-  if (m_resampler)
++  // (Hades: one that did not open is made anew by the engine, not here: ChangeResampler())
++  if (m_resampler && !m_resamplerFailed)
+     ChangeResampler();
+ }
+ 
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h
+index 586eb43..92172ad 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h
+@@ -93,6 +93,9 @@ public:
+   void FillBuffer();
+   bool DoesNormalize() const;
+   void ForceResampler(bool force);
++  //! Hades: the resampler did not open (Init() failed): nothing goes through this pool, neither
++  //! resampled nor as it is, until it is made anew (CActiveAE::ResamplerFailed())
++  bool ResamplerFailed() const { return m_resamplerFailed; }
+   AEAudioFormat m_inputFormat;
+   std::deque<CSampleBuffer*> m_inputSamples;
+   std::deque<CSampleBuffer*> m_outputSamples;
+@@ -113,6 +116,7 @@ protected:
+   bool m_normalize = true;
+   float m_mixSubLevel = 0.0f;
+   bool m_changeResampler = false;
++  bool m_resamplerFailed = false;
+   bool m_forceResampler = false;
+   AEQuality m_resampleQuality;
+   bool m_stereoUpmix = false;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEResampleFFMPEG.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEResampleFFMPEG.cpp
+index d0f88c1..2885a1d 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEResampleFFMPEG.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEResampleFFMPEG.cpp
+@@ -138,6 +138,7 @@ bool CActiveAEResampleFFMPEG::Init(SampleConfig dstConfig,
+   if (ret)
+   {
+     CLog::Log(LOGERROR, "CActiveAEResampleFFMPEG::Init - create context failed");
++    swr_free(&m_pContext);
+     return false;
+   }
+ 
+@@ -149,6 +150,7 @@ bool CActiveAEResampleFFMPEG::Init(SampleConfig dstConfig,
+     if (swr_set_matrix(m_pContext, reinterpret_cast<const double*>(m_rematrix), AE_CH_MAX) < 0)
+     {
+       CLog::Log(LOGERROR, "CActiveAEResampleFFMPEG::Init - setting channel matrix failed");
++      swr_free(&m_pContext);
+       return false;
+     }
+   }
+@@ -189,6 +191,7 @@ bool CActiveAEResampleFFMPEG::Init(SampleConfig dstConfig,
+   if(swr_init(m_pContext) < 0)
+   {
+     CLog::Log(LOGERROR, "CActiveAEResampleFFMPEG::Init - init resampler failed");
++    swr_free(&m_pContext);
+     return false;
+   }
+   return true;
+@@ -196,6 +199,13 @@ bool CActiveAEResampleFFMPEG::Init(SampleConfig dstConfig,
+ 
+ int CActiveAEResampleFFMPEG::Resample(uint8_t **dst_buffer, int dst_samples, uint8_t **src_buffer, int src_samples, double ratio)
+ {
++  // Hades: an Init() that failed leaves no context (it is freed there): nothing is resampled, and
++  // nothing is buffered (GetDelay(), GetBufferedSamples()). Each of these used to go on with a null
++  // context, or one that swr_init() had refused, into libswresample: a SIGSEGV in swr_get_delay(),
++  // or a division by its sample rate of 0.
++  if (!m_pContext)
++    return -1;
++
+   if (ratio != 1.0)
+   {
+     // Compensation is in whole samples, and a ratio this close to 1, or a call
+@@ -294,11 +304,15 @@ int CActiveAEResampleFFMPEG::Resample(uint8_t **dst_buffer, int dst_samples, uin
+ 
+ int64_t CActiveAEResampleFFMPEG::GetDelay(int64_t base)
+ {
++  if (!m_pContext) // (Hades: see Resample())
++    return 0;
+   return swr_get_delay(m_pContext, base);
+ }
+ 
+ int CActiveAEResampleFFMPEG::GetBufferedSamples()
+ {
++  if (!m_pContext) // (Hades: see Resample())
++    return 0;
+   return av_rescale_rnd(swr_get_delay(m_pContext, m_src_rate),
+                                     m_dst_rate, m_src_rate, AV_ROUND_UP);
+ }
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index e8d9b38..8d863b1 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -1630,11 +1630,19 @@ void CActiveAESink::GenerateNoise()
+   srcConfig.bits_per_sample = CAEUtil::DataFormatToUsedBits(m_sinkFormat.m_dataFormat);
+   srcConfig.dither_bits = CAEUtil::DataFormatToDitherBits(m_sinkFormat.m_dataFormat);
+ 
+-  resampler->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, nullptr, AE_QUALITY_UNKNOWN, false,
+-                  0.0);
+-
+-  resampler->Resample(m_sampleOfSilence.pkt->data, m_sampleOfSilence.pkt->max_nb_samples,
+-                     (uint8_t**)&noise, m_sampleOfSilence.pkt->max_nb_samples, 1.0);
++  // Hades: where the resampler does not open, the packet is silence, as without noise: what
++  // av_samples_alloc() left in it was sent otherwise
++  if (resampler->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, nullptr, AE_QUALITY_UNKNOWN,
++                      false, 0.0))
++    resampler->Resample(m_sampleOfSilence.pkt->data, m_sampleOfSilence.pkt->max_nb_samples,
++                        (uint8_t**)&noise, m_sampleOfSilence.pkt->max_nb_samples, 1.0);
++  else
++  {
++    CLog::Log(LOGERROR, "CActiveAESink::{} - the resampler did not open: silence without noise",
++              __FUNCTION__);
++    av_samples_set_silence(m_sampleOfSilence.pkt->data, 0, m_sampleOfSilence.pkt->max_nb_samples,
++                           config.channels, config.fmt);
++  }
+ 
+   KODI::MEMORY::AlignedFree(noise);
+ }
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.cpp
+index 38edf3c..dd728b3 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.cpp
+@@ -144,9 +144,20 @@ void CActiveAEStream::InitRemapper()
+     srcConfig.bits_per_sample = CAEUtil::DataFormatToUsedBits(m_format.m_dataFormat);
+     srcConfig.dither_bits = CAEUtil::DataFormatToDitherBits(m_format.m_dataFormat);
+ 
+-    m_remapper->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, &remapLayout,
+-                     AE_QUALITY_LOW, // not used for remapping
+-                     false, 0.0f);
++    // Hades: one that does not open is not used: RemapBuffer() would put its empty packet in
++    // place of each one of the stream (silence, or what the packet held before). The samples go
++    // on in the order that the decoder gave them.
++    if (!m_remapper->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, &remapLayout,
++                          AE_QUALITY_LOW, // not used for remapping
++                          false, 0.0f))
++    {
++      CLog::Log(LOGERROR,
++                "CActiveAEStream::{} - the remapper did not open: the channels of the stream go "
++                "on in the order of its decoder",
++                __FUNCTION__);
++      m_remapper.reset();
++      return;
++    }
+ 
+     // extra sound packet, we can't resample to the same buffer
+     m_remapBuffer =
+@@ -797,6 +808,11 @@ bool CActiveAEStreamBuffers::HasWork()
+   return false;
+ }
+ 
++bool CActiveAEStreamBuffers::ResamplerFailed() const
++{
++  return m_resampleBuffers->ResamplerFailed();
++}
++
+ bool CActiveAEStreamBuffers::IsAtempoActive() const
+ {
+   return m_atempoBuffers && m_atempoBuffers->GetTempo() != 1.0f;
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+index a24b6c2..64516e9 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+@@ -131,6 +131,7 @@ public:
+   std::unique_ptr<CActiveAEBufferPool> GetAtempoBuffers();
+ 
+   bool IsAtempoActive() const;
++  bool ResamplerFailed() const; //!< Hades: CActiveAEBufferPoolResample::ResamplerFailed()
+ 
+   AEAudioFormat m_inputFormat;
+   std::deque<CSampleBuffer*> m_outputSamples;
+diff --git a/xbmc/cores/paplayer/VideoPlayerCodec.cpp b/xbmc/cores/paplayer/VideoPlayerCodec.cpp
+index d38ad13..7172416 100644
+--- a/xbmc/cores/paplayer/VideoPlayerCodec.cpp
++++ b/xbmc/cores/paplayer/VideoPlayerCodec.cpp
+@@ -348,8 +348,15 @@ bool VideoPlayerCodec::InitFormatFromStream(CDemuxStreamAudio* stream, bool allo
+     srcConfig.bits_per_sample = CAEUtil::DataFormatToUsedBits(m_srcFormat.m_dataFormat);
+     srcConfig.dither_bits = CAEUtil::DataFormatToDitherBits(m_srcFormat.m_dataFormat);
+ 
+-    m_pResampler->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, NULL, AE_QUALITY_UNKNOWN,
+-                       false, 0.0f);
++    // Hades: one that does not open fails the stream, as a format that cannot be read does:
++    // ReadPCM() would hand on what its buffer held before
++    if (!m_pResampler->Init(dstConfig, srcConfig, false, false, M_SQRT1_2, NULL,
++                            AE_QUALITY_UNKNOWN, false, 0.0f))
++    {
++      CLog::Log(LOGERROR, "{}: the resampler to float did not open", __FUNCTION__);
++      m_pResampler.reset();
++      return false;
++    }
+ 
+     m_format.m_dataFormat = AE_FMT_FLOAT;
+     m_bitsPerSample = CAEUtil::DataFormatToBits(m_format.m_dataFormat);
+-- 
+2.53.0
+

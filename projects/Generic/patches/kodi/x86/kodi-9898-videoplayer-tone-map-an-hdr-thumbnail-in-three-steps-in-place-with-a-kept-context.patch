@@ -1,0 +1,175 @@
+From d964dd62eda9c849fc348e1192b9c39529f35ef2 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:51:51 +0000
+Subject: [PATCH] VideoPlayer: tone map an HDR thumbnail in three steps, in
+ place, with a kept context
+
+swscale maps the colours of a picture at the size of its input. For an HDR
+picture the one context of the thumbnail converted it to RGBA64 and mapped
+that into a second RGBA64 picture, both at the size of the picture (66 MB
+each at 3840x2160, a peak of 163 MB a thumbnail), and being new for every
+thumbnail it generated its 3D LUT each time: 0.7 to 0.8 s with 32 threads,
+1.9 to 2 s on 4 cores and 4.8 to 5.3 s on one.
+
+An HDR picture (PQ or HLG) is now done by three contexts: the picture to
+RGBA64 in its own encoding, the tone mapping of that in place, and the scale
+to the thumbnail. The mapping is the same, the perceptual intent with the
+same LUT, at the same size and before the scale, so highlights are mapped
+before they are averaged. The context of the mapping reads and writes RGBA64
+of one size and holds only its LUT, about 2 MB, so it is kept for the next
+HDR thumbnail the way the small pictures' one is: the episodes of a series,
+with one mastering display, do not build it again.
+
+Measured on the host with the image's FFmpeg on four 3840x2160 pictures, two
+films and two test clips, PQ and HLG:
+- a peak of 98 MB instead of 163 MB (HLG: 69 instead of 134);
+- a repeated picture in 0.16 to 0.24 s instead of 0.7 to 0.8 s (32 threads),
+  1.9 to 2 s (4 cores) or 4.8 to 5.3 s (one core); a picture that needs a
+  new LUT takes what it took;
+- against the same mapping applied to every pixel and averaged in linear
+  light, closer on each picture: PSNR 42.1 to 43.8 dB instead of 41.9 to
+  42.6, mean dE2000 0.04 to 0.44 instead of 0.35 to 0.71, the 95th and 99th
+  percentiles lower; the largest difference of a single pixel stays within
+  0.1 dE2000 of before. The average offset of a channel, up to two thirds of
+  a code before, is at most a third now.
+
+Scaling the picture down before the tone mapping would use a fraction of the
+memory and the time, but it averages highlights before they are mapped: on
+three of the four pictures the PSNR against that reference fell by 1 to
+2.8 dB and up to four times as many pixels were more than 10 dE2000 away, at
+bright edges. It is not done.
+---
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp | 97 ++++++++++++++++++++++++--
+ 1 file changed, 92 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index f948239..5007b38 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -263,6 +263,89 @@ int ConvertInOnePass(const AVFrame* picture, AVFrame* thumbnail, bool keep, bool
+     sws.Drop();
+   return res;
+ }
++
++KeptSwsContext* KeptToneMappingContext()
++{
++  static auto* const kept = new KeptSwsContext;
++  return kept;
++}
++
++//! Hades: tone map an HDR picture to the thumbnail in three steps: the picture to RGBA64 in its
++//! own encoding, the tone mapping of that in place, and the scale to the thumbnail. In one context
++//! swscale converted the picture to RGBA64 and mapped it into a second RGBA64 picture, both at
++//! the size of the picture (66 MB each at 3840x2160), and a new context generated its 3D LUT for
++//! every thumbnail. The mapping is the same (perceptual, the same LUT) and done at the same size,
++//! before the scale, so highlights are mapped before they are averaged. The mapping step is a
++//! context of its own that holds only its LUT and is kept; its 3D LUT is applied pixel by pixel,
++//! which lets it write over its input.
++int ToneMapThumbnail(const AVFrame* picture, AVFrame* thumbnail, bool& kept)
++{
++  AVFrame* full = av_frame_alloc();
++  AVFrame* mapped = av_frame_alloc();
++  int res = full && mapped ? 0 : AVERROR(ENOMEM);
++
++  if (res >= 0)
++    res = av_frame_copy_props(full, picture);
++  if (res >= 0)
++  {
++    full->width = picture->width;
++    full->height = picture->height;
++    full->format = AV_PIX_FMT_RGBA64;
++    full->colorspace = AVCOL_SPC_RGB;
++    full->color_range = AVCOL_RANGE_JPEG;
++    full->chroma_location = AVCHROMA_LOC_UNSPECIFIED;
++    res = av_frame_get_buffer(full, 0);
++  }
++  if (res >= 0)
++  {
++    CThumbnailSws toRgb(nullptr);
++    res = toRgb.Get() ? 0 : AVERROR(ENOMEM);
++    if (res >= 0)
++    {
++      toRgb.Get()->flags = SWS_BILINEAR;
++      res = sws_scale_frame(toRgb.Get(), full, picture);
++    }
++  }
++  if (res >= 0)
++  {
++    mapped->width = full->width;
++    mapped->height = full->height;
++    mapped->format = AV_PIX_FMT_RGBA64;
++    mapped->data[0] = full->data[0];
++    mapped->linesize[0] = full->linesize[0];
++    mapped->colorspace = AVCOL_SPC_RGB;
++    mapped->color_range = AVCOL_RANGE_JPEG;
++    mapped->color_primaries = thumbnail->color_primaries;
++    mapped->color_trc = thumbnail->color_trc;
++
++    CThumbnailSws toneMap(KeptToneMappingContext());
++    kept = toneMap.IsKept();
++    res = toneMap.Get() ? 0 : AVERROR(ENOMEM);
++    if (res >= 0)
++    {
++      toneMap.Get()->flags = SWS_BILINEAR;
++      toneMap.Get()->intent = SWS_INTENT_PERCEPTUAL;
++      res = sws_scale_frame(toneMap.Get(), mapped, full);
++      if (res < 0)
++        toneMap.Drop();
++    }
++  }
++  if (res >= 0)
++  {
++    CThumbnailSws toThumbnail(nullptr);
++    res = toThumbnail.Get() ? 0 : AVERROR(ENOMEM);
++    if (res >= 0)
++    {
++      toThumbnail.Get()->flags = SWS_BILINEAR;
++      res = sws_scale_frame(toThumbnail.Get(), thumbnail, mapped);
++    }
++  }
++
++  // mapped borrows the buffer of full
++  av_frame_free(&mapped);
++  av_frame_free(&full);
++  return res;
++}
+ #endif
+ 
+ //! Convert a decoded picture to a BGRA texture sized for the thumbnail cache.
+@@ -291,6 +374,8 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+ #if LIBSWSCALE_BUILD >= AV_VERSION_INT(9, 0, 100)
+   {
+     const auto start = std::chrono::steady_clock::now();
++    const bool hdr = picture.color_transfer == AVCOL_TRC_SMPTE2084 ||
++                     picture.color_transfer == AVCOL_TRC_ARIB_STD_B67;
+     AVFrame* srcFrame = av_frame_alloc();
+     AVFrame* dstFrame = av_frame_alloc();
+     if (srcFrame && dstFrame)
+@@ -333,17 +418,19 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+       dstFrame->color_trc = AVCOL_TRC_BT709;
+ 
+       bool kept = false;
+-      const int res = ConvertInOnePass(
+-          srcFrame, dstFrame, picture.iWidth * picture.iHeight <= KEPT_PICTURE_PIXELS, kept);
++      const int res =
++          hdr ? ToneMapThumbnail(srcFrame, dstFrame, kept)
++              : ConvertInOnePass(srcFrame, dstFrame,
++                                 picture.iWidth * picture.iHeight <= KEPT_PICTURE_PIXELS, kept);
+       if (res < 0)
+         CLog::LogF(LOGWARNING, "sws_scale_frame failed ({}), using legacy conversion", res);
+       else
+       {
+         converted = true;
+         const char* transfer = av_color_transfer_name(picture.color_transfer);
+-        CLog::LogF(LOGDEBUG, "{}x{} picture ({}) to {}x{}: one pass, {} context, {} ms",
+-                   picture.iWidth, picture.iHeight, transfer ? transfer : "unknown", nWidth,
+-                   nHeight, kept ? "kept" : "new",
++        CLog::LogF(LOGDEBUG, "{}x{} picture ({}) to {}x{}: {}, {} context, {} ms", picture.iWidth,
++                   picture.iHeight, transfer ? transfer : "unknown", nWidth, nHeight,
++                   hdr ? "tone mapped in three steps" : "one pass", kept ? "kept" : "new",
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
+-- 
+2.53.0
+

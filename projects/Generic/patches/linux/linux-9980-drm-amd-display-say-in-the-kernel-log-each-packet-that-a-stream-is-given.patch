@@ -1,0 +1,191 @@
+From c6911bbf7696529c07866ad3e7ad0928eba6a791 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:23:22 +0000
+Subject: [PATCH] drm/amd/display: say in the kernel log each packet that a
+ stream is given
+
+The same lines as nvidia's (nvidia-open-kernel-modules-9054) and i915's for amdgpu: resource_build_info_frame(),
+the one place where DC builds the packets of a stream for every generation (DCE and DCN, HDMI and
+DisplayPort), says each packet when its bytes change: the link, the packet (AVI, gamut,
+vendor-specific, HDR10+, HF-VSIF, extended metadata packet (VTEM), SPD, VSC SDP, HDR static metadata,
+adaptive sync SDP), its type, the VIC of an AVI InfoFrame, the OUI of a vendor-specific one, the
+length and the bytes (header, checksum, payload), and a packet that goes off. The state is a CRC
+of each packet in struct encoder_info_frame, which stays with the pipe.
+
+Bounded so that it can stay on: a packet built again with the same bytes says nothing; the packets
+that change with the scene or the frame (vendor, HDR10+, HF-VSIF, VTEM, adaptive sync) say at most one
+line a minute and the next line says how many changes it did not say; at most 400 lines until the
+module is loaded again, which the last line says.
+
+Nothing that goes out changes: only the log. Compiled with W=1 (dc_resource.o, dc.o) without
+warnings; not run on hardware: a Ryzen iGPU on an HDMI display shows the lines.
+---
+ .../gpu/drm/amd/display/dc/core/dc_resource.c | 106 ++++++++++++++++++
+ .../amd/display/dc/inc/hw/stream_encoder.h    |  13 +++
+ 2 files changed, 119 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+index 37064351a..0e9e3b272 100644
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_resource.c
+@@ -23,6 +23,8 @@
+  *
+  */
+ 
++#include <linux/crc32.h>
++
+ #include "dm_services.h"
+ 
+ #include "resource.h"
+@@ -5263,6 +5265,108 @@ struct clock_source *dc_resource_find_first_free_pll(
+ 	return NULL;
+ }
+ 
++/*
++ * Hades: the kernel log says each packet that a stream is given (the same lines as nvidia's and
++ * i915's InfoFrames: the type, the VIC of an AVI InfoFrame, the OUI of a vendor-specific one, the
++ * length and the bytes) when its bytes change, and the packet that goes off. Bounded so that it can
++ * stay on: a packet built again with the same bytes says nothing; the packets that change with the
++ * scene or the frame (vendor, HDR10+, HF-VSIF, VTEM, adaptive sync) say at most one line a minute
++ * and the next line says how many changes it did not say; at most 400 lines until the module is
++ * loaded again. Nothing that goes out changes: only the log.
++ */
++#define HADES_INFO_PACKET_LOG_LINES 400
++static atomic_t hades_info_packet_lines = ATOMIC_INIT(0);
++
++static void hades_log_info_packet(const struct pipe_ctx *pipe_ctx, const char *name, bool fast,
++				  const struct dc_info_packet *p, struct dc_info_packet_log *st)
++{
++	const struct dc_link *link = pipe_ctx->stream->link;
++	char bytes[3 * 36 + 1];
++	uint8_t packed[36];
++	unsigned int n, i;
++	int lines;
++	uint32_t crc;
++
++	if (!p->valid) {
++		if (!st->valid)
++			return;
++		st->valid = false;
++		st->suppressed = 0;
++		if (atomic_inc_return(&hades_info_packet_lines) <= HADES_INFO_PACKET_LOG_LINES)
++			pr_info("[drm] Hades: link %u (%s): %s off\n", link->link_index,
++				dc_is_hdmi_signal(pipe_ctx->stream->signal) ? "HDMI" : "DP", name);
++		return;
++	}
++
++	/* header bytes, then the payload (checksum first for an InfoFrame): the length is HB2 */
++	n = 3 + min_t(unsigned int, p->hb2 + 1u, 32u);
++	if (n > sizeof(packed))
++		n = sizeof(packed);
++	packed[0] = p->hb0;
++	packed[1] = p->hb1;
++	packed[2] = p->hb2;
++	memcpy(packed + 3, p->sb, n - 3);
++
++	crc = crc32_le(~0, packed, n);
++	if (st->valid && st->crc == crc)
++		return;
++	st->valid = true;
++	st->crc = crc;
++
++	if (fast && st->last && time_before(jiffies, st->last + 60 * HZ)) {
++		st->suppressed++;
++		return;
++	}
++
++	lines = atomic_inc_return(&hades_info_packet_lines);
++	if (lines > HADES_INFO_PACKET_LOG_LINES) {
++		if (lines == HADES_INFO_PACKET_LOG_LINES + 1)
++			pr_info("[drm] Hades: packet lines stop here (%d said); they start again when the module is loaded again\n",
++				HADES_INFO_PACKET_LOG_LINES);
++		return;
++	}
++
++	bytes[0] = '\0';
++	for (i = 0; i < n; i++)
++		scnprintf(bytes + strlen(bytes), sizeof(bytes) - strlen(bytes), "%s%02x", i ? " " : "",
++			  packed[i]);
++
++	if (p->hb0 == 0x82 && n > 7)
++		pr_info("[drm] Hades: link %u (HDMI): %s InfoFrame, VIC %u, %u bytes: %s\n",
++			link->link_index, name, packed[7], n, bytes);
++	else if (p->hb0 == 0x81 && n > 6)
++		pr_info("[drm] Hades: link %u (HDMI): %s InfoFrame of OUI %02X-%02X-%02X, %u bytes: %s\n",
++			link->link_index, name, packed[6], packed[5], packed[4], n, bytes);
++	else
++		pr_info("[drm] Hades: link %u (%s): %s, type %02x, %u bytes: %s\n", link->link_index,
++			dc_is_hdmi_signal(pipe_ctx->stream->signal) ? "HDMI" : "DP", name, p->hb0, n,
++			bytes);
++	if (st->suppressed)
++		pr_info("[drm] Hades: link %u: %u changes of %s within the last minute were not said\n",
++			link->link_index, st->suppressed, name);
++	st->suppressed = 0;
++	st->last = jiffies;
++}
++
++static void hades_log_info_packets(struct pipe_ctx *pipe_ctx)
++{
++	struct encoder_info_frame *info = &pipe_ctx->stream_res.encoder_info_frame;
++	struct encoder_info_frame *w = info;
++
++	hades_log_info_packet(pipe_ctx, "AVI", false, &info->avi, &w->hades_log[0]);
++	hades_log_info_packet(pipe_ctx, "gamut", false, &info->gamut, &w->hades_log[1]);
++	hades_log_info_packet(pipe_ctx, "vendor-specific", true, &info->vendor, &w->hades_log[2]);
++	hades_log_info_packet(pipe_ctx, "HDR10+", true, &info->hdr10plus, &w->hades_log[3]);
++	hades_log_info_packet(pipe_ctx, "HF-VSIF", true, &info->hfvsif, &w->hades_log[4]);
++	hades_log_info_packet(pipe_ctx, "extended metadata packet (VTEM)", true, &info->vtem,
++			      &w->hades_log[5]);
++	hades_log_info_packet(pipe_ctx, "SPD", false, &info->spd, &w->hades_log[6]);
++	hades_log_info_packet(pipe_ctx, "VSC SDP", false, &info->vsc, &w->hades_log[7]);
++	hades_log_info_packet(pipe_ctx, "HDR static metadata", false, &info->hdrsmd, &w->hades_log[8]);
++	hades_log_info_packet(pipe_ctx, "adaptive sync SDP", true, &info->adaptive_sync,
++			      &w->hades_log[9]);
++}
++
+ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ {
+ 	enum signal_type signal = SIGNAL_TYPE_NONE;
+@@ -5319,6 +5423,8 @@ void resource_build_info_frame(struct pipe_ctx *pipe_ctx)
+ 	}
+ 
+ 	patch_gamut_packet_checksum(&info->gamut);
++
++	hades_log_info_packets(pipe_ctx); /* Hades */
+ }
+ 
+ enum dc_status resource_map_clock_resources(
+diff --git a/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h b/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
+index 726a9254e..b2e19d2e5 100644
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw/stream_encoder.h
+@@ -87,6 +87,17 @@ struct enc_sdp_line_num {
+ 	uint32_t adaptive_sync_line_num;
+ };
+ 
++/*
++ * Hades: what the kernel log said last of one packet of a stream (resource_build_info_frame()): the
++ * CRC of its bytes, when, and how many changes it did not say since
++ */
++struct dc_info_packet_log {
++	uint32_t crc;
++	unsigned long last;
++	unsigned int suppressed;
++	bool valid;
++};
++
+ struct encoder_info_frame {
+ 	/* auxiliary video information */
+ 	struct dc_info_packet avi;
+@@ -104,6 +115,8 @@ struct encoder_info_frame {
+ 	struct dc_info_packet hdrsmd;
+ 	/* Adaptive Sync SDP*/
+ 	struct dc_info_packet adaptive_sync;
++	/* Hades: the packets that the kernel log said, in the order of the packets above */
++	struct dc_info_packet_log hades_log[10];
+ 	struct enc_sdp_line_num sdp_line_num;
+ 	bool firmware_controlled_hdr_info_packet;
+ };
+-- 
+2.53.0
+

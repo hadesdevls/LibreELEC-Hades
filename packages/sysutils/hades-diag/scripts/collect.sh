@@ -22,7 +22,13 @@
 # - it lists the PCI devices then (lspci.txt), which wakes a graphics card that sleeps;
 # - where no TV or monitor is seen on any socket, the kernel's display messages stay turned up until the
 #   second snapshot has the kernel log, or a video is opened.
-# It also keeps the firmware's description of the machine (acpi-tables.tar.gz).
+# It also keeps the firmware's description of the machine (acpi-tables.tar.gz), and how long the start took
+# (boot-time.txt, systemd-analyze).
+# "collect.sh report <folder>" (report.sh, the report made on demand from the settings) is one snapshot of what the
+# system is doing at that moment, "now", with the journal of this start and of the start before it and the newest
+# crash log of Kodi, into <folder> (in RAM, this run's, readable by root only), in the foreground, and nothing goes to
+# the boot partition: report.sh puts all of it through the filter of the diagnostics. Nothing is asked of an output
+# then (no redetect(), no listen()), and the PCI devices are not listed (that wakes a graphics card that sleeps).
 (
 D=/flash/hades-diag
 T=/tmp/hades-diag
@@ -30,6 +36,11 @@ R=/usr/lib/hades-diag/redact.sh
 . /usr/lib/hades-diag/folder.sh
 B=$1
 H=start-${2:-0}
+# (the report made on demand: its folder is where the snapshot goes, and the build is read here)
+REPORT=
+if [ "$B" = report ]; then
+  REPORT=$2; T=$2; B=$(this_build); H=
+fi
 # The level of the kernel's display messages, and where what it was is kept while this has it turned up
 G=/sys/module/drm/parameters/debug
 W=/run/hades-drm-debug.was
@@ -75,6 +86,7 @@ no_room() { [ -e $D/NO-ROOM.txt ] || { mkdir -p $D && cp /usr/lib/hades-diag/NO-
 # filter that fits it first, into $T/$1.filtered in RAM (a file that the filter fails on is not copied;
 # without the filter, nothing is). The second copy of a snapshot filters only what changed since the first.
 to_flash() {
+  [ -z "$REPORT" ] || return 0
   switch_on || return 0
   [ -f $R ] || return 0
   sh $R tree $T/$1 $T/$1.filtered
@@ -92,6 +104,31 @@ to_flash() {
     mount -o remount,ro /flash
   fi
   flash_unlock
+}
+
+# Hades: the file $2 of the snapshot $1, copied as soon as the query that writes it has ended, into the folder of
+# this start on the boot partition, through the filter. The queries of the graphics cards run in the background
+# and are not waited for: the copy of the snapshot 30 s after them took what they had written, and a PC turned off
+# before that lost all of it. Each file is filtered in a folder of its own (the queries end at about the same
+# time, and the copies of the snapshot filter into $T/$1.filtered), and copied under the lock of the writers of
+# the boot partition, beside what the first copy of the snapshot wrote. Once the last copy of the snapshot is
+# made, its files are gone from RAM: a query that ends after it copies nothing more.
+file_to_flash() {
+  local O=$T/$1.$2
+  [ -z "$REPORT" ] || return 0
+  switch_on && [ -f $R ] && [ -f $T/$1/$2 ] || return 0
+  rm -rf $O $O.filtered
+  mkdir -p $O && cp $T/$1/$2 $O/ && sh $R tree $O $O.filtered
+  if [ -f $O.filtered/$2 ] && flash_lock; then
+    if mount -o remount,rw /flash; then
+      if room_left && own_start $H; then
+        mkdir -p $D/$H/$1 && cp $O.filtered/$2 $D/$H/$1/ && echo $FILTERED > $D/$H/.filtered
+      fi
+      mount -o remount,ro /flash
+    fi
+    flash_unlock
+  fi
+  rm -rf $O $O.filtered
 }
 
 # What versions of the diagnostics before 15 left on the partition went there without the filter of
@@ -243,6 +280,20 @@ bluetooth() {
 # first does it: the second snapshot, listen() at its end, or the next start of this after one that was
 # killed).
 debug_down() { [ -f $W ] && { cat $W > $G; rm -f $W; }; }
+# Hades: the memory of an AMD card ($1, its device in sysfs) as amdgpu tells it, each used and total in MiB: the
+# video memory (vram; on an integrated card, the part of the memory that the firmware sets aside for it), the part of
+# it that the processor can reach (vis_vram), and the system memory that the card has mapped for itself (gtt). Only
+# the ones that are there; nothing where none is (a card of another driver).
+amd_memory() {
+  local m="" k u t
+  for k in vram vis_vram gtt; do
+    u=$(cat $1/mem_info_${k}_used 2>/dev/null); t=$(cat $1/mem_info_${k}_total 2>/dev/null)
+    case "$u" in ''|*[!0-9]*) continue ;; esac
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    m="$m, $k $((u / 1048576)) of $((t / 1048576)) MiB"
+  done
+  [ -z "$m" ] || echo "    memory used:${m#,}"
+}
 # Whether each graphics card is awake: " card0=suspended card1=active"
 cards_awake() {
   for c in /sys/class/drm/card[0-9]*; do
@@ -346,6 +397,21 @@ listen() {
   )
 }
 
+# Hades: how long this start took, and what held it up, into $S/boot-time.txt: the time of the firmware, the loader,
+# the kernel and the system until its default target was reached, the chains of units that the default target and Kodi
+# waited for, each unit by how long it took to start, and the jobs that systemd still runs (what a start that has not
+# finished is waiting for; systemd-analyze then says that it has not finished). Read from what systemd keeps of this
+# start: nothing is started or changed. Each query is stopped after 20 s.
+boot_time() {
+  {
+    echo "== systemd-analyze"; lim systemd-analyze
+    echo "== systemd-analyze critical-chain"; lim systemd-analyze critical-chain --no-pager
+    echo "== systemd-analyze critical-chain kodi.service"; lim systemd-analyze critical-chain kodi.service --no-pager
+    echo "== systemd-analyze blame"; lim systemd-analyze blame --no-pager
+    echo "== systemctl list-jobs (what the start still waits for)"; lim systemctl list-jobs --no-pager
+  } > $S/boot-time.txt 2>&1
+}
+
 snapshot() {
   S=$T/$1; rm -rf $S $S.filtered; mkdir -p $S/edid
   echo "$B" > $S/build.txt
@@ -373,6 +439,26 @@ snapshot() {
   done
   dmesg | grep -iE "locked down|lockdown|Loading of|module verification|Key was rejected|kernel-overlays-setup" | head -40
   lim journalctl -b --no-pager | grep -iE "Key was rejected|Failed to insert|Operation not permitted" | head -20 | clean
+  # Hades: what the IOMMU does with the memory accesses of the devices (DMA): the line that the init writes on it
+  # (hades-iommu:, where the init writes one), what the kernel said of its default domain and of the IOMMU of AMD
+  # (AMD-Vi) or of Intel (DMAR), how many groups of devices are of each type now (DMA-FQ and DMA: translated;
+  # identity: passed through), the devices passed through, and the transfers that the IOMMU stopped: one line per
+  # transfer (AMD-Vi's IO_PAGE_FAULT, DMAR's [DMA Read] or [DMA Write]; DMAR's "handling fault" line is the status of
+  # its fault registers, not a transfer), the first 10 shown. A device that works leaves none.
+  echo "== DMA translation (IOMMU)"
+  dmesg | grep -E "hades-iommu:|iommu: Default domain type|DMA domain TLB invalidation|AMD-Vi: (Interrupt remapping|Extended features)|DMAR: (IOMMU enabled|Disable GFX|Intel-IOMMU force)|DMAR-IR: Enabled" | head -12
+  for io_t in DMA-FQ DMA identity blocked unmanaged; do
+    io_n=$(cat /sys/kernel/iommu_groups/*/type 2>/dev/null | grep -c -x -- "$io_t")
+    [ "$io_n" -gt 0 ] && echo "groups $io_t: $io_n"
+  done
+  for io_g in /sys/kernel/iommu_groups/*; do
+    [ "$(cat $io_g/type 2>/dev/null)" = identity ] || continue
+    for io_d in $io_g/devices/*; do
+      [ -e "$io_d" ] && echo "passthrough: ${io_d##*/} $(cat $io_d/vendor 2>/dev/null):$(cat $io_d/device 2>/dev/null) class=$(cat $io_d/class 2>/dev/null)"
+    done
+  done | head -12
+  echo "transfers stopped by the IOMMU: $(dmesg | grep -c -E 'IO_PAGE_FAULT|DMAR: \[DMA (Read|Write)')"
+  dmesg | grep -E 'IO_PAGE_FAULT|DMAR: \[DMA (Read|Write)|DMAR: DRHD: handling fault|AMD-Vi: Event logged' | head -10
   echo "== PCI storage controllers (class 01xx) and their drivers (Run and Live from a USB drive: no nvme or ahci driver)"
   for d in /sys/bus/pci/devices/*; do
     case "$(cat $d/class 2>/dev/null)" in
@@ -401,6 +487,7 @@ snapshot() {
     case ${c##*/} in *-*) continue ;; esac
     dev=$(readlink -f $c/device)
     echo "${c##*/}: ${dev##*/} driver=$(basename "$(readlink $c/device/driver)") boot_vga=$(cat $c/device/boot_vga 2>/dev/null) runtime_status=$(cat $c/device/power/runtime_status 2>/dev/null) power_state=$(cat $c/device/power_state 2>/dev/null) control=$(cat $c/device/power/control 2>/dev/null)"
+    amd_memory $c/device
   done
   ls -l /dev/dri /dev/dri/by-path 2>&1
   echo "== framebuffers"; cat /proc/fb
@@ -441,7 +528,12 @@ snapshot() {
       [ -r $h/speed ] && echo "    root hub ${h##*/}: speed=$(cat $h/speed) ports=$(cat $h/maxchild 2>/dev/null) power/control=$(cat $h/power/control 2>/dev/null) runtime_status=$(cat $h/power/runtime_status 2>/dev/null)"
     done
   done
-  echo "usbcore autosuspend=$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null) (seconds; -1: no USB device is made to sleep by itself, as the kernel command line of the build has it)"
+  echo "external USB hubs (the SuperSpeed side of each sleeps when nothing is on it, by the udev rule 50-hades-usb3-hub-autosuspend; a USB 2.0 side is left awake):"
+  for h in /sys/bus/usb/devices/[0-9]*-[0-9]*; do
+    [ -r $h/bDeviceClass ] && [ "$(cat $h/bDeviceClass)" = 09 ] || continue
+    echo "    hub ${h##*/}: speed=$(cat $h/speed 2>/dev/null) ports=$(cat $h/maxchild 2>/dev/null) power/control=$(cat $h/power/control 2>/dev/null) runtime_status=$(cat $h/power/runtime_status 2>/dev/null) autosuspend_delay_ms=$(cat $h/power/autosuspend_delay_ms 2>/dev/null)"
+  done
+  echo "usbcore autosuspend=$(cat /sys/module/usbcore/parameters/autosuspend 2>/dev/null) (seconds; -1: no USB device is made to sleep by itself, as the kernel command line of the build has it; the udev rule 50-hades-usb3-hub-autosuspend sets 2000 ms on the SuperSpeed side of each external hub)"
   echo "== USB4 and Thunderbolt: the agreement with the firmware, who runs the connection manager, and the security level of each domain"
   dmesg | grep -E 'USB4 _OSC|platform _OSC|thunderbolt' | tail -40
   o=$(dmesg | grep 'USB4 _OSC: OS controls' | tail -n 1)
@@ -478,6 +570,14 @@ snapshot() {
   echo "== kodi: Dolby Vision verdicts and output handling"
   grep -hE "DVBridge|native Dolby Vision|DV FEL|DV: |\[DV\]|Display resolution ADJUST|turning off .* output|turned off .* output|outputs stay on|/dev/dri/card|Using connector|transactional test commit|DRMDisplayWatch|look [0-9]* at the outputs" \
     /storage/.kodi/temp/kodi.log 2>/dev/null | tail -80 | clean
+  echo "== output check (System > Submit Log, \"Check the Dolby Vision output\"): the last report, if one was asked for"
+  oc=/storage/.cache/hades-output-check/result.txt
+  if [ -s $oc ]; then echo "written: $(date -u -r $oc '+%F %T') UTC"; cat $oc; else echo "none"; fi
+  # Hades: the last result of "Check this setup" (the settings write summary.txt, in English, at the end of each check;
+  # last.json beside it holds the same results in the parts of their texts, for the settings to say them again)
+  echo "== check of this setup (System > Submit Log, \"Check this setup\"): the last result, if a check was made"
+  hc=/storage/.cache/hades-check/summary.txt
+  if [ -s $hc ]; then echo "written: $(date -u -r $hc '+%F %T') UTC"; head -c 65536 $hc; echo; else echo "none"; fi
   echo "== kodi: VA-API"
   grep -hiE "vaapi|va-api|libva|nvidia_drv_video" /storage/.kodi/temp/kodi.log 2>/dev/null | head -40 | clean
   echo "== time sync (journal)"; lim journalctl -b --no-pager | grep -E 'RTC configured|ntp:|imeserver' | head -20 | clean
@@ -486,7 +586,7 @@ snapshot() {
   } > $S/results.txt 2>&1
   [ -d /sys/class/bluetooth ] && bluetooth > $S/bluetooth.txt 2>&1
   [ -r /sys/kernel/debug/gpio ] && lim cat /sys/kernel/debug/gpio > $S/gpio.txt
-  if [ "$1" = 1-minute ]; then
+  if [ "$1" = 1-minute ] || [ "$1" = now ]; then
     # The firmware's description of the machine: its ACPI tables DSDT and SSDT, also the ones it loads while
     # it runs (how its sockets, buttons and power are wired and switched; much the same for every machine of
     # a model). Not the other tables: one of them holds the licence key of Windows.
@@ -495,15 +595,28 @@ snapshot() {
         [ -n "$l" ] && tar -cf - $l 2>/dev/null | gzip > $S/acpi-tables.tar.gz )
     [ -s $S/acpi-tables.tar.gz ] || rm -f $S/acpi-tables.tar.gz
   fi
+  # Hades: how long the start took (boot-time.txt, boot_time()): in the first snapshot, and in one taken at once (now).
+  # Where the start had not finished at the first snapshot, the second one asks again.
+  case $1 in
+    1-minute)
+      boot_time
+      grep -q 'Bootup is not yet finished' $S/boot-time.txt && : > $T/boot-unfinished
+      ;;
+    now) boot_time ;;
+    4-minutes) [ -e $T/boot-unfinished ] && { rm -f $T/boot-unfinished; boot_time; } ;;
+  esac
   to_flash $1
-  # GPU queries: background, time-limited, not waited for; whatever they wrote after 30 s is copied.
-  ( for f in /sys/kernel/debug/dri/*/state; do [ -r "$f" ] && { echo "--- $f"; cat "$f"; }; done > $S/drm-state.txt 2>&1 ) &
-  ( nvidia-smi -q > $S/nvidia-smi.txt 2>&1 ) &
-  ( for r in /dev/dri/renderD*; do echo "--- $r"; vainfo --display drm --device $r 2>&1; done > $S/vainfo.txt ) &
+  # GPU queries: background, time-limited, not waited for; each is copied once it has ended (file_to_flash()),
+  # and whatever they wrote after 30 s is copied with the snapshot.
+  ( for f in /sys/kernel/debug/dri/*/state; do [ -r "$f" ] && { echo "--- $f"; cat "$f"; }; done > $S/drm-state.txt 2>&1; file_to_flash $1 drm-state.txt ) &
+  ( nvidia-smi -q > $S/nvidia-smi.txt 2>&1; file_to_flash $1 nvidia-smi.txt ) &
+  ( for r in /dev/dri/renderD*; do echo "--- $r"; vainfo --display drm --device $r 2>&1; done > $S/vainfo.txt; file_to_flash $1 vainfo.txt ) &
   # (each by itself: an output that takes long to answer the one does not keep the other from being written.
   # What listen() says goes to the same file; it then stays for minutes, and writes nothing more.)
-  [ "$1" = 1-minute ] && ( redetect > $S/redetect.txt 2>&1; listen >> $S/redetect.txt 2>&1 ) &
-  ( modetest_all > $S/modetest-connectors.txt 2>&1 ) &
+  [ "$1" = 1-minute ] && ( redetect > $S/redetect.txt 2>&1; file_to_flash $1 redetect.txt; listen >> $S/redetect.txt 2>&1; file_to_flash $1 redetect.txt ) &
+  ( modetest_all > $S/modetest-connectors.txt 2>&1; file_to_flash $1 modetest-connectors.txt ) &
+  # (the report made on demand waits for the queries, 30 s at most, and keeps what they wrote: report.sh filters it)
+  if [ -n "$REPORT" ]; then settle 30; return; fi
   sleep 30
   to_flash $1
   # (it is on the boot partition now: not kept in RAM as well)
@@ -528,9 +641,50 @@ previous_boot() {
   last 8388608 $T/previous.txt | clean | gzip > $P/journal-kernel.txt.gz
   rm -f $T/previous.txt
   to_flash previous-boot
-  rm -rf $P $P.filtered
+  # (the report made on demand keeps it: report.sh takes it)
+  [ -n "$REPORT" ] || rm -rf $P $P.filtered
 }
 
+# Hades: the background jobs of this shell (the queries of the graphics cards of a snapshot), waited for at most $1
+# seconds: a query that hangs (a graphics card that does not answer) is left, and what it wrote by then is taken.
+# BusyBox's "jobs -p" in a shell that is not interactive goes on listing a job that has ended, so a job counts while
+# its process is there and is not a zombie (its state, the field after the name in brackets, which can hold spaces)
+settle() {
+  local k=0 p r s
+  while [ $k -lt $1 ]; do
+    jobs -p > $T/.jobs 2>/dev/null
+    r=
+    for p in $(cat $T/.jobs 2>/dev/null); do
+      s=$(cat /proc/$p/stat 2>/dev/null) || continue
+      s=${s##*") "}
+      case "${s%% *}" in ''|Z|X) ;; *) r=1 ;; esac
+    done
+    [ -n "$r" ] || break
+    sleep 1; k=$((k + 1))
+  done
+  rm -f $T/.jobs
+}
+
+# Hades: the report made on demand (report.sh): the snapshot "now"; the journal of this start (its last 8 MiB,
+# journal.txt.gz) and of the start before it where the storage kept it (previous-boot, as previous_boot() takes it);
+# the newest crash log of Kodi (its last 8 MiB); and the storage timeline of watch-dv.sh, while it runs (the
+# diagnostics are on). Everything through the filter for logs where it is taken, as the snapshots have it; report.sh
+# puts every file through the filter again, the one that fits it.
+report() {
+  local c
+  mkdir -p $T
+  snapshot now
+  lim journalctl -b --no-pager > $T/journal.raw 2>/dev/null
+  last 8388608 $T/journal.raw | clean | gzip > $T/journal.txt.gz
+  rm -f $T/journal.raw
+  previous_boot
+  c=$(ls -t /storage/.kodi/temp/kodi_crashlog_*.log 2>/dev/null | head -n 1)
+  [ -f "$c" ] && last 8388608 "$c" | clean | gzip > "$T/${c##*/}.gz"
+  [ -f /run/hades-io.log ] && cp /run/hades-io.log $T/io-timeline.txt
+}
+
+# (the report made on demand: that and nothing else)
+if [ -n "$REPORT" ]; then report; exit 0; fi
 # (what a run of this that was killed left turned up)
 debug_down
 refilter
@@ -538,3 +692,5 @@ mkdir -p $T; previous_boot
 sleep 60; snapshot 1-minute
 sleep 150; snapshot 4-minutes
 ) >/dev/null 2>&1 &
+# (the report made on demand is waited for: report.sh filters what it collected once it has ended)
+[ "$1" != report ] || wait $!

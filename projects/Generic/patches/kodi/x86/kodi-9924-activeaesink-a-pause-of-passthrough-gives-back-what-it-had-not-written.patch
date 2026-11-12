@@ -1,0 +1,920 @@
+From ae98c7dc85eff37780e385585ae8c319f1a8f356 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:18:50 +0000
+Subject: [PATCH] ActiveAESink: a pause of passthrough gives back what it had
+ not written
+
+What the sink needs for a pause of passthrough that keeps its sound, for a
+stream that it packs into IEC 61937 itself (the engine asks for it in the
+next commit; nothing here runs before that):
+
+- HOLD: the packets it has not written go back to the engine as a flush
+  has them, but marked unwritten (RETURNUNWRITTEN), in their order, and
+  the answer says what the device holds, which plays out. The sink answers
+  between two writes, so a packet comes back whole or has been written
+  whole: no burst is cut.
+- While that pause lasts, the silence that keeps the device alive goes out
+  as IEC 61937 pause bursts. Kodi sends pause bursts only while a stream
+  plays and zeros otherwise, which a receiver takes for the end of the
+  bitstream: the sound after the pause has to be locked onto again, and a
+  TrueHD decoder starts again at the next major sync. Pause bursts are what
+  a correction of the sync already sends in the middle of a stream. The
+  silence is kept three frames under the size of the device, so that at
+  the resume the device never holds more silence than the sound that
+  played after the picture stopped (HeldSilenceWaitMs()).
+- RESUMEGAP: at the resume a pause goes before the next packet written:
+  the sound that played with the picture stopped, less what the picture
+  moved since and what the device holds then, so that the sound goes on
+  where the picture is (GapMs()); in pauses of a frame at most, as a
+  correction of the sync has them.
+- HOLDDROPPED: what the engine kept at the pause was let go (a seek, a
+  stop, the output opened again): the silence goes out as after a pause
+  that keeps nothing. The packer is reset for it: PackPause() re-uses
+  its last pause of the same length whatever it is asked for, and would
+  send the pause bursts on. A stream that streams again, a flush and a
+  change of the output end such a pause too.
+
+The pause bursts are packed by CAEBitstreamPacker::PackPause() as before.
+The decision between pause bursts and zeros is the same expression as
+before when no such pause is held (AsBursts()): PCM, a pause that does not
+keep the sound and a sink that takes the stream unpacked are as before.
+
+TestPassthroughPause: the reckoning (clock, gap, silence, what is kept),
+and what goes out around such a pause for AC-3, E-AC-3, TrueHD (MAT) and
+DTS-HD MA, every buffer a valid IEC 61937 burst or valid pause bursts.
+---
+ xbmc/cores/AudioEngine/CMakeLists.txt         |   1 +
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 136 +++++++-
+ .../Engines/ActiveAE/ActiveAESink.h           |  39 ++-
+ .../AudioEngine/Utils/PassthroughPause.h      | 176 ++++++++++
+ .../AudioEngine/Utils/test/CMakeLists.txt     |   3 +-
+ .../Utils/test/TestPassthroughPause.cpp       | 320 ++++++++++++++++++
+ 6 files changed, 667 insertions(+), 8 deletions(-)
+ create mode 100644 xbmc/cores/AudioEngine/Utils/PassthroughPause.h
+ create mode 100644 xbmc/cores/AudioEngine/Utils/test/TestPassthroughPause.cpp
+
+diff --git a/xbmc/cores/AudioEngine/CMakeLists.txt b/xbmc/cores/AudioEngine/CMakeLists.txt
+index 2ffcce5..e3909f1 100644
+--- a/xbmc/cores/AudioEngine/CMakeLists.txt
++++ b/xbmc/cores/AudioEngine/CMakeLists.txt
+@@ -59,6 +59,7 @@ set(HEADERS AEResampleFactory.h
+             Utils/DownmixLevels.h
+             Utils/GpuClockHold.h
+             Utils/PackerMAT.h
++            Utils/PassthroughPause.h
+             Utils/TrueHDSyncScale.h)
+ 
+ if(TARGET ${APP_NAME_LC}::Alsa)
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index 8d863b1..b38f4d3 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -16,6 +16,7 @@
+ #include "cores/AudioEngine/Utils/AEBitstreamPacker.h"
+ #include "cores/AudioEngine/Utils/AEStreamInfo.h"
+ #include "cores/AudioEngine/Utils/AEUtil.h"
++#include "cores/AudioEngine/Utils/PassthroughPause.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "utils/EndianSwap.h"
+@@ -23,6 +24,8 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstring>
+ #include <new> // for std::bad_alloc
+ #include <sstream>
+ 
+@@ -322,6 +325,8 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+           m_extError = false;
+           m_extSilenceTimer.Set(0ms);
+           m_extStreaming = false;
++          m_extHeldPause = false; // (Hades)
++          m_resumeGap.reset();
+           ReturnBuffers();
+           OpenSink();
+ 
+@@ -354,6 +359,8 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+           return;
+ 
+         case CSinkControlProtocol::UNCONFIGURE:
++          m_extHeldPause = false; // (Hades)
++          m_resumeGap.reset();
+           ReturnBuffers();
+           CloseSink();
+           m_state = S_TOP_UNCONFIGURED;
+@@ -361,6 +368,8 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+           return;
+ 
+         case CSinkControlProtocol::FLUSH:
++          m_extHeldPause = false; // (Hades)
++          m_resumeGap.reset();
+           ReturnBuffers();
+           // Pause also clears AE queues: only explicit stream flush discards device audio.
+           if (m_sink && *reinterpret_cast<const bool*>(msg->data))
+@@ -368,6 +377,50 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+           msg->Reply(CSinkControlProtocol::ACC);
+           return;
+ 
++        // Hades: a passthrough stream is paused with its sound kept (CActiveAE::HoldRawStream()).
++        // What was not written goes back as a flush has it, but marked so (RETURNUNWRITTEN), in
++        // order; the answer says what the device holds, which plays out. Until the stream streams
++        // again, the silence that keeps the device alive goes out as pause bursts
++        // (PassthroughPause.h).
++        case CSinkControlProtocol::HOLD:
++        {
++          m_resumeGap.reset();
++          ReturnBuffers(true);
++          if (!m_sink || m_requestedFormat.m_dataFormat != AE_FMT_RAW || !m_needIecPack)
++          {
++            msg->Reply(CSinkControlProtocol::ERR);
++            return;
++          }
++          AEDelayStatus status;
++          m_sink->GetDelay(status);
++          m_extHeldPause = true;
++          msg->Reply(CSinkControlProtocol::ACC, &status, sizeof(status));
++          return;
++        }
++
++        // Hades: it resumes: the pause that goes before the next packet written
++        case CSinkControlProtocol::RESUMEGAP:
++        {
++          SinkResumeGap gap;
++          if (msg->data)
++          {
++            memcpy(&gap, msg->data, sizeof(gap));
++            m_resumeGap = gap;
++          }
++          return;
++        }
++
++        // Hades: what the engine kept at the pause was let go (a seek, a stop, the output opened
++        // again): the silence goes out as after a pause that keeps nothing. The packer re-uses its
++        // last pause of the same length whatever it is asked for (CAEBitstreamPacker::PackPause()):
++        // the pause bursts of the pause are not sent on for that silence
++        case CSinkControlProtocol::HOLDDROPPED:
++          if (m_extHeldPause && m_packer)
++            m_packer->Reset();
++          m_extHeldPause = false;
++          m_resumeGap.reset();
++          return;
++
+         case CSinkControlProtocol::APPFOCUSED:
+           m_extAppFocused = *(bool*)msg->data;
+           SetSilenceTimer();
+@@ -393,7 +446,7 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+         }
+ 
+         case CSinkControlProtocol::STREAMING:
+-          m_extStreaming = *(bool*)msg->data;
++          SetStreaming(*(bool*)msg->data); // (Hades)
+           return;
+ 
+         case CSinkControlProtocol::SETSILENCETIMEOUT:
+@@ -465,7 +518,7 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkControlProtocol::STREAMING:
+-          m_extStreaming = *(bool*)msg->data;
++          SetStreaming(*(bool*)msg->data); // (Hades)
+           SetSilenceTimer();
+           if (!m_extSilenceTimer.IsTimePast())
+           {
+@@ -506,6 +559,10 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+           CSampleBuffer *samples;
+           unsigned int delay;
+           samples = *((CSampleBuffer**)msg->data);
++          // Hades: the first packet after a passthrough stream resumed from a pause that kept its
++          // sound: the pause before it that puts it where the picture is
++          if (m_resumeGap)
++            OutputResumeGap();
+           delay = OutputSamples(samples);
+           msg->Reply(CSinkDataProtocol::RETURNSAMPLE, &samples, sizeof(CSampleBuffer*));
+           if (m_extError)
+@@ -535,7 +592,7 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkControlProtocol::STREAMING:
+-          m_extStreaming = *(bool*)msg->data;
++          SetStreaming(*(bool*)msg->data); // (Hades)
+           SetSilenceTimer();
+           m_extTimeout = 0ms;
+           return;
+@@ -650,6 +707,14 @@ void CActiveAESink::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkControlProtocol::TIMEOUT:
++          // Hades: while a pause keeps the sound of a passthrough stream, its silence keeps the
++          // device under what it held of sound (PassthroughPause.h, HeldSilenceWaitMs())
++          if (const auto wait = HeldSilenceWait())
++          {
++            m_state = S_TOP_CONFIGURED_PLAY;
++            m_extTimeout = *wait;
++            return;
++          }
+           OutputSamples(&m_sampleOfSilence);
+           if (m_extError)
+           {
+@@ -1420,7 +1485,7 @@ void CActiveAESink::UpdateGpuHold(bool passthrough)
+     m_gpuHold->Set(gpu.value_or(std::string()), wanted);
+ }
+ 
+-void CActiveAESink::ReturnBuffers()
++void CActiveAESink::ReturnBuffers(bool unwritten)
+ {
+   Message *msg = nullptr;
+   CSampleBuffer *samples;
+@@ -1429,12 +1494,69 @@ void CActiveAESink::ReturnBuffers()
+     if (msg->signal == CSinkDataProtocol::SAMPLE)
+     {
+       samples = *((CSampleBuffer**)msg->data);
+-      msg->Reply(CSinkDataProtocol::RETURNSAMPLE, &samples, sizeof(CSampleBuffer*));
++      msg->Reply(unwritten ? CSinkDataProtocol::RETURNUNWRITTEN : CSinkDataProtocol::RETURNSAMPLE,
++                 &samples, sizeof(CSampleBuffer*));
+     }
+     msg->Release();
+   }
+ }
+ 
++void CActiveAESink::SetStreaming(bool streaming)
++{
++  m_extStreaming = streaming;
++  // (Hades: a pause that kept its sound ends when the stream streams again)
++  if (streaming)
++    m_extHeldPause = false;
++}
++
++std::optional<std::chrono::milliseconds> CActiveAESink::HeldSilenceWait()
++{
++  if (!m_extHeldPause || !m_sink || m_requestedFormat.m_dataFormat != AE_FMT_RAW || !m_needIecPack)
++    return std::nullopt;
++  AEDelayStatus status;
++  m_sink->GetDelay(status);
++  const auto wait =
++      AE::PTPAUSE::HeldSilenceWaitMs(status.GetDelay() * 1000, m_sink->GetCacheTotal() * 1000,
++                                     m_sinkFormat.m_streamInfo.GetDuration());
++  if (!wait)
++    return std::nullopt;
++  return std::chrono::milliseconds(static_cast<int>(std::ceil(*wait)));
++}
++
++void CActiveAESink::OutputResumeGap()
++{
++  const SinkResumeGap gap = *m_resumeGap;
++  m_resumeGap.reset();
++  if (!m_sink || m_requestedFormat.m_dataFormat != AE_FMT_RAW || !m_needIecPack)
++    return;
++
++  // what the device holds now plays before the packet; the picture has moved since the engine
++  // reckoned the gap
++  AEDelayStatus status;
++  m_sink->GetDelay(status);
++  const double deviceMs = status.GetDelay() * 1000;
++  const double sinceMs =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gap.at).count();
++  double leftMs = AE::PTPAUSE::GapMs(gap.aheadMs, sinceMs, deviceMs);
++  CLog::LogF(LOGINFO,
++             "the passthrough stream resumes after a pause of {:.0f} ms (the sound played with the "
++             "picture stopped less what the picture moved, {:.0f} ms; {:.0f} ms since; the device "
++             "holds {:.0f} ms)",
++             leftMs, gap.aheadMs, sinceMs, deviceMs);
++
++  // in pauses of a frame of the stream at most, as a correction of the sync has them
++  const int silence = m_sampleOfSilence.pkt->pause_burst_ms;
++  const int frameMs = static_cast<int>(m_sinkFormat.m_streamInfo.GetDuration());
++  for (int piece = AE::PTPAUSE::GapPiece(leftMs, frameMs); piece > 0 && !m_extError;
++       piece = AE::PTPAUSE::GapPiece(leftMs, frameMs))
++  {
++    m_sampleOfSilence.pkt->pause_burst_ms = piece;
++    OutputSamples(&m_sampleOfSilence);
++    leftMs -= piece;
++  }
++  m_sampleOfSilence.pkt->pause_burst_ms = silence;
++}
++
+ unsigned int CActiveAESink::OutputSamples(CSampleBuffer* samples)
+ {
+   uint8_t **buffer = samples->pkt->data;
+@@ -1459,7 +1581,9 @@ unsigned int CActiveAESink::OutputSamples(CSampleBuffer* samples)
+       else if (samples->pkt->pause_burst_ms > 0)
+       {
+         // construct a pause burst if we have already output valid audio
+-        bool burst = m_extStreaming && (m_packer->GetBuffer()[0] != 0);
++        // (Hades: also while a pause keeps the sound of the stream, PassthroughPause.h)
++        bool burst =
++            AE::PTPAUSE::AsBursts(m_extStreaming, m_extHeldPause, m_packer->GetBuffer()[0]);
+         if (!m_packer->PackPause(m_sinkFormat.m_streamInfo, samples->pkt->pause_burst_ms, burst))
+           skipSwap = true;
+       }
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+index fe78590..8823681 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+@@ -22,7 +22,9 @@
+ #include "utils/ActorProtocol.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <memory>
++#include <optional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -50,6 +52,16 @@ struct SinkReply
+   bool hasVolume;
+ };
+ 
++//! Hades: a passthrough stream held at its pause resumes (CActiveAE::ResumeRawStream(), RESUMEGAP):
++//! what the device played after the picture stopped, less what the picture moved before the engine
++//! heard of the resume, ms, and when it did. The sink puts what is left of it, less what the device
++//! holds, as a pause before the next packet it writes (PassthroughPause.h, GapMs()).
++struct SinkResumeGap
++{
++  double aheadMs{0};
++  std::chrono::steady_clock::time_point at;
++};
++
+ class CSinkControlProtocol : public Protocol
+ {
+ public:
+@@ -69,6 +81,15 @@ public:
+     TIMEOUT,
+     SETSILENCETIMEOUT,
+     SETNOISETYPE,
++    //! Hades: a passthrough stream is paused with its sound kept (CActiveAE::HoldRawStream()):
++    //! the packets not written go back unwritten (RETURNUNWRITTEN), in order; the answer is what
++    //! the device holds (AEDelayStatus), and the silence of the pause goes out as pause bursts
++    HOLD,
++    //! Hades: it resumes: a pause goes before the next packet written (SinkResumeGap)
++    RESUMEGAP,
++    //! Hades: what the engine kept at the pause was let go (a seek, a stop, the output opened
++    //! again): the silence goes out as after a pause that keeps nothing
++    HOLDDROPPED,
+   };
+   enum InSignal
+   {
+@@ -94,6 +115,8 @@ public:
+   {
+     RETURNSAMPLE,
+     ACC,
++    //! Hades: a packet given back without having been written, at a pause that keeps them (HOLD)
++    RETURNUNWRITTEN,
+   };
+ };
+ 
+@@ -161,7 +184,15 @@ protected:
+   void GetDeviceFriendlyName(const std::string& device);
+   void OpenSink();
+   void CloseSink(bool drain = true);
+-  void ReturnBuffers();
++  //! \param unwritten (Hades) given back as RETURNUNWRITTEN, for a pause that keeps them (HOLD)
++  void ReturnBuffers(bool unwritten = false);
++  //! Hades: m_extStreaming, which ends a pause that keeps its packets (m_extHeldPause)
++  void SetStreaming(bool streaming);
++  //! Hades: the pause that goes before the first packet after a resume (m_resumeGap)
++  void OutputResumeGap();
++  //! Hades: while a pause keeps the sound, how long the silence that keeps the device alive waits
++  //! before its next frame (PassthroughPause.h, HeldSilenceWaitMs()); nullopt: now
++  std::optional<std::chrono::milliseconds> HeldSilenceWait();
+   void SetSilenceTimer();
+   bool NeedIECPacking();
+ 
+@@ -180,6 +211,12 @@ protected:
+   std::chrono::milliseconds m_extSilenceTimeout;
+   bool m_extAppFocused;
+   bool m_extStreaming;
++  //! Hades: a passthrough stream is paused with its packets kept (HOLD): the silence that keeps the
++  //! device alive goes out as pause bursts, which keep the receiver on the stream, until it streams
++  //! again (PassthroughPause.h, AsBursts())
++  bool m_extHeldPause{false};
++  //! Hades: it resumed: the pause to put before the next packet written (RESUMEGAP)
++  std::optional<SinkResumeGap> m_resumeGap;
+   bool m_extReserved{false};
+   std::chrono::duration<double> m_reservedCacheTotal{};
+   std::chrono::duration<double> m_reservedLatency{};
+diff --git a/xbmc/cores/AudioEngine/Utils/PassthroughPause.h b/xbmc/cores/AudioEngine/Utils/PassthroughPause.h
+new file mode 100644
+index 0000000..d833e32
+--- /dev/null
++++ b/xbmc/cores/AudioEngine/Utils/PassthroughPause.h
+@@ -0,0 +1,176 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++// Hades: a stream passed through (IEC 61937) that is paused and resumed without losing or
++// repeating any of its sound.
++//
++// What Kodi does. A pause flushes the engine (CActiveAE, PAUSESTREAM): every packet sent to the
++// sink and not yet written to the device goes back to its pool, unplayed. For TrueHD, which the
++// engine does not hold to its water level, that is all the stream had buffered, 380 to 480 ms; for
++// the others about 200 ms. What the device holds plays out (up to 200 ms at 192 kHz, the buffer of
++// the ALSA sink) with the picture already stopped, and then the sink feeds the device silence
++// (zeros, not pause bursts) for as long as the setting that keeps the device alive says. The resume
++// starts the sync again as for a new stream (SYNC_START): the packets that come first are turned
++// into pauses while the error is averaged (SYNC_MUTE), and then the error of the packets lost at
++// the pause is corrected with more pauses. The sound picks up hundreds of milliseconds further on
++// than where it stopped, and the decoder of the receiver gets a stream with a hole in it.
++//
++// What this does, for a passthrough stream that the sink packs itself (CActiveAE::HoldRawStream(),
++// ResumeRawStream(), CActiveAESink, HOLD and RESUMEGAP):
++//  - at the pause the sink gives back, in order and unwritten, every packet it had not written
++//    (RETURNUNWRITTEN), and tells what the device holds; the engine keeps copies of them, packets
++//    and the pauses between them, in the order the device would have played them, and gives the
++//    packets back to the pool of the stream as a flush would (the player feeds it as before);
++//  - while paused, the silence that keeps the device alive goes out as IEC 61937 pause bursts,
++//    which keep the receiver on the stream, muted, as a correction of the sync does;
++//  - at the resume the kept packets go out first, then what the stream had, and the stream takes
++//    up its sync where it was (no SYNC_START, no packet turned into a pause). The sound that the
++//    device played after the picture stopped is not played again: just before it writes the first
++//    packet the sink puts a pause in front of it, long enough that the sound goes on at the place
++//    it would have reached with the picture (GapMs());
++//  - a stream in sync is held to the band of a correction (30 ms) at its first average after the
++//    resume (CActiveAE::SyncStream()): a resume that the reckoning got wrong is corrected once,
++//    and said.
++// A seek, a flush, a change of the output and a stop let the kept packets go, as before. Nothing of
++// this runs for PCM, nor for a sink that takes the stream unpacked.
++//
++// Nothing of Kodi is included: the reckoning is tested on the host (TestPassthroughPause.cpp).
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdint>
++#include <optional>
++
++namespace AE
++{
++namespace PTPAUSE
++{
++using Clock = std::chrono::steady_clock;
++
++//! A reading of the video clock, ms, and when it was taken
++struct ClockRead
++{
++  Clock::time_point at;
++  double clockMs{0};
++};
++
++//! A reading older than this tells nothing of when the clock stopped
++constexpr double CLOCK_READ_MAX_AGE_MS = 1000.0;
++
++//! Keeps where the video clock last ran (CActiveAE::RunStages()): when it reached the value it has.
++//! A reading of a clock that has not moved since the last one is of a clock that stands still and
++//! changes nothing. One that moved less than the time since the last reading stopped in between,
++//! after it ran that much: it reached its value then, not at this reading. Any other (a clock that
++//! ran, jumped ahead or went back) is kept as it is.
++inline void NoteClock(std::optional<ClockRead>& last, Clock::time_point at, double clockMs)
++{
++  if (last && clockMs == last->clockMs)
++    return;
++  if (last && clockMs > last->clockMs)
++  {
++    const double since = std::chrono::duration<double, std::milli>(at - last->at).count();
++    const double ran = clockMs - last->clockMs;
++    // (1 ms and 1 % of slack: the clock is adjusted a little to the display)
++    if (ran + 1.0 + since * 0.01 < since)
++    {
++      last = ClockRead{last->at + std::chrono::duration_cast<Clock::duration>(
++                                      std::chrono::duration<double, std::milli>(ran)),
++                       clockMs};
++      return;
++    }
++  }
++  last = ClockRead{at, clockMs};
++}
++
++//! How long, in ms, the video clock has stood still at now, when it reads clockMs: the time since
++//! the last reading of it while it ran, less what it ran after that reading. nullopt when there is
++//! no such reading, when it is too old, or when the clock ran back or faster than time since.
++inline std::optional<double> FrozenFor(const std::optional<ClockRead>& last,
++                                       Clock::time_point now,
++                                       double clockMs)
++{
++  if (!last)
++    return std::nullopt;
++  const double since = std::chrono::duration<double, std::milli>(now - last->at).count();
++  if (since < 0.0 || since > CLOCK_READ_MAX_AGE_MS)
++    return std::nullopt;
++  const double ran = clockMs - last->clockMs;
++  // (1 ms and 5 % of slack: the clock is adjusted a little to the display)
++  if (ran < -1.0 || ran > since * 1.05 + 1.0)
++    return std::nullopt;
++  return std::clamp(since - ran, 0.0, since);
++}
++
++//! What a packet that the sink gives back unwritten is kept as
++enum class Kept
++{
++  SOUND, //!< a packet of the stream: kept, it is sound to play
++  PAUSE, //!< a pause, of the engine's pool or a packet of the stream turned into one: kept as a pause
++  NOTHING, //!< a packet left out for the sync, which writes nothing: not kept
++  UNKNOWN, //!< of a pool that is not the stream's nor the engine's pauses: nothing is kept
++};
++
++//! \param ofStream it is of the pool of the stream
++//! \param ofSilence it is of the pool of pauses of the engine
++//! \param frames its bytes (nb_samples of a passthrough packet)
++//! \param pauseMs the pause it is (pause_burst_ms)
++inline Kept Classify(bool ofStream, bool ofSilence, int frames, int pauseMs)
++{
++  if (ofStream)
++    return frames > 0 ? Kept::SOUND : (pauseMs > 0 ? Kept::PAUSE : Kept::NOTHING);
++  if (ofSilence)
++    return pauseMs > 0 ? Kept::PAUSE : Kept::NOTHING;
++  return Kept::UNKNOWN;
++}
++
++//! The pause, ms, that goes before the first packet written after a resume.
++//! \param aheadMs what the device played after the picture stopped, less what the picture moved
++//!        before the engine heard of the resume (CActiveAE::ResumeRawStream())
++//! \param sinceResumeMs the time since the engine heard of it: the picture has moved that much more
++//! \param deviceMs what the device holds now, which plays before the packet
++inline double GapMs(double aheadMs, double sinceResumeMs, double deviceMs)
++{
++  return std::max(0.0, aheadMs - sinceResumeMs - deviceMs);
++}
++
++//! The next piece of a pause of leftMs (rounded to whole ms), each at most frameMs, as a correction
++//! of the sync puts its pauses (CActiveAE::SyncStream()); 0 when nothing is left
++inline int GapPiece(double leftMs, int frameMs)
++{
++  const double whole = std::floor(leftMs + 0.5);
++  if (whole < 1.0 || frameMs < 1)
++    return 0;
++  return static_cast<int>(std::min(whole, static_cast<double>(frameMs)));
++}
++
++//! While a pause keeps the sound, the sink feeds the device its silence (pause bursts) no fuller
++//! than three frames under what it holds (cacheMs): what it held of sound when the pause came is
++//! never less than one frame under that, so at the resume the silence in the device is never more
++//! than the sound that played with the picture stopped, and the gap before the sound (GapMs()) is
++//! never less than nothing. nullopt: write the next frame of silence now; else, ms to wait first.
++inline std::optional<double> HeldSilenceWaitMs(double deviceMs, double cacheMs, double frameMs)
++{
++  const double target = std::max(frameMs, cacheMs - 3 * frameMs);
++  if (deviceMs + frameMs <= target)
++    return std::nullopt;
++  return deviceMs + frameMs - target;
++}
++
++//! Whether the sink packs a pause as IEC 61937 pause bursts (else as zeros, which the receiver
++//! takes for the end of the stream): while a stream plays, and while a stream is paused with its
++//! sound kept (held), once the sink has packed something of the stream (firstByte, the first byte
++//! of the last packet the packer made, is not 0)
++inline bool AsBursts(bool streaming, bool held, uint8_t firstByte)
++{
++  return (streaming || held) && firstByte != 0;
++}
++} // namespace PTPAUSE
++} // namespace AE
+diff --git a/xbmc/cores/AudioEngine/Utils/test/CMakeLists.txt b/xbmc/cores/AudioEngine/Utils/test/CMakeLists.txt
+index f2e9339..9719b1d 100644
+--- a/xbmc/cores/AudioEngine/Utils/test/CMakeLists.txt
++++ b/xbmc/cores/AudioEngine/Utils/test/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(SOURCES TestAEBitstreamPacker.cpp
+             TestAEPackIEC61937.cpp
+             TestAEPcmChannels.cpp
+             TestAEStreamParser.cpp
+-            TestGpuClockHold.cpp)
++            TestGpuClockHold.cpp
++            TestPassthroughPause.cpp)
+ 
+ core_add_test_library(audioengine_utils_test)
+diff --git a/xbmc/cores/AudioEngine/Utils/test/TestPassthroughPause.cpp b/xbmc/cores/AudioEngine/Utils/test/TestPassthroughPause.cpp
+new file mode 100644
+index 0000000..c31998b
+--- /dev/null
++++ b/xbmc/cores/AudioEngine/Utils/test/TestPassthroughPause.cpp
+@@ -0,0 +1,320 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++// PassthroughPause.h: the reckoning of a pause of passthrough that keeps its sound, and what goes
++// out to the receiver around it, packed by the packer of the sink (CAEBitstreamPacker): IEC 61937
++// bursts of the stream, pause bursts while paused and before the sound comes back, nothing else.
++
++#include "cores/AudioEngine/Utils/AEBitstreamPacker.h"
++#include "cores/AudioEngine/Utils/AEStreamInfo.h"
++#include "cores/AudioEngine/Utils/PassthroughPause.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++using namespace AE::PTPAUSE;
++using namespace std::chrono_literals;
++
++namespace
++{
++Clock::time_point At(double ms)
++{
++  return Clock::time_point(std::chrono::microseconds(static_cast<long long>(ms * 1000)));
++}
++
++uint16_t Word(const uint8_t* b, size_t i)
++{
++  uint16_t w;
++  memcpy(&w, b + i * 2, 2);
++  return w;
++}
++
++// a burst of the stream: the preambles, its data type, and the length that the type has
++void ExpectBurst(const uint8_t* b, unsigned int size, unsigned int expectedSize, uint16_t type)
++{
++  ASSERT_EQ(expectedSize, size);
++  EXPECT_EQ(0xF872, Word(b, 0));
++  EXPECT_EQ(0x4E1F, Word(b, 1));
++  EXPECT_EQ(type, Word(b, 2) & 0x1F);
++  EXPECT_NE(0, Word(b, 3));
++}
++
++// pause bursts (IEC 61937-1, data type 3, 32 bits of payload) repeated every period, the first one
++// with the gap in samples of the stream, as long as the pause
++void ExpectPause(const uint8_t* b,
++                 unsigned int size,
++                 unsigned int periodBytes,
++                 unsigned int millis,
++                 unsigned int rate,
++                 unsigned int repetition,
++                 unsigned int encodedRate)
++{
++  const double periodMs = static_cast<double>(repetition) / rate * 1000;
++  const unsigned int periods = static_cast<unsigned int>(millis / periodMs);
++  ASSERT_EQ(periods * periodBytes, size);
++  for (unsigned int p = 0; p < periods; ++p)
++  {
++    const uint8_t* q = b + p * periodBytes;
++    ASSERT_EQ(0xF872, Word(q, 0)) << "period " << p;
++    ASSERT_EQ(0x4E1F, Word(q, 1)) << "period " << p;
++    ASSERT_EQ(3, Word(q, 2)) << "period " << p;
++    ASSERT_EQ(32, Word(q, 3)) << "period " << p;
++  }
++  EXPECT_EQ(static_cast<uint16_t>(encodedRate * millis / 1000), Word(b, 4));
++}
++
++struct Format
++{
++  CAEStreamInfo::DataType type;
++  unsigned int frameBytes; // the packet of the stream given to the packer
++  unsigned int burstBytes; // the burst it is packed in
++  uint16_t dataType;
++  unsigned int repetition; // of a pause burst, in frames
++  int frameMs; // GetDuration(), whole
++};
++
++CAEStreamInfo Info(const Format& f)
++{
++  CAEStreamInfo info;
++  info.m_type = f.type;
++  info.m_sampleRate = 48000;
++  info.m_channels = 2;
++  info.m_repeat = 1;
++  info.m_dtsPeriod = 2048;
++  return info;
++}
++
++const Format FORMATS[] = {
++    {CAEStreamInfo::STREAM_TYPE_AC3, 1792, 6144, 0x01, 3, 32},
++    {CAEStreamInfo::STREAM_TYPE_EAC3, 2560, 24576, 0x15, 4, 32},
++    {CAEStreamInfo::STREAM_TYPE_TRUEHD, 61440, 61440, 0x16, 4, 20},
++    {CAEStreamInfo::STREAM_TYPE_DTSHD_MA, 3000, 8192, 0x11, 3, 10},
++};
++} // namespace
++
++TEST(TestPassthroughPause, TheClockIsNotedOnlyWhileItRuns)
++{
++  std::optional<ClockRead> last;
++  NoteClock(last, At(0), 1000.0);
++  ASSERT_TRUE(last);
++  NoteClock(last, At(20), 1020.0);
++  EXPECT_EQ(At(20), last->at);
++  // it stopped: the reading of before stays
++  NoteClock(last, At(40), 1020.0);
++  NoteClock(last, At(60), 1020.0);
++  EXPECT_EQ(At(20), last->at);
++  EXPECT_DOUBLE_EQ(1020.0, last->clockMs);
++}
++
++TEST(TestPassthroughPause, TheClockStoppedBetweenTwoReadings)
++{
++  // read at 20 ms; at 52 ms it has run 10 ms only: it reached that at 30 ms and stood since
++  std::optional<ClockRead> last = ClockRead{At(20), 1020.0};
++  NoteClock(last, At(52), 1030.0);
++  EXPECT_EQ(At(30), last->at);
++  EXPECT_NEAR(22.0, *FrozenFor(last, At(52), 1030.0), 1e-9);
++  // and later readings of the clock standing still change nothing
++  NoteClock(last, At(80), 1030.0);
++  EXPECT_NEAR(50.0, *FrozenFor(last, At(80), 1030.0), 1e-9);
++  // a clock that ran (1 % slower), jumped ahead, or went back is taken as it reads
++  last = ClockRead{At(100), 2000.0};
++  NoteClock(last, At(132), 2031.7);
++  EXPECT_EQ(At(132), last->at);
++  NoteClock(last, At(140), 2100.0);
++  EXPECT_EQ(At(140), last->at);
++  NoteClock(last, At(150), 1900.0);
++  EXPECT_EQ(At(150), last->at);
++  EXPECT_DOUBLE_EQ(1900.0, last->clockMs);
++}
++
++TEST(TestPassthroughPause, HowLongTheClockStood)
++{
++  std::optional<ClockRead> last;
++  EXPECT_FALSE(FrozenFor(last, At(100), 1000.0));
++  last = ClockRead{At(100), 1000.0};
++  // read at 100 ms, it ran 30 ms more and then stopped; at 150 ms it has stood 20 ms
++  ASSERT_TRUE(FrozenFor(last, At(150), 1030.0));
++  EXPECT_NEAR(20.0, *FrozenFor(last, At(150), 1030.0), 1e-9);
++  // it never stopped
++  EXPECT_NEAR(0.0, *FrozenFor(last, At(150), 1050.0), 1e-9);
++  // too old a reading, a clock that went back, one that ran faster than time
++  EXPECT_FALSE(FrozenFor(last, At(100 + CLOCK_READ_MAX_AGE_MS + 1), 1030.0));
++  EXPECT_FALSE(FrozenFor(last, At(150), 990.0));
++  EXPECT_FALSE(FrozenFor(last, At(150), 1100.0));
++}
++
++TEST(TestPassthroughPause, WhatAPacketGivenBackIsKeptAs)
++{
++  EXPECT_EQ(Kept::SOUND, Classify(true, false, 61440, 0));
++  EXPECT_EQ(Kept::PAUSE, Classify(true, false, 0, 20)); // muted while the sync was measured
++  EXPECT_EQ(Kept::NOTHING, Classify(true, false, 0, 0)); // left out for the sync
++  EXPECT_EQ(Kept::PAUSE, Classify(false, true, 0, 13));
++  EXPECT_EQ(Kept::NOTHING, Classify(false, true, 0, 0));
++  EXPECT_EQ(Kept::UNKNOWN, Classify(false, false, 61440, 0));
++}
++
++TEST(TestPassthroughPause, TheGapBeforeTheSoundComesBack)
++{
++  // 215 ms played with the picture stopped, which moved 3 ms before the engine heard of the resume
++  // and 2 ms more since; the device holds 195 ms of silence: 15 ms more
++  EXPECT_NEAR(15.0, GapMs(212.0, 2.0, 195.0), 1e-9);
++  // the device holds more than that already: none (the sound is late by the rest)
++  EXPECT_DOUBLE_EQ(0.0, GapMs(212.0, 2.0, 230.0));
++  EXPECT_DOUBLE_EQ(0.0, GapMs(-40.0, 0.0, 0.0));
++}
++
++TEST(TestPassthroughPause, TheGapGoesInPiecesOfAFrame)
++{
++  for (const double total : {0.0, 0.4, 0.6, 1.0, 7.3, 19.5, 20.0, 47.0, 212.49})
++  {
++    double left = total;
++    int sum = 0;
++    int pieces = 0;
++    for (int piece = GapPiece(left, 20); piece > 0; piece = GapPiece(left, 20))
++    {
++      EXPECT_LE(piece, 20);
++      sum += piece;
++      left -= piece;
++      ASSERT_LT(++pieces, 100);
++    }
++    EXPECT_EQ(static_cast<int>(std::floor(total + 0.5)), sum) << total;
++  }
++  EXPECT_EQ(0, GapPiece(50.0, 0));
++}
++
++TEST(TestPassthroughPause, TheSilenceOfAPauseStaysUnderTheSoundThatWasThere)
++{
++  // a device of 200 ms, frames of 20: the silence is written up to 140 ms, never past 160
++  EXPECT_FALSE(HeldSilenceWaitMs(100.0, 200.0, 20.0));
++  EXPECT_FALSE(HeldSilenceWaitMs(120.0, 200.0, 20.0));
++  ASSERT_TRUE(HeldSilenceWaitMs(130.0, 200.0, 20.0));
++  EXPECT_NEAR(10.0, *HeldSilenceWaitMs(130.0, 200.0, 20.0), 1e-9);
++  EXPECT_NEAR(40.0, *HeldSilenceWaitMs(160.0, 200.0, 20.0), 1e-9);
++  // the sound held when the pause came (the sink writes it as the device has room for a frame) is
++  // at least 180 ms: more than the silence ever is
++  for (double device = 0; device <= 200.0; device += 0.5)
++  {
++    if (!HeldSilenceWaitMs(device, 200.0, 20.0))
++    {
++      EXPECT_LE(device + 20.0, 200.0 - 20.0 - 20.0);
++    }
++  }
++  // a device too small for that still gets a frame
++  EXPECT_FALSE(HeldSilenceWaitMs(0.0, 40.0, 20.0));
++  EXPECT_TRUE(HeldSilenceWaitMs(10.0, 40.0, 20.0));
++}
++
++TEST(TestPassthroughPause, PauseBurstsWhileTheSoundIsKept)
++{
++  for (const bool streaming : {false, true})
++    for (const uint8_t first : {uint8_t{0}, uint8_t{0x72}, uint8_t{0xF8}})
++    {
++      // not held: as Kodi has it (bool burst = m_extStreaming && (m_packer->GetBuffer()[0] != 0))
++      EXPECT_EQ(streaming && first != 0, AsBursts(streaming, false, first));
++      // held: pause bursts once the stream was packed
++      EXPECT_EQ(first != 0, AsBursts(streaming, true, first));
++    }
++}
++
++// What the sink sends to the receiver around a pause that keeps the sound, for every format: a
++// burst of the stream; while paused, the silence that keeps the device alive, one frame of pause
++// at a time (the packer packs it once and sends the same again); at the resume the gap, in pieces,
++// and then the stream again. Every buffer is a valid IEC 61937 burst, or valid pause bursts.
++TEST(TestPassthroughPause, WhatGoesOutAroundAPauseIsIEC61937)
++{
++  for (const Format& f : FORMATS)
++  {
++    SCOPED_TRACE(f.dataType);
++    CAEStreamInfo info = Info(f);
++    const unsigned int rate = CAEBitstreamPacker::GetOutputRate(info);
++    const unsigned int frameSize = CAEBitstreamPacker::GetOutputChannelMap(info).Count() * 2;
++    const unsigned int periodBytes = f.repetition * frameSize;
++    std::vector<uint8_t> frame(f.frameBytes, 0x5A);
++    frame[5] = 0; // (an AC-3 bitstream mode of 0)
++
++    CAEBitstreamPacker packer;
++    packer.Reset();
++    packer.Pack(info, frame.data(), static_cast<int>(frame.size()));
++    ExpectBurst(packer.GetBuffer(), packer.GetSize(), f.burstBytes, f.dataType);
++
++    // paused, the sound kept: not streaming, held
++    for (int i = 0; i < 3; ++i)
++    {
++      const bool burst = AsBursts(false, true, packer.GetBuffer()[0]);
++      EXPECT_TRUE(burst);
++      EXPECT_EQ(i == 0, packer.PackPause(info, f.frameMs, burst)); // then the same one again
++      ExpectPause(packer.GetBuffer(), packer.GetSize(), periodBytes, f.frameMs, rate, f.repetition,
++                  info.m_sampleRate);
++    }
++
++    // resumed: streaming; a gap of 7 ms and of a frame, then the stream
++    for (const int piece : {7, f.frameMs})
++    {
++      const bool burst = AsBursts(true, false, packer.GetBuffer()[0]);
++      EXPECT_TRUE(burst);
++      packer.PackPause(info, piece, burst);
++      ExpectPause(packer.GetBuffer(), packer.GetSize(), periodBytes, piece, rate, f.repetition,
++                  info.m_sampleRate);
++    }
++    packer.Reset();
++    packer.Pack(info, frame.data(), static_cast<int>(frame.size()));
++    ExpectBurst(packer.GetBuffer(), packer.GetSize(), f.burstBytes, f.dataType);
++  }
++}
++
++// As Kodi has it, the silence of a pause is zeros: no burst, which the receiver takes for the end
++// of the stream (and locks onto it again at the resume).
++TEST(TestPassthroughPause, APauseThatDoesNotKeepTheSoundSendsZerosAsBefore)
++{
++  for (const Format& f : FORMATS)
++  {
++    SCOPED_TRACE(f.dataType);
++    CAEStreamInfo info = Info(f);
++    std::vector<uint8_t> frame(f.frameBytes, 0x5A);
++    frame[5] = 0;
++    CAEBitstreamPacker packer;
++    packer.Pack(info, frame.data(), static_cast<int>(frame.size()));
++    const bool burst = AsBursts(false, false, packer.GetBuffer()[0]);
++    EXPECT_FALSE(burst);
++    packer.PackPause(info, f.frameMs, burst);
++    ASSERT_GT(packer.GetSize(), 0u);
++    const uint8_t* b = packer.GetBuffer();
++    EXPECT_TRUE(std::all_of(b, b + packer.GetSize(), [](uint8_t v) { return v == 0; }));
++  }
++}
++
++// A pause that kept the sound and is let go (a seek, a stop): the packer re-uses its last pause of
++// the same length whatever it is asked for, so the sink resets it (HOLDDROPPED) for the silence
++// that follows to be zeros, as after a pause that keeps nothing.
++TEST(TestPassthroughPause, ThePauseBurstsOfAPauseLetGoAreNotSentOn)
++{
++  for (const Format& f : FORMATS)
++  {
++    SCOPED_TRACE(f.dataType);
++    CAEStreamInfo info = Info(f);
++    std::vector<uint8_t> frame(f.frameBytes, 0x5A);
++    frame[5] = 0;
++    CAEBitstreamPacker packer;
++    packer.Pack(info, frame.data(), static_cast<int>(frame.size()));
++    ASSERT_TRUE(packer.PackPause(info, f.frameMs, AsBursts(false, true, packer.GetBuffer()[0])));
++    ASSERT_EQ(0xF872, Word(packer.GetBuffer(), 0));
++    // let go, not reset: the pause bursts again
++    EXPECT_FALSE(packer.PackPause(info, f.frameMs, AsBursts(false, false, packer.GetBuffer()[0])));
++    EXPECT_EQ(0xF872, Word(packer.GetBuffer(), 0));
++    // reset: zeros
++    packer.Reset();
++    EXPECT_TRUE(packer.PackPause(info, f.frameMs, AsBursts(false, false, packer.GetBuffer()[0])));
++    ASSERT_GT(packer.GetSize(), 0u);
++    const uint8_t* b = packer.GetBuffer();
++    EXPECT_TRUE(std::all_of(b, b + packer.GetSize(), [](uint8_t v) { return v == 0; }));
++  }
++}
+-- 
+2.53.0
+

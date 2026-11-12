@@ -1,0 +1,313 @@
+From 1908e7a62f3a9c962cf51d7b87746a36e626f42f Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 17:25:38 +0000
+Subject: [PATCH] windowing/gbm, VideoRenderers: leave the GUI pass out while a
+ subtitle stays
+
+Where the GUI is composited over the picture (HDR10, HLG, Dolby Vision
+rebuilt as HDR10, native Dolby Vision output), the GUI pass of a frame is
+left out where no control is dirty (CDVGuiReuse), but it was not while
+subtitles or the debug information were on screen: they were "not left to
+the dirty regions alone". With a text subtitle on screen the pass was drawn
+in every frame: the FBO cleared, the line drawn again and the FBO
+composited over the whole window, for as long as the line stayed. With the
+PGS of an HDR video, which is drawn with the picture and not in the GUI
+pass, the walk of every control was kept for nothing.
+
+Subtitles do mark the GUI dirty where they change: libass tells a change
+(detect_change) and a bitmap that arrives has no texture yet
+(CRenderer::PrepareOverlays()), and a mark made after the windows were
+processed takes the skip back in that frame (CApplication::FrameMove(),
+MarkedSinceProcess()). What nothing told was a subtitle that goes without
+another coming: one of two bitmaps that ends, text subtitles that are turned
+off. PrepareOverlays() now keeps the set of the subtitles on screen
+(OverlayVisibleSet.h: the bitmap overlays, and whether libass gave images)
+and marks the GUI dirty where it is not the set of the frame before, which
+also covers the last bitmap that goes (the flag that did that is gone).
+
+The fact that keeps the pass in every frame is then the debug information
+alone, which changes without marking anything (SetGuiPassDebug()). A
+subtitle is drawn in the frame it comes with, and while it stays the pass is
+left out: the FBO of the frame before is what the pass would draw, and it is
+composited under the tile mask of the GUI once that is back, over the band
+of the subtitle instead of the whole window. An animated line (karaoke, a
+move) changes in every frame and has the pass in every frame, as before.
+Native Dolby Vision output takes the same rule: its frames with a subtitle
+stay composed (m_dvOverlays), the packer composites the same GUI texture,
+and its mask is the one of the content of the GUI that was last drawn.
+
+Tests (outside the tree): pgs_reuse_test, a model of the frame with the real
+rule and the real set (a still line; one that comes, changes and goes;
+subtitles turned off; one of two bitmaps that ends; an animated line; the
+OSD over a line; the debug information, and turning it off; the PGS of an
+HDR video), where every frame holds what a pass in every frame would draw,
+the old rule fails on the passes it draws, and mutants without the set,
+without the late mark or without the debug information fail on the frames;
+pgs_reuse_wiring.py, the real code (fails on the tree before); text_frame,
+the frames on llvmpipe and zink, full and limited range, the same bytes as
+a pass in every frame in each case; the other host tests of the GUI reuse and of the frame pass.
+---
+ .../VideoPlayer/VideoRenderers/CMakeLists.txt |  1 +
+ .../VideoRenderers/OverlayRenderer.cpp        | 14 +++--
+ .../VideoRenderers/OverlayRenderer.h          |  9 +--
+ .../VideoRenderers/OverlayVisibleSet.h        | 63 +++++++++++++++++++
+ .../VideoRenderers/RenderManager.cpp          |  4 ++
+ xbmc/windowing/gbm/DVGuiReuse.h               | 14 +++--
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  3 +-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  5 ++
+ 8 files changed, 98 insertions(+), 15 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/OverlayVisibleSet.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index ea8999b..434627a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -12,6 +12,7 @@ set(HEADERS BaseRenderer.h
+             DebugInfo.h
+             OverlayRenderer.h
+             OverlayWholeScale.h
++            OverlayVisibleSet.h
+             OverlayRendererUtil.h
+             RenderFactory.h
+             RenderFlags.h
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+index 593bef9..f732077 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.cpp
+@@ -765,7 +765,7 @@ void CRenderer::PrepareOverlays(int idx)
+   UpdateSubtitlePosition(resolution);
+ 
+   bool doMarkDirty = false;
+-  bool hasImageSpu = false;
++  m_visible.Begin();
+   for (auto& e : m_buffers[idx])
+   {
+     // Clear last frame's cached output; libass may have invalidated the
+@@ -782,10 +782,10 @@ void CRenderer::PrepareOverlays(int idx)
+     // so finding one means it is on screen now. m_textureid == 0 is the
+     // "new arrival" signal (also true every frame for animated PGS where
+     // each frame is a fresh CDVDOverlay). Disappearance is caught after
+-    // the loop by the hasImageSpu vs m_prevHadImageSpu check.
++    // the loop by the set of the subtitles on screen (Hades: m_visible).
+     if (o.IsOverlayType(DVDOVERLAY_TYPE_IMAGE) || o.IsOverlayType(DVDOVERLAY_TYPE_SPU))
+     {
+-      hasImageSpu = true;
++      m_visible.Bitmap(&o);
+       if (o.m_textureid == 0)
+         doMarkDirty = true;
+       continue;
+@@ -807,6 +807,8 @@ void CRenderer::PrepareOverlays(int idx)
+     int currentChange = 0;
+     e.renderedImages =
+         ovAss.GetLibassHandler()->RenderImage(e.pts, rOpts, m_overlayStyle, &currentChange);
++    if (e.renderedImages)
++      m_visible.Text();
+     if (currentChange > 0)
+     {
+       // Persist on the overlay so a skipped GUI render does not drop the change.
+@@ -818,9 +820,11 @@ void CRenderer::PrepareOverlays(int idx)
+   // PGS/DVB/SPU disappearance: arrival is caught by m_textureid==0 in
+   // the loop above. Without this, a PGS subtitle ending leaves its
+   // cached bitmap on the GUI plane until something else dirties.
+-  if (hasImageSpu != m_prevHadImageSpu)
++  // Hades: ... as does one of several that ends, or text subtitles that are turned off: the set of
++  // the subtitles on screen is not that of the frame before (the GUI pass that is left out where
++  // nothing is dirty relies on it, CDVGuiReuse)
++  if (m_visible.Changed())
+     doMarkDirty = true;
+-  m_prevHadImageSpu = hasImageSpu;
+ 
+   if (doMarkDirty)
+     MarkDirty();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+index fe68d55..a9fab37 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayRenderer.h
+@@ -10,6 +10,7 @@
+ #pragma once
+ 
+ #include "BaseRenderer.h"
++#include "OverlayVisibleSet.h"
+ #include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h"
+ #include "cores/VideoPlayer/DVDSubtitles/SubtitlesStyle.h"
+ #include "settings/SubtitlesSettings.h"
+@@ -352,9 +353,9 @@ namespace OVERLAY {
+     std::atomic<bool> m_isSettingsChanged{false};
+     // Set by OnViewChange; the subtitle baseline must then be recomputed
+     std::atomic<bool> m_isViewChanged{false};
+-    // Whether last frame had any image/SPU overlay. Used by PrepareOverlays
+-    // to detect arrival/disappearance transitions (image/SPU have no
+-    // per-frame change signal of their own, unlike libass detect_change).
+-    bool m_prevHadImageSpu{false};
++    // Hades: the subtitles on screen in the frame before, for PrepareOverlays() to tell their
++    // arrival and disappearance (image/SPU have no per-frame change signal of their own, unlike
++    // libass detect_change; and text subtitles that are turned off say nothing): OverlayVisibleSet.h
++    CVisibleSet m_visible;
+   };
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/OverlayVisibleSet.h b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayVisibleSet.h
+new file mode 100644
+index 0000000..2a4f1ff
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/OverlayVisibleSet.h
+@@ -0,0 +1,63 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <vector>
++
++namespace OVERLAY
++{
++
++/*!
++ * \brief Hades: which subtitles are on screen in a frame, to tell that they changed
++ *
++ * The GUI pass of a frame draws the subtitles that are not drawn with the picture, and where the
++ * GUI pass of a frame can be left out (where nothing is dirty: the dirty-driven skip of
++ * CApplication::FrameMove(), CDVGuiReuse) a subtitle that changes has to mark the GUI dirty itself,
++ * or the frame before is shown again. A text subtitle says that it changed (libass's detect_change),
++ * and a bitmap subtitle that arrives is a new overlay with no texture yet; what neither says is a
++ * subtitle that goes without another coming: one of two bitmap overlays that ends, text subtitles
++ * that are turned off (their overlay is no longer given to the frame). So the frame's set is kept:
++ * the bitmap overlays on screen, in the order the player gives them, and whether text subtitles
++ * gave images; a set that is not the one of the frame before is a change.
++ *
++ * Kept from one frame to the next without allocating once the vectors have grown.
++ */
++class CVisibleSet
++{
++public:
++  //! The subtitles of a frame begin
++  void Begin()
++  {
++    m_now.clear();
++    m_text = false;
++  }
++
++  //! A bitmap overlay (PGS, DVB, DVD SPU) is on screen in this frame
++  void Bitmap(const void* overlay) { m_now.push_back(overlay); }
++
++  //! Text subtitles gave images for this frame
++  void Text() { m_text = true; }
++
++  //! Whether the set of this frame is not the one of the frame before; it becomes the one before
++  bool Changed()
++  {
++    const bool changed = m_now != m_last || m_text != m_lastText;
++    m_last.swap(m_now);
++    m_lastText = m_text;
++    return changed;
++  }
++
++private:
++  std::vector<const void*> m_now;
++  std::vector<const void*> m_last;
++  bool m_text{false};
++  bool m_lastText{false};
++};
++
++} // namespace OVERLAY
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 04349bb..49e51a0 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -728,6 +728,10 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+     if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem()))
+     {
+       window->SetDVBridgeOverlays(m_renderDebug || m_overlays.HasVisibleOverlay(m_presentsource));
++      // Hades: ... and whether the debug information is, which changes without marking the GUI
++      // dirty: the GUI pass is not left out under it (CDVGuiReuse; the subtitles mark it where they
++      // change, OVERLAY::CRenderer::PrepareOverlays())
++      window->SetGuiPassDebug(m_renderDebug);
+       // Hades: the GUI pass was left out (CWinSystemGbmGLESContext::GuiPassReusable()): it is the
+       // one that updates the renderer's areas (a change of view mode, of the window), so it is
+       // done here
+diff --git a/xbmc/windowing/gbm/DVGuiReuse.h b/xbmc/windowing/gbm/DVGuiReuse.h
+index b080060..d46c80e 100644
+--- a/xbmc/windowing/gbm/DVGuiReuse.h
++++ b/xbmc/windowing/gbm/DVGuiReuse.h
+@@ -40,12 +40,15 @@ namespace GBM
+  * the setting, a GUI that is not composited, an FBO
+  * that was made after the last frame was drawn (or has not been drawn into yet), the menus in
+  * Dolby Vision (their frames are made of the FBO), partial redraws (the FBO would hold only what
+- * changed), stereoscopic 3D (two passes), overlays on the picture that are drawn in the GUI pass
+- * (subtitles, the debug information of the player: they are not left to the dirty regions alone),
++ * changed), stereoscopic 3D (two passes), the debug information of the player over the picture
++ * (it changes without marking anything dirty),
+  * a frame with the GUI that was not seen yet by the picture's pass (what it was over was not
+  * known), a frame before without a picture of the video drawn by RenderEx() (graphics of a disc
+  * menu without a picture are drawn by the GUI pass). A capture marks the window manager dirty
+- * itself (CApplication::FrameMove()).
++ * itself (CApplication::FrameMove()). Subtitles are no reason: they mark the GUI dirty where they
++ * come, change or go (OVERLAY::CRenderer::PrepareOverlays(), OverlayVisibleSet.h), and a mark made
++ * after the windows were processed takes the skip back in that frame (CApplication::FrameMove()),
++ * so the GUI pass is drawn for a subtitle in the frame it comes with, and left out while it stays.
+  */
+ class CDVGuiReuse
+ {
+@@ -59,7 +62,7 @@ public:
+     bool menus = false; //!< the menus in Dolby Vision are on, or the setting is
+     bool partial = false; //!< advancedsettings.xml asks for partial redraws
+     bool stereo = false; //!< a stereoscopic mode
+-    bool overlays = false; //!< subtitles or the debug information are over the picture
++    bool overlays = false; //!< the debug information of the player is over the picture
+     bool seen = false; //!< a frame whose GUI was drawn went through the picture's pass since
+     //!< the FBO was made, and its elements are known
+     bool video = false; //!< RenderEx() drew the picture in the frame before: a disc
+@@ -123,7 +126,8 @@ public:
+       case Why::STEREO:
+         return "a stereoscopic mode";
+       case Why::OVERLAYS:
+-        return "subtitles or the debug information are over the picture";
++        return "the debug information of the player is over the picture (subtitles mark the GUI "
++               "dirty where they change)";
+       case Why::NOT_SEEN:
+         return "no frame of the GUI has been seen by the picture's pass yet";
+       case Why::NO_VIDEO:
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 9f6e9d3..9de5696 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -6819,7 +6819,8 @@ CDVGuiReuse::Facts CWinSystemGbmGLESContext::GuiReuseFacts() const
+   f.partial = DVMenusPartialRedraws();
+   f.stereo = const_cast<CWinSystemGbmGLESContext*>(this)->GetGfxContext().GetStereoMode() !=
+              RenderStereoMode::OFF;
+-  f.overlays = m_dvOverlays;
++  // (Hades: the debug information; the subtitles mark the GUI dirty where they change)
++  f.overlays = m_guiPassDebug;
+   f.seen = m_guiSeen;
+   f.video = m_guiVideoLast;
+   return f;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 335d658..bfd70d0 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -167,6 +167,8 @@ public:
+   //! COutputHandover::TakeOverFailure() says why in the log); "" otherwise
+   const char* DVBeginRejectedCode() const { return m_dvBeginCode; }
+   void SetDVBridgeOverlays(bool visible) { m_dvOverlays = visible; }
++  //! Hades: the debug information of the player is over the picture (CDVGuiReuse::Facts::overlays)
++  void SetGuiPassDebug(bool on) { m_guiPassDebug = on; }
+   bool DVBridgeCaptured() const { return m_outputHandover.HoldsOutput(); }
+   //! (not while the restoration waits for the change of mode after a video: no frame is there)
+   bool HasCaptureFramebuffer() const override
+@@ -909,6 +911,9 @@ private:
+   bool m_dvFrame = false;
+   double m_dvFramePts = DVD_NOPTS_VALUE; //!< picture prepared by RenderDVBridge()
+   bool m_dvOverlays = true;
++  //! Hades: the debug information of the player was over the picture of the last frame drawn
++  //! (SetGuiPassDebug()), taken to be until a frame says otherwise
++  bool m_guiPassDebug = true;
+   GLint m_dvOverlayFramebuffer = 0;
+   GLint m_dvOverlayViewport[4]{};
+   bool m_dvOverlayScissor = false;
+-- 
+2.53.0
+

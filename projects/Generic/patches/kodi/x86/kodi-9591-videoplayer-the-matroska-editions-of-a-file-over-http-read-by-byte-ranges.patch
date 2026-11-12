@@ -1,0 +1,2147 @@
+From 09b3ea8c130d459096e846c96d12d3c2522a5db1 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 01:43:14 +0000
+Subject: [PATCH] VideoPlayer: the Matroska editions of a file over HTTP, read
+ by byte ranges
+
+The previous commit read the editions only of files on this device or
+the local network, so the question was never asked for what is played
+most: the files of add-ons over HTTP. They are read again, but only what
+names the editions, and still without blocking the interface.
+
+- A file over HTTP (http, https, dav, davs; for an add-on's item the URL
+  it resolved to, CApplicationPlay::ResolvePath(), never a plugin://
+  path) is read by byte ranges (MatroskaHttpRange.h). First a HEAD with
+  "Range: bytes=0-65535": the server accepts ranges if it answers 206
+  with a Content-Range that gives the length of the file, or 200 with
+  "Accept-Ranges: bytes" and a Content-Length; otherwise nothing of the
+  file is downloaded, and kodi.log says so. Then GETs of bounded ranges,
+  each a 206 of exactly the range asked, without a content coding:
+  anything else is refused at its first byte, and a body longer than
+  asked where it passes that length. An HTTP error (429, 403...) or a
+  network error ends the reading and the file plays as it is stored:
+  nothing is ever asked again.
+- What is read (MatroskaHeaderRead.h): the EBML header and the start of
+  the Segment, 64 KiB; then only the elements that the SeekHead points
+  to and that are needed: the Chapters and the Info where they are not
+  in that range, a SeekHead it points to while one of those is missing,
+  and Tags only where an edition is named by a tag (16 KiB a request
+  where the size of the element is not known yet). 1 MiB at most in all:
+  Chapters that do not fit are not read. Element for element as
+  matroskadec.c with ffmpeg-9940 reads them, so that MKV_EDITIONS::Parse()
+  gives the File that the player's demuxer gives.
+- No connection more. CCurlFile's sessions are kept by protocol and
+  server (DllLibCurlGlobal::easy_acquire()), and curl keeps the
+  connections in the multi handle of the session. The reading takes the
+  session as CCurlFile::Open() takes it, with Kodi's own options
+  (SetCommonOptions()), and releases it: the player's own opening of the
+  file takes the same session and finds the connection open, if it comes
+  within the 30 s after which an idle session is closed (CheckIdle()) and
+  before the server closes it. The transfers of the reading end as whole
+  responses, which leave the connection open.
+- The busy dialog, its cancel and the 10 s deadline stay; over HTTP the
+  reading itself stops within 100 ms of either. What was read of a path
+  is kept for the session, the last 32 (a resume does not read it
+  again); a reading the user cancelled is not kept.
+- A file without editions that FFmpeg's demuxer opens is now read, with
+  none (it was "could not read").
+- Kodi closing: CApplication::Stop() tells every reading left running to
+  stop and waits for it (MKV_EDITIONS::StopReadings()), before the
+  network services and the SMB client go away: over HTTP within 100 ms
+  (2 s at most), on SMB or NFS until its call to the server returns, at
+  the timeout of that client (30 s by default), so that it never uses
+  the SMB client that is freed right after. One still running after that
+  is said in the log.
+
+Measured on the host (http_read_test: the reader and the transport as
+Kodi builds them, against a local server in a network namespace of the
+test, with an easy and a multi handle of libcurl kept as Kodi keeps its
+sessions): a file with the Chapters at the start, 43 MB, 2 requests and
+65536 bytes; with the Chapters at the end, after a 5 MB attachment and
+40 MB, 3 requests and 66148 bytes; the reading and the player's opening
+on one connection; a server without ranges, the HEAD only and no byte of
+the file; 429 and 403, one request each and never again; a server that
+does not answer, ended at the deadline, or 300 ms after the stop. The
+keys and values exported are those of mkvdump with ffmpeg-9940 on the
+same files, also where matroskadec.c has its own ways (a TimestampScale
+of 0, the last of two EditionStrings, an integer without bytes, a NUL in
+a title, the TagTargets of a Tag, a nested ChapterAtom, two Chapters
+elements); 16 mutations make the test fail. Not run in Kodi on a device.
+---
+ xbmc/application/Application.cpp              |   4 +
+ xbmc/cores/VideoPlayer/CMakeLists.txt         |   1 +
+ .../VideoPlayer/DVDDemuxers/CMakeLists.txt    |   1 +
+ .../DVDDemuxers/MatroskaHeaderRead.h          | 970 ++++++++++++++++++
+ .../VideoPlayer/MatroskaEditionChoice.cpp     | 440 ++++++--
+ .../cores/VideoPlayer/MatroskaEditionChoice.h |  22 +-
+ xbmc/cores/VideoPlayer/MatroskaHttpRange.h    | 425 ++++++++
+ 7 files changed, 1768 insertions(+), 95 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDDemuxers/MatroskaHeaderRead.h
+ create mode 100644 xbmc/cores/VideoPlayer/MatroskaHttpRange.h
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index f5764f3..a54f422 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -2158,6 +2158,10 @@ bool CApplication::Stop(int exitCode)
+     // cancel any jobs from the jobmanager
+     CServiceBroker::GetJobManager()->CancelJobs();
+ 
++    // Hades: the readings of a Matroska file's editions that were left running (cancelled, or past
++    // their deadline) stop before the network services and the SMB client below go away
++    MKV_EDITIONS::StopReadings();
++
+     CServiceBroker::GetAppMessenger()->Cleanup();
+ 
+     m_ServiceManager->GetNetwork().NetworkMessage(CNetworkBase::SERVICES_DOWN, 0);
+diff --git a/xbmc/cores/VideoPlayer/CMakeLists.txt b/xbmc/cores/VideoPlayer/CMakeLists.txt
+index b3dabc7..7261729 100644
+--- a/xbmc/cores/VideoPlayer/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/CMakeLists.txt
+@@ -48,6 +48,7 @@ set(HEADERS AudioSinkAE.h
+             IVideoPlayer.h
+             LivePassthrough.h
+             MatroskaEditionChoice.h
++            MatroskaHttpRange.h
+             MultiviewChoice.h
+             MultiviewDisc.h
+             PTSTracker.h
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+index fe565e7..30c7385 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+@@ -36,6 +36,7 @@ set(HEADERS BlurayOffsetMetadata.h
+             DVDDemuxClient.h
+             DVDDemuxFFmpeg.h
+             MatroskaEditions.h
++            MatroskaHeaderRead.h
+             DVDDemuxUtils.h
+             DVDDemuxVobsub.h
+             DVDFactoryDemuxer.h)
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/MatroskaHeaderRead.h b/xbmc/cores/VideoPlayer/DVDDemuxers/MatroskaHeaderRead.h
+new file mode 100644
+index 0000000..4fbbb37
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/MatroskaHeaderRead.h
+@@ -0,0 +1,970 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++// What FFmpeg's Matroska demuxer exports of the editions of a file (the "editions" option of
++// ffmpeg-9940) and the duration it gives, read from the bytes of the file in ranges: for a file
++// over HTTP (MatroskaHttpRange.h), where every range is a request and a transfer. Read: the EBML
++// header and the start of the Segment (FIRST_BYTES), then only the elements that the SeekHead
++// points to and that are needed: the Chapters and the Info where they are not at the start, a
++// SeekHead that the first one points to while one of those is still missing, and Tags only where
++// an edition is named by a tag. MAX_BYTES at most in all.
++//
++// Element for element as matroskadec.c reads them: an unsigned integer or a float without bytes is
++// its default (ebml_read_uint(), ebml_read_float()); the integers and floats of a master element
++// start from their defaults at each occurrence of it (ebml_parse_nest()), and of an element that is
++// not a list the last one is kept; a string ends at its first NUL; of the level-1 elements the
++// first Info and the first Chapters are read, the ones before the first Cluster first and then
++// those that the SeekHead points to, in its order (an entry for one of them that comes after it is
++// not followed), and every Tags; a nested ChapterAtom is not read; the EBML header is refused as
++// matroska_read_header() refuses it. MKV_EDITIONS::Parse() of what this exports gives the File that
++// the player's demuxer gives (host test: the same keys and values as mkvdump of the same file).
++//
++// Where the two could differ, this reads nothing more and the file plays as it is stored, or the
++// editions are offered without a name: a Chapters or Info element that the demuxer finds by
++// reading on from the start beyond FIRST_BYTES and that the SeekHead does not point to (not
++// found); an entry of the SeekHead that points to another element than it says (not followed); a
++// file malformed where the demuxer would carry on (not read); Tags that do not fit in what is left
++// (tagsSkipped).
++//
++// Pure: no Kodi, curl or FFmpeg, so that a host test can run it.
++
++#include "MatroskaEditions.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <map>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
++#include <vector>
++
++namespace MKV_EDITIONS::HEADER
++{
++
++//! The first range: the EBML header and the start of the Segment
++constexpr int64_t FIRST_BYTES = 64 * 1024;
++//! The range for an element whose size is not known yet (its header comes with it)
++constexpr int64_t ELEMENT_BYTES = 16 * 1024;
++//! All the bytes read of one file, at most
++constexpr int64_t MAX_BYTES = 1024 * 1024;
++
++class ByteSource
++{
++public:
++  virtual ~ByteSource() = default;
++  //! Exactly the bytes [offset, offset + length) of the file, in out. False: they could not be had,
++  //! and nothing more is asked.
++  virtual bool Fetch(int64_t offset, int64_t length, std::string& out) = 0;
++};
++
++enum class Outcome
++{
++  READ, //!< exported is what the demuxer exports (empty: the file has no editions)
++  NOT_MATROSKA, //!< no EBML header and Segment, or a header that matroska_read_header() refuses
++  MALFORMED, //!< an element that is needed is not well formed
++  TOO_LARGE, //!< an element that is needed does not fit in what may be read
++  FETCH_FAILED, //!< the source could not give a range (it says why)
++};
++
++struct Result
++{
++  Outcome outcome = Outcome::MALFORMED;
++  //! the keys and values of the "editions" option of ffmpeg-9940 ("count", "0.uid", "0.0.start"...)
++  std::map<std::string, std::string> exported;
++  //! as ReadEditions() takes it from the demuxer (AVFormatContext::duration / 1000): 0 without one
++  int64_t durationMs = 0;
++  int64_t bytes = 0; //!< asked of the source
++  bool tagsSkipped = false; //!< Tags that could name an edition did not fit in what was left
++  std::string why; //!< for a log line, when not READ
++};
++
++namespace DETAIL
++{
++//! RFC 9559 element IDs, with their length marker, as matroskadec.c compares them
++enum : uint32_t
++{
++  ID_EBML = 0x1A45DFA3,
++  ID_EBMLREADVERSION = 0x42F7,
++  ID_EBMLMAXIDLENGTH = 0x42F2,
++  ID_EBMLMAXSIZELENGTH = 0x42F3,
++  ID_DOCTYPEREADVERSION = 0x4285,
++  ID_SEGMENT = 0x18538067,
++  ID_SEEKHEAD = 0x114D9B74,
++  ID_SEEK = 0x4DBB,
++  ID_SEEKID = 0x53AB,
++  ID_SEEKPOSITION = 0x53AC,
++  ID_INFO = 0x1549A966,
++  ID_TIMESTAMPSCALE = 0x2AD7B1,
++  ID_DURATION = 0x4489,
++  ID_SEGMENTUUID = 0x73A4,
++  ID_CLUSTER = 0x1F43B675,
++  ID_CHAPTERS = 0x1043A770,
++  ID_EDITIONENTRY = 0x45B9,
++  ID_EDITIONUID = 0x45BC,
++  ID_EDITIONFLAGHIDDEN = 0x45BD,
++  ID_EDITIONFLAGDEFAULT = 0x45DB,
++  ID_EDITIONFLAGORDERED = 0x45DD,
++  ID_EDITIONDISPLAY = 0x4520,
++  ID_EDITIONSTRING = 0x4521,
++  ID_CHAPTERATOM = 0xB6,
++  ID_CHAPTERUID = 0x73C4,
++  ID_CHAPTERTIMESTART = 0x91,
++  ID_CHAPTERTIMEEND = 0x92,
++  ID_CHAPTERFLAGHIDDEN = 0x98,
++  ID_CHAPTERFLAGENABLED = 0x4598,
++  ID_CHAPTERSEGMENTUUID = 0x6E67,
++  ID_CHAPTERDISPLAY = 0x80,
++  ID_CHAPSTRING = 0x85,
++  ID_TAGS = 0x1254C367,
++  ID_TAG = 0x7373,
++  ID_TARGETS = 0x63C0,
++  ID_TAGEDITIONUID = 0x63C9,
++  ID_SIMPLETAG = 0x67C8,
++  ID_TAGNAME = 0x45A3,
++  ID_TAGSTRING = 0x4487,
++};
++
++//! AV_NOPTS_VALUE as matroskadec.c keeps a chapter time without a value, in a uint64_t
++constexpr uint64_t NO_TIME = 0x8000000000000000ULL;
++
++struct Header
++{
++  uint32_t id = 0;
++  uint64_t size = 0;
++  bool unknownSize = false;
++  int length = 0; //!< of the ID and the size together
++};
++
++//! The ID (1 to 4 bytes, marker kept) and the size (1 to 8 bytes) of an element at p, from avail
++//! bytes; false: not a whole header there
++inline bool ElementHeader(const uint8_t* p, size_t avail, Header& h)
++{
++  if (avail < 2 || !p[0])
++    return false;
++  int idLength = 1;
++  while (idLength <= 4 && !(p[0] & (0x80 >> (idLength - 1))))
++    idLength++;
++  if (idLength > 4 || static_cast<size_t>(idLength) >= avail)
++    return false;
++  h.id = 0;
++  for (int i = 0; i < idLength; i++)
++    h.id = (h.id << 8) | p[i];
++  const uint8_t* s = p + idLength;
++  if (!s[0])
++    return false;
++  int sizeLength = 1;
++  while (!(s[0] & (0x80 >> (sizeLength - 1))))
++    sizeLength++;
++  if (static_cast<size_t>(idLength + sizeLength) > avail)
++    return false;
++  const unsigned marker = 0x80u >> (sizeLength - 1);
++  uint64_t v = s[0] & (marker - 1);
++  bool allOnes = v == marker - 1;
++  for (int i = 1; i < sizeLength; i++)
++  {
++    v = (v << 8) | s[i];
++    allOnes = allOnes && s[i] == 0xFF;
++  }
++  h.size = v;
++  h.unknownSize = allOnes;
++  h.length = idLength + sizeLength;
++  return true;
++}
++
++//! Every child of a master element whose data is data, in order: onChild(id, its data); false: a
++//! child that is not well formed, or does not fit in its parent (as ebml_parse_elem() refuses it)
++template<typename F>
++bool Children(std::string_view data, F&& onChild)
++{
++  size_t at = 0;
++  while (at < data.size())
++  {
++    Header h;
++    if (!ElementHeader(reinterpret_cast<const uint8_t*>(data.data()) + at, data.size() - at, h) ||
++        h.unknownSize || h.size > data.size() - at - static_cast<size_t>(h.length))
++      return false;
++    if (!onChild(h.id, data.substr(at + h.length, static_cast<size_t>(h.size))))
++      return false;
++    at += h.length + static_cast<size_t>(h.size);
++  }
++  return true;
++}
++
++//! ebml_read_uint(): no bytes, the default; more than 8, not well formed
++inline bool Uint(std::string_view v, uint64_t def, uint64_t& out)
++{
++  if (v.empty())
++  {
++    out = def;
++    return true;
++  }
++  if (v.size() > 8)
++    return false;
++  out = 0;
++  for (const char c : v)
++    out = (out << 8) | static_cast<unsigned char>(c);
++  return true;
++}
++
++//! ebml_read_float(): no bytes, the default; 4 or 8 bytes; otherwise not well formed
++inline bool Float(std::string_view v, double def, double& out)
++{
++  if (v.empty())
++  {
++    out = def;
++    return true;
++  }
++  if (v.size() != 4 && v.size() != 8)
++    return false;
++  uint64_t bits = 0;
++  for (const char c : v)
++    bits = (bits << 8) | static_cast<unsigned char>(c);
++  if (v.size() == 4)
++  {
++    const uint32_t b = static_cast<uint32_t>(bits);
++    float f;
++    std::memcpy(&f, &b, sizeof(f));
++    out = f;
++  }
++  else
++    std::memcpy(&out, &bits, sizeof(out));
++  return true;
++}
++
++//! ebml_read_ascii() keeps the bytes and a NUL after them: as a C string, up to the first NUL
++inline std::string Str(std::string_view v)
++{
++  return std::string(v.substr(0, v.find('\0')));
++}
++
++//! set_hex() of ffmpeg-9940: lowercase, for 1 to 64 bytes
++inline std::optional<std::string> Hex(std::string_view v)
++{
++  if (v.empty() || v.size() > 64)
++    return std::nullopt;
++  static constexpr char digits[] = "0123456789abcdef";
++  std::string s;
++  for (const char c : v)
++  {
++    s += digits[static_cast<unsigned char>(c) >> 4];
++    s += digits[static_cast<unsigned char>(c) & 15];
++  }
++  return s;
++}
++
++//! av_strcasecmp(), ASCII
++inline bool SameNoCase(std::string_view a, std::string_view b)
++{
++  return a.size() == b.size() &&
++         std::equal(a.begin(), a.end(), b.begin(),
++                    [](char x, char y)
++                    {
++                      const auto lower = [](char c)
++                      { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
++                      return lower(x) == lower(y);
++                    });
++}
++
++struct ChapterRead
++{
++  uint64_t start = NO_TIME;
++  uint64_t end = NO_TIME;
++  uint64_t uid = 0;
++  uint64_t hidden = 0;
++  uint64_t enabled = 1;
++  std::string segmentUid; // as stored: set_hex() exports 1 to 64 bytes
++  std::optional<std::string> title;
++};
++
++struct EditionRead
++{
++  uint64_t uid = 0;
++  uint64_t hidden = 0;
++  uint64_t isDefault = 0;
++  uint64_t ordered = 0;
++  std::optional<std::string> title; // EditionString: present, even empty, it is the name
++  std::vector<ChapterRead> chapters;
++};
++
++//! matroska_chapter_entry of ffmpeg-9940 (a nested ChapterAtom is not read)
++inline bool ParseChapter(std::string_view data, ChapterRead& ch)
++{
++  return Children(data,
++                  [&ch](uint32_t id, std::string_view v)
++                  {
++                    switch (id)
++                    {
++                      case ID_CHAPTERTIMESTART:
++                        return Uint(v, NO_TIME, ch.start);
++                      case ID_CHAPTERTIMEEND:
++                        return Uint(v, NO_TIME, ch.end);
++                      case ID_CHAPTERUID:
++                        return Uint(v, 0, ch.uid);
++                      case ID_CHAPTERFLAGHIDDEN:
++                        return Uint(v, 0, ch.hidden);
++                      case ID_CHAPTERFLAGENABLED:
++                        return Uint(v, 1, ch.enabled);
++                      case ID_CHAPTERSEGMENTUUID:
++                        ch.segmentUid = std::string(v);
++                        return true;
++                      case ID_CHAPTERDISPLAY:
++                        return Children(v,
++                                        [&ch](uint32_t did, std::string_view dv)
++                                        {
++                                          if (did == ID_CHAPSTRING)
++                                            ch.title = Str(dv);
++                                          return true;
++                                        });
++                      default:
++                        return true;
++                    }
++                  });
++}
++
++//! matroska_chapters and matroska_chapter of ffmpeg-9940
++inline bool ParseChapters(std::string_view data, std::vector<EditionRead>& editions)
++{
++  return Children(data,
++                  [&editions](uint32_t id, std::string_view v)
++                  {
++                    if (id != ID_EDITIONENTRY)
++                      return true;
++                    EditionRead ed;
++                    const bool ok =
++                        Children(v,
++                                 [&ed](uint32_t eid, std::string_view ev)
++                                 {
++                                   switch (eid)
++                                   {
++                                     case ID_EDITIONUID:
++                                       return Uint(ev, 0, ed.uid);
++                                     case ID_EDITIONFLAGHIDDEN:
++                                       return Uint(ev, 0, ed.hidden);
++                                     case ID_EDITIONFLAGDEFAULT:
++                                       return Uint(ev, 0, ed.isDefault);
++                                     case ID_EDITIONFLAGORDERED:
++                                       return Uint(ev, 0, ed.ordered);
++                                     case ID_EDITIONDISPLAY:
++                                       return Children(ev,
++                                                       [&ed](uint32_t did, std::string_view dv)
++                                                       {
++                                                         if (did == ID_EDITIONSTRING)
++                                                           ed.title = Str(dv);
++                                                         return true;
++                                                       });
++                                     case ID_CHAPTERATOM:
++                                     {
++                                       ChapterRead ch;
++                                       if (!ParseChapter(ev, ch))
++                                         return false;
++                                       ed.chapters.push_back(std::move(ch));
++                                       return true;
++                                     }
++                                     default:
++                                       return true;
++                                   }
++                                 });
++                    if (!ok)
++                      return false;
++                    editions.push_back(std::move(ed));
++                    return true;
++                  });
++}
++
++//! One Tag as edition_tag_title() of ffmpeg-9940 looks at it: the TagEditionUID of its TagTargets
++//! (which start from their defaults at each TagTargets), and its SimpleTags (TagName, TagString)
++struct TagRead
++{
++  uint64_t editionUid = 0;
++  std::vector<std::pair<std::optional<std::string>, std::optional<std::string>>> simple;
++};
++
++inline bool ParseTags(std::string_view data, std::vector<TagRead>& tags)
++{
++  return Children(data,
++                  [&tags](uint32_t id, std::string_view v)
++                  {
++                    if (id != ID_TAG)
++                      return true;
++                    TagRead tag;
++                    const bool ok =
++                        Children(v,
++                                 [&tag](uint32_t tid, std::string_view tv)
++                                 {
++                                   if (tid == ID_TARGETS)
++                                   {
++                                     tag.editionUid = 0;
++                                     return Children(tv,
++                                                     [&tag](uint32_t gid, std::string_view gv)
++                                                     {
++                                                       if (gid == ID_TAGEDITIONUID)
++                                                         return Uint(gv, 0, tag.editionUid);
++                                                       return true;
++                                                     });
++                                   }
++                                   if (tid != ID_SIMPLETAG)
++                                     return true;
++                                   std::optional<std::string> name;
++                                   std::optional<std::string> string;
++                                   const bool simpleOk =
++                                       Children(tv,
++                                                [&name, &string](uint32_t sid, std::string_view sv)
++                                                {
++                                                  if (sid == ID_TAGNAME)
++                                                    name = Str(sv);
++                                                  else if (sid == ID_TAGSTRING)
++                                                    string = Str(sv);
++                                                  return true;
++                                                });
++                                   tag.simple.emplace_back(std::move(name), std::move(string));
++                                   return simpleOk;
++                                 });
++                    if (!ok)
++                      return false;
++                    tags.push_back(std::move(tag));
++                    return true;
++                  });
++}
++
++class Reader
++{
++public:
++  Reader(ByteSource& source, int64_t fileSize, int64_t maxBytes)
++    : m_source(source),
++      m_size(fileSize),
++      m_max(maxBytes)
++  {
++  }
++
++  Result Run();
++
++private:
++  enum class Got
++  {
++    OK,
++    NONE, //!< not in the file
++    BUDGET, //!< it does not fit in what is left to read
++    FAILED, //!< the source failed
++    BAD, //!< not a well formed element
++  };
++
++  struct Piece
++  {
++    int64_t offset;
++    std::string data;
++    int64_t End() const { return offset + static_cast<int64_t>(data.size()); }
++  };
++
++  //! the piece that holds offset and goes furthest after it, or -1
++  int PieceAt(int64_t offset) const
++  {
++    int best = -1;
++    for (size_t i = 0; i < m_pieces.size(); i++)
++      if (offset >= m_pieces[i].offset && offset < m_pieces[i].End() &&
++          (best < 0 || m_pieces[i].End() > m_pieces[static_cast<size_t>(best)].End()))
++        best = static_cast<int>(i);
++    return best;
++  }
++
++  //! [offset, offset + length) from the source, within what is left to read
++  Got Fetch(int64_t offset, int64_t length, std::string& bytes)
++  {
++    if (m_bytes + length > m_max)
++      return Got::BUDGET;
++    if (!m_source.Fetch(offset, length, bytes) || static_cast<int64_t>(bytes.size()) != length)
++      return Got::FAILED;
++    m_bytes += length;
++    return Got::OK;
++  }
++
++  Got NewPiece(int64_t offset, int64_t length, int& index)
++  {
++    std::string bytes;
++    const Got g = Fetch(offset, length, bytes);
++    if (g == Got::OK)
++    {
++      m_pieces.push_back({offset, std::move(bytes)});
++      index = static_cast<int>(m_pieces.size()) - 1;
++    }
++    return g;
++  }
++
++  //! piece index read on up to the byte to
++  Got Extend(int index, int64_t to)
++  {
++    Piece& p = m_pieces[static_cast<size_t>(index)];
++    std::string bytes;
++    const Got g = Fetch(p.End(), to - p.End(), bytes);
++    if (g == Got::OK)
++      p.data += bytes;
++    return g;
++  }
++
++  //! The header of the element at pos, from what was read or a new range of ELEMENT_BYTES (to the
++  //! end of the file, within what is left); with data, its data too (the rest of it read if needed)
++  Got Element(int64_t pos, Header& h, std::string* data)
++  {
++    if (pos < 0 || pos >= m_size)
++      return Got::NONE;
++    const int64_t headerMax = std::min<int64_t>(12, m_size - pos);
++    int i = PieceAt(pos);
++    const auto header = [this, pos, &h](int k)
++    {
++      const Piece& p = m_pieces[static_cast<size_t>(k)];
++      return ElementHeader(reinterpret_cast<const uint8_t*>(p.data.data()) + (pos - p.offset),
++                           static_cast<size_t>(p.End() - pos), h);
++    };
++    if (i < 0 || (m_pieces[static_cast<size_t>(i)].End() - pos < headerMax && !header(i)))
++    {
++      const int64_t from = i < 0 ? pos : m_pieces[static_cast<size_t>(i)].End();
++      const int64_t to =
++          std::min({m_size, std::max(pos + ELEMENT_BYTES, from), from + (m_max - m_bytes)});
++      if (to < pos + headerMax)
++        return Got::BUDGET;
++      const Got g = i < 0 ? NewPiece(from, to - from, i) : Extend(i, to);
++      if (g != Got::OK)
++        return g;
++    }
++    if (!header(i))
++      return Got::BAD;
++    if (!data)
++      return Got::OK;
++    if (h.unknownSize || h.size > static_cast<uint64_t>(m_size - pos - h.length))
++      return Got::BAD;
++    const int64_t end = pos + h.length + static_cast<int64_t>(h.size);
++    if (m_pieces[static_cast<size_t>(i)].End() < end)
++      if (const Got g = Extend(i, end); g != Got::OK)
++        return g;
++    const Piece& p = m_pieces[static_cast<size_t>(i)];
++    *data =
++        p.data.substr(static_cast<size_t>(pos + h.length - p.offset), static_cast<size_t>(h.size));
++    return Got::OK;
++  }
++
++  //! the entries of the SeekHead at pos (matroska_seekhead_entry: SeekID, SeekPosition with -1 as
++  //! its default), appended
++  Got SeekHead(int64_t pos)
++  {
++    m_seekHeadsRead.push_back(pos);
++    Header h;
++    std::string data;
++    const Got g = Element(pos, h, &data);
++    if (g != Got::OK)
++      return g == Got::NONE ? Got::OK : g;
++    if (h.id != ID_SEEKHEAD)
++      return Got::OK;
++    std::vector<std::pair<uint64_t, uint64_t>> entries;
++    if (!Children(data,
++                  [&entries](uint32_t id, std::string_view v)
++                  {
++                    if (id != ID_SEEK)
++                      return true;
++                    uint64_t sid = 0;
++                    uint64_t spos = ~uint64_t{0};
++                    const bool ok = Children(v,
++                                             [&sid, &spos](uint32_t eid, std::string_view ev)
++                                             {
++                                               if (eid == ID_SEEKID)
++                                                 return Uint(ev, 0, sid);
++                                               if (eid == ID_SEEKPOSITION)
++                                                 return Uint(ev, ~uint64_t{0}, spos);
++                                               return true;
++                                             });
++                    entries.emplace_back(sid, spos);
++                    return ok;
++                  }))
++      return Got::BAD;
++    m_entries.insert(m_entries.end(), entries.begin(), entries.end());
++    return Got::OK;
++  }
++
++  //! the entries from m_next on, as matroska_execute_seekhead() walks them (CUES and the others are
++  //! not read here): a SeekHead it points to is kept for later
++  void Walk()
++  {
++    for (; m_next < m_entries.size(); m_next++)
++    {
++      const auto [id, rel] = m_entries[m_next];
++      if (id > 0xFFFFFFFFu)
++        continue;
++      const int64_t pos = static_cast<int64_t>(static_cast<uint64_t>(m_segment) + rel);
++      if (pos < m_segment)
++        continue;
++      switch (id)
++      {
++        case ID_INFO:
++          if (!m_infoTaken)
++          {
++            m_infoTaken = true;
++            m_info = pos;
++          }
++          break;
++        case ID_CHAPTERS:
++          if (!m_chaptersTaken)
++          {
++            m_chaptersTaken = true;
++            m_chapters = pos;
++          }
++          break;
++        case ID_TAGS:
++          if (std::find(m_tags.begin(), m_tags.end(), pos) == m_tags.end())
++            m_tags.push_back(pos);
++          break;
++        case ID_SEEKHEAD:
++          if (std::find(m_seekHeadsRead.begin(), m_seekHeadsRead.end(), pos) ==
++                  m_seekHeadsRead.end() &&
++              std::find(m_seekHeadsLater.begin(), m_seekHeadsLater.end(), pos) ==
++                  m_seekHeadsLater.end())
++            m_seekHeadsLater.push_back(pos);
++          break;
++        default:
++          break;
++      }
++    }
++  }
++
++  ByteSource& m_source;
++  const int64_t m_size;
++  const int64_t m_max;
++  int64_t m_bytes = 0;
++  std::vector<Piece> m_pieces;
++  int64_t m_segment = 0;
++  std::vector<std::pair<uint64_t, uint64_t>> m_entries;
++  size_t m_next = 0;
++  std::vector<int64_t> m_seekHeadsRead;
++  std::vector<int64_t> m_seekHeadsLater;
++  bool m_infoTaken = false;
++  bool m_chaptersTaken = false;
++  std::optional<int64_t> m_info;
++  std::optional<int64_t> m_chapters;
++  std::vector<int64_t> m_tags;
++};
++
++inline Result Reader::Run()
++{
++  Result r;
++  const auto fail = [this, &r](Outcome o, std::string why)
++  {
++    r.outcome = o;
++    r.why = std::move(why);
++    r.exported.clear();
++    r.bytes = m_bytes;
++    return r;
++  };
++  const auto failed = [this, &fail](Got g, const char* what) -> Result
++  {
++    switch (g)
++    {
++      case Got::BUDGET:
++        return fail(Outcome::TOO_LARGE, std::string(what) + " does not fit in the " +
++                                            std::to_string(m_max) +
++                                            " bytes that are read before playback");
++      case Got::FAILED:
++        return fail(Outcome::FETCH_FAILED, std::string(what) + " could not be read");
++      default:
++        return fail(Outcome::MALFORMED, std::string(what) + " is not well formed");
++    }
++  };
++  if (m_size <= 0)
++    return fail(Outcome::NOT_MATROSKA, "the file is empty");
++  int first = -1;
++  if (const Got g = NewPiece(0, std::min({FIRST_BYTES, m_size, m_max}), first); g != Got::OK)
++    return failed(g, "the start of the file");
++
++  // the EBML header, as matroska_read_header() takes it
++  Header h;
++  std::string data;
++  if (const Got g = Element(0, h, &data); g != Got::OK || h.id != ID_EBML)
++    return g == Got::FAILED ? failed(g, "the EBML header")
++                            : fail(Outcome::NOT_MATROSKA, "no EBML header");
++  uint64_t readVersion = 1;
++  uint64_t maxIdLength = 4;
++  uint64_t maxSizeLength = 8;
++  uint64_t docTypeReadVersion = 1;
++  if (!Children(data,
++                [&](uint32_t id, std::string_view v)
++                {
++                  switch (id)
++                  {
++                    case ID_EBMLREADVERSION:
++                      return Uint(v, 1, readVersion);
++                    case ID_EBMLMAXIDLENGTH:
++                      return Uint(v, 4, maxIdLength);
++                    case ID_EBMLMAXSIZELENGTH:
++                      return Uint(v, 8, maxSizeLength);
++                    case ID_DOCTYPEREADVERSION:
++                      return Uint(v, 1, docTypeReadVersion);
++                    default:
++                      return true;
++                  }
++                }))
++    return fail(Outcome::MALFORMED, "the EBML header is not well formed");
++  if (readVersion > 1 || maxSizeLength > 8 || maxIdLength > 4 || docTypeReadVersion > 3)
++    return fail(Outcome::NOT_MATROSKA, "an EBML header that the demuxer does not read");
++
++  // the Segment (an element that is not one, before it, is passed over)
++  int64_t pos = h.length + static_cast<int64_t>(h.size);
++  int64_t segmentEnd = m_size;
++  bool segment = false;
++  for (int k = 0; k < 8 && pos < m_size && !segment; k++)
++  {
++    Header sh;
++    if (const Got g = Element(pos, sh, nullptr); g != Got::OK)
++      return g == Got::FAILED ? failed(g, "the Segment")
++                              : fail(Outcome::NOT_MATROSKA, "no Segment");
++    if (sh.id == ID_SEGMENT)
++    {
++      segment = true;
++      m_segment = pos + sh.length;
++      if (!sh.unknownSize && sh.size < static_cast<uint64_t>(m_size - m_segment))
++        segmentEnd = m_segment + static_cast<int64_t>(sh.size);
++    }
++    else if (sh.unknownSize)
++      break;
++    else
++      pos += sh.length + static_cast<int64_t>(std::min<uint64_t>(sh.size, m_size));
++  }
++  if (!segment)
++    return fail(Outcome::NOT_MATROSKA, "no Segment");
++
++  // the level-1 elements from the start of the Segment, in what the first range holds, up to the
++  // first Cluster: the demuxer reads them in this order before it follows the SeekHead
++  std::vector<int64_t> seekHeads;
++  pos = m_segment;
++  while (pos < segmentEnd)
++  {
++    const Piece& start = m_pieces[static_cast<size_t>(first)]; // at 0
++    Header lh;
++    if (pos >= start.End() ||
++        !ElementHeader(reinterpret_cast<const uint8_t*>(start.data.data()) + pos,
++                       static_cast<size_t>(start.End() - pos), lh) ||
++        lh.id == ID_CLUSTER || lh.unknownSize)
++      break;
++    switch (lh.id)
++    {
++      case ID_INFO:
++        if (!m_infoTaken)
++        {
++          m_infoTaken = true;
++          m_info = pos;
++        }
++        break;
++      case ID_CHAPTERS:
++        if (!m_chaptersTaken)
++        {
++          m_chaptersTaken = true;
++          m_chapters = pos;
++        }
++        break;
++      case ID_TAGS:
++        m_tags.push_back(pos);
++        break;
++      case ID_SEEKHEAD:
++        seekHeads.push_back(pos);
++        break;
++      default:
++        break;
++    }
++    if (lh.size > static_cast<uint64_t>(segmentEnd - pos))
++      break;
++    pos += lh.length + static_cast<int64_t>(lh.size);
++  }
++
++  // the SeekHeads before the first Cluster, then their entries in order; a SeekHead that they point
++  // to is read while the Info or the Chapters are still missing
++  for (const int64_t at : seekHeads)
++    if (const Got g = SeekHead(at); g != Got::OK)
++      return failed(g, "the SeekHead");
++  Walk();
++  while ((!m_infoTaken || !m_chaptersTaken) && !m_seekHeadsLater.empty())
++  {
++    const int64_t at = m_seekHeadsLater.front();
++    m_seekHeadsLater.erase(m_seekHeadsLater.begin());
++    if (const Got g = SeekHead(at); g != Got::OK)
++      return failed(g, "a SeekHead that the SeekHead points to");
++    Walk();
++  }
++
++  // the Info: the duration as the demuxer gives it, and the SegmentUUID
++  uint64_t timeScale = 1000000;
++  double duration = 0;
++  std::optional<std::string> segmentUid;
++  if (m_info)
++  {
++    Header ih;
++    const Got g = Element(*m_info, ih, &data);
++    if (g != Got::OK && g != Got::NONE)
++      return failed(g, "the Info element");
++    if (g == Got::OK && ih.id == ID_INFO &&
++        !Children(data,
++                  [&](uint32_t id, std::string_view v)
++                  {
++                    switch (id)
++                    {
++                      case ID_TIMESTAMPSCALE:
++                        return Uint(v, 1000000, timeScale);
++                      case ID_DURATION:
++                        return Float(v, 0, duration);
++                      case ID_SEGMENTUUID:
++                        segmentUid = std::string(v);
++                        return true;
++                      default:
++                        return true;
++                    }
++                  }))
++      return fail(Outcome::MALFORMED, "the Info element is not well formed");
++  }
++  if (!timeScale)
++    timeScale = 1000000;
++  if (std::isnan(duration))
++    duration = 0;
++  if (duration != 0)
++  {
++    // matroska_read_header(): duration * time_scale * 1000 / AV_TIME_BASE, into an int64_t
++    const double us = duration * static_cast<double>(timeScale) * 1000 / 1000000;
++    if (us > 0 && us < 9223372036854775807.0)
++      r.durationMs = static_cast<int64_t>(us) / 1000;
++  }
++
++  // the Chapters
++  std::vector<EditionRead> editions;
++  if (m_chapters)
++  {
++    Header ch;
++    const Got g = Element(*m_chapters, ch, &data);
++    if (g != Got::OK && g != Got::NONE)
++      return failed(g, "the Chapters element");
++    if (g == Got::OK && ch.id == ID_CHAPTERS && !ParseChapters(data, editions))
++      return fail(Outcome::MALFORMED, "the Chapters element is not well formed");
++  }
++
++  // a name from the Tags, for an edition without an EditionString (edition_tag_title(): the first
++  // TITLE of a Tag that targets it, in the order the demuxer reads the Tags)
++  std::vector<uint64_t> unnamed;
++  for (const EditionRead& ed : editions)
++    if (!ed.title && ed.uid && std::find(unnamed.begin(), unnamed.end(), ed.uid) == unnamed.end())
++      unnamed.push_back(ed.uid);
++  std::map<uint64_t, std::string> tagNames;
++  for (size_t t = 0; tagNames.size() < unnamed.size();)
++  {
++    if (t == m_tags.size())
++    {
++      if (m_seekHeadsLater.empty())
++        break;
++      const int64_t at = m_seekHeadsLater.front();
++      m_seekHeadsLater.erase(m_seekHeadsLater.begin());
++      if (const Got g = SeekHead(at); g != Got::OK)
++      {
++        if (g != Got::BUDGET)
++          return failed(g, "a SeekHead that the SeekHead points to");
++        r.tagsSkipped = true;
++        break;
++      }
++      Walk();
++      continue;
++    }
++    Header th;
++    const Got g = Element(m_tags[t++], th, &data);
++    if (g == Got::BUDGET)
++    {
++      r.tagsSkipped = true;
++      break;
++    }
++    if (g == Got::NONE)
++      continue;
++    if (g != Got::OK)
++      return failed(g, "the Tags element");
++    if (th.id != ID_TAGS)
++      continue;
++    std::vector<TagRead> tags;
++    if (!ParseTags(data, tags))
++      return fail(Outcome::MALFORMED, "the Tags element is not well formed");
++    for (const TagRead& tag : tags)
++    {
++      if (std::find(unnamed.begin(), unnamed.end(), tag.editionUid) == unnamed.end() ||
++          tagNames.contains(tag.editionUid))
++        continue;
++      for (const auto& [name, string] : tag.simple)
++        if (name && string && SameNoCase(*name, "TITLE"))
++        {
++          tagNames.emplace(tag.editionUid, *string);
++          break;
++        }
++    }
++  }
++
++  // what matroska_export_editions() of ffmpeg-9940 exports
++  r.outcome = Outcome::READ;
++  r.bytes = m_bytes;
++  if (editions.empty())
++    return r;
++  auto& out = r.exported;
++  out["count"] = std::to_string(editions.size());
++  if (segmentUid)
++    if (const auto hex = Hex(*segmentUid))
++      out["segment_uid"] = *hex;
++  for (size_t e = 0; e < editions.size(); e++)
++  {
++    const EditionRead& ed = editions[e];
++    const std::string ek = std::to_string(e) + ".";
++    out[ek + "uid"] = std::to_string(ed.uid);
++    out[ek + "default"] = ed.isDefault ? "1" : "0";
++    out[ek + "hidden"] = ed.hidden ? "1" : "0";
++    out[ek + "ordered"] = ed.ordered ? "1" : "0";
++    out[ek + "chapters"] = std::to_string(ed.chapters.size());
++    std::optional<std::string> name = ed.title;
++    if (!name)
++      if (const auto it = tagNames.find(ed.uid); ed.uid && it != tagNames.end())
++        name = it->second;
++    if (name && !name->empty())
++      out[ek + "name"] = *name;
++    for (size_t c = 0; c < ed.chapters.size(); c++)
++    {
++      const ChapterRead& ch = ed.chapters[c];
++      const std::string ck = ek + std::to_string(c) + ".";
++      if (ch.start != NO_TIME)
++        out[ck + "start"] = std::to_string(ch.start);
++      if (ch.end != NO_TIME)
++        out[ck + "end"] = std::to_string(ch.end);
++      out[ck + "uid"] = std::to_string(ch.uid);
++      out[ck + "hidden"] = ch.hidden ? "1" : "0";
++      out[ck + "enabled"] = ch.enabled ? "1" : "0";
++      if (const auto hex = Hex(ch.segmentUid))
++        out[ck + "segment_uid"] = *hex;
++      if (ch.title && !ch.title->empty())
++        out[ck + "title"] = *ch.title;
++    }
++  }
++  return r;
++}
++} // namespace DETAIL
++
++//! What the demuxer exports of the editions of a file of fileSize bytes, and its duration, read
++//! through source: MAX_BYTES at most (maxBytes, for a test)
++inline Result ReadHeader(ByteSource& source, int64_t fileSize, int64_t maxBytes = MAX_BYTES)
++{
++  return DETAIL::Reader(source, fileSize, maxBytes).Run();
++}
++
++//! The File of what ReadHeader() exports, as from the demuxer (MKV_EDITIONS::Parse())
++inline File FromExported(const std::map<std::string, std::string>& exported)
++{
++  return Parse(
++      [&exported](const char* key) -> const char*
++      {
++        const auto it = exported.find(key);
++        return it == exported.end() ? nullptr : it->second.c_str();
++      });
++}
++
++} // namespace MKV_EDITIONS::HEADER
+diff --git a/xbmc/cores/VideoPlayer/MatroskaEditionChoice.cpp b/xbmc/cores/VideoPlayer/MatroskaEditionChoice.cpp
+index eb2231b..bd3d868 100644
+--- a/xbmc/cores/VideoPlayer/MatroskaEditionChoice.cpp
++++ b/xbmc/cores/VideoPlayer/MatroskaEditionChoice.cpp
+@@ -9,16 +9,21 @@
+ #include "MatroskaEditionChoice.h"
+ 
+ #include "DVDDemuxers/MatroskaEditions.h"
++#include "DVDDemuxers/MatroskaHeaderRead.h"
+ #include "FileItem.h"
++#include "MatroskaHttpRange.h"
+ #include "ServiceBroker.h"
+ #include "URL.h"
+ #include "dialogs/GUIDialogBusy.h"
+ #include "dialogs/GUIDialogSelect.h"
++#include "filesystem/CurlFile.h"
++#include "filesystem/DllLibCurl.h"
+ #include "filesystem/File.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIUtils.h"
+ #include "guilib/GUIWindowManager.h"
+ #include "guilib/WindowIDs.h"
++#include "settings/AdvancedSettings.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "threads/Event.h"
+@@ -27,11 +32,17 @@
+ #include "utils/Variant.h"
+ #include "utils/log.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
++#include <list>
+ #include <memory>
++#include <mutex>
+ #include <string>
++#include <system_error>
+ #include <thread>
++#include <utility>
+ 
+ extern "C"
+ {
+@@ -45,21 +56,82 @@ namespace
+ {
+ using namespace std::chrono_literals;
+ 
+-// How long the reading of the header may take before the file plays as it is stored
++// How long the reading may take before the file plays as it is stored
+ constexpr auto PROBE_DEADLINE = 10s;
++// How long Kodi, closing, waits for readings over HTTP that are left (StopReadings())
++constexpr auto STOP_WAIT = 2s;
++// How many paths what was read is kept for (the application thread only)
++constexpr size_t REMEMBERED = 32;
+ 
+-struct Probe
++//! Kodi is closing: every reading stops, and none starts
++std::atomic<bool> g_closing{false};
++
++//! The readings that have not ended, over HTTP and of files. Never freed, so that a reading that
++//! outlives StopReadings() does not touch a freed object when it ends.
++struct InFlight
+ {
+-  XFILE::CFile file;
++  std::mutex lock;
++  std::condition_variable ended;
++  int http = 0;
++  int files = 0;
++};
++
++InFlight& Readings()
++{
++  static InFlight* readings = new InFlight;
++  return *readings;
++}
++
++enum class How
++{
++  FILE, //!< on this device or the local network: FFmpeg's demuxer
++  HTTP, //!< by byte ranges (MatroskaHttpRange.h)
++};
++
++enum class ReadResult
++{
++  READ,
++  FAILED,
++  LATE, //!< not done within the deadline: abandoned
++  CANCELLED, //!< the user cancelled the busy dialog: abandoned
++};
++
++struct ReadOutcome
++{
++  ReadResult result = ReadResult::FAILED;
++  MKV_EDITIONS::File file;
++  int64_t durationMs = 0;
++  std::string why;
++  int requests = 0;
++  int64_t bytes = 0;
++  bool tagsSkipped = false;
++};
++
++// What a reading on its own thread leaves for the application thread, which may stop waiting for it
++// before it ends: shared by both, freed by the last
++struct Reading
++{
++  How how = How::FILE;
++  std::string path;
+   std::chrono::steady_clock::time_point deadline;
+   //! the application thread stopped waiting (the deadline, or the busy dialog cancelled)
+   std::atomic<bool> abandoned{false};
++  ReadOutcome outcome; // written before finished
++  std::atomic<bool> finished{false};
++  CEvent done{true}; // manual reset: the busy dialog and the deadline both wait on it
++  bool Stopped() const { return abandoned || g_closing; }
++};
++
++struct Probe
++{
++  XFILE::CFile file;
++  const Reading* reading = nullptr;
+ };
+ 
+ int ProbeRead(void* opaque, uint8_t* buf, int size)
+ {
+   auto* probe = static_cast<Probe*>(opaque);
+-  if (probe->abandoned)
++  if (probe->reading->Stopped())
+     return AVERROR_EXIT;
+   const ssize_t n = probe->file.Read(buf, static_cast<size_t>(size));
+   if (n < 0)
+@@ -78,32 +150,36 @@ int64_t ProbeSeek(void* opaque, int64_t pos, int whence)
+ int ProbeInterrupt(void* opaque)
+ {
+   const auto* probe = static_cast<Probe*>(opaque);
+-  return probe->abandoned || std::chrono::steady_clock::now() > probe->deadline ? 1 : 0;
++  return probe->reading->Stopped() || std::chrono::steady_clock::now() > probe->reading->deadline
++             ? 1
++             : 0;
+ }
+ 
+-// Reads the header of a Matroska file (no stream probing, no packets) and what the demuxer exports
+-// of its editions. Runs on a thread of its own (ReadEditionsWaiting()).
+-bool ReadEditions(Probe& probe,
+-                  const std::string& path,
+-                  MKV_EDITIONS::File& out,
+-                  int64_t& durationMs)
++// A file on this device or the local network: the header of the Matroska file (no stream probing,
++// no packets) and what the demuxer exports of its editions
++void ReadFile(Reading& reading)
+ {
+-  if (!probe.file.Open(path, XFILE::READ_TRUNCATED) || probe.abandoned)
+-    return false;
++  ReadOutcome& out = reading.outcome;
++  Probe probe;
++  probe.reading = &reading;
++  if (!probe.file.Open(reading.path, XFILE::READ_TRUNCATED) || reading.Stopped())
++  {
++    out.why = "the file could not be opened";
++    return;
++  }
+ 
+   constexpr int BUFFER_SIZE = 32768;
+   auto* buffer = static_cast<unsigned char*>(av_malloc(BUFFER_SIZE));
+   if (!buffer)
+-    return false;
++    return;
+   AVIOContext* io =
+       avio_alloc_context(buffer, BUFFER_SIZE, 0, &probe, ProbeRead, nullptr, ProbeSeek);
+   if (!io)
+   {
+     av_free(buffer);
+-    return false;
++    return;
+   }
+ 
+-  bool ok = false;
+   const AVInputFormat* format = av_find_input_format("matroska");
+   AVFormatContext* fc = format ? avformat_alloc_context() : nullptr;
+   if (fc)
+@@ -115,89 +191,192 @@ bool ReadEditions(Probe& probe,
+     // on failure avformat_open_input() frees the context, not the custom I/O
+     if (avformat_open_input(&fc, "", format, nullptr) >= 0)
+     {
++      // a file without editions has no "editions": it is read, with none
+       AVDictionary* editions = nullptr;
+       if (av_opt_get_dict_val(fc, "editions", AV_OPT_SEARCH_CHILDREN, &editions) >= 0 && editions)
+-      {
+-        out = MKV_EDITIONS::Parse(
++        out.file = MKV_EDITIONS::Parse(
+             [editions](const char* key) -> const char*
+             {
+               const AVDictionaryEntry* e = av_dict_get(editions, key, nullptr, AV_DICT_MATCH_CASE);
+               return e ? e->value : nullptr;
+             });
+-        ok = true;
+-      }
+       av_dict_free(&editions);
+-      durationMs = fc->duration > 0 ? fc->duration / (AV_TIME_BASE / 1000) : 0;
++      out.durationMs = fc->duration > 0 ? fc->duration / (AV_TIME_BASE / 1000) : 0;
++      out.result = ReadResult::READ;
+       avformat_close_input(&fc);
+     }
++    else
++      out.why = "not a Matroska file that the demuxer opens";
+   }
+   av_freep(&io->buffer);
+   avio_context_free(&io);
+-  return ok;
+ }
+ 
+-// What a reading on its own thread leaves for the application thread, which may stop waiting for it
+-// before it ends: shared by both, freed by the last
+-struct Reading
++// The curl session of a server, as CCurlFile::Open() takes it: DllLibCurlGlobal::easy_acquire()
++// keeps sessions by protocol and server name, and curl keeps the connections in the session's multi
++// handle. Released (idle, 30 s before it is closed) when this is destroyed: the player's own
++// opening of the file takes the same session next, and the connection that is still open.
++class CEditionsCurl : public XFILE::CCurlFile
+ {
+-  Probe probe;
+-  std::string path;
+-  MKV_EDITIONS::File file;
+-  int64_t durationMs = 0;
+-  bool ok = false;
+-  std::atomic<bool> finished{false};
+-  CEvent done{true}; // manual reset: the busy dialog and the deadline both wait on it
++public:
++  bool Acquire(const std::string& path)
++  {
++    CURL url(path);
++    ParseAndCorrectUrl(url);
++    g_curlInterface.easy_acquire(url.GetProtocol().c_str(), url.GetHostName().c_str(),
++                                 &m_state->m_easyHandle, &m_state->m_multiHandle);
++    if (!m_state->m_easyHandle || !m_state->m_multiHandle)
++      return false;
++    // the options of any request of Kodi's (user agent, proxy, certificates, the headers of the
++    // path): MatroskaHttpRange.h sets the rest
++    SetCommonOptions(m_state);
++    SetRequestHeaders(m_state);
++    return true;
++  }
++  CURL_HANDLE* Easy() const { return m_state->m_easyHandle; }
++  CURLM* Multi() const { return m_state->m_multiHandle; }
+ };
+ 
+-enum class ReadResult
++// A file over HTTP: by byte ranges, what names its editions
++void ReadHttp(Reading& reading)
+ {
+-  READ,
+-  FAILED,
+-  LATE, //!< not done within the deadline: abandoned
+-  CANCELLED, //!< the user cancelled the busy dialog: abandoned
+-};
++  using MKV_EDITIONS::HTTP::Failure;
++  ReadOutcome& out = reading.outcome;
++  CEditionsCurl session;
++  if (!session.Acquire(reading.path))
++  {
++    out.why = "no curl session";
++    return;
++  }
++  const MKV_EDITIONS::HTTP::Read read = MKV_EDITIONS::HTTP::ReadEditions(
++      session.Easy(), session.Multi(), session.GetURL(), [&reading] { return reading.Stopped(); },
++      reading.deadline);
++  out.requests = read.requests;
++  out.bytes = read.bytes;
++  if (read.failure != Failure::NONE)
++  {
++    out.result = read.failure == Failure::LATE      ? ReadResult::LATE
++                 : read.failure == Failure::STOPPED ? ReadResult::CANCELLED
++                                                    : ReadResult::FAILED;
++    out.why = read.why;
++    return;
++  }
++  if (read.header.outcome != MKV_EDITIONS::HEADER::Outcome::READ)
++  {
++    out.why = read.header.why;
++    return;
++  }
++  out.file = MKV_EDITIONS::HEADER::FromExported(read.header.exported);
++  out.durationMs = read.header.durationMs;
++  out.tagsSkipped = read.header.tagsSkipped;
++  out.result = ReadResult::READ;
++}
+ 
+-// The header is read on a thread of its own, and the application thread waits with the busy dialog,
++// The reading runs on a thread of its own, and the application thread waits with the busy dialog,
+ // which keeps the interface drawn and can be cancelled: a server that does not answer (an open or a
+-// read of the network that does not return, which no deadline of FFmpeg's reaches) never freezes
+-// the interface. At the deadline, or when cancelled, the reading is abandoned: it stops at its next
+-// read, or when its server gives up, and frees what it holds; its answer is not used.
+-ReadResult ReadEditionsWaiting(const std::string& path,
+-                               MKV_EDITIONS::File& out,
+-                               int64_t& durationMs)
++// read that does not return, which no deadline of FFmpeg's or curl's reaches) never freezes the
++// interface. At the deadline, or when cancelled, the reading is abandoned: it stops at its next
++// read (over HTTP within 100 ms), or when its server gives up, and frees what it holds; its answer
++// is not used.
++ReadOutcome ReadWaiting(How how, const std::string& path)
+ {
+   auto reading = std::make_shared<Reading>();
++  reading->how = how;
+   reading->path = path;
+-  reading->probe.deadline = std::chrono::steady_clock::now() + PROBE_DEADLINE;
+-  std::thread(
+-      [reading]
+-      {
+-        reading->ok =
+-            ReadEditions(reading->probe, reading->path, reading->file, reading->durationMs);
+-        reading->finished = true;
+-        reading->done.Set();
+-      })
+-      .detach();
+-  // the deadline, for a reading that hangs where FFmpeg's interrupt is not asked
+-  std::thread(
+-      [reading]
+-      {
+-        if (!reading->done.Wait(
+-                std::chrono::duration_cast<std::chrono::milliseconds>(PROBE_DEADLINE + 1s)))
++  reading->deadline = std::chrono::steady_clock::now() + PROBE_DEADLINE;
++  InFlight& inFlight = Readings();
++  int& counted = how == How::HTTP ? inFlight.http : inFlight.files;
++  {
++    std::lock_guard lock(inFlight.lock);
++    counted++;
++  }
++  try
++  {
++    std::thread(
++        [reading]
++        {
++          if (reading->how == How::HTTP)
++            ReadHttp(*reading);
++          else
++            ReadFile(*reading);
++          reading->finished = true;
+           reading->done.Set();
+-      })
+-      .detach();
++          // the session and the file of the reading are closed by now
++          InFlight& readings = Readings();
++          {
++            std::lock_guard lock(readings.lock);
++            (reading->how == How::HTTP ? readings.http : readings.files)--;
++          }
++          readings.ended.notify_all();
++        })
++        .detach();
++  }
++  catch (const std::system_error&)
++  {
++    {
++      std::lock_guard lock(inFlight.lock);
++      counted--;
++    }
++    ReadOutcome none;
++    none.why = "no thread to read it";
++    return none;
++  }
++  // the deadline, for a reading that hangs where neither FFmpeg's interrupt nor curl looks
++  try
++  {
++    std::thread(
++        [reading]
++        {
++          if (!reading->done.Wait(
++                  std::chrono::duration_cast<std::chrono::milliseconds>(PROBE_DEADLINE + 1s)))
++            reading->done.Set();
++        })
++        .detach();
++  }
++  catch (const std::system_error&)
++  {
++    reading->abandoned = true;
++    ReadOutcome none;
++    none.why = "no thread to wait for it";
++    return none;
++  }
+   const bool waited = CGUIDialogBusy::WaitOnEvent(reading->done, 100, true);
+   if (!reading->finished)
+   {
+-    reading->probe.abandoned = true;
+-    return waited ? ReadResult::LATE : ReadResult::CANCELLED;
++    reading->abandoned = true;
++    ReadOutcome abandoned;
++    abandoned.result = waited ? ReadResult::LATE : ReadResult::CANCELLED;
++    abandoned.why = waited ? "not within the deadline" : "cancelled";
++    return abandoned;
+   }
+-  if (!reading->ok)
+-    return ReadResult::FAILED;
+-  out = reading->file;
+-  durationMs = reading->durationMs;
+-  return ReadResult::READ;
++  return reading->outcome;
++}
++
++// What was read of a path in this session, the last REMEMBERED (only the application thread)
++std::list<std::pair<std::string, ReadOutcome>>& Remembered()
++{
++  static std::list<std::pair<std::string, ReadOutcome>> remembered;
++  return remembered;
++}
++
++const ReadOutcome* Recall(const std::string& path)
++{
++  auto& remembered = Remembered();
++  for (auto it = remembered.begin(); it != remembered.end(); ++it)
++    if (it->first == path)
++    {
++      remembered.splice(remembered.begin(), remembered, it);
++      return &remembered.front().second;
++    }
++  return nullptr;
++}
++
++void Remember(const std::string& path, const ReadOutcome& outcome)
++{
++  auto& remembered = Remembered();
++  remembered.emplace_front(path, outcome);
++  if (remembered.size() > REMEMBERED)
++    remembered.pop_back();
+ }
+ } // namespace
+ 
+@@ -206,46 +385,87 @@ namespace MKV_EDITIONS
+ 
+ std::optional<CFileItem> AskBeforePlayback(const CFileItem& item)
+ {
++  if (g_closing)
++    return std::nullopt;
+   const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
+   if (!settings || !settings->GetBool(CSettings::SETTING_VIDEOPLAYER_HADESMKVEDITIONS))
+     return std::nullopt;
+   if (item.IsFolder() || item.HasPVRChannelInfoTag())
+     return std::nullopt;
++  // the path that plays: for an add-on's item, the URL it resolved to
++  // (CApplicationPlay::ResolvePath())
+   const std::string path = item.GetDynPath();
+-  if (!URIUtils::HasExtension(path, ".mkv|.mk3d"))
++  if (!URIUtils::HasExtension(path, ".mkv|.mk3d") &&
++      !StringUtils::EqualsNoCase(item.GetMimeType(), "video/x-matroska"))
+     return std::nullopt;
+ 
+-  // Only a file on this device or on the local network is read before playback: a file over the
+-  // internet (an add-on's stream) would be opened twice, the second time by the player, with range
+-  // requests to its end, which servers that limit requests count
+-  if (!URIUtils::IsLocalOrLAN(path))
++  How how = How::FILE;
++  const std::string protocol = CURL(path).GetTranslatedProtocol();
++  if (URIUtils::IsPlugin(path))
+   {
+-    CLog::Log(LOGINFO,
+-              "MKV editions: {} is not on this device or the local network: it is not read before "
+-              "playback, and plays as it is stored",
++    CLog::Log(LOGINFO, "MKV editions: {} is an add-on's path that was not resolved: it is not read",
+               CURL::GetRedacted(path));
+     return std::nullopt;
+   }
++  if (protocol == "http" || protocol == "https")
++    how = How::HTTP;
++  else if (!URIUtils::IsLocalOrLAN(path))
++  {
++    CLog::Log(
++        LOGINFO,
++        "MKV editions: {} is not on this device, on the local network or over HTTP: it is not "
++        "read before playback, and plays as it is stored",
++        CURL::GetRedacted(path));
++    return std::nullopt;
++  }
+ 
+-  File file;
+-  int64_t durationMs = 0;
+   const auto start = std::chrono::steady_clock::now();
+-  const ReadResult read = ReadEditionsWaiting(path, file, durationMs);
+-  if (read != ReadResult::READ)
++  ReadOutcome read;
++  bool again = false;
++  if (const ReadOutcome* known = Recall(path))
+   {
+-    CLog::Log(LOGINFO,
+-              "MKV editions: could not read the editions of {} ({}): it plays as it is stored",
+-              CURL::GetRedacted(path),
+-              read == ReadResult::LATE        ? "not within the deadline"
+-              : read == ReadResult::CANCELLED ? "cancelled"
+-                                              : "not a Matroska file it could read");
+-    return std::nullopt;
++    read = *known;
++    again = true;
++  }
++  else
++  {
++    read = ReadWaiting(how, path);
++    // a reading cancelled by the user is not kept: the next playback may read it
++    if (read.result != ReadResult::CANCELLED)
++      Remember(path, read);
+   }
+   const auto took =
+       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
++  if (read.result != ReadResult::READ)
++  {
++    CLog::Log(LOGINFO,
++              "MKV editions: could not read the editions of {} ({}{}): it plays as it is stored",
++              CURL::GetRedacted(path), read.why,
++              again ? "; read before in this session, not read again" : "");
++    return std::nullopt;
++  }
++  if (read.tagsSkipped && !again)
++    CLog::Log(LOGINFO,
++              "MKV editions: the tags of {} that name editions do not fit in what is read before "
++              "playback: those editions are offered without their name",
++              CURL::GetRedacted(path));
++  const File& file = read.file;
++  const int64_t durationMs = read.durationMs;
+   const std::vector<size_t> offered = Offered(file, durationMs);
+-  CLog::Log(LOGINFO, "MKV editions: {} edition(s) in {} ({} ms to read), {} that can be offered",
+-            file.editions.size(), CURL::GetRedacted(path), took.count(), offered.size());
++  if (again)
++    CLog::Log(LOGINFO,
++              "MKV editions: {} edition(s) in {} (read before in this session, not read again), {} "
++              "that can be offered",
++              file.editions.size(), CURL::GetRedacted(path), offered.size());
++  else if (how == How::HTTP)
++    CLog::Log(LOGINFO,
++              "MKV editions: {} edition(s) in {} ({} ms to read, by byte ranges: {} request(s), {} "
++              "bytes), {} that can be offered",
++              file.editions.size(), CURL::GetRedacted(path), took.count(), read.requests,
++              read.bytes, offered.size());
++  else
++    CLog::Log(LOGINFO, "MKV editions: {} edition(s) in {} ({} ms to read), {} that can be offered",
++              file.editions.size(), CURL::GetRedacted(path), took.count(), offered.size());
+   if (offered.size() < 2)
+     return std::nullopt;
+ 
+@@ -301,4 +521,42 @@ std::optional<CFileItem> WithoutEdition(const CFileItem& item)
+   return without;
+ }
+ 
++void StopReadings()
++{
++  g_closing = true;
++  InFlight& inFlight = Readings();
++  std::unique_lock lock(inFlight.lock);
++  if (inFlight.http + inFlight.files == 0)
++    return;
++  // A reading over HTTP stops within 100 ms of being told. A reading of a file on the local network
++  // stops at its next read, but a call to its server that does not answer (SMB, NFS) returns only
++  // at the timeout of that client: it is waited for, so that it does not use the SMB client that
++  // CApplication::Stop() frees right after this.
++  std::chrono::seconds limit = std::chrono::duration_cast<std::chrono::seconds>(STOP_WAIT);
++  if (inFlight.files > 0)
++  {
++    const auto advanced = CServiceBroker::GetSettingsComponent()->GetAdvancedSettings();
++    limit = std::chrono::seconds(std::max<int64_t>(advanced->m_sambaclienttimeout,
++                                                   static_cast<int64_t>(advanced->m_nfsTimeout)) +
++                                 2);
++  }
++  const int waiting = inFlight.http + inFlight.files;
++  CLog::Log(LOGINFO,
++            "MKV editions: {} reading(s) of a file's editions left running: they are stopped (at "
++            "most {} s)",
++            waiting, limit.count());
++  const auto start = std::chrono::steady_clock::now();
++  if (inFlight.ended.wait_for(lock, limit,
++                              [&inFlight] { return inFlight.http + inFlight.files == 0; }))
++    CLog::Log(LOGINFO, "MKV editions: the readings stopped in {} ms",
++              std::chrono::duration_cast<std::chrono::milliseconds>(
++                  std::chrono::steady_clock::now() - start)
++                  .count());
++  else
++    CLog::Log(
++        LOGWARNING,
++        "MKV editions: {} reading(s) over HTTP and {} of files did not stop within {} s: left",
++        inFlight.http, inFlight.files, limit.count());
++}
++
+ } // namespace MKV_EDITIONS
+diff --git a/xbmc/cores/VideoPlayer/MatroskaEditionChoice.h b/xbmc/cores/VideoPlayer/MatroskaEditionChoice.h
+index db3ea66..ad63cf8 100644
+--- a/xbmc/cores/VideoPlayer/MatroskaEditionChoice.h
++++ b/xbmc/cores/VideoPlayer/MatroskaEditionChoice.h
+@@ -25,10 +25,14 @@ constexpr const char* PROPERTY_UID = "hades.mkveditionuid";
+  *        Matroska file with two or more editions that can be played, asks which one. Called on the
+  *        application thread before the player opens the file (a question from the player's thread
+  *        could leave Kodi waiting on itself if playback were stopped meanwhile), before the
+- *        messages of the playback before it are taken out of the queue. Only the header of the file
+- *        is read, on a thread of its own, while the busy dialog keeps the interface drawn and can
+- *        cancel it; 10 s at most. Only a file on this device or on the local network is read (a
+- *        file over the internet would be opened twice). Where nothing is chosen, WithoutEdition().
++ *        messages of the playback before it are taken out of the queue, with the path that plays
++ *        (an add-on's item resolved: the URL it gave). Only what names the editions is read, on a
++ *        thread of its own, while the busy dialog keeps the interface drawn and can cancel it; 10 s
++ *        at most. A file over HTTP is read by byte ranges (MatroskaHttpRange.h: the start of the
++ *        file and the elements that the SeekHead points to, 1 MiB at most, on the connection that
++ *        the player then reuses; a server that does not accept ranges is not read), a file on this
++ *        device or the local network by FFmpeg's demuxer. What was read of a path is kept for the
++ *        session (a resume does not read it again). Where nothing is chosen, WithoutEdition().
+  * \return a copy of the item with the choice in its properties, or nothing: the setting is off, the
+  *         file is not a Matroska file with editions to choose from, it could not be read, or the
+  *         question was not answered with a choice. With nothing, the file plays as it is stored.
+@@ -42,4 +46,14 @@ std::optional<CFileItem> AskBeforePlayback(const CFileItem& item);
+  */
+ std::optional<CFileItem> WithoutEdition(const CFileItem& item);
+ 
++/*!
++ * \brief Kodi is closing (CApplication::Stop(), before the network services and the SMB client go
++ *        away): every reading that AskBeforePlayback() left behind (cancelled, or past its
++ *        deadline) is told to stop, and waited for. A reading over HTTP stops within 100 ms (2 s at
++ *        most are waited); one blocked in a call to a file server (SMB, NFS) ends when that call
++ *        returns, at the timeout of that client (30 s by default), which is waited for. One that
++ *        is left after that is said in the log. No reading starts after this.
++ */
++void StopReadings();
++
+ } // namespace MKV_EDITIONS
+diff --git a/xbmc/cores/VideoPlayer/MatroskaHttpRange.h b/xbmc/cores/VideoPlayer/MatroskaHttpRange.h
+new file mode 100644
+index 0000000..873f6ff
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/MatroskaHttpRange.h
+@@ -0,0 +1,425 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++// Byte ranges of a file over HTTP for MatroskaHeaderRead.h, with libcurl, on an easy and a multi
++// handle that the caller gives already set up (in Kodi: the session of the server that the
++// player's own opening of the file takes next, DllLibCurlGlobal::easy_acquire(), so that it finds
++// the connection open in the multi handle). One request at a time, each answered as asked or the
++// reading ends there: nothing is ever asked again.
++// - First a HEAD with "Range: bytes=0-N": the server accepts byte ranges if it answers 206 with a
++//   Content-Range that gives the length of the file, or 200 with "Accept-Ranges: bytes" and a
++//   Content-Length. Otherwise nothing more is asked: no byte of the file is downloaded.
++// - Then GETs of bounded ranges, each of which must be a 206 of exactly that range of a file of
++//   that length, without a content coding; a body that is anything else is refused at its first
++//   byte, and one longer than asked where it passes that length.
++// - An HTTP error (429, 403...) or a network error ends the reading. stop() (the user, Kodi
++//   closing) and the deadline end it within 100 ms; the transfer then closes its connection.
++// Pure but for libcurl, so that a host test runs it against a local server.
++
++#include "DVDDemuxers/MatroskaHeaderRead.h"
++
++#define CURL CURL_HANDLE
++#include <curl/curl.h>
++#undef CURL
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <functional>
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace MKV_EDITIONS::HTTP
++{
++
++enum class Failure
++{
++  NONE,
++  NO_RANGES, //!< the server does not say it accepts byte ranges: nothing was downloaded
++  HTTP_ERROR, //!< an HTTP error (429, 403...): not asked again
++  NETWORK, //!< a network error: not tried again
++  NOT_THE_PART, //!< an answer that is not the range asked: refused at its first byte
++  STOPPED, //!< the caller stopped it
++  LATE, //!< the deadline
++};
++
++class RangeSource : public HEADER::ByteSource
++{
++public:
++  RangeSource(CURL_HANDLE* easy,
++              CURLM* multi,
++              std::string url,
++              std::function<bool()> stop,
++              std::chrono::steady_clock::time_point deadline)
++    : m_easy(easy),
++      m_multi(multi),
++      m_url(std::move(url)),
++      m_stop(std::move(stop)),
++      m_deadline(deadline)
++  {
++  }
++
++  //! The HEAD: true when the server accepts byte ranges (and Size() is known)
++  bool Begin(int64_t firstBytes)
++  {
++    Transfer t{this, true, 0, firstBytes, nullptr};
++    if (!Perform(t))
++      return false;
++    if (!Identity(t.response.contentEncoding))
++      return Fail(Failure::NO_RANGES, "the server sends the file with a content coding");
++    int64_t from = 0;
++    int64_t to = 0;
++    int64_t total = 0;
++    if (t.response.status == 206 && ContentRange(t.response.contentRange, from, to, total) &&
++        from == 0 && total > 0)
++      m_size = total;
++    else if (t.response.status == 200 && AcceptsBytes(t.response.acceptRanges) &&
++             t.response.contentLength > 0)
++      m_size = t.response.contentLength;
++    else
++      return Fail(Failure::NO_RANGES,
++                  "the server does not accept byte ranges (HTTP " +
++                      std::to_string(t.response.status) +
++                      ", no part and no Accept-Ranges): nothing was downloaded");
++    // the place the file is, after redirections, for the ranges (as CCurlFile::Open() keeps it)
++    char* effective = nullptr;
++    if (curl_easy_getinfo(m_easy, CURLINFO_EFFECTIVE_URL, &effective) == CURLE_OK && effective &&
++        *effective)
++      m_url = effective;
++    return true;
++  }
++
++  bool Fetch(int64_t offset, int64_t length, std::string& out) override
++  {
++    out.clear();
++    if (length <= 0 || m_size <= 0 || offset < 0 || offset + length > m_size)
++      return Fail(Failure::NOT_THE_PART, "a range outside the file");
++    Transfer t{this, false, offset, length, &out};
++    if (!Perform(t))
++      return false;
++    if (static_cast<int64_t>(out.size()) != length)
++      return Fail(Failure::NOT_THE_PART, "the server sent " + std::to_string(out.size()) +
++                                             " of the " + std::to_string(length) + " bytes asked");
++    return true;
++  }
++
++  int64_t Size() const { return m_size; }
++  int Requests() const { return m_requests; }
++  int64_t Bytes() const { return m_bytes; } //!< bodies received
++  Failure GetFailure() const { return m_failure; }
++  long Status() const { return m_status; }
++  const std::string& Why() const { return m_why; }
++
++private:
++  struct Response
++  {
++    long status = 0;
++    std::string acceptRanges;
++    std::string contentRange;
++    std::string contentEncoding;
++    int64_t contentLength = -1;
++  };
++
++  struct Transfer
++  {
++    RangeSource* self;
++    bool head;
++    int64_t offset;
++    int64_t length;
++    std::string* out; // nullptr for the HEAD
++    Response response{};
++    bool checked = false;
++    bool refused = false;
++  };
++
++  static std::string_view Trim(std::string_view s)
++  {
++    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
++      s.remove_prefix(1);
++    while (!s.empty() &&
++           (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n'))
++      s.remove_suffix(1);
++    return s;
++  }
++
++  static bool Identity(const std::string& coding)
++  {
++    return coding.empty() || HEADER::DETAIL::SameNoCase(coding, "identity");
++  }
++
++  static bool AcceptsBytes(std::string_view value)
++  {
++    while (!value.empty())
++    {
++      const size_t comma = value.find(',');
++      if (HEADER::DETAIL::SameNoCase(Trim(value.substr(0, comma)), "bytes"))
++        return true;
++      if (comma == std::string_view::npos)
++        break;
++      value.remove_prefix(comma + 1);
++    }
++    return false;
++  }
++
++  static bool Number(std::string_view s, int64_t& out)
++  {
++    if (s.empty() || s.size() > 18)
++      return false;
++    out = 0;
++    for (const char c : s)
++    {
++      if (c < '0' || c > '9')
++        return false;
++      out = out * 10 + (c - '0');
++    }
++    return true;
++  }
++
++  //! "bytes FROM-TO/TOTAL"
++  static bool ContentRange(std::string_view value, int64_t& from, int64_t& to, int64_t& total)
++  {
++    value = Trim(value);
++    if (value.size() < 6 || !HEADER::DETAIL::SameNoCase(value.substr(0, 5), "bytes"))
++      return false;
++    value = Trim(value.substr(5));
++    const size_t dash = value.find('-');
++    const size_t slash = value.find('/');
++    if (dash == std::string_view::npos || slash == std::string_view::npos || slash < dash)
++      return false;
++    return Number(value.substr(0, dash), from) &&
++           Number(value.substr(dash + 1, slash - dash - 1), to) &&
++           Number(value.substr(slash + 1), total) && from <= to && to < total;
++  }
++
++  bool IsThePart(const Response& r, int64_t offset, int64_t length) const
++  {
++    int64_t from = 0;
++    int64_t to = 0;
++    int64_t total = 0;
++    return r.status == 206 && Identity(r.contentEncoding) &&
++           ContentRange(r.contentRange, from, to, total) && from == offset &&
++           to == offset + length - 1 && total == m_size;
++  }
++
++  static size_t OnHeader(char* buffer, size_t size, size_t count, void* user)
++  {
++    auto* t = static_cast<Transfer*>(user);
++    const size_t n = size * count;
++    const std::string_view line = Trim(std::string_view(buffer, n));
++    if (line.substr(0, 5) == "HTTP/")
++    {
++      // a new response (after a redirection, or the 206 after nothing): its own headers only
++      t->response = Response{};
++      const size_t space = line.find(' ');
++      int64_t status = 0;
++      if (space != std::string_view::npos && Number(line.substr(space + 1, 3), status))
++        t->response.status = static_cast<long>(status);
++      return n;
++    }
++    const size_t colon = line.find(':');
++    if (colon == std::string_view::npos)
++      return n;
++    const std::string_view name = Trim(line.substr(0, colon));
++    const std::string_view value = Trim(line.substr(colon + 1));
++    if (HEADER::DETAIL::SameNoCase(name, "accept-ranges"))
++      t->response.acceptRanges = std::string(value);
++    else if (HEADER::DETAIL::SameNoCase(name, "content-range"))
++      t->response.contentRange = std::string(value);
++    else if (HEADER::DETAIL::SameNoCase(name, "content-encoding"))
++      t->response.contentEncoding = std::string(value);
++    else if (HEADER::DETAIL::SameNoCase(name, "content-length"))
++    {
++      int64_t length = 0;
++      if (Number(value, length))
++        t->response.contentLength = length;
++    }
++    return n;
++  }
++
++  static size_t Ignore(char*, size_t size, size_t count, void*) { return size * count; }
++
++  static size_t OnBody(char* buffer, size_t size, size_t count, void* user)
++  {
++    auto* t = static_cast<Transfer*>(user);
++    const size_t n = size * count;
++    if (!t->out)
++    {
++      t->refused = true;
++      return 0;
++    }
++    if (!t->checked)
++    {
++      t->checked = true;
++      if (!t->self->IsThePart(t->response, t->offset, t->length))
++      {
++        t->refused = true;
++        return 0;
++      }
++    }
++    if (static_cast<int64_t>(t->out->size() + n) > t->length)
++    {
++      t->refused = true;
++      return 0;
++    }
++    t->out->append(buffer, n);
++    t->self->m_bytes += static_cast<int64_t>(n);
++    return n;
++  }
++
++  bool Fail(Failure f, std::string why)
++  {
++    if (m_failure == Failure::NONE)
++    {
++      m_failure = f;
++      m_why = std::move(why);
++    }
++    return false;
++  }
++
++  //! One request, never repeated
++  bool Perform(Transfer& t)
++  {
++    if (m_failure != Failure::NONE)
++      return false;
++    if (m_stop && m_stop())
++      return Fail(Failure::STOPPED, "stopped");
++    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
++                          m_deadline - std::chrono::steady_clock::now())
++                          .count();
++    if (left <= 0)
++      return Fail(Failure::LATE, "not within the deadline");
++    const std::string range =
++        std::to_string(t.offset) + "-" + std::to_string(t.offset + t.length - 1);
++    curl_easy_setopt(m_easy, CURLOPT_URL, m_url.c_str());
++    if (t.head)
++      curl_easy_setopt(m_easy, CURLOPT_NOBODY, 1L);
++    else
++      curl_easy_setopt(m_easy, CURLOPT_HTTPGET, 1L);
++    curl_easy_setopt(m_easy, CURLOPT_RANGE, range.c_str());
++    curl_easy_setopt(m_easy, CURLOPT_ACCEPT_ENCODING, "identity");
++    curl_easy_setopt(m_easy, CURLOPT_FAILONERROR, 1L);
++    curl_easy_setopt(m_easy, CURLOPT_HEADERFUNCTION, &RangeSource::OnHeader);
++    curl_easy_setopt(m_easy, CURLOPT_HEADERDATA, &t);
++    curl_easy_setopt(m_easy, CURLOPT_WRITEFUNCTION, &RangeSource::OnBody);
++    curl_easy_setopt(m_easy, CURLOPT_WRITEDATA, &t);
++    curl_easy_setopt(m_easy, CURLOPT_NOPROGRESS, 1L);
++    curl_easy_setopt(m_easy, CURLOPT_TIMEOUT_MS, static_cast<long>(left));
++#if LIBCURL_VERSION_NUM >= 0x075700
++    // a transfer stopped while a name is still being resolved does not wait for the resolver
++    curl_easy_setopt(m_easy, CURLOPT_QUICK_EXIT, 1L);
++#endif
++    m_requests++;
++    if (curl_multi_add_handle(m_multi, m_easy) != CURLM_OK)
++      return Fail(Failure::NETWORK, "curl could not start the request");
++    CURLcode result = CURLE_OK;
++    bool done = false;
++    bool stopped = false;
++    bool late = false;
++    while (true)
++    {
++      int running = 0;
++      const CURLMcode code = curl_multi_perform(m_multi, &running);
++      int queued = 0;
++      while (CURLMsg* message = curl_multi_info_read(m_multi, &queued))
++        if (message->msg == CURLMSG_DONE && message->easy_handle == m_easy)
++        {
++          result = message->data.result;
++          done = true;
++        }
++      if (done || code != CURLM_OK || running == 0)
++        break;
++      if (m_stop && m_stop())
++      {
++        stopped = true;
++        break;
++      }
++      if (std::chrono::steady_clock::now() >= m_deadline)
++      {
++        late = true;
++        break;
++      }
++      curl_multi_poll(m_multi, nullptr, 0, 100, nullptr);
++    }
++    curl_multi_remove_handle(m_multi, m_easy);
++    // t goes away with this call: nothing of it is left in the handle
++    curl_easy_setopt(m_easy, CURLOPT_HEADERFUNCTION, &RangeSource::Ignore);
++    curl_easy_setopt(m_easy, CURLOPT_HEADERDATA, nullptr);
++    curl_easy_setopt(m_easy, CURLOPT_WRITEFUNCTION, &RangeSource::Ignore);
++    curl_easy_setopt(m_easy, CURLOPT_WRITEDATA, nullptr);
++    long status = 0;
++    curl_easy_getinfo(m_easy, CURLINFO_RESPONSE_CODE, &status);
++    m_status = status;
++    if (stopped)
++      return Fail(Failure::STOPPED, "stopped");
++    if (late)
++      return Fail(Failure::LATE, "not within the deadline");
++    if (!done)
++      return Fail(Failure::NETWORK, "curl ended the request without a result");
++    if (t.refused)
++      return Fail(Failure::NOT_THE_PART, "the server answered HTTP " + std::to_string(status) +
++                                             " without the range asked: refused at its first byte");
++    if (result == CURLE_OK)
++      return true;
++    if (result == CURLE_HTTP_RETURNED_ERROR)
++      return Fail(Failure::HTTP_ERROR,
++                  "the server answered HTTP " + std::to_string(status) + ": not asked again");
++    if (result == CURLE_OPERATION_TIMEDOUT)
++      return Fail(Failure::LATE, "not within the deadline");
++    return Fail(Failure::NETWORK,
++                std::string("network: ") + curl_easy_strerror(result) + ": not tried again");
++  }
++
++  CURL_HANDLE* m_easy;
++  CURLM* m_multi;
++  std::string m_url;
++  std::function<bool()> m_stop;
++  std::chrono::steady_clock::time_point m_deadline;
++  int64_t m_size = 0;
++  int m_requests = 0;
++  int64_t m_bytes = 0;
++  long m_status = 0;
++  Failure m_failure = Failure::NONE;
++  std::string m_why;
++};
++
++struct Read
++{
++  HEADER::Result header; //!< what was read, when failure is NONE
++  Failure failure = Failure::NONE;
++  std::string why; //!< of the failure
++  int requests = 0;
++  int64_t bytes = 0; //!< bodies received
++  int64_t size = 0; //!< of the file, as the server gave it
++};
++
++//! The editions of the Matroska file at url, read by byte ranges (see above)
++inline Read ReadEditions(CURL_HANDLE* easy,
++                         CURLM* multi,
++                         const std::string& url,
++                         std::function<bool()> stop,
++                         std::chrono::steady_clock::time_point deadline,
++                         int64_t maxBytes = HEADER::MAX_BYTES)
++{
++  RangeSource source(easy, multi, url, std::move(stop), deadline);
++  Read read;
++  if (source.Begin(std::min(HEADER::FIRST_BYTES, maxBytes)))
++  {
++    read.size = source.Size();
++    read.header = HEADER::ReadHeader(source, source.Size(), maxBytes);
++  }
++  read.failure = source.GetFailure();
++  read.why = source.Why();
++  read.requests = source.Requests();
++  read.bytes = source.Bytes();
++  return read;
++}
++
++} // namespace MKV_EDITIONS::HTTP
+-- 
+2.53.0
+

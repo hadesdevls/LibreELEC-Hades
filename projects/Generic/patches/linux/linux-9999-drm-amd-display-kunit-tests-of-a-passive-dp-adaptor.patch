@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:25:26 +0000
+Subject: [PATCH 5/5] drm/amd/display: KUnit tests of a passive DP++ adaptor
+
+Seven cases in amdgpu_dm_connector_test.c for what the two patches
+before this one and the HDR InfoFrame one do, with the values of the DP
+Dual-Mode Standard and of the CTA timings:
+
+- dm_test_dual_mode_of: what is behind a connector, for 16 connectors,
+  signals and adaptors;
+- dm_test_dvbridge_tmds_hdmi_links: the links that carry the Dolby
+  Vision tunnel (11 cases: an HDMI connector as before);
+- dm_test_dual_mode_update_stereo: a DisplayPort connector allows 3D
+  through an HDMI adaptor, and no longer through an active converter or
+  a DVI adaptor; an HDMI connector keeps what it has;
+- dm_test_dual_mode_stereo_layout: the 3D layout of a mode through an
+  adaptor, none before the adaptor is looked at or for a converter;
+- dm_test_dual_mode_3d_streams: the stream of a frame packed mode
+  through each type (create_stream_for_sink()): HDMI, the doubled
+  timing, the vendor InfoFrame of frame packing, and what DC takes of it
+  (link_validate_mode_timing()): 1080p24 and 720p60 through both,
+  1080p60 through type 2 only;
+- dm_test_dual_mode_tmds_clock: the TMDS clock of the adaptor in DC for
+  the modes of the tunnel and for HDR;
+- dm_test_fill_hdr_info_packet_link: the layout of the HDR InfoFrame for
+  the link.
+---
+ .../tests/amdgpu_dm_connector_test.c          | 513 ++++++++++++++++++
+ 1 file changed, 513 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c b/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
+index b61771749ca0..a84f885ef124 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/tests/amdgpu_dm_connector_test.c
+@@ -29,6 +29,8 @@
+ #include "amdgpu_dm_backlight.h"
+ #include "include/grph_object_id.h"
+ #include "amdgpu_dm_kunit_test_helpers.h"
++#include "amdgpu_dm_dvbridge.h" /* Hades: amdgpu_dm_stereo_layout() */
++#include "link/link_validation.h" /* Hades: link_validate_mode_timing() */
+ 
+ /* Tests for get_subconnector_type() */
+ 
+@@ -5571,6 +5573,509 @@ static void dm_test_update_scaling_underscan(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, stream->dst.height, 1048);
+ }
+ 
++/*
++ * Hades: a passive DisplayPort dual-mode (DP++) adaptor behind a DisplayPort connector
++ * (amdgpu_dm_dual_mode_of()): what it is, HDMI 3D and the Dolby Vision tunnel through it, the layout
++ * of the HDR InfoFrame on its link, and the TMDS clock of the adaptor, which DC keeps
++ * (link_validate_mode_timing()). The expected values are those of the DP Dual-Mode Standard (type 1:
++ * 165 MHz, type 2: what its register says) and of the CTA timings.
++ */
++
++/* the adaptor and its display, in what DC leaves of them after detect_dp() */
++struct dm_test_dual_mode_ctx {
++	struct drm_device *drm;
++	struct amdgpu_dm_connector *aconnector;
++	struct dc_link *link;
++	struct dc_sink *sink;
++};
++
++static void dm_test_dual_mode_release_sink(void *sink)
++{
++	dc_sink_release(sink);
++}
++
++/* (one mock device per test: drm_kunit_helper_alloc_device() takes a fixed name) */
++static struct dm_test_dual_mode_ctx *
++dm_test_dual_mode_ctx_alloc(struct kunit *test, struct drm_device *drm, int connector_type,
++			    enum signal_type connector_signal, enum signal_type sink_signal,
++			    enum display_dongle_type dongle, u32 dongle_max_khz, bool infoframes)
++{
++	struct dm_test_dual_mode_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	struct dc_context *dc_ctx;
++
++	KUNIT_ASSERT_NOT_NULL(test, ctx);
++	ctx->drm = drm;
++	ctx->aconnector = dm_test_add_connector(test, ctx->drm, connector_type);
++	dc_ctx = kunit_kzalloc(test, sizeof(*dc_ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dc_ctx);
++	ctx->link = kunit_kzalloc(test, sizeof(*ctx->link), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx->link);
++	ctx->link->ctx = dc_ctx;
++	ctx->link->connector_signal = connector_signal;
++	ctx->link->dpcd_caps.dongle_type = dongle;
++	ctx->link->dpcd_caps.is_dongle_type_one = dongle_max_khz == 165000;
++	ctx->link->dongle_max_pix_clk = dongle_max_khz;
++	ctx->aconnector->dc_link = ctx->link;
++	if (sink_signal != SIGNAL_TYPE_NONE) {
++		struct dc_sink_init_data init = { .link = ctx->link, .sink_signal = sink_signal };
++
++		ctx->sink = dc_sink_create(&init);
++		KUNIT_ASSERT_NOT_NULL(test, ctx->sink);
++		ctx->sink->sink_signal = sink_signal;
++		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dm_test_dual_mode_release_sink,
++								ctx->sink), 0);
++		ctx->aconnector->dc_sink = ctx->sink;
++	}
++	ctx->aconnector->base.display_info.has_hdmi_infoframe = infoframes;
++	ctx->aconnector->base.display_info.is_hdmi = infoframes;
++	return ctx;
++}
++
++/**
++ * dm_test_dual_mode_of - Test what is behind a connector, for each connector and adaptor
++ * @test: The KUnit test context
++ */
++static void dm_test_dual_mode_of(struct kunit *test)
++{
++	static const struct {
++		int connector_type;
++		bool mst;
++		enum signal_type signal;
++		enum display_dongle_type dongle;
++		int want;
++	} c[] = {
++		/* not a DisplayPort connector (SST): never */
++		{ DRM_MODE_CONNECTOR_HDMIA, false, SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_DP_HDMI_DONGLE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_eDP, false, SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_DP_HDMI_DONGLE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DVID, false, SIGNAL_TYPE_DVI_SINGLE_LINK, DISPLAY_DONGLE_DP_DVI_DONGLE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, true, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		/* a passive adaptor that identifies itself as an HDMI one, to an HDMI display */
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_HDMI },
++		/* ... to a DVI display, or another passive adaptor */
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DVI_SINGLE_LINK,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_OTHER },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_OTHER },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DVI_SINGLE_LINK,
++		  DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_OTHER },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DVI_SINGLE_LINK,
++		  DISPLAY_DONGLE_DP_DVI_DONGLE, AMDGPU_DVBRIDGE_DUAL_MODE_OTHER },
++		/* a DisplayPort display, an active converter, no display */
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DISPLAY_PORT, DISPLAY_DONGLE_NONE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DISPLAY_PORT,
++		  DISPLAY_DONGLE_DP_HDMI_CONVERTER, AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DISPLAY_PORT,
++		  DISPLAY_DONGLE_DP_DVI_CONVERTER, AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_DISPLAY_PORT,
++		  DISPLAY_DONGLE_DP_VGA_CONVERTER, AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_NONE, DISPLAY_DONGLE_DP_HDMI_DONGLE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_VIRTUAL, DISPLAY_DONGLE_DP_HDMI_DONGLE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++		{ DRM_MODE_CONNECTOR_DisplayPort, false, SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_NONE,
++		  AMDGPU_DVBRIDGE_DUAL_MODE_NONE },
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c); i++)
++		KUNIT_EXPECT_EQ_MSG(test, amdgpu_dm_dual_mode_of(c[i].connector_type, c[i].mst,
++								 c[i].signal, c[i].dongle),
++				    c[i].want, "case %u", i);
++}
++
++/**
++ * dm_test_dvbridge_tmds_hdmi_links - Test the links that carry the Dolby Vision tunnel
++ * @test: The KUnit test context
++ *
++ * An HDMI connector as before (TMDS, InfoFrames); a DisplayPort connector only through a passive
++ * HDMI adaptor to a display that takes InfoFrames.
++ */
++static void dm_test_dvbridge_tmds_hdmi_links(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	static const struct {
++		int type;
++		enum signal_type connector_signal, sink_signal;
++		enum display_dongle_type dongle;
++		bool infoframes, mst, want;
++	} c[] = {
++		{ DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_TYPE_A, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_NONE, true, false, true },
++		{ DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_TYPE_A, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_NONE, false, false, false },
++		{ DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_FRL, SIGNAL_TYPE_HDMI_FRL,
++		  DISPLAY_DONGLE_NONE, true, false, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, true, false, true },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, false, false, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_DONGLE, true, true, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++		  DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE, true, false, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_DVI_SINGLE_LINK,
++		  DISPLAY_DONGLE_DP_DVI_DONGLE, true, false, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_DISPLAY_PORT,
++		  DISPLAY_DONGLE_DP_HDMI_CONVERTER, true, false, false },
++		{ DRM_MODE_CONNECTOR_DisplayPort, SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_DISPLAY_PORT,
++		  DISPLAY_DONGLE_NONE, true, false, false },
++		{ DRM_MODE_CONNECTOR_eDP, SIGNAL_TYPE_EDP, SIGNAL_TYPE_EDP, DISPLAY_DONGLE_NONE, true,
++		  false, false },
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c); i++) {
++		struct dm_test_dual_mode_ctx *ctx =
++			dm_test_dual_mode_ctx_alloc(test, drm, c[i].type, c[i].connector_signal,
++						    c[i].sink_signal, c[i].dongle, 300000,
++						    c[i].infoframes);
++
++		ctx->aconnector->mst_mgr.mst_state = c[i].mst;
++		KUNIT_EXPECT_EQ_MSG(test, amdgpu_dm_dvbridge_tmds_hdmi(ctx->aconnector), c[i].want,
++				    "case %u", i);
++	}
++}
++
++/**
++ * dm_test_dual_mode_update_stereo - Test that a DisplayPort connector allows 3D through an adaptor
++ * @test: The KUnit test context
++ */
++static void dm_test_dual_mode_update_stereo(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	struct dm_test_dual_mode_ctx *ctx =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_DisplayPort,
++					    SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++					    DISPLAY_DONGLE_DP_HDMI_DONGLE, 300000, true);
++	struct dm_test_dual_mode_ctx *hdmi =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_TYPE_A,
++					    SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_NONE, 0, true);
++
++	KUNIT_EXPECT_FALSE(test, ctx->aconnector->base.stereo_allowed);
++	amdgpu_dm_update_dual_mode(ctx->aconnector);
++	KUNIT_EXPECT_TRUE(test, ctx->aconnector->base.stereo_allowed);
++	KUNIT_EXPECT_EQ(test, (int)ctx->aconnector->dvbridge_dual_mode_logged,
++			AMDGPU_DVBRIDGE_DUAL_MODE_HDMI);
++
++	/* the adaptor is replaced by an active converter to the same display */
++	ctx->link->dpcd_caps.dongle_type = DISPLAY_DONGLE_DP_HDMI_CONVERTER;
++	ctx->sink->sink_signal = SIGNAL_TYPE_DISPLAY_PORT;
++	amdgpu_dm_update_dual_mode(ctx->aconnector);
++	KUNIT_EXPECT_FALSE(test, ctx->aconnector->base.stereo_allowed);
++	KUNIT_EXPECT_EQ(test, (int)ctx->aconnector->dvbridge_dual_mode_logged,
++			AMDGPU_DVBRIDGE_DUAL_MODE_NONE);
++
++	/* a DVI adaptor */
++	ctx->link->dpcd_caps.dongle_type = DISPLAY_DONGLE_DP_DVI_DONGLE;
++	ctx->sink->sink_signal = SIGNAL_TYPE_DVI_SINGLE_LINK;
++	amdgpu_dm_update_dual_mode(ctx->aconnector);
++	KUNIT_EXPECT_FALSE(test, ctx->aconnector->base.stereo_allowed);
++	KUNIT_EXPECT_EQ(test, (int)ctx->aconnector->dvbridge_dual_mode_logged,
++			AMDGPU_DVBRIDGE_DUAL_MODE_OTHER);
++
++	/* an HDMI connector keeps what its init gave it */
++	hdmi->aconnector->base.stereo_allowed = true;
++	amdgpu_dm_update_dual_mode(hdmi->aconnector);
++	KUNIT_EXPECT_TRUE(test, hdmi->aconnector->base.stereo_allowed);
++	hdmi->aconnector->base.stereo_allowed = false;
++	amdgpu_dm_update_dual_mode(hdmi->aconnector);
++	KUNIT_EXPECT_FALSE(test, hdmi->aconnector->base.stereo_allowed);
++}
++
++static struct drm_display_mode *dm_test_dual_mode_cea(struct kunit *test, struct drm_device *drm,
++						      u8 vic, u32 layout)
++{
++	struct drm_display_mode *mode = drm_display_mode_from_cea_vic(drm, vic);
++
++	KUNIT_ASSERT_NOT_NULL(test, mode);
++	mode->flags |= layout;
++	drm_mode_set_crtcinfo(mode, 0);
++	return mode;
++}
++
++/**
++ * dm_test_dual_mode_stereo_layout - Test the 3D layout of a mode through an adaptor
++ * @test: The KUnit test context
++ */
++static void dm_test_dual_mode_stereo_layout(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	struct dm_test_dual_mode_ctx *dp =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_DisplayPort,
++					    SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++					    DISPLAY_DONGLE_DP_HDMI_DONGLE, 165000, true);
++	struct dm_test_dual_mode_ctx *hdmi =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_TYPE_A,
++					    SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_NONE, 0, true);
++	struct drm_display_mode *fp = dm_test_dual_mode_cea(test, dp->drm, 32,
++							    DRM_MODE_FLAG_3D_FRAME_PACKING);
++	struct drm_display_mode *tab = dm_test_dual_mode_cea(test, dp->drm, 32,
++							     DRM_MODE_FLAG_3D_TOP_AND_BOTTOM);
++
++	/* before the adaptor is looked at (as on every DisplayPort connector before): 2D */
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_stereo_layout(&dp->aconnector->base, fp), 0u);
++	amdgpu_dm_update_dual_mode(dp->aconnector);
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_stereo_layout(&dp->aconnector->base, fp),
++			(u32)DRM_MODE_FLAG_3D_FRAME_PACKING);
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_stereo_layout(&dp->aconnector->base, tab),
++			(u32)DRM_MODE_FLAG_3D_TOP_AND_BOTTOM);
++	/* stereo_allowed left from before, and an active converter now: 2D */
++	dp->link->dpcd_caps.dongle_type = DISPLAY_DONGLE_DP_HDMI_CONVERTER;
++	dp->sink->sink_signal = SIGNAL_TYPE_DISPLAY_PORT;
++	KUNIT_EXPECT_TRUE(test, dp->aconnector->base.stereo_allowed);
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_stereo_layout(&dp->aconnector->base, fp), 0u);
++	/* an HDMI connector, as before */
++	hdmi->aconnector->base.stereo_allowed = true;
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_stereo_layout(&hdmi->aconnector->base, fp),
++			(u32)DRM_MODE_FLAG_3D_FRAME_PACKING);
++	drm_mode_destroy(dp->drm, fp);
++	drm_mode_destroy(dp->drm, tab);
++}
++
++/*
++ * The stream of a mode on a connector (create_stream_for_sink(), RGB at 8 bits), and whether DC
++ * takes its timing on the link of the connector (link_validate_mode_timing(): the TMDS clock of the
++ * passive adaptor). The stream is released here; its validation and what the test needs of it are
++ * given back.
++ */
++struct dm_test_dual_mode_stream {
++	enum dc_status status;
++	enum signal_type signal;
++	u32 pix_clk_100hz;
++	u32 v_addressable;
++	bool vsif_3d;
++	u8 s3d_struct;
++};
++
++static struct dm_test_dual_mode_stream
++dm_test_dual_mode_stream(struct kunit *test, struct dm_test_dual_mode_ctx *ctx,
++			 const struct drm_display_mode *mode)
++{
++	struct dm_test_dual_mode_stream out = { 0 };
++	struct dm_connector_state *dm_state = kunit_kzalloc(test, sizeof(*dm_state), GFP_KERNEL);
++	struct dc_stream_state *stream;
++
++	KUNIT_ASSERT_NOT_NULL(test, dm_state);
++	dm_state->base.connector = &ctx->aconnector->base;
++	dm_state->scaling = RMX_OFF;
++	stream = create_stream_for_sink(&ctx->aconnector->base, mode, dm_state, NULL, 8,
++					PIXEL_ENCODING_RGB, false);
++	KUNIT_ASSERT_NOT_NULL(test, stream);
++	stream->timing.display_color_depth = COLOR_DEPTH_888;
++	out.signal = stream->signal;
++	out.pix_clk_100hz = stream->timing.pix_clk_100hz;
++	out.v_addressable = stream->timing.v_addressable;
++	out.vsif_3d = stream->vsp_infopacket.valid && stream->vsp_infopacket.hb0 == 0x81 &&
++		      stream->vsp_infopacket.sb[1] == 0x03 && stream->vsp_infopacket.sb[2] == 0x0c &&
++		      (stream->vsp_infopacket.sb[4] >> 5) == 2;
++	out.s3d_struct = stream->vsp_infopacket.sb[5] >> 4;
++	out.status = link_validate_mode_timing(stream, ctx->link, &stream->timing);
++	dc_stream_release(stream);
++	return out;
++}
++
++/**
++ * dm_test_dual_mode_3d_streams - Test HDMI 3D frame packing through a type 1 and a type 2 adaptor
++ * @test: The KUnit test context
++ *
++ * 1080p24 and 720p60 frame packed scan out 148.5 MHz: through both types. 1080p60 frame packed scans
++ * out 297 MHz: through type 2 only (DC refuses it for type 1, DC_EXCEED_DONGLE_CAP). (An active
++ * converter carries DisplayPort, which has no HDMI vendor InfoFrame: dm_test_dual_mode_stereo_layout()
++ * shows that its mode is the 2D twin.)
++ */
++static void dm_test_dual_mode_3d_streams(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	static const struct {
++		u8 vic;
++		u32 khz;
++		u32 pix_100hz;
++		u32 lines;
++		enum dc_status want;
++	} c[] = {
++		{ 32, 165000, 1485000, 2205, DC_OK },			/* 1080p24, type 1 */
++		{ 32, 300000, 1485000, 2205, DC_OK },			/* 1080p24, type 2 */
++		{ 4, 165000, 1485000, 1470, DC_OK },			/* 720p60, type 1 */
++		{ 16, 165000, 2970000, 2205, DC_EXCEED_DONGLE_CAP },	/* 1080p60, type 1 */
++		{ 16, 300000, 2970000, 2205, DC_OK },			/* 1080p60, type 2 */
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c); i++) {
++		struct dm_test_dual_mode_ctx *ctx =
++			dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_DisplayPort,
++						    SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++						    DISPLAY_DONGLE_DP_HDMI_DONGLE, c[i].khz, true);
++		struct drm_display_mode *fp = dm_test_dual_mode_cea(test, ctx->drm, c[i].vic,
++								    DRM_MODE_FLAG_3D_FRAME_PACKING);
++		struct dm_test_dual_mode_stream s;
++
++		amdgpu_dm_update_dual_mode(ctx->aconnector);
++		s = dm_test_dual_mode_stream(test, ctx, fp);
++		KUNIT_EXPECT_EQ_MSG(test, (int)s.signal, (int)SIGNAL_TYPE_HDMI_TYPE_A, "case %u", i);
++		KUNIT_EXPECT_EQ_MSG(test, s.pix_clk_100hz, c[i].pix_100hz, "case %u", i);
++		KUNIT_EXPECT_EQ_MSG(test, s.v_addressable, c[i].lines, "case %u", i);
++		KUNIT_EXPECT_TRUE_MSG(test, s.vsif_3d, "case %u", i);
++		KUNIT_EXPECT_EQ_MSG(test, s.s3d_struct, (u8)HDMI_3D_STRUCTURE_FRAME_PACKING, "case %u",
++				    i);
++		KUNIT_EXPECT_EQ_MSG(test, (int)s.status, (int)c[i].want, "case %u", i);
++		drm_mode_destroy(ctx->drm, fp);
++	}
++
++}
++
++/**
++ * dm_test_dual_mode_tmds_clock - Test what DC takes through a passive adaptor, by its TMDS clock
++ * @test: The KUnit test context
++ *
++ * The Dolby Vision tunnel is RGB at 8 bits: its TMDS clock is the pixel clock. 2160p24 (297 MHz) goes
++ * through a type 2 adaptor of 300 MHz, not a type 1 one; 2160p60 (594 MHz) through neither; what DC
++ * tries instead of it, YCbCr 4:2:0 at 297 MHz, goes through type 2, and the scanout check of the
++ * tunnel refuses it for its encoding. HDR10 at 10 bits in RGB at 2160p24 (371.25 MHz) does not go
++ * through type 2; YCbCr 4:2:2 at 12 bits does. Without an adaptor nothing of this limits.
++ */
++static void dm_test_dual_mode_tmds_clock(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	static const struct {
++		u32 pix_100hz;
++		enum dc_pixel_encoding encoding;
++		enum dc_color_depth depth;
++		u32 khz;
++		enum dc_status want;
++	} c[] = {
++		{ 742500, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 165000, DC_OK },	/* DV 1080p24 */
++		{ 1485000, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 165000, DC_OK },	/* DV 1080p60 */
++		{ 2970000, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 165000, DC_EXCEED_DONGLE_CAP },
++		{ 2970000, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 300000, DC_OK },	/* DV 2160p24 */
++		{ 5940000, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 300000, DC_EXCEED_DONGLE_CAP },
++		{ 5940000, PIXEL_ENCODING_YCBCR420, COLOR_DEPTH_888, 300000, DC_OK },
++		{ 2970000, PIXEL_ENCODING_RGB, COLOR_DEPTH_101010, 300000, DC_EXCEED_DONGLE_CAP },
++		{ 2970000, PIXEL_ENCODING_YCBCR422, COLOR_DEPTH_121212, 300000, DC_OK },
++		{ 5940000, PIXEL_ENCODING_RGB, COLOR_DEPTH_888, 0, DC_OK },		/* no adaptor */
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c); i++) {
++		struct dm_test_dual_mode_ctx *ctx =
++			dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_DisplayPort,
++						    SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++						    c[i].khz ? DISPLAY_DONGLE_DP_HDMI_DONGLE :
++							       DISPLAY_DONGLE_NONE,
++						    c[i].khz, true);
++		struct dc_stream_state *stream = kunit_kzalloc(test, sizeof(*stream), GFP_KERNEL);
++		struct dc *dc = kunit_kzalloc(test, sizeof(*dc), GFP_KERNEL);
++
++		KUNIT_ASSERT_NOT_NULL(test, stream);
++		KUNIT_ASSERT_NOT_NULL(test, dc);
++		ctx->link->dc = dc;
++		stream->link = ctx->link;
++		stream->signal = SIGNAL_TYPE_HDMI_TYPE_A;
++		stream->timing.pix_clk_100hz = c[i].pix_100hz;
++		stream->timing.pixel_encoding = c[i].encoding;
++		stream->timing.display_color_depth = c[i].depth;
++		KUNIT_EXPECT_EQ_MSG(test,
++				    (int)link_validate_mode_timing(stream, ctx->link, &stream->timing),
++				    (int)c[i].want, "case %u", i);
++	}
++}
++
++static struct drm_property_blob *dm_test_dual_mode_hdr_blob(struct kunit *test)
++{
++	struct drm_property_blob *blob =
++		kunit_kzalloc(test, sizeof(*blob) + sizeof(struct hdr_output_metadata), GFP_KERNEL);
++	struct hdr_output_metadata *md;
++
++	KUNIT_ASSERT_NOT_NULL(test, blob);
++	md = (struct hdr_output_metadata *)(blob + 1);
++	md->metadata_type = HDMI_STATIC_METADATA_TYPE1;
++	md->hdmi_metadata_type1.eotf = HDMI_EOTF_SMPTE_ST2084;
++	md->hdmi_metadata_type1.metadata_type = HDMI_STATIC_METADATA_TYPE1;
++	md->hdmi_metadata_type1.max_display_mastering_luminance = 1000;
++	md->hdmi_metadata_type1.min_display_mastering_luminance = 50;
++	md->hdmi_metadata_type1.max_cll = 1000;
++	md->hdmi_metadata_type1.max_fall = 400;
++	blob->data = md;
++	blob->length = sizeof(*md);
++	return blob;
++}
++
++static bool dm_test_hdmi_layout(const struct dc_info_packet *p)
++{
++	u8 sum = p->hb0 + p->hb1 + p->hb2;
++	unsigned int i;
++
++	for (i = 0; i <= 26; i++)
++		sum += p->sb[i];
++	return p->valid && p->hb0 == 0x87 && p->hb1 == 0x01 && p->hb2 == 0x1a && !sum;
++}
++
++static bool dm_test_sdp_layout(const struct dc_info_packet *p)
++{
++	return p->valid && p->hb0 == 0x00 && p->hb1 == 0x87 && p->hb2 == 0x1d &&
++	       p->hb3 == (0x13 << 2) && p->sb[0] == 0x01 && p->sb[1] == 0x1a;
++}
++
++/**
++ * dm_test_fill_hdr_info_packet_link - Test the layout of the HDR InfoFrame for the link
++ * @test: The KUnit test context
++ *
++ * A DisplayPort connector that carries HDMI through a passive adaptor gets the HDMI layout (the SDP
++ * one starts with a null packet type on an HDMI link); one that carries DisplayPort keeps the SDP,
++ * and an HDMI connector the HDMI one. The packet by the connector alone is what it was.
++ */
++static void dm_test_fill_hdr_info_packet_link(struct kunit *test)
++{
++	struct drm_device *drm = dm_test_alloc_drm(test);
++	struct dm_test_dual_mode_ctx *dp =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_DisplayPort,
++					    SIGNAL_TYPE_DISPLAY_PORT, SIGNAL_TYPE_HDMI_TYPE_A,
++					    DISPLAY_DONGLE_DP_HDMI_DONGLE, 300000, true);
++	struct dm_test_dual_mode_ctx *hdmi =
++		dm_test_dual_mode_ctx_alloc(test, drm, DRM_MODE_CONNECTOR_HDMIA, SIGNAL_TYPE_HDMI_TYPE_A,
++					    SIGNAL_TYPE_HDMI_TYPE_A, DISPLAY_DONGLE_NONE, 0, true);
++	struct drm_connector_state dp_state = {}, hdmi_state = {};
++	struct dc_info_packet out, ref;
++
++	dp_state.connector = &dp->aconnector->base;
++	dp_state.hdr_output_metadata = dm_test_dual_mode_hdr_blob(test);
++	hdmi_state.connector = &hdmi->aconnector->base;
++	hdmi_state.hdr_output_metadata = dp_state.hdr_output_metadata;
++
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet_link(&dp_state, SIGNAL_TYPE_HDMI_TYPE_A,
++								  &out), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_hdmi_layout(&out));
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet(&hdmi_state, &ref), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_hdmi_layout(&ref));
++	KUNIT_EXPECT_EQ(test, memcmp(&out, &ref, sizeof(out)), 0);
++
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet_link(&dp_state,
++								  SIGNAL_TYPE_DISPLAY_PORT, &out), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_sdp_layout(&out));
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet(&dp_state, &ref), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_sdp_layout(&ref));
++	KUNIT_EXPECT_EQ(test, memcmp(&out, &ref, sizeof(out)), 0);
++
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet_link(&hdmi_state,
++								  SIGNAL_TYPE_HDMI_TYPE_A, &out), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_hdmi_layout(&out));
++	KUNIT_ASSERT_EQ(test, amdgpu_dm_fill_hdr_info_packet_link(&hdmi_state,
++								  SIGNAL_TYPE_HDMI_FRL, &out), 0);
++	KUNIT_EXPECT_TRUE(test, dm_test_hdmi_layout(&out));
++
++	/* no metadata: nothing, on any link */
++	dp_state.hdr_output_metadata = NULL;
++	KUNIT_EXPECT_EQ(test, amdgpu_dm_fill_hdr_info_packet_link(&dp_state, SIGNAL_TYPE_HDMI_TYPE_A,
++								  &out), 0);
++	KUNIT_EXPECT_FALSE(test, out.valid);
++}
++
+ static struct kunit_case amdgpu_dm_connector_tests[] = {
+ 	/* get_subconnector_type */
+ 	KUNIT_CASE(dm_test_subconnector_type_none),
+@@ -5872,6 +6377,14 @@ static struct kunit_case amdgpu_dm_connector_tests[] = {
+ 	KUNIT_CASE(dm_test_update_scaling_rmx_aspect_letterbox),
+ 	KUNIT_CASE(dm_test_update_scaling_rmx_center),
+ 	KUNIT_CASE(dm_test_update_scaling_underscan),
++	/* Hades: a passive DisplayPort dual-mode adaptor */
++	KUNIT_CASE(dm_test_dual_mode_of),
++	KUNIT_CASE(dm_test_dvbridge_tmds_hdmi_links),
++	KUNIT_CASE(dm_test_dual_mode_update_stereo),
++	KUNIT_CASE(dm_test_dual_mode_stereo_layout),
++	KUNIT_CASE(dm_test_dual_mode_3d_streams),
++	KUNIT_CASE(dm_test_dual_mode_tmds_clock),
++	KUNIT_CASE(dm_test_fill_hdr_info_packet_link),
+ 	{}
+ };
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,490 @@
+From 621d979f7b03f36cd2b0d4c1564cf5134745bfc4 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:09:50 +0000
+Subject: [PATCH] windowing/gbm: what is not certain keeps only the output with
+ the picture on, and a refused turn-off goes on one CRTC at a time
+
+Monitors on the same card as the TV stayed on, black, with the picture on
+the TV. Two paths in the code kept them on, and both are closed:
+
+- Where it was not certain which output carries the sound in use (the audio
+  engine had not said yet, ALSA names no card or no ELD, the ELD of the card
+  reads as no display of it, which nothing says cannot happen with the ELD of
+  an NVIDIA codec), every output of the card that could carry sound was kept
+  on, monitors included. Only the output with the picture is kept now, as it
+  is on anyway; the others go off. What was in doubt goes to kodi.log in one
+  line per sound: why, the outputs that could have carried it with the
+  display of each, and the display the ELD names. An exact match of the ELD
+  still keeps that output, and hades-keep-outputs still keeps what the user
+  names. This replaces the filter by EDID audio descriptors of the commit
+  before, which would not have turned off a monitor with a headphone jack:
+  the descriptors are still named in the log line.
+- The commit that turns the unused outputs off was asked for three times
+  and then given up ("they stay on"), so one CRTC that the driver refused
+  kept every monitor lit. After the second refusal the outputs now go off
+  one CRTC at a time; one that the driver refuses alone is left on and
+  named, and the rest go off. A move to another output still turns them all
+  off at once.
+
+Not verified on hardware: that either was the cause on the 4080; the log
+lines of its next test say which.
+---
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp     |  74 +++++++++++++---
+ xbmc/windowing/gbm/drm/DRMAtomic.h       |   8 ++
+ xbmc/windowing/gbm/drm/DRMKeepOutputs.h  |  79 +++++++++++++++++
+ xbmc/windowing/gbm/drm/DRMSoundOutputs.h | 104 +++++++++++++++--------
+ xbmc/windowing/gbm/drm/DRMUtils.cpp      |   3 +-
+ 5 files changed, 217 insertions(+), 51 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 7a8ee45..774873e 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -198,6 +198,7 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   {
+     m_otherOutputsOff = std::chrono::steady_clock::now();
+     m_otherOutputsTries = 0;
++    m_offRetry.NewMode();
+   }
+ 
+   // Hades: a commit that changes "Broadcast RGB" allows a mode set (CRgbRange::ChangesRange()).
+@@ -256,6 +257,7 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     {
+       m_otherOutputsOff = std::chrono::steady_clock::now() + noticeTime;
+       m_otherOutputsTries = 0; // (Hades: OtherOutputsOffRefused())
++      m_offRetry.NewMode();
+     }
+     m_old_crtc = nullptr;
+   }
+@@ -637,6 +639,17 @@ CDRMAtomic::OtherOutputsOff CDRMAtomic::AddOtherOutputsOff(const AddFunction& ad
+       result.kept.insert(result.kept.end(), kept.begin(), kept.end());
+       continue;
+     }
++    // Hades: one CRTC at a time where the driver refused them all at once (COutputsOffRetry)
++    const auto verdict = m_offAllAtOnce ? KEEP_OUTPUTS::COutputsOffRetry::Verdict::TAKE
++                                        : m_offRetry.Consider(static_cast<uint32_t>(id), result.off);
++    if (verdict == KEEP_OUTPUTS::COutputsOffRetry::Verdict::SKIP)
++      continue;
++    if (verdict == KEEP_OUTPUTS::COutputsOffRetry::Verdict::LEAVE_FOR_NEXT)
++    {
++      result.more = true;
++      continue;
++    }
++    result.onlyCrtc = static_cast<uint32_t>(id);
+     result.keptOff.insert(result.keptOff.end(), kept.begin(), kept.end());
+ 
+     for (const auto& plane : m_planes)
+@@ -671,6 +684,7 @@ bool CDRMAtomic::DisableOtherOutputs(int& flags, std::optional<KEEP_OUTPUTS::Kee
+   // (Hades: in the commit of a move, the output that Kodi leaves goes off as it always did; and
+   // what the driver said of the last way it did not take, there as TestOutputMove() heard it)
+   const bool inMove = mode.has_value();
++  m_offAllAtOnce = inMove;
+   const CDRMConnector* leaving = inMove ? m_moveFrom : nullptr;
+   int refusedError = inMove ? m_moveKeepError : 0;
+ 
+@@ -729,6 +743,13 @@ bool CDRMAtomic::DisableOtherOutputs(int& flags, std::optional<KEEP_OUTPUTS::Kee
+       AddOtherOutputsOff([this](CDRMObject* object, const char* name, uint64_t value)
+                          { AddProperty(object, name, value); }, m_crtc, m_connector, leaving, *mode,
+                          inMove && m_moveLeftKept);
++  // Hades: one at a time, the next one is asked for soon after this one (a refusal of it says so)
++  if (!inMove)
++  {
++    m_offRetry.Built(done.onlyCrtc, done.more);
++    if (m_offRetry.MoreToFollow() && done.off > 0)
++      m_otherOutputsOff = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++  }
+   // Hades: the CRTC and the mode of each output that goes off, for when its sound is in use later
+   // (BringBack()); the blob of the mode is there until this commit is taken
+   for (const auto& [name, crtc] : done.offOutputs)
+@@ -821,22 +842,49 @@ void CDRMAtomic::LogKeptOutputs(const OtherOutputsOff& done,
+ 
+ void CDRMAtomic::OtherOutputsOffRefused(int error)
+ {
+-  // (a mode that comes asks again on its own: the count is of the one the outputs went off with)
+-  constexpr int tries = 3;
++  using Next = KEEP_OUTPUTS::COutputsOffRetry::Next;
+   constexpr auto later = std::chrono::seconds(10);
+-  if (++m_otherOutputsTries < tries)
++  constexpr auto soon = std::chrono::seconds(2);
++  const uint32_t alone = m_offRetry.Attempt();
++  // (a mode that comes asks again on its own: m_otherOutputsOff is set again with it)
++  switch (m_offRetry.Refused())
+   {
+-    m_otherOutputsOff = std::chrono::steady_clock::now() + later;
+-    CLog::LogF(LOGWARNING,
+-               "the commit that turns off the outputs not used by Kodi was refused ({}): it is "
+-               "asked for again in {} s",
+-               strerror(error), later.count());
++    case Next::SAME_LATER:
++      m_otherOutputsOff = std::chrono::steady_clock::now() + later;
++      CLog::LogF(LOGWARNING,
++                 "the commit that turns off the outputs not used by Kodi was refused ({}): it is "
++                 "asked for again in {} s",
++                 strerror(error), later.count());
++      break;
++    case Next::ONE_BY_ONE:
++      m_otherOutputsOff = std::chrono::steady_clock::now() + soon;
++      CLog::LogF(LOGWARNING,
++                 "the commit that turns off the outputs not used by Kodi was refused again ({}): "
++                 "they are turned off one CRTC at a time from now on, so that one that the driver "
++                 "refuses does not keep the others on",
++                 strerror(error));
++      break;
++    case Next::NEXT_SOON:
++      m_otherOutputsOff = std::chrono::steady_clock::now() + soon;
++      CLog::LogF(LOGWARNING,
++                 "the driver refused turning off CRTC {} alone ({}): it stays on, and the next "
++                 "one is turned off",
++                 alone, strerror(error));
++      break;
++    case Next::LEFT_ON:
++    {
++      std::string left;
++      for (const uint32_t id : m_offRetry.Skipped())
++        left += (left.empty() ? "" : ", ") + std::to_string(id);
++      CLog::LogF(LOGWARNING,
++                 "the driver refused turning off CRTC {} alone ({}): CRTC(s) {} stay on, the others "
++                 "that Kodi does not use are off",
++                 alone, strerror(error), left);
++      break;
++    }
+   }
+-  else
+-    CLog::LogF(LOGWARNING,
+-               "the commit that turns off the outputs not used by Kodi was refused {} times ({}): "
+-               "they stay on",
+-               tries, strerror(error));
++  // (kept for the log of older lines: how many of these commits were refused since the last mode)
++  ++m_otherOutputsTries;
+ }
+ 
+ void CDRMAtomic::FinishRequest(bool accepted)
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index 6bafe58..25185d8 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -195,6 +195,10 @@ private:
+     std::string leftOff;
+     //! Hades: the outputs that go off, with the CRTC each was on (for BringBack())
+     std::vector<std::pair<std::string, const CDRMCrtc*>> offOutputs;
++    //! Hades: one CRTC at a time (KEEP_OUTPUTS::COutputsOffRetry): the one that goes off, and
++    //! whether others are left for the next commit
++    uint32_t onlyCrtc{0};
++    bool more{false};
+   };
+   //! Hades: lights again, in this commit, which changes a mode, the outputs of this device whose
+   //! sound is in use now and which Kodi turned off before (m_soundBringBack), as the driver takes
+@@ -290,6 +294,10 @@ private:
+   //! Hades: how many commits that turned them off were refused since the last mode
+   //! (OtherOutputsOffRefused())
+   int m_otherOutputsTries{0};
++  //! Hades: how a refusal is asked again, all at once and then one CRTC at a time
++  KEEP_OUTPUTS::COutputsOffRetry m_offRetry;
++  //! Hades: in the commit of a move every other output goes off at once, whatever was refused before
++  bool m_offAllAtOnce{false};
+   //! Hades: how the next move leaves the outputs the user keeps on, as TestOutputMove() found that
+   //! the driver takes it
+   std::optional<KEEP_OUTPUTS::KeepMode> m_moveKeepMode;
+diff --git a/xbmc/windowing/gbm/drm/DRMKeepOutputs.h b/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
+index 06cbd12..62593f9 100644
+--- a/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
++++ b/xbmc/windowing/gbm/drm/DRMKeepOutputs.h
+@@ -14,6 +14,7 @@
+ #include <cstdint>
+ #include <istream>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -205,6 +206,84 @@ inline uint32_t CrtcOfOutput(std::optional<uint64_t> atomicCrtc, uint32_t encode
+   return encoderCrtc;
+ }
+ 
++/*!
++ * \brief Hades: how the turning off of the outputs that Kodi does not use is asked again when the
++ *        driver refuses it
++ *
++ * The commit that turns them off all at once may be refused for one of them (a monitor whose link
++ * the driver cannot drop with the rest), and giving up after a few tries left every monitor of the
++ * card on, black. After the first refusal the same commit is asked again once; after the second,
++ * the outputs go off one CRTC at a time: a CRTC that the driver refuses even alone is left on
++ * and said, and the others go off, however many there are.
++ */
++class COutputsOffRetry
++{
++public:
++  enum class Verdict
++  {
++    TAKE, //!< this CRTC goes off with this commit
++    LEAVE_FOR_NEXT, //!< one at a time: another one goes off with this commit, this one next
++    SKIP, //!< one at a time: the driver refused it alone, it stays on
++  };
++  //! \param taken how many CRTCs this commit turns off already
++  Verdict Consider(uint32_t crtc, unsigned int taken) const
++  {
++    if (!m_oneByOne)
++      return Verdict::TAKE;
++    if (m_skipped.contains(crtc))
++      return Verdict::SKIP;
++    return taken == 0 ? Verdict::TAKE : Verdict::LEAVE_FOR_NEXT;
++  }
++  //! What the commit that was built asks: the CRTC it turns off alone (0: all of them), and whether
++  //! more are left for later
++  void Built(uint32_t attempt, bool more)
++  {
++    m_attempt = m_oneByOne ? attempt : 0;
++    m_more = more;
++  }
++  //! Whether, once this commit is taken, another is to follow
++  bool MoreToFollow() const { return m_oneByOne && m_more; }
++
++  enum class Next
++  {
++    SAME_LATER, //!< the same commit again, later
++    ONE_BY_ONE, //!< from now on one CRTC at a time, soon
++    NEXT_SOON, //!< the CRTC that was asked alone stays on; the next one, soon
++    LEFT_ON, //!< what is left on stays on: nothing more to ask
++  };
++  Next Refused()
++  {
++    if (m_oneByOne)
++    {
++      if (m_attempt)
++        m_skipped.insert(m_attempt);
++      return m_more ? Next::NEXT_SOON : Next::LEFT_ON;
++    }
++    if (++m_tries < 2)
++      return Next::SAME_LATER;
++    m_oneByOne = true;
++    m_tries = 0;
++    return Next::ONE_BY_ONE;
++  }
++  //! The CRTC that was refused alone, for the log; 0 when it was not alone
++  uint32_t Attempt() const { return m_attempt; }
++  //! A new mode asks everything again (what was learned of the driver stays: one at a time)
++  void NewMode()
++  {
++    m_tries = 0;
++    m_skipped.clear();
++  }
++  const std::set<uint32_t>& Skipped() const { return m_skipped; }
++  bool OneByOne() const { return m_oneByOne; }
++
++private:
++  bool m_oneByOne{false};
++  int m_tries{0};
++  uint32_t m_attempt{0};
++  bool m_more{false};
++  std::set<uint32_t> m_skipped;
++};
++
+ } // namespace KEEP_OUTPUTS
+ } // namespace GBM
+ } // namespace WINDOWING
+diff --git a/xbmc/windowing/gbm/drm/DRMSoundOutputs.h b/xbmc/windowing/gbm/drm/DRMSoundOutputs.h
+index 4d8a415..f179ef2 100644
+--- a/xbmc/windowing/gbm/drm/DRMSoundOutputs.h
++++ b/xbmc/windowing/gbm/drm/DRMSoundOutputs.h
+@@ -132,27 +132,32 @@ struct SoundDecision
+   }
+ };
+ 
++//! Hades: an output, as (node of its device, its name)
++using OutputKey = std::pair<std::string, std::string>;
++
+ /*!
+  * \brief Hades: the outputs of the graphics devices that carry the sound of the audio outputs in use
+  * \param sound the audio outputs that the audio engine uses (KODI::UTILS::CSoundOutputsInUse)
+  * \param published the audio engine has said them (its generation is not 0)
+  * \param devices the graphics devices: the one that Kodi uses and the others that drive a display
++ * \param picture the output that carries Kodi's picture (node of its device, its name), which is on
++ *        anyway
+  *
+  * Exact where it can be: the sound card is of one graphics device (CardOfDevice()), and of the
+  * outputs of that device one has the display that the ELD of the audio output names
+  * (KODI::UTILS::SameDisplay(): maker, product, and name where both have one). Two outputs with
+  * the same display (two displays of one model) are both kept. Wherever it is not certain which
+- * output carries the sound, every output that can carry sound and has a display connected is
+- * kept, of the graphics device of the card where that is known and of all of them where it is
+- * not: that is what Kodi did before this build turned unused outputs off. Only a display that can
+- * take sound counts then (GraphicsOutput::audio): a monitor whose EDID has no audio descriptors
+- * has no ELD and cannot carry what is not certain to be its own, and would stay on as a black
+- * screen for nothing. An audio output that no
++ * output carries the sound, only the output with the picture is kept (it is on anyway): a monitor
++ * kept on for a sound that is probably the TV's shows a black screen for nothing, and the final
++ * 1.0 turns them off. What was in doubt goes to the log (SoundDecision::notes: the outputs that
++ * could have carried it, and the display its ELD names), and the user can keep outputs on with
++ * hades-keep-outputs. An audio output that no
+  * graphics output carries (analog, S/PDIF, USB) keeps nothing.
+  */
+ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& sound,
+                                      bool published,
+-                                     const std::vector<GraphicsDevice>& devices)
++                                     const std::vector<GraphicsDevice>& devices,
++                                     const OutputKey& picture = {})
+ {
+   SoundDecision decision;
+   const auto keep = [&decision](const GraphicsDevice& device, const GraphicsOutput& output,
+@@ -168,32 +173,75 @@ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& soun
+     if (std::ranges::find(it->why, why) == it->why.end())
+       it->why.push_back(why);
+   };
+-  // (every output that can carry sound and has a display that takes sound, of these devices)
+-  const auto keepAll = [&](const std::vector<const GraphicsDevice*>& among, const std::string& why)
++  // What is not certain: the output that carries the picture (Kodi's own, on whichever device) is
++  // the one that stays on, as it is on anyway, and the others are not kept on for a sound that may
++  // not be theirs: a monitor kept on for it shows a black screen for nothing, and the sound is the
++  // TV's more often than not. Which outputs could have carried it, and what is known of the sound's
++  // display, go to the log, so that one line of it says what was in doubt.
++  const auto describeOutput = [](const GraphicsOutput& output)
++  {
++    std::string text = output.name + " (" +
++                       (output.identity.Known() ? output.identity.Describe()
++                                                : std::string("a display that is not known")) +
++                       (output.audio ? "" : ", its EDID has no audio descriptors") + ")";
++    return text;
++  };
++  const auto candidates = [&](const std::vector<const GraphicsDevice*>& among)
++  {
++    std::string text;
++    for (const GraphicsDevice* device : among)
++    {
++      for (const GraphicsOutput& output : device->outputs)
++      {
++        if (output.sound && output.connected)
++          text += (text.empty() ? "" : "; ") + device->node + " " + describeOutput(output);
++      }
++    }
++    return text.empty() ? std::string("none") : text;
++  };
++  const std::string pictureText =
++      picture.second.empty() ? std::string("none known") : picture.first + " " + picture.second;
++  const auto keepPicture = [&](const std::vector<const GraphicsDevice*>& among,
++                               const std::string& why)
+   {
+     unsigned int kept = 0;
+     for (const GraphicsDevice* device : among)
+     {
+       for (const GraphicsOutput& output : device->outputs)
+       {
+-        if (output.sound && output.connected && output.audio)
++        if (output.sound && device->node == picture.first && output.name == picture.second)
+         {
+-          keep(*device, output, why);
++          keep(*device, output, why + ": the output with the picture");
+           ++kept;
+         }
+       }
+     }
+     return kept;
+   };
++  const auto uncertain = [&](const std::vector<const GraphicsDevice*>& among,
++                             const std::string& named, const std::string& why,
++                             const UTILS::DisplayIdentity& eld)
++  {
++    keepPicture(among, "the sound of " + named + ", not certain: " + why);
++    decision.notes.push_back(
++        named + ": not certain which output carries it (" + why +
++        "): only the output with the picture (" + pictureText +
++        ") stays on for it, and the others go off; the outputs that could carry it: " +
++        candidates(among) + "; the display that its ELD names: " +
++        (eld.Known() ? eld.Describe() : std::string("none")));
++  };
+   std::vector<const GraphicsDevice*> all;
+   for (const GraphicsDevice& device : devices)
+     all.push_back(&device);
+ 
+   if (!published)
+   {
+-    keepAll(all, "the audio engine has not said which output it uses: not certain");
+-    decision.notes.emplace_back("the audio engine has not said which audio output it uses: every "
+-                                "output that can carry sound and has a display stays on");
++    keepPicture(all, "the audio engine has not said which output it uses: not certain");
++    decision.notes.push_back(
++        "the audio engine has not said which audio output it uses: only the output with the "
++        "picture (" +
++        pictureText + ") stays on until it has; the outputs that could carry its sound: " +
++        candidates(all));
+     return decision;
+   }
+ 
+@@ -208,10 +256,7 @@ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& soun
+     }
+     if (s.kind == UTILS::SoundOutput::Kind::UNKNOWN)
+     {
+-      const unsigned int kept = keepAll(all, "the sound of " + named + ", not certain: " + s.why);
+-      decision.notes.push_back(named + ": not certain which output carries it (" + s.why +
+-                               "): every output that can carry sound and has a display stays on (" +
+-                               std::to_string(kept) + ")");
++      uncertain(all, named, s.why, s.identity);
+       continue;
+     }
+ 
+@@ -226,22 +271,14 @@ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& soun
+       const std::string why =
+           s.card.empty() ? "where its sound card is is not known"
+                          : "its sound card (" + s.card + ") is of none of the graphics devices";
+-      const unsigned int kept = keepAll(all, "the sound of " + named + ", not certain: " + why);
+-      decision.notes.push_back(named + ": not certain which output carries it (" + why +
+-                               "): every output that can carry sound and has a display stays on (" +
+-                               std::to_string(kept) + ")");
++      uncertain(all, named, why, s.identity);
+       continue;
+     }
+     if (!s.identity.Known())
+     {
+       const std::string why =
+           "its display is not known" + (s.why.empty() ? "" : " (" + s.why + ")");
+-      const unsigned int kept = keepAll(ofCard, "the sound of " + named + ", not certain: " + why);
+-      decision.notes.push_back(named + ": not certain which output of " + ofCard.front()->node +
+-                               " carries it (" + why +
+-                               "): every output of it that can carry sound and has a display "
+-                               "stays on (" +
+-                               std::to_string(kept) + ")");
++      uncertain(ofCard, named, why, s.identity);
+       continue;
+     }
+ 
+@@ -257,12 +294,8 @@ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& soun
+     const std::string of = s.identity.Describe() + (s.fromBefore ? ", as it was seen before" : "");
+     if (matches.empty())
+     {
+-      const std::string why = "no output of its graphics device has its display, " + of;
+-      const unsigned int kept = keepAll(ofCard, "the sound of " + named + ", not certain: " + why);
+-      decision.notes.push_back(named + ": not certain which output carries it (" + why +
+-                               "): every output of " + ofCard.front()->node +
+-                               " that can carry sound and has a display stays on (" +
+-                               std::to_string(kept) + ")");
++      uncertain(ofCard, named, "no output of its graphics device has its display, " + of,
++                s.identity);
+       continue;
+     }
+     const std::string how =
+@@ -277,9 +310,6 @@ inline SoundDecision OutputsForSound(const std::vector<UTILS::SoundOutput>& soun
+   return decision;
+ }
+ 
+-//! Hades: an output, as (node of its device, its name)
+-using OutputKey = std::pair<std::string, std::string>;
+-
+ //! Hades: the outputs kept on for the sound in use after a decision, and what changed
+ struct SoundKeptChange
+ {
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index fed6410..aedf52b 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -1458,7 +1458,8 @@ void CDRMUtils::DecideSoundOutputs(const std::vector<KEEP_OUTPUTS::GraphicsDevic
+   std::vector<KEEP_OUTPUTS::GraphicsDevice> devices{SurveyOwnDevice()};
+   devices.insert(devices.end(), others.begin(), others.end());
+   const KEEP_OUTPUTS::SoundDecision decision =
+-      KEEP_OUTPUTS::OutputsForSound(sound, generation != 0, devices);
++      KEEP_OUTPUTS::OutputsForSound(sound, generation != 0, devices,
++                                    {m_node, m_connector ? m_connector->GetName() : std::string()});
+ 
+   // (what is kept is what the decision says now: KEEP_OUTPUTS::NextSoundKept())
+   const KEEP_OUTPUTS::SoundKeptChange change = KEEP_OUTPUTS::NextSoundKept(m_soundKept, decision);
+-- 
+2.53.0
+

@@ -1,0 +1,198 @@
+From a3f94c364288849d0bc683276b1f53329711ea6a Mon Sep 17 00:00:00 2001
+From: Mounir IDRASSI <mounir.idrassi@idrix.fr>
+Date: Thu, 13 Aug 2026 11:14:29 +0900
+Subject: [PATCH] QUIC: pass the user SSL to session ID callbacks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ssl_generate_session_id() selected and invoked GEN_SESSION_CB using the
+internal handshake-layer SSL. This is the same object as the application
+SSL for TLS and DTLS, but not for QUIC, where user_ssl identifies the
+public QUIC connection.
+
+As a result, a custom callback received an SSL it had never seen, so
+per-SSL state such as ex_data was unavailable. The reader also locked the
+inner SSL, whereas SSL_set_generate_session_id() locks the public object
+before updating the callback pointer.
+
+Use the user SSL for the per-connection lock and pass it to every selected
+session ID callback. In def_generate_session_id(), unwrap it with
+SSL_CONNECTION_FROM_SSL() when obtaining the RAND library context. This
+preserves the handshake SSL_CTX semantics needed by SSL_listen_ex() when
+the public and handshake contexts differ.
+
+Test the callback during ordinary TLS 1.3 QUIC ticket generation and
+verify that every invocation receives the public SSL and its ex_data.
+
+Fixes #32360
+
+Assisted-by: Grok:grok-4.6
+Reviewed-by: Tomas Mraz <tomas@openssl.foundation>
+Reviewed-by: Matt Caswell <matt@openssl.foundation>
+Reviewed-by: Saša Nedvědický <sashan@openssl.org>
+Merge-date: Wed Nov  4 17:41:48 2026
+Merged-from: https://github.com/openssl/openssl/pull/32361
+(cherry picked from commit 1e8be52670ec6e26fe1066690909a0529237c5f3)
+---
+ ssl/ssl_sess.c     |   8 ++--
+ test/quicapitest.c | 106 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+), 3 deletions(-)
+
+diff --git a/ssl/ssl_sess.c b/ssl/ssl_sess.c
+index 7a74b5b..2e2639a 100644
+--- a/ssl/ssl_sess.c
++++ b/ssl/ssl_sess.c
+@@ -330,7 +330,9 @@ static int def_generate_session_id(SSL *ssl, unsigned char *id,
+ {
+     unsigned int retry = 0;
+     do {
+-        if (RAND_bytes_ex(ssl->ctx->libctx, id, *id_len, 0) <= 0)
++        if (RAND_bytes_ex(SSL_CONNECTION_GET_CTX(SSL_CONNECTION_FROM_SSL(ssl))->libctx,
++                id, *id_len, 0)
++            <= 0)
+             return 0;
+ #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+         if (retry > 0) {
+@@ -356,7 +358,7 @@ int ssl_generate_session_id(SSL_CONNECTION *s, SSL_SESSION *ss)
+ {
+     unsigned int tmp;
+     GEN_SESSION_CB cb = def_generate_session_id;
+-    SSL *ssl = SSL_CONNECTION_GET_SSL(s);
++    SSL *ssl = SSL_CONNECTION_GET_USER_SSL(s);
+ 
+     switch (s->version) {
+     case TLS1_VERSION:
+@@ -395,7 +397,7 @@ int ssl_generate_session_id(SSL_CONNECTION *s, SSL_SESSION *ss)
+     }
+ 
+     /* Choose which callback will set the session ID */
+-    if (!CRYPTO_THREAD_read_lock(SSL_CONNECTION_GET_SSL(s)->lock)) {
++    if (!CRYPTO_THREAD_read_lock(ssl->lock)) {
+         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+         return 0;
+     }
+diff --git a/test/quicapitest.c b/test/quicapitest.c
+index c73b7a8..ed3f7c0 100644
+--- a/test/quicapitest.c
++++ b/test/quicapitest.c
+@@ -2426,6 +2426,111 @@ err:
+     return testresult;
+ }
+ 
++static SSL *gen_sid_expected_ssl = NULL;
++static int gen_sid_called = 0;
++static int gen_sid_arg_error = 0;
++static int gen_sid_idx = -1;
++static const char gen_sid_marker[] = "gen-sid-marker";
++
++static int generate_session_id_user_ssl(SSL *ssl, unsigned char *id,
++    unsigned int *id_len)
++{
++    unsigned int i;
++
++    gen_sid_called++;
++    if (ssl != gen_sid_expected_ssl
++        || !SSL_is_quic(ssl)
++        || SSL_get_ex_data(ssl, gen_sid_idx) != (void *)gen_sid_marker) {
++        gen_sid_arg_error = 1;
++        return 0;
++    }
++
++    if (*id_len == 0)
++        return 0;
++    for (i = 0; i < *id_len; i++)
++        id[i] = (unsigned char)(0xa0 + i);
++    return !SSL_has_matching_session_id(ssl, id, *id_len);
++}
++
++/*
++ * generate_session_id must be invoked with the SSL the application holds,
++ * not the inner handshake-layer object. Ordinary TLS 1.3 QUIC handshake
++ * tickets reach the callback after tls_finish_handshake() clears
++ * ticket_expected; no explicit extra ticket is required.
++ */
++static int test_generate_session_id_user_ssl(void)
++{
++    SSL_CTX *cctx = NULL, *sctx = NULL;
++    SSL *clientssl = NULL, *serverssl = NULL, *qlistener = NULL;
++    int testresult = 0;
++    int ret, i;
++
++    if (gen_sid_idx < 0) {
++        gen_sid_idx = SSL_get_ex_new_index(0, "gen sid", NULL, NULL, NULL);
++        if (!TEST_int_ge(gen_sid_idx, 0))
++            return 0;
++    }
++
++    gen_sid_called = 0;
++    gen_sid_arg_error = 0;
++    gen_sid_expected_ssl = NULL;
++
++    if (!TEST_ptr(sctx = create_server_ctx())
++        || !TEST_ptr(cctx = create_client_ctx()))
++        goto err;
++
++    if (!create_quic_ssl_objects(sctx, cctx, &qlistener, &clientssl))
++        goto err;
++
++    /* Send ClientHello and server retry */
++    for (i = 0; i < 2; i++) {
++        ret = SSL_connect(clientssl);
++        if (!TEST_int_le(ret, 0)
++            || !TEST_int_eq(SSL_get_error(clientssl, ret), SSL_ERROR_WANT_READ))
++            goto err;
++        SSL_handle_events(qlistener);
++    }
++
++    serverssl = SSL_accept_connection(qlistener, 0);
++    if (!TEST_ptr(serverssl) || !TEST_false(SSL_is_init_finished(serverssl)))
++        goto err;
++
++    gen_sid_expected_ssl = serverssl;
++    if (!TEST_true(SSL_set_ex_data(serverssl, gen_sid_idx,
++            (void *)gen_sid_marker))
++        || !TEST_true(SSL_set_generate_session_id(serverssl,
++            generate_session_id_user_ssl)))
++        goto err;
++
++    if (!TEST_true(create_bare_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE, 0, 0)))
++        goto err;
++
++    /*
++     * Ordinary TLS 1.3 tickets are constructed after the handshake finishes.
++     * Drive both endpoints until the callback has run; do not request an
++     * extra ticket.
++     */
++    for (i = 0; i < 20 && gen_sid_called == 0; i++) {
++        if (!TEST_true(SSL_handle_events(serverssl))
++            || !TEST_true(SSL_handle_events(clientssl)))
++            goto err;
++    }
++
++    if (!TEST_int_gt(gen_sid_called, 0) || !TEST_int_eq(gen_sid_arg_error, 0))
++        goto err;
++
++    testresult = 1;
++err:
++    gen_sid_expected_ssl = NULL;
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_free(qlistener);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++    return testresult;
++}
++
+ static int test_domain_flags(void)
+ {
+     int testresult = 0;
+@@ -5383,6 +5488,7 @@ int setup_tests(void)
+     ADD_TEST(test_get_shutdown);
+     ADD_ALL_TESTS(test_tparam, OSSL_NELEM(tparam_tests));
+     ADD_TEST(test_session_cb);
++    ADD_TEST(test_generate_session_id_user_ssl);
+     ADD_TEST(test_domain_flags);
+     ADD_TEST(test_early_ticks);
+     ADD_TEST(test_ssl_new_from_listener);

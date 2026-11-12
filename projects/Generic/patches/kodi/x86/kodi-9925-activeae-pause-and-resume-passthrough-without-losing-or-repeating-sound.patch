@@ -1,0 +1,640 @@
+From e3dc0fd66d1eb4ab7a6a9ad2fb2cbd958a4c75ff Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:18:59 +0000
+Subject: [PATCH] ActiveAE: pause and resume passthrough without losing or
+ repeating sound
+
+At a pause Kodi flushes the engine (PAUSESTREAM, FlushEngine()): the
+packets sent to the sink and not yet written go back to their pool,
+unplayed. For TrueHD, which the engine does not hold to its water level,
+that is all it had buffered, 380 to 480 ms; for the others about 200 ms.
+The resume starts the sync again as for a new stream (SYNC_START): the
+packets that come first are turned into pauses while the error is
+averaged, and the error that the lost packets leave is corrected with more
+pauses. The sound picks up hundreds of milliseconds further on than where
+it stopped, and the receiver gets a stream with a hole in it.
+
+A passthrough stream that the sink packs, alone, playing and whose sync is
+measured, is now held instead (HoldRawStream()). The sink gives back what
+it had not written (HOLD); the engine keeps copies of those packets and of
+the pauses between them, in their order, and the packets go back to the
+pool of the stream as before, so that the player feeds it as before. It
+also reckons how much the device plays after the picture stopped: all that
+it held when the sink answered, and what it played while the pause reached
+the engine, from where the video clock last ran (PassthroughPause.h,
+NoteClock(), FrozenFor(): a reading of a clock that stood still is not
+taken for one that ran).
+
+At the resume (ResumeRawStream()) the copies go back to the sink as they
+were, ahead of anything the sync decides from then: the sync decided them
+before the pause. The sync goes on in the state it had: in sync; being
+corrected, with what was left to correct; being measured, ending with the
+average it had (measured on, it would turn into pauses the packets that
+the player fed while paused). The sink puts a pause before the copies
+(RESUMEGAP), so that what played with the picture stopped is not heard
+again and the sound goes on where the picture is; until the sink says what
+it holds, the engine counts at least that pause in it. Copies of a pause
+before that are still going out are kept again by the next one, and the
+copies of a pause are deleted once the sink has given them all back
+(ClearDiscardedBuffers()).
+
+A seek or flush, a stream closed and an output opened again let the kept
+packets go as before, and tell the sink (HOLDDROPPED), whose silence is
+then that of a pause that keeps nothing. An output that is no longer open
+or no longer passthrough resumes with the sound kept and the sync as at a
+start. Each pause, resume and letting go is said in kodi.log. PCM,
+transcoding, a sink that takes the stream unpacked and a stream not yet
+measured are as before.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp | 401 +++++++++++++++++-
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.h   |  13 +
+ .../Engines/ActiveAE/ActiveAEStream.h         |  30 ++
+ 3 files changed, 440 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index a6e6264..8709287 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -35,6 +35,7 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <cstring>
+ #include <memory>
+ #include <mutex>
+ 
+@@ -537,6 +538,9 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkDataProtocol::RETURNSAMPLE:
++        // (Hades: a packet that the sink gave back unwritten after a pause that HoldRawStream() did
++        // not wait for to the end: it goes back to its pool, as a flush has it)
++        case CSinkDataProtocol::RETURNUNWRITTEN:
+           CSampleBuffer **buffer;
+           buffer = (CSampleBuffer**)msg->data;
+           if (buffer)
+@@ -884,7 +888,9 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+           stream = *(CActiveAEStream**)msg->data;
+           if (!stream->m_paused && m_streams.size() == 1)
+           {
+-            FlushEngine();
++            // (Hades: a passthrough stream keeps what the sink had not played, PassthroughPause.h)
++            if (!HoldRawStream(stream))
++              FlushEngine();
+             streaming = false;
+             m_sink.m_controlPort.SendOutMessage(CSinkControlProtocol::STREAMING, &streaming, sizeof(bool));
+           }
+@@ -892,7 +898,8 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+           return;
+         case CActiveAEControlProtocol::RESUMESTREAM:
+           stream = *(CActiveAEStream**)msg->data;
+-          if (stream->m_paused)
++          // (Hades: one held at its pause goes on where it was)
++          if (stream->m_paused && !ResumeRawStream(stream))
+             stream->m_syncState = CAESyncInfo::AESyncState::SYNC_START;
+           stream->m_paused = false;
+           streaming = true;
+@@ -1050,6 +1057,7 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkDataProtocol::RETURNSAMPLE:
++        case CSinkDataProtocol::RETURNUNWRITTEN: // (Hades, see AE_TOP)
+           CSampleBuffer **buffer;
+           buffer = (CSampleBuffer**)msg->data;
+           if (buffer)
+@@ -1130,6 +1138,7 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         switch (signal)
+         {
+         case CSinkDataProtocol::RETURNSAMPLE:
++        case CSinkDataProtocol::RETURNUNWRITTEN: // (Hades, see AE_TOP)
+           CSampleBuffer **buffer;
+           buffer = (CSampleBuffer**)msg->data;
+           if (buffer)
+@@ -1162,8 +1171,19 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+         case CActiveAEControlProtocol::RESUMESTREAM:
+           CActiveAEStream *stream;
+           stream = *(CActiveAEStream**)msg->data;
++          // Hades: a stream held at its pause goes on where it was, and the sink is told that it
++          // streams again, as in the configured state (it ends the pause bursts of the pause)
++          if (stream->m_rawHold)
++          {
++            if (!ResumeRawStream(stream))
++              stream->m_syncState = CAESyncInfo::AESyncState::SYNC_START;
++            bool streaming = true;
++            m_sink.m_controlPort.SendOutMessage(CSinkControlProtocol::STREAMING, &streaming,
++                                                sizeof(bool));
++          }
++          else
++            stream->m_syncState = CAESyncInfo::AESyncState::SYNC_START;
+           stream->m_paused = false;
+-          stream->m_syncState = CAESyncInfo::AESyncState::SYNC_START;
+           m_state = AE_TOP_CONFIGURED_PLAY;
+           m_extTimeout = 0ms;
+           return;
+@@ -1415,6 +1435,9 @@ void CActiveAE::Configure(AEAudioFormat *desiredFmt)
+        !CompareFormat(m_sinkRequestFormat, oldSinkRequestFormat)) ||
+       m_currDevice.compare(dev.name) != 0 || m_settings.driver.compare(dev.driver) != 0)
+   {
++    // (Hades: as what the streams have, below)
++    for (CActiveAEStream* stream : m_streams)
++      DropRawHold(stream, "the output is opened again");
+     FlushEngine();
+     m_sinkInitFailed = !InitSink();
+     if (m_sinkInitFailed)
+@@ -1797,6 +1820,7 @@ void CActiveAE::DiscardStream(CActiveAEStream *stream)
+   {
+     if (stream == (*it))
+     {
++      DropRawHold(*it, "the stream was closed"); // (Hades)
+       while (!(*it)->m_processingSamples.empty())
+       {
+         (*it)->m_processingSamples.front()->Return();
+@@ -1824,6 +1848,7 @@ void CActiveAE::DiscardStream(CActiveAEStream *stream)
+ 
+ void CActiveAE::SFlushStream(CActiveAEStream *stream)
+ {
++  DropRawHold(stream, "the stream was flushed (a seek, or another track)"); // (Hades)
+   while (!stream->m_processingSamples.empty())
+   {
+     stream->m_processingSamples.front()->Return();
+@@ -1908,8 +1933,372 @@ void CActiveAE::FlushEngine(bool discardOutput)
+   m_stats.Reset(m_sinkFormat.m_sampleRate, m_mode == MODE_PCM);
+ }
+ 
++bool CActiveAE::SinkHold(AEDelayStatus& device, std::deque<CSampleBuffer*>& unwritten)
++{
++  Message* reply;
++  bool held = false;
++  if (m_sink.m_controlPort.SendOutMessageSync(CSinkControlProtocol::HOLD, &reply, 2s))
++  {
++    held = reply->signal == CSinkControlProtocol::ACC && reply->data;
++    if (held)
++      memcpy(&device, reply->data, sizeof(device));
++    reply->Release();
++  }
++  else
++  {
++    CLog::Log(LOGERROR, "ActiveAE::{} - failed to hold", __FUNCTION__);
++    m_extError = true;
++  }
++
++  // What the sink gave back before it answered is all in the queue: what it wrote, and then, in
++  // order, what it had not. A packet given back after an answer that did not come is returned to
++  // its pool by the state machine, as a flush has it.
++  Message* msg;
++  while (m_sink.m_dataPort.ReceiveInMessage(&msg))
++  {
++    CSampleBuffer* buffer = msg->data ? *reinterpret_cast<CSampleBuffer**>(msg->data) : nullptr;
++    if (buffer && held && msg->signal == CSinkDataProtocol::RETURNUNWRITTEN)
++      unwritten.push_back(buffer);
++    else if (buffer)
++      buffer->Return();
++    msg->Release();
++  }
++  return held;
++}
++
++bool CActiveAE::HoldRawStream(CActiveAEStream* stream)
++{
++  if (m_mode != MODE_RAW)
++    return false;
++
++  const char* refused = nullptr;
++  const auto state = stream->m_syncState;
++  if (!m_stats.SinkNeedsIecPack())
++    refused = "the output takes it without IEC 61937 packing";
++  else if (m_state != AE_TOP_CONFIGURED_PLAY && m_state != AE_TOP_CONFIGURED_IDLE)
++    refused = "the output is not open";
++  else if (!stream->m_started || stream->m_drain || !stream->m_processingBuffers ||
++           !stream->m_inputBuffers || !stream->m_pClock)
++    refused = "the stream is not playing";
++  else if (state != CAESyncInfo::AESyncState::SYNC_INSYNC &&
++           state != CAESyncInfo::AESyncState::SYNC_ADJUST &&
++           state != CAESyncInfo::AESyncState::SYNC_MUTE)
++    refused = "its sync is not measured yet";
++  else if (static_cast<unsigned int>(stream->m_format.m_streamInfo.GetDuration()) == 0)
++    refused = "its frames have no length";
++  else if (!PTPAUSE::FrozenFor(stream->m_rawClockRead, std::chrono::steady_clock::now(),
++                               stream->m_pClock->GetClock()))
++    refused = "the engine has no recent reading of the video clock";
++  const std::string type = CAEUtil::StreamTypeToStr(stream->m_format.m_streamInfo.m_type);
++  if (refused)
++  {
++    CLog::Log(LOGINFO,
++              "ActiveAE - the passthrough stream ({}) is paused as before, what the output had not "
++              "played let go: {}",
++              type, refused);
++    return false;
++  }
++
++  // the averages of the sync, as they are at the pause
++  const auto averageLeft = stream->m_syncError.GetTimeLeft();
++  unsigned int before;
++  const double lastError = stream->m_syncError.GetLastError(before);
++  double soFar;
++  const bool measured =
++      state == CAESyncInfo::AESyncState::SYNC_MUTE && stream->m_syncError.GetSoFar(soFar);
++
++  // what the sink had not written, then what the engine had for it after that, in this order
++  AEDelayStatus device;
++  std::deque<CSampleBuffer*> unwritten;
++  const bool sinkHeld = SinkHold(device, unwritten);
++  if (m_sinkBuffers)
++  {
++    for (auto* buffers : {&m_sinkBuffers->m_outputSamples, &m_sinkBuffers->m_inputSamples})
++    {
++      unwritten.insert(unwritten.end(), buffers->begin(), buffers->end());
++      buffers->clear();
++    }
++    m_sinkBuffers->Flush();
++  }
++  m_stats.Reset(m_sinkFormat.m_sampleRate, m_mode == MODE_PCM);
++
++  const auto releaseAll = [&unwritten]()
++  {
++    for (CSampleBuffer* buffer : unwritten)
++      buffer->Return();
++    unwritten.clear();
++  };
++  if (!sinkHeld)
++  {
++    releaseAll();
++    CLog::Log(LOGWARNING,
++              "ActiveAE - the passthrough stream ({}) is paused as before: the output did not give "
++              "back what it had not played",
++              type);
++    return true;
++  }
++
++  // copies of the packets and pauses, in their order; the packets go back to the pool of the stream
++  // (or to the pool of the copies of a pause before, still going out) as a flush has them, so that
++  // the player feeds it as before
++  const auto ofStream = [stream](const CSampleBuffer* buffer)
++  {
++    if (buffer->pool == stream->m_inputBuffers.get())
++      return true;
++    return std::any_of(stream->m_rawCopyPools.begin(), stream->m_rawCopyPools.end(),
++                       [buffer](const auto& pool) { return buffer->pool == pool.get(); });
++  };
++  std::deque<CSampleBuffer*> kept;
++  bool unknown = false;
++  for (CSampleBuffer* buffer : unwritten)
++  {
++    const PTPAUSE::Kept what = PTPAUSE::Classify(
++        ofStream(buffer), m_silenceBuffers && buffer->pool == m_silenceBuffers.get(),
++        buffer->pkt->nb_samples, buffer->pkt->pause_burst_ms);
++    if (what == PTPAUSE::Kept::UNKNOWN ||
++        buffer->pkt->nb_samples > static_cast<int>(stream->m_inputBuffers->m_format.m_frames))
++      unknown = true;
++    else if (what != PTPAUSE::Kept::NOTHING)
++      kept.push_back(buffer);
++  }
++  if (unknown)
++  {
++    releaseAll();
++    CLog::Log(LOGWARNING,
++              "ActiveAE - the passthrough stream ({}) is paused as before: the output gave back a "
++              "packet that is not of the stream",
++              type);
++    return true;
++  }
++
++  CActiveAEStream::RawHold hold;
++  const unsigned int frameMs =
++      static_cast<unsigned int>(stream->m_format.m_streamInfo.GetDuration());
++  CActiveAEBufferPool* pool = nullptr;
++  if (!kept.empty())
++  {
++    auto copies = std::make_unique<CActiveAEBufferPool>(stream->m_inputBuffers->m_format);
++    copies->Create(static_cast<unsigned int>(kept.size()) * frameMs);
++    pool = copies.get();
++    stream->m_rawCopyPools.push_back(std::move(copies));
++  }
++  double soundMs = 0;
++  double pauseMs = 0;
++  unsigned int sounds = 0;
++  for (CSampleBuffer* buffer : kept)
++  {
++    CSampleBuffer* copy = pool->GetFreeBuffer();
++    copy->pkt->nb_samples = buffer->pkt->nb_samples;
++    copy->pkt->pause_burst_ms = buffer->pkt->pause_burst_ms;
++    if (buffer->pkt->nb_samples > 0)
++      memcpy(copy->pkt->data[0], buffer->pkt->data[0], buffer->pkt->nb_samples);
++    // (a pause of the engine has no time of its own: it is not measured)
++    copy->timestamp = ofStream(buffer) ? buffer->timestamp : 0;
++    copy->pkt_start_offset = buffer->pkt_start_offset;
++    copy->centerMixLevel = buffer->centerMixLevel;
++    hold.packets.push_back(copy);
++    if (buffer->pkt->nb_samples > 0)
++    {
++      soundMs += stream->m_format.m_streamInfo.GetDuration();
++      sounds++;
++    }
++    else
++      pauseMs += buffer->pkt->pause_burst_ms;
++  }
++  releaseAll();
++  // (the pools of copies that all came back are let go)
++  std::erase_if(stream->m_rawCopyPools, [](const auto& copies)
++                { return copies->m_allSamples.size() == copies->m_freeSamples.size(); });
++
++  // what the device played after the picture stopped: while the pause reached the engine, and all
++  // that it held when the sink answered (it plays out)
++  const auto now = std::chrono::steady_clock::now();
++  const double clockMs = stream->m_pClock->GetClock();
++  const double frozenMs = PTPAUSE::FrozenFor(stream->m_rawClockRead, now, clockMs).value_or(0.0);
++  const double deviceMs = device.GetDelay() * 1000;
++  hold.clockMs = clockMs;
++  hold.heardMs = frozenMs + deviceMs;
++  hold.syncState = state;
++  hold.averageLeft = averageLeft;
++  if (measured)
++    hold.averageSoFar = soFar;
++  hold.at = now;
++  stream->m_rawHold = std::move(hold);
++
++  const double scale{IsTrueHDPassthrough() ? TRUEHD_SYNC_ERROR_SCALE : 1.0};
++  CLog::Log(LOGINFO,
++            "ActiveAE - the passthrough stream ({}) is paused: {} packets ({:.0f} ms of sound) and "
++            "{:.0f} ms of pauses that the output had not played are kept for the resume; {:.0f} ms "
++            "play with the picture stopped ({:.0f} in the device, {:.0f} before the pause reached "
++            "the engine); its sync was {} ({:+.0f} ms)",
++            type, sounds, soundMs, pauseMs, frozenMs + deviceMs, deviceMs, frozenMs,
++            state == CAESyncInfo::AESyncState::SYNC_INSYNC   ? "in sync"
++            : state == CAESyncInfo::AESyncState::SYNC_ADJUST ? "being corrected"
++                                                             : "being measured",
++            lastError / scale);
++  return true;
++}
++
++bool CActiveAE::ResumeRawStream(CActiveAEStream* stream)
++{
++  if (!stream->m_rawHold)
++    return false;
++
++  CActiveAEStream::RawHold hold = std::move(*stream->m_rawHold);
++  stream->m_rawHold.reset();
++  const std::string type = CAEUtil::StreamTypeToStr(stream->m_format.m_streamInfo.m_type);
++  const auto now = std::chrono::steady_clock::now();
++  const auto paused = std::chrono::duration_cast<std::chrono::milliseconds>(now - hold.at);
++
++  const size_t packets = hold.packets.size();
++  const auto letGoFreePools = [stream]()
++  {
++    // (the pools of the copies that all came back are let go)
++    std::erase_if(stream->m_rawCopyPools, [](const auto& copies)
++                  { return copies->m_allSamples.size() == copies->m_freeSamples.size(); });
++  };
++
++  const char* again = nullptr;
++  if (m_mode != MODE_RAW || !m_stats.SinkNeedsIecPack() || !m_sinkBuffers)
++    again = "the output is no longer passthrough";
++  else if (m_streams.size() != 1)
++    again = "another stream plays";
++  else if (m_state != AE_TOP_CONFIGURED_PLAY && m_state != AE_TOP_CONFIGURED_IDLE)
++    again = "the output is not open";
++  else if (!stream->m_processingBuffers || !stream->m_pClock)
++    again = "the stream is not playing";
++  if (again)
++  {
++    // the sound kept is what comes next: it goes first, and the sync starts again as at a start,
++    // which measures where it is (the pauses kept are let go)
++    if (m_mode == MODE_RAW && stream->m_processingBuffers)
++    {
++      auto& out = stream->m_processingBuffers->m_outputSamples;
++      auto at = out.begin();
++      for (CSampleBuffer* buffer : hold.packets)
++      {
++        if (buffer->pkt->nb_samples > 0)
++          at = std::next(out.insert(at, buffer));
++        else
++          buffer->Return();
++      }
++    }
++    else
++    {
++      for (CSampleBuffer* buffer : hold.packets)
++        buffer->Return();
++    }
++    letGoFreePools();
++    CLog::Log(LOGINFO,
++              "ActiveAE - the passthrough stream ({}) resumes after {} ms with the sound kept at "
++              "the pause, and its sync starts again as at a start: {}",
++              type, paused.count(), again);
++    return false;
++  }
++
++  // The picture moved this much before the engine heard of the resume: the sound that the device
++  // played after it stopped is what it is ahead now. The sink puts a pause of what is left of it,
++  // less what the device holds then, before the first packet it writes (PTPAUSE::GapMs()).
++  const double clockMs = stream->m_pClock->GetClock();
++  const double movedMs = clockMs - hold.clockMs;
++  SinkResumeGap gap;
++  gap.aheadMs = hold.heardMs - movedMs;
++  gap.at = now;
++  m_sink.m_controlPort.SendOutMessage(CSinkControlProtocol::RESUMEGAP, &gap, sizeof(gap));
++  // Nothing of the stream plays before that: the engine counts the sink to hold at least that much
++  // until it says what it holds, or the measurements of the packets it sends now (all of them at
++  // once for TrueHD) would take a device that the pause let empty for the time to the sound.
++  AEDelayStatus sinkDelay;
++  m_stats.GetDelay(sinkDelay);
++  if (sinkDelay.GetDelay() * 1000 < gap.aheadMs)
++  {
++    sinkDelay.SetDelay(gap.aheadMs / 1000);
++    m_stats.UpdateSinkDelay(sinkDelay, 0);
++  }
++
++  // What the sink had not written goes back to it as it was, in its order: the sync decided it
++  // before the pause, and decides from the packet after it, as it would have.
++  for (CSampleBuffer* buffer : hold.packets)
++  {
++    m_stats.AddSamples(1, m_streams);
++    m_sinkBuffers->m_inputSamples.push_back(buffer);
++  }
++  hold.packets.clear();
++  letGoFreePools();
++
++  // the sync goes on as it was, on averages taken from now (the readings made while the picture
++  // stood still and the engine did not know it yet are left out)
++  stream->m_syncState = hold.syncState;
++  switch (hold.syncState)
++  {
++    case CAESyncInfo::AESyncState::SYNC_INSYNC:
++      // what the player was told stays told
++      stream->m_syncError.Flush(stream->GetErrorInterval());
++      stream->m_lateStartHandedOver = false;
++      break;
++    case CAESyncInfo::AESyncState::SYNC_ADJUST:
++      // the error left to correct stays (m_lastError)
++      stream->m_syncError.SetErrorInterval(100ms);
++      stream->m_rawSilenceWaitSince.reset();
++      stream->m_rawAdjustSince += paused;
++      break;
++    default:
++      // measuring (SYNC_MUTE): the average it had is what it measured; it ends with the first
++      // reading taken from now. Measured on for the rest of its time, it would turn into pauses the
++      // packets that the player fed while paused, which went out only after the measurement without
++      // the pause. With no reading yet, it measures for the rest of its time.
++      if (hold.averageSoFar)
++      {
++        stream->m_syncError.Flush(0ms);
++        stream->m_syncError.Add(*hold.averageSoFar);
++      }
++      else
++        stream->m_syncError.SetErrorInterval(std::max<std::chrono::milliseconds>(
++            hold.averageLeft,
++            std::chrono::milliseconds(
++                2 * static_cast<int>(stream->m_format.m_streamInfo.GetDuration()) + 1)));
++      break;
++  }
++  stream->m_rawClockRead = PTPAUSE::ClockRead{now, clockMs};
++
++  CLog::Log(LOGINFO,
++            "ActiveAE - the passthrough stream ({}) resumes after {} ms where it stopped: the {} "
++            "packets kept at the pause go first, after a pause of what the device played with the "
++            "picture stopped ({:.0f} ms, the picture moved {:.0f} ms before the engine heard of "
++            "the resume), and its sync goes on as it was",
++            type, paused.count(), packets, hold.heardMs, movedMs);
++  return true;
++}
++
++void CActiveAE::DropRawHold(CActiveAEStream* stream, const char* why)
++{
++  // the pools of copies go with the stream's buffers: deleted once the last of them is back, as
++  // those of a stream (ClearDiscardedBuffers())
++  for (auto& copies : stream->m_rawCopyPools)
++    m_discardBufferPools.push_back(std::move(copies));
++  stream->m_rawCopyPools.clear();
++  if (!stream->m_rawHold)
++    return;
++
++  const size_t packets = stream->m_rawHold->packets.size();
++  for (CSampleBuffer* buffer : stream->m_rawHold->packets)
++    buffer->Return();
++  stream->m_rawHold.reset();
++  // the sink sends its silence as after a pause that keeps nothing
++  m_sink.m_controlPort.SendOutMessage(CSinkControlProtocol::HOLDDROPPED);
++  CLog::Log(LOGINFO,
++            "ActiveAE - the {} packets of the passthrough stream ({}) kept at its pause are "
++            "let go: {}",
++            packets, CAEUtil::StreamTypeToStr(stream->m_format.m_streamInfo.m_type), why);
++}
++
+ void CActiveAE::ClearDiscardedBuffers()
+ {
++  // Hades: the copies that a pause of passthrough kept, once all of them are back (HoldRawStream())
++  for (CActiveAEStream* stream : m_streams)
++    std::erase_if(stream->m_rawCopyPools, [](const auto& copies)
++                  { return copies->m_allSamples.size() == copies->m_freeSamples.size(); });
++
+   auto it = m_discardBufferPools.begin();
+   while (it != m_discardBufferPools.end())
+   {
+@@ -2374,7 +2763,11 @@ bool CActiveAE::RunStages()
+         double delay = status.GetDelay() * 1000;
+         double playingPts = pts - delay;
+         double maxError = ((*it)->m_syncState == CAESyncInfo::SYNC_INSYNC) ? 1000 : 5000;
+-        double error = playingPts - (*it)->m_pClock->GetClock();
++        const double clock = (*it)->m_pClock->GetClock();
++        double error = playingPts - clock;
++        // Hades: when the video clock last ran, for a pause of passthrough (HoldRawStream())
++        if (m_mode == MODE_RAW)
++          PTPAUSE::NoteClock((*it)->m_rawClockRead, std::chrono::steady_clock::now(), clock);
+ 
+         // underestimate error for TrueHD passthrough
+         // oscillations should be less than frametime 40ms to avoid unnecessary a/v sync corrections
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+index 3ce109e..a0c9c57 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+@@ -209,6 +209,8 @@ public:
+   void SetSinkCacheTotal(float time) { m_sinkCacheTotal = time; }
+   void SetSinkLatency(float time) { m_sinkLatency = time; }
+   void SetSinkNeedIec(bool needIEC) { m_sinkNeedIecPack = needIEC; }
++  //! Hades: the sink packs passthrough into IEC 61937 itself (set and read on the engine's thread)
++  bool SinkNeedsIecPack() const { return m_sinkNeedIecPack; }
+   bool IsSuspended();
+   AEAudioFormat GetCurrentSinkFormat();
+ protected:
+@@ -384,6 +386,17 @@ protected:
+   void DiscardStream(CActiveAEStream *stream);
+   void SFlushStream(CActiveAEStream *stream);
+   void FlushEngine(bool discardOutput = false);
++  //! Hades: pauses a passthrough stream keeping what the sink had not played (PassthroughPause.h);
++  //! false when it does not apply, and nothing was done: the engine is flushed as before
++  bool HoldRawStream(CActiveAEStream* stream);
++  //! Hades: resumes a stream paused by HoldRawStream(): its kept packets go first, and its sync
++  //! goes on where it was; false when it was not held, or when its sync starts again (SYNC_START)
++  bool ResumeRawStream(CActiveAEStream* stream);
++  //! Hades: lets the packets kept by HoldRawStream() go, saying why
++  void DropRawHold(CActiveAEStream* stream, const char* why);
++  //! Hades: the sink gives back the packets it has not written (HOLD), in order, and says what the
++  //! device holds; false when it did not
++  bool SinkHold(AEDelayStatus& device, std::deque<CSampleBuffer*>& unwritten);
+   void ClearDiscardedBuffers();
+   void SStopSound(CActiveAESound *sound);
+   void DiscardSound(CActiveAESound *sound);
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+index 64516e9..034f1ef 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEStream.h
+@@ -13,12 +13,15 @@
+ #include "cores/AudioEngine/Interfaces/AEStream.h"
+ #include "cores/AudioEngine/Utils/AEAudioFormat.h"
+ #include "cores/AudioEngine/Utils/AELimiter.h"
++#include "cores/AudioEngine/Utils/PassthroughPause.h"
+ #include "threads/Event.h"
+ 
+ #include <atomic>
+ #include <chrono>
+ #include <deque>
++#include <memory>
+ #include <optional>
++#include <vector>
+ 
+ namespace ActiveAE
+ {
+@@ -89,6 +92,9 @@ public:
+     m_lastError += correction;
+   }
+ 
++  //! Hades: the time that the average under way still has (a pause of passthrough keeps it)
++  std::chrono::milliseconds GetTimeLeft() const { return m_timer.GetTimeLeft(); }
++
+ protected:
+   double Get() const
+   {
+@@ -274,6 +280,30 @@ protected:
+   std::optional<std::chrono::steady_clock::time_point> m_rawSilenceWaitSince;
+   unsigned int m_rawSilenceWaits{0};
+   bool m_rawSilenceGaveUp{false};
++  //! Hades: a passthrough stream paused with the sound that the output had not played kept for its
++  //! resume (CActiveAE::HoldRawStream(), PassthroughPause.h)
++  struct RawHold
++  {
++    //! copies of the packets and of the pauses that the sink had not written, in the order it would
++    //! have played them (in a pool of m_rawCopyPools)
++    std::deque<CSampleBuffer*> packets;
++    double clockMs{0}; //!< the video clock when they were kept, ms (it stood still)
++    //! what the device played after the picture stopped, ms: before the engine heard of the pause,
++    //! and all that it held then
++    double heardMs{0};
++    CAESyncInfo::AESyncState syncState{CAESyncInfo::AESyncState::SYNC_OFF};
++    //! the time that the average under way still had (a stream that measured its error)
++    std::chrono::milliseconds averageLeft{0};
++    //! the average so far of a stream that measured its error (SYNC_MUTE), if it had any reading
++    std::optional<double> averageSoFar;
++    std::chrono::steady_clock::time_point at; //!< when they were kept
++  };
++  std::optional<RawHold> m_rawHold;
++  //! Hades: the pools of the copies that pauses kept, while any of them is in the engine or the
++  //! sink: a copy is a packet of the stream (a second pause keeps it again)
++  std::vector<std::unique_ptr<CActiveAEBufferPool>> m_rawCopyPools;
++  //! Hades: where the video clock last ran (PassthroughPause.h, NoteClock())
++  std::optional<AE::PTPAUSE::ClockRead> m_rawClockRead;
+ };
+ }
+ 
+-- 
+2.53.0
+

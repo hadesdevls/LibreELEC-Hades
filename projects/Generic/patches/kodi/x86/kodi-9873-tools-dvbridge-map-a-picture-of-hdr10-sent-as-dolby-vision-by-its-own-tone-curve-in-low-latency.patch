@@ -1,0 +1,349 @@
+From 541b6d4b4352eb33b587c52258ca11bae9ed0903 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:09:46 +0000
+Subject: [PATCH] tools/dvbridge: map a picture of HDR10+ sent as Dolby Vision
+ by its own tone curve in Low-Latency
+
+In Dolby Vision Low-Latency the player maps the picture to the display, and a
+picture of HDR10+ sent as Dolby Vision was mapped from the level 1 that its
+metadata are made of: the BT.2390 curve from the brightest of its HDR10+
+statistics. The tone curve that the studio made for the scene (SMPTE ST
+2094-40 8.7, the knee point and the Bezier curve for a display of a given
+peak) was left out, although nothing in Low-Latency leaves it no place: the
+display shows the picture as it comes.
+
+dvbridge_render_set_hdr10plus() gives the renderer the HDR10+ metadata of the
+picture that it draws, as dvbridge_hdr10plus_plain() takes them. In
+Low-Latency, a picture whose metadata carry a curve that can be used is mapped
+by it as an HDR10+ picture adapted to the display is, by the same function and
+table (map_hdr10plus(): libplacebo's pl_tone_map_st2094_40 from the scene's
+brightest, a table of 1024 entries made again where the metadata change), to
+the target of the Low-Latency mapping; the gamut mapping, the black of the
+display and the peak held are as before. Everything else draws the same bytes
+as before: no metadata, metadata without a curve (level 1 guides the curve of
+the mapping), HLG sent as Dolby Vision, the test pattern, Dolby Vision
+Standard (the display maps the picture there, and nothing of this is read) and
+Dolby Vision of a video's own.
+
+Fail closed: metadata that do not hold (a value not finite or out of its
+range) count as none; a render with the curve that fails, where the picture
+draws without it, is made again without it, and the rest of the stream is
+mapped without it (dvbridge_render_take_notes(): hdr10plus_ll_failed), so no
+picture is lost and no frame is drawn twice after that; a reset tries it
+again. The reference of the check of the bytes takes main's metadata.
+dvbridge_render_hdr10plus_curve() says whether the last picture was mapped by
+the curve.
+
+Measured on Mesa's software OpenGL ES (llvmpipe and zink), a 3840x2160 neutral
+ramp of every 10-bit code, its metadata made as the decoder makes them, the
+transport of 12 bits decoded as a receiver reads it, against an independent
+computation of ST 2094-40 8.7.4 on the picture that the metadata of profile
+8.1 describe: the curve of Tears of Steel (a display of 400 cd/m2) and 13
+synthetic curves, on a display of the curve's target and of other peaks (600
+to 1387 cd/m2, and the scene's brightest), 31 cases on each: at most 0.59 to
+0.64 of a code of 12-bit PQ (the 12-bit transport alone rounds by up to 0.58),
+0.27 to 0.37 on average; the ramp neutral and never going down. (The HDR10
+codes themselves are up to 0.87 of a code above that picture at the top, by
+the precision of the YCbCr to RGB matrix of profile 8.1, 9574/8192, which
+every picture sent so has, before this change as after it.) On a display of
+the curve's target, the mapping from level 1 was up to 184 codes and 71 on
+average from the curve; on one of 1387 cd/m2, the curve moves the picture from
+it by 48 codes on average.
+
+The same bytes as before, frame by frame: real Dolby Vision (profile 7 FEL, 64
+frames) in Low-Latency, in the IPT and BT.2020 transports and shown as HDR10;
+HLG and HDR10 sent as Dolby Vision in Low-Latency; in Low-Latency, no HDR10+
+metadata given, metadata without a curve, and pictures without metadata among
+pictures with a curve; Dolby Vision Standard and the test pattern with the
+metadata given; a display of its own gamut and black; HDR10 and HDR10+ adapted
+to the display and mapped to SDR.
+
+A frame costs the same as before within the noise of the software renderer
+(3840x2160 on llvmpipe: 182 to 189 ms with the curve, 177 to 187 ms without; a
+new scene every frame, 183 to 184 against 177 to 186). The table of the curve
+is made only where the metadata change, on the thread that draws and with no
+wait for the GPU: 0.14 to 0.19 ms of one core, against 2.6 to 5.2 us for the
+BT.2390 one.
+---
+ tools/dvbridge/dvbridge_render.c | 125 +++++++++++++++++++++++++++++--
+ tools/dvbridge/dvbridge_render.h |  26 +++++++
+ 2 files changed, 146 insertions(+), 5 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 7bf806c..63aec86 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -42,6 +42,7 @@ enum {
+     NOTE_TRIM_FAILED = 8192,
+     NOTE_HDR10PLUS_CURVE = 16384,
+     NOTE_HDR10PLUS_STATISTICS = 32768,
++    NOTE_HDR10PLUS_LL_FAILED = 65536,
+ };
+ 
+ /* Hades: the bridge's own passes that are timed (dvbridge_render_time_passes()), each with a few
+@@ -192,6 +193,14 @@ struct dvbridge_renderer {
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+     struct dvbridge_hdr10_mapping ll_mapping;
++    /* Hades: HDR10+ sent as Dolby Vision in Low-Latency (dvbridge_render_set_hdr10plus()): the HDR10+ metadata of
++     * the pictures drawn now (present false: none); the render in hand maps its picture by their tone curve
++     * (ll_curve_tried), the last render drew its picture so (ll_curve_drawn), and a render with it failed on this
++     * GPU, so the pictures of the rest of the stream are mapped without it (ll_curve_failed; ll_curve_retry()) */
++    struct dvbridge_plain_hdr10plus ll_hdr10plus;
++    bool ll_curve_tried, ll_curve_drawn, ll_curve_failed;
++    /* ... and the last render drew a picture without the curve it has, because of ll_curve_failed */
++    bool ll_curve_held;
+     /* Hades: the trim pass (dvbridge_trims.h): the render in hand has one (trim_tried); one could
+        not be drawn on
+      * this GPU, and pictures are mapped without it from here on (trim_failed; trim_retry()) */
+@@ -638,7 +647,10 @@ static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hd
+                            const struct dvbridge_level1 *level1);
+ static void map_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
+                           struct pl_color_space *source, struct pl_color_map_params *params,
+-                          const struct dvbridge_plain_hdr10plus *h);
++                          const struct dvbridge_plain_hdr10plus *h, bool low_latency);
++static bool ll_curve_usable(struct dvbridge_renderer *r);
++static bool ll_curve_retry(struct dvbridge_renderer *r, bool ok);
++static void ll_curve_kept(struct dvbridge_renderer *r, bool ok);
+ static const struct dvbridge_level1 *level1_noted(struct dvbridge_renderer *r, const void *metadata,
+                                                   size_t bytes, struct dvbridge_level1 *level1);
+ static bool trim_prepare(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
+@@ -734,6 +746,9 @@ void dvbridge_renderer_reset(struct dvbridge_renderer *r)
+     dvbridge_reset(r->context);
+     r->noted = r->fresh = 0;
+     r->trim_failed = false;
++    /* Hades: (a new stream: no HDR10+ metadata until they are given, and the curve is tried again) */
++    r->ll_hdr10plus = (struct dvbridge_plain_hdr10plus){0};
++    r->ll_curve_failed = false;
+ }
+ 
+ void dvbridge_render_set_frame_period(struct dvbridge_renderer *r, double period)
+@@ -775,6 +790,7 @@ bool dvbridge_render_take_notes(struct dvbridge_renderer *r, struct dvbridge_ren
+     notes->trim_failed = r->fresh & NOTE_TRIM_FAILED;
+     notes->hdr10plus_curve = r->fresh & NOTE_HDR10PLUS_CURVE;
+     notes->hdr10plus_statistics = r->fresh & NOTE_HDR10PLUS_STATISTICS;
++    notes->hdr10plus_ll_failed = r->fresh & NOTE_HDR10PLUS_LL_FAILED;
+     r->fresh = 0;
+     return true;
+ }
+@@ -1446,6 +1462,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     r->residual_drawn = false;
+     r->packed = packed != NULL;
+     r->gui_drawn = 0;
++    r->ll_curve_drawn = r->ll_curve_held = false; /* (Hades: dvbridge_render_hdr10plus_curve()) */
+     dvbridge_candidate_destroy(r->pending);
+     r->pending = NULL;
+     /* Hades: the picture that a composed render of the source transport made in the tiles of what
+@@ -1594,6 +1611,14 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                        r->base_transfer == DVBRIDGE_BASE_HLG_TO_PQ
+                            ? NULL
+                            : level1_noted(r, metadata, bytes, &level1));
++        /* Hades: HDR10+ sent as Dolby Vision: a picture whose HDR10+ metadata carry a tone curve that can be used
++         * is mapped by it, as an HDR10+ picture adapted to the display is (dvbridge_render_set_hdr10plus()); its
++         * level 1, made from the same metadata, is then not what the curve maps from. Anything else as before. */
++        const bool curve = ll_curve_usable(r);
++        r->ll_curve_tried = curve && !r->ll_curve_failed;
++        r->ll_curve_held = curve && r->ll_curve_failed;
++        if (r->ll_curve_tried)
++            map_hdr10plus(r, &r->ll_mapping, &image.color, &ll_color, &r->ll_hdr10plus, true);
+         params.color_map_params = &ll_color;
+         mask.low_latency = true;
+         mask.peak = pl_hdr_rescale(PL_HDR_NITS, PL_HDR_PQ, r->ll_mapping.peak);
+@@ -1672,6 +1697,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     else if (!clean)
+         r->not_drawn = WHY_PLACEBO_ERRORS;
+     r->ready = r->ready && clean;
++    r->ll_curve_drawn = r->ready && mask.low_latency && r->ll_curve_tried;
+     /* (Hades: a picture over HLG whose RPU declares PQ may be drawn by libplacebo's reshaping.) What
+      * the render composed, and why a base layer that is not in PQ was not composed, are of the render
+      * as its errors leave it, as render_hdr10() has them: a render that they fail composed nothing. */
+@@ -1732,8 +1758,10 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
+     const bool fine = r && fine_gamut_table(r, true);
+-    if (r)
++    if (r) {
+         r->trim_tried = false;
++        r->ll_curve_tried = false;
++    }
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+     if (r && gamut_table_retry(r, fine, ok)) {
+@@ -1745,6 +1773,15 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+         ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+         trim_kept(r, ok);
+     }
++    /* Hades: without the HDR10+ tone curve where it could not be drawn (Low-Latency) */
++    if (r && ll_curve_retry(r, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++        ll_curve_kept(r, ok);
++    }
++    /* (a picture drawn without the curve it has, because this GPU does not draw it: noted once in a stream, also
++     * where that was found while the ways of drawing were made ready, whose notes are not kept) */
++    if (r && ok && r->ll_curve_held)
++        note(r, NOTE_HDR10PLUS_LL_FAILED);
+     restore_gl_state(&state);
+     /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
+     if (r) {
+@@ -2268,10 +2305,12 @@ bool dvbridge_render_gamut_made(const struct dvbridge_renderer *r, struct dvbrid
+  * that brightest. Nothing changes for a picture without them: the same parameters as before, bit for bit. The
+  * table of the curve (in PQ, libplacebo's: 1024 entries for the picture's own curve, below, else 256) is made
+  * again only where the metadata change, once a scene, not for each frame (pl_tone_map_params_equal()); the gamut
+- * table does not depend on them. */
++ * table does not depend on them. Hades: the same for a picture of Dolby Vision Low-Latency made from its HDR10+
++ * metadata (low_latency: the notes say so), where the caller asks for it (one with a tone curve that can be used:
++ * ll_curve_usable()); the source is then the picture that its identity mapping reconstructs, BT.2020 PQ. */
+ static void map_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
+                           struct pl_color_space *source, struct pl_color_map_params *params,
+-                          const struct dvbridge_plain_hdr10plus *h)
++                          const struct dvbridge_plain_hdr10plus *h, bool low_latency)
+ {
+     if (!h || !h->present)
+         return;
+@@ -2311,7 +2350,79 @@ static void map_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_hdr
+         r->notes.hdr10plus.curve = curve;
+         r->notes.hdr10plus_peak = m->peak;
+         r->notes.hdr10plus_sdr = m->target == DVBRIDGE_HDR10_TARGET_SDR;
++        r->notes.hdr10plus_ll = low_latency;
++    }
++}
++
++/* Hades: a range of a value of the HDR10+ metadata that the mapping takes */
++static bool value_within(float v, float lo, float hi)
++{
++    return isfinite(v) && v >= lo && v <= hi;
++}
++
++void dvbridge_render_set_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_plain_hdr10plus *h)
++{
++    if (!r)
++        return;
++    r->ll_hdr10plus = (struct dvbridge_plain_hdr10plus){0};
++    if (!h || !h->present)
++        return;
++    /* what dvbridge_hdr10plus_plain() gives: the statistics in cd/m2, of a brightest above 0 and an average above
++     * 0; a curve for a display of 1 to 10000 cd/m2, its knee point and anchors in [0, 1] (fail closed: anything
++     * else counts as no metadata) */
++    bool holds = value_within(h->scene_avg, 0.0f, 10000.0f) && h->scene_avg > 0.0f;
++    float brightest = 0.0f;
++    for (int i = 0; i < 3; ++i) {
++        holds = holds && value_within(h->scene_max[i], 0.0f, 10000.0f);
++        brightest = holds && h->scene_max[i] > brightest ? h->scene_max[i] : brightest;
++    }
++    holds = holds && brightest > 0.0f;
++    if (holds && h->curve) {
++        holds = value_within(h->target, 1.0f, 10000.0f) && value_within(h->knee_x, 0.0f, 1.0f) &&
++                value_within(h->knee_y, 0.0f, 1.0f) && h->anchors >= 1 && h->anchors <= DVBRIDGE_HDR10PLUS_ANCHORS_MAX;
++        for (unsigned i = 0; holds && i < h->anchors; ++i)
++            holds = value_within(h->anchor[i], 0.0f, 1.0f);
+     }
++    if (holds)
++        r->ll_hdr10plus = *h;
++}
++
++bool dvbridge_render_hdr10plus_curve(const struct dvbridge_renderer *r)
++{
++    return r && r->ll_curve_drawn;
++}
++
++/* Hades: the picture of the render in hand (Low-Latency) is to be mapped by the tone curve of its HDR10+ metadata
++ * (dvbridge_render_set_hdr10plus()): there is one that can be used, of a picture in PQ (not HLG sent as Dolby
++ * Vision). The test pattern takes the place of the picture: nothing to map. Where this GPU was found not to draw
++ * it (ll_curve_failed), the picture is mapped without it (render()). */
++static bool ll_curve_usable(struct dvbridge_renderer *r)
++{
++    const struct dvbridge_plain_hdr10plus *h = &r->ll_hdr10plus;
++    return r->low_latency && !r->ll_pattern && r->base_transfer == DVBRIDGE_BASE_PQ && h->present && h->curve &&
++           h->anchors >= 1 && h->anchors <= DVBRIDGE_HDR10PLUS_ANCHORS_MAX;
++}
++
++/* Hades: after a render with the HDR10+ tone curve (Low-Latency) that failed: whether to make it again without it
++ * (the curve is noted as failed, and the errors that libplacebo keeps reset). The caller makes it again; where that
++ * draws, the curve was why, and the pictures of the rest of the stream are mapped without it (the note is made by
++ * the render that draws a picture without the curve it has: dvbridge_render_rgb()); where it fails as well, it was
++ * not, and the curve is tried again with the next picture (ll_curve_kept()). */
++static bool ll_curve_retry(struct dvbridge_renderer *r, bool ok)
++{
++    if (ok || !r->ll_curve_tried)
++        return false;
++    r->ll_curve_failed = true;
++    r->ll_curve_tried = false;
++    pl_renderer_reset_errors(r->renderer, NULL);
++    dvbridge_gl_drain_errors();
++    return true;
++}
++
++static void ll_curve_kept(struct dvbridge_renderer *r, bool ok)
++{
++    if (!ok)
++        r->ll_curve_failed = false;
+ }
+ 
+ /* Hades: the trim pass of the metadata of a picture mapped to a display
+@@ -2670,7 +2781,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+                        level1_noted(r, metadata, bytes, &level1));
+         /* Hades: a plain PQ picture with HDR10+ metadata: guided by them (dvbridge_hdr10plus_map.h) */
+         if (plain && !plain->hlg)
+-            map_hdr10plus(r, &r->hdr10_mapping, &image.color, &mapping, &plain->hdr10plus);
++            map_hdr10plus(r, &r->hdr10_mapping, &image.color, &mapping, &plain->hdr10plus, false);
+         params.color_map_params = &mapping;
+         if (!plain)
+             trim_prepare(r, &r->hdr10_mapping, metadata, bytes, &trim);
+@@ -3042,6 +3153,10 @@ bool dvbridge_render_reference(struct dvbridge_renderer *ref, const struct dvbri
+     ref->low_latency = main->low_latency;
+     ref->ll_pattern = main->ll_pattern;
+     ref->ll_mapping = main->ll_mapping;
++    /* (Hades: and the HDR10+ tone curve of its picture, where it maps the picture by it, unless main found that
++     * this GPU does not draw it) */
++    ref->ll_hdr10plus = main->ll_hdr10plus;
++    ref->ll_curve_failed = main->ll_curve_failed;
+     /* (and the gamut table of its mapping, which changes the picture on purpose) */
+     ref->gamut_asked = main->gamut_asked;
+     ref->gamut_fine_failed = main->gamut_fine_failed;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 5063429..d54f71c 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -99,6 +99,11 @@ struct dvbridge_render_notes {
+     struct dvbridge_plain_hdr10plus hdr10plus;
+     float hdr10plus_peak;
+     bool hdr10plus_sdr;
++    /* Hades: ... hdr10plus_ll, that picture was one of Dolby Vision Low-Latency, made from its HDR10+ metadata
++     * (dvbridge_render_set_hdr10plus()), mapped by its tone curve; hdr10plus_ll_failed, a render with that curve
++     * could not be drawn on this GPU, and the pictures of the rest of the stream are mapped from their level 1, as
++     * without it (none was lost) */
++    bool hdr10plus_ll, hdr10plus_ll_failed;
+ };
+ /* false when there is nothing new since the last call */
+ bool dvbridge_render_take_notes(struct dvbridge_renderer *renderer, struct dvbridge_render_notes *notes);
+@@ -261,6 +266,27 @@ bool dvbridge_render_gamut_made(const struct dvbridge_renderer *renderer,
+ bool dvbridge_render_set_low_latency(struct dvbridge_renderer *renderer,
+                                      const struct dvbridge_hdr10_mapping *mapping);
+ bool dvbridge_render_low_latency(const struct dvbridge_renderer *renderer);
++/* Hades: HDR10+ sent as Dolby Vision, in Low-Latency: the HDR10+ metadata (SMPTE ST 2094-40) of the picture that
++ * the renders from now on draw, as dvbridge_hdr10plus_plain() takes them, for a picture whose Dolby Vision metadata
++ * are made from them (dvbridge_hdr10plus.h: an identity mapping and level 1 from their statistics). In Low-Latency
++ * the player maps the picture to the display: a picture whose metadata carry a tone curve that can be used is
++ * mapped by that curve as dvbridge_render_plain() maps an HDR10+ picture (map_hdr10plus(): libplacebo's
++ * pl_tone_map_st2094_40 on the Bezier curve, from the brightest of the scene, a table of 1024 entries made again
++ * where the metadata change), to the target of the Low-Latency mapping; the rest of the render is as before (the
++ * gamut mapping, the black of the display, the peak held, the transport). Everything else is drawn as before, bit
++ * for bit: none given (NULL, the default), metadata without such a curve (level 1 guides the curve of the mapping,
++ * as always), HLG sent as Dolby Vision, the test pattern, and Low-Latency off (with Dolby Vision Standard the
++ * display maps the picture, and nothing of this is read). Metadata that do not hold (a value that is not finite or
++ * out of its range) count as none. Fail closed: a render with the curve that fails, where the same picture draws
++ * without it, is made again without it, and the pictures of the rest of the stream are drawn without it (the note
++ * hdr10plus_ll_failed); no picture is lost to it. The caller sets it for every picture, with that picture's own
++ * metadata (and what a picture without metadata of its own gets): it is kept until it is set again, and a reset
++ * takes it back to none. The reference renderer of a check of the bytes takes main's (it changes the picture on
++ * purpose). dvbridge_render_hdr10plus_curve(): the last render mapped its picture by the curve. */
++#define DVBRIDGE_RENDER_HDR10PLUS_LL 1
++void dvbridge_render_set_hdr10plus(struct dvbridge_renderer *renderer,
++                                   const struct dvbridge_plain_hdr10plus *hdr10plus);
++bool dvbridge_render_hdr10plus_curve(const struct dvbridge_renderer *renderer);
+ /* Hades: HDR over the tunnel (DVBRIDGE_HDR10_TUNNEL_LAB): an HDR10, HLG or HDR10+ picture (or a
+    Dolby Vision
+  * one reconstructed as HDR10) that is sent as YCbCr 4:2:2 at 12 bits packed in the RGB 8 bpc
+-- 
+2.53.0
+

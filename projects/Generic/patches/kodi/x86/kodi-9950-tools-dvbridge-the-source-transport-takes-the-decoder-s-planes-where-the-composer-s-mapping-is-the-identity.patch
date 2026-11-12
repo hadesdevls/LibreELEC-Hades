@@ -1,0 +1,185 @@
+From ae7140c558e4a5d983d83e38e3e0d5ac8f07c6aa Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 06:19:33 +0000
+Subject: [PATCH] tools/dvbridge: the source transport takes the decoder's
+ planes where the composer's mapping is the identity
+
+HDR10 and HDR10+ sent as Dolby Vision, and profile 8.1 streams made from
+HDR10, carry an RPU that maps each component of the 10-bit base layer to
+the 12 bits of the composer with the identity (one piece over 0 to 1023,
+a polynomial of order 1 with no offset and a slope of 1) and reconstruct
+no residual. Clause 5.4 of ETSI GS CCM 001 then composes each sample s to
+4 s, and libplacebo's composer pass did nothing else than read the
+decoder's planes and write ours of the same size (24.9 MB at 3840x2160).
+The packer reads every code as floor(value * 4096 + 0.5), and a P010
+sample read as an unsigned normalized value gives 4 s + 4 s / 65535 there,
+less than 1/16 of a code above 4 s for every s up to 1023: the same codes.
+So the packer now reads the decoder's planes directly where the RPU is the
+identity, the picture has no enhancement layer, its base layer is PQ and
+P010, and it is not scaled nor sent in the IPT tunnel.
+
+The same bytes: on six pictures of an HDR10+ stream, composed with a GUI
+told and drawn directly, the transport with the decoder's planes and with
+libplacebo's composer are the same byte for byte in every row of the
+picture and carry the same metadata, on llvmpipe and on zink, and the
+transport is the decoded picture sample for sample as before. A mapping
+one code off is not taken. The reference of the check of the bytes
+(video/dvverify) still composes, so that it compares the two on hardware.
+On a software renderer an HDR10+ frame drawn directly took 35.0 ms
+instead of 53.5. dvbridge_render_allow_identity_planes() turns it off, for
+the host test.
+---
+ tools/dvbridge/dvbridge_render.c | 91 ++++++++++++++++++++++++++++++--
+ tools/dvbridge/dvbridge_render.h |  7 +++
+ 2 files changed, 94 insertions(+), 4 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index d0e2955..e4c7fb3 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -128,6 +128,10 @@ struct dvbridge_renderer {
+      * (dvbridge_render_allow_early_mask()), and by the packed render [1] or the other one [0]
+      * once it has failed with it and not without it in two frames in a row. */
+     bool early_mask, early_off, early_unusable[2];
++    /* Hades: the decoder's planes taken as the composer's where its mapping is the identity
++     * (identity_planes()): turned off by dvbridge_render_allow_identity_planes(); the last picture
++     * prepared took them */
++    bool identity_off, identity_taken;
+     unsigned char early_failures[2];
+     int step; /* Hades: dvbridge_render_set_step() */
+     /* Hades: the picture of the transport (rgb) holds black outside the place of clean_place: a
+@@ -1300,6 +1304,61 @@ static bool source_pack(struct dvbridge_renderer *r, unsigned layer, unsigned fr
+     return packed;
+ }
+ 
++/* Hades: whether the composer's planes of a picture are its base layer's own codes, times 4: its RPU
++ * maps each component of a 10-bit base layer to the 12 bits of the composer with the identity (one
++ * piece over 0 to 1023, a polynomial of order 1 with no offset and a slope of 1, coefficients in
++ * integers), reconstructs no residual and has no enhancement layer with it: HDR10 and HDR10+ sent
++ * as Dolby Vision (dvbridge_profile81_metadata()) and profile 8.1 streams made from HDR10 as
++ * dovi_tool makes them. Clause 5.4 of ETSI GS CCM 001 then composes s / 2^10 to the same value at
++ * 12 bits, which the composer writes and the packer reads back as 4 s (the host test of HDR10+ sent
++ * as Dolby Vision compares the transport with the decoded picture sample for sample). The planes
++ * are those of the decoder, P010 (the 10 bits at the top of 16-bit unsigned normalized textures):
++ * every reader of the packer takes a code as floor(value * 4096 + 0.5), and (s << 6) / 65535 * 4096
++ * is 4 s + 4 s / 65535, less than 1/16 of a code above it, for every s up to 1023: the same codes.
++ * Then the composer's pass, which reads the planes and writes ours of the same size (24.9 MB at
++ * 3840x2160), is not made. Not for the reference of a check of the bytes (all_rows), which composes
++ * as before, so that the check compares the two; not for a scaled picture, the IPT tunnel, a base
++ * layer that is not PQ, or planes of another layout. Turned off by
++ * dvbridge_render_allow_identity_planes(). */
++static bool identity_planes(const struct dvbridge_renderer *r, const struct pl_frame *source,
++                            const void *metadata, size_t bytes, struct dvbridge_geometry g)
++{
++    if (r->identity_off || r->all_rows || r->ipt_wanted || scaled(g) || source->enhancement_layer ||
++        r->residual_drawn || r->base_transfer != DVBRIDGE_BASE_PQ || !metadata ||
++        bytes < sizeof(AVDOVIMetadata))
++        return false;
++    if (source->num_planes != 2 || source->repr.bits.sample_depth != 16 ||
++        source->repr.bits.color_depth != 10 || source->repr.bits.bit_shift != 6)
++        return false;
++    for (int p = 0; p < 2; ++p) {
++        const struct pl_plane *plane = &source->planes[p];
++        const pl_tex t = plane->texture;
++        const int w = p ? (g.source_width + 1) / 2 : g.source_width;
++        const int h = p ? (g.source_height + 1) / 2 : g.source_height;
++        if (!t || !t->params.format || t->params.format->type != PL_FMT_UNORM ||
++            t->params.format->num_components != p + 1 || t->params.format->component_depth[0] != 16 ||
++            plane->components != p + 1 || plane->component_mapping[0] != (p ? 1 : 0) ||
++            (p && plane->component_mapping[1] != 2) || t->params.w != w || t->params.h != h)
++            return false;
++    }
++    const AVDOVIMetadata *m = metadata;
++    const AVDOVIRpuDataHeader *head = av_dovi_get_header(m);
++    const AVDOVIDataMapping *map = av_dovi_get_mapping(m);
++    if (head->coef_data_type != 0 || head->coef_log2_denom > 30 || head->bl_bit_depth != 10 ||
++        head->vdr_bit_depth != 12 || map->mapping_color_space != 0 ||
++        map->mapping_chroma_format_idc != 0 ||
++        (map->nlq_method_idc != AV_DOVI_NLQ_NONE && !head->disable_residual_flag))
++        return false;
++    for (int c = 0; c < 3; ++c) {
++        const AVDOVIReshapingCurve *curve = &map->curves[c];
++        if (curve->num_pivots != 2 || curve->pivots[0] != 0 || curve->pivots[1] != 1023 ||
++            curve->mapping_idc[0] != AV_DOVI_MAPPING_POLYNOMIAL || curve->poly_order[0] != 1 ||
++            curve->poly_coef[0][0] != 0 || curve->poly_coef[0][1] != (1 << head->coef_log2_denom))
++            return false;
++    }
++    return true;
++}
++
+ /* Hades: the source transport (dvbridge_source.h). libplacebo composes the planes into ours and
+  * draws nothing else (pl_render_params.dovi_ccm_only: no scaling of the chroma to 4:4:4, no
+  * decoding, nothing written to the target), with the filters of the step-down level (step_down():
+@@ -1359,16 +1418,29 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         params.active_rows[1] = 2160 - (int)margins[3];
+         r->early_mask = true;
+     }
+-    time_render(r, &params);
+-    bool ok = pl_render_image(r->renderer, &image, &frame, &params) && *composed;
++    /* Hades: the decoder's planes where they are the composer's (identity_planes()) */
++    r->identity_taken = identity_planes(r, source, metadata, bytes, geometry);
++    bool ok;
++    if (r->identity_taken) {
++        /* (no rows are left out: the decoder's planes hold every row) */
++        *composed = true;
++        r->early_mask = false;
++        ok = true;
++    } else {
++        time_render(r, &params);
++        ok = pl_render_image(r->renderer, &image, &frame, &params) && *composed;
++    }
+     /* Hades: a base layer in BT.1886 is composed as clause 5.5 says or not at all, and one in HLG as
+      * one in ST 2084 where its RPU declares that, or not at all (base_transfer()) */
+     r->base_refused = r->base_transfer && !*composed ? r->base_transfer : DVBRIDGE_BASE_PQ;
+     r->composed = ok ? DVBRIDGE_COMPOSED_CCM : DVBRIDGE_COMPOSED_NONE;
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     ok = ok && !errors.errors && !errors.num_disabled_hooks;
+-    const unsigned composed_luma = ok ? pl_opengl_unwrap(r->gpu, r->planes[0], NULL, NULL, NULL) : 0;
+-    const unsigned chroma = ok ? pl_opengl_unwrap(r->gpu, r->planes[1], NULL, NULL, NULL) : 0;
++    const pl_tex composed_planes[2] = {r->identity_taken ? source->planes[0].texture : r->planes[0],
++                                       r->identity_taken ? source->planes[1].texture : r->planes[1]};
++    const unsigned composed_luma =
++        ok ? pl_opengl_unwrap(r->gpu, composed_planes[0], NULL, NULL, NULL) : 0;
++    const unsigned chroma = ok ? pl_opengl_unwrap(r->gpu, composed_planes[1], NULL, NULL, NULL) : 0;
+     r->pack_luma = 0;
+     r->pack_w = geometry.source_width;
+     r->pack_h = geometry.source_height;
+@@ -3084,6 +3156,17 @@ void dvbridge_render_allow_early_mask(struct dvbridge_renderer *r, bool allow)
+         r->early_off = !allow;
+ }
+ 
++void dvbridge_render_allow_identity_planes(struct dvbridge_renderer *r, bool allow)
++{
++    if (r)
++        r->identity_off = !allow;
++}
++
++bool dvbridge_render_identity_planes(const struct dvbridge_renderer *r)
++{
++    return r && r->ready && r->source && r->identity_taken;
++}
++
+ void dvbridge_render_set_step(struct dvbridge_renderer *r, int level)
+ {
+     if (r)
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index f2c3224..c18234f 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -357,6 +357,13 @@ int dvbridge_render_early_mask(const struct dvbridge_renderer *renderer, bool pa
+ /* Hades: whether the area outside the active picture may be written before the reconstruction
+  * (the default). Turned off to measure on hardware what it saves, and by the host test. */
+ void dvbridge_render_allow_early_mask(struct dvbridge_renderer *renderer, bool allow);
++/* Hades: whether the source transport may take the decoder's planes as the composer's where the
++ * RPU maps the base layer with the identity (the default; see identity_planes() in
++ * dvbridge_render.c: the same codes, and the composer's pass is not made). Turned off by the host
++ * test, to compare. identity_planes: the last picture prepared took them. */
++#define DVBRIDGE_RENDER_IDENTITY_PLANES 1
++void dvbridge_render_allow_identity_planes(struct dvbridge_renderer *renderer, bool allow);
++bool dvbridge_render_identity_planes(const struct dvbridge_renderer *renderer);
+ /* Hades: a step down from the faithful picture, for graphics that cannot draw a frame in the time
+  * of a refresh. With libplacebo's reshaping (dvbridge_render_use_ccm_composer(), false), the
+  * planes that are scaled up to the size of the picture are scaled up bilinearly (the sampling of
+-- 
+2.53.0
+

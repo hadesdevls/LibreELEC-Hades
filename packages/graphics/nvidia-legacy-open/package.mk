@@ -25,6 +25,11 @@ make_target() {
   # the kernel and without the target's user-space flags, as nvidia-open-kernel-modules.
   unset CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
 
+  # Hades: the "nvidia id" of NVKMS names the user and host of BUILD_IDENTITY_USER and
+  # BUILD_IDENTITY_HOST and the time of SOURCE_DATE_EPOCH (config/options), not those of this build
+  local nvid=(NV_BUILD_USER="${BUILD_IDENTITY_USER}" NV_BUILD_HOST="${BUILD_IDENTITY_HOST}")
+  [ -n "${SOURCE_DATE_EPOCH}" ] && nvid+=(DATE="LC_ALL=C date -u -d @${SOURCE_DATE_EPOCH}")
+
   make -C src/nvidia-modeset \
     TARGET_ARCH=x86_64 \
     ARCH=x86_64 \
@@ -32,7 +37,8 @@ make_target() {
     LD=${LD} \
     AR=${AR} \
     CXX=${CXX} \
-    OBJCOPY=${OBJCOPY}
+    OBJCOPY=${OBJCOPY} \
+    "${nvid[@]}"
 }
 
 makeinstall_target() {

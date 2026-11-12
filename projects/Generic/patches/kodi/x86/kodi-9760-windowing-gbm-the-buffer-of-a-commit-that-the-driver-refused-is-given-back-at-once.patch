@@ -1,0 +1,265 @@
+From c516df8e2f87fda19a247004a97a79f227462a11 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:11:31 +0000
+Subject: [PATCH] windowing/gbm: the buffer of a commit that the driver refused
+ is given back at once
+
+CGBMSurface::LockFrontBuffer() locks the buffer of each frame and, when the
+implementation has none left to draw into, gives back the oldest one that it
+holds: off the screen as long as every buffer after it went out. A commit
+that the driver refuses whole (the commit itself, also the one that falls
+back to the request before it, or a framebuffer that cannot be made of the
+buffer) left its buffer in the queue as if it were on the screen. Three such
+frames in a row, with Mesa's four buffers, gave back the buffer that the
+screen still showed, and the next frame was drawn into it: a picture torn or
+half drawn on the screen until a commit went through again. A refused test
+is not such a case: the frame then goes out with the request before it
+(DrmAtomicCommit()), and its buffer is on the screen.
+
+CDRMUtils::LastBufferTaken() says whether the buffer of the last FlipPage()
+went out (CDRMAtomic: an accepted commit, its own or the one it fell back
+to; legacy DRM: a queued page flip), and CWinSystemGbm gives a buffer that
+did not back at once (CGBMSurface::GiveBackRefused(): the newest of the
+queue, which is a deque now), also where a frame alone during a held change
+of mode (FlipPageAlone()) or the mode of legacy DRM was refused. Kodi's own
+buffers (IOwnBuffers) are given back the same way. Native Dolby Vision has a
+buffer of its own for each transaction (LockTransactionalBuffer()), which
+was given back when refused already.
+
+The idea comes from CroqueMr's builds (kodi-9997-gbm-colour-buffer-lifetime),
+which keep the accepted buffer on the screen through refused colour
+requests; here the refused buffer itself is given back, whatever the
+refusal.
+---
+ xbmc/windowing/gbm/GBMUtils.cpp      | 18 +++++++++++++-----
+ xbmc/windowing/gbm/GBMUtils.h        | 17 +++++++++++++++--
+ xbmc/windowing/gbm/WinSystemGbm.cpp  |  9 +++++++++
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp |  4 ++++
+ xbmc/windowing/gbm/drm/DRMAtomic.h   |  2 ++
+ xbmc/windowing/gbm/drm/DRMLegacy.cpp |  1 +
+ xbmc/windowing/gbm/drm/DRMLegacy.h   |  2 ++
+ xbmc/windowing/gbm/drm/DRMUtils.h    |  5 +++++
+ 8 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/GBMUtils.cpp b/xbmc/windowing/gbm/GBMUtils.cpp
+index 5a73783..49caf5a 100644
+--- a/xbmc/windowing/gbm/GBMUtils.cpp
++++ b/xbmc/windowing/gbm/GBMUtils.cpp
+@@ -86,7 +86,7 @@ std::unique_ptr<CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer> CGBMUtils
+ CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer& CGBMUtils::CGBMDevice::CGBMSurface::
+     LockFrontBuffer()
+ {
+-  m_buffers.emplace(MakeBuffer());
++  m_buffers.emplace_back(MakeBuffer());
+   if (m_buffers.back()->Own())
+     ++m_ownQueued;
+ 
+@@ -112,7 +112,7 @@ CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer& CGBMUtils::CGBMDevice::CG
+     {
+       if (m_buffers.front()->Own())
+         --m_ownQueued;
+-      m_buffers.pop();
++      m_buffers.pop_front();
+     };
+     giveBack();
+     while (mixed && m_buffers.size() > 1 && !HasFreeBuffers())
+@@ -122,6 +122,15 @@ CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer& CGBMUtils::CGBMDevice::CG
+   return *m_buffers.back();
+ }
+ 
++void CGBMUtils::CGBMDevice::CGBMSurface::GiveBackRefused(gbm_bo* bo)
++{
++  if (!bo || m_buffers.empty() || m_buffers.back()->Get() != bo)
++    return;
++  if (m_buffers.back()->Own())
++    --m_ownQueued;
++  m_buffers.pop_back();
++}
++
+ CGBMUtils::CGBMDevice::CGBMSurface::CGBMSurfaceBuffer::CGBMSurfaceBuffer(gbm_surface* surface)
+   : m_surface(surface), m_buffer(gbm_surface_lock_front_buffer(surface))
+ {
+@@ -152,8 +161,7 @@ void CGBMUtils::CGBMDevice::CGBMSurface::CompleteTransactionalBuffer(bool presen
+   {
+     // The blocking commit has replaced every legacy queued scanout buffer. (One that does not
+     // wait never is the first of a transactional mode: the queue is empty by then.)
+-    while (!m_buffers.empty())
+-      m_buffers.pop();
++    m_buffers.clear();
+     m_ownQueued = 0; // (Hades)
+     // The buffer that the commit before this one retired left the screen with the flip of
+     // that commit, which the caller has waited for; and with a blocking commit, the buffer
+@@ -182,7 +190,7 @@ void CGBMUtils::CGBMDevice::CGBMSurface::EndTransactionalMode()
+   {
+     if (m_scanoutBuffer->Own()) // (Hades)
+       ++m_ownQueued;
+-    m_buffers.push(std::move(m_scanoutBuffer));
++    m_buffers.push_back(std::move(m_scanoutBuffer));
+   }
+ }
+ 
+diff --git a/xbmc/windowing/gbm/GBMUtils.h b/xbmc/windowing/gbm/GBMUtils.h
+index d9ca503..43e3753 100644
+--- a/xbmc/windowing/gbm/GBMUtils.h
++++ b/xbmc/windowing/gbm/GBMUtils.h
+@@ -8,8 +8,8 @@
+ 
+ #pragma once
+ 
++#include <deque>
+ #include <memory>
+-#include <queue>
+ 
+ #include <gbm.h>
+ 
+@@ -153,6 +153,18 @@ public:
+        */
+       CGBMSurfaceBuffer& LockFrontBuffer();
+ 
++      /**
++       * @brief Hades: the buffer that LockFrontBuffer() locked last never reached the screen (the
++       * driver refused its commit, also the one that falls back to the request before it): it is
++       * given back now, so that the queue holds only buffers that are on the screen or on their
++       * way to it. LockFrontBuffer() gives back the oldest buffer when the implementation has none
++       * left to draw into, which is off the screen only while every buffer after it went out:
++       * kept in the queue, two refused frames in a row (with Mesa's four buffers) gave back the
++       * buffer that the screen still showed, and the frame after them was drawn into it. Nothing is
++       * done where bo is not the newest buffer of the queue.
++       */
++      void GiveBackRefused(gbm_bo* bo);
++
+       // Atomic presentation of one buffer at a time: retain the current scanout on failure.
+       gbm_bo* LockTransactionalBuffer();
+       // ahead: the commit did not wait for its flip, so the buffer that was the scanout stays
+@@ -176,7 +188,8 @@ public:
+ 
+     private:
+       gbm_surface* m_surface{nullptr};
+-      std::queue<std::unique_ptr<CGBMSurfaceBuffer>> m_buffers;
++      //! (Hades: a deque, so that the newest can be given back: GiveBackRefused())
++      std::deque<std::unique_ptr<CGBMSurfaceBuffer>> m_buffers;
+       std::unique_ptr<CGBMSurfaceBuffer> m_scanoutBuffer;
+       std::unique_ptr<CGBMSurfaceBuffer> m_pendingBuffer;
+       std::unique_ptr<CGBMSurfaceBuffer> m_retiredBuffer;
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index 92c84a0..8704bb9 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -571,6 +571,9 @@ bool CWinSystemGbm::SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool bl
+   }
+ 
+   auto result = m_DRM->SetVideoMode(res, bo);
++  // Hades: (legacy DRM) a mode that the driver refused did not show bo: CGBMSurface::GiveBackRefused()
++  if (!result && bo)
++    m_GBM->GetDevice().GetSurface().GiveBackRefused(bo);
+ 
+   // Complete Kodi's queued native modeset before the next EGL buffer swap.
+   // This existing GBM synchronization is required for ordinary HDR as well;
+@@ -2632,6 +2635,8 @@ bool CWinSystemGbm::FlipHeldGui()
+     ++m_heldGuiShown;
+     return true;
+   }
++  // (Hades: that buffer never reached the screen: CGBMSurface::GiveBackRefused())
++  m_GBM->GetDevice().GetSurface().GiveBackRefused(bo);
+   m_heldGuiFlips = false;
+   CLog::Log(LOGWARNING, "A frame of the GUI could not be shown while the change of mode waits: the "
+                         "display keeps the picture it has until then");
+@@ -3111,6 +3116,10 @@ void CWinSystemGbm::FlipPage(bool rendered, bool videoLayer, bool async)
+   const auto atomicForCta = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
+   const bool mayModeset = !atomicForCta || atomicForCta->ModesetPending() || m_dispReset;
+   m_DRM->FlipPage(bo, rendered, videoLayer, async);
++  // Hades: a buffer whose commit the driver refused never reached the screen: given back now, so that
++  // the one the screen shows is never given back for drawing (CGBMSurface::GiveBackRefused())
++  if (bo && !m_DRM->LastBufferTaken())
++    m_GBM->GetDevice().GetSurface().GiveBackRefused(bo);
+   // Hades: a change of mode that the driver kept refusing was given up (CModesetRetry)
+   if (m_DRM->TakeModesetGivenUp())
+     AnnounceModesetGivenUp();
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 60c18db..019ba45 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -1193,6 +1193,9 @@ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, boo
+   // frames of native output, FlipPageTransactional()) sees no modeset pending between the retries.
+   const auto now = CModesetRetry::Clock::now();
+   const bool modeset = CommitsModeset(m_need_modeset, m_active, m_modesetRetry, now);
++  // Hades: whether bo goes out (LastBufferTaken()): with an accepted commit, its own or the one before
++  // it with this frame (DrmAtomicCommit())
++  m_bufferTaken = !rendered;
+ 
+   if (rendered)
+   {
+@@ -1219,6 +1222,7 @@ void CDRMAtomic::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, boo
+   }
+ 
+   const bool accepted = DrmAtomicCommit(!drm_fb ? 0 : drm_fb->fb_id, flags, rendered, videoLayer);
++  m_bufferTaken = !rendered || accepted;
+   if (modeset)
+     SettleModeset(accepted, now);
+ }
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index adc2934..7369b1d 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -65,6 +65,7 @@ public:
+   bool FlipPageAlone(struct gbm_bo* bo);
+   bool TakeFlipRefused() override { return std::exchange(m_flipRefused, false); }
+   bool TakeFlipDropped() override { return std::exchange(m_flipDropped, false); }
++  bool LastBufferTaken() const override { return m_bufferTaken; }
+   FloatRefusal RefusedForBuffer(struct gbm_bo* bo) override;
+   /*!
+    * \brief Hades: a property of the user's choice (the colour format, the depth of the link): added
+@@ -302,6 +303,7 @@ private:
+   bool m_flipRefused = false;
+   bool m_flipDropped = false; //!< see TakeFlipDropped(); kept until it is asked
+   bool m_lastCommitRefused = false; //!< Hades: see LastCommitRefused()
++  bool m_bufferTaken = true; //!< Hades: see LastBufferTaken()
+   std::optional<int> m_hdr10PlusTestError; //!< Hades: see TakeHDR10PlusTestError()
+   uint64_t m_requestGeneration = 0; //!< Hades: see RequestGeneration()
+   //! Hades: a copy of the last request whose test was refused and told (TakeFlipRefused()), and
+diff --git a/xbmc/windowing/gbm/drm/DRMLegacy.cpp b/xbmc/windowing/gbm/drm/DRMLegacy.cpp
+index 7b08af3..82c2f76 100644
+--- a/xbmc/windowing/gbm/drm/DRMLegacy.cpp
++++ b/xbmc/windowing/gbm/drm/DRMLegacy.cpp
+@@ -111,6 +111,7 @@ void CDRMLegacy::FlipPage(struct gbm_bo* bo, bool rendered, bool videoLayer, boo
+   if (rendered || videoLayer)
+   {
+     flip_happening = QueueFlip(bo);
++    m_bufferTaken = !rendered || flip_happening; // (Hades: LastBufferTaken())
+     WaitingForFlip();
+   }
+ }
+diff --git a/xbmc/windowing/gbm/drm/DRMLegacy.h b/xbmc/windowing/gbm/drm/DRMLegacy.h
+index 322a99b..9d566a8 100644
+--- a/xbmc/windowing/gbm/drm/DRMLegacy.h
++++ b/xbmc/windowing/gbm/drm/DRMLegacy.h
+@@ -26,8 +26,10 @@ public:
+   bool SetVideoMode(const RESOLUTION_INFO& res, struct gbm_bo* bo) override;
+   bool SetActive(bool active) override;
+   bool InitDrm() override;
++  bool LastBufferTaken() const override { return m_bufferTaken; } // (Hades)
+ 
+ private:
++  bool m_bufferTaken = true; //!< (Hades) the page flip of the last frame was queued
+   bool WaitingForFlip();
+   bool QueueFlip(struct gbm_bo* bo);
+   static void PageFlipHandler(
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 298238b..050d963 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -93,6 +93,11 @@ public:
+   //! asked, for whatever reason: also the ones that TakeFlipRefused() does not tell of, but for
+   //! a commit made while the output is meant to be off. What such a commit carried is lost.
+   virtual bool TakeFlipDropped() { return false; }
++  //! \brief Hades: whether the buffer given to the last FlipPage() went out to the output, with its
++  //! own request or with the one before it: false where the driver refused the commit, or no
++  //! framebuffer could be made of the buffer (CGBMSurface::GiveBackRefused()). True where there was
++  //! no buffer, and for an output that cannot tell.
++  virtual bool LastBufferTaken() const { return true; }
+   //! \brief Hades: a change of mode that the driver kept refusing was given up since this was
+   //! asked last (CDRMAtomic, CModesetRetry)
+   virtual bool TakeModesetGivenUp() { return false; }
+-- 
+2.53.0
+

@@ -19,12 +19,17 @@
 #                              version damaged so (its header 0a ff ff ff ff ff ff 0a) cannot be mended and is left
 #                              out, with a note in its place. The archive of the ACPI tables as it is (the
 #                              firmware's description of the machine: no text of the system), Kodi's logs and
-#                              the journal through the whole filter (once more where they were made through
+#                              the journal (also those of a start of the installer, installer/) through the whole filter (once more where they were made through
 #                              it: a second pass changes nothing; the first one, for what an earlier version
 #                              left), every other file through the identifiers. A file of <out> that is
-#                              newer than its file of <in> is kept as it is
+#                              newer than its file of <in> is kept as it is. Then <out>/filter.txt: what
+#                              the filter left of the name of this system in all of <out> (hostnote)
 #   redact.sh btname <file>    the name and the alias of a Bluetooth device in a file of BlueZ, as the
 #                              markers that the filter puts where they stand: "Name: [bt-name-...]"
+#   redact.sh hostnote <dir>   what the filter left of the name of this system in the files of a folder that
+#                              went through it: the times it stands as a word of its own (none, where it is a
+#                              name of its own: the last pass of redact-ids.awk takes it wherever it stands
+#                              so) and inside longer words. Never the name itself
 # With HADES_REDACT_DROP_UNENDED set, a last line of the input with no line end is left out (the input was cut
 # while it was written, shutdown.sh); with HADES_REDACT_STATS set, what the filter did goes to standard error.
 # The names of the Bluetooth devices are those that BlueZ keeps in /storage/.cache/bluetooth: of each paired
@@ -92,12 +97,37 @@ tree() {
         fi ;;
       *.tar.gz) cp "$1/$f" "$2/$f" ;;
       kodi*.log.gz|*/kodi*.log.gz|journal*.gz|*/journal*.gz) (set -o pipefail; gunzip -c "$1/$f" | ids log | sed -E -f "$L/redact.sed" | gzip > "$2/$f") ;;
-      kodi-tail*|*/kodi-tail*) (set -o pipefail; ids log < "$1/$f" | sed -E -f "$L/redact.sed" > "$2/$f") ;;
+      kodi-tail*|*/kodi-tail*|installer/journal.txt|*/installer/journal.txt|installer/install.txt|*/installer/install.txt) (set -o pipefail; ids log < "$1/$f" | sed -E -f "$L/redact.sed" > "$2/$f") ;;
       *.gz) (set -o pipefail; gunzip -c "$1/$f" | ids | gzip > "$2/$f") ;;
       *) ids < "$1/$f" > "$2/$f" ;;
     esac || { rm -f "$2/$f"; rc=1; }
   done
+  # (Hades: what the filter left of the name of this system in all of <out>, for whoever reads the folder)
+  hostnote "$2" > "$2/filter.txt" 2>/dev/null || rm -f "$2/filter.txt"
   return $rc
+}
+# Hades: what the filter left of the name of this system in the files of the folder $1: "<kind> <as a word of its
+# own> <inside longer words>", the kind "word" (a name that the last pass takes wherever it stands as a word),
+# "plain" (one that only the lines that name it as such lose) or "none" (no name to take). Each file whole, a log
+# packed with gzip unpacked, with a line end after it; not the archive of the ACPI tables, the EDIDs (no text of
+# the system) nor a note of this.
+hostleft() {
+  for f in $(cd "$1" && find . -type f | sed 's|^\./||'); do
+    case $f in
+      filter.txt|*/filter.txt|*.tar.gz|edid/*.bin|*/edid/*.bin) ;;
+      *.gz) gunzip -c "$1/$f"; echo ;;
+      *) cat "$1/$f"; echo ;;
+    esac
+  done | awk -v HOST="$host" -v MODE=hostleft -f "$L/redact-ids.awk"
+}
+hostnote() {
+  set -- $(hostleft "$1")
+  case "$1" in
+    word) echo "The name of this system: $2 times left as a word of its own in the files of this folder (none is expected: the last pass of the filter takes it wherever it stands so), and $3 times inside a longer word (left as it is: such a word may be another one)." ;;
+    plain) echo "The name of this system: a word that the logs use themselves, or a very short one, so it is taken only where a line names it as the name of the system (not counted here)." ;;
+    none) echo "The name of this system: none to take (none is set, or it is the one that LibreELEC gives)." ;;
+    *) return 1 ;;
+  esac
 }
 
 case "$1" in ''|ids|tree) btnames ;; esac
@@ -106,6 +136,7 @@ case "$1" in
   ids) ids ;;
   edid) edid "$2" "$3" ;;
   tree) tree "$2" "$3" ;;
+  hostnote) hostnote "$2" ;;
   btname) [ -r "$2" ] && awk -v KEYFILE="$key" -v TMP="$W/h" -v MODE=btmark -f "$L/redact-ids.awk" "$2" < /dev/null ;;
-  *) echo "usage: $0 [ids | edid <in> <out> | tree <in> <out> | btname <file>]" >&2; exit 2 ;;
+  *) echo "usage: $0 [ids | edid <in> <out> | tree <in> <out> | btname <file> | hostnote <dir>]" >&2; exit 2 ;;
 esac

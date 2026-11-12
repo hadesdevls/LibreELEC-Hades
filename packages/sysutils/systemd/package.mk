@@ -100,6 +100,15 @@ PKG_MESON_OPTS_TARGET="--libdir=/usr/lib \
                        -Ddebug-tty=${DEBUG_TTY} \
                        -Dversion-tag=${PKG_VERSION}"
 
+# the BPF framework stays off, as it has always been here: meson turns it on by
+# itself when it finds libbpf, bpftool and a clang with the BPF target, and the
+# toolchain's clang has that target for the IR decoders of v4l-utils
+PKG_MESON_OPTS_TARGET+=" -Dbpf-framework=disabled"
+
+# libarchive support stays off, as in the builds so far: meson finds libarchive
+# only when it happens to be built (for elfutils) before systemd
+PKG_MESON_OPTS_TARGET+=" -Dlibarchive=disabled"
+
 if [ "${PROJECT}" = "Generic" ]; then
   PKG_MESON_OPTS_TARGET+=" -Defi=true"
 else
@@ -109,6 +118,13 @@ fi
 pre_configure_target() {
   export TARGET_CFLAGS="${TARGET_CFLAGS} -fno-schedule-insns -fno-schedule-insns2 -Wno-format-truncation"
   export LC_ALL=en_US.UTF-8
+
+  # Hades: the earliest time that systemd lets the clock have at boot (TIME_EPOCH) stays the one that
+  # meson takes when it is given none and there is no SOURCE_DATE_EPOCH: the time of systemd's NEWS
+  # file, the same in every build already. With SOURCE_DATE_EPOCH (config/options) meson would take the
+  # time of the commit instead, which is not only a date written into a file but changes when systemd
+  # moves the clock forward.
+  PKG_MESON_OPTS_TARGET+=" -Dtime-epoch=$(stat -c %Y ${PKG_BUILD}/NEWS)"
 }
 
 post_makeinstall_target() {

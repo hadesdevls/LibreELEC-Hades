@@ -1,0 +1,1128 @@
+From 07e04adfc7e6ac9389211deed2b6f1e7527a5af6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 01:58:13 +0000
+Subject: [PATCH] VideoPlayer: tell a film in the fields of interlaced video
+ from its decoded pictures
+
+A film on a DVD, and on television, is often stored as interlaced video. In 3:2 pulldown (NTSC)
+four pictures of the film fill five coded frames, and a top and a bottom field repeat once in
+every five; in 2:2 (PAL, and NTSC video at 30) each frame holds the two fields of one picture of
+the film, or one field off; a film at 25 in 29.97 progressive frames repeats one frame in six.
+None of it is in the flags of the stream: it is in the pictures.
+
+FieldCadence.h compares the luma of each decoded picture with the one before: how much its top
+and its bottom field changed, and how much it combs as coded and with its first field woven with
+the second field of the picture before. A run of such labels is 3:2 where a top field repeats at
+one place of the cycle of five and a bottom field at another, in nine cycles of ten and nowhere
+else always (by parity, as an encoder may mark the frames of a pulldown top or bottom field
+first); 25 in 30 where a whole frame repeats at one place of the cycle of six; 2:2 where nine
+weaves in ten that tell are the frame's own (or one field off) and no field repeats alone; video
+where pictures comb whichever way their fields are woven (a third of them, or six). A still, too
+few cycles, or anything less clear tells nothing. Decide() takes the start of a stream and three
+places further on: a film only where every place that told says the same film, never where one
+says video. CCadenceWatch says, with hysteresis, where the cadence stops and comes back during
+playback. GraphOf() gives the filters of FFmpeg that put the pictures back together (fieldmatch,
+bwdif on the frames that no weave makes whole, decimate).
+
+FieldCadenceProbe.h decodes a stretch of MPEG-2 video read before it is played with a decoder of
+its own, and takes the video out of a stretch of a transport stream or of a Matroska file read
+at a place of its own (the program stream already had its extractor).
+
+The idea, and the use of fieldmatch and decimate, come from CorentinB's pull request 101 to
+CroqueMr's build; the detection, the decision and the code are Hades' own.
+---
+ xbmc/cores/VideoPlayer/CMakeLists.txt         |   1 +
+ .../VideoPlayer/DVDDemuxers/CMakeLists.txt    |   1 +
+ .../DVDDemuxers/FieldCadenceProbe.h           | 385 ++++++++++
+ xbmc/cores/VideoPlayer/FieldCadence.h         | 663 ++++++++++++++++++
+ 4 files changed, 1050 insertions(+)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDDemuxers/FieldCadenceProbe.h
+ create mode 100644 xbmc/cores/VideoPlayer/FieldCadence.h
+
+diff --git a/xbmc/cores/VideoPlayer/CMakeLists.txt b/xbmc/cores/VideoPlayer/CMakeLists.txt
+index 919e7de..c1d6a1d 100644
+--- a/xbmc/cores/VideoPlayer/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/CMakeLists.txt
+@@ -52,6 +52,7 @@ set(HEADERS AudioSinkAE.h
+             MatroskaHttpRange.h
+             MultiviewChoice.h
+             MultiviewDisc.h
++            FieldCadence.h
+             FilmTimer.h
+             OverlayFrameMatch.h
+             PTSTracker.h
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+index bc3bf26..d5d44ce 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/CMakeLists.txt
+@@ -41,6 +41,7 @@ set(HEADERS BlurayOffsetMetadata.h
+             MatroskaHeaderRead.h
+             MatroskaSubtitlePacket.h
+             MatroskaSubtitleSeek.h
++            FieldCadenceProbe.h
+             Mpeg2SoftTelecine.h
+             DVDDemuxUtils.h
+             DVDDemuxVobsub.h
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/FieldCadenceProbe.h b/xbmc/cores/VideoPlayer/DVDDemuxers/FieldCadenceProbe.h
+new file mode 100644
+index 0000000..284b78c
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/FieldCadenceProbe.h
+@@ -0,0 +1,385 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/VideoPlayer/FieldCadence.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++}
++
++/*!
++ * \file FieldCadenceProbe.h
++ * \brief (Hades) Decodes a stretch of MPEG-2 video read before it is played and tells its cadence
++ *        (FieldCadence.h)
++ *
++ * Whether interlaced video is a film whose fields can be put back together is not in its flags:
++ * it is in its pictures. A stretch of the stream (its start, as the demuxer reads it, or a place
++ * further on, read as bytes) is decoded here with a decoder of its own, on one thread, and the luma
++ * of each picture is compared with the one before (KODI::FIELDCADENCE::Measure()). Nothing of the
++ * player is used, and the same file is tested outside of Kodi against FFmpeg.
++ *
++ * A picture that the decoder could not decode whole (the start of an open group of pictures whose
++ * reference was not read, a damaged stretch) ends the run of pictures that follow each other: the
++ * place in the cadence is counted again from the next one. The verdict is that of the runs, which
++ * have to agree.
++ */
++
++namespace KODI::FIELDCADENCE
++{
++/*!
++ * \brief The video elementary stream in a stretch of an MPEG transport stream that starts anywhere
++ *        (a TS read at a place of its own): the payload of the packets of the first PID met whose
++ *        packet starts a PES packet of a video stream (stream id 0xE0 to 0xEF), from that packet
++ *        on, without the PES headers; the packets are found by their sync byte every 188 bytes
++ */
++inline std::vector<uint8_t> TransportStreamVideo(const uint8_t* data, size_t size)
++{
++  static constexpr size_t PACKET = 188;
++  std::vector<uint8_t> video;
++  size_t i = 0;
++  // the first place where three packets in a row start with the sync byte
++  while (i + 2 * PACKET < size &&
++         (data[i] != 0x47 || data[i + PACKET] != 0x47 || data[i + 2 * PACKET] != 0x47))
++    ++i;
++  int pid = -1;
++  for (; i + PACKET <= size; i += PACKET)
++  {
++    const uint8_t* p = data + i;
++    if (p[0] != 0x47)
++      break; // (out of step: what is left is not read)
++    const bool start = (p[1] & 0x40) != 0;
++    const int packetPid = ((p[1] & 0x1F) << 8) | p[2];
++    const int adaptation = (p[3] >> 4) & 3;
++    size_t payload = 4;
++    if (adaptation & 2)
++      payload += 1 + static_cast<size_t>(p[4]);
++    if (!(adaptation & 1) || payload >= PACKET)
++      continue;
++    if (start)
++    {
++      // a PES packet: 00 00 01, stream id, length (2), flags (2), header length, header
++      const uint8_t* pes = p + payload;
++      const size_t left = PACKET - payload;
++      const bool videoPes = left >= 9 && pes[0] == 0 && pes[1] == 0 && pes[2] == 1 &&
++                            pes[3] >= 0xE0 && pes[3] <= 0xEF;
++      if (pid < 0 && videoPes)
++        pid = packetPid;
++      if (packetPid != pid)
++        continue;
++      if (!videoPes || 9 + static_cast<size_t>(pes[8]) > left)
++        continue;
++      payload += 9 + pes[8];
++    }
++    else if (packetPid != pid)
++      continue;
++    video.insert(video.end(), p + payload, p + PACKET);
++  }
++  return video;
++}
++
++/*!
++ * \brief The frames of the MPEG-2 video track in a stretch of a Matroska file that starts anywhere
++ *        (an MKV read at a place of its own), one after the other: from the first cluster met, the
++ *        payload of its blocks (SimpleBlock, and Block in a BlockGroup) without their headers; a
++ *        block with lacing (not used for video) and one cut by the end of the stretch are left out.
++ *        The track is the first whose block starts as an MPEG-2 picture does (a sequence header, a
++ *        group of pictures or a picture: the demuxer of FFmpeg does not keep the number of the
++ *        track). Where the elements stop making sense, the next cluster is looked for.
++ */
++inline std::vector<uint8_t> MatroskaVideo(const uint8_t* data, size_t size)
++{
++  std::vector<uint8_t> video;
++  uint64_t track = 0;
++  // an EBML variable-size integer at i: its length (0 where it is none), its value without the
++  // marker bit (or with it, for an element id), and whether all its bits are set (unknown size)
++  const auto vint = [data, size](size_t i, bool keepMarker, uint64_t& value, bool* unknown)
++  {
++    if (i >= size || data[i] == 0)
++      return size_t{0};
++    size_t length = 1;
++    while (!(data[i] & (0x80 >> (length - 1))))
++      ++length;
++    if (i + length > size)
++      return size_t{0};
++    value = keepMarker ? data[i] : (data[i] & (0xFF >> length));
++    bool ones = (data[i] & (0xFF >> length)) == (0xFF >> length);
++    for (size_t k = 1; k < length; ++k)
++    {
++      value = (value << 8) | data[i + k];
++      ones = ones && data[i + k] == 0xFF;
++    }
++    if (unknown)
++      *unknown = ones;
++    return length;
++  };
++  const auto nextCluster = [data, size](size_t from)
++  {
++    for (size_t i = from; i + 4 <= size; ++i)
++      if (data[i] == 0x1F && data[i + 1] == 0x43 && data[i + 2] == 0xB6 && data[i + 3] == 0x75)
++        return i;
++    return size;
++  };
++
++  size_t i = nextCluster(0);
++  while (i < size)
++  {
++    uint64_t id = 0;
++    uint64_t length = 0;
++    bool unknown = false;
++    const size_t idSize = vint(i, true, id, nullptr);
++    const size_t lengthSize = idSize ? vint(i + idSize, false, length, &unknown) : 0;
++    if (!idSize || !lengthSize)
++    {
++      i = nextCluster(i + 1);
++      continue;
++    }
++    const size_t body = i + idSize + lengthSize;
++    if (id == 0x1F43B675 || id == 0xA0) // a cluster, a block group: their elements follow
++    {
++      i = body;
++      continue;
++    }
++    if (unknown || body + length > size)
++    {
++      if (unknown)
++      {
++        i = nextCluster(i + 1);
++        continue;
++      }
++      break; // (cut by the end of the stretch)
++    }
++    if (id == 0xA3 || id == 0xA1) // SimpleBlock, Block
++    {
++      uint64_t number = 0;
++      const size_t numberSize = vint(body, false, number, nullptr);
++      const size_t header = numberSize + 3; // the track, a 16-bit timestamp, the flags
++      const uint8_t* frame = data + body + header;
++      if (track == 0 && numberSize && header + 4 <= length && frame[0] == 0 && frame[1] == 0 &&
++          frame[2] == 1 && (frame[3] == 0xB3 || frame[3] == 0xB8 || frame[3] == 0x00))
++        track = number;
++      if (numberSize && header <= length && number == track && !(data[body + numberSize + 2] & 0x06))
++        video.insert(video.end(), frame, data + body + length);
++    }
++    i = body + static_cast<size_t>(length);
++  }
++  return video;
++}
++
++class CProbe
++{
++public:
++  //! pictures decoded at the most (some 2.4 s at 29.97, 2.9 s at 25)
++  static constexpr size_t MAX_PICTURES = 72;
++
++  CProbe()
++  {
++    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
++    if (!codec)
++      return;
++    m_ctx = avcodec_alloc_context3(codec);
++    m_parser = av_parser_init(AV_CODEC_ID_MPEG2VIDEO);
++    m_packet = av_packet_alloc();
++    m_frame = av_frame_alloc();
++    if (!m_ctx || !m_parser || !m_packet || !m_frame)
++      return;
++    m_ctx->thread_count = 1;
++    if (avcodec_open2(m_ctx, codec, nullptr) < 0)
++      return;
++    m_open = true;
++  }
++
++  ~CProbe()
++  {
++    av_frame_free(&m_frame);
++    av_packet_free(&m_packet);
++    if (m_parser)
++      av_parser_close(m_parser);
++    avcodec_free_context(&m_ctx);
++  }
++
++  CProbe(const CProbe&) = delete;
++  CProbe& operator=(const CProbe&) = delete;
++
++  bool IsOpen() const { return m_open; }
++
++  //! \brief A packet of the stream as a demuxer gives it (a picture, or the end of one)
++  void AddPacket(const uint8_t* data, size_t size)
++  {
++    if (!m_open || Enough() || size == 0)
++      return;
++    av_packet_unref(m_packet);
++    if (av_new_packet(m_packet, static_cast<int>(size)) < 0)
++      return;
++    std::copy(data, data + size, m_packet->data);
++    Send(m_packet);
++  }
++
++  /*!
++   * \brief A stretch of elementary stream read at a place of its own: split into pictures by
++   *        FFmpeg's parser, as the demuxer of an elementary stream does
++   */
++  void AddElementaryStream(const uint8_t* data, size_t size)
++  {
++    if (!m_open)
++      return;
++    while (size > 0 && !Enough())
++    {
++      uint8_t* out = nullptr;
++      int outSize = 0;
++      const int used =
++          av_parser_parse2(m_parser, m_ctx, &out, &outSize, data, static_cast<int>(size),
++                           AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
++      if (used < 0)
++        return;
++      data += used;
++      size -= static_cast<size_t>(used);
++      if (outSize > 0)
++        AddPacket(out, static_cast<size_t>(outSize));
++      if (used == 0 && outSize == 0)
++        break;
++    }
++  }
++
++  /*!
++   * \brief A stretch of elementary stream read at a place of its own, from its first sequence
++   *        header or group of pictures on (what comes before is of a group whose start was not
++   *        read)
++   */
++  void AddStretch(const std::vector<uint8_t>& video)
++  {
++    for (size_t i = 0; i + 4 <= video.size(); ++i)
++    {
++      if (video[i] == 0 && video[i + 1] == 0 && video[i + 2] == 1 &&
++          (video[i + 3] == 0xB3 || video[i + 3] == 0xB8))
++      {
++        AddElementaryStream(video.data() + i, video.size() - i);
++        return;
++      }
++    }
++  }
++
++  bool Enough() const { return m_pictures >= MAX_PICTURES; }
++
++  //! \brief Pictures decoded and compared so far
++  size_t Pictures() const { return m_pictures; }
++
++  //! \brief The rate of the coded frames that the stream says (its sequence header); false
++  //!        before a picture was decoded
++  bool CodedRate(int& rate, int& scale) const
++  {
++    if (!m_open || m_ctx->framerate.num <= 0 || m_ctx->framerate.den <= 0)
++      return false;
++    rate = m_ctx->framerate.num;
++    scale = m_ctx->framerate.den;
++    return true;
++  }
++
++  //! \brief Decodes what is left in the decoder, and tells what the runs of pictures say
++  Cadence Finish()
++  {
++    if (m_open && !m_flushed)
++    {
++      m_flushed = true;
++      if (!Enough())
++        Send(nullptr);
++    }
++    EndRun();
++    Cadence found = Cadence::UNKNOWN;
++    for (const Cadence c : m_runs)
++    {
++      if (c == Cadence::VIDEO)
++        return Cadence::VIDEO;
++      if (c == Cadence::UNKNOWN)
++        continue;
++      if (found != Cadence::UNKNOWN && found != c)
++        return Cadence::UNKNOWN;
++      found = c;
++    }
++    return found;
++  }
++
++  //! \brief What the longest run counted (for the log)
++  const Evidence& GetEvidence() const { return m_longest; }
++
++private:
++  void Send(const AVPacket* packet)
++  {
++    if (avcodec_send_packet(m_ctx, packet) < 0 && packet)
++      return;
++    while (!Enough() && avcodec_receive_frame(m_ctx, m_frame) == 0)
++    {
++      Picture(*m_frame);
++      av_frame_unref(m_frame);
++    }
++  }
++
++  void Picture(const AVFrame& frame)
++  {
++    const bool whole = frame.data[0] && frame.width >= 16 && frame.height >= 16 &&
++                       frame.decode_error_flags == 0 && !(frame.flags & AV_FRAME_FLAG_CORRUPT);
++    if (!whole || frame.width != m_width || frame.height != m_height)
++    {
++      EndRun();
++      m_have = false;
++      if (!whole)
++        return;
++    }
++    const Plane now{frame.data[0], frame.linesize[0], frame.width, frame.height};
++    const bool interlaced = (frame.flags & AV_FRAME_FLAG_INTERLACED) != 0;
++    const bool topFirst = !interlaced || (frame.flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0;
++    if (m_have)
++    {
++      const Plane before{m_before.data(), frame.width, frame.width, frame.height};
++      m_run.Add(LabelOf(Measure(before, now, topFirst), interlaced));
++      ++m_pictures;
++    }
++    m_width = frame.width;
++    m_height = frame.height;
++    m_before.resize(static_cast<size_t>(frame.width) * frame.height);
++    for (int y = 0; y < frame.height; ++y)
++      std::copy(frame.data[0] + static_cast<ptrdiff_t>(y) * frame.linesize[0],
++                frame.data[0] + static_cast<ptrdiff_t>(y) * frame.linesize[0] + frame.width,
++                m_before.data() + static_cast<size_t>(y) * frame.width);
++    m_have = true;
++  }
++
++  void EndRun()
++  {
++    const Evidence& e = m_run.GetEvidence();
++    if (e.pictures > 0)
++    {
++      m_runs.push_back(m_run.Verdict());
++      if (e.pictures > m_longest.pictures)
++        m_longest = e;
++    }
++    m_run = CRunClassifier();
++  }
++
++  AVCodecContext* m_ctx = nullptr;
++  AVCodecParserContext* m_parser = nullptr;
++  AVPacket* m_packet = nullptr;
++  AVFrame* m_frame = nullptr;
++  bool m_open = false;
++  bool m_flushed = false;
++  std::vector<uint8_t> m_before;
++  int m_width = 0;
++  int m_height = 0;
++  bool m_have = false;
++  size_t m_pictures = 0;
++  CRunClassifier m_run;
++  std::vector<Cadence> m_runs;
++  Evidence m_longest;
++};
++} // namespace KODI::FIELDCADENCE
+diff --git a/xbmc/cores/VideoPlayer/FieldCadence.h b/xbmc/cores/VideoPlayer/FieldCadence.h
+new file mode 100644
+index 0000000..74a64ca
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/FieldCadence.h
+@@ -0,0 +1,663 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
++/*!
++ * \file FieldCadence.h
++ * \brief (Hades) Tells, from decoded pictures, whether interlaced video is a film whose fields can
++ *        be put back together
++ *
++ * A film is shot at 24 (or 25) pictures a second. On a DVD, and on television, it is often stored
++ * as interlaced video: each picture of the film is split into its two fields (the even lines and
++ * the odd lines), and the fields are sent one after the other at 59.94 or 50 a second:
++ * - 3:2 pulldown ("hard telecine", NTSC): the pictures of the film give 3 and 2 fields in turn, so
++ *   four pictures of the film fill five coded frames; two of the ten fields repeat a field of the
++ *   frame before;
++ * - 2:2 (PAL, and NTSC video at 30 pictures a second): each picture of the film gives two fields;
++ *   the frame that is coded holds the two fields of one picture of the film (or, one field off,
++ *   the second field of one and the first field of the next);
++ * - a film at 25 in progressive frames at 29.97 ("25 in 30"): one frame in six repeats the one
++ *   before it.
++ * Video that is really interlaced has every field from another instant: there is nothing to put
++ * back together, and it is deinterlaced.
++ *
++ * Nothing here depends on Kodi or on a library: it takes the luma of decoded pictures, so that
++ * the same file is tested outside of Kodi against FFmpeg's decoder and filters.
++ *
++ * - Measure() compares a picture with the one before it: how much each field of it changed (the
++ *   top field of the two pictures, and the bottom one), and how much the picture combs as it is coded and with its
++ *   first field woven with the second field of the picture before (the two fields that are next
++ *   to each other in time).
++ * - LabelOf() says what that means for the picture: which weave of fields is a whole picture,
++ *   and which of its fields repeat.
++ * - CRunClassifier takes the labels of a run of pictures that follow each other and tells the
++ *   cadence: a field that repeats at the same place of every cycle of five pictures, and only
++ *   there, is 3:2 pulldown; a frame that repeats at the same place of every cycle of six, and only
++ *   there, is a film at 25 in 30; pictures whose own fields weave without combing, and those of the
++ *   picture next to them do not, are 2:2; pictures that comb whichever way their fields are woven
++ *   are video. Anything less clear tells nothing (UNKNOWN), and a picture that does not move tells
++ *   nothing either.
++ * - Decide() takes the verdicts of the places of a stream that were read and tells what the
++ *   stream is: a film only where every place that told says the same film (the start of the
++ *   stream may be video, as an intro or a logo often is), never where one says video.
++ */
++
++namespace KODI::FIELDCADENCE
++{
++//! \brief 8-bit samples of a plane (the luma of a decoded picture)
++struct Plane
++{
++  const uint8_t* data = nullptr;
++  ptrdiff_t stride = 0;
++  int width = 0;
++  int height = 0;
++};
++
++//! \brief What a picture says against the one before it (Measure())
++struct Measures
++{
++  uint32_t samples = 0; //!< samples looked at in each of the two weaves
++  uint32_t combOwn = 0; //!< ... that comb, in the picture as it is coded
++  uint32_t combCross = 0; //!< ... in its first field woven with the second field of the one before
++  uint32_t fieldSamples = 0; //!< samples looked at in each field
++  uint64_t diffTop = 0; //!< sum of the absolute differences of the top fields of the two
++  uint64_t diffBottom = 0; //!< ... of their bottom fields
++};
++
++//! \brief How much a sample has to stand out of the lines above and below it, on the same side of
++//!        both, for the line to comb (8-bit levels): above the noise of an MPEG-2 coded picture
++inline constexpr int COMB_THRESHOLD = 12;
++
++/*!
++ * \brief Compares a picture with the one before it
++ *
++ * The columns are sampled (at most 240 of them, so that the cost is the same for every size), the
++ * lines are all looked at (a comb is in the lines). The first field is the top one when \p topFirst.
++ * A line of one field combs at a sample where the sample is more than COMB_THRESHOLD above both the
++ * lines next to it, of the other field, or below both: what a picture made of two instants shows
++ * where something moves. Fine detail of a picture that is whole combs the same in both weaves.
++ */
++inline Measures Measure(const Plane& before, const Plane& now, bool topFirst)
++{
++  Measures m;
++  const int width = std::min(before.width, now.width);
++  const int height = std::min(before.height, now.height) & ~1;
++  if (width < 16 || height < 16 || !before.data || !now.data)
++    return m;
++  const int step = std::max(1, width / 240);
++  // the first field's lines are the even ones when it is the top field
++  const int firstParity = topFirst ? 0 : 1;
++
++  // a line of a weave: the first field from `first`, the second from `second`
++  const auto line = [firstParity](const Plane& first, const Plane& second, int y)
++  {
++    const Plane& p = (y & 1) == firstParity ? first : second;
++    return p.data + static_cast<ptrdiff_t>(y) * p.stride;
++  };
++  const auto combs = [](int a, int b, int c)
++  {
++    const int d1 = b - a;
++    const int d2 = b - c;
++    return (d1 > COMB_THRESHOLD && d2 > COMB_THRESHOLD) ||
++           (d1 < -COMB_THRESHOLD && d2 < -COMB_THRESHOLD);
++  };
++
++  for (int y = 1; y + 1 < height; ++y)
++  {
++    const uint8_t* ownA = line(now, now, y - 1);
++    const uint8_t* ownB = line(now, now, y);
++    const uint8_t* ownC = line(now, now, y + 1);
++    const uint8_t* crossA = line(now, before, y - 1);
++    const uint8_t* crossB = line(now, before, y);
++    const uint8_t* crossC = line(now, before, y + 1);
++    for (int x = 0; x < width; x += step)
++    {
++      m.combOwn += combs(ownA[x], ownB[x], ownC[x]);
++      m.combCross += combs(crossA[x], crossB[x], crossC[x]);
++      ++m.samples;
++    }
++  }
++  for (int y = 0; y < height; ++y)
++  {
++    const uint8_t* a = before.data + static_cast<ptrdiff_t>(y) * before.stride;
++    const uint8_t* b = now.data + static_cast<ptrdiff_t>(y) * now.stride;
++    uint64_t sum = 0;
++    for (int x = 0; x < width; x += step)
++      sum += static_cast<uint64_t>(std::abs(static_cast<int>(a[x]) - static_cast<int>(b[x])));
++    if ((y & 1) == 0)
++    {
++      m.diffTop += sum;
++      m.fieldSamples += static_cast<uint32_t>((width + step - 1) / step);
++    }
++    else
++      m.diffBottom += sum;
++  }
++  return m;
++}
++
++//! \brief Which weave of fields is a whole picture (LabelOf())
++enum class Weave
++{
++  STILL, //!< both weave without combing: nothing moves between the fields, nothing to tell
++  OWN, //!< the picture as it is coded; its first field and the second of the one before comb
++  CROSS, //!< its first field and the second of the one before; the picture as coded combs
++  NEITHER, //!< both comb: the fields are of other instants (video)
++  UNSURE, //!< both comb a little, or not differently enough
++};
++
++/*!
++ * \brief Which fields of a picture are the same as those of the one before (LabelOf())
++ *
++ * By their parity, not by which is first: an encoder may mark the frames of a pulldown top field
++ * first and bottom field first in turn, and the field that repeats is the same lines of the film.
++ */
++enum class Repeat
++{
++  NONE, //!< both fields changed
++  TOP, //!< the top field is the one before's, the bottom changed
++  BOTTOM, //!< the bottom field is the one before's, the top changed
++  BOTH, //!< nothing changed (a frame repeated, or nothing moves)
++};
++
++struct Label
++{
++  Weave weave = Weave::UNSURE;
++  Repeat repeat = Repeat::BOTH;
++  bool interlaced = false; //!< the decoder marked the picture interlaced
++  bool valid = false; //!< there was a picture before it to compare with
++};
++
++//! \brief Mean absolute difference of a field below which it is the same field (8-bit levels,
++//!        x16): the noise of coding a field again in another frame
++inline constexpr uint64_t SAME_FIELD_X16 = 24; // 1.5 levels
++//! \brief ... above which a field moved
++inline constexpr uint64_t MOVED_FIELD_X16 = 40; // 2.5 levels
++//! \brief A field whose difference is under the other field's divided by this, where the other
++//!        moved, is the same field coded again: with film grain and the noise of the coding at the
++//!        rates of a DVD, a repeated field differs by a fifth to a quarter of a field that moved
++inline constexpr uint64_t REPEAT_RATIO = 3;
++//! \brief Combing samples, in thousandths of the samples, under which a weave is whole
++inline constexpr uint32_t WHOLE_PERMILLE = 2;
++//! \brief ... over which a weave combs for sure
++inline constexpr uint32_t COMBED_PERMILLE = 6;
++
++inline Label LabelOf(const Measures& m, bool interlaced)
++{
++  Label label;
++  label.interlaced = interlaced;
++  if (m.samples == 0 || m.fieldSamples == 0)
++    return label;
++  label.valid = true;
++
++  const uint64_t top = m.diffTop * 16 / m.fieldSamples;
++  const uint64_t bottom = m.diffBottom * 16 / m.fieldSamples;
++  const bool topMoved = top >= MOVED_FIELD_X16;
++  const bool bottomMoved = bottom >= MOVED_FIELD_X16;
++  if (bottomMoved && (top <= SAME_FIELD_X16 || top * REPEAT_RATIO < bottom))
++    label.repeat = Repeat::TOP;
++  else if (topMoved && (bottom <= SAME_FIELD_X16 || bottom * REPEAT_RATIO < top))
++    label.repeat = Repeat::BOTTOM;
++  else if (!topMoved && !bottomMoved)
++    label.repeat = Repeat::BOTH;
++  else
++    label.repeat = Repeat::NONE;
++
++  const uint64_t own = static_cast<uint64_t>(m.combOwn) * 1000;
++  const uint64_t cross = static_cast<uint64_t>(m.combCross) * 1000;
++  const uint64_t whole = static_cast<uint64_t>(m.samples) * WHOLE_PERMILLE;
++  const uint64_t combed = static_cast<uint64_t>(m.samples) * COMBED_PERMILLE;
++  // (a picture that repeats the one before, or where nothing moves, weaves the same both ways:
++  // nothing to tell, even where its grain combs a little)
++  if ((own < whole && cross < whole) || label.repeat == Repeat::BOTH)
++    label.weave = Weave::STILL;
++  else if (cross >= combed && own * 4 < cross)
++    label.weave = Weave::OWN;
++  else if (own >= combed && cross * 4 < own)
++    label.weave = Weave::CROSS;
++  else if (own >= combed && cross >= combed && own * 2 > cross && cross * 2 > own)
++    label.weave = Weave::NEITHER;
++  else
++    label.weave = Weave::UNSURE;
++  return label;
++}
++
++//! \brief What a run of pictures, or a stream, is
++enum class Cadence
++{
++  UNKNOWN, //!< not enough that moves, or not clear: tells nothing
++  VIDEO, //!< interlaced video whose fields are of other instants
++  PROGRESSIVE, //!< whole pictures, not marked interlaced, with no repeats: nothing to do
++  FIELDS_22, //!< whole pictures in the fields of each frame, or one field off (2:2)
++  PULLDOWN_32, //!< a film in 3:2 pulldown
++  REPEAT_6, //!< a film at 25 in progressive frames at 29.97, one frame in six repeated
++};
++
++inline const char* NameOf(Cadence cadence)
++{
++  switch (cadence)
++  {
++    case Cadence::VIDEO:
++      return "video";
++    case Cadence::PROGRESSIVE:
++      return "progressive";
++    case Cadence::FIELDS_22:
++      return "film in 2:2 fields";
++    case Cadence::PULLDOWN_32:
++      return "film in 3:2 pulldown";
++    case Cadence::REPEAT_6:
++      return "film at 25 with one frame in six repeated";
++    default:
++      return "not told";
++  }
++}
++
++//! \brief What the player information shows as the deinterlacing method of a film of a cadence
++inline const char* MethodOf(Cadence cadence)
++{
++  switch (cadence)
++  {
++    case Cadence::PULLDOWN_32:
++      return "film 3:2 (fieldmatch, decimate)";
++    case Cadence::FIELDS_22:
++      return "film 2:2 (fieldmatch)";
++    case Cadence::REPEAT_6:
++      return "film 25 in 30 (decimate)";
++    default:
++      return "none";
++  }
++}
++
++//! \brief What the pictures of a run counted (CRunClassifier::GetEvidence(), for the log)
++struct Evidence
++{
++  size_t pictures = 0; //!< labels added
++  size_t moving = 0; //!< ... of pictures that moved
++  size_t own = 0, cross = 0, neither = 0, unsure = 0;
++  size_t singleRepeats = 0; //!< pictures of which one field repeated
++  int topPhase = -1; //!< the place in the cycle of five of the repeated top fields
++  int bottomPhase = -1; //!< ... of the bottom fields
++  int duplicatePhase = -1; //!< the place in the cycle of six of the repeated frames
++  double topRate = 0.0, bottomRate = 0.0, duplicateRate = 0.0; //!< ... how often there
++  double otherTopRate = 0.0, otherBottomRate = 0.0, otherDuplicateRate = 0.0; //!< elsewhere
++  size_t interlaced = 0; //!< pictures the decoder marked interlaced
++};
++
++/*!
++ * \brief Tells the cadence of a run of pictures that follow each other (no picture left out)
++ *
++ * Pictures are added in the order they are shown. The place of a picture in the cycle of five
++ * (and of six) is counted from the first: a run that has a gap is two runs.
++ */
++class CRunClassifier
++{
++public:
++  //! cycles of five (or six) whose repeat says something, for a cadence of repeats
++  static constexpr size_t MIN_CYCLES = 4;
++  //! how often the repeat has to be at its place
++  static constexpr double AT_PLACE = 0.9;
++  //! how often it may be at another place (a film that holds a picture, as a cartoon does,
++  //! repeats fields elsewhere too, never always)
++  static constexpr double ELSEWHERE = 0.7;
++  //! pictures whose weave told, for a cadence of weaves
++  static constexpr size_t MIN_WEAVES = 12;
++  //! share of the pictures whose weave told that have to agree
++  static constexpr double AGREE = 0.9;
++  //! share of them that comb both ways, over which the run is video
++  static constexpr double VIDEO_SHARE = 0.3;
++  //! pictures that comb both ways over which the run holds video, whatever else it holds (a cut
++  //! in a film combs both ways in one or two pictures, a fifth of a second of video in six)
++  static constexpr size_t VIDEO_PICTURES = 6;
++
++  void Add(const Label& label)
++  {
++    if (!label.valid)
++      return;
++    const size_t index = m_evidence.pictures++;
++    m_evidence.interlaced += label.interlaced;
++    const bool moving = label.repeat != Repeat::BOTH || label.weave == Weave::OWN ||
++                        label.weave == Weave::CROSS || label.weave == Weave::NEITHER;
++    m_evidence.moving += moving;
++    switch (label.weave)
++    {
++      case Weave::OWN:
++        ++m_evidence.own;
++        break;
++      case Weave::CROSS:
++        ++m_evidence.cross;
++        break;
++      case Weave::NEITHER:
++        ++m_evidence.neither;
++        break;
++      case Weave::UNSURE:
++        ++m_evidence.unsure;
++        break;
++      default:
++        break;
++    }
++    // the repeats of a field, at their place in the cycle of five: a picture whose fields both
++    // stay tells nothing about a field (a held picture of a film, a still)
++    const size_t five = index % 5;
++    if (label.repeat != Repeat::BOTH)
++    {
++      ++m_fieldTold[five];
++      m_topAt[five] += label.repeat == Repeat::TOP;
++      m_bottomAt[five] += label.repeat == Repeat::BOTTOM;
++      m_evidence.singleRepeats += label.repeat == Repeat::TOP || label.repeat == Repeat::BOTTOM;
++    }
++    // the repeated frames, at their place in the cycle of six, in the cycles where the others move
++    m_six[index % 6] = label.repeat;
++    if (index % 6 == 5)
++    {
++      size_t moved = 0;
++      for (const Repeat r : m_six)
++        moved += r == Repeat::NONE;
++      if (moved >= 3)
++      {
++        ++m_sixCycles;
++        for (size_t i = 0; i < 6; ++i)
++          m_duplicateAt[i] += m_six[i] == Repeat::BOTH;
++      }
++    }
++  }
++
++  const Evidence& GetEvidence()
++  {
++    Classify();
++    return m_evidence;
++  }
++
++  Cadence Verdict()
++  {
++    Classify();
++    return m_verdict;
++  }
++
++private:
++  // the place of the cycle where a repeat is most often, how often, and how often at most elsewhere
++  template<size_t N>
++  static void Place(const std::array<size_t, N>& at,
++                    const std::array<size_t, N>& told,
++                    size_t minTold,
++                    int& place,
++                    double& rate,
++                    double& other)
++  {
++    place = -1;
++    rate = 0.0;
++    other = 0.0;
++    std::array<double, N> rates{};
++    for (size_t i = 0; i < N; ++i)
++    {
++      rates[i] = told[i] >= minTold ? static_cast<double>(at[i]) / told[i] : 0.0;
++      if (told[i] >= minTold && (place < 0 || rates[i] > rate))
++      {
++        place = static_cast<int>(i);
++        rate = rates[i];
++      }
++    }
++    for (size_t i = 0; i < N; ++i)
++      if (static_cast<int>(i) != place)
++        other = std::max(other, rates[i]);
++  }
++
++  void Classify()
++  {
++    Evidence& e = m_evidence;
++    Place(m_topAt, m_fieldTold, MIN_CYCLES, e.topPhase, e.topRate, e.otherTopRate);
++    Place(m_bottomAt, m_fieldTold, MIN_CYCLES, e.bottomPhase, e.bottomRate, e.otherBottomRate);
++    std::array<size_t, 6> cycles;
++    cycles.fill(m_sixCycles);
++    Place(m_duplicateAt, cycles, MIN_CYCLES, e.duplicatePhase, e.duplicateRate,
++          e.otherDuplicateRate);
++
++    const size_t weaves = e.own + e.cross + e.neither;
++    const bool video = (weaves >= MIN_WEAVES && e.neither >= VIDEO_SHARE * weaves) ||
++                       e.neither >= VIDEO_PICTURES;
++
++    // 3:2: a top field repeats at one place of the cycle of five and a bottom field at another
++    // (two or three pictures from it; one, where the film holds its pictures for two, as a
++    // cartoon does), in nearly every cycle, and nowhere else always. Video repeats no field.
++    const bool pulldown = e.topPhase >= 0 && e.bottomPhase >= 0 && e.topPhase != e.bottomPhase &&
++                          e.topRate >= AT_PLACE && e.bottomRate >= AT_PLACE &&
++                          e.otherTopRate <= ELSEWHERE && e.otherBottomRate <= ELSEWHERE;
++    // 25 in 30: a frame repeats at one place of the cycle of six, nearly always, rarely elsewhere;
++    // frames that are whole, not marked interlaced, with no fields repeated alone
++    const bool repeat6 = e.duplicatePhase >= 0 && e.duplicateRate >= AT_PLACE &&
++                         e.otherDuplicateRate <= 1.0 - AT_PLACE && e.interlaced == 0 &&
++                         e.singleRepeats * 20 <= e.moving && e.cross + e.neither <= weaves / 20;
++    // 2:2: the fields of each frame (or each one field off) weave whole, those next to them
++    // comb, and no field repeats alone
++    const bool whole22 =
++        weaves >= MIN_WEAVES && e.singleRepeats * 20 <= e.moving && e.neither * 20 <= weaves &&
++        (e.own >= AGREE * weaves || e.cross >= AGREE * weaves);
++
++    if (pulldown && !video)
++      m_verdict = Cadence::PULLDOWN_32;
++    else if (repeat6 && !video)
++      m_verdict = Cadence::REPEAT_6;
++    else if (whole22 && e.interlaced * 2 > e.pictures)
++      m_verdict = Cadence::FIELDS_22;
++    else if (whole22 && e.interlaced == 0 && e.own >= AGREE * weaves)
++      m_verdict = Cadence::PROGRESSIVE;
++    else if (video)
++      m_verdict = Cadence::VIDEO;
++    else
++      m_verdict = Cadence::UNKNOWN;
++  }
++
++  Evidence m_evidence;
++  Cadence m_verdict = Cadence::UNKNOWN;
++  std::array<size_t, 5> m_fieldTold{};
++  std::array<size_t, 5> m_topAt{};
++  std::array<size_t, 5> m_bottomAt{};
++  std::array<Repeat, 6> m_six{};
++  size_t m_sixCycles = 0;
++  std::array<size_t, 6> m_duplicateAt{};
++};
++
++/*!
++ * \brief (playback) Whether the cadence that a stream was told to be holds in the pictures that the
++ *        decoder gives, window after window, with hysteresis: for the log
++ *
++ * The graph of the film (GraphOf()) already falls back picture by picture: a frame whose fields no
++ * weave makes whole is deinterlaced. The display mode is the film's for the whole stream and does
++ * not change. What this tells is where the film's cadence stops (video in the title, a stretch
++ * edited as video) and where it comes back: a window of WINDOW pictures that is video or another
++ * cadence counts against it, one that is the cadence for it, one that tells nothing (stills, a
++ * cut) neither; it takes TO_CHANGE windows in a row to say that it broke, or that it came back.
++ */
++class CCadenceWatch
++{
++public:
++  static constexpr size_t WINDOW = 60; //!< pictures of a window (2 s at 29.97)
++  static constexpr int TO_CHANGE = 2; //!< windows in a row that say so, to change
++
++  explicit CCadenceWatch(Cadence cadence) : m_cadence(cadence) {}
++
++  //! \brief +1 where the cadence came back with this picture, -1 where it broke, 0 otherwise
++  int Add(const Label& label)
++  {
++    if (!label.valid)
++      return 0;
++    m_run.Add(label);
++    if (m_run.GetEvidence().pictures < WINDOW)
++      return 0;
++    const Cadence verdict = m_run.Verdict();
++    m_run = CRunClassifier();
++    ++m_windows;
++    const bool shows = verdict == m_cadence ||
++                       (m_cadence == Cadence::FIELDS_22 && verdict == Cadence::PROGRESSIVE);
++    const bool against = !shows && verdict != Cadence::UNKNOWN;
++    m_against += against;
++    if (shows == m_holding || (!shows && !against))
++    {
++      m_streak = 0;
++      return 0;
++    }
++    if (++m_streak < TO_CHANGE)
++      return 0;
++    m_streak = 0;
++    m_holding = shows;
++    return shows ? 1 : -1;
++  }
++
++  bool Holding() const { return m_holding; }
++  size_t Windows() const { return m_windows; }
++  size_t WindowsAgainst() const { return m_against; }
++
++private:
++  Cadence m_cadence;
++  CRunClassifier m_run;
++  bool m_holding = true;
++  int m_streak = 0;
++  size_t m_windows = 0;
++  size_t m_against = 0;
++};
++
++/*!
++ * \brief What a stream is, from what the places of it that were read say
++ *
++ * \p start is the start of the stream, \p points places further on. A film only where every place
++ * that told (the start may also be video: an intro, a logo) says the same film, at least one of
++ * them a point further on when there are any, and none says video or another film; 2:2 also
++ * where the others are progressive (the same pictures, marked otherwise). Anything else is
++ * played as before (UNKNOWN).
++ */
++inline Cadence Decide(Cadence start, const std::vector<Cadence>& points)
++{
++  const auto film = [](Cadence c)
++  {
++    return c == Cadence::PULLDOWN_32 || c == Cadence::FIELDS_22 || c == Cadence::REPEAT_6;
++  };
++  Cadence found = Cadence::UNKNOWN;
++  size_t told = 0;
++  for (const Cadence c : points)
++  {
++    if (c == Cadence::UNKNOWN)
++      continue;
++    if (c == Cadence::VIDEO)
++      return Cadence::UNKNOWN;
++    if (c == Cadence::PROGRESSIVE)
++    {
++      if (found != Cadence::UNKNOWN && found != Cadence::FIELDS_22 && found != Cadence::PROGRESSIVE)
++        return Cadence::UNKNOWN;
++      if (found == Cadence::UNKNOWN)
++        found = c;
++      continue;
++    }
++    if (found == Cadence::PROGRESSIVE && c == Cadence::FIELDS_22)
++      found = c;
++    else if (found != Cadence::UNKNOWN && found != c)
++      return Cadence::UNKNOWN;
++    else
++      found = c;
++    ++told;
++  }
++  if (!points.empty() && told == 0)
++    return Cadence::UNKNOWN; // (no point further on said a film)
++  if (points.empty())
++    return film(start) ? start : Cadence::UNKNOWN;
++  if (start == Cadence::UNKNOWN || start == Cadence::VIDEO || start == found ||
++      (found == Cadence::FIELDS_22 && start == Cadence::PROGRESSIVE))
++    return found;
++  return Cadence::UNKNOWN;
++}
++
++/*!
++ * \brief The rate of the film that a stream of this cadence carries, from the rate of its coded
++ *        frames: 4/5 of it in 3:2 pulldown, 5/6 of it for 25 in 30, the same in 2:2; false for a
++ *        rate that the cadence is not of (3:2 and 25 in 30 only at 30000/1001 and 30, 2:2 at 25
++ *        and at those)
++ */
++inline bool FilmRateOf(Cadence cadence, int codedRate, int codedScale, int& rate, int& scale)
++{
++  const bool ntsc = codedRate == 30000 && codedScale == 1001;
++  const bool thirty = codedRate == 30 && codedScale == 1;
++  const bool pal = codedRate == 25 && codedScale == 1;
++  switch (cadence)
++  {
++    case Cadence::PULLDOWN_32:
++      if (!ntsc && !thirty)
++        return false;
++      rate = ntsc ? 24000 : 24;
++      scale = codedScale;
++      return true;
++    case Cadence::REPEAT_6:
++      if (!ntsc && !thirty)
++        return false;
++      rate = ntsc ? 25000 : 25;
++      scale = codedScale;
++      return true;
++    case Cadence::FIELDS_22:
++      if (!ntsc && !thirty && !pal)
++        return false;
++      rate = codedRate;
++      scale = codedScale;
++      return true;
++    default:
++      return false;
++  }
++}
++
++/*!
++ * \brief The filters of FFmpeg that put a film of this cadence back together, for the graph of the
++ *        decoder (CDVDVideoCodecFFmpeg::SetFilters()); empty for any other
++ *
++ * - 3:2 and 2:2: fieldmatch weaves each frame with the fields that make a whole picture (its own,
++ *   or one of them with the field next to it in time), marks a frame that no weave makes whole
++ *   (a cut, video) interlaced, and bwdif deinterlaces that frame only, into one picture; in 3:2,
++ *   decimate then leaves out the picture of each cycle of five that repeats the one before it.
++ * - 25 in 30: decimate leaves out the frame of each cycle of six that repeats the one before it.
++ * A picture whose fields are whole goes out with the bytes of those fields: nothing is filtered.
++ *
++ * decimate leaves out, in each cycle, the picture that differs least from the one before it,
++ * unless no picture of the cycle differs by less than dupthresh (1.1 % by default) and one differs
++ * by more than scthresh (15 %, a scene change): then it leaves out the scene change. The first
++ * picture after the graph is set up (the start, every seek) has none before it and counts as a
++ * scene change, and a field that pulldown repeats is coded twice at the rates of a DVD, its two
++ * copies differing by some 2 % (measured on the corpus, against 25 % and more between pictures
++ * that move): in two clips of four the first picture of the film was left out and a repeat shown.
++ * With dupthresh=10 and scthresh=100 the picture left out is always the one that differs least,
++ * which in a film is the repeat.
++ */
++inline std::string GraphOf(Cadence cadence)
++{
++  static constexpr const char* MATCH =
++      "fieldmatch=order=auto:combmatch=full,bwdif=mode=send_frame:parity=auto:deint=interlaced";
++  switch (cadence)
++  {
++    case Cadence::PULLDOWN_32:
++      return std::string(MATCH) + ",decimate=dupthresh=10:scthresh=100";
++    case Cadence::FIELDS_22:
++      return MATCH;
++    case Cadence::REPEAT_6:
++      return "decimate=cycle=6:dupthresh=10:scthresh=100";
++    default:
++      return {};
++  }
++}
++
++//! \brief What the buffer source of a graph of a cadence needs more than Kodi gives it: the rate
++//!        of the coded frames (decimate takes the rate of its output from it); empty where the
++//!        decoder does not know it
++inline std::string FrameRateArgument(int num, int den)
++{
++  if (num <= 0 || den <= 0)
++    return {};
++  return ":frame_rate=" + std::to_string(num) + "/" + std::to_string(den);
++}
++} // namespace KODI::FIELDCADENCE
+-- 
+2.53.0
+

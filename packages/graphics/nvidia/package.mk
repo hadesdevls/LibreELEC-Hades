@@ -2,8 +2,8 @@
 # Copyright (C) 2021-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="nvidia"
-PKG_VERSION="615.78.08"
-PKG_SHA256="e9d5167f4ca67f58b2b3447584b1e4273218d5088aba210d3aef2a407e522892"
+PKG_VERSION="620.70.06"
+PKG_SHA256="20894d898b83622e385dcfb934dbd656471f09e38822770cf4c9fea4112990f3"
 PKG_ARCH="x86_64"
 PKG_LICENSE="LicenseRef-nonfree"
 PKG_SITE="https://www.nvidia.com/en-us/drivers/unix/"
@@ -161,4 +161,13 @@ makeinstall_target() {
   nvidia_stack_redirect ${INSTALL} ${PKG_DIR}/stack-names
     cp ${PKG_DIR}/scripts/stack-select ${PKG_DIR}/scripts/stack-links ${INSTALL}/usr/lib/nvidia
     chmod 0755 ${INSTALL}/usr/lib/nvidia/stack-select ${INSTALL}/usr/lib/nvidia/stack-links
+
+  # Hades: Kodi waits, 20 s at most, for the DRM device that nvidia-drm makes for each NVIDIA card
+  # (scripts/drm-wait, nvidia-drm-wait.service; for the 580 driver too)
+    cp ${PKG_DIR}/scripts/drm-wait ${INSTALL}/usr/lib/nvidia
+    chmod 0755 ${INSTALL}/usr/lib/nvidia/drm-wait
+}
+
+post_install() {
+  enable_service nvidia-drm-wait.service
 }

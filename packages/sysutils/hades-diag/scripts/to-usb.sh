@@ -10,6 +10,12 @@
 #   to-usb.sh auto <device>      run once a drive is mounted (hades-diag-usb@.service): a drive with a folder
 #                                named hades-diag at its top gets the copy in there, with nothing on the screen,
 #                                and a note there, NOT-COPIED.txt, when it does not
+#   to-usb.sh drives             the drives that a file can be copied to, as list prints them, whether or not the
+#                                diagnostics saved anything
+#   to-usb.sh file <file> <mount point>
+#                                a report that report.sh made (/storage/logfiles/hades-report-*.zip) copied to the top
+#                                of the drive, under its own name (with a number after it where that is taken), the
+#                                same way: written beside its name, read back and compared, and only then named
 # The folder is read into RAM while nothing of the diagnostics writes to the boot partition (their lock), written
 # beside its final name, read back from the drive and compared with the SHA-256 of every file, and only then given
 # its name, with those sums in it (SHA256SUMS.txt). Nothing that is on the drive is written over. Folders that a
@@ -21,8 +27,9 @@
 # drive, was busy for too long; 16 not enough free memory; 2 not a command of this script.
 D=/flash/hades-diag
 # (the filter that a folder went through, as its file .filtered says it: the FILTERED of folder.sh)
-FILTERED=3
+FILTERED=4
 MOUNTS=/proc/mounts
+LOGS=/storage/logfiles
 BLOCK=/sys/class/block
 RUN=/run
 TMP=/tmp
@@ -77,6 +84,10 @@ something() {
 
 list() {
   something || exit 10
+  drives
+}
+
+drives() {
   awk '{ print $2 }' $MOUNTS | sort -u | while read -r e; do
     m=$(unesc "$e")
     eligible "$m" || continue
@@ -162,14 +173,56 @@ copy() {
   exit 0
 }
 
+# A report that report.sh made ($1, in $LOGS) copied to the top of the drive mounted at $2, under its own name. It is
+# written beside that name, read back from the drive and compared with its SHA-256, and only then named; nothing on
+# the drive is written over. Prints "<name on the drive><tab>1<tab><bytes>".
+copy_file() {
+  local src="$1" m="$2" name size sum margin room stem target part n
+  case "$src" in "$LOGS"/hades-report-*.zip) ;; *) exit 2 ;; esac
+  # (its name, which is all that follows logfiles/: no folder in it)
+  name=${src#"$LOGS"/}
+  case "$name" in */*) exit 2 ;; esac
+  [ -f "$src" ] && [ ! -L "$src" ] || exit 10
+  eligible "$m" || exit 11
+  lock "$RUN/hades-to-usb.lock" 300 || exit 15
+  trap finish EXIT
+  trap 'exit 1' INT TERM HUP
+  size=$(($(wc -c < "$src")))
+  sum=$(sha256sum < "$src" | awk '{ print $1 }')
+  [ -n "$sum" ] || exit 16
+  margin=16384
+  boot_partition "$m" && margin=131072
+  room=$((size / 1024 + 64 + margin))
+  [ "$(free_kib "$m")" -gt "$room" ] || exit 12
+  stem=${name%.zip}
+  target="$m/$name"
+  n=1
+  while [ -e "$target" ] || [ -e "$target.part" ]; do n=$((n + 1)); target="$m/$stem-$n.zip"; done
+  part="$target.part"
+  if ! cp "$src" "$part" || ! sync "$part"; then
+    rm -f "$part"; sync -f "$m" 2>/dev/null; exit 14
+  fi
+  # read back from the drive itself, not from what the system still has of it in memory
+  sync; echo 1 > $DROP 2>/dev/null
+  if [ "$(sha256sum < "$part" | awk '{ print $1 }')" != "$sum" ]; then
+    rm -f "$part"; sync -f "$m" 2>/dev/null; exit 13
+  fi
+  if ! mv -n "$part" "$target" || [ -e "$part" ] || ! sync -f "$m"; then
+    rm -f "$part"; exit 14
+  fi
+  printf '%s\t1\t%s\n' "${target#$m/}" "$size"
+  exit 0
+}
+
 # What NOT-COPIED.txt says for an exit status of copy.
 why() {
   case $1 in
-    10) echo "There was nothing to copy: the diagnostics are off on that PC, or have saved nothing yet. Turn them on (tick
-\"Save diagnostics there\" in the installer when you install or update), start the PC, wait five minutes, and plug this
-drive in again.|No había nada que copiar: el diagnóstico está apagado en ese PC, o todavía no ha guardado nada.
-Enciéndelo (marca \"Guardar diagnóstico ahí\" en el instalador al instalar o actualizar), arranca el PC, espera cinco
-minutos y vuelve a conectar esta unidad." ;;
+    10) echo "There was nothing to copy: the diagnostics are off on that PC, or have saved nothing yet. Turn them on (the
+setting \"Save diagnostics at every start\" of LibreELEC Hades, in System, or the box \"Save diagnostics there\" of the
+installer when you install or update), start the PC, wait five minutes, and plug this drive in again.|No había nada
+que copiar: el diagnóstico está apagado en ese PC, o todavía no ha guardado nada. Enciéndelo (el ajuste \"Guardar el
+diagnóstico en cada arranque\" de LibreELEC Hades, en Sistema, o la casilla \"Guardar diagnóstico ahí\" del instalador
+al instalar o actualizar), arranca el PC, espera cinco minutos y vuelve a conectar esta unidad." ;;
     11) echo "This drive cannot be used for it: it has to be a USB drive that the system mounts with writing allowed.|Esta
 unidad no sirve para eso: tiene que ser una unidad USB que el sistema monte con escritura." ;;
     12) echo "There is not enough room on this drive.|No hay sitio suficiente en esta unidad." ;;
@@ -223,7 +276,9 @@ auto() {
 
 case "$1" in
   list) list ;;
+  drives) drives; exit 0 ;;
   copy) [ -n "$2" ] || exit 2; copy "$2" hades-diag ;;
+  file) [ -n "$2" ] && [ -n "$3" ] || exit 2; copy_file "$2" "$3" ;;
   auto) [ -n "$2" ] || exit 2; auto "$2" ;;
   *) exit 2 ;;
 esac

@@ -41,7 +41,7 @@ PKG_BUILD_FLAGS="-sysroot"
 HADES_BDJ_JDK="/usr/lib/jvm/java-8-openjdk-amd64"
 # the packages of the build host that make the jar, at the versions that were reviewed for it (the
 # supply-chain manifest): an update of the host stops the build until the new one is reviewed
-HADES_BDJ_HOST_DEBS="openjdk-8-jdk-headless=8u504-ga-1ubuntu1~26.04.3 openjdk-8-jre-headless=8u504-ga-1ubuntu1~26.04.3 ant=1.10.15-1build1"
+HADES_BDJ_HOST_DEBS="openjdk-8-jdk-headless=8u512-b09~us1-0ubuntu1~26.04.1 openjdk-8-jre-headless=8u512-b09~us1-0ubuntu1~26.04.1 ant=1.10.15-1build1"
 # the classes of libbluray (1.4: 48) and of ASM (1.5: 49), and nothing newer
 HADES_BDJ_MAX_CLASS=49
 PKG_MESON_OPTS_TARGET="${PKG_MESON_OPTS_TARGET/-Dbdj_jar=disabled/-Dbdj_jar=enabled} \

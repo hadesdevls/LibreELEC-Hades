@@ -1,0 +1,190 @@
+From d8a83161480a534c44a5297afe419bab1fea4178 Mon Sep 17 00:00:00 2001
+From: Jakub Zelenka <jakub.zelenka@openssl.foundation>
+Date: Sun, 4 Oct 2026 16:18:15 +0200
+Subject: [PATCH] statem: fix PSK resumption through SSL_stateless()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A server using SSL_stateless() rejected every resumption attempt with
+"binder does not verify". The PSK extension is processed as part of the
+session lookup, before the general extension parsing, and that is where
+the binder of the second ClientHello is checked. For a stateless server
+the cookie had not been parsed at that point, so the transcript still
+lacked the synthetic message hash of the first ClientHello and the
+HelloRetryRequest that the client included in its binder.
+
+Parse the cookie extension before the session lookup. The cookie parser
+can then no longer compare the group it carries with the one selected
+from the key_share extension, which is parsed later, so instead restore
+the group requested in the HelloRetryRequest and let the key_share
+parsing check that the client sent it, as it does when the server is
+stateful. The session id copy moves up as well since the reconstructed
+HelloRetryRequest needs it.
+
+Assisted-by: Claude:claude-fable-5-1
+Reviewed-by: Matt Caswell <matt@openssl.foundation>
+Reviewed-by: Saša Nedvědický <sashan@openssl.org>
+Merge-date: Mon Nov  9 15:32:43 2026
+Merged-from: https://github.com/openssl/openssl/pull/33095
+(cherry picked from commit b73e7d517e543fadcc6002dd32be22e8a2c6e26b)
+---
+ ssl/statem/extensions_srvr.c | 13 ++++----
+ ssl/statem/statem_srvr.c     | 22 ++++++++++----
+ test/sslapitest.c            | 57 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+), 12 deletions(-)
+
+diff --git a/ssl/statem/extensions_srvr.c b/ssl/statem/extensions_srvr.c
+index 8b0ed79..cb316f4 100644
+--- a/ssl/statem/extensions_srvr.c
++++ b/ssl/statem/extensions_srvr.c
+@@ -1108,12 +1108,10 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
+         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
+         return 0;
+     }
+-    if (group_id != s->s3.group_id
+-        || s->s3.tmp.new_cipher
+-            != ssl_get_cipher_by_char(s, ciphdata, 0)) {
++    if (s->s3.tmp.new_cipher != ssl_get_cipher_by_char(s, ciphdata, 0)) {
+         /*
+-         * We chose a different cipher or group id this time around to what is
+-         * in the cookie. Something must have changed.
++         * We chose a different cipher this time around to what is in the
++         * cookie. Something must have changed.
+          */
+         SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_CIPHER);
+         return 0;
+@@ -1202,7 +1200,7 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
+     if (key_share) {
+         if (!WPACKET_put_bytes_u16(&hrrpkt, TLSEXT_TYPE_key_share)
+             || !WPACKET_start_sub_packet_u16(&hrrpkt)
+-            || !WPACKET_put_bytes_u16(&hrrpkt, s->s3.group_id)
++            || !WPACKET_put_bytes_u16(&hrrpkt, group_id)
+             || !WPACKET_close(&hrrpkt)) {
+             WPACKET_cleanup(&hrrpkt);
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+@@ -1232,6 +1230,9 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
+ 
+     /* Act as if this ClientHello came after a HelloRetryRequest */
+     s->hello_retry_request = SSL_HRR_PENDING;
++    /* The key_share parsing then checks the client sent the group we asked for */
++    if (key_share)
++        s->s3.group_id = group_id;
+ 
+     s->ext.cookieok = 1;
+ #endif
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index 2034a0b..9f61852 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -2270,6 +2270,22 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
+         goto err;
+     }
+ 
++    if (SSL_CONNECTION_IS_VERSION13(s)) {
++        memcpy(s->tmp_session_id, s->clienthello->session_id,
++            s->clienthello->session_id_len);
++        s->tmp_session_id_len = s->clienthello->session_id_len;
++
++        /*
++         * A stateless server reconstructs the transcript from the cookie,
++         * which must happen before the PSK binder is verified.
++         */
++        if (!tls_parse_extension(s, TLSEXT_IDX_cookie, SSL_EXT_CLIENT_HELLO,
++                clienthello->pre_proc_exts, NULL, 0)) {
++            /* SSLfatal() already called */
++            goto err;
++        }
++    }
++
+     /*
+      * We don't allow resumption in a backwards compatible ClientHello.
+      * In TLS1.1+, session_id MUST be empty.
+@@ -2308,12 +2324,6 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
+         }
+     }
+ 
+-    if (SSL_CONNECTION_IS_VERSION13(s)) {
+-        memcpy(s->tmp_session_id, s->clienthello->session_id,
+-            s->clienthello->session_id_len);
+-        s->tmp_session_id_len = s->clienthello->session_id_len;
+-    }
+-
+     /*
+      * If it is a hit, check that the cipher is in the list. In TLSv1.3 we check
+      * ciphersuite compatibility with the session as part of resumption.
+diff --git a/test/sslapitest.c b/test/sslapitest.c
+index 115de3e..831a1af 100644
+--- a/test/sslapitest.c
++++ b/test/sslapitest.c
+@@ -9028,6 +9028,62 @@ end:
+     SSL_CTX_free(cctx);
+     return testresult;
+ }
++
++/* Resume a session through SSL_stateless(), which verifies the PSK binder */
++static int test_stateless_psk(void)
++{
++    SSL_CTX *sctx = NULL, *cctx = NULL;
++    SSL *serverssl = NULL, *clientssl = NULL;
++    SSL_SESSION *sess = NULL;
++    int testresult = 0;
++
++    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
++            TLS_client_method(), TLS1_VERSION, 0,
++            &sctx, &cctx, cert, privkey)))
++        goto end;
++
++    /* The arrival of CCS messages can confuse the test */
++    SSL_CTX_clear_options(cctx, SSL_OP_ENABLE_MIDDLEBOX_COMPAT);
++    SSL_CTX_set_stateless_cookie_generate_cb(sctx, generate_stateless_cookie_callback);
++    SSL_CTX_set_stateless_cookie_verify_cb(sctx, verify_stateless_cookie_callback);
++
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
++            NULL, NULL))
++        || !TEST_true(create_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE))
++        || !TEST_ptr(sess = SSL_get1_session(clientssl)))
++        goto end;
++
++    shutdown_ssl_connection(serverssl, clientssl);
++    serverssl = clientssl = NULL;
++
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
++            NULL, NULL))
++        || !TEST_true(SSL_set_session(clientssl, sess))
++        /* Send the first ClientHello */
++        || !TEST_false(create_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_WANT_READ))
++        /* A HelloRetryRequest with a cookie is sent */
++        || !TEST_int_eq(SSL_stateless(serverssl), 0)
++        /* Send the second ClientHello */
++        || !TEST_false(create_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_WANT_READ))
++        /* Its binder covers the first ClientHello and the HelloRetryRequest */
++        || !TEST_int_eq(SSL_stateless(serverssl), 1)
++        || !TEST_true(create_ssl_connection(serverssl, clientssl,
++            SSL_ERROR_NONE))
++        || !TEST_true(SSL_session_reused(clientssl)))
++        goto end;
++
++    testresult = 1;
++end:
++    SSL_SESSION_free(sess);
++    SSL_free(serverssl);
++    SSL_free(clientssl);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++    return testresult;
++}
+ #endif /* OSSL_NO_USABLE_TLS1_3 */
+ #endif /* !defined(OSSL_NO_USABLE_TLS1_3) || !defined(OSSL_NO_USABLE_DTLS1_3) */
+ 
+@@ -18929,6 +18985,7 @@ int setup_tests(void)
+ #endif
+ #ifndef OSSL_NO_USABLE_TLS1_3
+     ADD_TEST(test_stateless);
++    ADD_TEST(test_stateless_psk);
+ #endif
+     ADD_ALL_TESTS(test_export_key_mat, 6);
+ #if !defined(OSSL_NO_USABLE_TLS1_3) || !defined(OSSL_NO_USABLE_DTLS1_3)

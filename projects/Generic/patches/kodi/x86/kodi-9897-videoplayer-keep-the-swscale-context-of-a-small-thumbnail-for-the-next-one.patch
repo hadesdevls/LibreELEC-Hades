@@ -1,0 +1,201 @@
+From 78a96010f34afafa6982cba9b090b2c807991da6 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:51:34 +0000
+Subject: [PATCH] VideoPlayer: keep the swscale context of a small thumbnail
+ for the next one
+
+A thumbnail is converted by a swscale context that maps the colours of the
+picture to BT.709. For a picture whose primaries are not BT.709, a DVD among
+them (Kodi takes untagged SD video for BT.470 system B/G), the context
+generates a 3D LUT when it is set up, and a new context was made for every
+thumbnail: 0.4 s with 32 threads, 1.4 to 2 s on 4 cores and 3.7 s on one,
+for every DVD of a folder, measured on the host with FFmpeg 9.0.2.
+
+The context of a picture up to 1024x576 is now kept for the next thumbnail;
+swscale builds its graph and LUT again only when the next picture differs in
+size, format, colour tags or mastering display. It holds about 7 MB, its LUT
+and the picture twice in RGBA64. One thumbnail uses it at a time, and one
+that finds it in use takes a context of its own, as before. A conversion
+that fails drops it. A larger picture still gets a new context, whose
+intermediate pictures would be too large to keep.
+
+The thumbnails are the same bytes as before: compared on a DVD and on SD,
+1080p and 2K SDR pictures, one at a time and in a sequence that changes the
+format in between. The second DVD thumbnail took 7 ms instead of 1.95 s on
+4 cores. Dropping the colour management for such pictures instead would
+change them: without the conversion of the primaries they are farther from
+an independent reference (PSNR 20.1 dB instead of 21.8, 99th percentile
+dE2000 17.4 instead of 14.4).
+
+The debug line of each conversion says which context was used and how long
+it took. Keeping the context was suggested by Portisch (CoreELEC) and in
+Kodi pull request 30254.
+---
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp | 113 +++++++++++++++++++++++--
+ 1 file changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index 8a448f9..f948239 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -40,9 +40,11 @@
+ #include "filesystem/File.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <string_view>
+ 
+@@ -54,6 +56,7 @@ extern "C" {
+ #include <libavcodec/avcodec.h>
+ #include <libavformat/avformat.h>
+ #include <libavutil/mastering_display_metadata.h>
++#include <libavutil/pixdesc.h>
+ #include <libswscale/swscale.h>
+ }
+ 
+@@ -173,6 +176,95 @@ bool CDVDFileInfo::SeekAndDecodeFirstPicture(CDVDDemux& demuxer,
+ 
+ namespace
+ {
++#if LIBSWSCALE_BUILD >= AV_VERSION_INT(9, 0, 100)
++//! Hades: a swscale context kept from one thumbnail to the next. A context that maps the colours of
++//! a picture (primaries other than BT.709, or HDR to SDR) generates a 3D LUT when it is set up, and
++//! a new context did that for every thumbnail: for a DVD (BT.470 system B/G primaries) about 0.4 s
++//! with 32 threads, 1.4 s on 4 cores and 3.7 s on one. A kept context generates it again only when
++//! the next picture differs in size, format, colour tags or mastering display. One thumbnail uses
++//! it at a time; one that finds it in use takes a context of its own, as before. It is never freed,
++//! so that a thumbnail still converting while Kodi exits cannot lose it.
++struct KeptSwsContext
++{
++  std::mutex inUse;
++  SwsContext* context{nullptr};
++};
++
++//! The kept context when it is free, else a new context for this conversion only
++class CThumbnailSws
++{
++public:
++  explicit CThumbnailSws(KeptSwsContext* kept)
++  {
++    if (kept)
++    {
++      m_lock = std::unique_lock(kept->inUse, std::try_to_lock);
++      if (m_lock.owns_lock())
++      {
++        if (!kept->context)
++          kept->context = sws_alloc_context();
++        m_kept = kept;
++        m_context = kept->context;
++        return;
++      }
++    }
++    m_context = sws_alloc_context();
++  }
++
++  ~CThumbnailSws()
++  {
++    if (!m_kept)
++      sws_free_context(&m_context);
++  }
++
++  CThumbnailSws(const CThumbnailSws&) = delete;
++  CThumbnailSws& operator=(const CThumbnailSws&) = delete;
++
++  SwsContext* Get() const { return m_context; }
++  bool IsKept() const { return m_kept != nullptr; }
++
++  //! After a failure the next thumbnail starts with a new context
++  void Drop()
++  {
++    if (!m_kept)
++      return;
++    sws_free_context(&m_kept->context);
++    m_context = nullptr;
++  }
++
++private:
++  std::unique_lock<std::mutex> m_lock;
++  KeptSwsContext* m_kept{nullptr};
++  SwsContext* m_context{nullptr};
++};
++
++//! The context of a picture up to this size is kept: what it holds, its LUT and the picture in
++//! RGBA64 twice, is a few MB
++constexpr unsigned int KEPT_PICTURE_PIXELS = 1024 * 576;
++
++KeptSwsContext* KeptSmallPictureContext()
++{
++  static auto* const kept = new KeptSwsContext;
++  return kept;
++}
++
++//! The picture to the thumbnail in one swscale context, the kept one if `keep`
++int ConvertInOnePass(const AVFrame* picture, AVFrame* thumbnail, bool keep, bool& kept)
++{
++  CThumbnailSws sws(keep ? KeptSmallPictureContext() : nullptr);
++  kept = sws.IsKept();
++  if (!sws.Get())
++    return AVERROR(ENOMEM);
++
++  sws.Get()->flags = SWS_BILINEAR;
++  sws.Get()->intent = SWS_INTENT_PERCEPTUAL;
++  const int res = sws_scale_frame(sws.Get(), thumbnail, picture);
++  if (res < 0)
++    sws.Drop();
++  return res;
++}
++#endif
++
+ //! Convert a decoded picture to a BGRA texture sized for the thumbnail cache.
+ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CDVDStreamInfo& hint)
+ {
+@@ -198,10 +290,10 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+ 
+ #if LIBSWSCALE_BUILD >= AV_VERSION_INT(9, 0, 100)
+   {
++    const auto start = std::chrono::steady_clock::now();
+     AVFrame* srcFrame = av_frame_alloc();
+     AVFrame* dstFrame = av_frame_alloc();
+-    SwsContext* sws = sws_alloc_context();
+-    if (srcFrame && dstFrame && sws)
++    if (srcFrame && dstFrame)
+     {
+       srcFrame->width = static_cast<int>(picture.iWidth);
+       srcFrame->height = static_cast<int>(picture.iHeight);
+@@ -240,16 +332,23 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+       dstFrame->color_primaries = AVCOL_PRI_BT709;
+       dstFrame->color_trc = AVCOL_TRC_BT709;
+ 
+-      sws->flags = SWS_BILINEAR;
+-      sws->intent = SWS_INTENT_PERCEPTUAL;
+-
+-      const int res = sws_scale_frame(sws, dstFrame, srcFrame);
++      bool kept = false;
++      const int res = ConvertInOnePass(
++          srcFrame, dstFrame, picture.iWidth * picture.iHeight <= KEPT_PICTURE_PIXELS, kept);
+       if (res < 0)
+         CLog::LogF(LOGWARNING, "sws_scale_frame failed ({}), using legacy conversion", res);
+       else
++      {
+         converted = true;
++        const char* transfer = av_color_transfer_name(picture.color_transfer);
++        CLog::LogF(LOGDEBUG, "{}x{} picture ({}) to {}x{}: one pass, {} context, {} ms",
++                   picture.iWidth, picture.iHeight, transfer ? transfer : "unknown", nWidth,
++                   nHeight, kept ? "kept" : "new",
++                   std::chrono::duration_cast<std::chrono::milliseconds>(
++                       std::chrono::steady_clock::now() - start)
++                       .count());
++      }
+     }
+-    sws_free_context(&sws);
+     av_frame_free(&srcFrame);
+     av_frame_free(&dstFrame);
+   }
+-- 
+2.53.0
+

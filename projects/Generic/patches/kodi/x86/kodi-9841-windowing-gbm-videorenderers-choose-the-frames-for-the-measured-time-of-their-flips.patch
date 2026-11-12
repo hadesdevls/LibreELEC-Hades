@@ -1,0 +1,980 @@
+From 9c64c8cfd458d31ce6a59072ae85d935b9667493 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 22:39:43 +0000
+Subject: [PATCH] windowing/gbm, VideoRenderers: choose the frames for the
+ measured time of their flips
+
+In GBM the render manager chooses each frame for Kodi's fallback display
+latency, the buffers plus one: three refresh periods. The ordinary output
+and native Dolby Vision put a frame on the screen two periods after its
+choice (the way that waits one, with a period taken off its latency), so
+the picture leaves this computer a period before its sound, on every
+driver. The logs of seven computers say so: -41.9 ms at 23.976 Hz on an RTX
+4080 Laptop, an RX 550 and Intel Arrow Lake, -43.0 ms on a GTX 1060,
+-17.1 ms at 60 Hz on Intel Raptor Lake. Where a new frame comes every second
+or fifth refresh, Kodi presents each one a refresh sooner still.
+
+For every frame chosen with the render manager's clock sync on, the window
+system now measures its flip against the time its sound plays by that
+latency alone (CMeasuredLatency: per way of presenting and display mode,
+the interquartile mean and range of the last 2048 frames). Once at least 240
+frames say clearly that it is a whole number of periods (the middle half
+within a quarter of a period, the mean within a quarter of a period of a
+whole number, no more than two periods sooner or one later), it is kept for
+that GPU, driver and build, mode and way (the hidden setting
+videoscreen.hadeslatency), and the render manager chooses the frames that
+many periods later:
+- only whole periods: the frames keep their offset from the refreshes, and
+  only the refresh each one starts at moves, never which frames are shown
+  or for how many refreshes;
+- a new measurement is taken from the next video or seek on, never in the
+  middle of what plays;
+- without the clock sync (a refresh rate that is no whole multiple of the
+  frame rate) nothing is measured or corrected;
+- the latency tweak and the audio offset are left out of what is measured,
+  and keep their meaning.
+kodi.log says once a video what is taken and why, and what each video
+measured. <measuredlatency>false</measuredlatency> under <video> in
+advancedsettings.xml leaves Kodi's latency as it is (still measured and
+told).
+
+In a host model of the choice, in every case of those logs and with every
+way of presenting, the picture against its sound went from a period before
+it (two where frames come every second or fifth refresh) to within 2 ms
+with "Sync playback to display", and to within half a period around it
+without it, where the sound is left where it starts.
+
+CorentinB pointed at the fixed estimate of the display latency, and at
+measuring the time to the screen by the fence of the commit, in a pull
+request to CroqueMr's build.
+---
+ system/settings/settings.xml                  |  16 +
+ .../VideoRenderers/RenderManager.cpp          |  40 ++-
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   5 +
+ xbmc/settings/Settings.h                      |   4 +
+ xbmc/windowing/gbm/DVLatency.h                |   4 +
+ xbmc/windowing/gbm/MeasuredLatency.h          | 290 ++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 271 +++++++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  57 +++-
+ 9 files changed, 678 insertions(+), 11 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/MeasuredLatency.h
+
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index c2a5b66..27449c1 100644
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -3463,6 +3463,22 @@
+         </constraints>
+         <control type="edit" format="string" />
+       </setting>
++      <!-- Hades: the measured display latency, kept (see CLatencyMemory) -->
++      <setting id="videoscreen.hadeslatency" type="string">
++        <requirement>
++          <and>
++            <condition>HAVE_GBM</condition>
++            <condition>HAS_GLES</condition>
++          </and>
++        </requirement>
++        <visible>false</visible>
++        <level>1</level>
++        <default></default>
++        <constraints>
++          <allowempty>true</allowempty>
++        </constraints>
++        <control type="edit" format="string" />
++      </setting>
+       </group>
+       <group id="7" label="41104">
+       <setting id="videoscreen.hadesdvnative" type="boolean" label="39830" help="39831">
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index 1a04c99..2fc5eea 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -277,6 +277,13 @@ bool CRenderManager::Configure()
+     m_renderDebug = false;
+     m_clockSync.Reset();
+     m_dvdClock.SetVsyncAdjust(0);
++#ifdef HAVE_DVBRIDGE
++    // Hades: a stream starts: what the window system measured of the display latency before is
++    // taken from its first frame on (CMeasuredLatency)
++    if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++            CServiceBroker::GetWinSystem()))
++      dvWindow->VideoLatencyCommit(true);
++#endif
+     m_overlays.Reset();
+     m_overlays.SetStereoMode(m_picture.stereoMode);
+ 
+@@ -525,7 +532,12 @@ bool CRenderManager::Flush(bool wait, bool saveBuffers)
+       // lets the DV statistics tell seek/stream-change gaps from stalls
+       if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+               CServiceBroker::GetWinSystem()))
++      {
+         dvWindow->DVBridgeFlushed();
++        // (Hades: ... and a seek takes what was measured of the display latency until it, where
++        // the picture changes anyway: CMeasuredLatency)
++        dvWindow->VideoLatencyCommit(false);
++      }
+ #endif
+     }
+   }
+@@ -1387,11 +1399,23 @@ void CRenderManager::PrepareNextRender()
+       1.0 / static_cast<double>(CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS()) *
+       DVD_TIME_BASE;
+ 
++  // Hades: with the clock sync on, the frames are chosen as many whole refresh periods later than
++  // the display latency says as the window system measured them to reach the screen sooner
++  // (CMeasuredLatency): what is seen against what is heard is then what that latency means
++  double measuredMs = 0.0;
++#ifdef HAVE_DVBRIDGE
++  auto* const gbmWindow =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  if (gbmWindow)
++    measuredMs = gbmWindow->MeasuredLatencyMs(m_clockSync.m_enabled);
++#endif
++
+   m_displayLatency = DVD_MSEC_TO_TIME(
+       m_latencyTweak +
+       static_cast<double>(CServiceBroker::GetWinSystem()->GetGfxContext().GetDisplayLatency()) -
+       m_videoDelay -
+-      static_cast<double>(CServiceBroker::GetWinSystem()->GetFrameLatencyAdjustment()));
++      static_cast<double>(CServiceBroker::GetWinSystem()->GetFrameLatencyAdjustment()) -
++      measuredMs);
+ 
+   // While the clock is paused, frameOnScreen does not advance, so adding the display
+   // latency would pick a frame ahead of the one actually shown. That only holds for
+@@ -1472,8 +1496,7 @@ void CRenderManager::PrepareNextRender()
+     const double speed = m_dvdClock.GetClockSpeed();
+     if (isPaused || pts == DVD_NOPTS_VALUE || speed < 0.9 || speed > 1.1)
+       return;
+-    if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
+-            CServiceBroker::GetWinSystem()))
++    if (auto* dvWindow = gbmWindow)
+     {
+       const int64_t dueNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+@@ -1490,7 +1513,16 @@ void CRenderManager::PrepareNextRender()
+       const int64_t soundNs = m_dvdClock.GetAudioSyncError(heard)
+                                   ? clockSoundNs - static_cast<int64_t>(heard / DVD_TIME_BASE * 1e9)
+                                   : 0;
+-      dvWindow->VideoFrameChosen(dueNs, soundNs);
++      // (Hades: ... and, with the clock sync on, when it is played by the display latency alone:
++      // without what the latency tweak, the audio offset and the measured correction move, which
++      // is what CMeasuredLatency measures)
++      const int64_t modelNs =
++          m_clockSync.m_enabled
++              ? clockSoundNs -
++                    static_cast<int64_t>(
++                        (m_latencyTweak - static_cast<double>(m_videoDelay) - measuredMs) * 1e6)
++              : 0;
++      dvWindow->VideoFrameChosen(dueNs, soundNs, modelNs);
+     }
+   };
+ #endif
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index bf17a8a..0cc8f9d 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -204,6 +204,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVEarlyMask = true;
+   m_videoDualModeRestart = true;
+   m_videoHotplugRelink = true;
++  m_videoMeasuredLatency = true;
+   m_videoDVDrawnTiles = true;
+   m_videoDVGuiCache = true;
+   m_videoDVGpuProfile = true;
+@@ -729,6 +730,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvearlymask", m_videoDVEarlyMask);
+     XMLUtils::GetBoolean(pElement, "dualmoderestart", m_videoDualModeRestart);
+     XMLUtils::GetBoolean(pElement, "hotplugrelink", m_videoHotplugRelink);
++    XMLUtils::GetBoolean(pElement, "measuredlatency", m_videoMeasuredLatency);
+     XMLUtils::GetBoolean(pElement, "dvdrawntiles", m_videoDVDrawnTiles);
+     XMLUtils::GetBoolean(pElement, "dvguicache", m_videoDVGuiCache);
+     XMLUtils::GetBoolean(pElement, "dvgpuprofile", m_videoDVGpuProfile);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index d79e8b4..20900bb 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -285,6 +285,11 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! that NVKMS tells it the scrambling again (video/hotplugrelink; HotplugRelink.h). On, the
+     //! default; off to leave the output as it is after such an event, as before
+     bool m_videoHotplugRelink;
++    //! Hades: with the clock sync of the render manager on, the frames are chosen as many whole
++    //! refresh periods later than Kodi's display latency says as the window system measured its
++    //! frames to reach the screen sooner (video/measuredlatency; MeasuredLatency.h). On, the
++    //! default; off for Kodi's display latency as it is (still measured and told in the log)
++    bool m_videoMeasuredLatency;
+     bool m_videoSmoothPercentToTimeSeeking;
+     int m_videoTimeSeekForward;
+     int m_videoTimeSeekBackward;
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index 00d2114..ff5e283 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -506,6 +506,10 @@ public:
+   //! Not shown: which way of drawing a Dolby Vision frame is the faster one, as found with each
+   //! GPU, driver and build (see CDVPathMemory). Emptied, it is found again.
+   static constexpr auto SETTING_VIDEOSCREEN_HADESDVPATH = "videoscreen.hadesdvpath";
++  //! Not shown: how many refresh periods later than Kodi's display latency says the frames are
++  //! chosen, as measured with each GPU, driver and build, display mode and way of presenting (see
++  //! CLatencyMemory). Emptied, it is measured again.
++  static constexpr auto SETTING_VIDEOSCREEN_HADESLATENCY = "videoscreen.hadeslatency";
+   //! Not shown: the boolean that videoscreen.hadesdvstepmode took over, kept for earlier builds
+   //! (on for every mode but "never")
+   static constexpr auto SETTING_VIDEOSCREEN_HADESDVSTEPDOWN = "videoscreen.hadesdvstepdown";
+diff --git a/xbmc/windowing/gbm/DVLatency.h b/xbmc/windowing/gbm/DVLatency.h
+index 4ebc458..8c25933 100644
+--- a/xbmc/windowing/gbm/DVLatency.h
++++ b/xbmc/windowing/gbm/DVLatency.h
+@@ -36,6 +36,10 @@ namespace GBM
+  * is heard is the same with and without native output, and with and without frames ahead. Nothing
+  * changes which frames are shown at which refresh rate (the cadence): only which refresh a frame
+  * starts at, by one, as the way of presenting changes.
++ *
++ * The latency that Kodi takes is itself a period longer than the flip of the ordinary output (three
++ * periods for two): all three ways put the picture a period before its sound. That is measured,
++ * with this adjustment in it, and corrected in whole periods on top of it (MeasuredLatency.h).
+  */
+ inline double DVFrameLatencyAdjustmentMs(bool nativeOutput, bool ahead, double periodMs)
+ {
+diff --git a/xbmc/windowing/gbm/MeasuredLatency.h b/xbmc/windowing/gbm/MeasuredLatency.h
+new file mode 100644
+index 0000000..7d6df8d
+--- /dev/null
++++ b/xbmc/windowing/gbm/MeasuredLatency.h
+@@ -0,0 +1,290 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: how many refresh periods later than Kodi's display latency says the frames are
++ *        to be chosen, measured: the time from the choice of each frame to its flip
++ *
++ * The render manager chooses a frame for the time its sound is played plus the display latency
++ * that Kodi takes. In GBM that is Kodi's fallback, the buffers plus one, three refresh periods
++ * (CGraphicContext::GetDisplayLatency(): the window system gives none), less what
++ * GetFrameLatencyAdjustment() says for the way a frame is presented (DVLatency.h). With the clock
++ * sync of the render manager on (a refresh rate that is a whole multiple of the frame rate), Kodi
++ * moves the sound by the offset of the frames from the refreshes (SetVsyncAdjust()), and what is
++ * seen against what is heard is then the time from the choice of a frame to its flip, less that
++ * latency, and nothing else. Read in the code and measured on every driver (the logs of seven
++ * computers, NVIDIA, amdgpu and i915, from 23.976 to 60 Hz), the ordinary output and native Dolby
++ * Vision put a frame on the screen two periods after its choice, one for the way that waits (whose
++ * latency is a period shorter): a period sooner than Kodi takes. The picture went out a period
++ * before its sound: 41.7 ms at 23.976 Hz, 16.7 ms at 60 Hz.
++ *
++ * Here that time is measured for each frame (Add(): its flip less its choice less the latency that
++ * Kodi takes for its way, in ms) and told in whole refresh periods once it is clear (Judge()):
++ *  - whole periods only: the frames keep the offset from the refreshes that the clock sync found,
++ *    so which frames are shown, and for how many refreshes each (the cadence), stays the same, and
++ *    only the refresh each one starts at moves;
++ *  - only on clear evidence: at least SAMPLES frames; the middle half of them (the interquartile
++ *    range) within a quarter of a period; their mean (the interquartile mean, which leaves out the
++ *    frames that missed their refresh) within a quarter of a period of a whole number of periods,
++ *    so that what is left of an offset of a period is a third of it at most; no more than
++ *    MOST_SOONER periods sooner or MOST_LATER later than Kodi takes.
++ * Otherwise the verdict is no correction, and Kodi's latency stands.
++ * Correcting changes nothing that is measured (a frame is chosen and flipped when it is; only which
++ * frame moves), so the verdict cannot feed on itself.
++ *
++ * This class only counts; a test builds it on the host.
++ */
++class CMeasuredLatency
++{
++public:
++  //! As CPresentLag::Way
++  enum class Way
++  {
++    WAITING, //!< native Dolby Vision, a commit that returns with its flip
++    AHEAD, //!< native Dolby Vision presented a frame ahead
++    ORDINARY, //!< the ordinary output of Kodi
++    COUNT
++  };
++  static constexpr unsigned int SAMPLES = 240; //!< 10 s at 24 Hz
++  static constexpr size_t KEPT = 2048; //!< the last ones, judged
++  static constexpr int MOST_SOONER = 2;
++  static constexpr int MOST_LATER = 1;
++  static constexpr double SPREAD = 0.25; //!< of a period, the interquartile range at most
++  static constexpr double LEFT = 0.25; //!< of a period, from a whole number of periods at most
++
++  struct Verdict
++  {
++    bool clear = false; //!< the evidence is clear: periods is to be taken
++    int periods = 0; //!< how many periods later the frames are to be chosen
++    double meanMs =
++        0.0; //!< the interquartile mean of the frames: their flips against Kodi's latency
++    double spreadMs = 0.0; //!< the interquartile range
++    double periodMs = 0.0;
++    unsigned int frames = 0;
++    const char* why = ""; //!< what the evidence lacks, when it is not clear
++  };
++
++  //! A frame presented that way flipped offsetMs after the latency that Kodi takes for it (negative:
++  //! sooner), at a refresh period of periodMs. Samples of another period start the count again.
++  void Add(Way way, double offsetMs, double periodMs)
++  {
++    if (!(periodMs > 0.0) || !std::isfinite(offsetMs) || std::fabs(offsetMs) > 2000.0)
++      return;
++    auto& w = m_ways[static_cast<size_t>(way)];
++    if (std::fabs(w.periodMs - periodMs) > periodMs * 1e-3)
++    {
++      w = {};
++      w.periodMs = periodMs;
++    }
++    if (w.samples.size() < KEPT)
++      w.samples.push_back(offsetMs);
++    else
++      w.samples[w.next] = offsetMs;
++    w.next = (w.next + 1) % KEPT;
++    w.added++;
++  }
++
++  unsigned int Count(Way way) const
++  {
++    return static_cast<unsigned int>(m_ways[static_cast<size_t>(way)].samples.size());
++  }
++  //! Frames added since Reset(), for the ones kept
++  unsigned long long Added(Way way) const { return m_ways[static_cast<size_t>(way)].added; }
++
++  Verdict Judge(Way way) const
++  {
++    Verdict v;
++    const auto& w = m_ways[static_cast<size_t>(way)];
++    v.periodMs = w.periodMs;
++    v.frames = static_cast<unsigned int>(w.samples.size());
++    if (v.frames < SAMPLES || !(w.periodMs > 0.0))
++    {
++      v.why = "too few frames";
++      return v;
++    }
++    std::vector<double> sorted(w.samples);
++    std::sort(sorted.begin(), sorted.end());
++    const size_t n = sorted.size();
++    const size_t q1 = n / 4;
++    const size_t q3 = n - n / 4; // [q1, q3): the middle half
++    double sum = 0.0;
++    for (size_t i = q1; i < q3; ++i)
++      sum += sorted[i];
++    v.meanMs = sum / static_cast<double>(q3 - q1);
++    v.spreadMs = sorted[q3 - 1] - sorted[q1];
++    const double mean = v.meanMs / w.periodMs;
++    const int periods = static_cast<int>(std::lround(-mean));
++    v.periods = periods;
++    if (v.spreadMs > SPREAD * w.periodMs)
++      v.why = "the flips are spread over more than a quarter of a period";
++    else if (std::fabs(mean + periods) > LEFT)
++      v.why = "the offset is not near a whole number of periods";
++    else if (periods > MOST_SOONER || periods < -MOST_LATER)
++      v.why = "the offset is more periods than a correction takes";
++    else
++      v.clear = true;
++    if (!v.clear)
++      v.periods = 0;
++    return v;
++  }
++
++  void Reset(Way way) { m_ways[static_cast<size_t>(way)] = {}; }
++  void Reset() { m_ways = {}; }
++
++private:
++  struct Samples
++  {
++    std::vector<double> samples;
++    size_t next = 0;
++    unsigned long long added = 0;
++    double periodMs = 0.0;
++  };
++  std::array<Samples, static_cast<size_t>(Way::COUNT)> m_ways{};
++};
++
++/*!
++ * \brief Hades: the corrections of CMeasuredLatency found for each GPU, driver and build, display
++ *        mode and way of presenting, kept between sessions in one text
++ *
++ * "<key>/<width>x<height>@<refresh in mHz>[i]/<way>=<periods>" for each, the one put last first,
++ * ENTRIES at most, a space between them; the key is DVPathKey() of what tells the GPU, its driver
++ * and the build (as CDVPathMemory), in 16 hexadecimal digits; the way is w (the way that waits), a
++ * (a frame ahead) or o (the ordinary output). A new driver or build is a new key: what was found
++ * with the one before is not taken for it.
++ */
++class CLatencyMemory
++{
++public:
++  static constexpr unsigned int ENTRIES = 32;
++
++  //! The name of what is kept for that GPU, mode and way
++  static std::string Name(uint64_t key,
++                          unsigned int width,
++                          unsigned int height,
++                          unsigned int refreshMilliHz,
++                          bool interlaced,
++                          CMeasuredLatency::Way way)
++  {
++    static constexpr char WAYS[] = {'w', 'a', 'o'};
++    const size_t index = static_cast<size_t>(way);
++    char name[80];
++    std::snprintf(name, sizeof(name), "%016llx/%ux%u@%u%s/%c", static_cast<unsigned long long>(key),
++                  width, height, refreshMilliHz, interlaced ? "i" : "",
++                  index < sizeof(WAYS) ? WAYS[index] : 'o');
++    return name;
++  }
++
++  //! The text with that name set to periods, put first in place of what it had for it
++  static std::string Put(const std::string& all, const std::string& name, int periods)
++  {
++    std::string text = name + '=' + std::to_string(periods);
++    if (!Well(text))
++      return Without(all, "");
++    const std::string rest = Without(all, name);
++    unsigned int entries = 1;
++    for (size_t at = 0; at < rest.size() && entries < ENTRIES;)
++    {
++      const size_t end = std::min(rest.find(' ', at), rest.size());
++      text += ' ' + rest.substr(at, end - at);
++      ++entries;
++      at = end + 1;
++    }
++    return text;
++  }
++
++  //! What the text has for that name; false when it has nothing (or nothing well formed)
++  static bool Get(const std::string& all, const std::string& name, int& periods)
++  {
++    for (size_t at = 0; at < all.size();)
++    {
++      const size_t end = std::min(all.find(' ', at), all.size());
++      const std::string entry = all.substr(at, end - at);
++      at = end + 1;
++      if (!Well(entry) || entry.compare(0, name.size() + 1, name + '=') != 0)
++        continue;
++      periods = std::stoi(entry.substr(name.size() + 1));
++      return true;
++    }
++    return false;
++  }
++
++private:
++  //! "<16 hex>/<digits>x<digits>@<digits>[i]/<w|a|o>=<-1..2>"
++  static bool Well(const std::string& entry)
++  {
++    if (entry.size() < 16 + 1 + 3 + 1 + 1 + 1 + 1 + 1 + 1 || entry.size() > 64)
++      return false;
++    size_t at = 0;
++    for (; at < 16; ++at)
++      if (!std::isxdigit(static_cast<unsigned char>(entry[at])))
++        return false;
++    const auto digits = [&](char after)
++    {
++      const size_t from = at;
++      while (at < entry.size() && entry[at] >= '0' && entry[at] <= '9')
++        ++at;
++      return at > from && at - from <= 7 && at < entry.size() && entry[at++] == after;
++    };
++    if (entry[at++] != '/' || !digits('x') || !digits('@'))
++      return false;
++    const size_t from = at;
++    while (at < entry.size() && entry[at] >= '0' && entry[at] <= '9')
++      ++at;
++    if (at == from || at - from > 7 || at >= entry.size())
++      return false;
++    if (entry[at] == 'i')
++      ++at;
++    if (at + 3 >= entry.size() || entry[at] != '/' ||
++        (entry[at + 1] != 'w' && entry[at + 1] != 'a' && entry[at + 1] != 'o') ||
++        entry[at + 2] != '=')
++      return false;
++    const std::string value = entry.substr(at + 3);
++    return value == "-1" || value == "0" || value == "1" || value == "2";
++  }
++
++  //! The well formed entries of the text, without the one of that name
++  static std::string Without(const std::string& all, const std::string& name)
++  {
++    std::string text;
++    for (size_t at = 0; at < all.size();)
++    {
++      const size_t end = std::min(all.find(' ', at), all.size());
++      const std::string entry = all.substr(at, end - at);
++      at = end + 1;
++      if (!Well(entry) || (!name.empty() && entry.compare(0, name.size() + 1, name + '=') == 0))
++        continue;
++      if (!text.empty())
++        text += ' ';
++      text += entry;
++    }
++    return text;
++  }
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 6ae37a4..b048d11 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -549,13 +549,16 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ #ifdef HAVE_DVBRIDGE
+   // Hades: the frame that the render manager chose for this pass, if it chose one (CPresentLag)
+   m_lagFrameNs = TakeChosenFrame();
+-  // (Hades: ... and when its sound is played)
++  // (Hades: ... and when its sound is played, and when by Kodi's display latency alone)
+   m_lagFrameSoundNs = m_lagFrameNs > 0 ? m_lagChosenSoundNs.load() : 0;
++  m_lagFrameModelNs = m_lagFrameNs > 0 ? m_lagChosenModelNs.load() : 0;
++  // (Hades: what was measured of them, judged now and then: CMeasuredLatency)
++  MeasuredJudge(false);
+   // Hades: ... and whether it is the first after a seek (VideoSeekShown()): the time of its flip is
+   // not taken against the player's clock, which has just started again
+   m_passSeekNs = std::exchange(m_seekShownNs, 0);
+   if (m_passSeekNs > 0)
+-    m_lagFrameNs = m_lagFrameSoundNs = 0;
++    m_lagFrameNs = m_lagFrameSoundNs = m_lagFrameModelNs = 0;
+   // Hades: a video has ended and none has begun: what it made for the conversion of its pictures
+   // (Dolby Vision sent as HDR10 or HDR10+, HDR10 adapted or mapped to the display: libplacebo's
+   // objects and their tables of colour, the measurements of HDR10+, the timers) and the profile of
+@@ -737,7 +740,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+         // (a frame presented the way that waits comes after the flip of any frame ahead before it
+         // was told, or known lost: nothing ahead is left to tell)
+         if (presented && !presentedAhead)
+-          m_dvLagAheadNs = m_dvAvAheadNs = 0;
++          m_dvLagAheadNs = m_dvAvAheadNs = m_dvModelAheadNs = 0;
+         // (not a frame whose commit carried more than the picture, a modeset: it says nothing of
+         // the frames after it)
+         if (presented && m_lagFrameNs > 0)
+@@ -746,12 +749,14 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+           {
+             m_dvLagAheadNs = m_lagFrameNs;
+             m_dvAvAheadNs = m_lagFrameSoundNs;
++            m_dvModelAheadNs = m_lagFrameModelNs;
+           }
+           else if (plainFrame)
+           {
+             const int64_t flippedNs = SteadyNowNs();
+             m_dvLag.Add(CPresentLag::Way::WAITING, m_lagFrameNs, flippedNs);
+             m_dvAv.Add(CPresentLag::Way::WAITING, m_lagFrameSoundNs, flippedNs);
++            MeasuredAdd(CMeasuredLatency::Way::WAITING, m_lagFrameModelNs, flippedNs);
+           }
+         }
+         if (presented)
+@@ -1133,6 +1138,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+             {
+               m_videoLag.Add(CPresentLag::Way::ORDINARY, m_videoLagPendingNs, flippedNs);
+               m_videoAv.Add(CPresentLag::Way::ORDINARY, m_videoAvPendingNs, flippedNs);
++              MeasuredAdd(CMeasuredLatency::Way::ORDINARY, m_videoModelPendingNs, flippedNs);
+             }
+             // (Hades: the vblank it came at anchors the grid of the next ones; a time that cannot
+             // be read takes the anchor away)
+@@ -1173,19 +1179,21 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ #ifdef HAVE_DVBRIDGE
+     // Hades: the frame of this commit, whose flip comes before the next commit (async), or came
+     // with this one, which waited for it (CPresentLag); a line a minute while a video plays
+-    m_videoLagPendingNs = m_videoAvPendingNs = 0;
++    m_videoLagPendingNs = m_videoAvPendingNs = m_videoModelPendingNs = 0;
+     if (m_lagFrameNs > 0)
+     {
+       if (async)
+       {
+         m_videoLagPendingNs = m_lagFrameNs;
+         m_videoAvPendingNs = m_lagFrameSoundNs;
++        m_videoModelPendingNs = m_lagFrameModelNs;
+       }
+       else
+       {
+         const int64_t flippedNs = SteadyNowNs();
+         m_videoLag.Add(CPresentLag::Way::ORDINARY, m_lagFrameNs, flippedNs);
+         m_videoAv.Add(CPresentLag::Way::ORDINARY, m_lagFrameSoundNs, flippedNs);
++        MeasuredAdd(CMeasuredLatency::Way::ORDINARY, m_lagFrameModelNs, flippedNs);
+       }
+     }
+     VideoLagReport();
+@@ -5428,7 +5436,7 @@ void CWinSystemGbmGLESContext::DVNativeOutputEnds(bool restored)
+   DVAheadForgetFlip();
+   m_dvAheadShown = false;
+   m_dvAheadLatencyMs = 0.0f;
+-  m_dvLagAheadNs = m_dvAvAheadNs = 0; // (Hades: CPresentLag)
++  m_dvLagAheadNs = m_dvAvAheadNs = m_dvModelAheadNs = 0; // (Hades: CPresentLag)
+   m_dvAheadModeRead = false;
+   m_dvAheadGui = -1;
+   m_dvStepRead = false;
+@@ -9066,8 +9074,9 @@ void CWinSystemGbmGLESContext::DVAheadFlipped(int64_t ns)
+   {
+     m_dvLag.Add(CPresentLag::Way::AHEAD, m_dvLagAheadNs, ns);
+     m_dvAv.Add(CPresentLag::Way::AHEAD, m_dvAvAheadNs, ns);
++    MeasuredAdd(CMeasuredLatency::Way::AHEAD, m_dvModelAheadNs, ns);
+   }
+-  m_dvLagAheadNs = m_dvAvAheadNs = 0;
++  m_dvLagAheadNs = m_dvAvAheadNs = m_dvModelAheadNs = 0;
+   // The time between the flips of two frames in a row, as the kernel tells them: what says
+   // whether a refresh was missed while frames are presented a frame ahead, where the time that
+   // a presentation takes says little.
+@@ -9160,6 +9169,256 @@ void CWinSystemGbmGLESContext::DVAheadFailed(const char* what, bool forGood)
+                       : ", and so are the frames after it in this video");
+ }
+ 
++CMeasuredLatency::Way CWinSystemGbmGLESContext::MeasuredWay() const
++{
++  // (as GetFrameLatencyAdjustment(): set when native output starts, and when its way changes)
++  if (!m_dvSignalling)
++    return CMeasuredLatency::Way::ORDINARY;
++  return m_dvAheadShown ? CMeasuredLatency::Way::AHEAD : CMeasuredLatency::Way::WAITING;
++}
++
++std::string CWinSystemGbmGLESContext::MeasuredName(CMeasuredLatency::Way way)
++{
++  if (!m_latencyKeyRead)
++  {
++    m_latencyKeyRead = true;
++    // What tells the GPU and its driver (the GL strings: with Mesa they carry its version and the
++    // kernel's) and the build, as for the way of drawing a Dolby Vision frame (DVPathRecall()):
++    // what a new driver does is measured again.
++    const auto text = [](GLenum name)
++    {
++      const GLubyte* value = glGetString(name);
++      return std::string(value ? reinterpret_cast<const char*>(value) : "");
++    };
++    const std::string renderer = text(GL_RENDERER);
++    if (!renderer.empty())
++      m_latencyKey = DVPathKey(renderer + '\n' + text(GL_VERSION) + '\n' +
++                               CSysInfo::GetOsPrettyNameWithVersion());
++  }
++  const auto* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
++  if (!m_latencyKey || !mode || !mode->clock || !mode->htotal || !mode->vtotal)
++    return {};
++  auto& c = m_latencyCache;
++  if (c.way != static_cast<int>(way) || c.clock != mode->clock || c.htotal != mode->htotal ||
++      c.vtotal != mode->vtotal || c.hdisplay != mode->hdisplay || c.vdisplay != mode->vdisplay ||
++      c.flags != mode->flags)
++  {
++    c = {mode->clock,    mode->htotal, mode->vtotal,          mode->hdisplay,
++         mode->vdisplay, mode->flags,  static_cast<int>(way), {}};
++    const auto milliHz = static_cast<unsigned int>(
++        std::llround(static_cast<double>(mode->clock) * 1e6 /
++                     (static_cast<double>(mode->htotal) * static_cast<double>(mode->vtotal))));
++    c.name = CLatencyMemory::Name(m_latencyKey, mode->hdisplay, mode->vdisplay, milliHz,
++                                  (mode->flags & DRM_MODE_FLAG_INTERLACE) != 0, way);
++  }
++  return c.name;
++}
++
++std::string CWinSystemGbmGLESContext::MeasuredWhere(CMeasuredLatency::Way way) const
++{
++  const auto* mode = m_DRM ? m_DRM->GetSelectedMode() : nullptr;
++  const char* const how =
++      way == CMeasuredLatency::Way::WAITING ? "native Dolby Vision presented the way that waits"
++      : way == CMeasuredLatency::Way::AHEAD ? "native Dolby Vision presented a frame ahead"
++                                            : "the ordinary output";
++  if (!mode || !mode->clock || !mode->htotal || !mode->vtotal)
++    return how;
++  return StringUtils::Format(
++      "{}x{}{} at {:.3f} Hz, {}", mode->hdisplay, mode->vdisplay,
++      (mode->flags & DRM_MODE_FLAG_INTERLACE) != 0 ? "i" : "",
++      static_cast<double>(mode->clock) * 1000.0 /
++          (static_cast<double>(mode->htotal) * static_cast<double>(mode->vtotal)),
++      how);
++}
++
++const std::string& CWinSystemGbmGLESContext::LatencyMemory()
++{
++  if (!m_latencyMemoryRead)
++  {
++    m_latencyMemoryRead = true;
++    const auto component = CServiceBroker::GetSettingsComponent();
++    const auto settings = component ? component->GetSettings() : nullptr;
++    if (settings && settings->GetSetting(CSettings::SETTING_VIDEOSCREEN_HADESLATENCY))
++      m_latencyMemory = settings->GetString(CSettings::SETTING_VIDEOSCREEN_HADESLATENCY);
++  }
++  return m_latencyMemory;
++}
++
++double CWinSystemGbmGLESContext::MeasuredLatencyMs(bool clockSync)
++{
++  const auto way = MeasuredWay();
++  if (!clockSync)
++  {
++    // (a frame rate whose multiple is not the refresh rate: Kodi chooses each frame for the
++    // refresh nearest its time, without the clock sync, and nothing is measured)
++    const std::string name = MeasuredName(way) + " unsynced";
++    if (name != m_latencyAppliedName)
++    {
++      m_latencyAppliedName = name;
++      m_latencyApplied = 0;
++      CLog::Log(LOGINFO,
++                "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}: the refresh "
++                "rate is no whole multiple of the frame rate, so the render manager's clock sync "
++                "is off, and nothing is measured or corrected",
++                LagLatencyMs(), MeasuredWhere(way));
++    }
++    return 0.0;
++  }
++  const double period = DVRefreshPeriodMs();
++  const std::string name = MeasuredName(way);
++  int periods = 0;
++  const bool known =
++      !name.empty() && period > 0.0 && CLatencyMemory::Get(LatencyMemory(), name, periods);
++  const auto component = CServiceBroker::GetSettingsComponent();
++  const auto advanced = component ? component->GetAdvancedSettings() : nullptr;
++  const bool on = !advanced || advanced->m_videoMeasuredLatency;
++  const int applied = known && on ? periods : 0;
++  // (told when it changes: with each video, a mode, a way of presenting, or a seek that takes a
++  // new measurement)
++  if (!name.empty() && (name != m_latencyAppliedName || applied != m_latencyApplied))
++  {
++    m_latencyAppliedName = name;
++    m_latencyApplied = applied;
++    const double latency = LagLatencyMs();
++    if (applied != 0)
++      CLog::Log(
++          LOGINFO,
++          "Video: frames are chosen {} refresh period{} ({:.1f} ms) {} than Kodi's display "
++          "latency of {:.1f} ms says, at {}: as measured with this GPU, driver and build, so "
++          "that the picture goes out with its sound (<measuredlatency>false</measuredlatency> "
++          "under <video> in advancedsettings.xml leaves Kodi's latency as it is)",
++          std::abs(applied), std::abs(applied) == 1 ? "" : "s", std::abs(applied) * period,
++          applied > 0 ? "later" : "sooner", latency, MeasuredWhere(way));
++    else if (known && periods != 0)
++      CLog::Log(LOGINFO,
++                "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}, although with "
++                "this GPU, driver and build the frames were measured to be chosen {} refresh "
++                "period{} {}: <measuredlatency> is off in advancedsettings.xml",
++                latency, MeasuredWhere(way), std::abs(periods), std::abs(periods) == 1 ? "" : "s",
++                periods > 0 ? "later" : "sooner");
++    else
++      CLog::Log(LOGINFO, "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}: {}",
++                latency, MeasuredWhere(way),
++                known ? "it was measured right with this GPU, driver and build"
++                      : "nothing is measured with this GPU, driver and build yet (the frames of "
++                        "this video are)");
++  }
++  return applied * period;
++}
++
++void CWinSystemGbmGLESContext::MeasuredAdd(CMeasuredLatency::Way way,
++                                           int64_t modelNs,
++                                           int64_t flipNs)
++{
++  if (modelNs <= 0 || flipNs <= 0)
++    return;
++  // (what was measured for another mode, resolution or GPU is another count)
++  const std::string name = MeasuredName(way);
++  auto& last = m_measuredName[static_cast<size_t>(way)];
++  if (name != last)
++  {
++    m_measured.Reset(way);
++    m_measuredJudged[static_cast<size_t>(way)] = 0;
++    m_measuredUnclear[static_cast<size_t>(way)] = nullptr;
++    last = name;
++  }
++  if (!name.empty())
++    m_measured.Add(way, static_cast<double>(flipNs - modelNs) / 1e6, DVRefreshPeriodMs());
++}
++
++void CWinSystemGbmGLESContext::MeasuredJudge(bool now)
++{
++  const auto at = std::chrono::steady_clock::now();
++  if (!now && at - m_measuredJudgedAt < std::chrono::seconds(2))
++    return;
++  m_measuredJudgedAt = at;
++  for (size_t i = 0; i < static_cast<size_t>(CMeasuredLatency::Way::COUNT); ++i)
++  {
++    const auto way = static_cast<CMeasuredLatency::Way>(i);
++    if (m_measured.Added(way) == m_measuredJudged[i] || m_measuredName[i].empty())
++      continue;
++    m_measuredJudged[i] = m_measured.Added(way);
++    const CMeasuredLatency::Verdict v = m_measured.Judge(way);
++    if (!v.clear)
++    {
++      if (v.frames >= CMeasuredLatency::SAMPLES)
++        m_measuredUnclear[i] = v.why;
++      continue;
++    }
++    m_measuredUnclear[i] = nullptr;
++    const std::string& name = m_measuredName[i];
++    m_latencyPending[name] = v.periods;
++    if (!m_latencyTold.insert(name).second)
++      continue;
++    int before = 0;
++    const bool known = CLatencyMemory::Get(LatencyMemory(), name, before);
++    std::string then;
++    if (v.periods == 0)
++      then = "Kodi's latency is right";
++    else if (known && before == v.periods)
++      then = StringUtils::Format("the frames are chosen {} refresh period{} {} than it says, as "
++                                 "they are",
++                                 std::abs(v.periods), std::abs(v.periods) == 1 ? "" : "s",
++                                 v.periods > 0 ? "later" : "sooner");
++    else
++      then = StringUtils::Format("the frames are chosen {} refresh period{} {} than it says from "
++                                 "the next video or seek on, and so with this GPU, driver and "
++                                 "build from then on",
++                                 std::abs(v.periods), std::abs(v.periods) == 1 ? "" : "s",
++                                 v.periods > 0 ? "later" : "sooner");
++    // (the latency that Kodi takes for that way: GetFrameLatencyAdjustment() as it is for it)
++    const double latency =
++        static_cast<double>(GetGfxContext().GetDisplayLatency()) -
++        DVFrameLatencyAdjustmentMs(way != CMeasuredLatency::Way::ORDINARY,
++                                   way == CMeasuredLatency::Way::AHEAD, DVRefreshPeriodMs());
++    CLog::Log(
++        LOGINFO,
++        "Video: measured over {} frames at {}: by Kodi's display latency alone ({:.1f} ms) "
++        "the picture would go out {:.1f} ms {} its sound ({:+.2f} refresh periods; the middle "
++        "half of the frames within {:.1f} ms): {}",
++        v.frames, MeasuredWhere(way), latency, std::fabs(v.meanMs),
++        v.meanMs < 0 ? "before" : "after", v.meanMs / v.periodMs, v.spreadMs, then);
++  }
++}
++
++void CWinSystemGbmGLESContext::VideoLatencyCommit(bool newVideo)
++{
++  MeasuredJudge(true);
++  std::string memory = LatencyMemory();
++  for (const auto& [name, periods] : m_latencyPending)
++  {
++    int before = 0;
++    if (!CLatencyMemory::Get(memory, name, before) || before != periods)
++      memory = CLatencyMemory::Put(memory, name, periods);
++  }
++  m_latencyPending.clear();
++  if (memory != m_latencyMemory)
++  {
++    m_latencyMemory = memory;
++    // written with the other settings when Kodi stops
++    const auto component = CServiceBroker::GetSettingsComponent();
++    const auto settings = component ? component->GetSettings() : nullptr;
++    if (settings && settings->GetSetting(CSettings::SETTING_VIDEOSCREEN_HADESLATENCY))
++      settings->SetString(CSettings::SETTING_VIDEOSCREEN_HADESLATENCY, memory);
++  }
++  if (!newVideo)
++    return;
++  for (size_t i = 0; i < static_cast<size_t>(CMeasuredLatency::Way::COUNT); ++i)
++  {
++    if (m_measuredUnclear[i] && m_latencyTold.count(m_measuredName[i]) == 0)
++      CLog::Log(LOGINFO,
++                "Video: the frames of the video before did not tell clearly when they reached the "
++                "screen against Kodi's display latency ({}, {} frames): nothing was kept of them",
++                m_measuredUnclear[i], m_measured.Count(static_cast<CMeasuredLatency::Way>(i)));
++    m_measuredUnclear[i] = nullptr;
++  }
++  m_measured.Reset();
++  m_measuredJudged = {};
++  m_measuredName = {};
++  m_latencyTold.clear();
++  m_latencyAppliedName.clear();
++}
++
+ double CWinSystemGbmGLESContext::LagLatencyMs()
+ {
+   return static_cast<double>(GetGfxContext().GetDisplayLatency()) -
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 9c190f2..f986efe 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -45,6 +45,7 @@
+ #include "DVStepDown.h"
+ #include "DVVerify.h"
+ #include "HDR10Adapt.h"
++#include "MeasuredLatency.h"
+ #include "PresentLag.h"
+ #include "cores/VideoPlayer/Interface/TimingConstants.h"
+ #include "cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h"
+@@ -377,12 +378,27 @@ public:
+   //! Hades: ... and soundNs, when its sound is played (the clock with its adjustment to the
+   //! refreshes, as the audio engine takes it, less how far ahead of it the engine measured the
+   //! sound; 0: not known): the A/V offset of the frame (m_dvAv, m_videoAv)
+-  void VideoFrameChosen(int64_t dueNs, int64_t soundNs = 0)
++  //! Hades: ... and modelNs, when it is played by Kodi's display latency alone, as the window
++  //! system tells it (GetFrameLatencyAdjustment()): without the sound's own offset, the latency
++  //! tweak, the audio offset and the measured correction; 0 without the clock sync of the render
++  //! manager (CMeasuredLatency)
++  void VideoFrameChosen(int64_t dueNs, int64_t soundNs = 0, int64_t modelNs = 0)
+   {
+     m_lagChosenSoundNs = soundNs;
++    m_lagChosenModelNs = modelNs;
+     m_lagChosenNs = dueNs;
+     m_lagChosenSerial++;
+   }
++  //! Hades: how much later than Kodi's display latency says (with GetFrameLatencyAdjustment())
++  //! the render manager chooses the frames, in ms: with its clock sync on, as many whole refresh
++  //! periods as were measured with this GPU, driver and build, display mode and way of presenting
++  //! (CMeasuredLatency, CLatencyMemory), unless advancedsettings.xml turns it off; without it,
++  //! nothing. Told in the log once a video, and when it changes. Main thread.
++  double MeasuredLatencyMs(bool clockSync);
++  //! Hades: the render manager configured a stream (newVideo) or flushed for a seek: what was
++  //! measured of the display latency until now is kept, and taken from here on (never in the middle
++  //! of what plays). Main thread.
++  void VideoLatencyCommit(bool newVideo);
+   //! Hades: the frame that the render manager chose last is the first after a seek asked for at
+   //! askedNs (steady clock, CSeekTrace): the statistics of native output leave out what the seek
+   //! left before it (the gap, a late presentation, the time between flips) and the time of its flip
+@@ -1177,6 +1193,45 @@ private:
+   //! whose flips are to come
+   std::atomic<int64_t> m_lagChosenSoundNs{0};
+   int64_t m_lagFrameSoundNs = 0;
++  //! Hades: ... and by Kodi's display latency alone (VideoFrameChosen()), for CMeasuredLatency: of
++  //! the frame of this pass, the frame presented a frame ahead and the commit of the ordinary
++  //! output whose flips are to come
++  std::atomic<int64_t> m_lagChosenModelNs{0};
++  int64_t m_lagFrameModelNs = 0;
++  int64_t m_dvModelAheadNs = 0;
++  int64_t m_videoModelPendingNs = 0;
++  //! Hades: the flips against Kodi's display latency, per way (CMeasuredLatency), the name of the
++  //! GPU, mode and way each was measured for, and what is kept of it (CLatencyMemory: the setting)
++  CMeasuredLatency m_measured;
++  std::array<std::string, static_cast<size_t>(CMeasuredLatency::Way::COUNT)> m_measuredName;
++  std::array<unsigned long long, static_cast<size_t>(CMeasuredLatency::Way::COUNT)>
++      m_measuredJudged{};
++  //! ... why the frames of a way, enough of them, did not give a clear verdict (told when the
++  //! video ends, if they never did)
++  std::array<const char*, static_cast<size_t>(CMeasuredLatency::Way::COUNT)> m_measuredUnclear{};
++  std::chrono::steady_clock::time_point m_measuredJudgedAt;
++  std::map<std::string, int> m_latencyPending; //!< verdicts to keep at the next commit
++  std::set<std::string> m_latencyTold; //!< told in this video
++  std::string m_latencyMemory;
++  bool m_latencyMemoryRead = false;
++  uint64_t m_latencyKey = 0; //!< the GPU, driver and build (DVPathKey())
++  bool m_latencyKeyRead = false;
++  std::string m_latencyAppliedName; //!< what the correction taken last was for ...
++  int m_latencyApplied = 0; //!< ... and how many periods
++  //! ... and, for the render manager's call at every frame, the mode and way it last asked for and
++  //! their name
++  struct LatencyCache
++  {
++    uint32_t clock = 0, htotal = 0, vtotal = 0, hdisplay = 0, vdisplay = 0, flags = 0;
++    int way = -1;
++    std::string name;
++  } m_latencyCache;
++  CMeasuredLatency::Way MeasuredWay() const;
++  std::string MeasuredName(CMeasuredLatency::Way way);
++  std::string MeasuredWhere(CMeasuredLatency::Way way) const;
++  const std::string& LatencyMemory();
++  void MeasuredAdd(CMeasuredLatency::Way way, int64_t modelNs, int64_t flipNs);
++  void MeasuredJudge(bool now);
+   CPresentLag m_dvAv;
+   int64_t m_dvAvAheadNs = 0;
+   CPresentLag m_videoAv;
+-- 
+2.53.0
+

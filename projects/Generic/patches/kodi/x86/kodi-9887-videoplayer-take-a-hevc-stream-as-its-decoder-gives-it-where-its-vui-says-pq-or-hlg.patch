@@ -1,0 +1,383 @@
+From 8d27914d3bcab6c2b10a9b07fd5200301af7bb5e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:03:35 +0000
+Subject: [PATCH] VideoPlayer: take a HEVC stream as its decoder gives it where
+ its VUI says PQ or HLG
+
+FFmpeg leaves the colour of the container in the parameters of a stream,
+while its HEVC decoder gives every picture the colour description of the
+VUI of the stream's sequence parameter set. A Matroska or MP4 file that
+says BT.2020-10 (or BT.709, or no transfer) for a stream whose VUI says
+HLG was HLG on the display, from its pictures, but SDR for everything
+decided before its first picture: its HDR type, the change of mode held
+for its HDR signalling, HLG sent as Dolby Vision, the whole-number
+multiples of its frame rate, the library. The same for a VUI of PQ under
+another transfer, and for a VUI of HLG under PQ.
+
+PROGRESSIVE_VIDEO::HevcVuiColour() reads the colour description with the
+parse of the sequence parameter set that the progressive check already
+has, as FFmpeg 9.0.2 sets it (reserved and unnamed values unspecified),
+from an hvcC record or Annex B, and only where every SPS of the base layer
+has one and they agree. CDVDDemuxFFmpeg::TakeDecoderColour() takes it for
+the stream where its transfer is PQ or HLG and the container says
+another, and says so in the log. A VUI of BT.2020-10 or BT.709 under a
+container's HLG is not taken: that is how an HLG stream speaks to decoders
+that do not know HLG, with an alternative transfer characteristics SEI in
+its packets that says HLG (DVB's HLG10), so the container's HLG stays, and
+the log says that too. Files whose container and VUI agree do not change.
+
+Found by SamuriHL in his CoreELEC builds (a walker of the SPS of its own
+there).
+
+Tests (outside the tree): 14 Matroska files made with mkvmerge 97 from
+HEVC streams whose VUI says HLG, PQ or BT.2020-10 (with and without an
+alternative transfer characteristics SEI, two with Dolby Vision) under
+containers that contradict or agree with it, opened as the demuxer opens
+them with FFmpeg 9.0.2 and run through the real TakeDecoderColour() and
+DetermineHdrType(): wherever the VUI says PQ or HLG the stream says what
+the decoder gives its pictures, and the files that agree are unchanged;
+before the change 16 checks fail. HevcVuiColour() against FFmpeg 9.0.2's
+decoder on every HEVC stream of 27 files (10 VUI variants made with
+hevc_metadata, Dolby Vision samples, a transport stream) and on 8 records
+put together: 45 checks. 9 mutants, each seen.
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  53 +++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |   3 +
+ xbmc/utils/ProgressiveVideo.cpp               | 101 +++++++++++++++---
+ xbmc/utils/ProgressiveVideo.h                 |  28 +++++
+ 4 files changed, 170 insertions(+), 15 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 624f547..4405bd6 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -35,6 +35,7 @@
+ #include "threads/SystemClock.h"
+ #include "utils/FontUtils.h"
+ #include "utils/LanguageTag.h"
++#include "utils/ProgressiveVideo.h"
+ #include "utils/StreamUtils.h"
+ #include "utils/StringUtils.h"
+ #include "utils/URIUtils.h"
+@@ -3328,6 +3329,9 @@ CDemuxStream* CDVDDemuxFFmpeg::AddStream(int streamIdx)
+         if (desc != nullptr)
+           st->bitDepth = desc->comp[0].depth;
+ 
++        // Hades: the colour that its decoder will give its pictures, where the container said
++        // another (TakeDecoderColour())
++        TakeDecoderColour(pStream);
+         st->colorPrimaries = pStream->codecpar->color_primaries;
+         st->colorSpace = pStream->codecpar->color_space;
+         st->colorTransferCharacteristic = pStream->codecpar->color_trc;
+@@ -4382,6 +4386,55 @@ void CDVDDemuxFFmpeg::GetL16Parameters(int &channels, int &samplerate)
+   }
+ }
+ 
++// Hades: the pictures of a HEVC stream have the colour description of the VUI of its sequence
++// parameter sets wherever it has one (its decoder, PROGRESSIVE_VIDEO::HevcVuiColour()), but
++// libavformat leaves the container's in the parameters of the stream. A Matroska or MP4 file that
++// says BT.2020-10 (or BT.709, or no transfer) for a stream whose VUI says HLG was HLG on the display
++// but SDR for everything decided before its first picture: its HDR type, the change of mode held for
++// its HDR signalling, HLG sent as Dolby Vision, the whole-number multiples of its frame rate, the
++// library. Where the VUI says PQ or HLG and the container another transfer, the stream is taken as
++// its decoder gives it. Not the other way round: a VUI of BT.2020-10 (or BT.709) where the container
++// says HLG is how an HLG stream speaks to decoders that do not know HLG, with an alternative transfer
++// characteristics SEI in its packets that says HLG (DVB's HLG10: CDVHdr10Plus), so the container's
++// HLG stays, and the log says so. Nothing else changes.
++void CDVDDemuxFFmpeg::TakeDecoderColour(AVStream* pStream)
++{
++  AVCodecParameters* par = pStream->codecpar;
++  if (par->codec_id != AV_CODEC_ID_HEVC || !par->extradata || par->extradata_size <= 0)
++    return;
++  const std::optional<PROGRESSIVE_VIDEO::Colour> vui =
++      PROGRESSIVE_VIDEO::HevcVuiColour(par->extradata, static_cast<size_t>(par->extradata_size));
++  if (!vui || vui->transfer == par->color_trc)
++    return;
++  const auto hdr = [](int transfer)
++  { return transfer == AVCOL_TRC_SMPTE2084 || transfer == AVCOL_TRC_ARIB_STD_B67; };
++  const auto name = [](int transfer)
++  {
++    const char* n = av_color_transfer_name(static_cast<AVColorTransferCharacteristic>(transfer));
++    return n ? n : "?";
++  };
++  if (!hdr(vui->transfer))
++  {
++    if (hdr(par->color_trc))
++      CLog::Log(LOGINFO,
++                "CDVDDemuxFFmpeg: stream {}: the container says the transfer {} and the VUI of its "
++                "HEVC sequence parameter set {}: the container's is kept (an alternative transfer "
++                "characteristics SEI in its packets may say HLG, as DVB's HLG10 does)",
++                pStream->index, name(par->color_trc), name(vui->transfer));
++    return;
++  }
++  CLog::Log(
++      LOGINFO,
++      "CDVDDemuxFFmpeg: stream {}: the container says the transfer {} (primaries {}, matrix "
++      "{}) and the VUI of its HEVC sequence parameter set {} (primaries {}, matrix {}), which "
++      "its decoder gives its pictures: taken as the VUI says",
++      pStream->index, name(par->color_trc), static_cast<int>(par->color_primaries),
++      static_cast<int>(par->color_space), name(vui->transfer), vui->primaries, vui->matrix);
++  par->color_primaries = static_cast<AVColorPrimaries>(vui->primaries);
++  par->color_trc = static_cast<AVColorTransferCharacteristic>(vui->transfer);
++  par->color_space = static_cast<AVColorSpace>(vui->matrix);
++}
++
+ StreamHdrType CDVDDemuxFFmpeg::DetermineHdrType(AVStream* pStream)
+ {
+   StreamHdrType hdrType = StreamHdrType::HDR_TYPE_NONE;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index d415cd3..5bd9683 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -249,6 +249,9 @@ protected:
+   double SelectAspect(AVStream* st, bool& forced);
+ 
+   StreamHdrType DetermineHdrType(AVStream* pStream);
++  //! Hades: a HEVC stream whose VUI says PQ or HLG where its container says another transfer is
++  //! taken with the colour its decoder gives its pictures
++  void TakeDecoderColour(AVStream* pStream);
+ 
+   CCriticalSection m_critSection;
+   std::map<int, CDemuxStream*> m_streams;
+diff --git a/xbmc/utils/ProgressiveVideo.cpp b/xbmc/utils/ProgressiveVideo.cpp
+index d5276e0..efe07be 100644
+--- a/xbmc/utils/ProgressiveVideo.cpp
++++ b/xbmc/utils/ProgressiveVideo.cpp
+@@ -15,6 +15,11 @@
+ #include <span>
+ #include <vector>
+ 
++extern "C"
++{
++#include <libavutil/pixdesc.h>
++}
++
+ // The parameter sets are read as FFmpeg 9 reads them (libavcodec/h264_ps.c, hevc/ps.c,
+ // h2645_vui.c, h2645_parse.c, h264_parse.c and hevc/parse.c), up to the flag that decides whether
+ // its decoder can mark a picture as interlaced. A parameter set that ends before that flag, that
+@@ -23,6 +28,7 @@
+ 
+ namespace
+ {
++using PROGRESSIVE_VIDEO::Colour;
+ using PROGRESSIVE_VIDEO::Result;
+ 
+ constexpr unsigned int H264_NAL_SPS = 7;
+@@ -161,8 +167,9 @@ std::vector<std::span<const uint8_t>> AnnexBNals(std::span<const uint8_t> data)
+ 
+ // The part of the VUI common to H.264 and HEVC (ff_h2645_decode_common_vui_params). The chroma
+ // sample locations go up to 5; FFmpeg reads them with get_ue_golomb_31(), which takes a longer code
+-// with other bits, so a larger value fails here.
+-bool SkipCommonVui(CRbspReader& br)
++// with other bits, so a larger value fails here. Hades: the colour description, where it has one,
++// with its reserved values and those libavutil does not name as unspecified, as FFmpeg sets them.
++bool SkipCommonVui(CRbspReader& br, std::optional<Colour>* colour = nullptr)
+ {
+   if (br.Bit() && br.Bits(8) == 255) // aspect_ratio_info_present_flag, aspect_ratio_idc
+     br.Skip(32); // sar_width, sar_height
+@@ -172,7 +179,25 @@ bool SkipCommonVui(CRbspReader& br)
+   {
+     br.Skip(4); // video_format, video_full_range_flag
+     if (br.Bit()) // colour_description_present_flag
+-      br.Skip(24); // colour_primaries, transfer_characteristics, matrix_coeffs
++    {
++      Colour description;
++      description.primaries = static_cast<int>(br.Bits(8)); // colour_primaries
++      description.transfer = static_cast<int>(br.Bits(8)); // transfer_characteristics
++      description.matrix = static_cast<int>(br.Bits(8)); // matrix_coeffs
++      if (description.primaries == AVCOL_PRI_RESERVED0 ||
++          description.primaries == AVCOL_PRI_RESERVED ||
++          !av_color_primaries_name(static_cast<AVColorPrimaries>(description.primaries)))
++        description.primaries = AVCOL_PRI_UNSPECIFIED;
++      if (description.transfer == AVCOL_TRC_RESERVED0 ||
++          description.transfer == AVCOL_TRC_RESERVED ||
++          !av_color_transfer_name(static_cast<AVColorTransferCharacteristic>(description.transfer)))
++        description.transfer = AVCOL_TRC_UNSPECIFIED;
++      if (description.matrix == AVCOL_SPC_RESERVED ||
++          !av_color_space_name(static_cast<AVColorSpace>(description.matrix)))
++        description.matrix = AVCOL_SPC_UNSPECIFIED;
++      if (colour)
++        *colour = description;
++    }
+   }
+   if (br.Bit()) // chroma_loc_info_present_flag
+   {
+@@ -430,11 +455,21 @@ void SkipHevcProfileTierLevel(CRbspReader& br, unsigned int maxSubLayersMinus1)
+   }
+ }
+ 
+-Result HevcSps(std::span<const uint8_t> nal)
++// Hades: what the parse of a HEVC SPS gives: whether it is progressive for Kodi and, where it was
++// read up to the flags that decide that without a fault, the colour description of its VUI (none
++// where the parse failed)
++struct HevcSpsRead
++{
++  Result result;
++  std::optional<Colour> colour;
++};
++
++HevcSpsRead ReadHevcSps(std::span<const uint8_t> nal)
+ {
+   const std::vector<uint8_t> rbsp = Rbsp(nal.subspan(2));
+   CRbspReader br(rbsp);
+-  const Result truncated{false, "HEVC: sequence parameter set ends early or is invalid"};
++  const HevcSpsRead truncated{{false, "HEVC: sequence parameter set ends early or is invalid"},
++                              std::nullopt};
+ 
+   br.Skip(4); // sps_video_parameter_set_id
+   const uint32_t maxSubLayersMinus1 = br.Bits(3);
+@@ -503,9 +538,10 @@ Result HevcSps(std::span<const uint8_t> nal)
+ 
+   bool fieldSeq = false;
+   bool frameFieldInfo = false;
++  std::optional<Colour> colour;
+   if (br.Bit()) // vui_parameters_present_flag
+   {
+-    if (!SkipCommonVui(br))
++    if (!SkipCommonVui(br, &colour))
+       return truncated;
+     br.Skip(1); // neutral_chroma_indication_flag
+     fieldSeq = br.Bit() != 0;
+@@ -514,10 +550,16 @@ Result HevcSps(std::span<const uint8_t> nal)
+   if (br.Failed())
+     return truncated;
+   if (fieldSeq)
+-    return {false, "HEVC: field_seq_flag is 1, the pictures are fields"};
++    return {{false, "HEVC: field_seq_flag is 1, the pictures are fields"}, colour};
+   if (frameFieldInfo)
+-    return {false, "HEVC: frame_field_info_present_flag is 1, picture timing may signal fields"};
+-  return {true, "HEVC: no field_seq_flag and no frame_field_info_present_flag"};
++    return {{false, "HEVC: frame_field_info_present_flag is 1, picture timing may signal fields"},
++            colour};
++  return {{true, "HEVC: no field_seq_flag and no frame_field_info_present_flag"}, colour};
++}
++
++Result HevcSps(std::span<const uint8_t> nal)
++{
++  return ReadHevcSps(nal).result;
+ }
+ 
+ Result CheckH264(std::span<const uint8_t> data)
+@@ -563,10 +605,11 @@ Result CheckH264(std::span<const uint8_t> data)
+   return result;
+ }
+ 
+-Result CheckHevc(std::span<const uint8_t> data)
++// The NAL units of HEVC parameter sets as FFmpeg reads them: an hvcC record, also the
++// configurationVersion 0 that predates the standard (hevc/parse.c), or an Annex B byte stream. False
++// where an hvcC record ends early.
++bool HevcNals(std::span<const uint8_t> data, std::vector<std::span<const uint8_t>>& nals)
+ {
+-  std::vector<std::span<const uint8_t>> nals;
+-  // hvcC, also the configurationVersion 0 that predates the standard (hevc/parse.c)
+   if (data.size() >= 23 && (data[0] == 1 || (data[0] == 0 && (data[1] != 0 || data[2] > 1))))
+   {
+     const unsigned int arrays = data[22]; // numOfArrays
+@@ -574,17 +617,17 @@ Result CheckHevc(std::span<const uint8_t> data)
+     for (unsigned int i = 0; i < arrays; i++)
+     {
+       if (data.size() - pos < 3)
+-        return {false, "HEVC: hvcC ends early"};
++        return false;
+       const unsigned int count = (static_cast<unsigned int>(data[pos + 1]) << 8) | data[pos + 2];
+       pos += 3;
+       for (unsigned int j = 0; j < count; j++)
+       {
+         if (data.size() - pos < 2)
+-          return {false, "HEVC: hvcC ends early"};
++          return false;
+         const size_t length = (static_cast<size_t>(data[pos]) << 8) | data[pos + 1];
+         pos += 2;
+         if (length > data.size() - pos)
+-          return {false, "HEVC: hvcC ends early"};
++          return false;
+         nals.push_back(data.subspan(pos, length));
+         pos += length;
+       }
+@@ -592,6 +635,14 @@ Result CheckHevc(std::span<const uint8_t> data)
+   }
+   else
+     nals = AnnexBNals(data);
++  return true;
++}
++
++Result CheckHevc(std::span<const uint8_t> data)
++{
++  std::vector<std::span<const uint8_t>> nals;
++  if (!HevcNals(data, nals))
++    return {false, "HEVC: hvcC ends early"};
+ 
+   Result result{false, "HEVC: no sequence parameter set in the extradata"};
+   for (const auto& nal : nals)
+@@ -630,4 +681,24 @@ Result Check(AVCodecID codec, const uint8_t* extradata, size_t size)
+       return {false, "codec with interlaced coding, not inspected"};
+   }
+ }
++
++std::optional<Colour> HevcVuiColour(const uint8_t* extradata, size_t size)
++{
++  std::vector<std::span<const uint8_t>> nals;
++  if (!extradata || !HevcNals(std::span<const uint8_t>(extradata, size), nals))
++    return {};
++  std::optional<Colour> colour;
++  for (const auto& nal : nals)
++  {
++    if (nal.size() < 3 || ((nal[0] >> 1) & 0x3f) != HEVC_NAL_SPS)
++      continue;
++    if ((((nal[0] & 1) << 5) | (nal[1] >> 3)) != 0) // nuh_layer_id: another layer, not looked into
++      return {};
++    const HevcSpsRead sps = ReadHevcSps(nal);
++    if (!sps.colour || (colour && *colour != *sps.colour))
++      return {};
++    colour = sps.colour;
++  }
++  return colour;
++}
+ } // namespace PROGRESSIVE_VIDEO
+diff --git a/xbmc/utils/ProgressiveVideo.h b/xbmc/utils/ProgressiveVideo.h
+index 1e15f1e..9358e5a 100644
+--- a/xbmc/utils/ProgressiveVideo.h
++++ b/xbmc/utils/ProgressiveVideo.h
+@@ -9,6 +9,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <optional>
+ #include <string_view>
+ 
+ extern "C"
+@@ -44,4 +45,31 @@ struct Result
+  * a stream without them, an unparsable one or any other codec is not progressive
+  */
+ Result Check(AVCodecID codec, const uint8_t* extradata, size_t size);
++
++//! Hades: a colour description of H.273 (the values of AVColorPrimaries, AVColorTransferCharacteristic
++//! and AVColorSpace)
++struct Colour
++{
++  int primaries{0};
++  int transfer{0};
++  int matrix{0};
++
++  bool operator==(const Colour&) const = default;
++};
++
++/*!
++ * \brief Hades: the colour description that FFmpeg's HEVC decoder gives every picture of a stream,
++ *        from the VUI of its sequence parameter sets, known before its first picture
++ *
++ * FFmpeg 9's decoder takes the primaries, the transfer and the matrix of the VUI wherever it has a
++ * colour description (hevc/hevcdec.c, export_stream_params()), whatever the container said, and a
++ * value that libavutil does not name as unspecified (h2645_vui.c); an alternative transfer
++ * characteristics SEI in the packets may still change the transfer (CDVHdr10Plus). Read with the
++ * parse of Check().
++ *
++ * \param extradata the codec's parameter sets (hvcC or Annex B), as FFmpeg reads them
++ * \return the description where every sequence parameter set in it has one and they all agree;
++ * nothing where one has none, one is cut or invalid, one is of another layer, or there is none
++ */
++std::optional<Colour> HevcVuiColour(const uint8_t* extradata, size_t size);
+ } // namespace PROGRESSIVE_VIDEO
+-- 
+2.53.0
+

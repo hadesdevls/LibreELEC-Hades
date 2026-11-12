@@ -1,0 +1,500 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 04:40:05 +0000
+Subject: [PATCH 2/3] drm/i915/dp: Dolby Vision tunnel through a DisplayPort to
+ HDMI converter
+
+A DisplayPort connector of a port that can carry the tunnel through the
+converter of its board (intel_dv_pcon_policy.h) gets DVBRIDGE_DV_STANDARD_LAB
+and DVBRIDGE_REFUSED as an HDMI connector does, and DVBRIDGE_DV_CONVERTER,
+read only: what detect found behind the port, "none", "unlisted"
+(a converter that nobody has seen carry it), "listed" (the board is on
+the list) or "forced" (dv_pcon=1). Kodi's Automatic takes "listed" and
+"forced", its setting "On" takes "unlisted" too; "none" is refused by the
+kernel whatever user space asks, as before. Low-Latency and the HDMI 1.4b
+signalling are not attached to a DisplayPort connector: they were not
+seen through a converter.
+
+The converter is "behind the port" when the sink is an HDMI sink behind a
+DisplayPort branch device of the HDMI type that will not go to FRL
+(what the tunnel was seen through is TMDS). The kernel log says it when
+detect finds one, with the verdict and why (the board on the list, or
+not; dv_pcon), and warns once when a request goes through one that
+nobody has seen carry it.
+
+The configuration is checked with intel_dv_lab_validate() as the one of
+native HDMI is, with the converter test of the policy in place of the
+native HDMI one, and DVBRIDGE_REFUSED says why a request is refused
+(RGB, 8 bits, full range, no HDR metadata, no DSC, a mode in the list,
+a sink that takes it). The tunnel never goes past the converter's TMDS
+limit (no retry without the downstream limits), as through native HDMI.
+
+The AVI InfoFrame of the tunnel (drm_dvbridge_tunnel_avi(), as native
+HDMI sends it) and the Dolby vendor InfoFrame go to the converter as
+DisplayPort InfoFrame SDPs, as HDR10 does: the AVI one in the AVI DIP,
+the vendor one in the GMP DIP (the vendor DIP blanks the HDMI output of
+the converter that this was seen through, YBLOD's report); the converter
+turns them into HDMI InfoFrames. The DP InfoFrame SDP has room for 26
+payload bytes: the last byte of the Dolby vendor InfoFrame is reserved
+and zero, and is checked to be. The GMP DIP carries the vendor
+InfoFrame in the guardband calculation of the SDPs too.
+
+Not tried on hardware. Compiled with W=1, for i915 and xe, with the
+configuration and the toolchain of the image.
+---
+ drivers/gpu/drm/i915/display/intel_atomic.c   |   7 +-
+ .../drm/i915/display/intel_display_types.h    |   7 +
+ drivers/gpu/drm/i915/display/intel_dp.c       | 325 +++++++++++++++++-
+ drivers/gpu/drm/i915/display/intel_dp.h       |   1 +
+ 4 files changed, 337 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_atomic.c b/drivers/gpu/drm/i915/display/intel_atomic.c
+index b3386c200..b4604d46e 100644
+--- a/drivers/gpu/drm/i915/display/intel_atomic.c
++++ b/drivers/gpu/drm/i915/display/intel_atomic.c
+@@ -124,7 +124,12 @@ int intel_digital_connector_atomic_set_property(struct drm_connector *connector,
+ 
+ 	if (to_intel_connector(connector)->dv_lab_property &&
+ 	    property == to_intel_connector(connector)->dv_lab_property) {
+-		if (val > 1 || connector->connector_type != DRM_MODE_CONNECTOR_HDMIA)
++		/*
++		 * (Hades: DisplayPort too, where the port has a converter to HDMI that carries it:
++		 * only such a connector has the property, intel_dp_pcon_dv_add_properties())
++		 */
++		if (val > 1 || (connector->connector_type != DRM_MODE_CONNECTOR_HDMIA &&
++				connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort))
+ 			return -EINVAL;
+ 		if (val && !display->params.enable_dv_lab)
+ 			return -EOPNOTSUPP;
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 3e026905c..c2cf7e551 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -539,6 +539,13 @@ struct intel_connector {
+ 	 */
+ 	struct drm_property *dv_hdr10_property;
+ 	struct drm_property *dv_refused_property;
++	/*
++	 * Hades: DVBRIDGE_DV_CONVERTER on a DisplayPort connector that can carry the tunnel through
++	 * the DisplayPort to HDMI converter of its board (intel_dv_pcon_policy.h): what detect found
++	 * of the converter behind it (enum intel_dv_pcon_verdict, read only), and the value it gave
++	 */
++	struct drm_property *dv_converter_property;
++	u8 dv_converter, dv_converter_told;
+ 	struct drm_dvbridge_refused_log dv_refused_log;
+ 	/*
+ 	 * Hades: DVBRIDGE_LINK_FORMAT, what a request of the guard found the configuration sends
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.c b/drivers/gpu/drm/i915/display/intel_dp.c
+index d79b6367c..fa483b02d 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -25,7 +25,9 @@
+  *
+  */
+ 
++#include <linux/dmi.h>
+ #include <linux/export.h>
++#include <linux/ratelimit.h>
+ #include <linux/i2c.h>
+ #include <linux/iopoll.h>
+ #include <linux/log2.h>
+@@ -84,6 +86,8 @@
+ #include "intel_hdmi.h"
+ #include "intel_hotplug.h"
+ #include "intel_hotplug_irq.h"
++#include "intel_dv_lab_policy.h"
++#include "intel_dv_pcon_policy.h"
+ #include "intel_lspcon.h"
+ #include "intel_lvds.h"
+ #include "intel_modeset_lock.h"
+@@ -3546,6 +3550,291 @@ int intel_dp_compute_min_hblank(struct intel_crtc_state *crtc_state,
+ 	return 0;
+ }
+ 
++/*
++ * Hades: Standard Dolby Vision through the DisplayPort to HDMI converter of a board (a protocol
++ * converter, PCON, between the DDI port and the HDMI socket), whose policy is
++ * intel_dv_pcon_policy.h: the tunnel has been an HDMI connector's, and a port with a converter is
++ * a DisplayPort connector here.
++ *
++ * The converter turns DisplayPort InfoFrame SDPs into HDMI InfoFrames, which is how HDR10 goes
++ * through it (the GMP DIP, the DRM InfoFrame). The AVI InfoFrame and the Dolby vendor InfoFrame of
++ * the tunnel go as DisplayPort InfoFrame SDPs too: the AVI one in the AVI DIP, the vendor one in
++ * the GMP DIP, because the vendor DIP blanks the HDMI output of the converter that it was seen
++ * through (YBLOD, linux-9930: the mechanism and the board; this is written again for the policy,
++ * the checks and the readout of this tree). The bytes of the picture go as they do through native
++ * HDMI: RGB at 8 bits, full range, nothing of the display pipe in between.
++ */
++bool intel_dp_pcon_dv_candidate(const struct intel_digital_port *dig_port)
++{
++	struct intel_display *display = to_intel_display(&dig_port->base);
++	const struct intel_bios_encoder_data *devdata = dig_port->base.devdata;
++
++	return intel_dv_pcon_candidate(DISPLAY_VER(display), display->params.enable_dv_lab,
++				       display->params.dv_pcon, false,
++				       intel_bios_encoder_is_lspcon(devdata),
++				       intel_bios_encoder_supports_hdmi(devdata));
++}
++
++/*
++ * The sink is an HDMI sink behind a branch device of the HDMI type, and that device will not go
++ * to FRL (what the tunnel was seen through is TMDS): Kodi asks only where this is so.
++ */
++static bool intel_dp_pcon_dv_route(struct intel_dp *intel_dp)
++{
++	return drm_dp_is_branch(intel_dp->dpcd) &&
++		(intel_dp->downstream_ports[0] & DP_DS_PORT_TYPE_MASK) == DP_DS_PORT_TYPE_HDMI &&
++		intel_dp_has_hdmi_sink(intel_dp) && !intel_dp->dfp.pcon_max_frl_bw;
++}
++
++static const struct intel_dv_pcon_board *intel_dp_pcon_dv_board(void)
++{
++	return intel_dv_pcon_board_listed(dmi_get_system_info(DMI_BOARD_VENDOR),
++					  dmi_get_system_info(DMI_BOARD_NAME));
++}
++
++static enum intel_dv_pcon_verdict intel_dp_pcon_dv_verdict(struct intel_dp *intel_dp)
++{
++	struct intel_display *display = to_intel_display(intel_dp);
++
++	return intel_dv_pcon_verdict(display->params.dv_pcon, intel_dp_pcon_dv_route(intel_dp),
++				     !!intel_dp_pcon_dv_board());
++}
++
++/*
++ * DVBRIDGE_DV_CONVERTER, what the detect that just ran found; the kernel log says it when a
++ * converter is found, and again only when it is another verdict
++ */
++static void intel_dp_pcon_dv_update(struct intel_dp *intel_dp, bool connected)
++{
++	struct intel_display *display = to_intel_display(intel_dp);
++	struct intel_connector *connector = intel_dp->attached_connector;
++	enum intel_dv_pcon_verdict verdict =
++		connected ? intel_dp_pcon_dv_verdict(intel_dp) : INTEL_DV_PCON_NONE;
++	const struct intel_dv_pcon_board *board;
++
++	if (!connector->dv_converter_property)
++		return;
++	if (verdict != connector->dv_converter) {
++		drm_object_property_set_value(&connector->base.base,
++					      connector->dv_converter_property, verdict);
++		connector->dv_converter = verdict;
++	}
++	if (verdict == INTEL_DV_PCON_NONE || verdict == connector->dv_converter_told)
++		return;
++	connector->dv_converter_told = verdict;
++	board = intel_dp_pcon_dv_board();
++	drm_info(display->drm,
++		 "[CONNECTOR:%d:%s] DVBRIDGE: a DisplayPort to HDMI converter is behind this port (DVBRIDGE_DV_CONVERTER %s): %s%s%s%s\n",
++		 connector->base.base.id, connector->base.name,
++		 intel_dv_pcon_verdict_name(verdict), intel_dv_pcon_verdict_why(verdict),
++		 board ? " (" : "", board ? board->seen : "", board ? ")" : "");
++}
++
++/* The properties of the tunnel on a DisplayPort connector of a port that can carry it */
++static void intel_dp_pcon_dv_add_properties(struct intel_dp *intel_dp,
++					    struct drm_connector *_connector)
++{
++	struct intel_display *display = to_intel_display(intel_dp);
++	struct intel_connector *connector = to_intel_connector(_connector);
++	static const struct drm_prop_enum_list verdicts[] = {
++		{ INTEL_DV_PCON_NONE, "none" },
++		{ INTEL_DV_PCON_UNLISTED, "unlisted" },
++		{ INTEL_DV_PCON_LISTED, "listed" },
++		{ INTEL_DV_PCON_FORCED, "forced" },
++	};
++
++	if (intel_dp_is_edp(intel_dp) || !intel_dp_pcon_dv_candidate(dp_to_dig_port(intel_dp)))
++		return;
++
++	connector->dv_lab_property = drm_property_create_bool(display->drm, DRM_MODE_PROP_ATOMIC,
++							      "DVBRIDGE_DV_STANDARD_LAB");
++	if (!connector->dv_lab_property)
++		return;
++	drm_object_attach_property(&_connector->base, connector->dv_lab_property, 0);
++
++	connector->dv_converter_property =
++		drm_property_create_enum(display->drm, DRM_MODE_PROP_IMMUTABLE,
++					 "DVBRIDGE_DV_CONVERTER", verdicts,
++					 ARRAY_SIZE(verdicts));
++	if (connector->dv_converter_property)
++		drm_object_attach_property(&_connector->base, connector->dv_converter_property,
++					   INTEL_DV_PCON_NONE);
++
++	connector->dv_refused_property = drm_dvbridge_refused_property_create(display->drm);
++	if (connector->dv_refused_property) {
++		drm_dvbridge_refused_log_init(&connector->dv_refused_log);
++		drm_object_attach_property(&_connector->base, connector->dv_refused_property, 0);
++	}
++}
++
++/* Why a request of the tunnel was refused, for DVBRIDGE_REFUSED and the kernel log */
++static void intel_dp_pcon_dv_refused(struct intel_connector *connector, u64 bits,
++				     const char *detail)
++{
++	if (connector->dv_refused_property)
++		drm_dvbridge_refused_report(&connector->base, connector->dv_refused_property,
++					    &connector->dv_refused_log, bits, detail);
++}
++
++static int intel_dp_pcon_dv_compute_config(struct intel_dp *intel_dp,
++					   struct intel_crtc_state *crtc_state,
++					   const struct drm_connector_state *conn_state)
++{
++	static DEFINE_RATELIMIT_STATE(limit, 30 * HZ, 2);
++	struct intel_display *display = to_intel_display(intel_dp);
++	struct intel_connector *connector = intel_dp->attached_connector;
++	const struct drm_display_mode *mode = &crtc_state->hw.adjusted_mode;
++	const struct drm_dvbridge_sink *sink = &connector->dv_sink;
++	struct hdmi_avi_infoframe *avi = &crtc_state->infoframes.avi.avi;
++	struct hdmi_dolby_vendor_infoframe *dv = &crtc_state->infoframes.hdmi.vendor.dolby;
++	const struct intel_digital_connector_state *dcs =
++		to_intel_digital_connector_state(conn_state);
++	enum intel_dv_pcon_verdict verdict;
++	struct intel_dv_lab_link link;
++	char detail[256];
++	u8 vic;
++	int ret;
++	u64 bits;
++
++	if (!dcs->dv_lab_standard)
++		return 0;
++
++	drm_modeset_lock_assert_held(&display->drm->mode_config.connection_mutex);
++	verdict = intel_dp_pcon_dv_verdict(intel_dp);
++	link = (struct intel_dv_lab_link) {
++		.requested = true,
++		.lab_enabled = display->params.enable_dv_lab &&
++			intel_dv_lab_platform_supported(DISPLAY_VER(display)),
++		.sink_standard = drm_dvbridge_sink_takes(sink, false),
++		.sink_2160p60 = sink->p60,
++		.hdmi = intel_dp_has_hdmi_sink(intel_dp) &&
++			connector->base.display_info.has_hdmi_infoframe,
++		.native_hdmi = false,
++		.converter = intel_dv_pcon_takes(verdict) &&
++			intel_dv_pcon_signalling_ok(dcs->dv_lab_low_latency, dcs->dv_lab_hdmi14b),
++		.rgb = crtc_state->output_format == INTEL_OUTPUT_FORMAT_RGB &&
++			crtc_state->sink_format == INTEL_OUTPUT_FORMAT_RGB,
++		.limited_range = crtc_state->limited_color_range,
++		.hdr_blob = !!conn_state->hdr_output_metadata,
++		.cloned = hweight32(crtc_state->uapi.encoder_mask) > 1,
++		.progressive = !(mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN |
++						DRM_MODE_FLAG_DBLCLK | DRM_MODE_FLAG_3D_MASK)),
++		.requested_bpc = conn_state->max_requested_bpc,
++		.pipe_bpp = crtc_state->pipe_bpp,
++		.colorspace = conn_state->colorspace,
++		.width = mode->hdisplay,
++		.height = mode->vdisplay,
++		.rounded_refresh = drm_mode_vrefresh(mode),
++	};
++	ret = intel_dv_lab_validate(&link);
++	if (ret || crtc_state->dsc.compression_enable || mode->flags & DRM_MODE_FLAG_3D_MASK) {
++		bits = intel_dv_lab_refused(&link, crtc_state->sink_format ==
++						   INTEL_OUTPUT_FORMAT_YCBCR420);
++		if (!bits)
++			bits = BIT_ULL(DRM_DVBRIDGE_REFUSED_FORMAT);
++		scnprintf(detail, sizeof(detail),
++			  "DisplayPort to HDMI converter: %s (%s); %s at %u bpp, max bpc %u, limited range %d, HDR metadata %d, colorimetry %u; %ux%u@%u%s%s%s",
++			  intel_dv_pcon_verdict_name(verdict), intel_dv_pcon_verdict_why(verdict),
++			  crtc_state->sink_format == INTEL_OUTPUT_FORMAT_YCBCR420 ? "YCbCr 4:2:0" :
++			  crtc_state->sink_format == INTEL_OUTPUT_FORMAT_YCBCR444 ? "YCbCr 4:4:4" : "RGB",
++			  link.pipe_bpp, link.requested_bpc, link.limited_range, link.hdr_blob,
++			  link.colorspace, link.width, link.height, link.rounded_refresh,
++			  link.progressive ? "" : ", not progressive 2D", link.cloned ? ", cloned" : "",
++			  crtc_state->dsc.compression_enable ? ", DSC" : "");
++		intel_dp_pcon_dv_refused(connector, bits, detail);
++		if (__ratelimit(&limit))
++			drm_err(display->drm,
++				"[CONNECTOR:%d:%s] DVBRIDGE: the tunnel through the DisplayPort to HDMI converter was refused: %s\n",
++				connector->base.base.id, connector->base.name, detail);
++		return ret ?: -EINVAL;
++	}
++
++	/* the AVI InfoFrame of the tunnel: the one of native HDMI (drm_dvbridge.h) */
++	vic = drm_dvbridge_avi_vic(drm_match_cea_mode(mode));
++	if (!vic) {
++		scnprintf(detail, sizeof(detail),
++			  "%dx%d@%d has no CTA VIC that the tunnel takes (CTA VIC %u)", mode->hdisplay,
++			  mode->vdisplay, drm_mode_vrefresh(mode), drm_match_cea_mode(mode));
++		intel_dp_pcon_dv_refused(connector, BIT_ULL(DRM_DVBRIDGE_REFUSED_MODE), detail);
++		return -EINVAL;
++	}
++	ret = drm_hdmi_avi_infoframe_from_display_mode(avi, &connector->base, mode);
++	if (ret)
++		return ret;
++	drm_hdmi_avi_infoframe_quant_range(avi, &connector->base, mode,
++					   HDMI_QUANTIZATION_RANGE_FULL);
++	drm_hdmi_avi_infoframe_content_type(avi, conn_state);
++	drm_dvbridge_tunnel_avi(avi, vic);
++	ret = hdmi_avi_infoframe_check(avi);
++	if (ret)
++		return ret;
++
++	drm_dvbridge_tunnel_vsif(dv);
++	ret = hdmi_dolby_vendor_infoframe_check(dv);
++	if (ret)
++		return ret;
++
++	crtc_state->dither_force_disable = true;
++	crtc_state->infoframes.enable |= intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_AVI) |
++					 intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_VENDOR);
++	intel_dp_pcon_dv_refused(connector, 0, NULL);
++
++	if (verdict != INTEL_DV_PCON_LISTED && __ratelimit(&limit))
++		drm_warn(display->drm,
++			 "[CONNECTOR:%d:%s] DVBRIDGE: the tunnel goes through a DisplayPort to HDMI converter that nobody has seen carry it (%s)\n",
++			 connector->base.base.id, connector->base.name,
++			 intel_dv_pcon_verdict_name(verdict));
++	return 0;
++}
++
++/*
++ * An HDMI InfoFrame (type, version, length, checksum, payload) as the DisplayPort 1.4 InfoFrame
++ * SDP that intel_dp_hdr_metadata_infoframe_sdp_pack() makes, in 32 bytes (the size of the AVI
++ * DIP): the Dolby vendor InfoFrame's last payload byte (reserved, zero) is not carried; the 36
++ * bytes of the GMP DIP are zero-padded by hsw_write_infoframe().
++ */
++static void intel_dp_pcon_dv_sdp(const u8 *hdmi, ssize_t len, u8 *sdp)
++{
++	memset(sdp, 0, VIDEO_DIP_DATA_SIZE);
++	sdp[1] = hdmi[0];	/* HB1: 0x80 + the InfoFrame type */
++	sdp[2] = 0x1d;		/* HB2: as the HDR metadata one */
++	sdp[3] = 0x13 << 2;	/* HB3 */
++	sdp[4] = hdmi[1];	/* DB0: version */
++	sdp[5] = hdmi[2];	/* DB1: length */
++	memcpy(&sdp[6], &hdmi[HDMI_INFOFRAME_HEADER_SIZE],
++	       min_t(ssize_t, len - HDMI_INFOFRAME_HEADER_SIZE, VIDEO_DIP_DATA_SIZE - 6));
++}
++
++static void intel_dp_pcon_dv_write(struct intel_encoder *encoder,
++				   const struct intel_crtc_state *crtc_state)
++{
++	struct intel_display *display = to_intel_display(encoder);
++	u8 buf[VIDEO_DIP_DATA_SIZE] = {}, sdp[VIDEO_DIP_DATA_SIZE];
++	ssize_t len;
++
++	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DP_MST) ||
++	    !(crtc_state->infoframes.enable &
++	      intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_VENDOR)) ||
++	    !intel_dp_pcon_dv_candidate(enc_to_dig_port(encoder)))
++		return;
++
++	len = hdmi_avi_infoframe_pack_only(&crtc_state->infoframes.avi.avi, buf, sizeof(buf));
++	if (drm_WARN_ON(display->drm, len < HDMI_INFOFRAME_HEADER_SIZE))
++		return;
++	intel_dp_pcon_dv_sdp(buf, len, sdp);
++	hsw_write_infoframe(encoder, crtc_state, HDMI_INFOFRAME_TYPE_AVI, sdp, sizeof(sdp));
++
++	memset(buf, 0, sizeof(buf));
++	len = hdmi_dolby_vendor_infoframe_pack(&crtc_state->infoframes.hdmi.vendor.dolby, buf,
++					       sizeof(buf));
++	if (drm_WARN_ON(display->drm, len != HDMI_INFOFRAME_HEADER_SIZE + 27 ||
++			buf[HDMI_INFOFRAME_HEADER_SIZE + 26]))
++		return;
++	intel_dp_pcon_dv_sdp(buf, len, sdp);
++	/* The GMP DIP: the vendor DIP blanks the output of the converter that this was seen through */
++	hsw_write_infoframe(encoder, crtc_state, HDMI_PACKET_TYPE_GAMUT_METADATA, sdp, sizeof(sdp));
++}
++
+ int
+ intel_dp_compute_config(struct intel_atomic_state *state,
+ 			struct intel_encoder *encoder,
+@@ -3582,7 +3871,8 @@ intel_dp_compute_config(struct intel_atomic_state *state,
+ 	 * that fails assume the user might know something we don't.
+ 	 */
+ 	ret = intel_dp_compute_formats(encoder, pipe_config, conn_state, true);
+-	if (ret)
++	/* Hades: the tunnel never goes past the converter's TMDS limit (as through native HDMI) */
++	if (ret && !to_intel_digital_connector_state(conn_state)->dv_lab_standard)
+ 		ret = intel_dp_compute_formats(encoder, pipe_config, conn_state, false);
+ 	if (ret)
+ 		return ret;
+@@ -3656,6 +3946,11 @@ intel_dp_compute_config(struct intel_atomic_state *state,
+ 	intel_dp_compute_vsc_sdp(intel_dp, pipe_config, conn_state);
+ 	intel_dp_compute_hdr_metadata_infoframe_sdp(intel_dp, pipe_config, conn_state);
+ 
++	/* Hades: the tunnel through the converter of the board, after what its checks look at */
++	ret = intel_dp_pcon_dv_compute_config(intel_dp, pipe_config, conn_state);
++	if (ret)
++		return ret;
++
+ 	return intel_dp_tunnel_atomic_compute_stream_bw(state, intel_dp, connector,
+ 							pipe_config);
+ }
+@@ -5373,6 +5668,9 @@ void intel_dp_set_infoframes(struct intel_encoder *encoder,
+ 	intel_write_dp_sdp(encoder, crtc_state, DP_SDP_ADAPTIVE_SYNC);
+ 
+ 	intel_write_dp_sdp(encoder, crtc_state, HDMI_PACKET_TYPE_GAMUT_METADATA);
++
++	/* Hades: the AVI and Dolby vendor InfoFrames of the tunnel through a converter */
++	intel_dp_pcon_dv_write(encoder, crtc_state);
+ }
+ 
+ static
+@@ -6193,6 +6491,18 @@ intel_dp_set_edid(struct intel_dp *intel_dp)
+ 	intel_dp_update_dfp(intel_dp, drm_edid);
+ 	intel_dp_update_420(intel_dp);
+ 
++	/*
++	 * Hades: what the EDID says of Dolby Vision (drm_dvbridge.h) for the atomic check of the
++	 * tunnel, and what is behind the port (the display info and the branch device are read now)
++	 */
++	if (connector->dv_lab_property) {
++		const struct drm_property_blob *blob = connector->base.edid_blob_ptr;
++
++		drm_dvbridge_edid_read(blob ? blob->data : NULL, blob ? blob->length : 0,
++				       &connector->dv_sink);
++		intel_dp_pcon_dv_update(intel_dp, true);
++	}
++
+ 	drm_dp_cec_attach(&intel_dp->aux,
+ 			  connector->base.display_info.source_physical_address);
+ }
+@@ -6216,6 +6526,12 @@ intel_dp_unset_edid(struct intel_dp *intel_dp)
+ 	intel_dp->dfp.ycbcr_444_to_420 = false;
+ 	connector->base.ycbcr_420_allowed = false;
+ 
++	/* Hades: no EDID, no Dolby Vision sink, no converter behind the port */
++	if (connector->dv_lab_property) {
++		drm_dvbridge_edid_read(NULL, 0, &connector->dv_sink);
++		intel_dp_pcon_dv_update(intel_dp, false);
++	}
++
+ 	drm_connector_set_vrr_capable_property(&connector->base,
+ 					       false);
+ }
+@@ -6943,6 +7259,9 @@ intel_dp_add_properties(struct intel_dp *intel_dp, struct drm_connector *_connec
+ 		intel_attach_dp_colorspace_property(&connector->base);
+ 	}
+ 
++	/* Hades: the tunnel through the converter of the board, where the port can carry it */
++	intel_dp_pcon_dv_add_properties(intel_dp, _connector);
++
+ 	if (intel_dp_has_gamut_metadata_dip(&dp_to_dig_port(intel_dp)->base))
+ 		drm_connector_attach_hdr_output_metadata_property(&connector->base);
+ 
+@@ -7376,9 +7695,11 @@ int intel_dp_sdp_min_guardband(const struct intel_crtc_state *crtc_state,
+ {
+ 	int sdp_guardband = 0;
+ 
++	/* (Hades: the tunnel through a converter takes the GMP DIP for its vendor InfoFrame) */
+ 	if (assume_all_enabled ||
+ 	    crtc_state->infoframes.enable &
+-	    intel_hdmi_infoframe_enable(HDMI_PACKET_TYPE_GAMUT_METADATA))
++	    (intel_hdmi_infoframe_enable(HDMI_PACKET_TYPE_GAMUT_METADATA) |
++	     intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_VENDOR)))
+ 		sdp_guardband = max(sdp_guardband,
+ 				    intel_dp_get_lines_for_sdp(crtc_state,
+ 							       HDMI_PACKET_TYPE_GAMUT_METADATA));
+diff --git a/drivers/gpu/drm/i915/display/intel_dp.h b/drivers/gpu/drm/i915/display/intel_dp.h
+index 04fae203b..314c74bf7 100644
+--- a/drivers/gpu/drm/i915/display/intel_dp.h
++++ b/drivers/gpu/drm/i915/display/intel_dp.h
+@@ -89,6 +89,7 @@ void intel_dp_audio_compute_config(struct intel_encoder *encoder,
+ 				   struct intel_crtc_state *pipe_config,
+ 				   struct drm_connector_state *conn_state);
+ bool intel_dp_has_hdmi_sink(struct intel_dp *intel_dp);
++bool intel_dp_pcon_dv_candidate(const struct intel_digital_port *dig_port);
+ bool intel_dp_is_edp(struct intel_dp *intel_dp);
+ bool intel_dp_is_uhbr(const struct intel_crtc_state *crtc_state);
+ bool intel_dp_has_dsc(const struct intel_connector *connector);

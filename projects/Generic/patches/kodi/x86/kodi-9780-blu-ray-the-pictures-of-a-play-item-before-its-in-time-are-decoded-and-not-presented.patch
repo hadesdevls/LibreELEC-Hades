@@ -1,0 +1,570 @@
+From 0bb686a9ae61084ce7160aa35913f8e993f55b2d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:22:34 +0000
+Subject: [PATCH] Blu-ray: the pictures of a play item before its IN time are
+ decoded and not presented
+
+libbluray wipes the primary video of a play item up to its first picture presented at or after the IN
+time. Where IN is not the time of a random-access picture, the pictures after IN are predicted from
+pictures before it, which it wiped: the decoder, which waits for a random-access picture, presented the
+play item only from its next one, up to a second later, and the Dolby Vision enhancement layer started
+there too (its random-access picture came, the base picture that it pairs with did not). That is the
+start of a play item whose IN the authoring did not put on a random-access picture, whether the
+playlist reaches it or a menu jumps to it.
+
+With libbluray-9091 (BLURAY_PLAYER_SETTING_VIDEO_PREROLL, asked for in SetupPlayerSettings(), in both
+modes) libbluray gives the primary video of a play item that is not joined seamlessly from the
+random-access picture at or before IN. The input says, for every byte it read, the IN time of the play
+item it was read for (BlurayPreroll.h: CPresentationStarts, kept where the timeline of the joins is kept:
+NavPlayItem(), NavRestart(), BeginClipSpan()). The demuxer marks a packet of the primary video presented
+before the IN time of its play item, on the clock of its clip (DemuxPacket::decodeOnly,
+MarkBlurayPreroll()); the decoder gives the mark to the picture of the packet through the opaque that
+FFmpeg copies from packet to frame (beside the count of doviSourceEpoch), and GetPicture() leaves that
+picture out after the pairing of the layers, as it leaves out a picture given again after a drain. So the
+play item is presented from IN with every picture, and with its enhancement layer from the first one.
+Nothing else is marked: the pictures of a seamless join, of audio, subtitles and menus, and every picture
+when libbluray did not take the setting. kodi.log says the first marks of a demuxer and of a decoder, and
+every hundredth. (A playlist played directly still loses the first bytes of a play item that does not
+join seamlessly to the demuxer that BD_EVENT_DISCONTINUITY resets, as before: there this helps the first
+play item and the ones a seek lands in.)
+
+Run on the host (the join test, with libbluray-9091 and a disc
+whose fourth playlist begins its second play item at the fourth picture of its clip, behind an EP map):
+the play item's video begins at the random-access picture before IN, and the three video packets
+presented before IN are marked, and only they; nothing of the other playlists is marked, also of a play
+item kept at a seamless join whose clock is far below the IN time of the one before (40 checks). Three
+mutations of the input and four of BlurayPreroll.h fail. The decoder's part is compiled with the commands
+of the image's build, not run: no Blu-ray here.
+
+The idea of decoding the pictures before IN and presenting none of them is CroqueMr's
+(libreelec-x86-DV, for the clips of Dolby Vision); written anew for every primary video, in both modes.
+---
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |  1 +
+ .../DVDCodecs/Video/DVDVideoCodec.h           |  4 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 41 +++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |  2 +
+ .../DVDCodecs/Video/DrainRestart.h            |  1 +
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 44 +++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  7 ++
+ .../DVDInputStreams/BlurayPreroll.h           | 93 +++++++++++++++++++
+ .../DVDInputStreams/CMakeLists.txt            |  1 +
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 40 ++++++++
+ .../DVDInputStreams/DVDInputStreamBluray.h    | 20 +++-
+ .../cores/VideoPlayer/Interface/DemuxPacket.h |  4 +
+ 12 files changed, 253 insertions(+), 5 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDInputStreams/BlurayPreroll.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index 29ca61e..f018fe4 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -77,6 +77,7 @@ void VideoPicture::Reset()
+   doviRpu.Reset();
+ #endif
+ 
++  decodeOnly = false;
+   hasDisplayMetadata = false;
+   hasLightMetadata = false;
+   hdr10PlusVsif.reset();
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index df2c5bc..3007bbd 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -157,6 +157,10 @@ public:
+   CDVMetadataBuffer doviRpu;
+ #endif
+ 
++  //! Hades: the picture of a packet that is decoded and not presented (DemuxPacket::decodeOnly):
++  //! the decoder that sets it leaves the picture out (CDVDVideoCodecFFmpeg::GetPicture())
++  bool decodeOnly = false;
++
+   bool hasDisplayMetadata = false;
+   AVMasteringDisplayMetadata displayMetadata;
+   bool hasLightMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 54c63e7..5b157f1 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -103,6 +103,14 @@ constexpr const char* WITHOUT_LAYER_AT_START =
+ } // namespace
+ #endif
+ 
++namespace
++{
++// Hades: the mark that the packet of a picture that is decoded and not presented
++// (DemuxPacket::decodeOnly) gives its opaque, which the decoder hands on to the picture
++// (AV_CODEC_FLAG_COPY_OPAQUE): the top bit, beside the count of doviSourceEpoch
++constexpr uintptr_t DECODE_ONLY_MARK = uintptr_t{1} << (sizeof(uintptr_t) * 8 - 1);
++} // namespace
++
+ enum DecoderState
+ {
+   STATE_NONE,
+@@ -1144,7 +1152,8 @@ bool CDVDVideoCodecFFmpeg::AddData(const DemuxPacket &packet)
+   avpkt->side_data = static_cast<AVPacketSideData*>(packet.pSideData);
+   avpkt->side_data_elems = packet.iSideDataElems;
+ 
+-  const bool sendAgain = SendPacket(avpkt, {packet.dts, packet.m_ptsOffset, packet.recoveryPoint});
++  const bool sendAgain =
++      SendPacket(avpkt, {packet.dts, packet.m_ptsOffset, packet.recoveryPoint, packet.decodeOnly});
+ 
+   //! @todo: properly handle avpkt side_data. this works around our improper use of the side_data
+   // as we pass pointers to ffmpeg allocated memory for the side_data. we should really be allocating
+@@ -1192,6 +1201,15 @@ bool CDVDVideoCodecFFmpeg::SendPacket(AVPacket* avpkt, const CDrainRestart::Info
+                                                                DVD_TIME_BASE * AV_TIME_BASE));
+   }
+ #endif
++  // Hades: the picture of a packet that is decoded and not presented (DemuxPacket::decodeOnly)
++  // takes a mark through the decoder to its picture (AV_CODEC_FLAG_COPY_OPAQUE), beside the count
++  // of doviSourceEpoch; GetPictureCommon() reads it and GetPicture() leaves the picture out
++  {
++    uintptr_t opaque = reinterpret_cast<uintptr_t>(avpkt->opaque) & ~DECODE_ONLY_MARK;
++    if (info.decodeOnly)
++      opaque |= DECODE_ONLY_MARK;
++    avpkt->opaque = reinterpret_cast<void*>(opaque);
++  }
+   // FFmpeg doesn't export the AV1 RPU, so keep it for the frame with the same pts
+   if (m_exportDoviRpu && m_hints.codec == AV_CODEC_ID_AV1 && avpkt->pts != AV_NOPTS_VALUE)
+   {
+@@ -1594,9 +1612,20 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetPicture(VideoPicture* pVideoPi
+ #endif
+     if (result == VC_EOF)
+       m_drainRestart.Ended();
+-    if (result != VC_PICTURE || pVideoPicture->pts == DVD_NOPTS_VALUE ||
+-        !m_drainRestart.Drop(pVideoPicture->pts))
++    if (result != VC_PICTURE)
+       break;
++    const bool wentOut =
++        pVideoPicture->pts != DVD_NOPTS_VALUE && m_drainRestart.Drop(pVideoPicture->pts);
++    // Hades: and a picture that is decoded for the ones after it and not presented (a Blu-ray
++    // picture before the IN time of its play item: DemuxPacket::decodeOnly) is left out too
++    if (!wentOut && !pVideoPicture->decodeOnly)
++      break;
++    if (!wentOut && (++m_decodeOnlyLeftOut <= 3 || m_decodeOnlyLeftOut % 100 == 0))
++      CLog::Log(LOGINFO,
++                "CDVDVideoCodecFFmpeg: the picture at {:.3f} s was decoded for the pictures after "
++                "it and is not presented: it is before the IN time of its Blu-ray play item ({} so "
++                "far)",
++                pVideoPicture->pts / DVD_TIME_BASE, m_decodeOnlyLeftOut);
+ #ifdef HAVE_DVBRIDGE
+     // (the counts of the enhancement layer are of the pictures that go out)
+     if (m_dvFel && !pVideoPicture->doviLayerNotDecoded)
+@@ -2594,7 +2623,8 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+                                      ? m_pFrame->pts
+                                      : m_pFrame->best_effort_timestamp;
+   pVideoPicture->doviSourceTimed = m_pFrame->pts != AV_NOPTS_VALUE;
+-  pVideoPicture->doviSourceEpoch = reinterpret_cast<uintptr_t>(m_pFrame->opaque);
++  pVideoPicture->doviSourceEpoch =
++      reinterpret_cast<uintptr_t>(m_pFrame->opaque) & ~DECODE_ONLY_MARK;
+   pVideoPicture->doviVideo = m_dvVideo;
+   pVideoPicture->doviConvert = m_dvConvert;
+   pVideoPicture->doviBaseIsPicture = DVBRIDGE::BaseLayerIsKnownPicture(
+@@ -2613,6 +2643,9 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+ #else
+   pVideoPicture->doviSourcePts = m_pFrame->best_effort_timestamp;
+ #endif
++  // Hades: a picture of a packet that is decoded and not presented (SendPacket())
++  pVideoPicture->decodeOnly =
++      (reinterpret_cast<uintptr_t>(m_pFrame->opaque) & DECODE_ONLY_MARK) != 0;
+   pVideoPicture->doviRpuNal.reset();
+   if (m_exportDoviRpu)
+   {
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index c18f05f..d59c48d 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -81,6 +81,8 @@ protected:
+   void ResetWithin();
+   //! Hades: an HEVC stream that goes on after its decoder was drained in the middle of it
+   CDrainRestart m_drainRestart;
++  //! Hades: pictures decoded and left out, not presented (VideoPicture::decodeOnly)
++  uint64_t m_decodeOnlyLeftOut{0};
+   //! Hades: HDR10+ across pictures without metadata of their own
+   KODI::UTILS::HDR10PLUS::CGap m_hdr10PlusGap;
+   //! Hades: the HDR10 static metadata that the stream carried in band, for its pictures that come
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
+index 33524e5..7990911 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DrainRestart.h
+@@ -77,6 +77,7 @@ public:
+     double dts = 0.0; //!< DemuxPacket::dts
+     double ptsOffset = 0.0; //!< DemuxPacket::m_ptsOffset
+     bool recoveryPoint = false; //!< DemuxPacket::recoveryPoint
++    bool decodeOnly = false; //!< DemuxPacket::decodeOnly
+   };
+ 
+   //! A packet kept: a copy of the packet as the decoder was given it (data and side data), what came
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index 06902eb..0027ed3 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -461,6 +461,8 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool
+     m_blurayReadPos.clear();
+     m_blurayTitleTimeMissed = false;
+     m_blurayNavigation = false;
++    m_blurayPrerollInput = nullptr;
++    m_blurayPrerolled = 0;
+     if (m_pInput->IsStreamType(DVDSTREAM_TYPE_BLURAY))
+     {
+       const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInput);
+@@ -468,6 +470,14 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool
+       // the packets on the timeline: BlurayJoin.h)
+       if (bluray)
+         bluray->SetTimelineReader(m_blurayTitleTimeWanted);
++      // Hades: the pictures of a play item before its IN time, which libbluray gives for the
++      // ones after them, are marked by the position of their packets (BlurayPreroll.h), whether
++      // or not the packets go on the timeline (the base view of a 3D disc does not)
++      if (bluray && bluray->HasVideoPreroll())
++      {
++        m_blurayPrerollInput = bluray.get();
++        m_blurayReadBase = bluray->GetReadPos();
++      }
+       if (bluray && m_blurayTitleTimeWanted)
+       {
+         m_blurayTitleInput = bluray.get();
+@@ -2189,6 +2199,38 @@ void CDVDDemuxFFmpeg::ConvertBlurayTimestamps(DemuxPacket* packet, const AVStrea
+   packet->pts = toTitle(m_pkt.pkt.pts);
+   packet->dts = toTitle(m_pkt.pkt.dts);
+ }
++
++void CDVDDemuxFFmpeg::MarkBlurayPreroll(DemuxPacket* packet, const AVStream* stream)
++{
++  // the primary video (PIDs 0x1011 to 0x101f, the streams libbluray gives from before IN), with
++  // its time as the transport stream gives it
++  if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || stream->id < 0x1011 ||
++      stream->id > 0x101f || m_pkt.pkt.pts == AV_NOPTS_VALUE)
++    return;
++
++  // a packet without a position is of the play item of its stream's last packet
++  const auto readPos =
++      m_blurayReadPos.try_emplace(m_pkt.pkt.stream_index, m_blurayPrerollInput->GetReadPos()).first;
++  if (m_pkt.pkt.pos >= 0)
++    readPos->second = m_blurayReadBase + static_cast<uint64_t>(m_pkt.pkt.pos);
++
++  const std::optional<uint64_t> inTime =
++      m_blurayPrerollInput->GetPresentationStart(readPos->second);
++  if (!inTime)
++    return;
++  constexpr AVRational CLIP_TIME_BASE = {1, 90000};
++  const int64_t pts = av_rescale_q(m_pkt.pkt.pts, stream->time_base, CLIP_TIME_BASE);
++  if (!KODI::BLURAYPREROLL::BeforeIn(pts, *inTime))
++    return;
++
++  packet->decodeOnly = true;
++  if (++m_blurayPrerolled <= 3 || m_blurayPrerolled % 100 == 0)
++    CLog::Log(LOGINFO,
++              "CDVDDemuxFFmpeg: the picture at {:.3f} s of its clip is before the IN time of its "
++              "play item ({:.3f} s): decoded for the pictures after it, not presented ({} so far)",
++              static_cast<double>(pts) / 90000.0, static_cast<double>(*inTime) / 90000.0,
++              m_blurayPrerolled);
++}
+ #endif
+ 
+ void CDVDDemuxFFmpeg::LogReadTimeout() const
+@@ -2338,6 +2380,8 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+ #ifdef HAVE_LIBBLURAY
+           if (m_blurayTitleInput)
+             ConvertBlurayTimestamps(pPacket, stream);
++          if (m_blurayPrerollInput)
++            MarkBlurayPreroll(pPacket, stream);
+ #endif
+           pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
+                                               stream->time_base.den);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 3f92b9a..d415cd3 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -232,6 +232,9 @@ protected:
+ #ifdef HAVE_LIBBLURAY
+   //! Hades: a packet of a playlist played directly, on the playlist's timeline (BlurayTitleTime.h)
+   void ConvertBlurayTimestamps(DemuxPacket* packet, const AVStream* stream);
++  //! Hades: a packet of the primary video presented before the IN time of its play item, which
++  //! libbluray gave for the pictures after it, is decoded and not presented (BlurayPreroll.h)
++  void MarkBlurayPreroll(DemuxPacket* packet, const AVStream* stream);
+ #endif
+   bool IsProgramChange();
+   unsigned int HLSSelectProgram();
+@@ -416,6 +419,10 @@ protected:
+   bool m_blurayTitleTimeMissed{false};
+   //! with the disc's menus: only the play items kept at a seamless join are on the timeline
+   bool m_blurayNavigation{false};
++  //! Hades: m_pInput, when libbluray gives the video of a play item from before its IN time
++  //! (MarkBlurayPreroll()); with m_blurayReadBase and m_blurayReadPos
++  CDVDInputStreamBluray* m_blurayPrerollInput{nullptr};
++  uint64_t m_blurayPrerolled{0}; //!< packets marked to be decoded and not presented
+ #endif
+   std::vector<ChapterFFmpeg> m_chapters;
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/BlurayPreroll.h b/xbmc/cores/VideoPlayer/DVDInputStreams/BlurayPreroll.h
+new file mode 100644
+index 0000000..414a5e4
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/BlurayPreroll.h
+@@ -0,0 +1,93 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++// Hades: the pictures of a Blu-ray play item before its IN time.
++//
++// libbluray gives the primary video of a play item that is not joined seamlessly from the
++// random-access picture at or before its IN time (BLURAY_PLAYER_SETTING_VIDEO_PREROLL,
++// libbluray-9091), not from the first picture presented at IN: where IN is not the time of a
++// random-access picture, the pictures after IN are predicted from pictures before it, and without
++// them the video of the play item could begin only at its next random-access picture, up to a second
++// later (and the enhancement layer of Dolby Vision with it). The pictures before IN are decoded for
++// the ones after them and never presented: the demuxer marks their packets (DemuxPacket::decodeOnly)
++// by the time each one is presented, on the clock of its clip, against the IN time of the play item
++// its bytes were read for; the decoder leaves their pictures out.
++//
++// Pure, for the tests.
++
++#include <algorithm>
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++namespace KODI::BLURAYPREROLL
++{
++
++//! The IN time (90 kHz, on the clock of its clip) of the play item of each byte that the input read
++class CPresentationStarts
++{
++public:
++  //! The bytes from readPos on are of a play item with this IN time; nothing when not known
++  void Begin(uint64_t readPos, std::optional<uint64_t> inTime)
++  {
++    // a play item opened again where nothing was read of the one before replaces it
++    while (!m_starts.empty() && m_starts.back().readPos >= readPos)
++      m_starts.pop_back();
++    if (!m_starts.empty() && m_starts.back().inTime == inTime)
++      return;
++    if (m_starts.size() == MAX_STARTS)
++      m_starts.erase(m_starts.begin());
++    m_starts.push_back({readPos, inTime});
++  }
++
++  //! A demuxer opens or a seek was made: what was read before is not asked for again
++  void Restart(uint64_t readPos, std::optional<uint64_t> inTime)
++  {
++    m_starts.clear();
++    m_starts.push_back({readPos, inTime});
++  }
++
++  void Clear() { m_starts.clear(); }
++
++  //! The IN time of the play item of the byte at readPos, or nothing
++  std::optional<uint64_t> At(uint64_t readPos) const
++  {
++    const auto it =
++        std::upper_bound(m_starts.begin(), m_starts.end(), readPos,
++                         [](uint64_t pos, const Start& start) { return pos < start.readPos; });
++    if (it == m_starts.begin())
++      return {};
++    return std::prev(it)->inTime;
++  }
++
++private:
++  struct Start
++  {
++    uint64_t readPos{0};
++    std::optional<uint64_t> inTime;
++  };
++  //! more than the play items of any playlist (999)
++  static constexpr size_t MAX_STARTS = 1024;
++  std::vector<Start> m_starts;
++};
++
++/*!
++ * \brief Whether a picture presented at \p pts (90 kHz, as the transport stream gives it, which
++ *        libavformat may have taken past the 33 bits of the clock) is presented before the IN time
++ *        \p inTime (90 kHz) of its play item. On the 33-bit clock: before by less than half of it.
++ */
++inline bool BeforeIn(int64_t pts, uint64_t inTime)
++{
++  constexpr int64_t WRAP = INT64_C(1) << 33;
++  const int64_t difference = (pts - static_cast<int64_t>(inTime % WRAP)) & (WRAP - 1);
++  return difference >= WRAP / 2;
++}
++
++} // namespace KODI::BLURAYPREROLL
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
+index 977456e..41174cb 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/CMakeLists.txt
+@@ -35,6 +35,7 @@ if(TARGET ${APP_NAME_LC}::Bluray)
+   list(APPEND SOURCES DVDInputStreamBluray.cpp
+                       DVDInputStreamBlurayFile.cpp)
+   list(APPEND HEADERS BlurayJoin.h
++                      BlurayPreroll.h
+                       BlurayTitleTime.h
+                       DVDInputStreamBluray.h
+                       DVDInputStreamBlurayFile.h)
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index e369e4c..50b4e91 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -791,7 +791,11 @@ void CDVDInputStreamBluray::ProcessEvent() {
+       BeginClipSpan(false);
+     }
+     else if (!m_navmode)
++    {
+       m_clipSpans.Begin(m_readPos, std::nullopt);
++      std::unique_lock lock(m_navTimelineLock);
++      m_presentationStarts.Begin(m_readPos, std::nullopt);
++    }
+     // Hades: in navigation mode, on the timeline where a seamless join kept the streams, or on
+     // the clock of its clip (KeepStreamsAtJoin())
+     if (m_navmode)
+@@ -1034,12 +1038,21 @@ void CDVDInputStreamBluray::BeginClipSpan(bool restart)
+   }
+ 
+   std::optional<KODI::BLURAYTIMELINE::ClipTime> time;
++  std::optional<uint64_t> inTime;
+   if (m_clip)
++  {
+     time = KODI::BLURAYTIMELINE::ClipTime{m_clip->in_time, m_clip->start_time};
++    inTime = m_clip->in_time;
++  }
+   if (restart)
+     m_clipSpans.Restart(m_readPos, time);
+   else
+     m_clipSpans.Begin(m_readPos, time);
++  std::unique_lock lock(m_navTimelineLock);
++  if (restart)
++    m_presentationStarts.Restart(m_readPos, inTime);
++  else
++    m_presentationStarts.Begin(m_readPos, inTime);
+ }
+ 
+ std::optional<KODI::BLURAYTIMELINE::ClipTime> CDVDInputStreamBluray::GetClipTime(
+@@ -1053,6 +1066,12 @@ std::optional<KODI::BLURAYTIMELINE::ClipTime> CDVDInputStreamBluray::GetClipTime
+   return m_clipSpans.At(readPos);
+ }
+ 
++std::optional<uint64_t> CDVDInputStreamBluray::GetPresentationStart(uint64_t readPos) const
++{
++  std::unique_lock lock(m_navTimelineLock);
++  return m_presentationStarts.At(readPos);
++}
++
+ bool CDVDInputStreamBluray::KeepStreamsAtJoin(int readBytes, bool fromRead)
+ {
+   namespace JOIN = KODI::BLURAYJOIN;
+@@ -1151,6 +1170,11 @@ bool CDVDInputStreamBluray::KeepStreamsAtJoin(int readBytes, bool fromRead)
+ void CDVDInputStreamBluray::NavPlayItem(uint32_t item)
+ {
+   std::unique_lock lock(m_navTimelineLock);
++  // (the bytes from here on are of this play item, whatever the timeline does)
++  m_presentationStarts.Begin(m_readPos,
++                             m_titleInfo && item < m_titleInfo->clip_count
++                                 ? std::optional<uint64_t>(m_titleInfo->clips[item].in_time)
++                                 : std::nullopt);
+   if (m_navKept)
+   {
+     // the bytes of this read are the first of the play item kept (counted after the event)
+@@ -1176,10 +1200,16 @@ void CDVDInputStreamBluray::NavRestart()
+   m_navKept.reset();
+   const uint32_t item = m_playItem;
+   if (m_titleInfo && item < m_titleInfo->clip_count)
++  {
+     m_navAnchor = KODI::BLURAYTIMELINE::ClipTime{m_titleInfo->clips[item].in_time,
+                                                  m_titleInfo->clips[item].start_time};
++    m_presentationStarts.Restart(m_readPos, m_titleInfo->clips[item].in_time);
++  }
+   else
++  {
+     m_navAnchor.reset();
++    m_presentationStarts.Restart(m_readPos, std::nullopt);
++  }
+ }
+ 
+ void CDVDInputStreamBluray::ReadConnections()
+@@ -2367,6 +2397,16 @@ void CDVDInputStreamBluray::SetupPlayerSettings()
+   CLog::Log(LOGINFO, "CDVDInputStreamBluray::Open - BD-Live: {}",
+             bdLive ? "on: the Java of a disc may reach IPv4 addresses of the Internet only"
+                    : "off: the Java of a disc has no network");
++#endif
++#ifdef BD_HAVE_VIDEO_PREROLL
++  // Hades: the primary video of a play item from the random-access picture at or before its IN
++  // time, so that its first pictures can be decoded; the demuxer marks the ones before IN, and the
++  // decoder does not present them (BlurayPreroll.h)
++  m_videoPreroll = bd_set_player_setting(m_bd, BLURAY_PLAYER_SETTING_VIDEO_PREROLL, 1) != 0;
++  CLog::Log(LOGINFO, "CDVDInputStreamBluray::Open - the video of a play item {}",
++            m_videoPreroll ? "comes from the random-access picture at or before its IN time; the "
++                             "pictures before IN are decoded and not presented"
++                           : "comes from its IN time (libbluray did not take the setting)");
+ #endif
+   bd_set_player_setting(m_bd, BLURAY_PLAYER_SETTING_PARENTAL, 99);
+   bd_set_player_setting(m_bd, BLURAY_PLAYER_SETTING_3D_CAP, 0xffffffff);
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index 371548a..4aa6da4 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "BlurayPreroll.h"
+ #include "BlurayStateSerializer.h"
+ #include "BlurayTitleTime.h"
+ #include "DVDInputStream.h"
+@@ -178,6 +179,19 @@ public:
+    */
+   void SetTimelineReader(bool on) { m_timelineReader = on; }
+ 
++  /*!
++   * \brief Hades: libbluray gives the primary video of a play item from the random-access picture
++   *        at or before its IN time (BlurayPreroll.h): the pictures presented before IN are for the
++   *        decoder only.
++   */
++  bool HasVideoPreroll() const { return m_videoPreroll; }
++
++  /*!
++   * \brief Hades: the IN time (90 kHz, on the clock of its clip) of the play item that a byte
++   *        returned by Read() was read for, in both modes (BlurayPreroll.h); nothing when not known.
++   */
++  std::optional<uint64_t> GetPresentationStart(uint64_t readPos) const;
++
+   /*!
+    * \brief Whether the playing title carries a stereoscopic (MVC) sub-path.
+    *
+@@ -561,9 +575,13 @@ protected:
+     //! Hades: navigation mode, the time of the play item that KeepStreamsAtJoin() kept, for
+     //! NavPlayItem()
+     std::optional<KODI::BLURAYTIMELINE::ClipTime> m_navKept;
++    //! Hades: the IN time of the play item of each byte that Read() returned (GetPresentationStart())
++    KODI::BLURAYPREROLL::CPresentationStarts m_presentationStarts;
++    //! Hades: libbluray took BLURAY_PLAYER_SETTING_VIDEO_PREROLL (BlurayPreroll.h)
++    bool m_videoPreroll{false};
+     //! Hades: navigation mode, guards m_clipSpans, m_navAnchor, m_navKept, m_connections and
+     //! m_connectionsPlaylist: the events of the disc are also processed by the thread of the
+-    //! application (UserInput())
++    //! application (UserInput()). Also m_presentationStarts, in both modes.
+     mutable CCriticalSection m_navTimelineLock;
+     //! Hades: whether the demuxer reading puts its packets on the timeline (SetTimelineReader())
+     std::atomic<bool> m_timelineReader{false};
+diff --git a/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h b/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h
+index 3b5fb04..67cb1bf 100644
+--- a/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h
++++ b/xbmc/cores/VideoPlayer/Interface/DemuxPacket.h
+@@ -45,6 +45,10 @@ extern "C"
+     double m_ptsOffsetCorrection{0};
+     //! @brief The sum of all the corrections applied to the PTS and DTS of this packet.
+     double m_ptsOffset{0};
++    //! @brief Hades: the picture of this packet is decoded for the pictures that are predicted
++    //! from it, and not presented (a Blu-ray picture before the IN time of its play item:
++    //! DVDInputStreams/BlurayPreroll.h)
++    bool decodeOnly{false};
+   };
+ 
+ #ifdef __cplusplus
+-- 
+2.53.0
+

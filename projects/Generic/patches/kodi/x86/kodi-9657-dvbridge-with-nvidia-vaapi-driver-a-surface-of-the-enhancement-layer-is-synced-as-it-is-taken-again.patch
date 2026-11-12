@@ -1,0 +1,164 @@
+From 6e5be5f6fb1c64699d5a131eb38f8e342cc3f0c1 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 00:41:50 +0000
+Subject: [PATCH] dvbridge: with nvidia-vaapi-driver a surface of the
+ enhancement layer is synced as it is taken again
+
+The decoder of the enhancement layer takes its surfaces from FFmpeg's
+pool (counted_buffer()), which hands out the one given back last first.
+nvidia-vaapi-driver copies a decoded picture into the image of its
+surface on a thread of its own after the decode, and nvBeginPicture()
+waits for a pending copy only when the surface comes from another
+decoder: a copy that ends after the next picture began marks that one
+as copied. A picture of the layer that is let go without being drawn
+(the queue emptied after a seek, one that no base picture took, one of
+a repeated time) is given back without the map that syncs a drawn one,
+so the next picture of the layer can be decoded into its surface with
+that copy still pending, and the sync of the map of the new picture can
+come back before its own copy: the residual of another picture, or part
+of one. This is read from the code of the driver; it has not been seen.
+
+With that driver (the fixed pool of 32 surfaces, fixed_pool_driver())
+the surface is synced as the decoder takes it, before it is decoded
+into again. Where nothing is pending that comes back at once, as for
+every surface whose picture was drawn. The line "DV FEL: at most N
+surfaces ..." of kodi.log says how many surfaces waited more than
+0.1 ms in that sync, to see on the hardware whether it ever does.
+---
+ tools/dvbridge/dvbridge_fel.c                 | 39 ++++++++++++++++++-
+ tools/dvbridge/dvbridge_fel.h                 |  2 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  9 ++++-
+ 3 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_fel.c b/tools/dvbridge/dvbridge_fel.c
+index 5b882c6..8c5b7da 100644
+--- a/tools/dvbridge/dvbridge_fel.c
++++ b/tools/dvbridge/dvbridge_fel.c
+@@ -22,6 +22,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ #define QUEUE_MAX 32
+ #define PACKET_BYTES_MAX (64u * 1024u * 1024u)
+@@ -304,6 +305,10 @@ struct dvbridge_fel {
+     AVBufferRef *surfaces;
+     unsigned surfaces_peak, surfaces_pool, surfaces_none_free, surfaces_uncounted;
+     bool surface_failed;
++    /* Hades: a surface is synced as it is taken again (sync_reused(): nvidia-vaapi-driver), and the surfaces that still
++     * had the copy of their last picture pending then */
++    bool sync_reused;
++    unsigned surfaces_synced;
+     /* the most surfaces the layer may hold (SURFACES_MAX); the access units that waited for one to be given back,
+      * and whether the first one queued waits now (pump()) */
+     unsigned surface_limit, surface_waits;
+@@ -449,6 +454,29 @@ static void surface_released(void *opaque, uint8_t *data)
+     av_buffer_unref(&count);
+ }
+ 
++/* Hades: the surface that a picture of the layer takes is the one given back last (FFmpeg's pool hands that one out
++ * first, av_buffer_pool_get()). With nvidia-vaapi-driver its last picture can still be on its way into the image of the
++ * surface: nvBeginPicture() waits for that copy only when the surface comes from another decoder, and a copy that
++ * ends after the next picture began marks that one as copied (vabackend.c), so that the sync of the map of the next
++ * picture (dvbridge_dmabuf_import_cached()) can come back before its own copy. A picture of the layer let go without
++ * being drawn (after a seek, or one that no base picture took) leaves such a copy behind. The surface is waited for
++ * here, before it is decoded into again; that comes back at once where nothing is pending, as for every surface given
++ * back after it was drawn (its map synced it). */
++static void sync_reused(struct dvbridge_fel *f, const AVCodecContext *ctx, const AVFrame *frame)
++{
++    const AVHWDeviceContext *d = ctx->hw_device_ctx ? (const AVHWDeviceContext *)ctx->hw_device_ctx->data : NULL;
++    const AVVAAPIDeviceContext *va = d && d->type == AV_HWDEVICE_TYPE_VAAPI ? d->hwctx : NULL;
++    if (!va || !va->display || frame->format != AV_PIX_FMT_VAAPI)
++        return;
++    struct timespec a, b;
++    clock_gettime(CLOCK_MONOTONIC, &a);
++    vaSyncSurface(va->display, (VASurfaceID)(uintptr_t)frame->data[3]);
++    clock_gettime(CLOCK_MONOTONIC, &b);
++    /* (a wait of more than a tenth of a millisecond: a copy was pending) */
++    if ((long long)(b.tv_sec - a.tv_sec) * 1000000000LL + (b.tv_nsec - a.tv_nsec) > 100000LL)
++        ++f->surfaces_synced;
++}
++
+ /* Hades: the decoder of the layer takes the surface of each of its pictures here, from the pool of its frames context
+  * as it would without this (avcodec_default_get_buffer2()). Each picture carries a reference of its own (opaque_ref,
+  * which no other part of this decoder sets) that goes with its buffers wherever the picture is referenced or copied
+@@ -468,6 +496,8 @@ static int counted_buffer(AVCodecContext *ctx, AVFrame *frame, int flags)
+         f->surface_failed = true;
+         return result;
+     }
++    if (f->sync_reused)
++        sync_reused(f, ctx, frame);
+     AVBufferRef *count = frame->opaque_ref ? NULL : av_buffer_ref(f->surfaces);
+     AVBufferRef *held = count ? av_buffer_create(f->surfaces->data, f->surfaces->size, surface_released, count, 0)
+                               : NULL;
+@@ -515,6 +545,7 @@ void dvbridge_fel_surface_counts(const struct dvbridge_fel *f, struct dvbridge_f
+     out->uncounted = f->surfaces_uncounted;
+     out->limit = f->surface_limit;
+     out->waits = f->surface_waits;
++    out->synced = f->surfaces_synced;
+ }
+ 
+ /* Hades: whether the decoder of the layer has a fixed pool of SURFACES_MAX surfaces, by what its VAAPI driver says it
+@@ -554,7 +585,8 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
+      * with VAAPI 1 grows as surfaces are needed (0). (A libva without VAAPI 1, which LibreELEC does not have, gets a
+      * fixed one sized by the references alone: the queue's own come on top, up to SURFACES_MAX, as before.) Either
+      * way the layer holds at most SURFACES_MAX (surface_limit, pump()). */
+-    if (fixed_pool_driver(ctx->hw_device_ctx))
++    const bool fixed = fixed_pool_driver(ctx->hw_device_ctx);
++    if (fixed)
+         hw->initial_pool_size = SURFACES_MAX;
+     else if (hw->initial_pool_size > 0)
+         hw->initial_pool_size = FFMIN(hw->initial_pool_size + QUEUE_MAX + 4, SURFACES_MAX);
+@@ -564,8 +596,11 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx, const enum AVPixe
+     }
+     /* Hades: (for the log, and for what a picture that finds no surface says) */
+     struct dvbridge_fel *f = ctx->opaque;
+-    if (f)
++    if (f) {
+         f->surfaces_pool = hw->initial_pool_size > 0 ? (unsigned)hw->initial_pool_size : 0;
++        /* (Hades: and its surfaces are synced as they are taken again, sync_reused()) */
++        f->sync_reused = fixed;
++    }
+     av_buffer_unref(&ctx->hw_frames_ctx);
+     ctx->hw_frames_ctx = frames;
+     return AV_PIX_FMT_VAAPI;
+diff --git a/tools/dvbridge/dvbridge_fel.h b/tools/dvbridge/dvbridge_fel.h
+index 1f3e985..1c4f95b 100644
+--- a/tools/dvbridge/dvbridge_fel.h
++++ b/tools/dvbridge/dvbridge_fel.h
+@@ -96,6 +96,8 @@ struct dvbridge_fel_surfaces {
+     unsigned uncounted; /* pictures whose surface could not be counted (live and peak are low by as many) */
+     unsigned limit;     /* the most the layer holds: an access unit waits while it holds as many */
+     unsigned waits;     /* access units that waited for a surface to be given back */
++    unsigned synced;    /* Hades: surfaces taken again that still had the copy of their last picture pending, and
++                           were waited for (nvidia-vaapi-driver) */
+ };
+ void dvbridge_fel_surface_counts(const struct dvbridge_fel *fel, struct dvbridge_fel_surfaces *out);
+ /* Enhancement packets discarded while waiting for a random-access point since the last reset. */
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 096aafc..d65bc9d 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -907,11 +907,16 @@ void CDVDVideoCodecFFmpeg::Dispose()
+     CLog::Log(LOGINFO,
+               "DV FEL: at most {} surfaces of the enhancement layer were held at once ({}{}, at most {}); {} "
+               "enhancement access units waited for one to be given back, and {} pictures of the layer found none "
+-              "free{}",
++              "free{}{}",
+               surfaces.peak,
+               surfaces.pool ? "of the fixed pool of its decoder, " : "its decoder's pool grows as they are needed",
+               surfaces.pool ? std::to_string(surfaces.pool) : std::string(), surfaces.limit, surfaces.waits,
+-              surfaces.none_free, surfaces.uncounted ? "; some pictures could not be counted" : "");
++              surfaces.none_free, surfaces.uncounted ? "; some pictures could not be counted" : "",
++              surfaces.synced
++                  ? StringUtils::Format("; {} surfaces taken again still had the copy of their "
++                                        "last picture pending, and were waited for",
++                                        surfaces.synced)
++                  : std::string());
+   m_dvNotDecoded = 0;
+   m_dvNotDecodedLogged = false;
+   m_dvDecodedAgain = 0;
+-- 
+2.53.0
+

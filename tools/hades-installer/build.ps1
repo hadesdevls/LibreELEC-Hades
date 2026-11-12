@@ -9,7 +9,7 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $csc)) { throw "The C# compiler of Windows was not found: $csc" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $exe = Join-Path $Out 'LibreELEC-Hades-Installer.exe'
-$sources = 'Model.cs', 'Image.cs', 'Diagnostics.cs', 'Disks.cs', 'Operations.cs', 'Window.cs', 'Tests.cs', 'VhdTest.cs', 'Program.cs' |
+$sources = 'AssemblyInfo.cs', 'Model.cs', 'Image.cs', 'BootMenus.cs', 'Diagnostics.cs', 'Disks.cs', 'Operations.cs', 'Ui.cs', 'Window.cs', 'Tests.cs', 'BootTests.cs', 'VhdTest.cs', 'Program.cs' |
   ForEach-Object { Join-Path $PSScriptRoot $_ }
 # The sources are UTF-8 without a byte order mark: /codepage says so, or the accents and quotes of the texts
 # would depend on what the compiler guesses.
@@ -17,7 +17,8 @@ $sources = 'Model.cs', 'Image.cs', 'Diagnostics.cs', 'Disks.cs', 'Operations.cs'
 # not have that option (nor /pathmap: they came with the Roslyn compiler), and an option that it does not know
 # stops the build. Two builds of the same sources can therefore differ in their bytes.
 & $csc /nologo /target:winexe /platform:anycpu /optimize+ /warn:4 /warnaserror+ /codepage:65001 `
-  "/win32manifest:$(Join-Path $PSScriptRoot 'app.manifest')" "/out:$exe" `
+  "/win32manifest:$(Join-Path $PSScriptRoot 'app.manifest')" "/win32icon:$(Join-Path $PSScriptRoot 'app.ico')" `
+  "/resource:$(Join-Path $PSScriptRoot 'app.ico'),Hades.Installer.app.ico" "/out:$exe" `
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll $sources
 if ($LASTEXITCODE -ne 0) { throw "The build failed ($LASTEXITCODE)" }
 $exe

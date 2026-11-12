@@ -5,7 +5,7 @@
 PKG_NAME="automake"
 PKG_VERSION="1.20"
 PKG_SHA256="f6f34dad4cbe395715762b0710f7c511e39bd5cf777e6b95818ccbecf7714248"
-PKG_LICENSE="GPL-2.0-or-later"
+PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="http://sources.redhat.com/automake/"
 PKG_URL="https://ftp.gnu.org/gnu/automake/${PKG_NAME}-${PKG_VERSION}.tar.xz"
 PKG_DEPENDS_HOST="ccache:host autoconf:host"

@@ -8,6 +8,7 @@ PKG_SHA256="8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="https://ffmpeg.org"
 PKG_URL="http://ffmpeg.org/releases/ffmpeg-${PKG_VERSION}.tar.xz"
+PKG_DEPENDS_HOST="toolchain:host"
 PKG_DEPENDS_TARGET="toolchain zlib bzip2 openssl speex libxml2"
 PKG_LONGDESC="FFmpeg is a complete, cross-platform solution to record, convert and stream audio and video."
 PKG_BUILD_FLAGS="+hardening -bindnow"
@@ -128,6 +129,13 @@ post_patch() {
   if [ "${PROJECT}" = "Generic" ]; then
     bash ${PKG_DIR}/h264-mvc/twin.sh ${PKG_BUILD} ${PKG_DIR}/h264-mvc
   fi
+
+  # Hades: a copy of the sources as they are now, patched, for ffmpeg:host (below). The target is
+  # configured in ${PKG_BUILD} itself, and FFmpeg builds out of its source tree only from a tree that was
+  # never configured in place; the host and the target may be built in either order, or at once. Made
+  # here, at unpack time, it is the tree that both start from. Nothing of the target reads it.
+  mkdir -p ${PKG_BUILD}/.hades-host-source
+  cp -PR ${PKG_BUILD}/* ${PKG_BUILD}/.hades-host-source/
 }
 
 pre_configure_target() {
@@ -250,4 +258,48 @@ configure_target() {
 
 post_makeinstall_target() {
   rm -rf ${INSTALL}/usr/share/ffmpeg/examples
+}
+
+# Hades: FFmpeg for the build host, for the clips of "Check this setup" (packages/mediacenter/hades-check):
+# the ffmpeg and ffprobe programs with only the parts that the clips and their checks use, static, without
+# network, C code only, for the baseline of the host's architecture (without -march=native) and without
+# contraction of floating-point expressions, so that what they make does not depend on the CPU of the
+# build host. Built out of tree from the copy that post_patch makes, in ${PKG_BUILD}/.${HOST_NAME}, and
+# installed outside the toolchain's PATH, where nothing else finds them (no libraries, no headers); never
+# into the image. (FFmpeg's configure takes CFLAGS from the environment as well, so the flags go there.)
+configure_host() {
+  CFLAGS="${CFLAGS//${HOST_CFLAGS_OPTIM_NATIVE}/} -ffp-contract=off" \
+  CXXFLAGS="${CXXFLAGS//${HOST_CFLAGS_OPTIM_NATIVE}/} -ffp-contract=off" \
+  ${PKG_BUILD}/.hades-host-source/configure \
+    --prefix=${TOOLCHAIN}/lib/hades-check \
+    --cc="${CC}" \
+    --host-cc="${CC}" \
+    --ar="${AR}" \
+    --nm="${NM}" \
+    --ranlib="${RANLIB}" \
+    --pkg-config=false \
+    --disable-everything \
+    --disable-autodetect \
+    --disable-network \
+    --disable-doc \
+    --disable-debug \
+    --disable-shared \
+    --enable-static \
+    --disable-asm \
+    --disable-ffplay \
+    --enable-ffmpeg \
+    --enable-ffprobe \
+    --enable-encoder=ac3,eac3,mlp,truehd,dca,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,rawvideo,wrapped_avframe \
+    --enable-decoder=ac3,eac3,mlp,truehd,dca,flac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,hevc,rawvideo \
+    --enable-parser=ac3,mlp,dca,flac,hevc \
+    --enable-demuxer=matroska,mov,ac3,eac3,truehd,dts,flac,wav,hevc,rawvideo,pcm_f32le,pcm_s32le,yuv4mpegpipe \
+    --enable-muxer=matroska,mp4,ac3,eac3,truehd,dts,flac,wav,hevc,rawvideo,null,md5,framemd5,framecrc \
+    --enable-bsf=hevc_mp4toannexb,extract_extradata,dovi_rpu,hevc_metadata,null \
+    --enable-filter=aresample,aformat,anull,volume,ebur128,astats,null,format,scale \
+    --enable-protocol=file,pipe
+}
+
+makeinstall_host() {
+  mkdir -p ${TOOLCHAIN}/lib/hades-check/bin
+  cp ffmpeg ffprobe ${TOOLCHAIN}/lib/hades-check/bin/
 }

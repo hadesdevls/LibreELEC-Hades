@@ -1,0 +1,189 @@
+From db215817096c8f3b4df23df32c64baa5ab1c71a5 Mon Sep 17 00:00:00 2001
+From: tanio99 <tanio99@wolke7.net>
+Date: Thu, 29 Oct 2026 17:01:10 +0100
+Subject: [PATCH] AEStreamParser: keep a DTS-HD MA stream MA when its XLL
+ frames straddle
+
+SyncDTS() takes the stream type from the word right after the EXSS header on every frame: the
+XLL sync means MA, an XCH/XXCH/X96/XBR/LBR sync means HRA. At its peak bit rate a DTS-HD MA
+encoder lets XLL frames straddle substream frames, so that word is then XLL payload. The payload
+is low-entropy and regularly contains 0x5a5a5a5a, the XCH sync (43 times in 41 MB of one track,
+where random data gives about 0.05).
+
+Since f8c5fb83 a stream already typed MA switches to HRA only on the third such frame with no XLL
+sync in between, but a straddling run has no XLL sync at that position, so it still switches. A
+stream that starts inside a straddling run has no type yet and switches on the first one. Either
+way the sink is reopened with 6 channels and 8320-byte frames are packed into 8192-byte bursts,
+which crashed Kodi until the packer guard in the previous commit.
+
+A parser lives for one audio stream (Reset() only flushes), so once the stream is known to be MA
+it now stays MA. It is known from CDVDAudioCodecPassthrough::Open(), which was created with the
+type the demuxer's profile gave (new SetDTSHDMA()), or from an XLL sync seen by the parser. The
+seed matters: without it, playback that starts inside a straddling run, such as a resume or
+chapter jump into a loud passage, has seen no XLL yet and still misdetects. Measured by running
+these sources on the affected title's DTS-HD MA track: 238 bursts (2.5 s) dropped without the
+seed, none with it.
+
+Streams with no XLL sync and no MA profile, such as DTS-HD HRA, take the same branches as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+(Backported from xbmc/xbmc pull request 30440, commit 41daffe19b7d.)
+---
+ xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp |  9 +++
+ xbmc/cores/AudioEngine/Utils/AEStreamInfo.h   |  2 +
+ .../Utils/test/TestAEStreamParser.cpp         | 70 ++++++++++++++++++-
+ .../Audio/DVDAudioCodecPassthrough.cpp        |  1 +
+ 4 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
+index f69c17c..720a381 100644
+--- a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
++++ b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.cpp
+@@ -657,8 +657,17 @@ unsigned int CAEStreamParser::SyncDTS(uint8_t* data, unsigned int size)
+       else if (hd_sync == DTS_PREAMBLE_XLL)
+       {
+         dataType = CAEStreamInfo::STREAM_TYPE_DTSHD_MA;
++        m_dtsHDMA = true;
+         m_skipCount = 0;
+       }
++      // At its peak bit rate an MA stream lets XLL frames straddle substream frames, so the word
++      // after the header is then XLL payload, not a sync word. That payload is low-entropy and
++      // regularly contains 0x5a5a5a5a, the XCH sync. Taking it as an HRA stream switches the
++      // packer to a 2048 period whose burst the frame does not fit. One parser serves one stream
++      // (Reset() only flushes), so once the stream is known to be MA - from the codec, which has
++      // it from the demuxer's profile, or from an XLL sync seen here - it stays MA.
++      else if (m_dtsHDMA)
++        dataType = CAEStreamInfo::STREAM_TYPE_DTSHD_MA;
+       else if (hd_sync == DTS_PREAMBLE_XCH || hd_sync == DTS_PREAMBLE_XXCH ||
+                hd_sync == DTS_PREAMBLE_X96K || hd_sync == DTS_PREAMBLE_XBR ||
+                hd_sync == DTS_PREAMBLE_LBR)
+diff --git a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.h b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.h
+index 4840ac7..c57d250 100644
+--- a/xbmc/cores/AudioEngine/Utils/AEStreamInfo.h
++++ b/xbmc/cores/AudioEngine/Utils/AEStreamInfo.h
+@@ -58,6 +58,7 @@ public:
+   int AddData(uint8_t *data, unsigned int size, uint8_t **buffer = NULL, unsigned int *bufferSize = 0);
+ 
+   void SetCoreOnly(bool value) { m_coreOnly = value; }
++  void SetDTSHDMA(bool value) { m_dtsHDMA = value; }
+   unsigned int IsValid() const { return m_hasSync; }
+   unsigned int GetSampleRate() const { return m_info.m_sampleRate; }
+   unsigned int GetChannels() const { return m_info.m_channels; }
+@@ -86,6 +87,7 @@ private:
+ 
+   unsigned int m_skipCount = 0;
+   unsigned int m_coreSize = 0;         /* core size for dtsHD */
++  bool m_dtsHDMA = false;              /* stream is dtsHD MA for this parser's lifetime */
+   unsigned int m_dtsBlocks = 0;
+   unsigned int m_fsize = 0;
+   int m_substreams = 0;       /* used for TrueHD  */
+diff --git a/xbmc/cores/AudioEngine/Utils/test/TestAEStreamParser.cpp b/xbmc/cores/AudioEngine/Utils/test/TestAEStreamParser.cpp
+index 2c1e21d..1ec9a08 100644
+--- a/xbmc/cores/AudioEngine/Utils/test/TestAEStreamParser.cpp
++++ b/xbmc/cores/AudioEngine/Utils/test/TestAEStreamParser.cpp
+@@ -48,6 +48,24 @@ std::vector<uint8_t> UnknownExtension()
+   return ext;
+ }
+ 
++//! A DTS-HD MA extension at peak bit rate, where an XLL frame straddles the substream frame: the
++//! word after the header is XLL payload, here one that happens to read as the XCH sync.
++std::vector<uint8_t> StraddlingExtension()
++{
++  std::vector<uint8_t> ext = HdExtension();
++  const uint8_t xchLookalike[] = {0x5A, 0x5A, 0x5A, 0x5A};
++  std::copy(std::begin(xchLookalike), std::end(xchLookalike), ext.begin() + 16);
++  return ext;
++}
++
++std::vector<uint8_t> StraddlingFrame()
++{
++  std::vector<uint8_t> frame = CoreFrame();
++  const std::vector<uint8_t> ext = StraddlingExtension();
++  frame.insert(frame.end(), ext.begin(), ext.end());
++  return frame;
++}
++
+ std::vector<uint8_t> MaFrame()
+ {
+   std::vector<uint8_t> frame = CoreFrame();
+@@ -62,9 +80,12 @@ void Append(std::vector<uint8_t>& stream, const std::vector<uint8_t>& bytes)
+ }
+ 
+ //! The type the parser reported for every frame it handed out, fed at most \p chunk bytes a call.
+-std::vector<CAEStreamInfo::DataType> Parse(std::vector<uint8_t> stream, size_t chunk = SIZE_MAX)
++std::vector<CAEStreamInfo::DataType> Parse(std::vector<uint8_t> stream,
++                                           size_t chunk = SIZE_MAX,
++                                           bool knownMa = false)
+ {
+   CAEStreamParser parser;
++  parser.SetDTSHDMA(knownMa);
+   std::vector<CAEStreamInfo::DataType> types;
+   size_t pos = 0;
+   while (pos < stream.size())
+@@ -154,3 +175,50 @@ TEST(TestAEStreamParser, ACoreOnlyStreamIsStillDts)
+   for (const CAEStreamInfo::DataType type : types)
+     EXPECT_EQ(CAEStreamInfo::STREAM_TYPE_DTS_512, type);
+ }
++
++//! At peak bit rate the word after an MA extension header can be XLL payload that reads as the XCH
++//! sync. Taking such frames as DTS-HD HRA packs 8320-byte MA frames into 8192-byte HRA bursts.
++TEST(TestAEStreamParser, AnMaStreamStaysMaThroughXllPayloadThatLooksLikeXch)
++{
++  std::vector<uint8_t> stream = MaFrame();
++  for (int i = 0; i < 4; ++i)
++    Append(stream, StraddlingFrame());
++  Append(stream, MaFrame());
++
++  // One frame per call, as the demuxer delivers them.
++  const std::vector<CAEStreamInfo::DataType> types = Parse(stream, CORE_SIZE + HD_SIZE);
++
++  ASSERT_EQ(6u, types.size());
++  for (const CAEStreamInfo::DataType type : types)
++    EXPECT_EQ(CAEStreamInfo::STREAM_TYPE_DTSHD_MA, type);
++}
++
++//! A resume or chapter jump can start inside a straddling run, before any XLL sync is seen. The
++//! codec knows the stream is MA from the demuxer's profile and tells the parser.
++TEST(TestAEStreamParser, AKnownMaStreamStartingInsideAStraddlingRunIsMa)
++{
++  std::vector<uint8_t> stream;
++  for (int i = 0; i < 4; ++i)
++    Append(stream, StraddlingFrame());
++  Append(stream, MaFrame());
++
++  const std::vector<CAEStreamInfo::DataType> types = Parse(stream, CORE_SIZE + HD_SIZE, true);
++
++  ASSERT_EQ(5u, types.size());
++  for (const CAEStreamInfo::DataType type : types)
++    EXPECT_EQ(CAEStreamInfo::STREAM_TYPE_DTSHD_MA, type);
++}
++
++//! The MA latch must not catch a real DTS-HD HRA stream, which never carries an XLL sync.
++TEST(TestAEStreamParser, ADtsHdHraStreamIsStillHra)
++{
++  std::vector<uint8_t> stream;
++  for (int i = 0; i < 4; ++i)
++    Append(stream, StraddlingFrame());
++
++  const std::vector<CAEStreamInfo::DataType> types = Parse(stream, CORE_SIZE + HD_SIZE);
++
++  ASSERT_EQ(4u, types.size());
++  for (const CAEStreamInfo::DataType type : types)
++    EXPECT_EQ(CAEStreamInfo::STREAM_TYPE_DTSHD, type);
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Audio/DVDAudioCodecPassthrough.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Audio/DVDAudioCodecPassthrough.cpp
+index 10c7705..20002e6 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Audio/DVDAudioCodecPassthrough.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Audio/DVDAudioCodecPassthrough.cpp
+@@ -52,6 +52,7 @@ CDVDAudioCodecPassthrough::~CDVDAudioCodecPassthrough(void)
+ bool CDVDAudioCodecPassthrough::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options)
+ {
+   m_parser.SetCoreOnly(false);
++  m_parser.SetDTSHDMA(m_format.m_streamInfo.m_type == CAEStreamInfo::STREAM_TYPE_DTSHD_MA);
+   switch (m_format.m_streamInfo.m_type)
+   {
+     case CAEStreamInfo::STREAM_TYPE_AC3:
+-- 
+2.53.0
+

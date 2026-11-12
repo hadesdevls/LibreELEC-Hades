@@ -40,3 +40,15 @@ pre_make_target() {
   cd $(get_build_dir nss)/nspr
   make clean
 }
+
+make_target() {
+  # Hades: NSPR writes the time of its build into its three libraries (_BUILD_STRING and _BUILD_TIME, in
+  # the version description of each one), from date and its own program "now", which do not read
+  # SOURCE_DATE_EPOCH: with it (config/options) they are given that time, in the same forms (UTC, as
+  # the builds of Hades have them, and microseconds)
+  if [ -n "${SOURCE_DATE_EPOCH}" ]; then
+    make ${PKG_MAKE_OPTS_TARGET} SH_DATE="$(date -u -d "@${SOURCE_DATE_EPOCH}" "+%Y-%m-%d %T")" SH_NOW="${SOURCE_DATE_EPOCH}000000"
+  else
+    make ${PKG_MAKE_OPTS_TARGET}
+  fi
+}

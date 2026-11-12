@@ -45,6 +45,16 @@ namespace Hades.Installer
         // itself), the uuid they name, and the one that the file system of the image's storage has
         public List<long> StorageUuidOffsets = new List<long>();
         public string StorageUuid, StorageUuidInFs;
+        // The image writes the choices of the start in forms of a fixed length (BootMenus: "boot-choices" in the first
+        // line of its menus), so that an update can carry them
+        public bool HasBootChoices;
+        // Where the values of the three lines of the wait are (TIMEOUT, GRUB's timeout, the line of the BIOS text menu),
+        // and the seconds each says; and where the value (0 or 1) of each kernel option is (BootMenus.Options)
+        public List<long>[] WaitOffsets = { new List<long>(), new List<long>(), new List<long>() };
+        public List<int>[] WaitValues = { new List<int>(), new List<int>(), new List<int>() };
+        public List<long>[] OptionOffsets = { new List<long>(), new List<long>() };
+        // The wait that the image writes by itself, where its three lines say the same, once each; 0 otherwise
+        public int BootWait;
     }
 
     sealed class WriteResult
@@ -289,7 +299,10 @@ namespace Hades.Installer
                 byte[] hide = Encoding.ASCII.GetBytes(HideInternal), feature = Encoding.ASCII.GetBytes(FeatureStorageAnywhere);
                 byte[] others = Encoding.ASCII.GetBytes(FeatureOtherDisks);
                 byte[] names = Encoding.ASCII.GetBytes(DiskUuid);
-                int keep = Math.Max(Math.Max(hide.Length, others.Length), names.Length + UuidLength) - 1;
+                byte[] choices = Encoding.ASCII.GetBytes(BootMenus.Feature);
+                // (what is carried over to the next chunk: the longest string looked for, with what is read after it)
+                int keep = Math.Max(Math.Max(Math.Max(hide.Length, others.Length), names.Length + UuidLength),
+                                    Math.Max(choices.Length, BootMenus.SayLine.Length + BootMenus.SayWords + 1)) - 1;
                 var buffer = new byte[keep + Chunk];
                 var super = new byte[2048]; // the start of the storage partition
                 plan.Tail = new byte[TailSize];
@@ -317,6 +330,10 @@ namespace Hades.Installer
                         foreach (int at in Find(buffer, have, others))
                             if (bufferStart + at >= plan.System.Start && bufferStart + at < plan.System.End)
                                 plan.HidesOtherDisks = true;
+                        foreach (int at in Find(buffer, have, choices))
+                            if (bufferStart + at >= plan.System.Start && bufferStart + at < plan.System.End)
+                                plan.HasBootChoices = true;
+                        BootMenus.Scan(plan, buffer, have, bufferStart);
                         foreach (int at in Find(buffer, have, names))
                         {
                             int uuidAt = at + names.Length;
@@ -353,6 +370,10 @@ namespace Hades.Installer
                 if (done != plan.Size) throw new InvalidDataException(Incomplete(done, plan.Size));
                 plan.HideOffsets.Sort();
                 plan.StorageUuidOffsets.Sort();
+                foreach (List<long> o in plan.OptionOffsets) o.Sort();
+                if (plan.WaitValues[0].Count == 1 && plan.WaitValues[1].Count == 1 && plan.WaitValues[2].Count == 1 &&
+                    plan.WaitValues[0][0] == plan.WaitValues[1][0] && plan.WaitValues[1][0] == plan.WaitValues[2][0])
+                    plan.BootWait = plan.WaitValues[0][0];
                 plan.StorageUuidInFs = Ext4Uuid(super);
                 plan.Scanned = true;
             }
@@ -377,7 +398,7 @@ namespace Hades.Installer
             return total;
         }
 
-        static List<int> Find(byte[] buffer, int length, byte[] what)
+        internal static List<int> Find(byte[] buffer, int length, byte[] what)
         {
             var found = new List<int>();
             for (int i = 0; i + what.Length <= length; ++i)
@@ -600,14 +621,17 @@ namespace Hades.Installer
         // Every change that is made to an image as it is written, and nothing else decides them.
         // inside: for a disk inside the PC. table: the whole image is written, with its partition table.
         // storage: an update: the identifier of the storage that the disk already has (null: an install).
-        // diagnostics: with the switch of the diagnostics turned on.
-        public static List<Patch> Patches(ImagePlan plan, bool inside, bool table, string storage, bool diagnostics)
+        // diagnostics: with the switch of the diagnostics turned on. boot: an update: what the old boot menus said of the
+        // start (their wait and kernel options), carried into the new ones where the image can take it (BootMenus.Keep).
+        public static List<Patch> Patches(ImagePlan plan, bool inside, bool table, string storage, bool diagnostics,
+                                          BootChoices boot = null)
         {
             var patches = new List<Patch>();
             if (storage != null) patches.AddRange(KeepStorage(plan, storage));
             if (inside) patches.AddRange(ForInternalDisk(plan));
             if (inside && table) patches.AddRange(SystemAsEfi(plan));
             if (diagnostics) patches.Add(DiagnosticsOn(plan));
+            if (boot != null) patches.AddRange(BootMenus.Keep(plan, boot));
             return patches;
         }
 

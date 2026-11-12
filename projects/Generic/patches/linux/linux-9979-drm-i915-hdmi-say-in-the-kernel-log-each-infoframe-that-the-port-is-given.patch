@@ -1,0 +1,219 @@
+From 5b5149ab7ca7ec0d269d42ba91267dd53d44c464 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 05:23:22 +0000
+Subject: [PATCH] drm/i915/hdmi: say in the kernel log each InfoFrame that the
+ port is given
+
+NVIDIA's driver says each InfoFrame that a head puts on the cable (nvidia-open-kernel-modules-9054);
+i915 said it only with drm.debug, where the state dump has them. The kernel log now says each
+InfoFrame that intel_write_infoframe() gives the port, when its bytes change: the encoder and the
+pipe, the type, the VIC of an AVI InfoFrame, the OUI of a vendor-specific one (00-D0-46 is Dolby),
+the length and the bytes as the sink gets them (header, checksum, payload, without the hole of the
+DIP), and the slot that goes off. The state is a CRC of each type's bytes in struct intel_hdmi.
+
+Bounded so that it can stay on: a packet written again with the same bytes says nothing (a mode set
+writes them all); a vendor-specific InfoFrame (HDR10+ changes with every scene) says at most one
+line a minute and the next line says how many changes it did not say; at most 400 lines until the
+module is loaded again, which the last line says. The HDR10+ DIP that intel_hdmi_write_vendor_infoframe()
+writes directly goes through the same function.
+
+Nothing that goes out changes: only the log. Compiled with W=1 for i915 and xe without warnings;
+not run on hardware: an Intel laptop with an HDMI display (HDR10, Dolby Vision) shows the lines.
+---
+ .../drm/i915/display/intel_display_types.h    |  12 ++
+ drivers/gpu/drm/i915/display/intel_hdmi.c     | 127 +++++++++++++++++-
+ 2 files changed, 138 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 345ecd5ec..8d73c3a51 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1778,6 +1778,18 @@ struct intel_hdmi {
+ 	struct cec_notifier *cec_notifier;
+ 	/* Hades: what the kernel log said last of QMS (intel_qms.h); 0 when it said nothing */
+ 	u32 hades_qms_logged;
++	/*
++	 * Hades: what the kernel log said last of each InfoFrame written to the port, by the low bits of
++	 * its type (0x81 vendor, 0x82 AVI, 0x83 SPD, 0x87 DRM): the CRC of its bytes (valid), when it
++	 * said it, and how many changes of a vendor InfoFrame it did not say since (HDR10+ changes with
++	 * every scene)
++	 */
++	struct {
++		u32 crc;
++		unsigned long last;
++		unsigned int suppressed;
++		bool valid;
++	} hades_infoframe_log[8];
+ };
+ 
+ struct intel_dp_mst_encoder;
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index ea67c45ab..0095b27c7 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -26,6 +26,7 @@
+  *	Jesse Barnes <jesse.barnes@intel.com>
+  */
+ 
++#include <linux/crc32.h>
+ #include <linux/delay.h>
+ #include <linux/hdmi.h>
+ #include <linux/i2c.h>
+@@ -733,6 +734,124 @@ u32 intel_hdmi_infoframes_enabled(struct intel_encoder *encoder,
+  * trick them by giving an offset into the buffer and moving back the header
+  * bytes by one.
+  */
++/*
++ * Hades: the kernel log says each InfoFrame that the port is given, when its bytes change, as the
++ * NVIDIA driver's does ("head 0 (HDMI-A-1): AVI InfoFrame, VIC 97, ... bytes: ..."): the type, the VIC of
++ * an AVI InfoFrame, the OUI of a vendor InfoFrame, the length and the bytes as they are written
++ * (header, checksum, payload), and the slot that goes off. Bounded so that it can stay on: a packet
++ * written again with the same bytes says nothing (a mode set writes them all); a vendor InfoFrame
++ * (HDR10+ changes with every scene) says at most one line a minute and the next line says how many
++ * changes it did not say; at most 400 lines until the module is loaded again. Nothing that goes out
++ * changes: only the log.
++ */
++#define HADES_INFOFRAME_LOG_LINES 400
++static atomic_t hades_infoframe_lines = ATOMIC_INIT(0);
++
++static char hades_if_pipe(const struct intel_crtc_state *crtc_state)
++{
++	return crtc_state->uapi.crtc ? pipe_name(to_intel_crtc(crtc_state->uapi.crtc)->pipe) : '?';
++}
++
++static const char *hades_infoframe_name(u8 type)
++{
++	switch (type) {
++	case HDMI_INFOFRAME_TYPE_VENDOR:
++		return "vendor-specific";
++	case HDMI_INFOFRAME_TYPE_AVI:
++		return "AVI";
++	case HDMI_INFOFRAME_TYPE_SPD:
++		return "SPD";
++	case HDMI_INFOFRAME_TYPE_AUDIO:
++		return "audio";
++	case HDMI_INFOFRAME_TYPE_DRM:
++		return "DRM (HDR static metadata)";
++	}
++	return "unknown";
++}
++
++/* buf: header (3 bytes), the hole of the DIP at 3, then checksum and payload: len bytes in all */
++static void intel_hdmi_log_infoframe(struct intel_encoder *encoder,
++				     const struct intel_crtc_state *crtc_state,
++				     u8 type, const u8 *buf, int len, bool off)
++{
++	struct intel_display *display = to_intel_display(encoder);
++	struct intel_hdmi *hdmi = enc_to_intel_hdmi(encoder);
++	typeof(hdmi->hades_infoframe_log[0]) *st = &hdmi->hades_infoframe_log[type & 7];
++	char bytes[3 * 40 + 1];
++	u8 packed[40];
++	int n, i, lines;
++	u32 crc;
++
++	if (off) {
++		if (!st->valid)
++			return;
++		st->valid = false;
++		st->suppressed = 0;
++		if (atomic_inc_return(&hades_infoframe_lines) > HADES_INFOFRAME_LOG_LINES)
++			return;
++		drm_info(display->drm, "Hades: %s pipe %c: %s InfoFrame off\n", encoder->base.name,
++			 hades_if_pipe(crtc_state),
++			 hades_infoframe_name(type));
++		return;
++	}
++
++	/* the bytes as the sink gets them: the hole of the DIP (at 3) is not part of the packet */
++	n = min_t(int, len - 1, ARRAY_SIZE(packed));
++	if (n < 4)
++		return;
++	memcpy(packed, buf, 3);
++	memcpy(packed + 3, buf + 4, n - 3);
++
++	crc = crc32_le(~0, packed, n);
++	if (st->valid && st->crc == crc)
++		return;
++	st->valid = true;
++	st->crc = crc;
++
++	if (type == HDMI_INFOFRAME_TYPE_VENDOR && st->last &&
++	    time_before(jiffies, st->last + 60 * HZ)) {
++		st->suppressed++;
++		return;
++	}
++
++	lines = atomic_inc_return(&hades_infoframe_lines);
++	if (lines > HADES_INFOFRAME_LOG_LINES) {
++		if (lines == HADES_INFOFRAME_LOG_LINES + 1)
++			drm_info(display->drm,
++				 "Hades: InfoFrame lines stop here (%d said); they start again when the module is loaded again\n",
++				 HADES_INFOFRAME_LOG_LINES);
++		return;
++	}
++
++	bytes[0] = '\0';
++	for (i = 0; i < n && i < 40; i++)
++		scnprintf(bytes + strlen(bytes), sizeof(bytes) - strlen(bytes), "%s%02x",
++			  i ? " " : "", packed[i]);
++
++	if (type == HDMI_INFOFRAME_TYPE_AVI && n > 7)
++		drm_info(display->drm,
++			 "Hades: %s pipe %c: AVI InfoFrame, VIC %u, in the AVI slot, %d bytes: %s\n",
++			 encoder->base.name, hades_if_pipe(crtc_state),
++			 packed[7], n, bytes);
++	else if (type == HDMI_INFOFRAME_TYPE_VENDOR && n > 6)
++		drm_info(display->drm,
++			 "Hades: %s pipe %c: vendor-specific InfoFrame of OUI %02X-%02X-%02X in the vendor-specific slot, %d bytes: %s%s\n",
++			 encoder->base.name, hades_if_pipe(crtc_state),
++			 packed[6], packed[5], packed[4], n, bytes,
++			 st->suppressed ? " (changes not said since the last line: see next)" : "");
++	else
++		drm_info(display->drm, "Hades: %s pipe %c: %s InfoFrame, %d bytes: %s\n",
++			 encoder->base.name, hades_if_pipe(crtc_state),
++			 hades_infoframe_name(type), n, bytes);
++	if (st->suppressed)
++		drm_info(display->drm,
++			 "Hades: %s pipe %c: %u changes of the vendor-specific InfoFrame within the last minute were not said\n",
++			 encoder->base.name, hades_if_pipe(crtc_state),
++			 st->suppressed);
++	st->suppressed = 0;
++	st->last = jiffies;
++}
++
+ static void intel_write_infoframe(struct intel_encoder *encoder,
+ 				  const struct intel_crtc_state *crtc_state,
+ 				  enum hdmi_infoframe_type type,
+@@ -743,8 +862,11 @@ static void intel_write_infoframe(struct intel_encoder *encoder,
+ 	ssize_t len;
+ 
+ 	if ((crtc_state->infoframes.enable &
+-	     intel_hdmi_infoframe_enable(type)) == 0)
++	     intel_hdmi_infoframe_enable(type)) == 0) {
++		/* Hades: said when a slot that had a packet goes off */
++		intel_hdmi_log_infoframe(encoder, crtc_state, type, NULL, 0, true);
+ 		return;
++	}
+ 
+ 	if (drm_WARN_ON(encoder->base.dev, frame->any.type != type))
+ 		return;
+@@ -759,6 +881,7 @@ static void intel_write_infoframe(struct intel_encoder *encoder,
+ 	buffer[3] = 0;
+ 	len++;
+ 
++	intel_hdmi_log_infoframe(encoder, crtc_state, type, buffer, len, false); /* Hades */
+ 	dig_port->write_infoframe(encoder, crtc_state, type, buffer, len);
+ }
+ 
+@@ -780,6 +903,8 @@ static void intel_hdmi_write_vendor_infoframe(struct intel_encoder *encoder,
+ 	     intel_hdmi_infoframe_enable(HDMI_INFOFRAME_TYPE_VENDOR)) == 0)
+ 		return;
+ 	intel_hdr10plus_to_dip(crtc_state->infoframes.hdr10plus, buffer);
++	intel_hdmi_log_infoframe(encoder, crtc_state, HDMI_INFOFRAME_TYPE_VENDOR, buffer,
++				 DRM_HDR10PLUS_INFOFRAME_SIZE + 1, false); /* Hades */
+ 	dig_port->write_infoframe(encoder, crtc_state, HDMI_INFOFRAME_TYPE_VENDOR, buffer,
+ 				  DRM_HDR10PLUS_INFOFRAME_SIZE + 1);
+ }
+-- 
+2.53.0
+

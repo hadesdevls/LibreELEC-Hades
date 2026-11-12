@@ -1,0 +1,538 @@
+From 243fd4a544f8c5459d13d33afe426dbede75f3f0 Mon Sep 17 00:00:00 2001
+From: Duc Anh Luu <luuducanh05051995@gmail.com>
+Date: Tue, 6 Oct 2026 23:16:36 +0700
+Subject: [PATCH] Retransmit the DTLS 1.3 ClientHello when sending early data
+
+When a DTLS 1.3 client resumes a session and sends early data, it
+switches to the early data write key right after sending its
+ClientHello. tls13_change_cipher_state() treated that key change like
+the start of a new flight and cleared the sent message buffer. At that
+point the version has not been negotiated yet, so the logic that keeps
+unacknowledged DTLS 1.3 messages did not apply and the ClientHello was
+dropped from the retransmit queue. With the queue empty,
+ssl_set_new_record_layer() then also freed the epoch 0 write record
+layer that a retransmitted ClientHello would need.
+
+As a result the retransmit timer kept running but had nothing to send:
+if the first flight was lost, the client never resent its ClientHello
+and the handshake stalled. Without early data the problem did not occur.
+
+The early data is part of the same flight as the ClientHello, which the
+server has not answered yet, so do not clear the sent buffer when the
+early data write key is installed. Since the ClientHello can now outlive
+the switch to the early data write record layer, free the record layer
+it was sent with once the buffered ClientHello is released, in the same
+way as is already done for the CCS, Finished, ServerHello and KeyUpdate
+messages.
+
+ssl_set_new_record_layer() kept the old DTLS write record layer
+whenever there were buffered sent messages. With the ClientHello now
+staying buffered, the early data record layer can be replaced while
+the queue still holds the ClientHello, for example when the server
+answers with a HelloRetryRequest, and no buffered message was sent with
+that record layer, so nothing freed it. Only keep the old write record
+layer if a buffered message was sent with it.
+
+The buffered ClientHello now also frees its write record layer when it
+is released, so it must not be left pointing at a layer that has
+already been freed. SSL_set_connect_state() and SSL_set_accept_state()
+call RECORD_LAYER_reset(), which freed the current write record layer
+while a buffered ClientHello still referenced it: SSL_free() then freed
+it a second time, and a retransmission timeout used it. Drop the
+buffered messages in RECORD_LAYER_reset() before freeing the record
+layers, as they belong to the handshake being abandoned.
+
+Add a test that drops the client's first flight in a resumed DTLS 1.3
+handshake with early data and checks that the ClientHello is
+retransmitted and the handshake completes, and a test that calls
+SSL_set_connect_state() while a DTLS 1.2 or DTLS 1.3 ClientHello is
+buffered.
+
+Fixes #33127
+
+Reviewed-by: Mounir Idrassi <mounir.idrassi@idrix.fr>
+Reviewed-by: Matt Caswell <matt@openssl.foundation>
+Merge-date: Tue Nov 10 14:24:43 2026
+Merged-from: https://github.com/openssl/openssl/pull/33128
+(cherry picked from commit 14a6de1652f6df9809ef4b888a7c7769a8c533cf)
+---
+ ssl/d1_lib.c              |  35 ++++-
+ ssl/record/rec_layer_s3.c |  23 +++-
+ ssl/ssl_local.h           |   1 +
+ ssl/statem/statem_dtls.c  |  18 +++
+ ssl/tls13_enc.c           |   9 +-
+ test/dtlstest.c           | 280 ++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 357 insertions(+), 9 deletions(-)
+
+diff --git a/ssl/d1_lib.c b/ssl/d1_lib.c
+index c5bc0ce..7ba6317 100644
+--- a/ssl/d1_lib.c
++++ b/ssl/d1_lib.c
+@@ -222,12 +222,23 @@ void dtls1_clear_sent_buffer(SSL_CONNECTION *s, int keep_unacked_msgs)
+                 || (SSL_CONNECTION_IS_DTLS13(s)
+                     && (msg_type == SSL3_MT_FINISHED
+                         || msg_type == SSL3_MT_SERVER_HELLO
+-                        || msg_type == SSL3_MT_KEY_UPDATE)))
++                        || msg_type == SSL3_MT_KEY_UPDATE))
++                /*
++                 * A ClientHello followed by early data. SSL3_MT_CLIENT_HELLO
++                 * has the same value as SSL3_MT_CCS, which is recorded as the
++                 * message type of a CCS, so the record type has to be checked
++                 * as well to tell the two apart. The other message types
++                 * above do not clash with anything.
++                 */
++                || (record_type == SSL3_RT_HANDSHAKE
++                    && msg_type == SSL3_MT_CLIENT_HELLO))
+             && sent_msg->saved_retransmit_state.wrlmethod != NULL
+             && s->rlayer.wrl != sent_msg->saved_retransmit_state.wrl) {
+             /*
+-             * If we're freeing the CCS then we're done with the old wrl and it
+-             * can bee freed
++             * This message was the last one sent with its write record layer
++             * before the keys changed, and the record layer was kept only so
++             * that the message could be retransmitted. Now that the message
++             * is being dropped, the record layer can be freed too.
+              */
+             sent_msg->saved_retransmit_state.wrlmethod->free(sent_msg->saved_retransmit_state.wrl);
+         }
+@@ -264,6 +275,24 @@ void dtls1_clear_current_wrl_from_sent_buffer(SSL_CONNECTION *s)
+     }
+ }
+ 
++/*
++ * Returns 1 if a message in the sent_messages queue was sent with the current
++ * write record layer, which then has to be kept for retransmissions.
++ */
++int dtls1_sent_buffer_uses_current_wrl(SSL_CONNECTION *s)
++{
++    pitem *item;
++    piterator iter = pqueue_iterator(&s->d1->sent_messages);
++
++    while ((item = pqueue_next(&iter)) != NULL) {
++        dtls_sent_msg *sent_msg = (dtls_sent_msg *)item->data;
++
++        if (sent_msg->saved_retransmit_state.wrl == s->rlayer.wrl)
++            return 1;
++    }
++    return 0;
++}
++
+ int dtls_any_sent_messages_are_missing_acknowledge(SSL_CONNECTION *s)
+ {
+     pitem *item;
+diff --git a/ssl/record/rec_layer_s3.c b/ssl/record/rec_layer_s3.c
+index ef7b469..80a5dc0 100644
+--- a/ssl/record/rec_layer_s3.c
++++ b/ssl/record/rec_layer_s3.c
+@@ -73,6 +73,17 @@ int RECORD_LAYER_reset(RECORD_LAYER *rl)
+ {
+     int ret;
+ 
++    /*
++     * Buffered DTLS messages belong to the handshake being abandoned, and
++     * may reference the write record layer that is about to be freed, such
++     * as a ClientHello when SSL_set_connect_state() is called while waiting
++     * for the server's response. Drop them first, and cancel the
++     * retransmission timer along with them so that the application is not
++     * told to keep servicing a timer that has nothing left to retransmit.
++     */
++    if (rl->s->d1 != NULL)
++        dtls1_stop_timer(rl->s);
++
+     ret = RECORD_LAYER_clear(rl);
+ 
+     /* We try and reset both record layers even if one fails */
+@@ -1580,10 +1591,12 @@ int ssl_set_new_record_layer(SSL_CONNECTION *s, int version,
+ 
+     /*
+      * Free the old record layer if we have one except in the case of DTLS when
+-     * writing and there are still buffered sent messages in our queue. In that
+-     * case the record layer is still referenced by those buffered messages for
+-     * potential retransmit. Only when those buffered messages get freed do we
+-     * free the record layer object (see dtls1_hm_fragment_free)
++     * writing and buffered sent messages in our queue were sent with it. In
++     * that case the record layer is still referenced by those buffered
++     * messages for potential retransmit. Only when those buffered messages get
++     * freed do we free the record layer object (see dtls1_clear_sent_buffer).
++     * A record layer that no buffered message was sent with, such as the one
++     * for DTLS 1.3 early data, is freed straight away.
+      *
+      * For a DTLS 1.3 read layer, hand the old one to the new one for
+      * retention instead of freeing it: a retransmission of the message that
+@@ -1601,7 +1614,7 @@ int ssl_set_new_record_layer(SSL_CONNECTION *s, int version,
+         }
+     } else if (!SSL_CONNECTION_IS_DTLS(s)
+         || direction == OSSL_RECORD_DIRECTION_READ
+-        || pqueue_peek(&s->d1->sent_messages) == NULL) {
++        || !dtls1_sent_buffer_uses_current_wrl(s)) {
+         if (*thismethod != NULL && !(*thismethod)->free(*thisrl)) {
+             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+             return 0;
+diff --git a/ssl/ssl_local.h b/ssl/ssl_local.h
+index 8f87f72..812e324 100644
+--- a/ssl/ssl_local.h
++++ b/ssl/ssl_local.h
+@@ -3119,6 +3119,7 @@ void dtls1_start_timer(SSL_CONNECTION *s);
+ void dtls1_stop_timer(SSL_CONNECTION *s);
+ __owur int dtls1_is_timer_expired(SSL_CONNECTION *s);
+ void dtls1_clear_current_wrl_from_sent_buffer(SSL_CONNECTION *s);
++int dtls1_sent_buffer_uses_current_wrl(SSL_CONNECTION *s);
+ __owur int dtls_raw_hello_verify_request(WPACKET *pkt, unsigned char *cookie,
+     size_t cookie_len);
+ __owur size_t dtls1_min_mtu(SSL_CONNECTION *s);
+diff --git a/ssl/statem/statem_dtls.c b/ssl/statem/statem_dtls.c
+index 47ab742..3ec3789 100644
+--- a/ssl/statem/statem_dtls.c
++++ b/ssl/statem/statem_dtls.c
+@@ -1738,6 +1738,24 @@ int dtls1_retransmit_message(SSL_CONNECTION *s, dtls_sent_msg *sent_msg)
+ 
+     ret = dtls1_do_write(s, sent_msg->msg_info.record_type);
+ 
++    /*
++     * If the message was retransmitted through a write record layer that is
++     * no longer the current one, the retransmission used up record sequence
++     * numbers that the current layer does not know about. This only matters
++     * for a ClientHello: it is retransmitted through the epoch 0 layer after
++     * the client has switched to the early data layer, and a ClientHello sent
++     * after a HelloRetryRequest must not reuse any of those sequence numbers.
++     * Keep the saved epoch 0 sequence number up to date for that case.
++     */
++    if (s->rlayer.wrl != saved_state.wrl) {
++        uint64_t epoch, seq;
++
++        if (s->rlayer.wrlmethod->get_epoch(s->rlayer.wrl, &epoch) == 1
++            && epoch == 0
++            && s->rlayer.wrlmethod->get_sequence(s->rlayer.wrl, &seq) == 1)
++            s->rlayer.wlayer_epoch_zero_sequence = seq;
++    }
++
+     /* restore current state */
+     s->rlayer.wrlmethod = saved_state.wrlmethod;
+     s->rlayer.wrl = saved_state.wrl;
+diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
+index 4624e9c..8706459 100644
+--- a/ssl/tls13_enc.c
++++ b/ssl/tls13_enc.c
+@@ -867,7 +867,14 @@ int tls13_change_cipher_state(SSL_CONNECTION *s, int which)
+         if (direction == OSSL_RECORD_DIRECTION_READ)
+             dtls1_clear_received_buffer(s);
+ 
+-        dtls1_clear_sent_buffer(s, 1);
++        /*
++         * The client's early data belongs to the same flight as its
++         * ClientHello, which has not been answered yet. Keep it buffered so
++         * that it can still be retransmitted.
++         */
++        if (!(direction == OSSL_RECORD_DIRECTION_WRITE
++                && (which & SSL3_CC_EARLY) != 0))
++            dtls1_clear_sent_buffer(s, 1);
+     }
+ 
+     if (!ssl_set_new_record_layer(s, s->version, direction, level, secret,
+diff --git a/test/dtlstest.c b/test/dtlstest.c
+index fc52efa..b64f0a5 100644
+--- a/test/dtlstest.c
++++ b/test/dtlstest.c
+@@ -2575,8 +2575,286 @@ end:
+     SSL_CTX_free(sctx);
+     return testresult;
+ }
++
++/*
++ * Take the datagrams the client has sent so far out of the server's read BIO,
++ * note the record sequence numbers of the epoch 0 (plaintext) records in them
++ * and, unless they are to be lost, put them back.
++ */
++static int snoop_epoch0_seqs(BIO *s_rbio, int lose, uint64_t *seqs, int *nseqs,
++    int maxseqs)
++{
++    unsigned char dgrams[8][2048];
++    int lens[8], ndgrams = 0, i;
++
++    while (BIO_ctrl_pending(s_rbio) > 0) {
++        if (!TEST_int_lt(ndgrams, 8)
++            || !TEST_int_gt(lens[ndgrams] = BIO_read(s_rbio, dgrams[ndgrams],
++                                sizeof(dgrams[0])),
++                0))
++            return 0;
++        ndgrams++;
++    }
++
++    for (i = 0; i < ndgrams; i++) {
++        PACKET dgram, fragment;
++
++        if (!PACKET_buf_init(&dgram, dgrams[i], lens[i]))
++            return 0;
++
++        while (PACKET_remaining(&dgram) >= DTLS1_RT_HEADER_LENGTH) {
++            unsigned int rectype, epoch;
++            uint64_t seq;
++
++            /* Epoch 0 records have the DTLS 1.2 style header */
++            if (!PACKET_get_1(&dgram, &rectype)
++                || !PACKET_forward(&dgram, 2)
++                || !PACKET_get_net_2(&dgram, &epoch)
++                || !PACKET_get_net_6(&dgram, &seq))
++                return 0;
++            if (rectype != SSL3_RT_HANDSHAKE || epoch != 0)
++                break;
++            if (!TEST_true(PACKET_get_length_prefixed_2(&dgram, &fragment))
++                || !TEST_int_lt(*nseqs, maxseqs))
++                return 0;
++            seqs[(*nseqs)++] = seq;
++        }
++        if (!lose
++            && !TEST_int_eq(BIO_write(s_rbio, dgrams[i], lens[i]), lens[i]))
++            return 0;
++    }
++    return 1;
++}
++
++/*
++ * Check that a DTLS 1.3 client that sends early data still retransmits its
++ * ClientHello if the first flight is lost, and that early data sent after the
++ * retransmission is delivered. With idx 1 the server answers with a
++ * HelloRetryRequest, so the second ClientHello must not reuse a record sequence
++ * number of the retransmitted first one.
++ */
++static int test_dtls13_early_data_retransmit(int idx)
++{
++    SSL_CTX *sctx = NULL, *cctx = NULL;
++    SSL *sssl = NULL, *cssl = NULL;
++    SSL_SESSION *sess = NULL;
++    BIO *s_rbio;
++    struct timeval tv;
++    unsigned char buf[2048], rbuf[64];
++    static const char msg1[] = "early data 1";
++    static const char msg2[] = "early data 2";
++    static const char app_c[] = "from client";
++    static const char app_s[] = "from server";
++    size_t written, readbytes = 0, len;
++    uint64_t seqs[16];
++    int nseqs = 0, i, ret, cdone, sdone, testresult = 0;
++    int hrr = idx == 1;
++
++    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
++            DTLS_client_method(), DTLS1_3_VERSION, DTLS1_3_VERSION,
++            &sctx, &cctx, cert, privkey))
++        || !TEST_true(SSL_CTX_set_max_early_data(sctx,
++            SSL3_RT_MAX_PLAIN_LENGTH)))
++        goto end;
++
++    /* Do a full handshake to get a session that allows early data */
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &sssl, &cssl, NULL, NULL))
++        || !TEST_true(create_ssl_connection(sssl, cssl, SSL_ERROR_NONE))
++        || !TEST_ptr(sess = SSL_get1_session(cssl))
++        || !TEST_uint_eq(SSL_SESSION_get_max_early_data(sess),
++            SSL3_RT_MAX_PLAIN_LENGTH))
++        goto end;
++    shutdown_ssl_connection(sssl, cssl);
++    sssl = cssl = NULL;
++
++    /* Make the server reject the client's key share to force an HRR */
++#ifdef OPENSSL_NO_EC
++    if (hrr && !TEST_true(SSL_CTX_set1_groups_list(sctx, "ffdhe3072")))
++#else
++    if (hrr && !TEST_true(SSL_CTX_set1_groups_list(sctx, "P-384")))
++#endif
++        goto end;
++
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &sssl, &cssl, NULL, NULL))
++        || !TEST_true(SSL_set_session(cssl, sess)))
++        goto end;
++
++    DTLS_set_timer_cb(cssl, timer_cb);
++
++    /* Sends the ClientHello followed by the early data */
++    if (!TEST_true(SSL_write_early_data(cssl, msg1, sizeof(msg1), &written))
++        || !TEST_size_t_eq(written, sizeof(msg1)))
++        goto end;
++
++    /* Lose everything the client has sent so far */
++    s_rbio = SSL_get_rbio(sssl);
++    if (!TEST_int_gt((int)BIO_ctrl_pending(s_rbio), 0)
++        || !snoop_epoch0_seqs(s_rbio, 1, seqs, &nseqs, OSSL_NELEM(seqs)))
++        goto end;
++
++    /* The ClientHello retransmission timer must be running */
++    if (!TEST_int_gt((int)DTLSv1_get_timeout(cssl, &tv), 0))
++        goto end;
++    OSSL_sleep((uint64_t)(tv.tv_sec * 1000 + tv.tv_usec / 1000) + 10);
++    if (!TEST_int_gt((int)DTLSv1_handle_timeout(cssl), 0)
++        || !TEST_size_t_gt(BIO_ctrl_pending(s_rbio), 0))
++        goto end;
++
++    /* The first early data was lost, so send a fresh payload */
++    if (!TEST_true(SSL_write_early_data(cssl, msg2, sizeof(msg2), &written))
++        || !TEST_size_t_eq(written, sizeof(msg2)))
++        goto end;
++
++    /*
++     * Let the server read the early data while the client carries on with the
++     * handshake. After an HRR the server skips the early data.
++     */
++    for (i = 0; i < 100; i++) {
++        ret = SSL_connect(cssl);
++        if (ret <= 0
++            && !TEST_int_eq(SSL_get_error(cssl, ret), SSL_ERROR_WANT_READ))
++            goto end;
++        if (!snoop_epoch0_seqs(s_rbio, 0, seqs, &nseqs, OSSL_NELEM(seqs)))
++            goto end;
++        ret = SSL_read_early_data(sssl, rbuf, sizeof(rbuf), &len);
++        if (ret == SSL_READ_EARLY_DATA_SUCCESS) {
++            if (!TEST_false(hrr)
++                || !TEST_size_t_lt(readbytes + len, sizeof(rbuf)))
++                goto end;
++            readbytes += len;
++            break;
++        }
++        if (ret == SSL_READ_EARLY_DATA_FINISH)
++            break;
++        if (!TEST_int_eq(SSL_get_error(sssl, 0), SSL_ERROR_WANT_READ))
++            goto end;
++    }
++    if (!TEST_int_lt(i, 100))
++        goto end;
++
++    if (hrr) {
++        if (!TEST_size_t_eq(readbytes, 0))
++            goto end;
++    } else if (!TEST_size_t_eq(readbytes, sizeof(msg2))
++        || !TEST_mem_eq(rbuf, readbytes, msg2, sizeof(msg2))) {
++        goto end;
++    }
++
++    /* The handshake should complete using the retransmitted ClientHello */
++    for (i = 0, cdone = sdone = 0; i < 100 && !(cdone && sdone); i++) {
++        if (!cdone)
++            cdone = SSL_connect(cssl) > 0;
++        if (!snoop_epoch0_seqs(s_rbio, 0, seqs, &nseqs, OSSL_NELEM(seqs)))
++            goto end;
++        if (!sdone)
++            sdone = SSL_accept(sssl) > 0;
++    }
++    if (!TEST_true(cdone && sdone)
++        || !TEST_int_eq(SSL_get_early_data_status(cssl),
++            hrr ? SSL_EARLY_DATA_REJECTED : SSL_EARLY_DATA_ACCEPTED))
++        goto end;
++    if (!hrr
++        && (!TEST_true(SSL_session_reused(cssl))
++            || !TEST_true(SSL_session_reused(sssl))))
++        goto end;
++
++    /*
++     * Every epoch 0 record the client sent, including those of the lost first
++     * flight and of the retransmission, must have used the next unused record
++     * sequence number.
++     */
++    if (!TEST_int_gt(nseqs, 0))
++        goto end;
++    for (i = 0; i < nseqs; i++)
++        if (!TEST_uint64_t_eq(seqs[i], (uint64_t)i))
++            goto end;
++
++    /* Exchange application data in both directions */
++    if (!TEST_true(SSL_write_ex(cssl, app_c, sizeof(app_c), &written))
++        || !TEST_true(SSL_read_ex(sssl, buf, sizeof(buf), &len))
++        || !TEST_mem_eq(buf, len, app_c, sizeof(app_c))
++        || !TEST_true(SSL_write_ex(sssl, app_s, sizeof(app_s), &written))
++        || !TEST_true(SSL_read_ex(cssl, buf, sizeof(buf), &len))
++        || !TEST_mem_eq(buf, len, app_s, sizeof(app_s)))
++        goto end;
++
++    testresult = 1;
++end:
++    SSL_SESSION_free(sess);
++    SSL_free(cssl);
++    SSL_free(sssl);
++    SSL_CTX_free(cctx);
++    SSL_CTX_free(sctx);
++    return testresult;
++}
+ #endif /* OPENSSL_NO_DTLS1_3 */
+ 
++/*
++ * Check that resetting a client with SSL_set_connect_state() while its
++ * ClientHello is still buffered for retransmission drops the buffered message
++ * instead of leaving it pointing at the freed write record layer, so that it
++ * is neither retransmitted nor freed again.
++ */
++static int test_dtls_connect_state_after_client_hello(int idx)
++{
++    SSL_CTX *sctx = NULL, *cctx = NULL;
++    SSL *sssl = NULL, *cssl = NULL;
++    BIO *s_rbio;
++    struct timeval tv;
++    unsigned char buf[2048];
++    int version = idx == 0 ? DTLS1_2_VERSION : DTLS1_3_VERSION;
++    int ret, testresult = 0;
++
++#ifdef OPENSSL_NO_DTLS1_2
++    if (version == DTLS1_2_VERSION)
++        return TEST_skip("DTLS 1.2 is disabled");
++#endif
++#ifdef OPENSSL_NO_DTLS1_3
++    if (version == DTLS1_3_VERSION)
++        return TEST_skip("DTLS 1.3 is disabled");
++#endif
++
++    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
++            DTLS_client_method(), version, version,
++            &sctx, &cctx, cert, privkey))
++        || !TEST_true(create_ssl_objects(sctx, cctx, &sssl, &cssl,
++            NULL, NULL)))
++        goto end;
++
++    DTLS_set_timer_cb(cssl, timer_cb);
++
++    /* Send the ClientHello and wait for the server's response */
++    ret = SSL_connect(cssl);
++    if (!TEST_int_le(ret, 0)
++        || !TEST_int_eq(SSL_get_error(cssl, ret), SSL_ERROR_WANT_READ))
++        goto end;
++
++    /* This frees the write record layer the ClientHello was sent with */
++    SSL_set_connect_state(cssl);
++
++    /*
++     * The retransmission timer must have been cancelled, and nothing from
++     * the abandoned handshake may be retransmitted
++     */
++    if (!TEST_int_eq((int)DTLSv1_get_timeout(cssl, &tv), 0))
++        goto end;
++    s_rbio = SSL_get_rbio(sssl);
++    while (BIO_ctrl_pending(s_rbio) > 0)
++        if (!TEST_int_gt(BIO_read(s_rbio, buf, sizeof(buf)), 0))
++            goto end;
++    if (!TEST_int_eq((int)DTLSv1_handle_timeout(cssl), 0)
++        || !TEST_size_t_eq(BIO_ctrl_pending(s_rbio), 0))
++        goto end;
++
++    testresult = 1;
++end:
++    SSL_free(cssl);
++    SSL_free(sssl);
++    SSL_CTX_free(cctx);
++    SSL_CTX_free(sctx);
++    return testresult;
++}
++
+ OPT_TEST_DECLARE_USAGE("certfile privkeyfile\n")
+ 
+ int setup_tests(void)
+@@ -2625,6 +2903,7 @@ int setup_tests(void)
+     ADD_ALL_TESTS(test_dtls13_plaintext_after_hellos, 3);
+     ADD_TEST(test_dtls13_ccm8_not_offered);
+     ADD_TEST(test_dtls13_ack_read_timeout);
++    ADD_ALL_TESTS(test_dtls13_early_data_retransmit, 2);
+ #endif
+ #ifndef OPENSSL_NO_DTLS1_2
+     ADD_TEST(test_dtls_client_retransmit);
+@@ -2635,6 +2914,7 @@ int setup_tests(void)
+     ADD_TEST(test_dtls_client_retransmit_dtls13);
+     ADD_TEST(test_dtls_server_retransmit_dtls13);
+ #endif
++    ADD_ALL_TESTS(test_dtls_connect_state_after_client_hello, 2);
+ 
+     return 1;
+ }

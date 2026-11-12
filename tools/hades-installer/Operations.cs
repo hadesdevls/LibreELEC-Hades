@@ -294,7 +294,9 @@ namespace Hades.Installer
         // there (Engine.ForInternalDisk). diagnostics: with the switch of its diagnostics turned on. What the
         // diagnostics had saved on the old system partition (the folder hades-diag) is read from it before it
         // is written over and goes into the new one (DiagFolder); what became of it is returned, and whatever
-        // goes wrong with it leaves the update as it would be without it.
+        // goes wrong with it leaves the update as it would be without it. So do the choices of the start that
+        // the old boot menus keep (how long they wait, the kernel options of Kodi's display: BootMenus), with
+        // what became of them in the same result (DiagKeep.Boot).
         // A system partition that some program has open is left alone (PartitionInUseException), unless
         // take says to take it from that program (Native.OpenPartition): the user is asked first.
         public static DiagKeep Update(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take = false)
@@ -329,8 +331,19 @@ namespace Hades.Installer
             DiagKeep kept;
             using (FileStream stream = Native.OpenPartition(now.Number, system.Number, system.Offset, system.Size, true, take))
             {
+                // what the old boot menus say of the start (their wait, the kernel options of Kodi's display), carried into
+                // the new ones (BootMenus): read before anything is written, and so the patches are made again with it
+                BootChoices boot = BootMenus.Read(DiagFolder.Reader(stream, system.Size), system.Size);
+                patches = Engine.Patches(plan, !now.Removable, false, existing, diagnostics, boot);
+                var bootKept = new BootKept();
+                bootKept.Old = boot;
+                bootKept.ImageKnows = plan.HasBootChoices;
+                bootKept.ImageWait = plan.BootWait;
+                bootKept.Patches = BootMenus.Keep(plan, boot).Count;
+                Log.Line("update: " + bootKept.Summary());
                 report(30, L.T("Reading what the diagnostics saved…", "Leyendo lo que guardó el diagnóstico…"));
                 kept = DiagFolder.Prepare(plan, stream, system.Size, patches);
+                kept.Boot = bootKept;
                 Log.Line("update: hades-diag before writing: " + kept.Summary());
                 var all = new List<Patch>(patches);
                 all.AddRange(kept.Patches);

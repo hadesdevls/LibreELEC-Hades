@@ -72,9 +72,9 @@ activate_safe_mode()
 
   if [ "${BOOT_STATE:-OK}" = "OK" ]; then
     # generate logfiles zip for the failed kodi
-    /usr/bin/createlog
-    lastlog=$(ls -1 /storage/logfiles/*.zip | tail -n 1)
-    mv $lastlog /storage/logfiles/log-$(date -u +%Y-%m-%d-%H.%M.%S)-FAILED.zip
+    # Hades: through the filter of the diagnostics, as the share Logfiles gives it (filtered-log-<date>-FAILED.zip in
+    # /storage/logfiles); createlog by itself, over SSH, still makes it unfiltered
+    /usr/lib/hades-diag/report.sh share FAILED >/dev/null 2>&1
 
     echo "SAFE" > $BOOT_STATUS
   fi

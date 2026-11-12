@@ -1,0 +1,661 @@
+From bea6cb492ccab1693314c0609565e2818f53422d Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 20:57:16 +0000
+Subject: [PATCH] windowing/gbm: HDR of more than 8 bits through Kodi's own
+ buffers where EGL has no deeper window
+
+Video of more than 8 bits (HDR10, HLG, Dolby Vision rebuilt as HDR10) goes out at 10 bits on
+nvidia-drm with the 580 driver: where its planes take buffers of 10 bits and its EGL offers no window
+of them, Kodi draws into buffers that it allocates itself (COwnScanout) and commits those.
+
+When: SetVideoOutput() for more than 8 bits, with GLES, on nvidia-drm (NV_INPUT_COLORSPACE on its
+planes), when ChooseEGLConfig() finds no window of that depth. Where EGL has one (the 615 driver: half
+floats; Mesa: 10 bits) nothing changes. advancedsettings.xml:
+<video><hdrownbuffersalways>true</hdrownbuffersalways></video> uses Kodi's own buffers there too, with
+any driver (to try this way on an RTX with the 615 driver), and <hdrownbuffers>false</hdrownbuffers>
+never.
+
+Which: the active 10-bit formats of the planes first, in their order (AB30, then XB30), then half
+floats where FloatOutputUsable() allows the half-float output. 10 bits are the depth of HDR10 itself,
+sent as they are with "None" as the input colour space (read in NVKMS 580 and 615: identity matrices
+and output table, as for a half-float buffer; nvkms-modeset.c also hints depth 30 to headSurface only
+for A2B10G10R10/X2B10G10R10), like the 10-bit window of the Mesa drivers, with half the memory of half
+floats and nothing outside [0, 1] to clamp.
+
+Before use: the buffers are made and probed (previous commit) and the driver takes one of them in a
+test commit (TestFramebuffer()). A failure keeps the output of today (the window, at 8 bits) with
+one line that says which step failed, and that display, mode and format are not tried again. In
+use, a commit that the driver refuses is met as for a half-float output (CheckFloatOutput()): when the
+refusal is about the buffer, or may be, the window's buffers are put back, for the rest of the video
+(three videos in a row: then seven without), and what the refused commit carried is queued again.
+
+How: the window of EGL stays, unswapped, and is the output again at the end of the video (8 bits),
+when the window is made anew (another size) or after a failure; the plane gets back the format and
+the modifier it had. Every swap of a frame in the GLES window system goes through
+SwapOutputBuffers(): eglSwapBuffers(), or the frame done in Kodi's own buffer (flushed; finished
+when there is no fence for the commit). The buffer of the next frame is bound after each flip and in
+BeginRender(), and is the framebuffer that stands for the window (OutputFramebuffer()). The fencing,
+the commits and the queue are those of the window: Kodi's commit takes the front buffer through
+CGBMSurface::LockFrontBuffer(). The buffer age is 0 with them, and for the first frames of the window
+after them. The buffers that went are destroyed once Kodi's queue has given them back and two flips
+of others have come (30 flips at most). GetOutputBitDepth(), HasFloatOutput() and OutputBufferDeep()
+say what these buffers are, so that the link depth (LinkDepth.h), the captures and native Dolby
+Vision (which starts only at 8 bits) see them.
+
+In kodi.log: "HDR output: video of more than 8 bits goes out at 10 bits through 3 buffers of AB30
+(modifier ...) that Kodi allocates itself ...", and then the depth of the link, "HDR output: HDR10
+goes out at 10 bits in ..., as the driver says (NV_OUTPUT_BPC)".
+
+Only hardware shows: the allocation for scanout, the import, the commits, the flips and what NVKMS
+sends. Not seen on any GPU.
+---
+ xbmc/settings/AdvancedSettings.cpp            |   4 +
+ xbmc/settings/AdvancedSettings.h              |   7 +
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp | 275 ++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.h   |  69 ++++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  27 +-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   3 +
+ 6 files changed, 374 insertions(+), 11 deletions(-)
+
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index f37e2d5..fde669f 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -213,6 +213,8 @@ void CAdvancedSettings::Initialize()
+   m_videoDVLLPattern = false;
+   m_videoDVCCMComposer = true;
+   m_videoDVAheadAlways = false;
++  m_videoHdrOwnBuffers = true;
++  m_videoHdrOwnBuffersAlways = false;
+   m_videoDVStepDown = -1;
+   m_videoDVKeepRepeats = true;
+   m_videoDVKeepByCommit = false;
+@@ -734,6 +736,8 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvllpattern", m_videoDVLLPattern);
+     XMLUtils::GetBoolean(pElement, "dvccmcomposer", m_videoDVCCMComposer);
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
++    XMLUtils::GetBoolean(pElement, "hdrownbuffers", m_videoHdrOwnBuffers);
++    XMLUtils::GetBoolean(pElement, "hdrownbuffersalways", m_videoHdrOwnBuffersAlways);
+     XMLUtils::GetInt(pElement, "dvstepdown", m_videoDVStepDown, 0, 3);
+     XMLUtils::GetBoolean(pElement, "dvkeeprepeats", m_videoDVKeepRepeats);
+     XMLUtils::GetBoolean(pElement, "dvkeepbycommit", m_videoDVKeepByCommit);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index e1703ece..9093607 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -196,6 +196,13 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! Hades: native Dolby Vision frames are presented a frame ahead wherever that can be done,
+     //! not only where the GPU needs it (video/dvaheadalways). To try it on a fast GPU
+     bool m_videoDVAheadAlways;
++    //! Hades: HDR of more than 8 bits goes out through buffers that Kodi allocates itself where the
++    //! planes take such buffers and the EGL of the driver offers no window of them (nvidia-drm with
++    //! the 580 driver; COwnScanout, video/hdrownbuffers). Off: such video goes out at 8 bits there
++    bool m_videoHdrOwnBuffers;
++    //! Hades: ... also where EGL offers such a window, and with any driver
++    //! (video/hdrownbuffersalways). To try that way on a GPU whose EGL has a deeper window
++    bool m_videoHdrOwnBuffersAlways;
+     //! Hades: the fidelity step-down level of native Dolby Vision frames, 0 to 3, forced for every
+     //! frame (video/dvstepdown; dvbridge_render_set_step()). To measure on a GPU what each level
+     //! saves. -1, when it is not there: Kodi chooses, only where the GPU cannot keep up
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index faae449..546c34e 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -13,6 +13,7 @@
+ #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
++#include "settings/AdvancedSettings.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "utils/DRMHelpers.h"
+@@ -185,6 +186,11 @@ bool CWinSystemGbmEGLContext::CreateNewWindow(const std::string& name,
+   //Notify other subsystems that we change resolution
+   OnLostDevice();
+ 
++  // Hades: Kodi's own buffers are of the size of the window that goes: the new one is the window's
++  // own (of the EGL config in use, 8 bits), until the output of a video asks for them again
++  if (OwnScanoutOn())
++    OwnScanoutStop("the window is made again, for another mode", false);
++
+   if (!DestroyWindow())
+   {
+     return false;
+@@ -307,11 +313,16 @@ int CWinSystemGbmEGLContext::VideoOutputBitDepth(const VideoPicture* picture) co
+ 
+ bool CWinSystemGbmEGLContext::HasFloatOutput() const
+ {
++  // (Hades: the buffers of Kodi's own, while the frames go into them)
++  if (m_ownBits)
++    return m_ownFloat;
+   return IsFloatFormat(static_cast<uint32_t>(m_eglContext.GetConfigAttrib(EGL_NATIVE_VISUAL_ID)));
+ }
+ 
+ bool CWinSystemGbmEGLContext::OutputBufferDeep() const
+ {
++  if (m_ownBits) // (Hades)
++    return true;
+   switch (static_cast<uint32_t>(m_eglContext.GetConfigAttrib(EGL_NATIVE_VISUAL_ID)))
+   {
+     case DRM_FORMAT_XRGB2101010:
+@@ -382,6 +393,30 @@ void CWinSystemGbmEGLContext::CheckFloatOutput(bool rendered)
+   // a half-float one that is made later.
+   const bool refused = m_DRM->TakeFlipRefused();
+   const bool dropped = m_DRM->TakeFlipDropped();
++  // Hades: Kodi's own buffers that went, once they are off the screen
++  OwnScanoutRetire(rendered, refused);
++  // Hades: ... and those in use, as a half-float output: a refusal about the buffer (or that may be)
++  // puts the window's buffers back, which stayed as they were
++  if (OwnScanoutOn())
++  {
++    if (!refused)
++    {
++      if (dropped)
++        RequeueOutputProperties();
++      else
++        m_ownShown = m_ownShown || rendered;
++      return;
++    }
++    if (RefusalAboutBuffer() == FloatRefusal::NOT_BUFFER)
++    {
++      CLog::LogF(LOGINFO, "the driver refused a commit with Kodi's own buffers of more than 8 bits, "
++                          "and refuses it with an 8-bit buffer too: it is not held against them");
++      return;
++    }
++    OwnScanoutStop("the driver refused a commit with them", true);
++    RequeueOutputProperties();
++    return;
++  }
+   if (!m_floatOutputSupported || !HasFloatOutput())
+     return;
+ 
+@@ -592,8 +627,30 @@ bool CWinSystemGbmEGLContext::SetVideoOutput(const VideoPicture* videoPicture)
+       m_floatOutputBlocked = false;
+     else
+       --m_floatOutputWait;
++    // Hades: Kodi's own buffers, as the half-float output (display changes: their keys hold the
++    // display, m_ownFailedKeys)
++    if (m_ownShown && !m_ownBlocked)
++      m_ownFailures = 0;
++    m_ownShown = false;
++    if (m_ownFailures < FLOAT_OUTPUT_ATTEMPTS || m_ownWait == 0)
++      m_ownBlocked = false;
++    else
++      --m_ownWait;
+   }
+ 
++  // Hades: video of more than 8 bits through buffers that Kodi allocates itself, where the planes
++  // take them and EGL offers no window of them (OwnScanoutWanted()). Where they cannot be made, or
++  // fail their checks, the output is the window's, as below.
++  if (bitDepth > 8 && OwnScanoutWanted(bitDepth))
++  {
++    if (OwnScanoutStart(bitDepth))
++      return CWinSystemGbm::SetVideoOutput(videoPicture);
++  }
++  else if (OwnScanoutOn())
++    OwnScanoutStop(bitDepth > 8 ? "the video goes out through the window of EGL"
++                                : "the output has 8 bits again (no video of more than 8 bits)",
++                   false);
++
+   // Pick an EGL config matching the target bit depth, then rebuild
+   // the surface only if that pick changed the native visual ID.
+   uint32_t currentFormat = m_eglContext.GetConfigAttrib(EGL_NATIVE_VISUAL_ID);
+@@ -680,6 +737,12 @@ bool CWinSystemGbmEGLContext::SetVideoOutput(const VideoPicture* videoPicture)
+ 
+ bool CWinSystemGbmEGLContext::DestroyWindowSystem()
+ {
++  // Hades: Kodi's own buffers are objects of the GL context, which goes
++  if (m_GBM && OwnScanoutOn())
++    m_GBM->GetDevice().GetSurface().SetOwnBuffers(nullptr);
++  m_ownScanout.reset();
++  m_ownRetired.clear();
++  m_ownBits = 0;
+   CDVDFactoryCodec::ClearHWAccels();
+   VIDEOPLAYER::CRendererFactory::ClearRenderer();
+   m_eglContext.Destroy();
+@@ -687,6 +750,218 @@ bool CWinSystemGbmEGLContext::DestroyWindowSystem()
+   return CWinSystemGbm::DestroyWindowSystem();
+ }
+ 
++// Hades: output of more than 8 bits through buffers that Kodi allocates itself (COwnScanout).
++// nvidia-drm with the 580 driver (Pascal and older GPUs) takes buffers of 10 bits (AB30, XB30)
++// and of half floats (AB4H) on its planes, and its EGL offers windows of 8 bits only: video of
++// more than 8 bits went out at 8 (NVKMS sends no more than the buffer holds). Kodi draws then into
++// buffers of its own, imported into EGL and drawn into through framebuffer objects; they stand
++// for the window's for Kodi's queue and commits (CGBMSurface::SetOwnBuffers()), and the window
++// of EGL stays, unswapped, for when the output has 8 bits again.
++// 10 bits are chosen before half floats: in the depth of HDR10 itself, which the driver then sends
++// as it is with "None" as the input colour space (see FloatOutputUsable()), and like the window of
++// 10 bits of the Mesa drivers; half the memory of half floats, and nothing out of [0, 1] to clamp.
++// Half floats only where FloatOutputUsable() allows the half-float output.
++// Where EGL offers a window of that depth (the 615 driver: half floats; AMD and Intel: 10 bits)
++// the window is used, as before; <video><hdrownbuffersalways>true</hdrownbuffersalways></video> in
++// advancedsettings.xml uses Kodi's own buffers there too, with any driver (to try this way on a
++// GPU whose EGL has a deeper window), and <hdrownbuffers>false</hdrownbuffers> never.
++bool CWinSystemGbmEGLContext::OwnScanoutWanted(int bitDepth)
++{
++  if (m_renderableType == EGL_OPENGL_BIT)
++    return false;
++  const auto component = CServiceBroker::GetSettingsComponent();
++  const auto advanced = component ? component->GetAdvancedSettings() : nullptr;
++  if (advanced && !advanced->m_videoHdrOwnBuffers)
++    return false;
++  if (advanced && advanced->m_videoHdrOwnBuffersAlways)
++    return true;
++  // (nvidia-drm, known by a property of its planes: what another driver does with them is not
++  // known here, and the Mesa drivers offer windows of 10 bits)
++  if (!m_floatOutputSupported)
++    return false;
++  const EGLConfig config = m_eglContext.GetEGLConfig();
++  const bool window = ChooseEGLConfig(m_renderableType, bitDepth);
++  m_eglContext.SetEGLConfig(config);
++  return !window;
++}
++
++bool CWinSystemGbmEGLContext::OwnScanoutStart(int bitDepth)
++{
++#if defined(HAS_GLES)
++  if (OwnScanoutOn())
++    return true;
++  if (m_ownBlocked || !m_GBM || !m_DRM)
++    return false;
++  CDRMPlane* plane = m_DRM->GetGuiPlane() ? m_DRM->GetGuiPlane() : m_DRM->GetVideoPlane();
++  if (!plane || !m_DRM->GetCrtc())
++    return false;
++
++  std::vector<const outputformat*> candidates;
++  for (const auto& format : m_DRM->GetOutputFormats())
++    if (format.active && format.bpp >= 10 && format.bpp <= bitDepth &&
++        COwnScanout::Bits(format.drm) == 10)
++      candidates.push_back(&format);
++  if (FloatOutputUsable())
++    for (const auto& format : m_DRM->GetOutputFormats())
++      if (format.active && COwnScanout::IsFloat(format.drm))
++        candidates.push_back(&format);
++  if (candidates.empty())
++  {
++    if (m_ownFailedKeys.insert("no-formats").second)
++      CLog::LogF(LOGINFO, "HDR output: no plane takes a buffer of 10 bits or of half floats: video "
++                          "of more than 8 bits goes out at 8 bits");
++    return false;
++  }
++
++  for (const outputformat* format : candidates)
++  {
++    // A frame-packed (3D) mode of nvidia-drm wants a buffer of its own kind
++    // (FramePackedBufferDemands()): not one of these
++    if (int width = m_nWidth; m_DRM->FramePackedBufferDemands(format->drm, width))
++      return false;
++    const std::string key =
++        StringUtils::Format("{}x{}@{:.3f} display {} {}", m_nWidth, m_nHeight, m_fRefreshRate,
++                            m_displayChanges.load(), DRMHELPERS::FourCCToString(format->drm));
++    if (m_ownFailedKeys.contains(key))
++      continue;
++    std::string failed;
++    auto own = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), m_nWidth,
++                                   m_nHeight, format->drm, format->modifiers, failed);
++    if (own && !m_DRM->TestFramebuffer(own->FirstBuffer()))
++    {
++      failed = "the driver refused, in a test, a commit of the plane with one of them";
++      own.reset();
++    }
++    if (!own)
++    {
++      m_ownFailedKeys.insert(key);
++      CLog::LogF(LOGWARNING,
++                 "HDR output: buffers of {} that Kodi allocates itself cannot be used in {}x{} @ "
++                 "{:.3f} Hz on this display ({}): not tried again for it",
++                 DRMHELPERS::FourCCToString(format->drm), m_nWidth, m_nHeight, m_fRefreshRate,
++                 failed);
++      continue;
++    }
++
++    // In place of the window's buffers: what the driver refused or dropped before counts no more
++    // (as for a half-float window, SetVideoOutput())
++    m_DRM->TakeFlipRefused();
++    if (m_DRM->TakeFlipDropped())
++      RequeueOutputProperties();
++    m_ownWindowFormat = plane->GetFormat();
++    m_ownWindowModifier = plane->GetModifier();
++    m_GBM->GetDevice().GetSurface().SetOwnBuffers(own);
++    m_ownScanout = own;
++    m_ownFloat = own->Floating();
++    m_ownBits = own->OutputBits();
++    plane->SetFormat(own->Format());
++    plane->SetModifier(own->Modifier());
++    BindOwnBack();
++    if (!OwnScanoutOn())
++      return false;
++    // (as for a half-float window: the next commit allows a modeset, which is an ordinary flip
++    // when no mode changes; with the amdgpu quirk, the output is set active)
++    if (m_DRM->HasQuirk(KODI::WINDOWING::GBM::QUIRK_NEEDSPRIMARY))
++      m_DRM->SetActive(true);
++    else
++      m_DRM->AllowModeset();
++    CLog::LogF(LOGINFO,
++               "HDR output: video of more than 8 bits goes out at {} bits through {} buffers of {} "
++               "(modifier {}) that Kodi allocates itself and draws into, {}x{}: {}; checked before "
++               "use (values of more than 8 bits written and read back, and a test commit)",
++               own->OutputBits() == 16 ? "more than 10" : "10", COwnScanout::BUFFERS,
++               DRMHELPERS::FourCCToString(own->Format()),
++               DRMHELPERS::ModifierToString(own->Modifier()), m_nWidth, m_nHeight,
++               m_floatOutputSupported ? "the EGL of nvidia-drm offers no window of that depth"
++                                      : "asked for in advancedsettings.xml (hdrownbuffersalways)");
++    return true;
++  }
++  return false;
++#else
++  return false;
++#endif
++}
++
++void CWinSystemGbmEGLContext::OwnScanoutStop(const std::string& why, bool failed)
++{
++  if (!OwnScanoutOn())
++    return;
++#if defined(HAS_GLES)
++  m_GBM->GetDevice().GetSurface().SetOwnBuffers(nullptr);
++  m_ownRetired.push_back(std::move(m_ownScanout));
++  m_ownScanout.reset();
++  m_ownRetiredFlips = 0;
++  m_ownBits = 0;
++  m_ownFloat = false;
++  m_ownFullFrames = COwnScanout::BUFFERS + 1;
++  COwnScanout::UnbindAll();
++  if (CDRMPlane* plane = m_DRM->GetGuiPlane() ? m_DRM->GetGuiPlane() : m_DRM->GetVideoPlane())
++  {
++    plane->SetFormat(m_ownWindowFormat);
++    plane->SetModifier(m_ownWindowModifier);
++  }
++  if (m_DRM->HasQuirk(KODI::WINDOWING::GBM::QUIRK_NEEDSPRIMARY))
++    m_DRM->SetActive(true);
++  else
++    m_DRM->AllowModeset();
++  if (!failed)
++  {
++    CLog::LogF(LOGINFO, "HDR output: back to the window of EGL, at its depth: {}", why);
++    return;
++  }
++  m_ownBlocked = true;
++  ++m_ownFailures;
++  m_ownWait = m_ownFailures >= FLOAT_OUTPUT_ATTEMPTS ? FLOAT_OUTPUT_WAIT : 0;
++  CLog::LogF(LOGWARNING,
++             "HDR output: Kodi's own buffers of more than 8 bits could not be used ({}): back to "
++             "the window of EGL, at 8 bits, for this video{}",
++             why,
++             m_ownWait ? StringUtils::Format(" and the {} after it (they failed in each of the "
++                                             "last {} videos they were tried with)",
++                                             m_ownWait, m_ownFailures)
++                       : std::string());
++#endif
++}
++
++bool CWinSystemGbmEGLContext::SwapOutputBuffers()
++{
++#if defined(HAS_GLES)
++  if (OwnScanoutOn())
++    // The frame is in Kodi's own buffer: its GPU work goes to the GPU now, as eglSwapBuffers()
++    // would send it; with no fence of it for the commit to wait for, it is finished first
++    return m_ownScanout->Swap(!m_eglFence);
++  if (m_ownFullFrames > 0)
++    --m_ownFullFrames;
++#endif
++  return m_eglContext.TrySwapBuffers();
++}
++
++void CWinSystemGbmEGLContext::BindOwnBack()
++{
++#if defined(HAS_GLES)
++  if (!OwnScanoutOn() || m_ownScanout->BindBack())
++    return;
++  // Never with Kodi's queue (two buffers held at most, CGBMSurface::LockFrontBuffer()): the
++  // window's buffers, which are there, take the next frame
++  OwnScanoutStop("none of them was free to draw the next frame into", true);
++#endif
++}
++
++void CWinSystemGbmEGLContext::OwnScanoutRetire(bool rendered, bool refused)
++{
++#if defined(HAS_GLES)
++  if (m_ownRetired.empty() || !rendered || refused)
++    return;
++  // Off the screen after two flips of other buffers, and out of Kodi's queue when it has given
++  // them back; a queue that went with its window never gives them back, and their framebuffers
++  // are not used by it again: destroyed after a while all the same
++  ++m_ownRetiredFlips;
++  std::erase_if(m_ownRetired,
++                [this](const std::shared_ptr<COwnScanout>& own)
++                { return m_ownRetiredFlips >= 30 || (m_ownRetiredFlips >= 3 && own->Unlocked()); });
++#endif
++}
++
+ void CWinSystemGbmEGLContext::delete_CVaapiProxy::operator()(CVaapiProxy* p) const
+ {
+   VaapiProxyDelete(p);
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+index 75a65c3..c9fd885 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "OwnScanout.h"
+ #include "WinSystemGbm.h"
+ #include "utils/EGLFence.h"
+ #include "utils/EGLUtils.h"
+@@ -15,6 +16,8 @@
+ 
+ #include <atomic>
+ #include <memory>
++#include <set>
++#include <string>
+ 
+ namespace KODI
+ {
+@@ -35,10 +38,23 @@ public:
+   bool DestroyWindow() override;
+   void SetDirtyRegions(const CDirtyRegionList& dirtyRegions) override
+   {
+-    m_eglContext.SetDamagedRegions(dirtyRegions);
++    // (Hades: not in the window while the frames go into buffers of Kodi's own, OwnScanoutOn())
++    if (!OwnScanoutOn())
++      m_eglContext.SetDamagedRegions(dirtyRegions);
++  }
++  //! Hades: 0 (nothing of an earlier frame is kept) for buffers of Kodi's own, and for the first
++  //! frames of the window after them: what EGL counts of the window knows nothing of the frames
++  //! that went out through those
++  int GetBufferAge() override
++  {
++    return OwnScanoutOn() || m_ownFullFrames > 0 ? 0 : m_eglContext.GetBufferAge();
++  }
++  int GetOutputBitDepth() const override
++  {
++    if (const int bits = m_ownBits)
++      return bits;
++    return m_eglContext.GetConfigAttrib(EGL_RED_SIZE);
+   }
+-  int GetBufferAge() override { return m_eglContext.GetBufferAge(); }
+-  int GetOutputBitDepth() const override { return m_eglContext.GetConfigAttrib(EGL_RED_SIZE); }
+   bool HasFloatOutput() const override;
+   //! Hades: the window's buffer has more than 8 bits per component (the depth of the link,
+   //! LinkDepth.h)
+@@ -66,6 +82,10 @@ public:
+ 
+   bool SetVideoOutput(const VideoPicture* videoPicture) override;
+ 
++  //! Hades: the frames go out through buffers that Kodi allocates itself (COwnScanout), not
++  //! through the window of EGL: output of more than 8 bits where EGL has no window of them
++  bool OwnScanoutOn() const { return m_ownScanout != nullptr; }
++
+ protected:
+   CWinSystemGbmEGLContext(EGLenum platform, std::string const& platformExtension)
+     : CWinSystemEGL{platform, platformExtension}
+@@ -100,6 +120,49 @@ protected:
+   //! driver with an 8-bit buffer of the output in place of the frame's (RefusedForBuffer())
+   FloatRefusal RefusalAboutBuffer();
+ 
++  // Hades: output of more than 8 bits through buffers of Kodi's own (COwnScanout)
++  //! \brief The frame drawn is presented: the window's buffers are swapped (eglSwapBuffers()), or
++  //! the frame is done in Kodi's own buffer, which Kodi's commit takes next
++  bool SwapOutputBuffers();
++  //! \brief The buffer the next frame is drawn into is bound (Kodi's own buffers only; the
++  //! window's otherwise, as it is). When none is free the output goes back to the window.
++  void BindOwnBack();
++  //! \brief Video of this depth goes out through Kodi's own buffers here: the switch of
++  //! advancedsettings.xml says so, or nvidia-drm has planes and no EGL window of that depth
++  bool OwnScanoutWanted(int bitDepth);
++  //! \brief Kodi's own buffers made, checked and put in place of the window's
++  bool OwnScanoutStart(int bitDepth);
++  //! \brief Back to the window's buffers (which stayed, unswapped); a failure keeps Kodi's own
++  //! from this video, as a half-float output that failed
++  void OwnScanoutStop(const std::string& why, bool failed);
++  //! \brief Once in every presentation pass: Kodi's own buffers that went are destroyed once they
++  //! are off the screen
++  void OwnScanoutRetire(bool rendered, bool refused);
++
++  //! Kodi's own buffers in use
++  std::shared_ptr<COwnScanout> m_ownScanout;
++  //! ... their bits and whether they are half floats, for other threads (0: none in use)
++  std::atomic<int> m_ownBits{0};
++  std::atomic<bool> m_ownFloat{false};
++  //! Kodi's own buffers that went, until they are off the screen and out of Kodi's queue
++  std::vector<std::shared_ptr<COwnScanout>> m_ownRetired;
++  unsigned int m_ownRetiredFlips{0};
++  //! Frames of the window still to draw in full (GetBufferAge())
++  unsigned int m_ownFullFrames{0};
++  //! Kodi's own buffers are not tried in this video (they failed in it)
++  bool m_ownBlocked{false};
++  //! The videos in a row in which they failed; the videos still to start before they are tried
++  //! again (as the half-float output: FLOAT_OUTPUT_ATTEMPTS, FLOAT_OUTPUT_WAIT)
++  unsigned int m_ownFailures{0};
++  unsigned int m_ownWait{0};
++  //! A flip of Kodi's own buffers was taken in this video
++  bool m_ownShown{false};
++  //! Display, mode and format for which they could not be made or checked: not tried again
++  std::set<std::string> m_ownFailedKeys;
++  //! The format and the modifier of the plane with the window's buffers, put back with them
++  uint32_t m_ownWindowFormat{0};
++  uint64_t m_ownWindowModifier{0};
++
+   EGLint m_renderableType{0};
+   bool m_highBitDepthReported{false};
+   //! The driver has a half-float output (nvidia-drm). Set with the window; other threads ask
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 05a8e39..3f0b011 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -298,6 +298,14 @@ bool CWinSystemGbmGLESContext::InitWindowSystem()
+   return true;
+ }
+ 
++bool CWinSystemGbmGLESContext::BeginRender()
++{
++  // Hades: the frame goes into the buffer of Kodi's own that is free for it, when the frames go
++  // into those (COwnScanout; bound already after the last flip, unless another commit came since)
++  BindOwnBack();
++  return CRenderSystemGLES::BeginRender();
++}
++
+ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+                                              RESOLUTION_INFO& res,
+                                              bool blankOtherDisplays)
+@@ -442,7 +450,7 @@ bool CWinSystemGbmGLESContext::SetFullScreen(bool fullScreen,
+   }
+ #endif
+ 
+-  if (!m_eglContext.TrySwapBuffers())
++  if (!SwapOutputBuffers())
+   {
+     CEGLUtils::Log(LOGERROR, "eglSwapBuffers failed");
+     throw std::runtime_error("eglSwapBuffers failed");
+@@ -603,7 +611,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       // (CHeldModeAnnouncement), which flushes the renderer: its GPU work is finished first
+       if (m_modeAnnounce.Pending() == CHeldModeAnnouncement::Step::BEFORE_NEXT)
+         ahead = false;
+-      const bool swapped = m_eglContext.TrySwapBuffers();
++      const bool swapped = SwapOutputBuffers();
+       // The fence is made after the swap, so that it also stands for what the swap itself has
+       // the GPU do with the buffer.
+       const bool fenced = ahead && swapped && DVAheadFence();
+@@ -984,7 +992,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+   {
+     if (rendered && !videoLayer && m_heldGuiFlips && m_modeHold.GuiGoesOn())
+     {
+-      if (!m_eglContext.TrySwapBuffers())
++      if (!SwapOutputBuffers())
+       {
+         CEGLUtils::Log(LOGERROR, "eglSwapBuffers failed");
+         throw std::runtime_error("eglSwapBuffers failed");
+@@ -1038,7 +1046,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       }
+ #endif
+ 
+-      if (!m_eglContext.TrySwapBuffers())
++      if (!SwapOutputBuffers())
+       {
+         CEGLUtils::Log(LOGERROR, "eglSwapBuffers failed");
+         throw std::runtime_error("eglSwapBuffers failed");
+@@ -1100,6 +1108,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+       m_dvPlusClock.Lost();
+ #endif
+     CWinSystemGbm::FlipPage(rendered, videoLayer, async);
++    // Hades: with Kodi's own buffers, the next frame is drawn into one that Kodi does not hold for
++    // the screen, now that it has given back what it gives back (COwnScanout)
++    BindOwnBack();
+     TellWindowBuffers();
+ #ifdef HAVE_DVBRIDGE
+     // Hades: the frame of this commit, whose flip comes before the next commit (async), or came
+@@ -5719,7 +5730,7 @@ bool CWinSystemGbmGLESContext::DVStartSignal(const RESOLUTION_INFO& res)
+   glFinish();
+   bool presented = false;
+   const char* failed = "its buffer could not be swapped";
+-  if (m_eglContext.TrySwapBuffers())
++  if (SwapOutputBuffers())
+   {
+     // Told as the change of mode that it makes: lost now, back once the delay that the user set has
+     // passed after it (SendDisplayReset()), as every other change of the refresh rate is
+@@ -6168,7 +6179,7 @@ void CWinSystemGbmGLESContext::PresentDVMenus(bool rendered)
+   if (m_dvBridge->Pack(0, m_nWidth, m_nHeight, true, CDVBridgeGLES::Cover::NONE))
+   {
+     // the way that waits: the GPU work of the frame finished, then a commit that waits for its flip
+-    const bool swapped = m_eglContext.TrySwapBuffers();
++    const bool swapped = SwapOutputBuffers();
+     if (swapped)
+     {
+       glFinish();
+@@ -6318,7 +6329,7 @@ void CWinSystemGbmGLESContext::PresentDVEndOfStream()
+     // a transport frame like the others, in a commit that waits for its flip; the restoration
+     // follows it
+     glFinish();
+-    shown = m_eglContext.TrySwapBuffers() && FlipDVBridgePage(m_dvState, false);
++    shown = SwapOutputBuffers() && FlipDVBridgePage(m_dvState, false);
+     if (!shown)
+       why = "its commit was refused";
+   }
+@@ -6403,7 +6414,7 @@ bool CWinSystemGbmGLESContext::EndDVBridge(bool tellModeset, bool withMode)
+       m_modeAnnounce.Modeset();
+     // Hades: a mode that native output moved into, and that no frame of it carried (CDVModeMove),
+     // goes with this restoration, in one commit
+-    const bool restored = m_eglContext.TrySwapBuffers() &&
++    const bool restored = SwapOutputBuffers() &&
+                           FlipDVBridgePage(m_dvState, true, nullptr, withMode || m_dvMovePending);
+     if (!restored)
+     {
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index b37080d..92866d4 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -95,6 +95,9 @@ public:
+   bool InitWindowSystem() override;
+   bool SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays) override;
+   void PresentRender(bool rendered, bool videoLayer) override;
++  //! Hades: the frame is drawn into the buffer that is free for it, where the frames go into
++  //! buffers of Kodi's own (BindOwnBack())
++  bool BeginRender() override;
+ 
+   // GUI compositing for HDR
+   bool SetGuiCompositing(int colorTransfer) override;
+-- 
+2.53.0
+

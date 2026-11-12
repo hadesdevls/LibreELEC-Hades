@@ -2,8 +2,8 @@
 # Copyright (C) 2022-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="kmsxx"
-PKG_VERSION="4d2008f5893a5d6ea2b2bf5e70bc539bfcaf6db0"
-PKG_SHA256="8671e99766590055cafd58793eaf56782044e2cf1203a8a390a5726457d39f7d"
+PKG_VERSION="e0d593d298a3590d306bdf850cf0295d078fbf73"
+PKG_SHA256="7da8d6297f519c354ce1d63c5632676fdb7f1ab8bd26f7c42702080616b83d3c"
 PKG_LICENSE="MPL-2.0"
 PKG_SITE="https://github.com/tomba/kmsxx"
 PKG_URL="https://github.com/tomba/kmsxx/archive/${PKG_VERSION}.tar.gz"

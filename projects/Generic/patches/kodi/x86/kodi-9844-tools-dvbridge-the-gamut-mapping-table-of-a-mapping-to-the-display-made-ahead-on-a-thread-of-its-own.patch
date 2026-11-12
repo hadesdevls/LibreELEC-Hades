@@ -1,0 +1,423 @@
+From 614cc25ffaecdf8c4addfc620f3b1c95d14d4974 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 23:29:14 +0000
+Subject: [PATCH] tools/dvbridge: the gamut mapping table of a mapping to the
+ display made ahead, on a thread of its own
+
+The gamut mapping table of a mapping to a display (Low-Latency, Dolby
+Vision or HDR10 to an HDR10 display, anything to SDR) was made by
+libplacebo when the shader of the first picture of that mapping was made,
+on the thread that draws: in Kodi the thread of the interface, in the pass
+that starts the video (issue #3). At the bridge's standard size (96x64x512,
+24 MiB) that is 0.64 s of one core of a Ryzen 9 7950X3D, 174 ms on four of
+its threads and 49 ms on all 32; the finer table eight times that.
+
+When a mapping is set (dvbridge_render_hdr10_mapping(),
+dvbridge_render_set_low_latency(), or the size of the table changed), the
+renderer now asks libplacebo which table that mapping draws with, from the
+colour spaces that map_to_display() gives a picture of it
+(display_mapping(), which map_to_display() calls; pl_color_map_gamut_table()
+of libplacebo-9980), and makes it on a thread of its own
+(pl_gamut_table_fill()). When the shader of the first picture asks for its
+table, libplacebo takes that one where it is the table asked for (the same
+signature and size), after what is left of it is made, and makes its own as
+before where it is not (pl_gamut_table_source). The job of the thread is
+shared by the two and freed by the last: a table let go of while it is made
+(another mapping, the renderer destroyed) is left to finish alone, without
+a wait; the thread reads nothing of the GPU, the format of the table being a
+copy. None is made where libplacebo holds that table already (a renderer
+kept from an earlier video of that mapping, as the one of native output is),
+nor where the mapping needs none. dvbridge_render_gamut_made() says how the
+last table was made; dvbridge_render_use_gamut_ahead() turns it off, for a
+comparison.
+
+Measured on the host with Mesa's software OpenGL ES (libplacebo of the image
+with libplacebo-9980):
+- twelve mappings: the table made ahead is the shader's own, byte for byte,
+  and the shader takes it and makes none; a mapping that needs no table gets
+  none either way. A table made for a display 1 cd/m2 brighter is refused,
+  and one changed by a byte is told apart.
+- the first picture of a profile 7 stream with its enhancement layer, mapped
+  as Low-Latency, as HDR10 and to SDR: the same bytes with the table made
+  ahead or not. With 300 ms of passes of the interface before it, the pass
+  of that picture took the table without waiting for it, where without it
+  the pass made the table itself; without any passes before it, the pass
+  waits for what is left of it.
+- ThreadSanitizer and AddressSanitizer: tables taken, let go of while made,
+  renderers destroyed while their table is made, mappings changed before the
+  first picture: no data race, no error, nothing of the bridge left.
+---
+ tools/dvbridge/CMakeLists.txt    |   5 +-
+ tools/dvbridge/dvbridge_render.c | 227 ++++++++++++++++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h |  19 +++
+ 3 files changed, 244 insertions(+), 7 deletions(-)
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 88cb18b..4cd0d7e 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -11,6 +11,8 @@ pkg_check_modules(DVEgl REQUIRED IMPORTED_TARGET egl)
+ pkg_check_modules(DVDrm REQUIRED IMPORTED_TARGET libdrm)
+ # Hades: the enhancement layer asks its VAAPI driver what it is (dvbridge_fel.c, fixed_pool_driver())
+ pkg_check_modules(DVVa REQUIRED IMPORTED_TARGET libva)
++# Hades: the gamut mapping table made ahead on a thread of its own (dvbridge_render.c)
++find_package(Threads REQUIRED)
+ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_render.c
+                                 dvbridge_gl_frame.c dvbridge_gl_pack.c dvbridge_fel.c dvbridge_dmabuf.c
+                                 dvbridge_cache.c dvbridge_verify.c dvbridge_guimask.c
+@@ -21,4 +23,5 @@ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_ST
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+                                          PkgConfig::DVAvcodec PkgConfig::DVGles
+-                                         PkgConfig::DVEgl PkgConfig::DVDrm PkgConfig::DVVa m)
++                                         PkgConfig::DVEgl PkgConfig::DVDrm PkgConfig::DVVa m
++                                         Threads::Threads)
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index a77538c..00650be 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -18,7 +18,10 @@
+ #include <libplacebo/opengl.h>
+ #include <GLES3/gl31.h>
+ #include <math.h>
++#include <pthread.h>
++#include <stdatomic.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <time.h>
+ 
+ /* Hades: what dvbridge_render_take_notes() reports, once each in a stream */
+@@ -57,6 +60,26 @@ struct pass_timer {
+     bool made, open;
+ };
+ 
++/* Hades: a gamut mapping table made ahead, on a thread of its own (gamut_ahead_start()). The job is
++ * the renderer's and its thread's (refs): its thread makes data and make_ms and lets go of it; the
++ * renderer reads them once it has joined the thread, or lets go of it without a wait (the thread
++ * then goes on alone, and the last of the two frees it). The thread reads nothing of the GPU: the
++ * format of the table is a copy (fmt). */
++struct gamut_job {
++    atomic_int refs;
++    struct pl_gamut_table table;
++    struct pl_fmt_t fmt;
++    void *data;
++    double make_ms; /* what making it took, on its thread */
++};
++
++struct gamut_ahead {
++    struct gamut_job *job; /* the table asked for; NULL: none */
++    pthread_t thread;
++    bool joined;
++    double asked_at; /* now_ms() when it was asked for */
++};
++
+ struct dvbridge_renderer {
+     pl_gpu gpu;
+     pl_renderer renderer;
+@@ -181,6 +204,18 @@ struct dvbridge_renderer {
+     struct dvbridge_passtime *passtime;
+     bool gl_timers;
+     struct pass_timer timers[PASS_TIMERS];
++    /* Hades: the gamut mapping table of the mapping to a display, made ahead on a thread of its
++     * own while nothing waits for it (gamut_ahead_start()): the one asked for (ahead), how
++     * libplacebo takes it (gamut_source), the table libplacebo holds (gamut_held,
++     * gamut_held_bytes: its signature and size; 0, none or not known), how the last one it took
++     * was made (gamut_made), and whether the one made ahead was for another mapping (gamut_other).
++     * gamut_ahead_off: none is made ahead (dvbridge_render_use_gamut_ahead()). */
++    struct gamut_ahead ahead;
++    struct pl_gamut_table_source gamut_source;
++    uint64_t gamut_held;
++    size_t gamut_held_bytes;
++    struct dvbridge_gamut_made gamut_made;
++    bool gamut_other, gamut_ahead_off;
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -609,6 +644,12 @@ static bool gamut_table_retry(struct dvbridge_renderer *r, bool fine, bool ok);
+ static bool trim_retry(struct dvbridge_renderer *r, bool ok);
+ static void trim_kept(struct dvbridge_renderer *r, bool ok);
+ static void gamut_table_kept(struct dvbridge_renderer *r, bool ok);
++static double now_ms(void);
++static bool gamut_ahead_start(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m);
++static void gamut_ahead_forget(struct dvbridge_renderer *r);
++static bool gamut_take(void *priv, uint64_t signature, void *data, size_t bytes);
++static void gamut_made_here(void *priv, uint64_t signature, const void *data, size_t bytes,
++                            double ms);
+ 
+ struct dvbridge_renderer *dvbridge_renderer_create(pl_gpu gpu, pl_log log)
+ {
+@@ -628,6 +669,9 @@ static struct dvbridge_renderer *create_renderer(pl_gpu gpu, pl_log log, bool tr
+     if (!r)
+         return NULL;
+     r->gpu = gpu;
++    /* Hades: the gamut mapping table that libplacebo needs, taken from the one made ahead */
++    r->gamut_source = (struct pl_gamut_table_source){
++        .take = gamut_take, .made = gamut_made_here, .priv = r};
+     // Query just the operation used here. libplacebo's global subgroup flag
+     // requires arithmetic/clustered features that this fragment hook never uses.
+     pl_opengl gl = pl_opengl_get(gpu);
+@@ -752,6 +796,8 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+ {
+     if (!r)
+         return;
++    /* Hades: (a table being made ahead goes on alone, and frees itself) */
++    gamut_ahead_forget(r);
+     dvbridge_candidate_destroy(r->pending);
+     dvbridge_destroy(r->context);
+     dvbridge_source_packer_destroy(r->source_packer);
+@@ -1863,6 +1909,9 @@ bool dvbridge_render_hdr10_mapping(struct dvbridge_renderer *r,
+         r->hdr10_mapping = *mapping;
+     else
+         r->hdr10_mapping = (struct dvbridge_hdr10_mapping){0};
++    /* Hades: its gamut mapping table, made ahead while nothing waits for it */
++    if (r->hdr10_mapping.enabled)
++        gamut_ahead_start(r, &r->hdr10_mapping);
+     return valid;
+ }
+ 
+@@ -1956,10 +2005,13 @@ static const struct dvbridge_level1 *level1_noted(struct dvbridge_renderer *r, c
+     return level1;
+ }
+ 
+-static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
+-                           struct pl_color_space *source, struct pl_color_space *target,
+-                           struct pl_color_map_params *params,
+-                           const struct dvbridge_level1 *level1)
++/* Hades: map_to_display() without the renderer: the sizes of its gamut mapping table given (size).
++ * gamut_ahead_start() takes the same, so that the table it makes ahead is the one the mapping
++ * needs. */
++static void display_mapping(const struct dvbridge_hdr10_mapping *m, const int *size,
++                            struct pl_color_space *source, struct pl_color_space *target,
++                            struct pl_color_map_params *params,
++                            const struct dvbridge_level1 *level1)
+ {
+     /* Hades: the brightest and the average of the scene that libplacebo maps by
+      * (PL_HDR_METADATA_CIE_Y: max_pq_y, avg_pq_y; it does not read the minimum) are those of level 1
+@@ -2009,12 +2061,166 @@ static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hd
+      * machine, 0.6 s instead of 0.08 s; its work is spread over the cores there is), and a picture
+      * costs as much to draw as with the smaller one. (Hades: GAMUT_STANDARD; the finer one where it
+      * is asked for, gamut_table_size().) */
+-    const int *size = gamut_table_size(r);
+     params->lut3d_size[0] = size[0];
+     params->lut3d_size[1] = size[1];
+     params->lut3d_size[2] = size[2];
+ }
+ 
++static void map_to_display(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m,
++                           struct pl_color_space *source, struct pl_color_space *target,
++                           struct pl_color_map_params *params,
++                           const struct dvbridge_level1 *level1)
++{
++    display_mapping(m, gamut_table_size(r), source, target, params, level1);
++    /* Hades: the gamut mapping table made ahead, where it is the one this mapping needs (the same
++     * table, byte for byte: libplacebo makes it otherwise, as before) */
++    params->gamut_table_source = &r->gamut_source;
++}
++
++/* Hades: the gamut mapping table of a mapping to a display (to HDR10, to SDR, or Low-Latency)
++ * made ahead, on a thread of its own, from when the mapping is set: for the first picture that
++ * maps, libplacebo made it while that picture waited, on the thread that draws (the standard
++ * table, 0.64 s of one core of the build machine; 49 ms on its 32 threads, 106 ms on 8, 174 ms on
++ * 4, which libplacebo spreads it over), under the busy dialog at the start of a video (issue #3).
++ * The mapping is set when the renderer is configured for the video and when its native output
++ * begins, some frames of the GUI before the first picture; the table libplacebo then asks for is
++ * taken from here (gamut_take()), or, where it is not the same (its signature and size), made by
++ * libplacebo as before (gamut_made_here()). The pictures mapped are BT.2020 (Dolby Vision
++ * reconstructed, HDR10, HLG) with the gamut of the mastering display that the mapping has, or
++ * none: what else their colour has (their brightness, PQ or HLG) the gamut mapping does not read
++ * (pl_color_map_gamut_table()). Not made where libplacebo holds that table already (an earlier
++ * video of the same mapping), nor where the mapping needs none. */
++static void gamut_job_release(struct gamut_job *job)
++{
++    if (atomic_fetch_sub_explicit(&job->refs, 1, memory_order_acq_rel) == 1) {
++        free(job->data);
++        free(job);
++    }
++}
++
++static void *gamut_ahead_run(void *arg)
++{
++    struct gamut_job *job = arg;
++    const double start = now_ms();
++    pl_gamut_table_fill(job->data, &job->table);
++    job->make_ms = now_ms() - start;
++    gamut_job_release(job);
++    return NULL;
++}
++
++/* the table asked for is let go of without a wait: a thread that has not ended goes on alone, and
++ * frees what it made */
++static void gamut_ahead_forget(struct dvbridge_renderer *r)
++{
++    struct gamut_ahead *a = &r->ahead;
++    if (!a->job)
++        return;
++    if (!a->joined)
++        pthread_detach(a->thread);
++    gamut_job_release(a->job);
++    *a = (struct gamut_ahead){0};
++}
++
++static bool gamut_ahead_start(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m)
++{
++    if (r->gamut_ahead_off || !m->enabled || !dvbridge_hdr10_mapping_valid(m))
++        return false;
++    struct pl_color_space source = {.primaries = PL_COLOR_PRIM_BT_2020,
++                                     .transfer = PL_COLOR_TRC_PQ};
++    struct pl_color_space target;
++    struct pl_color_map_params params;
++    const bool fine = r->gamut_asked == DVBRIDGE_GAMUT_TABLE_FINE && !r->gamut_fine_failed;
++    display_mapping(m, fine ? GAMUT_FINE : GAMUT_STANDARD, &source, &target, &params, NULL);
++    struct pl_gamut_table table;
++    if (!pl_color_map_gamut_table(r->gpu, &params, source, target, &table))
++        return false;
++    if (table.signature == r->gamut_held && table.bytes == r->gamut_held_bytes)
++        return false;
++    struct gamut_ahead *a = &r->ahead;
++    if (a->job && a->job->table.signature == table.signature && a->job->table.bytes == table.bytes)
++        return true;
++    gamut_ahead_forget(r);
++    struct gamut_job *job = calloc(1, sizeof(*job));
++    void *data = job ? malloc(table.bytes) : NULL;
++    if (!data) {
++        free(job);
++        return false;
++    }
++    atomic_init(&job->refs, 2);
++    job->fmt = *table.fmt;
++    job->table = table;
++    job->table.fmt = &job->fmt;
++    job->data = data;
++    const double asked = now_ms();
++    if (pthread_create(&a->thread, NULL, gamut_ahead_run, job) != 0) {
++        free(data);
++        free(job);
++        return false;
++    }
++    a->job = job;
++    a->joined = false;
++    a->asked_at = asked;
++    return true;
++}
++
++/* Hades: libplacebo asks for the table it needs (pl_gamut_table_source::take) */
++static bool gamut_take(void *priv, uint64_t signature, void *data, size_t bytes)
++{
++    struct dvbridge_renderer *r = priv;
++    struct gamut_ahead *a = &r->ahead;
++    r->gamut_held = signature;
++    r->gamut_held_bytes = bytes;
++    r->gamut_other =
++        a->job && (a->job->table.signature != signature || a->job->table.bytes != bytes);
++    if (!a->job || r->gamut_other)
++        return false;
++    const double needed = now_ms();
++    if (!a->joined) {
++        pthread_join(a->thread, NULL);
++        a->joined = true;
++    }
++    const double got = now_ms();
++    memcpy(data, a->job->data, bytes);
++    r->gamut_made = (struct dvbridge_gamut_made){.serial = r->gamut_made.serial + 1,
++                                                 .ahead = true,
++                                                 .make_ms = a->job->make_ms,
++                                                 .lead_ms = needed - a->asked_at,
++                                                 .wait_ms = got - needed};
++    gamut_ahead_forget(r);
++    return true;
++}
++
++/* Hades: libplacebo made the table it needed itself (pl_gamut_table_source::made) */
++static void gamut_made_here(void *priv, uint64_t signature, const void *data, size_t bytes,
++                            double ms)
++{
++    (void)signature;
++    (void)data;
++    (void)bytes;
++    struct dvbridge_renderer *r = priv;
++    r->gamut_made = (struct dvbridge_gamut_made){
++        .serial = r->gamut_made.serial + 1, .ahead_other = r->gamut_other, .make_ms = ms};
++    /* (one made ahead for another mapping is let go of, without a wait) */
++    gamut_ahead_forget(r);
++}
++
++void dvbridge_render_use_gamut_ahead(struct dvbridge_renderer *r, bool use)
++{
++    if (!r)
++        return;
++    r->gamut_ahead_off = !use;
++    if (!use)
++        gamut_ahead_forget(r);
++}
++
++bool dvbridge_render_gamut_made(const struct dvbridge_renderer *r, struct dvbridge_gamut_made *made)
++{
++    if (!r || !made || !r->gamut_made.serial)
++        return false;
++    *made = r->gamut_made;
++    return true;
++}
++
+ /* Hades: the trim pass of the metadata of a picture mapped to a display
+    (dvbridge_hdr10_mapping::trims): the pass
+  * to draw, or false: none (the picture is mapped as before, bit for bit). The log notes (once each
+@@ -2133,9 +2339,15 @@ void dvbridge_render_set_gamut_table(struct dvbridge_renderer *r, int table)
+         return;
+     const int asked = table == DVBRIDGE_GAMUT_TABLE_FINE ? DVBRIDGE_GAMUT_TABLE_FINE
+                                                          : DVBRIDGE_GAMUT_TABLE_STANDARD;
+-    if (asked != r->gamut_asked)
++    const bool changed = asked != r->gamut_asked;
++    if (changed)
+         r->gamut_fine_failed = false;
+     r->gamut_asked = asked;
++    /* Hades: (the table made ahead is then of the other size) */
++    if (changed && r->low_latency)
++        gamut_ahead_start(r, &r->ll_mapping);
++    else if (changed && r->hdr10_mapping.enabled)
++        gamut_ahead_start(r, &r->hdr10_mapping);
+ }
+ 
+ bool dvbridge_render_gamut_table(const struct dvbridge_renderer *r, struct dvbridge_gamut_table *table)
+@@ -3296,6 +3508,9 @@ bool dvbridge_render_set_low_latency(struct dvbridge_renderer *r,
+                                     dvbridge_hdr10_mapping_valid(mapping));
+     r->low_latency = mapping && valid;
+     r->ll_mapping = r->low_latency ? *mapping : (struct dvbridge_hdr10_mapping){0};
++    /* Hades: its gamut mapping table, made ahead while nothing waits for it */
++    if (r->low_latency)
++        gamut_ahead_start(r, &r->ll_mapping);
+     return valid;
+ }
+ 
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 9952744..7641d82 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -220,6 +220,25 @@ struct dvbridge_gamut_table {
+ /* false before a render of this renderer mapped a picture */
+ bool dvbridge_render_gamut_table(const struct dvbridge_renderer *renderer,
+                                  struct dvbridge_gamut_table *table);
++/* Hades: the gamut mapping table of a mapping to a display is made ahead, on a thread of its own,
++ * from when the mapping is set (dvbridge_render_hdr10_mapping(),
++ * dvbridge_render_set_low_latency()), and the first picture that maps takes it instead of waiting
++ * while libplacebo makes it (libplacebo-9980: the same table, byte for byte; where it is not the
++ * one needed, libplacebo makes it as before). On by default; dvbridge_render_use_gamut_ahead()
++ * turns it off (to compare). dvbridge_render_gamut_made() says how the last table that libplacebo
++ * took was made: false before any. */
++#define DVBRIDGE_RENDER_GAMUT_AHEAD 1
++void dvbridge_render_use_gamut_ahead(struct dvbridge_renderer *renderer, bool use);
++struct dvbridge_gamut_made {
++    unsigned serial;  /* counts the tables taken: one that is new to the caller is one to tell */
++    bool ahead;       /* made ahead, and taken */
++    bool ahead_other; /* made by the render that needed it; the one made ahead was another */
++    double make_ms;   /* what making it took (on its thread, or on the thread that draws) */
++    double lead_ms;   /* ahead: from when it was asked for to when a render needed it */
++    double wait_ms;   /* ahead: what that render waited for the rest of it */
++};
++bool dvbridge_render_gamut_made(const struct dvbridge_renderer *renderer,
++                                struct dvbridge_gamut_made *made);
+ 
+ #define DVBRIDGE_RENDER_LOW_LATENCY 1
+ bool dvbridge_render_set_low_latency(struct dvbridge_renderer *renderer,
+-- 
+2.53.0
+

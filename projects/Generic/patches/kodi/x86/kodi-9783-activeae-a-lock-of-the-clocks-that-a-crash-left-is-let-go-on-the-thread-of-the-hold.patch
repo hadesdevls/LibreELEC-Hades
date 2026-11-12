@@ -1,0 +1,299 @@
+From da5afe3c72d736a9b7bf6fbf961cef50639c8984 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 08:55:00 +0000
+Subject: [PATCH] ActiveAE: a lock of the clocks that a crash left is let go on
+ the thread of the hold
+
+CActiveAESink::Start() runs on the thread of the audio engine, before the
+loop of that thread, and the start of Kodi waits up to 10 s for the engine to
+answer INIT (CActiveAE::Start()). Where the marker of a lock that a crash left
+was there, RecoverStale() loaded NVML, initialised it and reset the clocks
+right there: nvmlInit() can take a second or more with the GPU asleep, and a
+driver that does not answer kept the whole audio engine from starting, which
+GpuClockHold.h says never happens ("never makes the audio engine wait").
+
+Start() now only reads the marker (one file, normally absent) and, where it
+is there, hands it to the hold (CAsyncHold::Recover()), whose thread lets that
+lock go before anything that is asked after it: a stream of HD audio played at
+once on the same card is locked after the reset, not reset by it.
+
+TestGpuClockHold: AStaleLockIsLetGoOnTheThreadOfTheHoldFirst (Recover()
+returns at once with a driver that takes 300 ms to answer, and the stale lock
+is let go before the new one is made) and NoMarkerNoRecovery. A copy of the
+header that lets go on the thread that asks fails the first; one that lets go
+after the requests hangs. The 13 tests pass.
+---
+ .../Engines/ActiveAE/ActiveAESink.cpp         | 28 ++++---
+ .../Engines/ActiveAE/ActiveAESink.h           |  4 +-
+ xbmc/cores/AudioEngine/Utils/GpuClockHold.h   | 76 ++++++++++++++++---
+ .../Utils/test/TestGpuClockHold.cpp           | 51 +++++++++++++
+ 4 files changed, 138 insertions(+), 21 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+index 85026e5..d39fef1 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp
+@@ -51,15 +51,26 @@ namespace
+ constexpr const char* GPU_HOLD_MARKER = "/run/hades-gpu-clock-hold";
+ } // namespace
+ 
++AE::GPUHOLD::CAsyncHold& CActiveAESink::GpuHold()
++{
++  if (!m_gpuHold)
++    m_gpuHold = std::make_unique<AE::GPUHOLD::CAsyncHold>(
++        [](const std::string& pci) -> std::unique_ptr<AE::GPUHOLD::IClocks>
++        { return std::make_unique<AE::GPUHOLD::CNvmlClocks>(pci, GPU_HOLD_MARKER); },
++        [](const std::string& said) { CLog::Log(LOGINFO, "GPU clock hold: {}", said); });
++  return *m_gpuHold;
++}
++
+ void CActiveAESink::Start()
+ {
+   if (!IsRunning())
+   {
+-    // a lock of the clocks that a crash of Kodi left lets go here, whatever the setting says; with
+-    // no
+-    // marker (the usual case) this reads one file that is not there
+-    if (const auto said = AE::GPUHOLD::RecoverStale(GPU_HOLD_MARKER))
+-      CLog::Log(LOGINFO, "GPU clock hold: {}", *said);
++    // a lock of the clocks that a crash of Kodi left lets go, whatever the setting says, on the
++    // thread of the hold: this is the thread of the audio engine, whose start Kodi waits for, and
++    // NVML can take a while or not come back. With no marker (the usual case) this reads one file
++    // that is not there, and makes nothing
++    if (AE::GPUHOLD::StaleLockMarked(GPU_HOLD_MARKER))
++      GpuHold().Recover(GPU_HOLD_MARKER);
+     Create();
+     SetPriority(ThreadPriority::ABOVE_NORMAL);
+   }
+@@ -1391,11 +1402,8 @@ void CActiveAESink::UpdateGpuHold(bool passthrough)
+   request.nvidiaGpu = gpu.has_value();
+ 
+   const bool wanted = AE::GPUHOLD::Wants(request);
+-  if (wanted && !m_gpuHold)
+-    m_gpuHold = std::make_unique<AE::GPUHOLD::CAsyncHold>(
+-        [](const std::string& pci) -> std::unique_ptr<AE::GPUHOLD::IClocks>
+-        { return std::make_unique<AE::GPUHOLD::CNvmlClocks>(pci, GPU_HOLD_MARKER); },
+-        [](const std::string& said) { CLog::Log(LOGINFO, "GPU clock hold: {}", said); });
++  if (wanted)
++    GpuHold();
+   if (m_gpuHold)
+     m_gpuHold->Set(gpu.value_or(std::string()), wanted);
+ }
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+index 9f07362..a8f8c9f 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.h
+@@ -209,8 +209,10 @@ protected:
+   std::shared_ptr<const SinkInfoList> SinkInfo() const;
+   std::unique_ptr<IAESink> m_sink;
+   //! Hades: the clocks of an NVIDIA card held while HD audio plays through it (GpuClockHold.h);
+-  //! made when the setting is first on, on the thread of the sink
++  //! made when the setting is first on, on the thread of the sink, or by Start() before that thread
++  //! is made, where a crash left a lock to let go
+   std::unique_ptr<AE::GPUHOLD::CAsyncHold> m_gpuHold;
++  AE::GPUHOLD::CAsyncHold& GpuHold();
+   //! OpenSink() is closing the sink to open it again: the clocks stay as they are meanwhile
+   bool m_reopening{false};
+   //! Hades: asks for the clocks held, or let go, for the stream that the sink just opened
+diff --git a/xbmc/cores/AudioEngine/Utils/GpuClockHold.h b/xbmc/cores/AudioEngine/Utils/GpuClockHold.h
+index 54e29d6..ea4b3e0 100644
+--- a/xbmc/cores/AudioEngine/Utils/GpuClockHold.h
++++ b/xbmc/cores/AudioEngine/Utils/GpuClockHold.h
+@@ -29,8 +29,8 @@
+ //
+ // A lock outlives the process that made it ("After system reboot or driver reload GPU clocks go
+ // back to their default value", nvml.h), so a marker file in /run says that this made one, and the
+-// next start of Kodi lets it go if a crash left it. With the setting off, nothing of this runs
+-// but that check of the marker.
++// next start of Kodi lets it go if a crash left it, on the thread of the hold as every call to
++// NVML. With the setting off, nothing of this runs but that check of the marker.
+ //
+ // Nothing of Kodi is included: the policy and the sysfs lookups are tested on the host
+ // (TestGpuClockHold.cpp).
+@@ -485,9 +485,17 @@ private:
+   bool m_memoryLocked{false};
+ };
+ 
++//! Whether a lock that a crash of Kodi left is marked (the marker file is there): the one check
++//! that runs at the start whatever the setting says, a read of a file that is normally not there
++inline bool StaleLockMarked(const std::string& marker)
++{
++  return DETAIL::ReadLine(marker).has_value();
++}
++
+ /*!
+- * \brief A lock that a crash of Kodi left (the marker file is there): let it go. Called once at the
+- * start, whatever the setting says. Nothing is done when there is no marker.
++ * \brief A lock that a crash of Kodi left (the marker file is there): let it go. Done once at the
++ * start, whatever the setting says, on the thread of the hold (CAsyncHold::Recover()). Nothing is
++ * done when there is no marker.
+  * \return what was said, or nothing
+  */
+ inline std::optional<std::string> RecoverStale(const std::string& marker, IClocks* clocks = nullptr)
+@@ -543,6 +551,22 @@ public:
+   //! wanted.
+   void Set(const std::string& pci, bool wanted) { Request(pci, wanted, false); }
+ 
++  /*!
++   * \brief Let go a lock of the clocks that a crash of Kodi left (RecoverStale(): \a marker is
++   *        there), on the thread of the hold and before anything that is asked after this, with
++   *        the clocks that make gives for the card that the marker names. Returns at once: NVML is
++   *        not called on the thread that asks (the thread of the audio engine, at the start)
++   */
++  void Recover(const std::string& marker)
++  {
++    {
++      std::lock_guard<std::mutex> lock(m_state->mutex);
++      m_state->recover = marker;
++      StartLocked();
++    }
++    m_state->cv.notify_all();
++  }
++
+ private:
+   struct State
+   {
+@@ -551,12 +575,23 @@ private:
+     std::mutex mutex;
+     std::condition_variable cv;
+     std::string pci; //!< the card that is wanted held
++    std::string recover; //!< the marker of a lock that a crash left (Recover()), "" for none
+     bool wanted{false};
+     bool stop{false};
+     bool finished{false};
+     bool running{false};
+   };
+ 
++  //! The thread of the hold, if it is not running yet (m_state->mutex held)
++  void StartLocked()
++  {
++    if (!m_state->running)
++    {
++      m_state->running = true;
++      std::thread([state = m_state] { Work(state); }).detach();
++    }
++  }
++
+   void Request(const std::string& pci, bool wanted, bool stop)
+   {
+     {
+@@ -565,15 +600,24 @@ private:
+         m_state->pci = pci;
+       m_state->wanted = wanted && !stop;
+       m_state->stop = stop;
+-      if (!m_state->running)
+-      {
+-        m_state->running = true;
+-        std::thread([state = m_state] { Work(state); }).detach();
+-      }
++      StartLocked();
+     }
+     m_state->cv.notify_all();
+   }
+ 
++  //! A lock that a crash left, let go with the clocks of its card (Recover())
++  static void LetGoStale(const State& state, const std::string& marker)
++  {
++    const auto stale = DETAIL::ReadLine(marker);
++    if (!stale)
++      return;
++    const std::unique_ptr<IClocks> staleClocks = state.make(*stale);
++    if (!staleClocks)
++      return;
++    if (const auto said = RecoverStale(marker, staleClocks.get()))
++      state.say(*said);
++  }
++
+   static void Work(const std::shared_ptr<State>& state)
+   {
+     std::unique_ptr<IClocks> clocks;
+@@ -583,14 +627,26 @@ private:
+     std::unique_lock<std::mutex> lock(state->mutex);
+     for (;;)
+     {
++      // a lock that a crash left goes first: what is asked after it may lock the same card again
++      if (!state->recover.empty())
++      {
++        std::string marker;
++        marker.swap(state->recover);
++        lock.unlock();
++        LetGoStale(*state, marker);
++        lock.lock();
++        continue;
++      }
+       // (another card, asked for while the hold is of one, wakes it too: the clocks of the first
+       // are let go and those of the other held; the same "wanted" alone would leave the first held)
+       state->cv.wait(lock,
+                      [&]
+                      {
+-                       return state->stop || state->wanted != applied ||
++                       return state->stop || !state->recover.empty() || state->wanted != applied ||
+                               (state->wanted && state->pci != pci);
+                      });
++      if (!state->recover.empty())
++        continue;
+       const bool stop = state->stop;
+       const bool wanted = state->wanted && !stop;
+       const std::string want = state->pci;
+diff --git a/xbmc/cores/AudioEngine/Utils/test/TestGpuClockHold.cpp b/xbmc/cores/AudioEngine/Utils/test/TestGpuClockHold.cpp
+index 385fd1d..2ac84ee 100644
+--- a/xbmc/cores/AudioEngine/Utils/test/TestGpuClockHold.cpp
++++ b/xbmc/cores/AudioEngine/Utils/test/TestGpuClockHold.cpp
+@@ -388,3 +388,54 @@ TEST(TestGpuClockHold, AStaleLockIsLetGo)
+   EXPECT_NE(std::string::npos, said->find("earlier run"));
+   std::remove(marker.c_str());
+ }
++
++TEST(TestGpuClockHold, AStaleLockIsLetGoOnTheThreadOfTheHoldFirst)
++{
++  char name[] = "/tmp/gpuholdrXXXXXX";
++  const int fd = mkstemp(name);
++  ASSERT_GE(fd, 0);
++  close(fd);
++  const std::string marker = name;
++  EXPECT_FALSE(StaleLockMarked(marker)); // an empty file is no marker
++  Touch(marker, "0000:01:00.0");
++  EXPECT_TRUE(StaleLockMarked(marker));
++
++  CEvents events;
++  std::atomic<int> told{0};
++  {
++    // a driver that takes its time to let go
++    CAsyncHold hold([&events](const std::string& pci)
++                    { return std::unique_ptr<IClocks>(new CCardClocks(pci, events, 300)); },
++                    [&told](const std::string& said)
++                    {
++                      if (said.find("earlier run") != std::string::npos)
++                        ++told;
++                    });
++    const auto start = std::chrono::steady_clock::now();
++    hold.Recover(marker); // the start of the audio engine
++    hold.Set("0000:01:00.0", true); // and HD audio right away, on the same card
++    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(100));
++    EXPECT_TRUE(Eventually([&] { return events.Get().size() == 2; }));
++  }
++  // the stale lock went first: the new one is not let go by it
++  const std::vector<std::string> expected{"unlock 0000:01:00.0", "lock 0000:01:00.0",
++                                          "unlock 0000:01:00.0"};
++  EXPECT_EQ(expected, events.Get());
++  EXPECT_EQ(1, told);
++  std::remove(marker.c_str());
++}
++
++TEST(TestGpuClockHold, NoMarkerNoRecovery)
++{
++  CEvents events;
++  {
++    CAsyncHold hold([&events](const std::string& pci)
++                    { return std::unique_ptr<IClocks>(new CCardClocks(pci, events)); },
++                    [](const std::string&) {});
++    hold.Recover("/nonexistent/hades-gpu-clock-hold");
++    hold.Set("0000:01:00.0", true);
++    EXPECT_TRUE(Eventually([&] { return events.Get().size() == 1; }));
++  }
++  const std::vector<std::string> expected{"lock 0000:01:00.0", "unlock 0000:01:00.0"};
++  EXPECT_EQ(expected, events.Get());
++}
+-- 
+2.53.0
+

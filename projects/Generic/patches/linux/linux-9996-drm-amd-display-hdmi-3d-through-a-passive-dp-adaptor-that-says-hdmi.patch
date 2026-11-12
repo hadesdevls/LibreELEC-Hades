@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 03:25:22 +0000
+Subject: [PATCH 2/5] drm/amd/display: HDMI 3D through a passive DP++ adaptor
+ that says HDMI
+
+amdgpu offers HDMI 3D on HDMI connectors only (stereo_allowed, from the
+3D patch of cinema-ONE: "DP->HDMI dongles reject 3D timings in link
+validation"). That holds for an active converter, which the connector
+drives as DisplayPort and which DC refuses 3D formats for
+(dp_active_dongle_validate_timing()). A passive DisplayPort dual-mode
+adaptor (DP++) is another thing: where the DPCD does not answer, DC finds
+it on the I2C bus of the port and, for one that identifies itself as an
+HDMI one with an HDMI display, drives the link as TMDS HDMI (sink signal
+HDMI, InfoFrames included), within the TMDS clock of the adaptor (165
+MHz for type 1, what its register says for type 2: dongle_max_pix_clk,
+DC_EXCEED_DONGLE_CAP above it). The connector stays a DisplayPort one,
+and no 3D mode was listed there: 3D through such an adaptor was refused
+although the vendor InfoFrame of 3D goes through it as on an HDMI
+connector.
+
+amdgpu_dm_dual_mode_of() says what is behind a DisplayPort connector
+(single stream): none (a DisplayPort display, an active converter, or no
+display), an HDMI adaptor to an HDMI display, or another passive adaptor
+(DVI, one without the HDMI signature, or an HDMI one to a DVI display).
+After each look at the display (amdgpu_dm_update_connector_after_detect()
+and the detect callback, under the mode_config mutex, as the
+subconnector property) the connector allows 3D while an HDMI adaptor is
+behind it (amdgpu.hdmi_3d still turns all of it off), and
+amdgpu_dm_stereo_layout() takes a 3D layout on a DisplayPort connector
+only then, so that a mode of a display of before is the 2D mode it is.
+The doubled timing of frame packing, the source size and the vendor
+InfoFrame follow that layout as on an HDMI connector, and DC keeps the
+doubled clock within the adaptor: 1080p24 and 720p50/60 frame packed
+(148.5 MHz) go through both types, 1080p60 frame packed (297 MHz) only
+through type 2. An HDMI connector, a DisplayPort display and an active
+converter are as before.
+
+The kernel log names a passive adaptor once for each change, with its
+type, its clock and the display behind it; DC says it only with its
+debug mask.
+
+Checked: KUnit of amdgpu_dm (x86_64 in QEMU), with the test patch of
+this series; W=1 of amdgpu_dm_connector.o without warnings.
+
+Not tried with an adaptor or a 3D display on hardware.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h      |  10 ++
+ .../gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h |   5 +
+ .../display/amdgpu_dm/amdgpu_dm_connector.c   | 116 +++++++++++++++++-
+ .../display/amdgpu_dm/amdgpu_dm_connector.h   |  11 ++
+ 4 files changed, 141 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+index b8250239a7ee..d1f283040cda 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_mode.h
+@@ -623,6 +623,16 @@ enum amdgpu_connector_dither {
+ 	AMDGPU_FMT_DITHER_ENABLE = 1,
+ };
+ 
++/* Hades: what is behind a DisplayPort connector (amdgpu_dm_dual_mode_of()) */
++enum amdgpu_dvbridge_dual_mode {
++	/* no passive dual-mode adaptor: a DisplayPort display, an active converter, or none */
++	AMDGPU_DVBRIDGE_DUAL_MODE_NONE = 0,
++	/* a passive adaptor that identifies itself as an HDMI one, with an HDMI display */
++	AMDGPU_DVBRIDGE_DUAL_MODE_HDMI = 1,
++	/* another passive adaptor: a DVI one, one without the HDMI signature, or a DVI display */
++	AMDGPU_DVBRIDGE_DUAL_MODE_OTHER = 2,
++};
++
+ struct amdgpu_dm_dp_aux {
+ 	struct drm_dp_aux aux;
+ 	struct ddc_service *ddc_service;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+index fa5e1e187cd9..0171aabfc83a 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.h
+@@ -919,6 +919,11 @@ struct amdgpu_dm_connector {
+ 	 */
+ 	struct drm_dvbridge_refused_log dvbridge_refused_log;
+ 	bool dvbridge_refused_ready;
++	/*
++	 * Hades: what the kernel log said last of the passive adaptor behind a DisplayPort connector
++	 * (enum amdgpu_dvbridge_dual_mode; amdgpu_dm_update_dual_mode())
++	 */
++	u8 dvbridge_dual_mode_logged;
+ };
+ 
+ static inline void amdgpu_dm_set_mst_status(uint8_t *status,
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+index c36faa6f8833..31fe9357209b 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.c
+@@ -261,6 +261,57 @@ STATIC_IFN_KUNIT void update_subconnector_property(struct amdgpu_dm_connector *a
+ }
+ EXPORT_IF_KUNIT(update_subconnector_property);
+ 
++/*
++ * Hades: a passive DisplayPort dual-mode (DP++) adaptor. Where the DPCD of a DisplayPort connector
++ * does not answer, DC looks for such an adaptor on the I2C bus of the port (detect_dp(),
++ * query_dp_dual_mode_adaptor()). With one that identifies itself as an HDMI one (the HDMI signature
++ * of the DP Dual-Mode Standard: DISPLAY_DONGLE_DP_HDMI_DONGLE) and an HDMI display, DC drives the
++ * link as TMDS HDMI (sink signal SIGNAL_TYPE_HDMI_TYPE_A), InfoFrames included, as on an HDMI
++ * connector, and keeps every stream within the TMDS clock of the adaptor: 165 MHz for type 1, what
++ * its register says for type 2 (dongle_max_pix_clk; link_validate_mode_timing() refuses more as
++ * DC_EXCEED_DONGLE_CAP). The connector stays a DisplayPort one for DRM. Through such an adaptor the
++ * HDMI that this driver sends on an HDMI connector goes as it is: HDMI 3D, the Dolby Vision
++ * tunnel, the HDMI layout of the HDR InfoFrame. Any other passive adaptor is "other": a DVI one, one
++ * without the signature (which DC may still drive as HDMI), or an HDMI one with a DVI display.
++ * Nothing says that HDMI reaches the display through it: neither 3D nor the tunnel go there. A
++ * DisplayPort display, an active converter (a DisplayPort branch) and no display are "none".
++ */
++int amdgpu_dm_dual_mode_of(int connector_type, bool mst, enum signal_type sink_signal,
++			   enum display_dongle_type dongle_type)
++{
++	if (connector_type != DRM_MODE_CONNECTOR_DisplayPort || mst)
++		return AMDGPU_DVBRIDGE_DUAL_MODE_NONE;
++	switch (dongle_type) {
++	case DISPLAY_DONGLE_DP_DVI_DONGLE:
++	case DISPLAY_DONGLE_DP_HDMI_DONGLE:
++	case DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE:
++		break;
++	default:
++		return AMDGPU_DVBRIDGE_DUAL_MODE_NONE;
++	}
++	/* (no display: the type of the adaptor is what the last one left) */
++	if (sink_signal == SIGNAL_TYPE_NONE || sink_signal == SIGNAL_TYPE_VIRTUAL)
++		return AMDGPU_DVBRIDGE_DUAL_MODE_NONE;
++	return dongle_type == DISPLAY_DONGLE_DP_HDMI_DONGLE &&
++	       sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ? AMDGPU_DVBRIDGE_DUAL_MODE_HDMI :
++							AMDGPU_DVBRIDGE_DUAL_MODE_OTHER;
++}
++EXPORT_IF_KUNIT(amdgpu_dm_dual_mode_of);
++
++/* Hades: the same, for a connector as its display was last looked at (its dc_sink) */
++int amdgpu_dm_connector_dual_mode(const struct amdgpu_dm_connector *aconnector)
++{
++	return amdgpu_dm_dual_mode_of(aconnector->base.connector_type,
++				      aconnector->mst_root || aconnector->mst_mgr.mst_state,
++				      aconnector->dc_sink ? aconnector->dc_sink->sink_signal :
++							    SIGNAL_TYPE_NONE,
++				      aconnector->dc_link ? aconnector->dc_link->dpcd_caps.dongle_type :
++							    DISPLAY_DONGLE_NONE);
++}
++EXPORT_IF_KUNIT(amdgpu_dm_connector_dual_mode);
++
++STATIC_IFN_KUNIT void amdgpu_dm_update_dual_mode(struct amdgpu_dm_connector *aconnector);
++
+ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector);
+ 
+ STATIC_IFN_KUNIT void amdgpu_dm_fbc_init(struct drm_connector *connector)
+@@ -661,6 +712,8 @@ void amdgpu_dm_update_connector_after_detect(
+ 	}
+ 
+ 	update_subconnector_property(aconnector);
++	/* Hades: and what passive adaptor is behind a DisplayPort connector */
++	amdgpu_dm_update_dual_mode(aconnector);
+ 
+ 	/* When polling, the mutex will be unlocked for us by DRM. */
+ 	if (!drm_kms_helper_is_poll_worker())
+@@ -997,6 +1050,14 @@ u32 amdgpu_dm_stereo_layout(const struct drm_connector *connector,
+ 	if (!connector || !connector->stereo_allowed ||
+ 	    (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN)))
+ 		return 0;
++	/*
++	 * Hades: a DisplayPort connector allows 3D while a passive adaptor carries HDMI to its display
++	 * (amdgpu_dm_update_dual_mode()); a mode of a display of before is 2D on another one
++	 */
++	if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
++	    amdgpu_dm_connector_dual_mode(to_amdgpu_dm_connector(connector)) !=
++	    AMDGPU_DVBRIDGE_DUAL_MODE_HDMI)
++		return 0;
+ 
+ 	switch (layout) {
+ 	case DRM_MODE_FLAG_3D_FRAME_PACKING:
+@@ -1008,6 +1069,53 @@ u32 amdgpu_dm_stereo_layout(const struct drm_connector *connector,
+ 	}
+ }
+ 
++/* Hades: the passive adaptor behind a DisplayPort connector, by name, for the kernel log */
++static const char *amdgpu_dm_dual_mode_name(const struct dc_link *link)
++{
++	switch (link->dpcd_caps.dongle_type) {
++	case DISPLAY_DONGLE_DP_HDMI_DONGLE:
++		return link->dpcd_caps.is_dongle_type_one ? "type 1 HDMI" : "type 2 HDMI";
++	case DISPLAY_DONGLE_DP_HDMI_MISMATCHED_DONGLE:
++		return link->dpcd_caps.is_dongle_type_one ? "type 1 without the HDMI signature" :
++							    "type 2 without the HDMI signature";
++	case DISPLAY_DONGLE_DP_DVI_DONGLE:
++		return "DVI, or one that did not answer";
++	default:
++		return "none";
++	}
++}
++
++/*
++ * Hades: a DisplayPort connector (SST) once its display was looked at: what passive adaptor is
++ * behind it (amdgpu_dm_dual_mode_of()), for HDMI 3D (stereo_allowed, which the probe helper reads
++ * under the mode_config mutex that the callers hold, as for the subconnector property), and for
++ * the kernel log once for each change.
++ */
++STATIC_IFN_KUNIT void amdgpu_dm_update_dual_mode(struct amdgpu_dm_connector *aconnector)
++{
++	struct drm_connector *connector = &aconnector->base;
++	int mode;
++
++	if (connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort || aconnector->mst_root)
++		return;
++	mode = amdgpu_dm_connector_dual_mode(aconnector);
++	connector->stereo_allowed = amdgpu_dm_hdmi_3d && mode == AMDGPU_DVBRIDGE_DUAL_MODE_HDMI;
++	if (mode == aconnector->dvbridge_dual_mode_logged)
++		return;
++	aconnector->dvbridge_dual_mode_logged = mode;
++	if (mode == AMDGPU_DVBRIDGE_DUAL_MODE_NONE)
++		return;
++	drm_info(connector->dev,
++		 "[CONNECTOR:%d:%s] passive DisplayPort dual-mode adaptor: %s, TMDS clock up to %u kHz, to %s display%s\n",
++		 connector->base.id, connector->name, amdgpu_dm_dual_mode_name(aconnector->dc_link),
++		 aconnector->dc_link->dongle_max_pix_clk,
++		 aconnector->dc_sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ? "an HDMI" : "a DVI",
++		 mode == AMDGPU_DVBRIDGE_DUAL_MODE_HDMI ?
++		 "; HDMI 3D can go through it" :
++		 "; no HDMI 3D through it (only an HDMI adaptor to an HDMI display carries it)");
++}
++EXPORT_IF_KUNIT(amdgpu_dm_update_dual_mode);
++
+ STATIC_IFN_KUNIT void fill_stream_properties_from_drm_display_mode(
+ 	struct dc_stream_state *stream,
+ 	const struct drm_display_mode *mode_in,
+@@ -2903,6 +3011,8 @@ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
+ 	struct amdgpu_dm_connector *aconnector = to_amdgpu_dm_connector(connector);
+ 
+ 	update_subconnector_property(aconnector);
++	/* Hades: and what passive adaptor is behind a DisplayPort connector */
++	amdgpu_dm_update_dual_mode(aconnector);
+ 
+ 	if (aconnector->base.force == DRM_FORCE_ON ||
+ 		aconnector->base.force == DRM_FORCE_ON_DIGITAL)
+@@ -4720,7 +4830,11 @@ void amdgpu_dm_connector_init_helper(struct amdgpu_display_manager *dm,
+ 	aconnector->dc_link = link;
+ 	aconnector->base.interlace_allowed = false;
+ 	aconnector->base.doublescan_allowed = false;
+-	/* HDMI only: DP->HDMI dongles reject 3D timings in link validation */
++	/*
++	 * HDMI only: DP->HDMI dongles reject 3D timings in link validation (Hades: active ones, which
++	 * a DisplayPort connector drives as DisplayPort; while a passive dual-mode adaptor carries
++	 * HDMI to its display, amdgpu_dm_update_dual_mode() allows it there)
++	 */
+ 	aconnector->base.stereo_allowed = amdgpu_dm_hdmi_3d &&
+ 					  connector_type == DRM_MODE_CONNECTOR_HDMIA;
+ 	aconnector->base.dpms = DRM_MODE_DPMS_OFF;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
+index 4e9eb3ff2c90..8f1bdeca0e6e 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_connector.h
+@@ -125,6 +125,15 @@ bool amdgpu_dm_is_freesync_video_mode(const struct drm_display_mode *mode,
+ int amdgpu_dm_fill_hdr_info_packet(const struct drm_connector_state *state,
+ 			 struct dc_info_packet *out);
+ 
++/*
++ * Hades: what is behind a DisplayPort connector (SST) for the HDMI that this driver sends through
++ * it (a value of enum amdgpu_dvbridge_dual_mode), and for a connector as it is now
++ */
++enum display_dongle_type;
++int amdgpu_dm_dual_mode_of(int connector_type, bool mst, enum signal_type sink_signal,
++			   enum display_dongle_type dongle_type);
++int amdgpu_dm_connector_dual_mode(const struct amdgpu_dm_connector *aconnector);
++
+ enum dc_color_space
+ amdgpu_dm_get_output_color_space(const struct dc_crtc_timing *dc_crtc_timing,
+ 		       const struct drm_connector_state *connector_state);
+@@ -180,6 +189,8 @@ int dm_encoder_helper_atomic_check(struct drm_encoder *encoder,
+ 				   struct drm_connector_state *conn_state);
+ enum drm_mode_subconnector get_subconnector_type(struct dc_link *link);
+ void update_subconnector_property(struct amdgpu_dm_connector *aconnector);
++/* Hades: the passive dual-mode adaptor behind a DisplayPort connector */
++void amdgpu_dm_update_dual_mode(struct amdgpu_dm_connector *aconnector);
+ void amdgpu_dm_fbc_init(struct drm_connector *connector);
+ void amdgpu_dm_set_panel_type(struct amdgpu_dm_connector *aconnector);
+ void amdgpu_dm_update_cacp_caps(struct amdgpu_dm_connector *aconnector);
+-- 
+2.53.0
+

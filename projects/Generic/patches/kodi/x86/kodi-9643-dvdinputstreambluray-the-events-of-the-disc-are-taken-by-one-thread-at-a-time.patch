@@ -1,0 +1,297 @@
+From 8fffa6cdfebb167aacc083b84b8ce8db94f4dffb Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 21:38:02 +0000
+Subject: [PATCH] DVDInputStreamBluray: the events of the disc are taken by one
+ thread at a time
+
+With the disc's menus, a key (UserInput(), the thread of the application) took the queued events of
+libbluray into m_event and processed them, while the thread that plays read into the same m_event,
+processed what it read and kept a held event there for NextStream(). Read in this file and in
+libbluray 1.5.0 with Hades' series, the harm is concrete:
+- the two threads wrote m_event and ran ProcessEvent() at once (m_titleInfo freed and read again, m_clip,
+  m_playItem, m_hold, and since the join the read position and the timeline of the joins);
+- the last bd_get_event() of that drain, with the queue empty, writes BD_EVENT_NONE into its event
+  (_get_event(), and bdr_get_event() in the BD-J host's client): a key pressed while a read had held a
+  new title, playlist, play item, angle, seek or still for NextStream() wiped it, and NextStream()
+  processed nothing - the playlist, its title information and its play item stayed those before;
+- an event that the reading thread holds on, taken by that drain, was processed there without being
+  held: a new playlist read on with the demuxer of the one before.
+
+Now m_eventLock guards m_event, ProcessEvent() and what it changes: Read() takes it for each event,
+NextStream(), PosTime(), SeekChapter(), SkipStill() and GetBdjWaitState() for theirs, and UserInput()
+for its drain (TakeUserInputEvents()). The disc is not read under it: bd_read_ext() runs into an event
+of its own with m_readInFlight set and the lock released, so the thread of the application never waits
+on it for a read of the disc. While a read is in flight, or a held event waits for NextStream(), that
+drain leaves the queue to the thread that reads, which takes it in order after that event (libbluray
+hands queued events on first, with the next read); and an event that the thread that reads holds on or
+waits on (a new title, playlist or play item, an angle, a seek, a still, idle) is left in m_event for
+it, which Read() takes as one that a read returned. The drains of the thread that plays take that event
+first (ProcessQueuedEvents()), where they wrote over it before.
+
+Lock order: m_eventLock first, then libbluray's own locks (bd_* calls made under it), then
+m_overlayLock, m_navTimelineLock and m_playlistInfoLock. libbluray's callbacks (overlays, which the BD-J
+host's client also delivers inside the call that drew them or on its callback thread, and files) run
+under libbluray's lock and never take m_eventLock, and nothing under m_eventLock waits for another
+thread (the announcements of ProcessEvent() are queued: CAnnouncementManager). So it cannot deadlock.
+
+Run on the host with the join test, the thread of the application put in at two moments of the thread
+that plays: while the start of playlist 2 is held, and after every read that returned bytes. All the
+checks of the join pass; with the drain as it was, playlist 2 is lost; with the guard of the held event
+taken out, too.
+
+What stays as in Kodi: other readers of m_titleInfo outside the events (the chapters and stream
+information asked by the thread of the application) are not under this lock.
+---
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 109 ++++++++++++++----
+ .../DVDInputStreams/DVDInputStreamBluray.h    |  26 +++++
+ 2 files changed, 113 insertions(+), 22 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index 052adcc..893bedb 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -500,8 +500,11 @@ bool CDVDInputStreamBluray::Open()
+   m_startWatchTime = std::chrono::steady_clock::now();
+ 
+   // Process any events that occurred during opening
+-  while (bd_get_event(m_bd, &m_event))
+-    ProcessEvent();
++  {
++    std::unique_lock lock(m_eventLock);
++    while (bd_get_event(m_bd, &m_event))
++      ProcessEvent();
++  }
+ 
+   // Selecting a playlist normally raises BD_EVENT_PLAYLIST, which is where the 3D
+   // information is picked up. Cover the case where it did not.
+@@ -845,6 +848,8 @@ int CDVDInputStreamBluray::Read(uint8_t* buf, int buf_size)
+   if(m_navmode)
+   {
+     do {
++      // Hades: the events of the disc are taken by one thread at a time (m_eventLock)
++      std::unique_lock lock(m_eventLock);
+ 
+       if (m_hold == HOLD_HELD)
+          return 0;
+@@ -852,7 +857,22 @@ int CDVDInputStreamBluray::Read(uint8_t* buf, int buf_size)
+       if (m_hold == HOLD_ERROR || m_aborted || HasGivenUpReading())
+         return -1;
+ 
+-      result = bd_read_ext (m_bd, buf, buf_size, &m_event);
++      // Hades: an event that the thread of the application took from the queue and left for this
++      // one (UserInput()) is taken as if this read had returned it, with nothing read
++      if (m_event.event != BD_EVENT_NONE)
++        result = 0;
++      else
++      {
++        // the disc is read without the lock, so that the thread of the application never waits
++        // for a read of the disc there; meanwhile it leaves the events to this thread
++        BD_EVENT got{};
++        m_readInFlight = true;
++        lock.unlock();
++        result = bd_read_ext(m_bd, buf, buf_size, &got);
++        lock.lock();
++        m_readInFlight = false;
++        m_event = got;
++      }
+ 
+       if(result < 0)
+       {
+@@ -914,6 +934,7 @@ int CDVDInputStreamBluray::Read(uint8_t* buf, int buf_size)
+       // Hades: (counted after the event: a play item told with this read begins with its bytes)
+       if (result > 0)
+         m_readPos += static_cast<uint64_t>(result);
++      lock.unlock();
+ 
+       // Hades: nothing read and nothing happened: the reader waits for the BD-J application
+       // (the end of a playlist), which with presentation timing hears of it only when the
+@@ -1486,8 +1507,8 @@ bool CDVDInputStreamBluray::PosTime(int ms)
+   if(bd_seek_time(m_bd, ms * 90) < 0)
+     return false;
+ 
+-  while (bd_get_event(m_bd, &m_event))
+-    ProcessEvent();
++  std::unique_lock lock(m_eventLock);
++  ProcessQueuedEvents();
+   BeginClipSpan(true);
+ 
+   return true;
+@@ -1529,8 +1550,8 @@ bool CDVDInputStreamBluray::SeekChapter(int ch)
+   if(m_titleInfo && bd_seek_chapter(m_bd, ch-1) < 0)
+     return false;
+ 
+-  while (bd_get_event(m_bd, &m_event))
+-    ProcessEvent();
++  std::unique_lock lock(m_eventLock);
++  ProcessQueuedEvents();
+   BeginClipSpan(true);
+ 
+   return true;
+@@ -1938,15 +1959,13 @@ std::shared_ptr<CDVDInputStreamBlurayFile> CDVDInputStreamBluray::OpenClipStream
+ 
+ CDVDInputStream::ENextStream CDVDInputStreamBluray::NextStream()
+ {
++  // Hades: (the events of the disc are taken by one thread at a time)
++  std::unique_lock lock(m_eventLock);
+   if (!m_navmode || m_aborted || m_hold == HOLD_ERROR || HasGivenUpReading())
+     return NEXTSTREAM_NONE;
+ 
+-  /* process any current event */
+-  ProcessEvent();
+-
+-  /* process all queued up events */
+-  while(bd_get_event(m_bd, &m_event))
+-    ProcessEvent();
++  /* process any current event, then all queued up events */
++  ProcessQueuedEvents();
+ 
+   // The last read error can be queued with the events of a clip boundary
+   if (HasGivenUpReading())
+@@ -1964,16 +1983,14 @@ CDVDInputStream::ENextStream CDVDInputStreamBluray::NextStream()
+ int CDVDInputStreamBluray::GetBdjWaitState(bool drain)
+ {
+ #if defined(BD_HAVE_BDJ_WAITING_FOR_PLAYBACK)
++  std::unique_lock lock(m_eventLock);
+   if (m_bd == nullptr || !m_navmode || m_aborted || m_hold == HOLD_ERROR)
+     return 0;
+ 
+   // BD-J starts playlists (and changes titles) on its own threads; the events it queues are
+   // what move us on, so consume them before asking
+   if (drain)
+-  {
+-    while (bd_get_event(m_bd, &m_event))
+-      ProcessEvent();
+-  }
++    ProcessQueuedEvents();
+ 
+   const int state = bd_bdj_waiting_for_playback(m_bd);
+   // the background is behind the video: shown only while no playlist is open, not while one
+@@ -2068,13 +2085,60 @@ void CDVDInputStreamBluray::UserInput(bd_vk_key_e vk)
+     CLog::Log(LOGDEBUG, "CDVDInputStreamBluray::UserInput - user input failed");
+   }
+   else
++    TakeUserInputEvents();
++}
++
++void CDVDInputStreamBluray::TakeUserInputEvents()
++{
++  // Hades: this is the thread of the application, while the one that plays reads the disc and
++  // takes its events too (m_event, ProcessEvent()). Under m_eventLock, one at a time. While that
++  // one reads, or while an event that a read returned waits for NextStream() (a held one), what is
++  // queued is left to it: it takes the queue in order, after that event. (Before, this drain took
++  // m_event from under the read, and its last bd_get_event() wrote BD_EVENT_NONE over a held
++  // event, which NextStream() then never processed.)
++  std::unique_lock lock(m_eventLock);
++  if (m_readInFlight || m_event.event != BD_EVENT_NONE)
++    return;
++
++  /* process all queued up events */
++  while (bd_get_event(m_bd, &m_event))
+   {
+-    /* process all queued up events */
+-    while (bd_get_event(m_bd, &m_event))
+-      ProcessEvent();
++    // one that the thread that reads holds on (a new title, playlist or play item, an angle, a
++    // seek, a still) or waits on is left for it in m_event, which Read() takes as one that a read
++    // returned: held there as before, not processed here without holding
++    if (IsReaderEvent(m_event.event))
++      return;
++    ProcessEvent();
+   }
+ }
+ 
++bool CDVDInputStreamBluray::IsReaderEvent(uint32_t event)
++{
++  switch (event)
++  {
++    case BD_EVENT_SEEK:
++    case BD_EVENT_TITLE:
++    case BD_EVENT_ANGLE:
++    case BD_EVENT_PLAYLIST:
++    case BD_EVENT_PLAYITEM:
++    case BD_EVENT_STILL_TIME:
++    case BD_EVENT_IDLE:
++      return true;
++    default:
++      return false;
++  }
++}
++
++void CDVDInputStreamBluray::ProcessQueuedEvents()
++{
++  // (m_eventLock held) the event left in m_event first - one that a read held for NextStream(),
++  // or one that TakeUserInputEvents() left for this thread - then the queue, in order
++  if (m_event.event != BD_EVENT_NONE)
++    ProcessEvent();
++  while (bd_get_event(m_bd, &m_event))
++    ProcessEvent();
++}
++
+ bool CDVDInputStreamBluray::MouseMove(const CPoint &point)
+ {
+   if (m_bd == nullptr || !m_navmode)
+@@ -2165,14 +2229,15 @@ void CDVDInputStreamBluray::SkipStill()
+   if(m_bd == nullptr || !m_navmode)
+     return;
+ 
++  // Hades: (the events of the disc are taken by one thread at a time)
++  std::unique_lock lock(m_eventLock);
+   if ( m_hold == HOLD_STILL)
+   {
+     m_hold = HOLD_HELD;
+     bd_read_skip_still(m_bd);
+ 
+     /* process all queued up events */
+-    while (bd_get_event(m_bd, &m_event))
+-      ProcessEvent();
++    ProcessQueuedEvents();
+   }
+ }
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index 891a7eb..c4b5c96 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -441,6 +441,17 @@ protected:
+     //! Hades: navigation mode, the connection conditions of the play items of the playlist
+     void ReadConnections();
+ 
++    /*!
++     * \brief Hades: the thread of the application takes the events that a key queued
++     *        (UserInput()), unless the thread that plays is reading or a held event waits for
++     *        NextStream(): then they are left to it. One it holds on is left for it in m_event.
++     */
++    void TakeUserInputEvents();
++    //! Hades: an event that the thread that reads holds on or waits on (Read())
++    static bool IsReaderEvent(uint32_t event);
++    //! Hades: m_event, if any, then the queue, in order (m_eventLock held)
++    void ProcessQueuedEvents();
++
+     /*!
+      * \brief Read the clip information of a play item of the playlist being played.
+      * \param playItem The index of the play item, as BD_EVENT_PLAYITEM reports it
+@@ -539,6 +550,21 @@ protected:
+     mutable CCriticalSection m_navTimelineLock;
+     //! Hades: whether the demuxer reading puts its packets on the timeline (SetTimelineReader())
+     std::atomic<bool> m_timelineReader{false};
++    /*!
++     * Hades: the events of the disc are taken by one thread at a time. The thread that plays
++     * reads and takes them (Read(), NextStream(), PosTime(), SeekChapter(), SkipStill(),
++     * GetBdjWaitState()); the thread of the application takes those of a key (UserInput()). It
++     * guards m_event, m_readInFlight, and what ProcessEvent() changes (m_hold, m_playItem, m_clip,
++     * m_titleInfo as the events change them, m_readPos, the timeline of the joins).
++     * Lock order: m_eventLock first, then libbluray's own locks (bd_* calls made under it), then
++     * m_overlayLock, m_navTimelineLock and m_playlistInfoLock. It is never taken from a callback of
++     * libbluray (overlays, files: they run under libbluray's lock), and the disc is not read under it
++     * (bd_read_ext() runs with m_readInFlight set and the lock released), so the thread of the
++     * application never waits on it for a read of the disc.
++     */
++    mutable CCriticalSection m_eventLock;
++    //! Hades: the thread that plays is inside bd_read_ext() (m_eventLock)
++    bool m_readInFlight{false};
+     //! Hades: navigation mode, the connection condition of each play item of m_connectionsPlaylist
+     //! (-1 where not known)
+     std::vector<int> m_connections;
+-- 
+2.53.0
+

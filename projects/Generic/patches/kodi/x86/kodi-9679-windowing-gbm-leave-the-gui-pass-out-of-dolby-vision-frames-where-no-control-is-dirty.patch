@@ -1,0 +1,560 @@
+From 321fef65485841086f0edef0597be47a1d632a43 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 03:08:33 +0000
+Subject: [PATCH] windowing/gbm: leave the GUI pass out of Dolby Vision frames
+ where no control is dirty
+
+Kodi leaves the GUI pass out of a frame when no control marked itself dirty, but
+only where the video has a plane of its own (IsRenderingVideoLayer()): with the
+video drawn by the render pass, the video window and its control mark themselves
+dirty in every frame so that the pass that draws the picture keeps running.
+Native Dolby Vision output draws the picture in RenderEx(), after the GUI pass,
+and puts the GUI over it from its FBO (CompositeGui()). The FBO of the frame
+before is what drawing the GUI again would put in it wherever nothing dirtied
+itself, so the walk of every control and its draw calls (on a GPU that is also
+doing the packing) can go, with the same bytes sent to the display.
+
+GuiPassReusable() is pure and decides from CDVGuiReuse: setting
+(<video><dvguireuse>, on by default), native output, a composited GUI, an FBO of
+the output's size that a drawn frame has been composited into, no menus in Dolby
+Vision, no partial redraws, no stereoscopic mode, and no subtitles or debug
+information over the picture (they are not left to the dirty regions alone).
+Captures mark the window manager dirty themselves. A frame whose pass was left
+out takes whether the GUI was empty from m_guiFboClean (set from the count of
+the frame that drew it, so a clean flag means the count was zero), keeps the
+direct way for it, and counts as composed otherwise; the view of the renderer is
+updated by RenderManager in that frame, since the GUI pass is what did it. An
+FBO made after the decision is cleared and the next frame draws.
+
+The 10 s line of Dolby Vision says what the composed frames had over the
+picture (GUI elements, of them how many from the FBO of the frame before,
+subtitles or debug alone, a capture) and the window on top; the reason that the
+pass is drawn is logged once, and again when it changes.
+
+Host test (outside the tree): dvguireuse_test, every fact on its own in both directions.
+---
+ xbmc/application/Application.cpp              |   5 +-
+ .../VideoRenderers/RenderManager.cpp          |   6 +
+ xbmc/guilib/GUIVideoControl.cpp               |   2 +-
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   4 +
+ xbmc/video/windows/GUIWindowFullScreen.cpp    |   4 +-
+ xbmc/windowing/WinSystem.h                    |   9 +
+ xbmc/windowing/gbm/DVGuiReuse.h               | 217 ++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  82 ++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  11 +
+ 10 files changed, 336 insertions(+), 6 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/DVGuiReuse.h
+
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index 6ccb6a0..acfa89f 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -1691,7 +1691,10 @@ void CApplication::FrameMove(bool processEvents, bool processGUI)
+     // Dirty-driven skip: on paths with a persistent framebuffer (D2P plane or
+     // HDR GUI compositing FBO), skip Render when no controls dirtied themselves
+     // this frame. The persistence keeps the previous OSD on screen for free.
+-    if (!m_skipGuiRender && appPlayer->IsRenderingVideoLayer() &&
++    // Hades: ... and with native Dolby Vision output, whose GUI goes over the picture from its FBO
++    // (CWinSystemGbmGLESContext::GuiPassReusable())
++    if (!m_skipGuiRender &&
++        (appPlayer->IsRenderingVideoLayer() || CServiceBroker::GetWinSystem()->GuiPassReusable()) &&
+         !CServiceBroker::GetGUI()->GetWindowManager().HasDirtyRegions())
+       m_skipGuiRender = true;
+     CServiceBroker::GetGUI()->GetWindowManager().FrameMove();
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index ef0ec5e..7c721ad 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -717,7 +717,13 @@ void CRenderManager::Render(bool clear, DWORD flags, DWORD alpha, bool gui)
+   {
+ #ifdef HAVE_DVBRIDGE
+     if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem()))
++    {
+       window->SetDVBridgeOverlays(m_renderDebug || m_overlays.HasVisibleOverlay(m_presentsource));
++      // Hades: the GUI pass was left out (CWinSystemGbmGLESContext::GuiPassReusable()): it is the one
++      // that updates the renderer's areas (a change of view mode, of the window), so it is done here
++      if (!gui && window->GuiPassSkipped())
++        m_pRenderer->Update();
++    }
+ #endif
+ #ifdef HAVE_DVBRIDGE
+     // Hades: the pictures queued after the one presented now, measured ahead where they are HDR10
+diff --git a/xbmc/guilib/GUIVideoControl.cpp b/xbmc/guilib/GUIVideoControl.cpp
+index 2e92b59..25b671a 100644
+--- a/xbmc/guilib/GUIVideoControl.cpp
++++ b/xbmc/guilib/GUIVideoControl.cpp
+@@ -38,7 +38,7 @@ void CGUIVideoControl::Process(unsigned int currentTime, CDirtyRegionList &dirty
+   const auto appPlayer = components.GetComponent<CApplicationPlayer>();
+   // Only fire for single-plane renderers where video draws via the GUI walk.
+   // See CGUIWindowFullScreen::Process for full rationale.
+-  if (!appPlayer->IsRenderingVideoLayer())
++  if (!appPlayer->IsRenderingVideoLayer() && !CServiceBroker::GetWinSystem()->GuiPassReusable())
+     MarkDirtyRegion();
+ 
+   CGUIControl::Process(currentTime, dirtyregions);
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index fde669f..4888d88 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -210,6 +210,7 @@ void CAdvancedSettings::Initialize()
+   m_videoDVGpuForceHigh = false;
+   m_videoDVGuiCacheCheck = false;
+   m_videoDVGuiInPlace = true;
++  m_videoDVGuiReuse = true;
+   m_videoDVLLPattern = false;
+   m_videoDVCCMComposer = true;
+   m_videoDVAheadAlways = false;
+@@ -733,6 +734,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "dvgpuforcehigh", m_videoDVGpuForceHigh);
+     XMLUtils::GetBoolean(pElement, "dvguicachecheck", m_videoDVGuiCacheCheck);
+     XMLUtils::GetBoolean(pElement, "dvguiinplace", m_videoDVGuiInPlace);
++    XMLUtils::GetBoolean(pElement, "dvguireuse", m_videoDVGuiReuse);
+     XMLUtils::GetBoolean(pElement, "dvllpattern", m_videoDVLLPattern);
+     XMLUtils::GetBoolean(pElement, "dvccmcomposer", m_videoDVCCMComposer);
+     XMLUtils::GetBoolean(pElement, "dvaheadalways", m_videoDVAheadAlways);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 9093607..661c1b1 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -187,6 +187,10 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! picture in 32-bit floats that it was composited into (video/dvguiinplace; the same bytes
+     //! wherever the GUI covers nothing). Off for a measurement of what that saves
+     bool m_videoDVGuiInPlace;
++    //! Hades: native Dolby Vision output leaves the GUI pass out of the frames where no control is dirty
++    //! and puts the GUI of the frame before over the picture (video/dvguireuse; the same bytes). Off for
++    //! a measurement of what that saves
++    bool m_videoDVGuiReuse;
+     //! Hades: native Dolby Vision Low-Latency shows a test pattern in place of the picture
+     //! (video/dvllpattern), for a first look at a display (dvbridge_render_set_ll_pattern())
+     bool m_videoDVLLPattern;
+diff --git a/xbmc/video/windows/GUIWindowFullScreen.cpp b/xbmc/video/windows/GUIWindowFullScreen.cpp
+index 5f5a555..d8c90d3 100644
+--- a/xbmc/video/windows/GUIWindowFullScreen.cpp
++++ b/xbmc/video/windows/GUIWindowFullScreen.cpp
+@@ -382,7 +382,9 @@ void CGUIWindowFullScreen::Process(unsigned int currentTime, CDirtyRegionList &d
+   // Single-plane: MarkDirtyRegion every frame so the render pass keeps
+   // running and draws the next video frame. D2P video plane updates
+   // independently.
+-  if (!appPlayer->IsRenderingVideoLayer())
++  // Hades: nor with native Dolby Vision output, which draws the picture in RenderEx() whatever the
++  // GUI pass does (WinSystem::GuiPassReusable())
++  if (!appPlayer->IsRenderingVideoLayer() && !CServiceBroker::GetWinSystem()->GuiPassReusable())
+     MarkDirtyRegion();
+ 
+   m_controlStats->Reset();
+diff --git a/xbmc/windowing/WinSystem.h b/xbmc/windowing/WinSystem.h
+index 44c790f..0af28a1 100644
+--- a/xbmc/windowing/WinSystem.h
++++ b/xbmc/windowing/WinSystem.h
+@@ -399,6 +399,15 @@ public:
+   // the GUI coverage (see gles_gui_composite.frag).
+   virtual bool IsHdrComposite() const { return false; }
+ 
++  // Hades: native Dolby Vision output draws the video in RenderEx() and puts the GUI over it from its FBO
++  // (CompositeGui()), so the FBO of the frame before is what drawing the GUI again would give wherever
++  // no control marked itself dirty: then the video window and its control need not dirty themselves
++  // in every frame, and the GUI pass may be left out (CApplication::FrameMove()). Pure: asked more
++  // than once in a frame.
++  virtual bool GuiPassReusable() const { return false; }
++  // Hades: the GUI pass of this frame is left out and the composite reads the FBO of the frame before
++  virtual bool GuiPassSkipped() const { return false; }
++
+   /*!
+    * \brief Gets debug info from video renderer for use in "Debug Info OSD" (Alt + O)
+    *
+diff --git a/xbmc/windowing/gbm/DVGuiReuse.h b/xbmc/windowing/gbm/DVGuiReuse.h
+new file mode 100644
+index 0000000..e529d8c
+--- /dev/null
++++ b/xbmc/windowing/gbm/DVGuiReuse.h
+@@ -0,0 +1,217 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief When the GUI pass of a frame of native Dolby Vision output can be left out, and why the
++ *        frames that have something over the picture have it
++ *
++ * Kodi leaves the GUI pass out of a frame when no control marked itself dirty (the dirty-driven
++ * skip of CApplication::FrameMove()), but only where the video has a plane of its own
++ * (IsRenderingVideoLayer()): with the video drawn by the render pass, the window of the video and
++ * its control mark themselves dirty in every frame, so that the pass that draws the picture keeps
++ * running. With native Dolby Vision output the picture is drawn by RenderEx(), after the GUI pass
++ * and whatever it did, and the GUI goes over it from its FBO (CompositeGui()): the FBO of the
++ * frame before holds, to the bit, what drawing the GUI again would put in it, wherever nothing
++ * dirtied itself. Leaving the pass out (the walk of every control and its draw calls, on a GPU
++ * that is also doing the packing) changes nothing that is sent to the display.
++ *
++ * This class only decides, from facts the window system gathers, and counts. The facts that make
++ * the content of the FBO something other than the last frame drawn are each a reason to draw:
++ * the setting, an output that is not native Dolby Vision, a GUI that is not composited, an FBO
++ * that was made after the last frame was drawn (or has not been drawn into yet), the menus in
++ * Dolby Vision (their frames are made of the FBO), partial redraws (the FBO would hold only what
++ * changed), stereoscopic 3D (two passes), overlays on the picture that are drawn in the GUI pass
++ * (subtitles, the debug information of the player: they are not left to the dirty regions alone),
++ * a frame with the GUI that was not seen yet by the picture's pass (what it was over was not
++ * known). A capture marks the window manager dirty itself (CApplication::FrameMove()).
++ */
++class CDVGuiReuse
++{
++public:
++  struct Facts
++  {
++    bool setting = true; //!< advancedsettings.xml <video><dvguireuse>, on by default
++    bool native = false; //!< native Dolby Vision output is captured
++    bool compositing = false; //!< the GUI is composited (the FBO and the composite exist)
++    bool fboReady = false; //!< the FBO is valid, of the size of the output
++    bool menus = false; //!< the menus in Dolby Vision are on, or the setting is
++    bool partial = false; //!< advancedsettings.xml asks for partial redraws
++    bool stereo = false; //!< a stereoscopic mode
++    bool overlays = false; //!< subtitles or the debug information are over the picture
++    bool seen = false; //!< a frame whose GUI was drawn went through the picture's pass since
++                       //!< the FBO was made, and its elements are known
++  };
++
++  enum class Why
++  {
++    NONE, //!< the pass may be left out
++    SETTING,
++    NOT_NATIVE,
++    NO_COMPOSITE,
++    FBO,
++    MENUS,
++    PARTIAL,
++    STEREO,
++    OVERLAYS,
++    NOT_SEEN,
++  };
++
++  static Why Check(const Facts& f)
++  {
++    if (!f.setting)
++      return Why::SETTING;
++    if (!f.native)
++      return Why::NOT_NATIVE;
++    if (!f.compositing)
++      return Why::NO_COMPOSITE;
++    if (!f.fboReady)
++      return Why::FBO;
++    if (f.menus)
++      return Why::MENUS;
++    if (f.partial)
++      return Why::PARTIAL;
++    if (f.stereo)
++      return Why::STEREO;
++    if (f.overlays)
++      return Why::OVERLAYS;
++    if (!f.seen)
++      return Why::NOT_SEEN;
++    return Why::NONE;
++  }
++
++  static const char* Text(Why why)
++  {
++    switch (why)
++    {
++      case Why::NONE:
++        return "nothing";
++      case Why::SETTING:
++        return "turned off in advancedsettings.xml (video/dvguireuse)";
++      case Why::NOT_NATIVE:
++        return "the output is not native Dolby Vision";
++      case Why::NO_COMPOSITE:
++        return "the GUI is not composited";
++      case Why::FBO:
++        return "the FBO of the GUI is not ready";
++      case Why::MENUS:
++        return "the menus in Dolby Vision are on";
++      case Why::PARTIAL:
++        return "advancedsettings.xml asks for partial redraws of the GUI";
++      case Why::STEREO:
++        return "a stereoscopic mode";
++      case Why::OVERLAYS:
++        return "subtitles or the debug information are over the picture";
++      case Why::NOT_SEEN:
++        return "no frame of the GUI has been seen by the picture's pass yet";
++    }
++    return "?";
++  }
++
++  //! What a frame that is not drawn directly has over its picture
++  enum class Over
++  {
++    GUI, //!< GUI elements
++    OVERLAYS, //!< subtitles or the debug information, no GUI element
++    CAPTURE, //!< a capture reads the picture
++  };
++
++  //! The over-picture classification of a frame (a capture first: it makes every frame whole)
++  static Over Classify(bool captured, bool guiElements)
++  {
++    return captured ? Over::CAPTURE : guiElements ? Over::GUI : Over::OVERLAYS;
++  }
++
++  struct Counts
++  {
++    unsigned int gui = 0; //!< frames composed because GUI elements were over the picture
++    unsigned int guiReused = 0; //!< ... of those, whose GUI pass was left out (the FBO of the frame before)
++    unsigned int overlays = 0; //!< ... because of subtitles or debug information alone
++    unsigned int capture = 0; //!< ... because a capture waited for the frame
++    unsigned int passesSkipped = 0; //!< GUI passes left out (drawn directly or not)
++    int window = -1; //!< the window or dialog that was on top when the line was taken
++  };
++
++  void Frame(Over over, bool reused)
++  {
++    switch (over)
++    {
++      case Over::GUI:
++        ++m_counts.gui;
++        m_counts.guiReused += reused ? 1 : 0;
++        break;
++      case Over::OVERLAYS:
++        ++m_counts.overlays;
++        break;
++      case Over::CAPTURE:
++        ++m_counts.capture;
++        break;
++    }
++  }
++
++  //! The pass of a frame was left out
++  void Skipped() { ++m_counts.passesSkipped; }
++
++  //! The reason that the last ask said no, told once when it changes (empty: nothing to tell)
++  //! (an ask is made once a frame: a reason that lasts is not told again)
++  std::string Declined(Why why)
++  {
++    if (m_told && why == m_lastAsked)
++      return std::string();
++    m_told = true;
++    m_lastAsked = why;
++    if (why == Why::NONE)
++      return "DVBridge: the GUI pass of a frame is left out where no control is dirty: the GUI "
++             "over the picture is the FBO of the frame before, the same bytes (video/dvguireuse)";
++    return std::string("DVBridge: the GUI pass is drawn in every frame: ") + Text(why) +
++           " (video/dvguireuse)";
++  }
++
++  //! The counts of the span since the last line, and their text
++  std::string Line(int window)
++  {
++    m_counts.window = window;
++    const Counts c = m_counts;
++    m_counts = Counts();
++    std::string s;
++    if (c.gui || c.overlays || c.capture)
++    {
++      s = "; frames composed: " + std::to_string(c.gui) + " with GUI elements (" +
++          std::to_string(c.guiReused) + " of them from the FBO of the frame before, the GUI pass " +
++          "left out), " + std::to_string(c.overlays) + " with subtitles or debug information only, " +
++          std::to_string(c.capture) + " for a capture (the window on top: " +
++          std::to_string(c.window) + ")";
++    }
++    else if (c.passesSkipped)
++      s = "; " + std::to_string(c.passesSkipped) + " GUI passes left out";
++    return s;
++  }
++
++  //! Forget what was asked: the output begins again
++  void Restart() { m_told = false; }
++
++private:
++  Counts m_counts;
++  Why m_lastAsked = Why::NONE;
++  bool m_told = false; //!< the first ask of an output is told whatever it says
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 6c330b2..2773cd5 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -1960,6 +1960,13 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+   }
+ 
+   m_guiWillRender = guiWillRender;
++  m_guiReusing = false;
++#ifdef HAVE_DVBRIDGE
++  // Hades: what the GUI pass of a frame left out leaves to the frames that follow it is known only
++  // for native Dolby Vision output, whose frames are all seen by RenderDVBridge()
++  if (!m_dvState.Captured())
++    m_guiSeen = false;
++#endif
+ 
+   int width = m_nWidth;
+   int height = m_nHeight;
+@@ -1995,9 +2002,33 @@ bool CWinSystemGbmGLESContext::BeginGuiComposite(bool guiWillRender)
+     m_guiFboWidth = width;
+     m_guiFboHeight = height;
+     m_guiFboClean = false; // fresh FBO is undefined, force a clear
++    m_guiSeen = false;
++    if (!guiWillRender)
++    {
++      // Hades: made after the pass was left out (a change of size between the decision and here): it
++      // holds nothing, and the next frame draws the GUI (never what the memory of the GPU had)
++      if (m_guiFbo.BeginRender())
++      {
++        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
++        glClear(GL_COLOR_BUFFER_BIT);
++        m_guiFbo.EndRender();
++        m_guiFboClean = true;
++      }
++      CServiceBroker::GetGUI()->GetWindowManager().MarkDirty();
++    }
+     CLog::Log(LOGDEBUG, "CWinSystemGbmGLESContext: created GUI FBO {}x{}", width, height);
+   }
+ 
++#ifdef HAVE_DVBRIDGE
++  // Hades: ... which, where nothing is dirty, is what the FBO of the frame before holds
++  if (!guiWillRender)
++  {
++    m_guiReusing = GuiPassReusable();
++    if (m_guiReusing)
++      m_dvGuiReuse.Skipped();
++  }
++  DVGuiReuseTell();
++#endif
+   // When GUI render is being skipped, leave the FBO bind/clear out: nothing
+   // will draw into it this frame. The FBO's prior sRGB GUI content is
+   // implicitly preserved across the skipped frame as a side effect.
+@@ -2068,6 +2099,7 @@ void CWinSystemGbmGLESContext::CompositeGui()
+   {
+     const bool guiEmpty = (GetGUIElementCount() == 0);
+     m_guiFboClean = guiEmpty;
++    m_guiSeen = true; // (Hades: the FBO holds what this frame drew, and says if it is empty)
+     if (guiEmpty)
+       return;
+   }
+@@ -5324,11 +5356,15 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   const auto captures = CServiceBroker::GetCaptureService();
+   const bool captured = captures && (!captures->TakeActive(CaptureContent::COMPOSITE).empty() ||
+                                      !captures->TakeActive(CaptureContent::VIDEO).empty());
+-  const bool overlayFree =
+-      m_guiWillRender && GetGUIElementCount() == 0 && !m_dvOverlays && !captured;
++  // Hades: a frame whose GUI pass was left out has the GUI of the frame before (m_guiFboClean says
++  // if it was empty: it is set where the frame was composited, from the count of its elements)
++  const bool guiEmpty = m_guiWillRender ? GetGUIElementCount() == 0 : (m_guiReusing && m_guiFboClean);
++  const bool overlayFree = (m_guiWillRender || m_guiReusing) && guiEmpty && !m_dvOverlays && !captured;
+   // Hades: GUI elements over the picture (not subtitles alone, nor a capture): the frames whose
+   // pixels drawn over can be converted above level 0 (CDVGuiLevel)
+-  const bool guiElements = m_guiWillRender && GetGUIElementCount() > 0;
++  const bool guiElements = m_guiWillRender ? GetGUIElementCount() > 0 : (m_guiReusing && !m_guiFboClean);
++  if (!overlayFree)
++    m_dvGuiReuse.Frame(CDVGuiReuse::Classify(captured, guiElements), m_guiReusing);
+   const bool guiFrame = guiElements && !captured;
+   // What earlier sessions found with this GPU, driver and build, before the first frame; and the
+   // automatic choices begin this output as its settings say (before the times of its frames are
+@@ -6107,6 +6143,42 @@ constexpr int64_t DV_MENUS_SETTLE_MS = 3000;
+ constexpr auto DV_MENUS_AFTER_WAKE = std::chrono::seconds(5);
+ } // namespace
+ 
++CDVGuiReuse::Facts CWinSystemGbmGLESContext::GuiReuseFacts() const
++{
++  CDVGuiReuse::Facts f;
++  const auto component = CServiceBroker::GetSettingsComponent();
++  const auto advanced = component ? component->GetAdvancedSettings() : nullptr;
++  f.setting = !advanced || advanced->m_videoDVGuiReuse;
++  f.native = m_dvState.Captured();
++  f.compositing = m_guiCompositing && m_compositeShader != nullptr;
++  f.fboReady = m_guiFbo.IsValid() && m_guiFboWidth == m_nWidth && m_guiFboHeight == m_nHeight;
++  f.menus = m_dvMenus || DVMenusSetting();
++  f.partial = DVMenusPartialRedraws();
++  f.stereo = const_cast<CWinSystemGbmGLESContext*>(this)->GetGfxContext().GetStereoMode() !=
++             RenderStereoMode::OFF;
++  f.overlays = m_dvOverlays;
++  f.seen = m_guiSeen;
++  return f;
++}
++
++bool CWinSystemGbmGLESContext::GuiPassReusable() const
++{
++  return CDVGuiReuse::Check(GuiReuseFacts()) == CDVGuiReuse::Why::NONE;
++}
++
++void CWinSystemGbmGLESContext::DVGuiReuseTell()
++{
++  // once a frame, where native output is captured: what is told is a change of the reason
++  if (!m_dvState.Captured())
++  {
++    m_dvGuiReuse.Restart();
++    return;
++  }
++  const std::string text = m_dvGuiReuse.Declined(CDVGuiReuse::Check(GuiReuseFacts()));
++  if (!text.empty())
++    CLog::Log(LOGINFO, "{}", text);
++}
++
+ CDVMenus::State CWinSystemGbmGLESContext::DVMenusState(bool forStart)
+ {
+   CDVMenus::State s;
+@@ -8501,6 +8573,10 @@ void CWinSystemGbmGLESContext::LogDVStats(const char* period)
+     ioctls += StringUtils::Format("; {} frames with GUI elements composited by the packer, from "
+                                   "the GUI texture (video/dvguiinplace)",
+                                   m_dvStats.guiInPlace);
++  // Hades: which frames had something over the picture, and why (CDVGuiReuse)
++  ioctls += m_dvGuiReuse.Line(CServiceBroker::GetGUI()
++                                  ? CServiceBroker::GetGUI()->GetWindowManager().GetActiveWindowOrDialog()
++                                  : -1);
+   m_dvLag.Reset();
+   // Hades: the GPU time of each pass, where advancedsettings.xml asks for it (dvpasstimes)
+   std::vector<dvbridge_pass_time> passes;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 6116446..d2cc079 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -31,6 +31,7 @@
+ #include "DVEngineSettings.h"
+ #include "PresentLag.h"
+ #include "DVGuiLevel.h"
++#include "DVGuiReuse.h"
+ #include "DVGuiStep.h"
+ #include "DVHdr10PlusFill.h"
+ #include "DVMenus.h"
+@@ -109,6 +110,8 @@ public:
+   void EndGuiComposite() override;
+   void CompositeGui() override;
+   bool IsHdrComposite() const override { return m_guiCompositing; }
++  bool GuiPassReusable() const override;
++  bool GuiPassSkipped() const override { return m_guiReusing; }
+ #ifdef HAVE_DVBRIDGE
+   static bool DVBridgeRequested(const VideoPicture* picture);
+   //! Whether the configured video renderer draws its pictures natively; set before its output
+@@ -442,6 +445,14 @@ private:
+   bool m_guiFboClean{false};
+   // Whether the GUI render pass will run this frame; set by BeginGuiComposite.
+   bool m_guiWillRender{true};
++  //! Hades: the GUI pass of this frame is left out and its GUI is the FBO of the frame before
++  //! (CDVGuiReuse; the content of m_guiFboClean is that of the last frame drawn)
++  bool m_guiReusing{false};
++  //! Hades: a frame whose GUI was drawn was composited since the FBO was made (CDVGuiReuse::Facts)
++  bool m_guiSeen{false};
++  CDVGuiReuse m_dvGuiReuse;
++  CDVGuiReuse::Facts GuiReuseFacts() const;
++  void DVGuiReuseTell();
+ 
+   std::unique_ptr<CGuiCompositeShaderGLES> m_compositeShader;
+   //! Hades: a new value whenever the program or the tables of the GUI composite are made: the key
+-- 
+2.53.0
+

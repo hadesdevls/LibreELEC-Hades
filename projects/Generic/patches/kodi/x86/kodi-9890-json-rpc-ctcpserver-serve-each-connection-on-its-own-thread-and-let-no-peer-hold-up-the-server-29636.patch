@@ -1,0 +1,1556 @@
+From d1dc7677e5dd5576cefcf10f1b3733d9303c6d06 Mon Sep 17 00:00:00 2001
+From: Martin Ellis <malard@gmail.com>
+Date: Sun, 11 Oct 2026 20:03:40 +0100
+Subject: [PATCH] [JSON-RPC][CTCPServer] Serve each connection on its own
+ thread, and let no peer hold up the server (#29636)
+
+* [JSON-RPC][CTCPServer] Serve each connection on its own thread, and let no peer hold up the server
+
+A request handler can block in a modal dialog, and CTCPServer ran every
+request on its one server thread, so every other TCP and WebSocket
+client waited behind it. Announce also held the connections lock
+across its whole send loop while Process held it for a request, so
+the same dialog stopped every JSON-RPC notification in the
+application, add-on listeners included.
+
+Each connection's buffers are now parsed and executed on a worker of
+its own. The server thread only polls, accepts and closes sockets. A
+worker exits once it has drained what it was handed, so an idle or
+half-sent connection holds no thread. Connections are held in
+shared_ptr and Announce sends to a snapshot of the list, so a client
+dropped mid-iteration stays alive until the snapshot is done with it.
+
+The problems this fixes, and the ones it would otherwise open:
+
+- A client that keeps sending while its request sits in a dialog is
+  no longer read without limit: a connection whose unparsed input
+  reaches 64 KiB is left unread until its worker catches up, so its
+  receive window closes and holds the client back.
+- CTCPClient::Send added send()'s -1 to an unsigned counter, so a
+  send on a closed socket spun forever. It now gives up and logs.
+- Send took the client lock per send() call, so a response and an
+  announcement could interleave their partial writes. The lock now
+  covers the whole message, and WebSocket framing, unframing and
+  Disconnect take it too.
+- A send to a peer that has stopped reading blocked with the client
+  lock held, and on Windows shutdown() does not wake a blocked send(),
+  so dropping that client or stopping the server waited on the peer.
+  Client sockets are non-blocking, Send() waits for room in short
+  steps and gives up once Disconnect() is called, and Deinitialize()
+  shuts the sockets down before unregistering from announcements.
+- A WebSocket Disconnect() took the send lock before shutting the
+  socket down, so a stalled WebSocket peer held up the server thread
+  and every other client. The close frame is now sent only when the
+  lock is free, and goes out already framed instead of wrapped in a
+  text frame; the descriptor is closed whatever state the close
+  handshake reached.
+- A WebSocket client over the buffer limit is closed rather than left
+  open.
+- An exception from a request is caught at the worker entry point and
+  drops that connection instead of calling std::terminate.
+- A worker that cannot be started no longer ends the server thread,
+  which left the listening sockets open and no connection served.
+- StopServer waits up to two seconds for running workers, so one that
+  returns promptly completes before teardown.
+- The announcement flags are written under the lock they are read
+  under.
+- A send to a peer that has gone, or to a socket Disconnect() has shut
+  down, fails with EPIPE rather than raising SIGPIPE: sends pass
+  MSG_NOSIGNAL, or SO_NOSIGPIPE is set where that is the mechanism, and
+  the wait for room gives up once the connection is disconnecting.
+
+TestTCPServer covers an answered and a half-sent request leaving no
+worker running, and StopServer returning while an announcement is
+blocked on a client that never reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* [JSON-RPC][CTCPServer] Close a connection a send fails on, and retry an interrupted call
+
+A send that fails part way through a message left the connection open,
+so the next message followed a truncated one and the client could not
+find its place in the stream again; the connection is now closed.
+A send, a wait for the socket to become writable or a read that a signal
+interrupts is retried, and a read that would block on the non-blocking
+socket leaves the connection open rather than treating it as closed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* [JSON-RPC][CTCPServer] Start and send nothing once the server is stopped
+
+StopServer(true) waits at most two seconds for the connection workers and
+then returns, and application shutdown carries on tearing down the services
+a request reaches. A worker that outlived the wait went on executing every
+request it still held and serialising and sending their responses, so a
+request could run after the settings component, the JSON-RPC method table
+or the GUI had gone.
+
+The wait has to stay bounded. A request can be waiting on the thread that
+stops the server: one that opened a modal dialog through the messenger is
+blocked until the GUI thread's dialog loop returns, and when the quit is
+processed inside that loop, the loop only returns after StopServer() does.
+No wait inside StopServer() can release it. Requests blocked on queued
+messages are not affected: CApplication::Stop() stops and drains the
+messenger before it stops the network services.
+
+So once StopServer() has been called a worker starts no further request,
+sends nothing, and leaves the rest of its input unread. A worker that
+outlives the wait finishes only the request it is already in.
+
+The wait itself was skipped at shutdown. Network services are stopped twice,
+first without waiting and then with, and StopJSONRPCServer(true) returned
+early when the server thread had already exited, which it does within a
+second of the first stop. Requests run on workers that outlive the server
+thread, so it now always waits.
+
+Process() no longer resets m_bStop. Create() already does, and the reset
+could overwrite a stop issued as the thread started, which would lose the
+stop and hang the join in StopServer(true).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* [JSON-RPC][CTCPServer] Queue output so no peer holds up another, and wait for every request at stop
+
+A send queues the message and writes only what the socket takes. The
+connection's worker waits for room after its response, and the server
+thread writes the rest once the socket is writable, so the announcement
+thread never waits on a peer. A peer that falls 16 MiB behind is dropped.
+
+StopServer(true) waits for every running request, as it did when
+requests ran on the server thread: its caller tears down what a request
+reaches once it returns. A request that stops the server it arrived on,
+as a change to the services settings does, is not waited for.
+
+A WebSocket upgrade hands the socket and its queued output to the new
+client, so an announcement still holding the old one writes nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* [JSON-RPC][CTCPServer] Lay out two added lines as clang-format does
+
+The anonymous namespace's closing brace gains its comment, and the log call for a peer that is not reading fits on two lines.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/network/NetworkServices.cpp    |   7 +-
+ xbmc/network/TCPServer.cpp          | 577 +++++++++++++++++++++++-----
+ xbmc/network/TCPServer.h            | 120 +++++-
+ xbmc/network/test/CMakeLists.txt    |   3 +-
+ xbmc/network/test/TestTCPServer.cpp | 395 +++++++++++++++++++
+ 5 files changed, 994 insertions(+), 108 deletions(-)
+ create mode 100644 xbmc/network/test/TestTCPServer.cpp
+
+diff --git a/xbmc/network/NetworkServices.cpp b/xbmc/network/NetworkServices.cpp
+index 849cb33..bb4f87c 100644
+--- a/xbmc/network/NetworkServices.cpp
++++ b/xbmc/network/NetworkServices.cpp
+@@ -895,10 +895,11 @@ bool CNetworkServices::IsJSONRPCServerRunning()
+ 
+ bool CNetworkServices::StopJSONRPCServer(bool bWait)
+ {
+-  if (!IsJSONRPCServerRunning())
+-    return true;
+-
++  // Requests can still be running after the server thread has exited
++  const bool wasRunning = IsJSONRPCServerRunning();
+   CTCPServer::StopServer(bWait);
++  if (!wasRunning)
++    return true;
+ 
+ #ifdef HAS_ZEROCONF
+   CZeroconf::GetInstance()->RemoveService("servers.jsonrpc-tcp");
+diff --git a/xbmc/network/TCPServer.cpp b/xbmc/network/TCPServer.cpp
+index cb4d286..95298f3 100644
+--- a/xbmc/network/TCPServer.cpp
++++ b/xbmc/network/TCPServer.cpp
+@@ -18,14 +18,25 @@
+ #include "utils/log.h"
+ #include "websocket/WebSocketManager.h"
+ 
++#include <algorithm>
++#include <exception>
++#include <memory>
+ #include <mutex>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <thread>
++#include <utility>
+ 
+ #include <arpa/inet.h>
+ #include <memory.h>
+ #include <netinet/in.h>
+ 
++#if !defined(TARGET_WINDOWS)
++#include <cerrno>
++
++#include <fcntl.h>
++#endif
++
+ using namespace std::chrono_literals;
+ 
+ #if defined(TARGET_WINDOWS) || defined(HAVE_LIBBLUETOOTH)
+@@ -58,15 +69,67 @@ using namespace JSONRPC;
+ namespace
+ {
+ constexpr size_t maxBufferLength = 64 * 1024;
++
++// Output queued for a peer that has stopped reading, beyond which it is dropped
++constexpr size_t maxQueuedOutput = 16 * 1024 * 1024;
++
++// The server the calling thread runs requests for, if it is a request worker
++thread_local const CTCPServer* currentWorkerOf = nullptr;
++
++// A send to a peer that has gone, or to a socket Disconnect() has shut down, must fail with an
++// error rather than raise SIGPIPE, which ends the process unless something else ignores it.
++#if defined(MSG_NOSIGNAL)
++constexpr int SEND_FLAGS = MSG_NOSIGNAL;
++#else
++constexpr int SEND_FLAGS = 0;
++#endif
++
++void SuppressSigPipe([[maybe_unused]] SOCKET socket)
++{
++#if defined(SO_NOSIGPIPE)
++  int on = 1;
++  setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
++#endif
++}
++
++bool SetNonBlocking(SOCKET socket)
++{
++#if defined(TARGET_WINDOWS)
++  u_long nonBlocking = 1;
++  return ioctlsocket(socket, FIONBIO, &nonBlocking) == 0;
++#else
++  return fcntl(socket, F_SETFL, fcntl(socket, F_GETFL) | O_NONBLOCK) == 0;
++#endif
++}
++
++bool WouldBlock()
++{
++#if defined(TARGET_WINDOWS)
++  return WSAGetLastError() == WSAEWOULDBLOCK;
++#else
++  return errno == EAGAIN || errno == EWOULDBLOCK;
++#endif
+ }
+ 
+-CTCPServer *CTCPServer::ServerInstance = NULL;
++bool Interrupted()
++{
++#if defined(TARGET_WINDOWS)
++  return WSAGetLastError() == WSAEINTR;
++#else
++  return errno == EINTR;
++#endif
++}
++} // namespace
++
++std::shared_ptr<CTCPServer> CTCPServer::ServerInstance;
+ 
+ bool CTCPServer::StartServer(int port, bool nonlocal)
+ {
+   StopServer(true);
+ 
+-  ServerInstance = new CTCPServer(port, nonlocal);
++  // The constructor is private, so make_shared cannot reach it.
++  ServerInstance = std::shared_ptr<CTCPServer>(new CTCPServer(port, nonlocal));
++  ServerInstance->m_self = ServerInstance;
+   if (ServerInstance->Initialize())
+   {
+     ServerInstance->Create(false);
+@@ -83,18 +146,28 @@ void CTCPServer::StopServer(bool bWait)
+     ServerInstance->StopThread(bWait);
+     if (bWait)
+     {
+-      delete ServerInstance;
+-      ServerInstance = NULL;
++      // The caller tears down what a request reaches once this returns
++      ServerInstance->WaitForWorkers();
++      ServerInstance.reset();
+     }
+   }
+ }
+ 
++unsigned int CTCPServer::GetActiveWorkers()
++{
++  if (!ServerInstance)
++    return 0;
++
++  std::lock_guard lock(ServerInstance->m_workersMutex);
++  return ServerInstance->m_activeWorkers;
++}
++
+ bool CTCPServer::IsRunning()
+ {
+-  if (ServerInstance == NULL)
++  if (!ServerInstance)
+     return false;
+ 
+-  return ((CThread*)ServerInstance)->IsRunning();
++  return ServerInstance->CThread::IsRunning();
+ }
+ 
+ CTCPServer::CTCPServer(int port, bool nonlocal) : CThread("TCPServer")
+@@ -106,15 +179,17 @@ CTCPServer::CTCPServer(int port, bool nonlocal) : CThread("TCPServer")
+ 
+ void CTCPServer::Process()
+ {
+-  m_bStop = false;
+-
+   while (!m_bStop)
+   {
+     SOCKET          max_fd = 0;
+     fd_set          rfds;
+     struct timeval  to     = {1, 0};
++    bool backlogged = false;
+     FD_ZERO(&rfds);
+ 
++    fd_set wfds;
++    FD_ZERO(&wfds);
++
+     {
+       // Build the fd_set under lock so a concurrent Announce or modification
+       // of m_connections doesn't tear out from under us. Drop the lock for
+@@ -129,15 +204,44 @@ void CTCPServer::Process()
+           max_fd = it;
+       }
+ 
+-      for (unsigned int i = 0; i < m_connections.size(); i++)
++      for (int i = static_cast<int>(m_connections.size()) - 1; i >= 0; i--)
+       {
++        if (m_connections[i]->Closing())
++        {
++          CLog::Log(LOGINFO, "JSONRPC Server: Disconnection requested");
++          m_connections[i]->Disconnect();
++          m_connections.erase(m_connections.begin() + i);
++          continue;
++        }
++
++        if (m_connections[i]->HasUnwrittenOutput())
++        {
++          FD_SET(m_connections[i]->m_socket, &wfds);
++          if ((intptr_t)m_connections[i]->m_socket > (intptr_t)max_fd)
++            max_fd = m_connections[i]->m_socket;
++        }
++
++        // Reading faster than the worker parses would queue without limit, so a connection
++        // that is far enough ahead is left unread until the worker catches up. Its receive
++        // window closes and the client waits.
++        if (m_connections[i]->Backlogged())
++        {
++          backlogged = true;
++          continue;
++        }
++
+         FD_SET(m_connections[i]->m_socket, &rfds);
+         if ((intptr_t)m_connections[i]->m_socket > (intptr_t)max_fd)
+           max_fd = m_connections[i]->m_socket;
+       }
+     }
+ 
+-    int res = select((intptr_t)max_fd+1, &rfds, NULL, NULL, &to);
++    // A held-back connection is not in the set, so nothing wakes the select when its worker
++    // drains. Look again soon rather than after the idle timeout.
++    if (backlogged)
++      to = {0, 50000};
++
++    int res = select((intptr_t)max_fd + 1, &rfds, &wfds, NULL, &to);
+     if (res < 0)
+     {
+       CLog::Log(LOGERROR, "JSONRPC Server: Select failed");
+@@ -149,9 +253,12 @@ void CTCPServer::Process()
+       // Re-acquire for the I/O and accept passes; both modify m_connections.
+       std::unique_lock lock(m_connectionsCritSection);
+ 
+-      for (int i = m_connections.size() - 1; i >= 0; i--)
++      for (int i = static_cast<int>(m_connections.size()) - 1; i >= 0; i--)
+       {
+         int socket = m_connections[i]->m_socket;
++        if (FD_ISSET(socket, &wfds))
++          m_connections[i]->Flush();
++
+         if (FD_ISSET(socket, &rfds))
+         {
+           char buffer[RECEIVEBUFFER] = {};
+@@ -171,27 +278,19 @@ void CTCPServer::Process()
+               if (websocket != NULL)
+               {
+                 // Replace the CTCPClient with a CWebSocketClient
+-                CWebSocketClient *websocketClient = new CWebSocketClient(websocket, *(m_connections[i]));
+-                delete m_connections[i];
+-                m_connections.erase(m_connections.begin() + i);
+-                m_connections.insert(m_connections.begin() + i, websocketClient);
++                auto upgraded = std::make_shared<CWebSocketClient>(websocket, *(m_connections[i]));
++                m_connections[i]->HandOver(*upgraded);
++                m_connections[i] = std::move(upgraded);
+               }
+             }
+ 
+             if (response.empty())
+             {
+-              // Don't hold the lock while a request runs. A method that waits on the
+-              // main thread would block Announce, which holds the announcement lock
+-              // the main thread may be waiting for. Only this thread removes
+-              // connections, so the client stays valid.
+-              CTCPClient* client = m_connections[i];
+-              lock.unlock();
+-              client->PushBuffer(this, buffer, nread);
+-              lock.lock();
++              m_connections[i]->Enqueue(m_connections[i], this, buffer, nread);
+             }
+-
+-            close = m_connections[i]->Closing();
+           }
++          else if (nread < 0 && (WouldBlock() || Interrupted()))
++            continue;
+           else
+             close = true;
+ 
+@@ -199,7 +298,6 @@ void CTCPServer::Process()
+           {
+             CLog::Log(LOGINFO, "JSONRPC Server: Disconnection detected");
+             m_connections[i]->Disconnect();
+-            delete m_connections[i];
+             m_connections.erase(m_connections.begin() + i);
+           }
+         }
+@@ -210,7 +308,7 @@ void CTCPServer::Process()
+         if (FD_ISSET(it, &rfds))
+         {
+           CLog::Log(LOGDEBUG, "JSONRPC Server: New connection detected");
+-          CTCPClient *newconnection = new CTCPClient();
++          auto newconnection = std::make_shared<CTCPClient>();
+           newconnection->m_socket =
+               accept(it, (sockaddr*)&newconnection->m_cliaddr, &newconnection->m_addrlen);
+ 
+@@ -227,7 +325,10 @@ void CTCPServer::Process()
+           else
+           {
+             CLog::Log(LOGINFO, "JSONRPC Server: New connection added");
+-            m_connections.push_back(newconnection);
++            if (!SetNonBlocking(newconnection->m_socket))
++              CLog::Log(LOGWARNING, "JSONRPC Server: Could not make the connection non-blocking");
++            SuppressSigPipe(newconnection->m_socket);
++            m_connections.push_back(std::move(newconnection));
+           }
+         }
+       }
+@@ -257,26 +358,28 @@ void CTCPServer::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+                           const std::string& message,
+                           const CVariant& data)
+ {
+-  // Hold m_connectionsCritSection across the whole iteration so the Process
+-  // thread cannot erase a connection out from under us while we Send to it.
+-  // Without this lock, a client that disconnects right after receiving its
+-  // response (e.g. `nc -q1`) crashes Announce on use-after-free.
+-  std::unique_lock lock(m_connectionsCritSection);
++  // Take a snapshot under the lock and send outside it. Each entry is a shared_ptr, so a
++  // connection the Process thread drops mid-iteration stays alive until we are done with it.
++  std::vector<std::shared_ptr<CTCPClient>> connections;
++  {
++    std::unique_lock lock(m_connectionsCritSection);
++    if (m_connections.empty())
++      return;
+ 
+-  if (m_connections.empty())
+-    return;
++    connections = m_connections;
++  }
+ 
+   std::string str = IJSONRPCAnnouncer::AnnouncementToJSONRPC(flag, sender, message, data, CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_jsonOutputCompact);
+ 
+-  for (unsigned int i = 0; i < m_connections.size(); i++)
++  for (const auto& connection : connections)
+   {
+     {
+-      std::unique_lock connLock(m_connections[i]->m_critSection);
+-      if ((m_connections[i]->GetAnnouncementFlags() & flag) == 0)
++      std::unique_lock connLock(connection->m_critSection);
++      if ((connection->GetAnnouncementFlags() & flag) == 0)
+         continue;
+     }
+ 
+-    m_connections[i]->Send(str.c_str(), str.size());
++    connection->Send(str.c_str(), str.size());
+   }
+ }
+ 
+@@ -505,23 +608,23 @@ bool CTCPServer::InitializeTCP()
+ 
+ void CTCPServer::Deinitialize()
+ {
+-  // unregister first so no Announce callback runs during teardown
+-  CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
++  {
++    std::unique_lock lock(m_connectionsCritSection);
+ 
+-  std::unique_lock lock(m_connectionsCritSection);
++    for (const auto& connection : m_connections)
++      connection->Disconnect();
+ 
+-  for (unsigned int i = 0; i < m_connections.size(); i++)
+-  {
+-    m_connections[i]->Disconnect();
+-    delete m_connections[i];
+-  }
++    m_connections.clear();
+ 
+-  m_connections.clear();
++    for (unsigned int i = 0; i < m_servers.size(); i++)
++      closesocket(m_servers[i]);
+ 
+-  for (unsigned int i = 0; i < m_servers.size(); i++)
+-    closesocket(m_servers[i]);
++    m_servers.clear();
++  }
+ 
+-  m_servers.clear();
++  // Only after the sockets are shut down: an Announce blocked sending to a peer that has stopped
++  // reading would otherwise hold this up for as long as the peer stays connected.
++  CServiceBroker::GetAnnouncementManager()->RemoveAnnouncer(this);
+ 
+ #ifdef HAVE_LIBBLUETOOTH
+   if (m_sdpd)
+@@ -572,18 +675,267 @@ bool CTCPServer::CTCPClient::SetAnnouncementFlags(int flags)
+ 
+ void CTCPServer::CTCPClient::Send(const char *data, unsigned int size)
+ {
+-  // Announce can send from another thread, so a message goes out whole
+-  std::unique_lock lock(m_critSection);
+-  unsigned int sent = 0;
+-  do
++  if (m_disconnecting)
++    return;
++
++  {
++    std::unique_lock<std::mutex> lock(m_outputMutex);
++    // A single message of any size is accepted, so a large response is never refused
++    if (!m_output.empty() && m_outputBytes + size > maxQueuedOutput)
++    {
++      if (!m_closing)
++        CLog::Log(LOGERROR, "JSONRPC Server: Peer is not reading, dropping it with {} bytes unsent",
++                  m_outputBytes);
++      RequestClose();
++      return;
++    }
++    m_output.emplace_back(data, size);
++    m_outputBytes += size;
++  }
++
++  Flush();
++}
++
++void CTCPServer::CTCPClient::Flush()
++{
++  // A writer already holding the lock writes what was just queued
++  std::unique_lock<std::mutex> lock(m_writeMutex, std::try_to_lock);
++  if (lock.owns_lock())
++    WriteQueued();
++}
++
++bool CTCPServer::CTCPClient::HasUnwrittenOutput()
++{
++  std::unique_lock<std::mutex> writeLock(m_writeMutex, std::try_to_lock);
++  if (!writeLock.owns_lock())
++    return false;
++
++  std::unique_lock<std::mutex> lock(m_outputMutex);
++  return !m_output.empty();
++}
++
++CTCPServer::CTCPClient::WriteResult CTCPServer::CTCPClient::WriteQueued()
++{
++  while (m_socket != INVALID_SOCKET)
++  {
++    const char* data;
++    size_t length;
++    {
++      std::unique_lock<std::mutex> lock(m_outputMutex);
++      if (m_output.empty())
++        return WriteResult::DONE;
++      const std::string& front = m_output.front();
++      data = front.data() + m_frontWritten;
++      length = std::min(front.size() - m_frontWritten, maxBufferLength);
++    }
++
++    const auto written = send(m_socket, data, static_cast<int>(length), SEND_FLAGS);
++    if (written > 0)
++    {
++      std::unique_lock<std::mutex> lock(m_outputMutex);
++      m_frontWritten += static_cast<size_t>(written);
++      m_outputBytes -= static_cast<size_t>(written);
++      if (m_frontWritten == m_output.front().size())
++      {
++        m_output.pop_front();
++        m_frontWritten = 0;
++      }
++      continue;
++    }
++
++    if (written < 0 && Interrupted())
++      continue;
++    if (written < 0 && WouldBlock())
++      return WriteResult::SOCKET_FULL;
++
++    // The peer cannot find the start of the next message after a partly written one
++    {
++      std::unique_lock<std::mutex> lock(m_outputMutex);
++      CLog::Log(LOGERROR, "JSONRPC Server: Send failed, dropping {} bytes", m_outputBytes);
++      m_output.clear();
++      m_outputBytes = 0;
++      m_frontWritten = 0;
++    }
++    RequestClose();
++    return WriteResult::FAILED;
++  }
++  return WriteResult::FAILED;
++}
++
++void CTCPServer::CTCPClient::Drain()
++{
++  std::unique_lock<std::mutex> lock(m_writeMutex);
++  while (WriteQueued() == WriteResult::SOCKET_FULL)
++  {
++    if (!WaitUntilWritable())
++      break;
++  }
++}
++
++void CTCPServer::CTCPClient::HandOver(CTCPClient& successor)
++{
++  m_disconnecting = true;
++
++  std::unique_lock<std::mutex> writeLock(m_writeMutex);
++  std::unique_lock<std::mutex> lock(m_outputMutex);
++  successor.m_output = std::move(m_output);
++  successor.m_outputBytes = m_outputBytes;
++  successor.m_frontWritten = m_frontWritten;
++  m_output.clear();
++  m_outputBytes = 0;
++  m_frontWritten = 0;
++  m_socket = INVALID_SOCKET;
++}
++
++bool CTCPServer::CTCPClient::WaitUntilWritable()
++{
++  while (!m_disconnecting && !m_closing)
+   {
+-    sent += send(m_socket, data + sent, size - sent, 0);
+-  } while (sent < size);
++    fd_set writable;
++    FD_ZERO(&writable);
++    FD_SET(m_socket, &writable);
++    timeval timeout = {0, 100000};
++    const int result =
++        select(static_cast<int>(m_socket) + 1, nullptr, &writable, nullptr, &timeout);
++    if (result < 0 && Interrupted())
++      continue;
++    if (result != 0)
++      return result > 0 && !m_disconnecting;
++  }
++  return false;
+ }
+ 
+-void CTCPServer::CTCPClient::PushBuffer(CTCPServer *host, const char *buffer, int length)
++void CTCPServer::CTCPClient::Enqueue(const std::shared_ptr<CTCPClient>& self,
++                                     CTCPServer* host,
++                                     const char* buffer,
++                                     int length)
+ {
++  // Cleared on the server thread so a second read cannot re-enter the WebSocket handshake
++  // before the first buffer is parsed.
+   m_new = false;
++
++  bool start = false;
++  {
++    std::unique_lock<std::mutex> lock(m_inboundMutex);
++    m_inbound.emplace_back(buffer, length);
++    m_inboundBytes += static_cast<size_t>(length);
++    if (!m_workerStarted)
++    {
++      m_workerStarted = true;
++      start = true;
++    }
++  }
++
++  if (start)
++  {
++    {
++      std::lock_guard lock(host->m_workersMutex);
++      ++host->m_activeWorkers;
++    }
++
++    try
++    {
++      std::thread(&CTCPClient::RunWorker, self, host->m_self.lock()).detach();
++    }
++    catch (const std::exception& error)
++    {
++      // Out of threads. The count was reserved for a worker that will never run, and letting
++      // this reach the server thread would end it: CThread swallows the exception, so Process()
++      // would return without deinitializing and no connection would ever be served again.
++      {
++        std::lock_guard lock(host->m_workersMutex);
++        --host->m_activeWorkers;
++      }
++      host->m_workersDone.notify_all();
++
++      {
++        std::unique_lock<std::mutex> lock(m_inboundMutex);
++        m_workerStarted = false;
++        m_inbound.clear();
++        m_inboundBytes = 0;
++      }
++
++      CLog::Log(LOGERROR,
++                "JSONRPC Server: Could not start a request worker ({}), dropping the "
++                "connection",
++                error.what());
++      RequestClose();
++    }
++  }
++}
++
++bool CTCPServer::CTCPClient::Backlogged()
++{
++  std::unique_lock<std::mutex> lock(m_inboundMutex);
++  return m_inboundBytes >= maxBufferLength;
++}
++
++void CTCPServer::CTCPClient::RunWorker(std::shared_ptr<CTCPClient> self,
++                                       std::shared_ptr<CTCPServer> host)
++{
++  currentWorkerOf = host.get();
++
++  // A bare thread entry point: an escaping exception would call std::terminate. The connection
++  // is dropped after one, as m_workerStarted stays set and nothing would serve it again.
++  try
++  {
++    RunRequests(self, host.get());
++  }
++  catch (const std::exception& error)
++  {
++    CLog::Log(LOGERROR, "JSONRPC Server: Request worker failed: {}", error.what());
++    self->RequestClose();
++  }
++  catch (...)
++  {
++    CLog::Log(LOGERROR, "JSONRPC Server: Request worker failed");
++    self->RequestClose();
++  }
++
++  {
++    std::lock_guard lock(host->m_workersMutex);
++    --host->m_activeWorkers;
++  }
++  host->m_workersDone.notify_all();
++}
++
++void CTCPServer::CTCPClient::RunRequests(const std::shared_ptr<CTCPClient>& self, CTCPServer* host)
++{
++  while (true)
++  {
++    std::string buffer;
++    {
++      std::unique_lock<std::mutex> lock(self->m_inboundMutex);
++
++      // Cleared under the lock Enqueue tests it under, so the next buffer starts a new worker.
++      // A connection that is dropped still has what it already sent executed, a stopped server
++      // does not.
++      if (self->m_inbound.empty() || host->m_bStop)
++      {
++        self->m_workerStarted = false;
++        return;
++      }
++
++      buffer = std::move(self->m_inbound.front());
++      self->m_inbound.pop_front();
++      self->m_inboundBytes -= buffer.size();
++    }
++
++    self->PushBuffer(host, buffer.data(), static_cast<int>(buffer.size()));
++  }
++}
++
++void CTCPServer::WaitForWorkers()
++{
++  // A request can stop the server it arrived on, as changing the services settings does
++  const unsigned int self = currentWorkerOf == this ? 1 : 0;
++
++  std::unique_lock lock(m_workersMutex);
++  m_workersDone.wait(lock, [this, self] { return m_activeWorkers <= self; });
++}
++
++void CTCPServer::CTCPClient::PushBuffer(CTCPServer* host, const char* buffer, int length)
++{
+   bool inObject = false;
+   bool inString = false;
+   bool escapeNext = false;
+@@ -644,8 +996,15 @@ void CTCPServer::CTCPClient::PushBuffer(CTCPServer *host, const char *buffer, in
+       }
+       if (m_beginBrackets > 0 && m_endBrackets > 0 && m_beginBrackets == m_endBrackets)
+       {
++        // Once StopServer() has been called nothing more is started or sent, as StopServer(true)
++        // may return before this does and the application then tears down what a request reaches
++        if (host->m_bStop)
++          return;
+         std::string line = CJSONRPC::MethodCall(m_buffer, host, this);
++        if (host->m_bStop)
++          return;
+         Send(line.c_str(), line.size());
++        Drain();
+         m_beginChar = m_beginBrackets = m_endBrackets = 0;
+         m_buffer.clear();
+       }
+@@ -657,8 +1016,13 @@ void CTCPServer::CTCPClient::Disconnect()
+ {
+   if (m_socket > 0)
+   {
+-    std::unique_lock lock(m_critSection);
++    // Drain() holds m_writeMutex while it waits for a peer that has stopped reading, so it is
++    // told to give up first. The socket is non-blocking because shutdown() alone does not wake a
++    // blocked send() on Windows.
++    m_disconnecting = true;
+     shutdown(m_socket, SHUT_RDWR);
++
++    std::unique_lock<std::mutex> lock(m_writeMutex);
+     closesocket(m_socket);
+     m_socket = INVALID_SOCKET;
+   }
+@@ -716,6 +1080,10 @@ CTCPServer::CWebSocketClient& CTCPServer::CWebSocketClient::operator=(const CWeb
+ 
+ void CTCPServer::CWebSocketClient::Send(const char *data, unsigned int size)
+ {
++  // The announcement thread and this connection's worker both send here, so a message's frames
++  // are queued together.
++  std::unique_lock lock(m_critSection);
++
+   const CWebSocketMessage *msg = m_websocket->Send(WebSocketTextFrame, data, size);
+   if (msg == NULL || !msg->IsComplete())
+     return;
+@@ -729,61 +1097,78 @@ void CTCPServer::CWebSocketClient::PushBuffer(CTCPServer *host, const char *buff
+ {
+   bool send;
+   const CWebSocketMessage *msg = NULL;
++  std::vector<std::string> payloads;
+ 
+-  if (m_buffer.size() + length > maxBufferLength)
+   {
+-    CLog::Log(LOGINFO, "WebSocket: client buffer size {} exceeded", maxBufferLength);
+-    return Disconnect();
+-  }
++    // Unframing shares the websocket with the announcement thread and is locked; the JSON-RPC
++    // calls below are not, as one may sit in a modal dialog.
++    std::unique_lock lock(m_critSection);
++
++    if (m_buffer.size() + length > maxBufferLength)
++    {
++      CLog::Log(LOGINFO, "WebSocket: client buffer size {} exceeded", maxBufferLength);
++      RequestClose();
++      return;
++    }
+ 
+-  m_buffer.append(buffer, length);
++    m_buffer.append(buffer, length);
+ 
+-  const char* buf = m_buffer.data();
+-  size_t len = m_buffer.size();
++    const char* buf = m_buffer.data();
++    size_t len = m_buffer.size();
+ 
+-  do
+-  {
+-    if ((msg = m_websocket->Handle(buf, len, send)) != NULL && msg->IsComplete())
++    do
+     {
+-      std::vector<const CWebSocketFrame *> frames = msg->GetFrames();
+-      if (send)
++      if ((msg = m_websocket->Handle(buf, len, send)) != NULL && msg->IsComplete())
+       {
+-        for (unsigned int index = 0; index < frames.size(); index++)
+-          CTCPClient::Send(frames.at(index)->GetFrameData(),
+-                           static_cast<unsigned int>(frames.at(index)->GetFrameLength()));
+-      }
+-      else
+-      {
+-        for (unsigned int index = 0; index < frames.size(); index++)
+-          CTCPClient::PushBuffer(host, frames.at(index)->GetApplicationData(), (int)frames.at(index)->GetLength());
++        std::vector<const CWebSocketFrame*> frames = msg->GetFrames();
++        if (send)
++        {
++          for (unsigned int index = 0; index < frames.size(); index++)
++            CTCPClient::Send(frames.at(index)->GetFrameData(),
++                             static_cast<unsigned int>(frames.at(index)->GetFrameLength()));
++        }
++        else
++        {
++          for (unsigned int index = 0; index < frames.size(); index++)
++            payloads.emplace_back(frames.at(index)->GetApplicationData(),
++                                  static_cast<size_t>(frames.at(index)->GetLength()));
++        }
++
++        delete msg;
+       }
++    } while (len > 0 && msg != NULL);
+ 
+-      delete msg;
+-    }
+-  }
+-  while (len > 0 && msg != NULL);
++    if (len < m_buffer.size())
++      m_buffer = m_buffer.substr(m_buffer.size() - len);
+ 
+-  if (len < m_buffer.size())
+-    m_buffer = m_buffer.substr(m_buffer.size() - len);
++    if (m_websocket->GetState() == WebSocketStateClosed)
++      RequestClose();
++  }
+ 
+-  if (m_websocket->GetState() == WebSocketStateClosed)
+-    Disconnect();
++  for (const auto& payload : payloads)
++    CTCPClient::PushBuffer(host, payload.data(), static_cast<int>(payload.size()));
+ }
+ 
+ void CTCPServer::CWebSocketClient::Disconnect()
+ {
+-  if (m_socket > 0)
++  if (m_socket <= 0)
++    return;
++
+   {
+-    if (m_websocket->GetState() != WebSocketStateClosed && m_websocket->GetState() != WebSocketStateNotConnected)
++    std::unique_lock lock(m_critSection);
++    if (m_websocket->GetState() != WebSocketStateClosed &&
++        m_websocket->GetState() != WebSocketStateNotConnected)
+     {
+-      // Already framed, so it bypasses Send(), which would wrap it in a text frame
+-      const CWebSocketFrame *closeFrame = m_websocket->Close();
++      // Already framed, so it bypasses Send(), which would wrap it in a text frame. Only what the
++      // socket takes now is written: it is not worth waiting for a peer that has stopped reading.
++      const CWebSocketFrame* closeFrame = m_websocket->Close();
+       if (closeFrame)
+-        CTCPClient::Send(closeFrame->GetFrameData(), (unsigned int)closeFrame->GetFrameLength());
++        CTCPClient::Send(closeFrame->GetFrameData(),
++                         static_cast<unsigned int>(closeFrame->GetFrameLength()));
+     }
+-
+-    // The caller drops this connection, so the descriptor goes with it even when the peer
+-    // never answers the close frame
+-    CTCPClient::Disconnect();
+   }
++
++  // The caller is dropping this connection, so the descriptor goes with it even when the peer
++  // never answers the close frame.
++  CTCPClient::Disconnect();
+ }
+diff --git a/xbmc/network/TCPServer.h b/xbmc/network/TCPServer.h
+index dbc3d96..101807e 100644
+--- a/xbmc/network/TCPServer.h
++++ b/xbmc/network/TCPServer.h
+@@ -15,6 +15,12 @@
+ #include "threads/Thread.h"
+ #include "websocket/WebSocket.h"
+ 
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
+ #include <vector>
+ 
+ #include <sys/socket.h>
+@@ -32,6 +38,9 @@ namespace JSONRPC
+     static void StopServer(bool bWait);
+     static bool IsRunning();
+ 
++    //! \brief Number of request workers currently running, across every connection
++    static unsigned int GetActiveWorkers();
++
+     bool PrepareDownload(const char *path, CVariant &details, std::string &protocol) override;
+     bool Download(const char *path, CVariant &result) override;
+     int GetCapabilities() override;
+@@ -56,6 +65,7 @@ namespace JSONRPC
+       CTCPClient();
+       //Copying a CCriticalSection is not allowed, so copy everything but that
+       //when adding a member variable, make sure to copy it in CTCPClient::Copy
++      // worker state is deliberately not copied
+       CTCPClient(const CTCPClient& client);
+       CTCPClient& operator=(const CTCPClient& client);
+       ~CTCPClient() override = default;
+@@ -64,12 +74,55 @@ namespace JSONRPC
+       int GetAnnouncementFlags() override;
+       bool SetAnnouncementFlags(int flags) override;
+ 
++      /*!
++       * \brief Queue a message and write as much of it as the socket takes now.
++       *
++       * Never waits for the peer, so the announcement thread and the server thread are not held
++       * up by one that has stopped reading. The rest is written by the connection's worker in
++       * Drain(), or by the server thread once the socket has room.
++       */
+       virtual void Send(const char *data, unsigned int size);
+       virtual void PushBuffer(CTCPServer *host, const char *buffer, int length);
+       virtual void Disconnect();
+ 
++      //! \brief Write what is queued and nothing is writing, without waiting for room
++      void Flush();
++
++      //! \brief Whether output is queued that nothing is writing
++      bool HasUnwrittenOutput();
++
++      /*!
++       * \brief Hand the socket, and what is still queued for it, to the client replacing this one.
++       *
++       * Announce() may still hold this client, and must not write to a socket it no longer owns.
++       */
++      void HandOver(CTCPClient& successor);
++
++      /*!
++       * \brief Hand a received buffer to this connection's worker, starting one if none is running.
++       *
++       * The server thread never executes a request itself: a handler may block in a modal
++       * dialog, and every other client would wait behind it. A worker exits once it has drained
++       * the buffers handed to it, so an idle or half-sent connection holds no thread.
++       *
++       * \param self shared ownership of this client, kept alive by the worker
++       * \param host the server, kept alive by the worker through its own shared_ptr
++       */
++      void Enqueue(const std::shared_ptr<CTCPClient>& self,
++                   CTCPServer* host,
++                   const char* buffer,
++                   int length);
++
+       virtual bool IsNew() const { return m_new; }
+-      virtual bool Closing() const { return false; }
++      virtual bool Closing() const { return m_closing; }
++
++      /*!
++       * \brief Whether this connection has more accepted but unparsed input than it should.
++       *
++       * The server thread stops reading a backlogged connection, which closes the receive
++       * window and holds the client back.
++       */
++      bool Backlogged();
+ 
+       SOCKET m_socket{INVALID_SOCKET};
+       sockaddr_storage m_cliaddr;
+@@ -78,12 +131,57 @@ namespace JSONRPC
+ 
+     protected:
+       void Copy(const CTCPClient& client);
++
++      /*!
++       * \brief Ask the server thread to drop this connection.
++       *
++       * Only the server thread closes a socket: it may be in select() on that descriptor.
++       */
++      void RequestClose() { m_closing = true; }
++
++      //! \brief Set once this client no longer owns its socket, so that nothing more is sent
++      std::atomic<bool> m_disconnecting{false};
++
+     private:
++      static void RunWorker(std::shared_ptr<CTCPClient> self, std::shared_ptr<CTCPServer> host);
++      static void RunRequests(const std::shared_ptr<CTCPClient>& self, CTCPServer* host);
++
++      enum class WriteResult
++      {
++        DONE,
++        SOCKET_FULL,
++        FAILED,
++      };
++
++      //! \brief Write what is queued until the socket is full; m_writeMutex must be held
++      WriteResult WriteQueued();
++
++      //! \brief Write everything queued, waiting for room; only the connection's worker waits here
++      void Drain();
++
++      //! \brief Wait for room to send; false once the connection is being dropped
++      bool WaitUntilWritable();
++
+       bool m_new;
+       int m_announcementflags;
+       int m_beginBrackets, m_endBrackets;
+       char m_beginChar, m_endChar;
+       std::string m_buffer;
++
++      std::atomic<bool> m_closing{false};
++
++      // Held by whoever writes to the socket, and to close it. Only that writer removes from
++      // m_output, so it writes from the front message without copying it.
++      std::mutex m_writeMutex;
++      std::mutex m_outputMutex;
++      std::deque<std::string> m_output;
++      size_t m_outputBytes{0};
++      size_t m_frontWritten{0};
++
++      std::mutex m_inboundMutex;
++      std::deque<std::string> m_inbound;
++      size_t m_inboundBytes{0};
++      bool m_workerStarted{false};
+     };
+ 
+     class CWebSocketClient : public CTCPClient
+@@ -100,24 +198,30 @@ namespace JSONRPC
+       void Disconnect() override;
+ 
+       bool IsNew() const override { return m_websocket == NULL; }
+-      bool Closing() const override
+-      {
+-        return m_socket == INVALID_SOCKET ||
+-               (m_websocket != NULL && m_websocket->GetState() == WebSocketStateClosed);
+-      }
+ 
+     private:
+       CWebSocket *m_websocket;
+       std::string m_buffer;
+     };
+ 
+-    std::vector<CTCPClient*> m_connections;
++    std::vector<std::shared_ptr<CTCPClient>> m_connections;
+     std::vector<SOCKET> m_servers;
+     CCriticalSection m_connectionsCritSection;
+     int m_port;
+     bool m_nonlocal;
+     void* m_sdpd;
+ 
+-    static CTCPServer *ServerInstance;
++    // Handed to each worker, so a request still running when StopServer() drops ServerInstance
++    // keeps the server alive until it returns.
++    std::weak_ptr<CTCPServer> m_self;
++
++    //! \brief Wait for every worker but the calling one to finish
++    void WaitForWorkers();
++
++    std::mutex m_workersMutex;
++    std::condition_variable m_workersDone;
++    unsigned int m_activeWorkers{0};
++
++    static std::shared_ptr<CTCPServer> ServerInstance;
+   };
+ }
+diff --git a/xbmc/network/test/CMakeLists.txt b/xbmc/network/test/CMakeLists.txt
+index ab171e1..d1480fe 100644
+--- a/xbmc/network/test/CMakeLists.txt
++++ b/xbmc/network/test/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ set(SOURCES TestDNSNameCache.cpp
+             TestNetwork.cpp
+-            TestNetworkFileItemClassify.cpp)
++            TestNetworkFileItemClassify.cpp
++            TestTCPServer.cpp)
+ 
+ if(TARGET ${APP_NAME_LC}::MicroHttpd)
+   list(APPEND SOURCES TestWebServer.cpp)
+diff --git a/xbmc/network/test/TestTCPServer.cpp b/xbmc/network/test/TestTCPServer.cpp
+new file mode 100644
+index 0000000..b3a866f
+--- /dev/null
++++ b/xbmc/network/test/TestTCPServer.cpp
+@@ -0,0 +1,395 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "ServiceBroker.h"
++#include "interfaces/AnnouncementManager.h"
++#include "interfaces/json-rpc/JSONRPC.h"
++#include "interfaces/json-rpc/JSONServiceDescription.h"
++#include "network/Network.h"
++#include "network/NetworkServices.h"
++#include "network/TCPServer.h"
++#include "threads/Event.h"
++#include "utils/Variant.h"
++
++#include <atomic>
++#include <chrono>
++#include <future>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <arpa/inet.h>
++#include <gtest/gtest.h>
++#include <netinet/in.h>
++
++using namespace JSONRPC;
++using namespace std::chrono_literals;
++
++namespace
++{
++CEvent requestBlocked{true};
++CEvent releaseRequest{true};
++std::atomic<bool> blockedRequestReturned{false};
++CEvent laterRequestStarted{true};
++
++JSONRPC_STATUS Block(const std::string& method,
++                     ITransportLayer* transport,
++                     IClient* client,
++                     const CVariant& parameterObject,
++                     CVariant& result)
++{
++  requestBlocked.Set();
++  releaseRequest.Wait();
++  blockedRequestReturned = true;
++  result = "OK";
++  return OK;
++}
++
++JSONRPC_STATUS Record(const std::string& method,
++                      ITransportLayer* transport,
++                      IClient* client,
++                      const CVariant& parameterObject,
++                      CVariant& result)
++{
++  laterRequestStarted.Set();
++  result = "OK";
++  return OK;
++}
++
++CEvent stoppedFromRequest{true};
++
++JSONRPC_STATUS Stop(const std::string& method,
++                    ITransportLayer* transport,
++                    IClient* client,
++                    const CVariant& parameterObject,
++                    CVariant& result)
++{
++  // As a request changing the services settings does, through StopJSONRPCServer(true)
++  CTCPServer::StopServer(true);
++  stoppedFromRequest.Set();
++  result = "OK";
++  return OK;
++}
++
++// Test.Block holds its worker until releaseRequest is set; Test.Record only says it ran;
++// Test.Stop stops the server it arrived on
++class CTestMethods
++{
++public:
++  CTestMethods()
++  {
++    requestBlocked.Reset();
++    releaseRequest.Reset();
++    blockedRequestReturned = false;
++    laterRequestStarted.Reset();
++    stoppedFromRequest.Reset();
++
++    CJSONRPC::Initialize();
++    m_added = CJSONServiceDescription::AddMethod(Schema("Test.Block"), Block) &&
++              CJSONServiceDescription::AddMethod(Schema("Test.Record"), Record) &&
++              CJSONServiceDescription::AddMethod(Schema("Test.Stop"), Stop);
++  }
++
++  ~CTestMethods()
++  {
++    releaseRequest.Set();
++    CJSONRPC::Cleanup();
++  }
++
++  bool Added() const { return m_added; }
++
++private:
++  static std::string Schema(const std::string& name)
++  {
++    return R"(")" + name +
++           R"(": {"type": "method", "description": "", "transport": "Response",
++                  "permission": "ReadData", "params": [], "returns": "string"})";
++  }
++
++  bool m_added{false};
++};
++
++class TestTCPServer : public testing::Test
++{
++protected:
++  void SetUp() override
++  {
++#if defined(TARGET_WINDOWS)
++    WSADATA wsaData;
++    ASSERT_EQ(0, WSAStartup(MAKEWORD(2, 2), &wsaData));
++#endif
++    for (int port = 39190; port < 39290; ++port)
++    {
++      if (CTCPServer::StartServer(port, false))
++      {
++        m_port = port;
++        break;
++      }
++    }
++    ASSERT_NE(0, m_port) << "no free port for the JSON-RPC server";
++  }
++
++  void TearDown() override
++  {
++    for (SOCKET client : m_clients)
++      closesocket(client);
++    CTCPServer::StopServer(true);
++#if defined(TARGET_WINDOWS)
++    WSACleanup();
++#endif
++  }
++
++  SOCKET Connect()
++  {
++    SOCKET client = socket(AF_INET, SOCK_STREAM, 0);
++    if (client == INVALID_SOCKET)
++      return client;
++    m_clients.push_back(client);
++
++    sockaddr_in address{};
++    address.sin_family = AF_INET;
++    address.sin_port = htons(static_cast<uint16_t>(m_port));
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    if (connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
++      return INVALID_SOCKET;
++    return client;
++  }
++
++  static bool ReadReply(SOCKET client)
++  {
++    fd_set readable;
++    FD_ZERO(&readable);
++    FD_SET(client, &readable);
++    timeval timeout = {5, 0};
++    if (select(static_cast<int>(client) + 1, &readable, nullptr, nullptr, &timeout) != 1)
++      return false;
++
++    char buffer[4096];
++    return recv(client, buffer, sizeof(buffer), 0) > 0;
++  }
++
++  static bool Exchange(SOCKET client, const std::string& request)
++  {
++    return send(client, request.data(), static_cast<int>(request.size()), 0) ==
++               static_cast<int>(request.size()) &&
++           ReadReply(client);
++  }
++
++  //! \brief Read everything the server sends until it includes the text, for at most the time
++  static bool ReadUntil(SOCKET client, const std::string& text, std::chrono::milliseconds timeout)
++  {
++    const auto deadline = std::chrono::steady_clock::now() + timeout;
++    std::string received;
++    while (std::chrono::steady_clock::now() < deadline)
++    {
++      fd_set readable;
++      FD_ZERO(&readable);
++      FD_SET(client, &readable);
++      timeval wait = {0, 100000};
++      if (select(static_cast<int>(client) + 1, &readable, nullptr, nullptr, &wait) != 1)
++        continue;
++
++      char buffer[4096];
++      const int read = recv(client, buffer, sizeof(buffer), 0);
++      if (read <= 0)
++        return false;
++      received.append(buffer, read);
++      if (received.find(text) != std::string::npos)
++        return true;
++      // Keep only what could hold the start of the text
++      if (received.size() > text.size())
++        received.erase(0, received.size() - text.size());
++    }
++    return false;
++  }
++
++  static bool WaitForNoWorkers()
++  {
++    for (auto waited = 0ms; waited < 5s; waited += 10ms)
++    {
++      if (CTCPServer::GetActiveWorkers() == 0)
++        return true;
++      std::this_thread::sleep_for(10ms);
++    }
++    return false;
++  }
++
++  int m_port{0};
++  std::vector<SOCKET> m_clients;
++};
++} // namespace
++
++TEST_F(TestTCPServer, AnIdleConnectionHoldsNoWorker)
++{
++  const std::string request = R"({"jsonrpc":"2.0","method":"JSONRPC.Ping","id":1})";
++
++  for (int i = 0; i < 4; ++i)
++  {
++    const SOCKET client = Connect();
++    ASSERT_NE(INVALID_SOCKET, client);
++    ASSERT_EQ(static_cast<int>(request.size()),
++              send(client, request.data(), static_cast<int>(request.size()), 0));
++    ASSERT_TRUE(ReadReply(client)) << "connection " << i << " got no reply";
++  }
++
++  // Every request has been answered and every connection is still open
++  EXPECT_TRUE(WaitForNoWorkers()) << CTCPServer::GetActiveWorkers() << " workers still running";
++}
++
++TEST_F(TestTCPServer, AnIncompleteRequestHoldsNoWorker)
++{
++  const SOCKET client = Connect();
++  ASSERT_NE(INVALID_SOCKET, client);
++
++  // Answered once complete, so the first half has been read and handed to a worker by then
++  const std::string first = R"({"jsonrpc":"2.0","method":)";
++  const std::string rest = R"("JSONRPC.Ping","id":1})";
++  ASSERT_EQ(static_cast<int>(first.size()),
++            send(client, first.data(), static_cast<int>(first.size()), 0));
++  std::this_thread::sleep_for(200ms);
++  EXPECT_TRUE(WaitForNoWorkers()) << "a half-sent request held a worker";
++
++  ASSERT_EQ(static_cast<int>(rest.size()),
++            send(client, rest.data(), static_cast<int>(rest.size()), 0));
++  EXPECT_TRUE(ReadReply(client)) << "the request was not answered once complete";
++}
++
++TEST_F(TestTCPServer, APeerThatStopsReadingHoldsUpNoAnnouncement)
++{
++  // The test environment never starts its announcement thread, so run one for this test
++  CTCPServer::StopServer(true);
++  const auto previous = CServiceBroker::GetAnnouncementManager();
++  const auto manager = std::make_shared<ANNOUNCEMENT::CAnnouncementManager>();
++  CServiceBroker::RegisterAnnouncementManager(manager);
++  manager->Start();
++  ASSERT_TRUE(CTCPServer::StartServer(m_port, false));
++
++  const SOCKET stalled = Connect();
++  ASSERT_NE(INVALID_SOCKET, stalled);
++  ASSERT_TRUE(Exchange(stalled, R"({"jsonrpc":"2.0","method":"JSONRPC.Ping","id":1})"));
++
++  // Not sent the flood, so only the stalled peer is sent more than it reads
++  const SOCKET listener = Connect();
++  ASSERT_NE(INVALID_SOCKET, listener);
++  ASSERT_TRUE(Exchange(listener, R"({"jsonrpc":"2.0","method":"JSONRPC.SetConfiguration",)"
++                                 R"("params":{"notifications":{"Other":false}},"id":1})"));
++
++  // Far more than the socket buffers hold
++  const CVariant data(std::string(60000, 'x'));
++  for (int i = 0; i < 400; ++i)
++    manager->Announce(ANNOUNCEMENT::Other, "test", "flood", data);
++  manager->Announce(ANNOUNCEMENT::Info, "test", "marker", CVariant{});
++
++  const bool delivered = ReadUntil(listener, "marker", 5s);
++
++  std::promise<void> stopped;
++  auto done = stopped.get_future();
++  std::thread stopper(
++      [&stopped]
++      {
++        CTCPServer::StopServer(true);
++        stopped.set_value();
++      });
++  const bool stoppedInTime = done.wait_for(5s) == std::future_status::ready;
++
++  // Closing the peer fails a send blocked on it, so a hang ends here rather than in the suite
++  closesocket(stalled);
++  closesocket(listener);
++  m_clients.clear();
++  stopper.join();
++  manager->Deinitialize();
++  CServiceBroker::RegisterAnnouncementManager(previous);
++
++  EXPECT_TRUE(delivered) << "a peer that stopped reading held up an announcement to another";
++  EXPECT_TRUE(stoppedInTime) << "StopServer waited on a peer that stopped reading";
++}
++
++TEST_F(TestTCPServer, StopWaitsForARunningRequestAndStartsNoOther)
++{
++  CTestMethods methods;
++  ASSERT_TRUE(methods.Added());
++
++  const SOCKET client = Connect();
++  ASSERT_NE(INVALID_SOCKET, client);
++
++  // One write, so the second request is already with the worker when the first blocks it
++  const std::string requests = R"({"jsonrpc":"2.0","method":"Test.Block","id":1})"
++                               R"({"jsonrpc":"2.0","method":"Test.Record","id":2})";
++  ASSERT_EQ(static_cast<int>(requests.size()),
++            send(client, requests.data(), static_cast<int>(requests.size()), 0));
++  ASSERT_TRUE(requestBlocked.Wait(5s));
++
++  std::promise<void> stopped;
++  auto done = stopped.get_future();
++  std::thread stopper(
++      [&stopped]
++      {
++        CTCPServer::StopServer(true);
++        stopped.set_value();
++      });
++  // The application tears down what a request reaches once StopServer(true) returns
++  const bool stoppedEarly = done.wait_for(4s) == std::future_status::ready;
++  releaseRequest.Set();
++  const bool stoppedOnRelease = done.wait_for(5s) == std::future_status::ready;
++  stopper.join();
++
++  EXPECT_FALSE(stoppedEarly) << "StopServer returned while a request was still running";
++  EXPECT_TRUE(stoppedOnRelease) << "StopServer did not return once the request finished";
++  EXPECT_FALSE(laterRequestStarted.Wait(1s)) << "a request started after StopServer was called";
++}
++
++TEST_F(TestTCPServer, ARequestCanStopTheServerItArrivedOn)
++{
++  CTestMethods methods;
++  ASSERT_TRUE(methods.Added());
++
++  const SOCKET client = Connect();
++  ASSERT_NE(INVALID_SOCKET, client);
++  const std::string request = R"({"jsonrpc":"2.0","method":"Test.Stop","id":1})";
++  ASSERT_EQ(static_cast<int>(request.size()),
++            send(client, request.data(), static_cast<int>(request.size()), 0));
++
++  EXPECT_TRUE(stoppedFromRequest.Wait(5s)) << "StopServer waited for the request calling it";
++
++  // Let the request return before its method is removed
++  std::this_thread::sleep_for(200ms);
++}
++
++TEST_F(TestTCPServer, StopWaitsForRequestsAfterTheServerThreadHasExited)
++{
++  CTestMethods methods;
++  ASSERT_TRUE(methods.Added());
++
++  const SOCKET client = Connect();
++  ASSERT_NE(INVALID_SOCKET, client);
++  const std::string request = R"({"jsonrpc":"2.0","method":"Test.Block","id":1})";
++  ASSERT_EQ(static_cast<int>(request.size()),
++            send(client, request.data(), static_cast<int>(request.size()), 0));
++  ASSERT_TRUE(requestBlocked.Wait(5s));
++
++  // Application shutdown signals every service to stop before it waits for any of them
++  CTCPServer::StopServer(false);
++  for (auto waited = 0ms; CTCPServer::IsRunning() && waited < 5s; waited += 10ms)
++    std::this_thread::sleep_for(10ms);
++  ASSERT_FALSE(CTCPServer::IsRunning());
++
++  std::thread releaser(
++      []
++      {
++        std::this_thread::sleep_for(200ms);
++        releaseRequest.Set();
++      });
++  CServiceBroker::GetNetwork().GetServices().StopJSONRPCServer(true);
++  const bool returned = blockedRequestReturned;
++  releaser.join();
++  // Nothing may still be in a request once its method is removed
++  CTCPServer::StopServer(true);
++
++  EXPECT_TRUE(returned) << "StopJSONRPCServer(true) did not wait for a running request";
++}
+-- 
+2.53.0
+

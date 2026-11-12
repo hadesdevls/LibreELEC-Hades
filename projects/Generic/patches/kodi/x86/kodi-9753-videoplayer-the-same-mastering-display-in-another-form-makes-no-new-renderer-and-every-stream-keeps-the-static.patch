@@ -1,0 +1,555 @@
+From f2303f95e34f80b244826cf9d7d7600d8c359906 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 07:14:02 +0000
+Subject: [PATCH] VideoPlayer: the same mastering display in another form makes
+ no new renderer, and every stream keeps the static metadata it carried
+
+Whether two pictures have the same mastering display decides whether the
+renderer is made again (VideoPicture::IsSameParams(),
+CRenderManager::Configure()), which sets the output up again: the display
+is told the metadata again, and native Dolby Vision output ends and starts
+again. CompareDisplayMetadata() compared the numerators and denominators
+of the luminances, and did not look at has_luminance. The same display
+comes in more than one form: FFmpeg gives the SEI of HEVC as fractions of
+its steps (10000000/10000 for 1000 cd/m2), Matroska's demuxer gives its
+floats as av_d2q() makes them (1000/1, and 5368709/1073741824 for a
+minimum of 0.005 cd/m2 stored in four bytes). An HDR10 stream whose
+pictures had the SEI and then had the container's metadata made the
+renderer again at each change: a stutter, and what the display is told
+changed in the middle of the video.
+
+They are now compared as the bitstream and the HDMI InfoFrame code them:
+the luminances in steps of 0.0001 cd/m2, the primaries and the white
+point in steps of 0.00002 (an exact comparison of the fractions would
+still tell the float of 0.005 from the SEI's 50/10000). Both pictures
+have a luminance or neither has, and the values are compared only where
+both have them; the same for the primaries and white point, which go to
+the display with the luminance (SetHDR(), only when the renderer is
+configured) and were not compared at all. The content light levels are
+still not compared, as in Kodi: they change from one clip of a Blu-ray
+playlist to the next, and making the renderer again there would end
+native output in the middle of a title. Each picture costs one comparison
+of the fractions, as before; their values are worked out only where the
+fractions differ. (HdrStaticMetadata.h)
+
+The SEI of HEVC applies to the coded layer video sequence of its picture
+(H.265: it persists to the end of the CLVS, and all that apply to one
+CLVS have the same content). FFmpeg 9.0.2 gives it to every picture of
+that sequence and to none of the next one that does not carry it again
+(hevcdec.c counts its presence down at each IRAP picture with
+NoRaslOutputFlag set), and forgets it at every flush (a seek). An encoder
+that carries it on the first IRAP picture only left every picture from
+the next IDR picture on, and every picture after a seek, with the
+container's metadata, or none. A stream set up for native Dolby Vision
+output or for the reconstruction kept the last that it carried in band;
+every stream does now (CInBandHdrMetadata), in the decoder of FFmpeg and
+in the DRM PRIME one: a picture without it takes the last that the stream
+carried with the same transfer function, a new SEI replaces it, the
+container's is used before any SEI has come, and nothing is kept from one
+stream to the next. It is kept when the decoder of the same stream is
+reset or opened again.
+
+The idea of comparing the luminances by value is CroqueMr's
+(libreelec-x86-DV, preview/rc4-update3, 5145be51ae, "Compare HDR mastering
+luminance by rational value"); written for this tree.
+---
+ .../DVDCodecs/Video/CMakeLists.txt            |   1 +
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |  20 +-
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp |  33 +--
+ .../DVDCodecs/Video/DVDVideoCodecDRMPRIME.h   |   4 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |  80 ++------
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |   8 +-
+ .../DVDCodecs/Video/HdrStaticMetadata.h       | 188 ++++++++++++++++++
+ 7 files changed, 236 insertions(+), 98 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/DVDCodecs/Video/HdrStaticMetadata.h
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+index 9ae060e..946098d 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+@@ -8,6 +8,7 @@ set(HEADERS AddonVideoCodec.h
+             DVDVideoCodecFFmpeg.h
+             DVDVideoPP.h
+             DrainRestart.h
++            HdrStaticMetadata.h
+             MultiviewPacker.h)
+ 
+ if(TARGET ffmpeg::libpostproc)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index 026a6fc..29ca61e 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "DVDVideoCodec.h"
+ 
++#include "HdrStaticMetadata.h"
+ #include "cores/VideoPlayer/DVDCodecs/DVDFactoryCodec.h"
+ 
+ #include <string>
+@@ -117,19 +118,12 @@ bool VideoPicture::IsFullRange(AVColorRange range, AVPixelFormat format)
+ 
+ bool VideoPicture::CompareDisplayMetadata(const VideoPicture& pic) const
+ {
+-  if (this->hasDisplayMetadata != pic.hasDisplayMetadata)
+-    return false;
+-
+-  // both this and pic not has display metadata (e.g. SDR video)
+-  // returns true because it is equal and there is no need to compare
+-  if (!pic.hasDisplayMetadata)
+-    return true;
+-
+-  // both this and pic has display metadata
+-  return this->displayMetadata.max_luminance.num == pic.displayMetadata.max_luminance.num &&
+-         this->displayMetadata.max_luminance.den == pic.displayMetadata.max_luminance.den &&
+-         this->displayMetadata.min_luminance.num == pic.displayMetadata.min_luminance.num &&
+-         this->displayMetadata.min_luminance.den == pic.displayMetadata.min_luminance.den;
++  // Hades: the same mastering display in another form (the SEI's fractions, the container's) is
++  // the same: compared by value as the bitstream codes it, the luminance where both pictures have
++  // one, the primaries and white point where both have them (HdrStaticMetadata.h). The numerators
++  // and denominators were compared, which made the renderer again between pictures of one stream.
++  return VIDEOPLAYER::HDR_STATIC::SameMasteringDisplay(hasDisplayMetadata, displayMetadata,
++                                                       pic.hasDisplayMetadata, pic.displayMetadata);
+ }
+ 
+ bool VideoPicture::IsSameParams(const VideoPicture& pic) const
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+index 13d30de..91a427e 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.cpp
+@@ -374,6 +374,7 @@ bool CDVDVideoCodecDRMPRIME::Open(CDVDStreamInfo& hints, CDVDCodecOptions& optio
+     return false;
+ 
+   m_hints = hints;
++  m_inBandHdr.Reset(); // Hades: nothing is kept from one stream to the next
+ 
+   const AVCodecHWConfig* pConfig = FindHWConfig(pCodec);
+   if (pConfig && (pConfig->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+@@ -672,31 +673,19 @@ void CDVDVideoCodecDRMPRIME::SetPictureParams(VideoPicture* pVideoPicture)
+   if (!m_hdr10PlusGap.Message().empty())
+     CLog::Log(LOGINFO, "HDR10+: {}", m_hdr10PlusGap.Message());
+ 
+-  pVideoPicture->hasDisplayMetadata = false;
++  // Hades: what the picture carries in band, else the last that the stream carried in band with the
++  // same transfer function, else the container's (HdrStaticMetadata.h)
+   AVFrameSideData* sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+-  if (sd)
+-  {
+-    pVideoPicture->displayMetadata = *reinterpret_cast<AVMasteringDisplayMetadata*>(sd->data);
+-    pVideoPicture->hasDisplayMetadata = true;
+-  }
+-  else if (m_hints.masteringMetadata)
+-  {
+-    pVideoPicture->displayMetadata = *m_hints.masteringMetadata.get();
+-    pVideoPicture->hasDisplayMetadata = true;
+-  }
++  pVideoPicture->hasDisplayMetadata = m_inBandHdr.Display(
++      sd ? reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data) : nullptr,
++      pVideoPicture->color_transfer, m_hints.masteringMetadata.get(),
++      pVideoPicture->displayMetadata);
+ 
+-  pVideoPicture->hasLightMetadata = false;
+   sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+-  if (sd)
+-  {
+-    pVideoPicture->lightMetadata = *reinterpret_cast<AVContentLightMetadata*>(sd->data);
+-    pVideoPicture->hasLightMetadata = true;
+-  }
+-  else if (m_hints.contentLightMetadata)
+-  {
+-    pVideoPicture->lightMetadata = *m_hints.contentLightMetadata.get();
+-    pVideoPicture->hasLightMetadata = true;
+-  }
++  pVideoPicture->hasLightMetadata =
++      m_inBandHdr.Light(sd ? reinterpret_cast<const AVContentLightMetadata*>(sd->data) : nullptr,
++                        pVideoPicture->color_transfer, m_hints.contentLightMetadata.get(),
++                        pVideoPicture->lightMetadata);
+ 
+   pVideoPicture->iRepeatPicture = 0;
+   pVideoPicture->iFlags = 0;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+index 7127d13..1f0bfc8 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecDRMPRIME.h
+@@ -11,6 +11,7 @@
+ #include "cores/VideoPlayer/Buffers/VideoBuffer.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DRMPRIMEHandBack.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
++#include "cores/VideoPlayer/DVDCodecs/Video/HdrStaticMetadata.h"
+ #include "cores/VideoPlayer/DVDStreamInfo.h"
+ #include "utils/HDR10PlusVsif.h"
+ 
+@@ -57,4 +58,7 @@ protected:
+   bool m_handBackTold = false;
+   //! Hades: HDR10+ across pictures without metadata of their own
+   KODI::UTILS::HDR10PLUS::CGap m_hdr10PlusGap;
++  //! Hades: the HDR10 static metadata that the stream carried in band, for its pictures that come
++  //! without it (HdrStaticMetadata.h)
++  VIDEOPLAYER::HDR_STATIC::CInBandHdrMetadata m_inBandHdr;
+ };
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index e3e13a0..54c63e7 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -392,6 +392,7 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+ 
+   m_hints = hints;
+   m_options = options;
++  m_inBandHdr.Reset(); // Hades: nothing is kept from one stream to the next
+ #ifdef HAVE_DVBRIDGE
+   // The stream is set up for native output (dual-layer decoding) when a transport mode can carry
+   // it, also before the output switches to that mode.
+@@ -454,8 +455,6 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+                                                   !m_dvMeasured && !m_dvFromHdr10Plus);
+   m_dvDecoderTold = false;
+   m_dvBaseTold = false;
+-  m_dvDisplayMetadata.reset();
+-  m_dvLightMetadata.reset();
+   // Hades: what the stream says it is, in the log without debugging, with the metadata of its
+   // first picture (DVBridge) what tells a stream whose picture comes out wrong from one that
+   // plays right
+@@ -961,8 +960,6 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvConvert = false;
+   m_dvConvertSdr = false;
+   m_dvNoNative = false;
+-  m_dvDisplayMetadata.reset();
+-  m_dvLightMetadata.reset();
+   m_dvFromHdr10Plus = false;
+   m_dvHdr10PlusFill = false;
+   dvbridge_hdr10plus_scene_destroy(m_dvHdr10PlusScene);
+@@ -973,6 +970,7 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   m_dvMeasuredPlaceholder.clear();
+ #endif
+   m_hdr10PlusGap.Reset(); // Hades
++  m_inBandHdr.Reset(); // Hades
+   av_frame_free(&m_pFrame);
+   av_frame_free(&m_pDecodedFrame);
+   av_frame_free(&m_pFilterFrame);
+@@ -2330,23 +2328,17 @@ void CDVDVideoCodecFFmpeg::Reset()
+ 
+ void CDVDVideoCodecFFmpeg::Reopen()
+ {
+-#ifdef HAVE_DVBRIDGE
+-  // the same stream goes on: what it carried in band is still its static metadata
+-  const auto displayMetadata = m_dvDisplayMetadata;
+-  const auto lightMetadata = m_dvLightMetadata;
+-#endif
++  // Hades: the same stream goes on: what it carried in band is still its static metadata
++  const auto inBandHdr = m_inBandHdr;
+   Dispose();
+   if (!Open(m_hints, m_options))
+   {
+     Dispose();
+   }
+-#ifdef HAVE_DVBRIDGE
+   else
+   {
+-    m_dvDisplayMetadata = displayMetadata;
+-    m_dvLightMetadata = lightMetadata;
++    m_inBandHdr = inBandHdr;
+   }
+-#endif
+ }
+ 
+ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::HandleHwFatal()
+@@ -2576,55 +2568,23 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   pVideoPicture->pict_type = m_pFrame->pict_type;
+ 
+   // metadata
+-  pVideoPicture->hasDisplayMetadata = false;
+-  pVideoPicture->hasLightMetadata = false;
++  // Hades: what the picture carries in band, else the last that the stream carried in band with the
++  // same transfer function, else the container's (HdrStaticMetadata.h). The static metadata of
++  // HDR10 describes the whole stream, but an encoder may carry its SEI only on the first IRAP
++  // picture: a later picture without it compared as another format (VideoPicture::IsSameParams()),
++  // and the renderer was made again, which changes what the display is told in the middle of the
++  // video, and ends native Dolby Vision output and starts it again. (Kept so for the streams set up
++  // for native output or for the reconstruction before; for every stream now.)
+   sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+-  if (sd)
+-  {
+-    pVideoPicture->displayMetadata = *(AVMasteringDisplayMetadata *)sd->data;
+-    pVideoPicture->hasDisplayMetadata = true;
+-#ifdef HAVE_DVBRIDGE
+-    m_dvDisplayMetadata = pVideoPicture->displayMetadata;
+-#endif
+-  }
+-#ifdef HAVE_DVBRIDGE
+-  // The static metadata of HDR10 describes the whole stream, but an encoder may carry its SEI
+-  // only on the first IRAP picture. A later picture without it compares as another format
+-  // (VideoPicture::IsSameParams()): the renderer is made again, which ends native Dolby Vision
+-  // output and starts it again, two changes of the display mode in the middle of the video.
+-  // A stream set up for native output keeps the last metadata it carried; a new SEI replaces it.
+-  else if ((m_dvNativeOutput || m_dvConvert) && m_dvDisplayMetadata)
+-  {
+-    pVideoPicture->displayMetadata = *m_dvDisplayMetadata;
+-    pVideoPicture->hasDisplayMetadata = true;
+-  }
+-#endif
+-  else if (m_hints.masteringMetadata)
+-  {
+-    pVideoPicture->displayMetadata = *m_hints.masteringMetadata.get();
+-    pVideoPicture->hasDisplayMetadata = true;
+-  }
++  pVideoPicture->hasDisplayMetadata = m_inBandHdr.Display(
++      sd ? reinterpret_cast<const AVMasteringDisplayMetadata*>(sd->data) : nullptr,
++      pVideoPicture->color_transfer, m_hints.masteringMetadata.get(),
++      pVideoPicture->displayMetadata);
+   sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+-  if (sd)
+-  {
+-    pVideoPicture->lightMetadata = *(AVContentLightMetadata *)sd->data;
+-    pVideoPicture->hasLightMetadata = true;
+-#ifdef HAVE_DVBRIDGE
+-    m_dvLightMetadata = pVideoPicture->lightMetadata;
+-#endif
+-  }
+-#ifdef HAVE_DVBRIDGE
+-  else if ((m_dvNativeOutput || m_dvConvert) && m_dvLightMetadata)
+-  {
+-    pVideoPicture->lightMetadata = *m_dvLightMetadata;
+-    pVideoPicture->hasLightMetadata = true;
+-  }
+-#endif
+-  else if (m_hints.contentLightMetadata)
+-  {
+-    pVideoPicture->lightMetadata = *m_hints.contentLightMetadata.get();
+-    pVideoPicture->hasLightMetadata = true;
+-  }
++  pVideoPicture->hasLightMetadata =
++      m_inBandHdr.Light(sd ? reinterpret_cast<const AVContentLightMetadata*>(sd->data) : nullptr,
++                        pVideoPicture->color_transfer, m_hints.contentLightMetadata.get(),
++                        pVideoPicture->lightMetadata);
+ 
+   pVideoPicture->doviMetadata.Reset();
+ #ifdef HAVE_DVBRIDGE
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index c75deab..c18f05f 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -11,6 +11,7 @@
+ #include "DVDVideoCodec.h"
+ #include "DVDVideoPP.h"
+ #include "DrainRestart.h"
++#include "HdrStaticMetadata.h"
+ #include "cores/VideoPlayer/DVDCodecs/DVDCodecs.h"
+ #include "cores/VideoPlayer/DVDStreamInfo.h"
+ #include "utils/HDR10PlusVsif.h"
+@@ -82,6 +83,10 @@ protected:
+   CDrainRestart m_drainRestart;
+   //! Hades: HDR10+ across pictures without metadata of their own
+   KODI::UTILS::HDR10PLUS::CGap m_hdr10PlusGap;
++  //! Hades: the HDR10 static metadata that the stream carried in band, for its pictures that come
++  //! without it (HdrStaticMetadata.h); kept when the decoder of the same stream is reset or opened
++  //! again (Reopen())
++  VIDEOPLAYER::HDR_STATIC::CInBandHdrMetadata m_inBandHdr;
+ #ifdef HAVE_DVBRIDGE
+   std::shared_ptr<dvbridge_fel> m_dvFel;
+   std::deque<std::shared_ptr<VideoPicture>> m_dvPending;
+@@ -157,9 +162,6 @@ protected:
+                         const AVDOVIColorMetadata& color);
+   bool m_dvBaseTold{false};
+   bool m_dvBaseDeclaredPq{false};
+-  //! The last HDR10 static metadata that the stream carried in band (see GetPictureCommon())
+-  std::optional<AVMasteringDisplayMetadata> m_dvDisplayMetadata;
+-  std::optional<AVContentLightMetadata> m_dvLightMetadata;
+   //! Hades: the Dolby Vision of the stream is made from its HDR10+ metadata
+   //! (CDVDStreamInfo::doviFromHdr10Plus), picture by picture (MakeHdr10PlusMetadata()), with what is
+   //! kept of the scene (dvbridge_hdr10plus_next())
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/HdrStaticMetadata.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/HdrStaticMetadata.h
+new file mode 100644
+index 0000000..652978f
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/HdrStaticMetadata.h
+@@ -0,0 +1,188 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++extern "C"
++{
++#include <libavutil/mastering_display_metadata.h>
++#include <libavutil/rational.h>
++}
++
++#include <cmath>
++#include <cstdint>
++#include <optional>
++
++namespace VIDEOPLAYER::HDR_STATIC
++{
++
++/*!
++ * \brief Hades: the HDR10 static metadata of a stream (SMPTE ST 2086 mastering display, and the
++ *        content light levels), the same from one picture to the next, and kept for its pictures
++ *        that come without it
++ *
++ * Whether two pictures have the same mastering display decides whether the renderer is made again
++ * (VideoPicture::IsSameParams(), CRenderManager::Configure()), which sets the output up again: the
++ * display is told the new metadata, and native Dolby Vision output ends and starts again. The same
++ * mastering display comes in more than one form: the SEI of HEVC and H.264 codes its luminances in
++ * steps of 0.0001 cd/m2 and its chromaticities in steps of 0.00002, which FFmpeg gives as fractions
++ * of those steps (10000000/10000 for 1000 cd/m2), and a container gives its own fractions
++ * (Matroska's floats, av_d2q(): 1000/1; or 5368709/1073741824 for a minimum of 0.005 cd/m2 stored
++ * as a 32-bit float). Their numerators and denominators differ, and so would a comparison of exact
++ * fractions (av_cmp_q()) for the float. They are compared here as the bitstream and the HDMI
++ * InfoFrame code them, in those steps (SameMasteringDisplay()); the luminance only where both have
++ * one, the primaries and white point only where both have them.
++ *
++ * The SEI of HEVC applies to the coded layer video sequence (CLVS) of its picture (H.265, the
++ * semantics of the mastering display colour volume SEI message: it persists from its picture to the
++ * end of the CLVS, and all that apply to one CLVS have the same content), and FFmpeg gives it to
++ * every picture of that sequence (libavcodec/hevc/hevcdec.c: its presence counts down at each IRAP
++ * picture with NoRaslOutputFlag set), and to none of the next sequence that does not carry it again.
++ * An encoder may carry it on the first IRAP picture of the stream only: from the next IDR picture
++ * on, the pictures take the container's mastering display (another form, or none at all), and the
++ * renderer is made again at every such change, and after every seek (a flush makes FFmpeg forget
++ * the SEI). The static metadata describes the content, not one sequence of it: a picture without
++ * any takes the last that the stream carried in band while its transfer function is the same
++ * (CInBandHdrMetadata); a new SEI replaces it, the container's is used before any SEI has come, and
++ * nothing is kept from one stream to the next.
++ */
++
++//! The steps of the luminances of a mastering display: 0.0001 cd/m2 (the SEI; CTA-861 codes the
++//! minimum so, and the maximum in 1 cd/m2)
++constexpr int LUMINANCE_STEPS = 10000;
++//! The steps of its chromaticities: 0.00002 (the SEI and CTA-861)
++constexpr int CHROMATICITY_STEPS = 50000;
++
++//! A fraction in steps of 1 / steps, rounded; nothing where it is no number (a denominator of 0)
++inline std::optional<int64_t> Steps(AVRational value, int steps)
++{
++  if (value.den == 0)
++    return std::nullopt;
++  const double v = av_q2d(value) * steps;
++  if (!std::isfinite(v) || std::fabs(v) > 1e15)
++    return std::nullopt;
++  return std::llround(v);
++}
++
++//! Two fractions are the same value in steps of 1 / steps (the same fraction always is)
++inline bool SameValue(AVRational a, AVRational b, int steps)
++{
++  if (a.num == b.num && a.den == b.den)
++    return true;
++  const auto x = Steps(a, steps);
++  const auto y = Steps(b, steps);
++  return x && y && *x == *y;
++}
++
++/*!
++ * \brief Two pictures have the same mastering display: both have none, or both have one with the
++ *        same luminances (where they have them) and the same primaries and white point (where they
++ *        have them), in the steps that the bitstream and the InfoFrame code them in
++ */
++inline bool SameMasteringDisplay(bool hasA,
++                                 const AVMasteringDisplayMetadata& a,
++                                 bool hasB,
++                                 const AVMasteringDisplayMetadata& b)
++{
++  if (hasA != hasB)
++    return false;
++  if (!hasA)
++    return true;
++  if (!a.has_luminance != !b.has_luminance || !a.has_primaries != !b.has_primaries)
++    return false;
++  if (a.has_luminance && (!SameValue(a.max_luminance, b.max_luminance, LUMINANCE_STEPS) ||
++                          !SameValue(a.min_luminance, b.min_luminance, LUMINANCE_STEPS)))
++    return false;
++  if (a.has_primaries)
++  {
++    for (int i = 0; i < 3; ++i)
++      for (int j = 0; j < 2; ++j)
++        if (!SameValue(a.display_primaries[i][j], b.display_primaries[i][j], CHROMATICITY_STEPS))
++          return false;
++    for (int j = 0; j < 2; ++j)
++      if (!SameValue(a.white_point[j], b.white_point[j], CHROMATICITY_STEPS))
++        return false;
++  }
++  return true;
++}
++
++/*!
++ * \brief The static metadata that a stream carried in band, for its pictures that come without it
++ *        (see above); one for each stream: Reset() when another opens
++ */
++class CInBandHdrMetadata
++{
++public:
++  void Reset()
++  {
++    m_display.reset();
++    m_light.reset();
++  }
++
++  /*!
++   * \brief The mastering display of a picture
++   * \param carried what the picture carries in band (its side data), or null
++   * \param transfer its transfer function (AVColorTransferCharacteristic)
++   * \param container the container's, or null
++   * \param out set where the picture has one
++   * \return whether it has one: what it carries (kept for the pictures after it), else the last
++   *         one that the stream carried with the same transfer function, else the container's
++   */
++  bool Display(const AVMasteringDisplayMetadata* carried,
++               int transfer,
++               const AVMasteringDisplayMetadata* container,
++               AVMasteringDisplayMetadata& out)
++  {
++    return Take(m_display, carried, transfer, container, out);
++  }
++
++  //! The content light levels of a picture, as Display() takes the mastering display
++  bool Light(const AVContentLightMetadata* carried,
++             int transfer,
++             const AVContentLightMetadata* container,
++             AVContentLightMetadata& out)
++  {
++    return Take(m_light, carried, transfer, container, out);
++  }
++
++private:
++  template<typename T>
++  struct Kept
++  {
++    T value;
++    int transfer;
++  };
++
++  template<typename T>
++  static bool Take(
++      std::optional<Kept<T>>& kept, const T* carried, int transfer, const T* container, T& out)
++  {
++    if (carried)
++    {
++      out = *carried;
++      kept = Kept<T>{*carried, transfer};
++      return true;
++    }
++    if (kept && kept->transfer == transfer)
++    {
++      out = kept->value;
++      return true;
++    }
++    if (container)
++    {
++      out = *container;
++      return true;
++    }
++    return false;
++  }
++
++  std::optional<Kept<AVMasteringDisplayMetadata>> m_display;
++  std::optional<Kept<AVContentLightMetadata>> m_light;
++};
++
++} // namespace VIDEOPLAYER::HDR_STATIC
+-- 
+2.53.0
+

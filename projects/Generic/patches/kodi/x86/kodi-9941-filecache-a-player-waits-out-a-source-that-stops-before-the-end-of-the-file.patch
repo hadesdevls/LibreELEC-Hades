@@ -1,0 +1,533 @@
+From bde79c26da788d1affe56848574dc4b6d3e4ac08 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 02:44:06 +0000
+Subject: [PATCH] filecache: a player waits out a source that stops before the
+ end of the file
+
+When the network source of a cached file stops sending (a Wi-Fi that drops,
+a streaming service that stalls), CFileCache::Read() waits 10 s for data
+and then returns 0. CDVDInputStreamFile takes 0 for the end of the file,
+the demuxer for AVERROR_EOF, and the player ends the video as if it had
+been played to its end, with whatever an add-on does at an end (marked as
+watched, the next episode). The cache thread meanwhile gives a source that
+stopped up after 4 reopenings (7.5 s) and ends the input, which is the end
+of the file as well. A file of known length whose bytes are still missing
+has not ended: its source has stalled.
+
+A reader that can stop its reads at once (IOControl::READ_ABORT) and gives
+IOControl::READ_WAIT around its reads (a player, which buffers meanwhile)
+now waits for such a source instead:
+
+- CFileCache::Read() waits, in slices of 100 ms between which the reader's
+  function is called with how long it has waited, until there is data,
+  the input ends, a seek fails, or the reader aborts.
+- The cache thread keeps reopening the source at the byte it stopped at,
+  every 4 s after the first pauses, for as long as it stays silent, and
+  gives it up after 5 minutes without data, or at once when the server
+  answers the range with a 4xx that will not change (an expired or removed
+  link). The read that then finds nothing fails (-1, IOControl::
+  SOURCE_FAILED answers 1): it is not the end of the file. A 416 (the file
+  is shorter than it said) and a source that cannot seek (a server without
+  ranges) end the file as before.
+- A stall logs its first reopenings, then a line every 30 s, and a line
+  when the source sends again.
+
+Readers that do not ask (thumbnails, stream details, scans), sources of
+unknown length (live streams) and the end of a file are as before: no
+data for 10 s is the end, 4 reopenings, and the end of the file at once.
+
+Host test of CFileCache (FileCache.cpp and CircularCache.cpp of the tree,
+with a source that holds, drops and refuses like an HTTP source), 32
+checks: before, 17 fail (a 12 s hold ends the file at 10 s with 1 of 8 MiB
+read; a 10 s outage ends it after 4 reopenings; a source that never comes
+back, one that refuses the file, and a stop all read as the end of the
+file); after, all pass with ASan+UBSan and TSan, and the 18 checks of the
+abort change still pass.
+---
+ .../DVDInputStreams/DVDInputStream.h          |  16 ++
+ .../DVDInputStreams/DVDInputStreamFile.cpp    |  15 ++
+ .../DVDInputStreams/DVDInputStreamFile.h      |   4 +
+ xbmc/filesystem/FileCache.cpp                 | 247 ++++++++++++++++--
+ xbmc/filesystem/FileCache.h                   |  24 ++
+ xbmc/filesystem/IFileTypes.h                  |   9 +
+ 6 files changed, 289 insertions(+), 26 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
+index 2cf5408..208d842 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStream.h
+@@ -18,6 +18,7 @@
+ 
+ #include <chrono>
+ #include <cstdint>
++#include <functional>
+ #include <string>
+ #include <vector>
+ 
+@@ -196,6 +197,21 @@ public:
+    */
+   virtual bool GetCacheStatus(XFILE::SCacheStatus *status) { return false; }
+ 
++  /*!
++   * \brief Hades: around its reads of packets, a player gives the input a function to call while a
++   *        read waits for a source that stopped sending before the end of a file of known length
++   *        (IOControl::READ_WAIT): such a read then waits for the source instead of taking 10 s
++   *        without data for the end of the file. nullptr after the read. Inputs whose reads do not
++   *        go through the cache of a file ignore it.
++   */
++  virtual void SetReadWait(const std::function<void(std::chrono::milliseconds)>* wait) {}
++
++  /*!
++   * \brief Hades: a read failed because the source of the file was given up on before its end
++   *        (no data for minutes, or the server refuses the file): the input did not end, it failed
++   */
++  virtual bool SourceFailed() const { return false; }
++
+   bool IsStreamType(DVDStreamType type) const { return m_streamType == type; }
+   virtual bool IsEOF() = 0;
+   virtual BitstreamStats GetBitstreamStats() const { return m_stats; }
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+index 84ad72b..30bb5a6 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.cpp
+@@ -123,6 +123,21 @@ void CDVDInputStreamFile::Abort()
+   m_aborted = true;
+ }
+ 
++void CDVDInputStreamFile::SetReadWait(const std::function<void(std::chrono::milliseconds)>* wait)
++{
++  // only for the file a player reads itself (RetryFailedReads() without the flag of an outer
++  // stream), which can stop its reads at once (IOControl::READ_ABORT, set in Open()): the file of a
++  // Blu-ray or DVD image is read as before
++  if (m_pFile && m_retryReads && !m_retryAbort)
++    m_pFile->IoControl(IOControl::READ_WAIT,
++                       const_cast<std::function<void(std::chrono::milliseconds)>*>(wait));
++}
++
++bool CDVDInputStreamFile::SourceFailed() const
++{
++  return m_pFile && m_pFile->IoControl(IOControl::SOURCE_FAILED, nullptr) == 1;
++}
++
+ int CDVDInputStreamFile::Read(uint8_t* buf, int buf_size)
+ {
+   if(!m_pFile) return -1;
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.h
+index b7d7757..ae90fdc 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamFile.h
+@@ -29,6 +29,10 @@ public:
+   bool GetCacheStatus(XFILE::SCacheStatus *status) override;
+   //! Hades: ends the wait of a read that is tried again (CPosixFile::SetReadRetry())
+   void Abort() override;
++  //! Hades: a player's reads wait for a source that stalls (IOControl::READ_WAIT)
++  void SetReadWait(const std::function<void(std::chrono::milliseconds)>* wait) override;
++  //! Hades: IOControl::SOURCE_FAILED of the file
++  bool SourceFailed() const override;
+ 
+   /*!
+    * \brief Hades: called before Open() by a player: a read of a file on a drive of this machine
+diff --git a/xbmc/filesystem/FileCache.cpp b/xbmc/filesystem/FileCache.cpp
+index ec2e303..ae2998c 100644
+--- a/xbmc/filesystem/FileCache.cpp
++++ b/xbmc/filesystem/FileCache.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <inttypes.h>
+ #include <memory>
+ #include <stdexcept>
+@@ -43,6 +44,38 @@ namespace
+ constexpr int MAX_SOURCE_REOPENS = 4;
+ constexpr std::chrono::milliseconds FIRST_REOPEN_PAUSE{500};
+ 
++// For a reader that waits out a stall (IOControl::READ_WAIT: a player, which buffers meanwhile and
++// can stop at once), the source is reopened for as long as it stays silent, every 4 s after the
++// first pauses, and given up on after m_sourceSilenceLimit (FileCache.h)
++constexpr std::chrono::milliseconds MAX_REOPEN_PAUSE{4000};
++constexpr std::chrono::seconds STALL_LOG_INTERVAL{30};
++
++// What the latest answer of an HTTP source says of reopening it: nothing (no answer, or one that
++// may change: 408, 425, 429, 5xx), that the server refuses the file (any other 4xx: an expired or
++// removed link, no access), or that the file is shorter than its announced length (416: the range
++// starts after its end)
++enum class SourceAnswer
++{
++  NONE,
++  REFUSED,
++  SHORTER,
++};
++
++SourceAnswer ClassifyAnswer(const std::string& protoLine, int& code)
++{
++  code = 0;
++  // "HTTP/1.1 404 Not Found", "HTTP/2 404"
++  const size_t sp = protoLine.find(' ');
++  if (protoLine.compare(0, 5, "HTTP/") != 0 || sp == std::string::npos)
++    return SourceAnswer::NONE;
++  code = std::atoi(protoLine.c_str() + sp + 1);
++  if (code == 416)
++    return SourceAnswer::SHORTER;
++  if (code >= 400 && code < 500 && code != 408 && code != 425 && code != 429)
++    return SourceAnswer::REFUSED;
++  return SourceAnswer::NONE;
++}
++
+ class CFileCacheSource final : public IFileCacheSource
+ {
+ public:
+@@ -263,6 +296,9 @@ bool CFileCache::Open(const CURL& url)
+   m_sourcePositionValid = true;
+   m_seekEvent.Reset();
+   m_seekEnded.Reset();
++  m_readerWaits = false;
++  m_sourceFailed = false;
++  m_lastSourceData = std::chrono::steady_clock::now();
+ 
+   CThread::Create(false);
+ 
+@@ -368,6 +404,9 @@ void CFileCache::Process()
+         m_seekError = 0;
+         m_sourcePositionValid = true;
+         m_sourceReopens = 0;
++        // a new transfer: a stall before the seek, or a source given up on, is not this one's
++        m_lastSourceData = std::chrono::steady_clock::now();
++        m_sourceFailed = false;
+         if (bCompleteReset)
+         {
+           CLog::Log(LOGDEBUG,
+@@ -452,40 +491,25 @@ void CFileCache::Process()
+         continue; // while (!m_bStop)
+       }
+       else if (m_fileSize != 0 && m_writePos < m_fileSize &&
+-               m_sourceReopens < MAX_SOURCE_REOPENS)
++               (m_sourceReopens < MAX_SOURCE_REOPENS || m_readerWaits) &&
++               ReopenStalledSource(iRead))
+       {
+         // The source stopped before the end of the file and nothing is left in the cache. An HTTP
+         // server may answer the range request of a seek with 429 (too many requests) or 503;
+         // CCurlFile then reports a successful seek followed by no data, and reporting EOF here
+-        // would end playback. Reopen the source at the write position after a short pause that
+-        // grows with each attempt; a seek request or StopThread() interrupts the pause.
+-        // (StopThread() sets the seek event, and the wait for a seek at the top of this loop can
+-        // take it: a cache that is being stopped neither pauses nor reopens.)
++        // would end playback. The source is reopened at the write position after a short pause
++        // that grows with each attempt (ReopenStalledSource()); a seek request or StopThread()
++        // interrupts the pause. (StopThread() sets the seek event, and the wait for a seek at the
++        // top of this loop can take it: a cache that is being stopped neither pauses nor
++        // reopens.)
+         if (m_bStop)
+           break; // while (!m_bStop)
+-        const auto pause = FIRST_REOPEN_PAUSE * (1 << m_sourceReopens);
+-        m_sourceReopens++;
+-        CLog::Log(LOGWARNING,
+-                  "CFileCache::{} - <{}> source read returned {} at {} of {} bytes, reopening it in "
+-                  "{} ms (attempt {} of {})",
+-                  __FUNCTION__, m_sourcePath, iRead, m_writePos, m_fileSize.load(),
+-                  pause.count(), m_sourceReopens, MAX_SOURCE_REOPENS);
+-        if (m_seekEvent.Wait(pause))
+-        {
+-          if (!m_bStop)
+-            m_seekEvent.Set(); // hack so that later we realize seek is needed
+-          continue; // while (!m_bStop)
+-        }
+-        if (m_bStop)
+-          break; // while (!m_bStop)
+-        const int64_t reopened = m_source->Seek(m_writePos, SEEK_SET);
+-        if (reopened != m_writePos && !m_bStop)
+-          CLog::Log(LOGWARNING, "CFileCache::{} - <{}> reopening at {} returned {}", __FUNCTION__,
+-                    m_sourcePath, m_writePos, reopened);
+         continue; // while (!m_bStop)
+       }
+       else
+       {
++        if (m_bStop)
++          break; // while (!m_bStop)
+         if (iRead < 0)
+           CLog::Log(LOGERROR,
+                     "{} - <{}> source read failed with {}!", __FUNCTION__, m_sourcePath, iRead);
+@@ -514,7 +538,19 @@ void CFileCache::Process()
+     }
+ 
+     if (iRead > 0)
++    {
++      const auto now = std::chrono::steady_clock::now();
++      if (m_sourceReopens > 0)
++        CLog::Log(LOGINFO,
++                  "CFileCache::{} - <{}> the source sends again from byte {}, after {} ms without "
++                  "data and {} reopening(s)",
++                  __FUNCTION__, m_sourcePath, m_writePos,
++                  std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastSourceData)
++                      .count(),
++                  m_sourceReopens);
+       m_sourceReopens = 0;
++      m_lastSourceData = now;
++    }
+ 
+     int iTotalWrite = 0;
+     while (!m_bStop && (iTotalWrite < iRead))
+@@ -625,9 +661,9 @@ retry:
+       return -1;
+     }
+ 
+-    // just wait for some data to show up
++    // just wait for some data to show up (a player waits out a source that stalls: Hades)
+     bool aborted = false;
+-    iRc = WaitForCacheData(1, 10s, aborted);
++    iRc = ReaderWaitsOutStalls() ? WaitOutStall(aborted) : WaitForCacheData(1, 10s, aborted);
+     if (aborted)
+     {
+       CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> read aborted by the reader", __FUNCTION__,
+@@ -657,6 +693,15 @@ retry:
+       SetLastError(m_seekError != 0 ? m_seekError : EIO);
+       return -1;
+     }
++    // Hades: the cache thread gave up on a source that stopped before the end of the file: an
++    // error, not the end of the file (a player ends with an error, not as if it had played it all)
++    if (m_sourceFailed)
++    {
++      CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> no data at {}: the source was given up on",
++                __FUNCTION__, m_sourcePath, m_readPos.load());
++      SetLastError(EIO);
++      return -1;
++    }
+     return 0;
+   }
+ 
+@@ -787,6 +832,143 @@ int64_t CFileCache::WaitForCacheData(uint32_t minimum,
+   }
+ }
+ 
++bool CFileCache::ReaderWaitsOutStalls() const
++{
++  // a reader that can stop at once (READ_ABORT) and waits (READ_WAIT), a file whose length is
++  // known and not yet read to its end: the silence of its source is not its end. A source of
++  // unknown length (a live stream) keeps the 10 s after which no data is the end, as before.
++  return m_readWait && m_readAbort && m_fileSize > 0 && m_readPos < m_fileSize;
++}
++
++int64_t CFileCache::WaitOutStall(bool& aborted)
++{
++  // The cache thread reopens the source at the byte it stopped at for as long as it stays silent,
++  // and ends the input when it gives up on it (ReopenStalledSource()); data, the end of the input,
++  // a failed seek or the reader's abort end this wait. Between slices of 100 ms the reader is told
++  // how long it has waited.
++  const auto start = std::chrono::steady_clock::now();
++  bool told = false;
++  for (;;)
++  {
++    const int64_t avail = WaitForCacheData(1, 100ms, aborted);
++    if (aborted || avail > 0 || m_pCache->IsEndOfInput() || !m_sourcePositionValid ||
++        !CThread::IsRunning())
++    {
++      if (told)
++        CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> the wait at {} ends after {} ms", __FUNCTION__,
++                  m_sourcePath, m_readPos.load(),
++                  std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now() - start)
++                      .count());
++      return avail;
++    }
++    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - start);
++    if (!told && waited >= 1s)
++    {
++      told = true;
++      CLog::Log(LOGDEBUG, "CFileCache::{} - <{}> the reader waits for the source at {} of {}",
++                __FUNCTION__, m_sourcePath, m_readPos.load(), m_fileSize.load());
++    }
++    (*m_readWait)(waited);
++  }
++}
++
++bool CFileCache::ReopenStalledSource(ssize_t iRead)
++{
++  // a cache that is being stopped neither pauses, nor reopens, nor logs (the caller leaves)
++  if (m_bStop)
++    return true;
++  const auto now = std::chrono::steady_clock::now();
++  const auto silent =
++      std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastSourceData);
++  const bool waits = m_readerWaits;
++  if (waits)
++  {
++    // what the latest answer of the source says (an HTTP source; others answer nothing)
++    int code = 0;
++    IFile* imp = m_source->GetImplementation();
++    const SourceAnswer answer =
++        imp ? ClassifyAnswer(imp->GetProperty(FileProperty::RESPONSE_PROTOCOL), code)
++            : SourceAnswer::NONE;
++    if (answer == SourceAnswer::SHORTER)
++    {
++      CLog::Log(LOGWARNING,
++                "CFileCache::{} - <{}> the source has nothing from byte {} of the {} it announced "
++                "(HTTP {}): taken as the end of the file",
++                __FUNCTION__, m_sourcePath, m_writePos, m_fileSize.load(), code);
++      return false;
++    }
++    if (answer == SourceAnswer::REFUSED)
++    {
++      CLog::Log(LOGERROR,
++                "CFileCache::{} - <{}> the source refuses the file at byte {} of {} (HTTP {}): "
++                "given up on, the read fails",
++                __FUNCTION__, m_sourcePath, m_writePos, m_fileSize.load(), code);
++      m_sourceFailed = true;
++      return false;
++    }
++    if (m_seekPossible == 0)
++    {
++      // it cannot be reopened at the byte it stopped at (a server without ranges): the end of
++      // what it sent, as before
++      CLog::Log(LOGWARNING,
++                "CFileCache::{} - <{}> the source stopped at byte {} of {} and cannot be reopened "
++                "there (it cannot seek): taken as the end of the file",
++                __FUNCTION__, m_sourcePath, m_writePos, m_fileSize.load());
++      return false;
++    }
++    if (silent >= m_sourceSilenceLimit)
++    {
++      CLog::Log(LOGERROR,
++                "CFileCache::{} - <{}> the source has sent nothing for {} s, at byte {} of {}: "
++                "given up on after {} reopening(s), the read fails",
++                __FUNCTION__, m_sourcePath, silent.count() / 1000, m_writePos, m_fileSize.load(),
++                m_sourceReopens);
++      m_sourceFailed = true;
++      return false;
++    }
++  }
++
++  const auto pause =
++      std::min<std::chrono::milliseconds>(FIRST_REOPEN_PAUSE * (1 << std::min(m_sourceReopens, 4)),
++                                          MAX_REOPEN_PAUSE);
++  m_sourceReopens++;
++  // every attempt of the first ones; then, for a source that stays silent, a line every 30 s
++  const bool log = m_sourceReopens <= MAX_SOURCE_REOPENS || now - m_lastStallLog >= STALL_LOG_INTERVAL;
++  if (log)
++  {
++    m_lastStallLog = now;
++    if (!waits)
++      CLog::Log(LOGWARNING,
++                "CFileCache::{} - <{}> source read returned {} at {} of {} bytes, reopening it in "
++                "{} ms (attempt {} of {})",
++                __FUNCTION__, m_sourcePath, iRead, m_writePos, m_fileSize.load(), pause.count(),
++                m_sourceReopens, MAX_SOURCE_REOPENS);
++    else
++      CLog::Log(LOGWARNING,
++                "CFileCache::{} - <{}> source read returned {} at {} of {} bytes, {} ms without "
++                "data: reopening it in {} ms (attempt {}; the reader waits, given up on after {} "
++                "s without data)",
++                __FUNCTION__, m_sourcePath, iRead, m_writePos, m_fileSize.load(), silent.count(),
++                pause.count(), m_sourceReopens,
++                std::chrono::duration_cast<std::chrono::seconds>(m_sourceSilenceLimit).count());
++  }
++  if (m_seekEvent.Wait(pause))
++  {
++    if (!m_bStop)
++      m_seekEvent.Set(); // hack so that later we realize seek is needed
++    return true;
++  }
++  if (m_bStop)
++    return true;
++  const int64_t reopened = m_source->Seek(m_writePos, SEEK_SET);
++  if (reopened != m_writePos && !m_bStop && log)
++    CLog::Log(LOGWARNING, "CFileCache::{} - <{}> reopening at {} returned {}", __FUNCTION__,
++              m_sourcePath, m_writePos, reopened);
++  return true;
++}
++
+ void CFileCache::Close()
+ {
+   StopThread();
+@@ -867,5 +1049,18 @@ int CFileCache::IoControl(IOControl request, void* param)
+     return 0;
+   }
+ 
++  if (request == IOControl::READ_WAIT)
++  {
++    // the reader's function, set and cleared on its own thread around its reads; once given, the
++    // cache thread keeps reopening a source that stalls (ReopenStalledSource())
++    m_readWait = static_cast<const std::function<void(std::chrono::milliseconds)>*>(param);
++    if (m_readWait)
++      m_readerWaits = true;
++    return 0;
++  }
++
++  if (request == IOControl::SOURCE_FAILED)
++    return m_sourceFailed ? 1 : 0;
++
+   return -1;
+ }
+diff --git a/xbmc/filesystem/FileCache.h b/xbmc/filesystem/FileCache.h
+index 004000d..3212561 100644
+--- a/xbmc/filesystem/FileCache.h
++++ b/xbmc/filesystem/FileCache.h
+@@ -15,6 +15,7 @@
+ 
+ #include <atomic>
+ #include <chrono>
++#include <functional>
+ #include <memory>
+ 
+ class TestFileCache;
+@@ -100,6 +101,13 @@ public:
+     bool ReadAborted() const { return m_readAbort && *m_readAbort; }
+     //! m_pCache->WaitForData(), ended early (aborted = true) when the reader aborts its reads
+     int64_t WaitForCacheData(uint32_t minimum, std::chrono::milliseconds timeout, bool& aborted);
++    //! the reader waits out a source that stops sending before the end (IOControl::READ_WAIT)
++    bool ReaderWaitsOutStalls() const;
++    //! the wait of such a reader: until there is data, the input ends, or the reader aborts
++    int64_t WaitOutStall(bool& aborted);
++    //! the cache thread, when the source failed with nothing left in the cache: true when it is
++    //! reopened (after a pause), false when the cache gives up on it (m_sourceFailed, or its end)
++    bool ReopenStalledSource(ssize_t iRead);
+ 
+     std::unique_ptr<CCacheStrategy> m_pCache;
+     int m_seekPossible = 0;
+@@ -127,6 +135,22 @@ public:
+     std::chrono::milliseconds m_processWait{100ms};
+     //! IOControl::READ_ABORT of the reader (a player sets it when it closes)
+     const std::atomic<bool>* m_readAbort = nullptr;
++    //! IOControl::READ_WAIT of the reader, while it reads (the reader's thread only)
++    const std::function<void(std::chrono::milliseconds)>* m_readWait = nullptr;
++    //! a reader gave READ_WAIT: the cache thread does not give up on a source that stalls before
++    //! the end of the file after a few reopenings, only after SOURCE_SILENCE_LIMIT
++    std::atomic<bool> m_readerWaits{false};
++    //! the cache thread gave up on the source before the end of the file: a read that finds
++    //! nothing more fails (an error), it is not the end of the file
++    std::atomic<bool> m_sourceFailed{false};
++    //! the cache thread's: when the source last gave data, and the lines of a stall
++    std::chrono::steady_clock::time_point m_lastSourceData;
++    std::chrono::steady_clock::time_point m_lastStallLog;
++    //! A source that has sent nothing for this long is given up on, also when a reader waits: a
++    //! network that does not come back within that (a router that restarts, a Wi-Fi that connects
++    //! again, a service that stalls take seconds to a couple of minutes), or a link that has
++    //! expired, would otherwise keep a screen that waits, with no one watching, for ever.
++    std::chrono::milliseconds m_sourceSilenceLimit{std::chrono::minutes(5)};
+   };
+ 
+ }
+diff --git a/xbmc/filesystem/IFileTypes.h b/xbmc/filesystem/IFileTypes.h
+index 8c90df1..01b4dee 100644
+--- a/xbmc/filesystem/IFileTypes.h
++++ b/xbmc/filesystem/IFileTypes.h
+@@ -76,6 +76,15 @@ enum class IOControl
+   SET_RETRY = 16, /**< Enable/disable retry within the protocol handler (if supported) */
+   READ_ABORT = 32, /**< const std::atomic<bool>*: a read that waits for data ends when it is true,
+                         and so does every later one (nullptr: none). Set before the reads. */
++  READ_WAIT = 64, /**< const std::function<void(std::chrono::milliseconds)>*: while it is set, a read
++                       of a file of known length whose source stops sending before its end waits for
++                       the source (a reader that also gave READ_ABORT), instead of taking 10 s without
++                       data for the end of the file; the function is called on the reader's thread
++                       about every 100 ms of that wait, with how long it has lasted (nullptr: none).
++                       Set and cleared by the reader around its reads (CFileCache). */
++  SOURCE_FAILED = 128, /**< returns 1 when the source of the file was given up on before the end of
++                            the file (a read that found nothing more failed: it was no end of the
++                            file), 0 otherwise (CFileCache) */
+ };
+ 
+ enum class CURLOptionType
+-- 
+2.53.0
+

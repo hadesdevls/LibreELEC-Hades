@@ -1,0 +1,370 @@
+From 6ff97e353fbaa10ee7587a439a570d7085ca9841 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:43:19 +0000
+Subject: [PATCH] backgroundinfoloader: stopping the loader says what it waits
+ for, and the interface keeps drawing
+
+The interface stops the loader of a list (opening a folder, leaving the window,
+playing a file) with StopThread(), which joined the thread without a word.
+When the loader was in the middle of a read of a file that did not come back
+(issue #21), the interface froze for as long as that read took, a minute and
+a half in the report, with nothing in kodi.log about why.
+
+StopThread() now waits for the end of Run() on an event. After 300 ms it
+writes one line with the item the loader is at and, once the thread has
+ended, how long it waited. The thread of the interface waits with the busy
+dialog, which keeps drawing and answering, as it does for a directory that is
+slow to read; any other thread, and every thread while Kodi closes, just waits.
+The event is also set when the thread could not be created, so that a stop
+never waits for a thread that does not exist.
+
+m_stopReads is the stop of the reads that an item does of a file: StopAsync()
+sets it, Load() and the end of StopThread() clear it. It is not m_bStop,
+which is true as well while there is no loader (LoadItem() is called by code
+that has none, and its reads must not be stopped). m_bStop is atomic now, as
+StopAsync() sets it from one thread while the loader thread reads it.
+
+Tests: the loader with an item whose read stops with the flag (the stop
+returns at once and the item stores nothing), with a read that cannot be
+stopped (the stop waits for it), a load after a stop, and the flag that is
+clear when there is nothing to stop.
+---
+ xbmc/BackgroundInfoLoader.cpp          |  60 +++++++++++-
+ xbmc/BackgroundInfoLoader.h            |  33 ++++++-
+ xbmc/test/TestBackgroundInfoLoader.cpp | 123 +++++++++++++++++++++++++
+ 3 files changed, 212 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/BackgroundInfoLoader.cpp b/xbmc/BackgroundInfoLoader.cpp
+index 92f70dd..5e0a632 100644
+--- a/xbmc/BackgroundInfoLoader.cpp
++++ b/xbmc/BackgroundInfoLoader.cpp
+@@ -10,14 +10,21 @@
+ 
+ #include "FileItem.h"
+ #include "FileItemList.h"
++#include "ServiceBroker.h"
+ #include "URL.h"
+ #include "application/Application.h"
++#include "dialogs/GUIDialogBusy.h"
++#include "guilib/GUIComponent.h"
++#include "messaging/ApplicationMessenger.h"
+ #include "threads/Thread.h"
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <mutex>
+ 
++using namespace std::chrono_literals;
++
+ CBackgroundInfoLoader::CBackgroundInfoLoader() = default;
+ 
+ CBackgroundInfoLoader::~CBackgroundInfoLoader()
+@@ -50,6 +57,7 @@ void CBackgroundInfoLoader::Run()
+   }
+ 
+   Reset();
++  m_finished.Set();
+ }
+ 
+ void CBackgroundInfoLoader::RunStages()
+@@ -203,10 +211,21 @@ void CBackgroundInfoLoader::Load(CFileItemList& items)
+ 
+   m_pVecItems = &items;
+   m_bStop = false;
++  m_stopReads = false;
+   m_bIsLoading = true;
+ 
+   m_thread = std::make_unique<CThread>(this, "BackgroundLoader");
+-  m_thread->Create();
++  m_finished.Reset();
++  try
++  {
++    m_thread->Create();
++  }
++  catch (...)
++  {
++    // there is no Run() that will say it
++    m_finished.Set();
++    throw;
++  }
+   m_thread->SetPriority(ThreadPriority::BELOW_NORMAL);
+ }
+ 
+@@ -214,6 +233,7 @@ void CBackgroundInfoLoader::StopAsync()
+ {
+   std::unique_lock lock(m_itemLock);
+   m_bStop = true;
++  m_stopReads = true;
+   // a loader thread waiting for a held item has to stop as well
+   m_itemChanged.notifyAll();
+ }
+@@ -224,10 +244,46 @@ void CBackgroundInfoLoader::StopThread()
+ 
+   if (m_thread)
+   {
++    WaitForLoaderThread();
+     m_thread->StopThread();
+     m_thread.reset();
+   }
+   Reset();
++  // no read of the loader is left to stop, and an item may be loaded again, by LoadItem()
++  m_stopReads = false;
++}
++
++void CBackgroundInfoLoader::WaitForLoaderThread()
++{
++  // a loader that stops at its next item, or a read that stops where it is asked to, is not
++  // worth a line
++  const auto start{std::chrono::steady_clock::now()};
++  if (m_finished.Wait(300ms))
++    return;
++
++  std::string waitingFor;
++  {
++    std::unique_lock lock(m_itemLock);
++    waitingFor = m_currentName;
++  }
++  CLog::Log(LOGINFO,
++            "CBackgroundInfoLoader: the loader of the list was asked to stop and is still at {}; "
++            "waiting for it",
++            waitingFor.empty() ? "an item that is not named" : waitingFor);
++
++  // the thread of the interface keeps drawing (and answering) while it waits; the others, and
++  // everything while Kodi closes, just wait
++  const auto messenger{CServiceBroker::GetAppMessenger()};
++  if (messenger && messenger->IsProcessThread() && !g_application.IsStopping() &&
++      CServiceBroker::GetGUI())
++    CGUIDialogBusy::WaitOnEvent(m_finished, 0, false);
++  else
++    m_finished.Wait();
++
++  CLog::Log(LOGINFO, "CBackgroundInfoLoader: the loader of the list stopped after {} ms",
++            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
++                                                                  start)
++                .count());
+ }
+ 
+ CBackgroundInfoLoader::ItemState CBackgroundInfoLoader::BeginItem(const CFileItem* item,
+@@ -245,6 +301,7 @@ CBackgroundInfoLoader::ItemState CBackgroundInfoLoader::BeginItem(const CFileIte
+     return ItemState::HELD;
+ 
+   m_currentItem = item;
++  m_currentName = CURL::GetRedacted(item->GetPath());
+   return ItemState::STARTED;
+ }
+ 
+@@ -252,6 +309,7 @@ void CBackgroundInfoLoader::EndItem()
+ {
+   std::unique_lock lock(m_itemLock);
+   m_currentItem = nullptr;
++  m_currentName.clear();
+   m_itemChanged.notifyAll();
+ }
+ 
+diff --git a/xbmc/BackgroundInfoLoader.h b/xbmc/BackgroundInfoLoader.h
+index 0224bd6..e45cb74 100644
+--- a/xbmc/BackgroundInfoLoader.h
++++ b/xbmc/BackgroundInfoLoader.h
+@@ -11,9 +11,12 @@
+ #include "IProgressCallback.h"
+ #include "threads/Condition.h"
+ #include "threads/CriticalSection.h"
++#include "threads/Event.h"
+ #include "threads/IRunnable.h"
+ 
++#include <atomic>
+ #include <memory>
++#include <string>
+ #include <vector>
+ 
+ class CFileItem; typedef std::shared_ptr<CFileItem> CFileItemPtr;
+@@ -42,8 +45,17 @@ public:
+   virtual bool LoadItemCached(CFileItem* pItem) { return false; }
+   virtual bool LoadItemLookup(CFileItem* pItem) { return false; }
+ 
+-  void StopThread(); // will actually stop the loader thread.
+-  void StopAsync();  // will ask loader to stop as soon as possible, but not block
++  /*!
++   \brief Stops the loader thread and waits for it to end.
++   \note Hades: what a loader reads for an item that is slow (a video file, for its stream details)
++   is asked to stop as well, with m_stopReads (see LoadItemLookup() of CVideoThumbLoader), so that
++   the wait lasts as long as a read in progress that cannot be interrupted, if there is one. After
++   a moment the wait is written to the log with the item it is for, and the thread of the
++   interface that waits keeps drawing, with the busy dialog (as it does for a directory that
++   is slow to read).
++   */
++  void StopThread();
++  void StopAsync(); // will ask loader to stop as soon as possible, but not block
+ 
+   /*!
+    \brief Keeps the loader thread away from an item for as long as it lives, so that another thread
+@@ -77,7 +89,16 @@ protected:
+   CCriticalSection m_lock;
+ 
+   volatile bool m_bIsLoading{false};
+-  volatile bool m_bStop{true};
++  //! Hades: atomic, as StopAsync() sets it from one thread while the loader thread reads it
++  std::atomic<bool> m_bStop{true};
++  /*!
++   \brief Hades: set by StopAsync(), cleared by Load() and by StopThread() once the thread has
++   ended. The reads that an item does of a file, from the loader thread, stop where they are when it
++   is set (it is the stop of CDVDFileInfo::GetFileStreamDetails()). Not m_bStop, which is true
++   as well while there is no loader at all, and an item that is loaded by LoadItem() without one
++   has to read.
++   */
++  std::atomic<bool> m_stopReads{false};
+   std::unique_ptr<CThread> m_thread{};
+ 
+   IBackgroundLoaderObserver* m_pObserver{nullptr};
+@@ -104,10 +125,16 @@ private:
+   ItemState ProcessItem(Stage stage, CFileItem* item, bool waitWhileHeld);
+   ItemState BeginItem(const CFileItem* item, bool waitWhileHeld);
+   void EndItem();
++  //! Hades: the wait of StopThread() for the loader thread to end
++  void WaitForLoaderThread();
++
++  //! Set when Run() has ended (set too while there is no loader thread to wait for)
++  CEvent m_finished{true, true};
+ 
+   CCriticalSection m_itemLock;
+   XbmcThreads::ConditionVariable m_itemChanged;
+   const CFileItem* m_currentItem{nullptr}; //!< item the loader thread is working on
++  std::string m_currentName; //!< Hades: its path, redacted, for the log (guarded by m_itemLock)
+   std::vector<const CFileItem*> m_heldItems; //!< items the loader thread has to leave alone
+ };
+ 
+diff --git a/xbmc/test/TestBackgroundInfoLoader.cpp b/xbmc/test/TestBackgroundInfoLoader.cpp
+index 7521396..915fff9 100644
+--- a/xbmc/test/TestBackgroundInfoLoader.cpp
++++ b/xbmc/test/TestBackgroundInfoLoader.cpp
+@@ -128,3 +128,126 @@ TEST(TestBackgroundInfoLoader, StopWakesWaitForHeldItem)
+   EXPECT_FALSE(loader.IsLoading());
+   EXPECT_EQ(loader.Calls(), (std::vector<std::string>{"cached:b", "lookup:b"}));
+ }
++
++namespace
++{
++//! An item that reads a file: the read ends when the file answers, and, if it looks at the flag as
++//! the demuxer of a probe does, when the loader is asked to stop. A read that was stopped stores
++//! nothing.
++class CReadingLoader : public CBackgroundInfoLoader
++{
++public:
++  explicit CReadingLoader(bool stopsTheRead) : m_stopsTheRead(stopsTheRead) {}
++  ~CReadingLoader() override { StopThread(); }
++
++  bool LoadItemLookup(CFileItem* item) override
++  {
++    if (item->GetPath() != "slow")
++    {
++      ++m_stored;
++      return true;
++    }
++    m_reading.Set();
++    while (!m_answered && !(m_stopsTheRead && m_stopReads))
++      std::this_thread::sleep_for(1ms);
++    if (!m_answered)
++    {
++      m_stopped = true;
++      return false;
++    }
++    ++m_stored;
++    return true;
++  }
++
++  bool Stopping() const { return m_stopReads; }
++
++  CEvent m_reading;
++  std::atomic<bool> m_answered{false};
++  std::atomic<bool> m_stopped{false};
++  std::atomic<int> m_stored{0};
++
++private:
++  const bool m_stopsTheRead;
++};
++
++void AddItemsWithSlow(CFileItemList& items)
++{
++  items.Add(std::make_shared<CFileItem>("a", false));
++  items.Add(std::make_shared<CFileItem>("slow", false));
++  items.Add(std::make_shared<CFileItem>("b", false));
++}
++} // namespace
++
++TEST(TestBackgroundInfoLoader, StopEndsTheReadOfTheItemInProgress)
++{
++  CFileItemList items;
++  AddItemsWithSlow(items);
++  CReadingLoader loader{true};
++  loader.Load(items);
++  ASSERT_TRUE(loader.m_reading.Wait(5s));
++
++  const auto start{std::chrono::steady_clock::now()};
++  loader.StopThread();
++  EXPECT_LT(std::chrono::steady_clock::now() - start, 250ms);
++  EXPECT_TRUE(loader.m_stopped);
++  // the item that was stopped and the one after it stored nothing
++  EXPECT_EQ(loader.m_stored, 1);
++  EXPECT_FALSE(loader.IsLoading());
++}
++
++TEST(TestBackgroundInfoLoader, StopWaitsForAReadThatCannotBeStopped)
++{
++  CFileItemList items;
++  AddItemsWithSlow(items);
++  CReadingLoader loader{false};
++  loader.Load(items);
++  ASSERT_TRUE(loader.m_reading.Wait(5s));
++
++  std::thread drive(
++      [&loader]
++      {
++        std::this_thread::sleep_for(500ms);
++        loader.m_answered = true;
++      });
++  const auto start{std::chrono::steady_clock::now()};
++  loader.StopThread();
++  EXPECT_GE(std::chrono::steady_clock::now() - start, 450ms);
++  drive.join();
++  EXPECT_FALSE(loader.IsLoading());
++}
++
++TEST(TestBackgroundInfoLoader, LoadAfterStopReadsTheItemInFull)
++{
++  CFileItemList items;
++  AddItemsWithSlow(items);
++  CReadingLoader loader{true};
++  loader.Load(items);
++  ASSERT_TRUE(loader.m_reading.Wait(5s));
++  loader.StopThread();
++  ASSERT_TRUE(loader.m_stopped);
++
++  loader.m_stopped = false;
++  loader.m_answered = true;
++  loader.Load(items);
++  ASSERT_TRUE(ConditionPoll::poll([&loader] { return !loader.IsLoading(); }));
++  EXPECT_FALSE(loader.m_stopped);
++  // "a" before, then "a", "slow" and "b"
++  EXPECT_EQ(loader.m_stored, 4);
++}
++
++TEST(TestBackgroundInfoLoader, StopOfReadsEndsWithTheLoader)
++{
++  // an item that is loaded by LoadItem() with no loader thread (there are such callers) must read
++  CReadingLoader loader{true};
++  loader.StopThread();
++  EXPECT_FALSE(loader.Stopping());
++
++  CFileItemList items;
++  AddItemsWithSlow(items);
++  loader.Load(items);
++  ASSERT_TRUE(loader.m_reading.Wait(5s));
++  loader.StopAsync();
++  EXPECT_TRUE(loader.Stopping());
++  loader.StopThread();
++  EXPECT_FALSE(loader.Stopping());
++}
+-- 
+2.53.0
+
