@@ -6,7 +6,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 **Why the screen says "LibreELEC Hades".** The media centre of this build is Kodi with changes that the XBMC Foundation has not approved, and Kodi's trademark policy asks such a build not to use Kodi's name and logos as its own. Underneath, it is Kodi: add-ons, skins and remote-control apps work as with Kodi, its log is still `kodi.log`, and other programs still see Kodi. The page "About this build" of the system information says what it is and how to support Kodi and LibreELEC.
 
-**Version 1.0.** The first version that is not a release candidate. Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through. What is new since 1.0 RC8 is listed in the [changelog](CHANGELOG.md), and what nobody has seen on a screen yet is listed under [Not tried on hardware yet](#not-tried-on-hardware-yet). If you try Hades, please tell me what you see in the issues: results from more hardware are what this project needs most.
+**Version 1.0.** The first version that is not a release candidate. Native Dolby Vision, including profile 7 with its full enhancement layer, has been seen working on NVIDIA, AMD and Intel graphics, with Dolby Atmos passed through. On my PC, the final build of 1.0 plays native Dolby Vision of profiles 5, 7 with its full enhancement layer and 8.1, HDR10 and HDR10+, with Dolby TrueHD, Atmos and DTS-HD Master Audio passed through ([On 1.0](#on-10)). What is new since 1.0 RC8 is listed in the [changelog](CHANGELOG.md), and the few new things that could behave differently on your hardware, and that nobody has seen yet, are under [Not tried on hardware yet](#not-tried-on-hardware-yet). If you try Hades, please tell me what you see in the issues: results from more hardware are what this project needs most.
 
 ## Start here
 
@@ -129,7 +129,18 @@ Nothing from LibreELEC is removed. LibreELEC is made for a box that does nothing
 
 ## What has been tested
 
-I test on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar (on the TV's eARC, or between the PC and the TV) and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "author" are mine. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results below were seen on versions up to 1.0 RC8; what came in 1.0 is under [Not tried on hardware yet](#not-tried-on-hardware-yet).
+I test on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar (on the TV's eARC, or between the PC and the TV) and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H. Results marked "author" are mine. Results marked "user" were reported by people on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums. Seen working means correct colours and a clean return to the menus; the TV's Dolby Vision logo alone does not count. The results in [On 1.0](#on-10) were seen on the final build of 1.0; the tables below were seen on versions up to 1.0 RC8.
+
+### On 1.0
+
+On the final build of 1.0, on my PC with the GeForce RTX 4080 SUPER connected by HDMI to the LG C5, with the TCL Q85H Pro sound bar, and with the Samsung Odyssey OLED G6 monitor (author):
+
+- Native Dolby Vision of profile 7 with its full enhancement layer (several films, with Dolby TrueHD and Atmos passed through), profile 5 and profile 8.1, and HDR10 sent as Dolby Vision.
+- The three Tron films, which had dropped out of Dolby Vision before, play in Dolby Vision.
+- HDR10 with DTS-HD Master Audio passed through to the sound bar.
+- The new player information page.
+- Moving from the LG C5 to the Odyssey monitor and back from the settings, with the display that is not in use turned off.
+- On the Odyssey, which takes HDR10+ and not Dolby Vision: Dolby Vision videos that carry their own HDR10+ go out as HDR10+, and HDR10+ videos go out as HDR10+.
 
 ### Graphics
 
@@ -180,51 +191,17 @@ Every change is tested before a release: on the host, with the code that the ima
 
 ### Not tried on hardware yet
 
-These are new in 1.0. Each was checked on the host, with the code that the image runs, or in a virtual machine, but nobody has seen it on a real screen or with real hardware. If you see one work, or fail, please say so in the issues.
+These are new in 1.0 and could behave differently on your hardware than on mine. Each was checked on the host, with the code that the image runs, or in a virtual machine. If you see one work, or fail, please say so in the issues.
 
-- **Check this setup** and **the diagnostic report**, with the diagnostic switch in the settings: tried in a virtual machine, not on a PC with a TV and a receiver.
-- **The player information page** (key O, or the red key of a TV remote over HDMI-CEC): how it reads over bright HDR pictures, with the TV in game mode and with Dolby Atmos, and that opening it costs no dropped frames on graphics cards and on integrated graphics.
-- **Dolby Vision sent as composed** (the new default): measured against the films, not yet seen on a TV.
-- **Dolby Vision on the newest Ryzen processors** (DCN 4.2 and 4.2B), with the read back of the display pipe that gives way to HDR10 in the same video; the setting that turns Dolby Vision on for the Radeon RX 400, RX 500 and Vega cards; and the button *Check the Dolby Vision output*.
-- **Dolby Vision, HDR10 and 3D through a passive DisplayPort adaptor** (DP++): not tried with an adaptor.
-- **The TV's Dolby Vision block kept whole** where its EDID counts extra blocks with an HDMI Forum EEODB, and the player information that tells a TV input without Dolby Vision from an EDID read in part (issue #7): checked with NVIDIA's EDID code and the kernel's tests, not with that TV.
-- **HDR in 4:2:2 at 12 bits over HDMI 2.0** on Intel graphics and on AMD graphics such as those of the Ryzen 7000 series: the picture, the extra change of mode at the start of a video, and whether small graphics keep up. On AMD this reaches a screen for the first time with this version.
-- **HDR at more than 8 bits on NVIDIA, now on by default:** YCbCr 4:2:2 at 12 bits on the GeForce GTX 16, RTX 20 and newer cards, and the step back to 8 bits where a TV does not lock onto it. At 10 bits on a GeForce GTX 1060 it was seen working.
-- **HDR over HDMI on Intel HD and UHD 6xx graphics,** an expert setting: nobody has tried it on a TV.
-- **Tone mapping:** the knee of ITU-R BT.2390 on displays without HDR and in the mappings to the display, HDR10+ adapted by its own metadata and studio tone curve, HDR videos played as SDR, the SDR displays (Bright room, Projector, Custom) and the black of the display, the trims of Dolby Vision as an expert choice, and the peak of the TV set by hand for the automatic tone mapping (v4.0) choices. Measured with the software bridge.
-- **Picture in step with its sound,** the pause that keeps passthrough sound, TrueHD that comes back sooner after a start or a seek, and the fixes of DTS-HD passthrough: measured on the host, not with a receiver.
-- **A lighter interface during Dolby Vision, HDR10 and HLG,** Dolby Vision made from HDR10, HDR10+ and profile 8.1 at about a third less GPU time, and the packing of Dolby Vision with less GPU time while the interface is over the picture: the picture is meant to be byte for byte the same; the saving has not been measured on real graphics.
-- **Memory for the decoder:** the pool of video surfaces is sized from the level of the stream. Not tried on a graphics card with 2 GB.
-- **Dolby Vision through the DisplayPort-to-HDMI converter** of a mini PC or NUC board. On by default only on the board where it was seen working elsewhere.
-- **The output during and after Dolby Vision:** the output given back as it was found, with the colour range and format of that moment; with NVIDIA's driver 620, its own depth and colour format set to automatic during Dolby Vision; HDMI variable refresh rate left off during native Dolby Vision on NVIDIA GeForce GTX 16, RTX 20 and RTX 30 cards; a colour format or bit depth that another program left on the output put back when Hades starts (the case reported after using a Flatpak app in the same session); the two new settings *Colour format* and *Maximum bit depth*.
-- **HLG sent as Dolby Vision,** on its own where the output cannot send HLG, and by choice anywhere else.
-- **Larger pictures:** a Dolby Vision video of up to 4096x2304 is scaled down to the 3840x2160 output.
-- **Dolby Vision that fell back to HDR10:** films whose metadata repeat a pivot (the Transformers sample of the reports) were refused by the picture check and now play. The check was changed against the specification and the sample's own metadata, not on a screen.
-- **HDR10 whose mastering display comes in two forms** no longer sets the output up again in the middle of a video; the check of which video formats the graphics can show follows the layout of each picture.
-- **NVIDIA driver 620.70.06** in place of 615; HDR of more than 8 bits on the GeForce GTX 900 and GTX 10 cards flipped on the graphics chip; the kernel log of what the EDID holds.
-- **Keeping an NVIDIA card at full speed while HD audio plays through it** (off by default): for the laptop whose sound cut out on its charger.
-- **Only the display in use lit, with its sound:** the audio output followed by the display it was chosen with instead of its number, the other displays left off, *Keep the display of the audio output on* for a receiver on its own output, and each output matched with its own EDID: checked on the host, not with several displays.
-- **A display connected while Hades runs,** taken without a restart on the same graphics: tried in a virtual machine.
-- **DVD films:** films stored as interlaced video put back together and shown at their own rate, and soft-telecined MPEG-2 films at 23.976 Hz, each picture shown once, from files and from DVD images and folders.
-- **Streaming through a network drop:** the film waits and goes on from where it stopped; a second video asked for while another opens. Tried in a virtual machine with a server that stops.
-- **The library's HDR details from playback,** for a `.strm`, a disc or a stream: tried in a virtual machine with a test add-on, not with a Debrid add-on.
-- **Blu-ray:** the audio or subtitle stream that you choose, a play item that starts between key pictures, the enhancement layer of Dolby Vision after a jump or a seek, the chapter marks, joins and subtitles around a jump, the audio and subtitles that a disc chooses, the menus of an HDR disc drawn as the disc made them, Java menus that animate, VC-1 at its own rate, and a disc image over the network. No disc has been tried with these.
-- **Picture subtitles:** shown with their own frame, the two new settings for their saturation and for subtitles made for SDR or HDR, and the subtitles of profile 5.
-- **3D:** side by side at 1080p for a display that does not list it, the black lines between the eyes of frame packing, and the second view after a picture that empties the decoder. Nobody has tried them on a 3D display.
-- **Menus that cannot lock you out:** *Dolby Vision for the menus* asks you to confirm and goes back by itself after 15 seconds; monitors on the same graphics card as the TV are no longer left on with a black picture where Hades is not sure which output carries the sound.
-- **The boot menu:** a wait of 5 seconds, brought from 10 once by an update, and no second menu after an update. Tried in virtual machines with UEFI and with BIOS, not on a PC.
-- **DMA translation in the normal start** (the IOMMU): tried in virtual machines with the IOMMU of Intel and of AMD; its cost on a graphics card is not measured.
-- **First-run wizard and Settings:** the window that shows the Samba login, and nameservers of your own with DHCP. Not tried on a PC.
-- **HDMI-CEC:** over a DisplayPort connector, on SECO boards (UDOO x86), an amplifier asked only what volume control needs, and the fixes of libCEC; the kernel log of each InfoFrame (Intel) and packet (AMD).
-- **Hardware:** infrared remotes that use the decoders now compiled from source (checked on a virtual receiver), USB disks stopped at power off, the deepest sleep of Ryzen PCs that sleep to idle, the fast side of an external USB hub that may sleep.
-- **The wait for the NVIDIA driver** before Hades starts: seen in a virtual machine without an NVIDIA card (no wait), not with one.
-- **Intel:** the HDMI check after a TV drops its signal for a moment, no longer lost to a commit under way; the fallback for reading the EDID on Panther Lake and Wildcat Lake.
-- **A frame that the driver refuses** no longer leaves a half-drawn picture: tested on the host only.
-- **Linux 7.3.4** and its NTFS fixes, including the one for the long wait when a folder on an NTFS disk is opened and for the film that stopped after two minutes (issue #21). Not tried on that reporter's disk.
-- **The libplacebo update** (the Dolby Vision picture is meant to be byte for byte the same), **Mesa 26.3.0** with the Dolby Vision output on AMD and Intel graphics, and Matroska seeks that start at the earliest key frame.
-- **The diagnostics of a start of the Installer entry:** tried in a virtual machine, not on a PC.
-- **For add-ons:** `Player.Process(video.sidedata)`, the same label as in CoreELEC, tried on the host only.
-- **The Windows installer:** its new look and its steps, tested on a virtual disk (writing, updating and a partition that another program holds), not yet on a real disk with this version.
+- **Check this setup**, the test pictures and sounds.
+- **Streaming through a network drop:** the film waits and goes on from where it stopped.
+- **Dolby Vision, HDR10 and 3D through a passive DisplayPort adaptor** (DP++).
+- **Dolby Vision on the newest Ryzen processors** (DCN 4.2 and 4.2B).
+- **Version 1.0 on AMD and Intel graphics,** integrated graphics included, and HDR in 4:2:2 at 12 bits over HDMI 2.0 there: so far 1.0 has been tried on an NVIDIA card only.
+- **HDR at 12 bits on NVIDIA GeForce GTX 16, RTX 20 and newer cards** where the card would send RGB at 8 bits (at 10 bits on a GeForce GTX 1060 it was seen working).
+- **With several displays on one graphics card,** the sound that follows the display in use, and *Keep the display of the audio output on* for a receiver on its own output.
+- **DVD films shown at their own rate, and the Blu-ray changes of 1.0:** no disc has been tried.
+- **3D:** nobody has tried it on a 3D display.
 
 SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's own code and behave as in LibreELEC, apart from the additions above.
 
