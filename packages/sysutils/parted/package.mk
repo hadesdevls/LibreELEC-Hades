@@ -5,6 +5,9 @@
 PKG_NAME="parted"
 PKG_VERSION="3.8"
 PKG_SHA256="a2b7811f47b0ddb1f7b1d0aa456f7c1270da70708ce231c2fe054c7199eafa63"
+PKG_MAKE_OPTS_HOST="-j1"
+PKG_MAKE_OPTS_TARGET="-j1"
+
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="http://www.gnu.org/software/parted/"
 PKG_URL="https://ftpmirror.gnu.org/parted/${PKG_NAME}-${PKG_VERSION}.tar.xz"
