@@ -3,7 +3,7 @@
 
 PKG_NAME="newt"
 PKG_VERSION="0.52.25"
-PKG_SHA256="ef0ca9ee27850d1a5c863bb7ff9aa08096c9ed312ece9087b30f3a426828de82"
+PKG_SHA256="a9b272a4fc446e3725b6efe75863731fc06e47a5ce9d4a3546f37392cd91e584"
 PKG_LICENSE="LGPL-2.0-only"
 PKG_SITE="https://pagure.io/newt"
 PKG_URL="https://releases.pagure.org/newt/${PKG_NAME}-${PKG_VERSION}.tar.gz"
