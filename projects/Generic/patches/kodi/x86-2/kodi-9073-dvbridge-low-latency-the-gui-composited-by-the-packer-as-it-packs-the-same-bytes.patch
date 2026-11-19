@@ -1,0 +1,843 @@
+From 3bfd5b07ac356a70dda10d96333e90c06750608b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:57:38 +0000
+Subject: [PATCH] [DVBridge] Low-Latency: the GUI composited by the packer as
+ it packs, the same bytes
+
+In Dolby Vision Low-Latency the bridge maps the picture to the display into a 3840x2160
+RGBA32F texture, CompositeGui() blends Kodi's GUI into that texture, and the packer of the
+converted transport reads it back. A frame with a GUI therefore read and wrote 32 bytes a pixel
+under the GUI in a 128-bit float target, with blending, and a picture that does not fill the
+raster had the whole texture (132 MB) cleared again on the next frame, because the GUI had been
+drawn over its bars. CroqueMr's CB1 (#197) folds the GUI into its Low-Latency reconstruction
+instead, blending in display-linear light, which changes the picture under a translucent GUI.
+Hades already composites the GUI exactly in the packer of the source transport (dvguiinplace,
+PACK_GUI); this does the same for Low-Latency.
+
+The packer of the converted transport gets a second program: the same shader with
+DVBRIDGE_PACK_GUI, which samples the GUI texture where the composite samples it and does the
+composite's arithmetic (KODI_GUI_EXACT, PQ in full range, the GUI's tone curve and white, the
+coverage squared, then colour a + picture (1 - a)) before it packs. With Low-Latency a frame
+asks for it wherever the composite converts exactly and the packer has the program, in every
+frame (Low-Latency sends no metadata: there is no level 5 block to measure). The caller then
+skips CompositeGui(); PQ subtitles and captures give the composite back
+(dvbridge_render_complete()). A pack that fails is not shown and the packer never packs so
+again. kodi.log says once that it is used, that it is not made on a GPU, or that it failed.
+
+The program is made only where fragment shaders have quad operations: there each pixel
+composites the GUI once and the odd pixel of a pair takes its even pixel's colour from the
+quad, and every shortcut (no GUI, a black or an opaque texel) is taken only where the whole
+quad takes it, as composited_quad() of the source transport does. With each pixel taking its
+own way, a helper invocation left the picture out of the value it swapped: 13 odd pixels came
+out up to 59 codes off on the software bridge. Without quad operations the odd pixel would
+composite its even pixel's GUI again; that form gives the same bytes, but it measured slower
+than the composite where the GUI stays still (24.1 against 17.5 ms with a seek bar over a tenth
+of the raster, 28.5 against 23.0 ms with the player information over 40 %), so it is not made.
+Every GPU in the logs of Hades' users packs with quad operations.
+
+Measured on the software bridge (zink on lavapipe, picture 51 of the profile 7 FEL test stream,
+Kodi's own composite shaders, 21 repetitions, median GPU time of the composite and the packing):
+a GUI over 10 % of the raster 33.2 ms over the whole quad and 15.5 ms in its tiles, now 18.4; over
+40 %, 32.9 and 21.4, now 20.2; over all of it, 33.1, now 22.7; the 6.9 ms clear of a picture
+that does not fill the raster is gone. The transports against the composite and the packing,
+byte for byte: 0 pixels differ with any of the three GUIs, and a frame without a GUI is packed
+as before; mutations of the coverage, of the GUI's row and of the quad form are caught. The
+software bridge does not show what a GPU saves most: the read and the blended write of 32 bytes
+a pixel under the GUI.
+
+<video><dvguiinplace>false</dvguiinplace></video> in advancedsettings.xml turns it off, as it
+does for the source transport.
+---
+ tools/dvbridge/dvbridge_gl_pack.c             | 137 +++++++++++++---
+ tools/dvbridge/dvbridge_gl_pack.h             |  22 +++
+ tools/dvbridge/dvbridge_render.c              |  61 ++++++-
+ tools/dvbridge/dvbridge_render.h              |  12 +-
+ tools/dvbridge/pack_gles300.frag              | 153 +++++++++++++++++-
+ .../VideoRenderers/DVBridgeGLES.cpp           |  19 +++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   2 +
+ xbmc/settings/AdvancedSettings.h              |   3 +-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  28 +++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |   2 +
+ 10 files changed, 403 insertions(+), 36 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index a3e17d4..365075b 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -22,10 +22,22 @@ void dvbridge_gl_drain_errors(void)
+         ;
+ }
+ 
++/* Hades: a program of the packer and the locations of its uniforms (gui, gui_peak, gui_gamma: the
++ * program with Kodi's GUI composited, DVBRIDGE_PACK_GUI; -1 in the other one) */
++struct pack_program {
++    GLuint program;
++    GLint input, words, count, flip, gui, peak, gamma;
++};
++
+ struct dvbridge_gl_packer {
+-    GLuint program, vao, sampler;
+-    GLint input, words, count, flip;
++    struct pack_program main;
++    GLuint vao, sampler;
+     bool quad;
++    /* Hades: the program that composites Kodi's GUI as it packs
++     * (dvbridge_gl_pack_no_metadata_gui()); gui_failed: a pack with it failed on this GPU (never
++     * used again) */
++    struct pack_program gui;
++    bool gui_failed;
+ };
+ 
+ /* first: lines in place of the first line of the source, its #version. quiet: a shader that does
+@@ -103,17 +115,27 @@ bool dvbridge_gl_fragment_quad(void)
+ }
+ 
+ /* quad: both stages as ESSL 3.10 (the version that the subgroup extensions need in Mesa; shaders
+- * of two ES versions do not link), and the fragment shader with DVBRIDGE_PACK_QUAD */
+-static bool build_program(struct dvbridge_gl_packer *p, const char *vertex, const char *fragment,
+-                          bool quad)
++ * of two ES versions do not link), and the fragment shader with DVBRIDGE_PACK_QUAD. Hades: gui:
++ * the fragment shader with DVBRIDGE_PACK_GUI as well (Kodi's GUI composited as it packs), and its
++ * uniforms. Quiet where it has a fallback (the form with quad operations, or the GUI's program). */
++static bool build_program(struct pack_program *p, const char *vertex, const char *fragment,
++                          bool quad, bool gui)
+ {
+     static const char version[] = "#version 310 es\n";
+     static const char prelude[] = "#version 310 es\n"
+                                   "#extension GL_KHR_shader_subgroup_basic : require\n"
+                                   "#extension GL_KHR_shader_subgroup_quad : require\n"
+                                   "#define DVBRIDGE_PACK_QUAD 1\n";
+-    GLuint vs = compile(GL_VERTEX_SHADER, vertex, quad ? version : NULL, quad);
+-    GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, quad ? prelude : NULL, quad);
++    static const char gui_version[] = "#version 300 es\n"
++                                      "#define DVBRIDGE_PACK_GUI 1\n";
++    static const char gui_prelude[] = "#version 310 es\n"
++                                      "#extension GL_KHR_shader_subgroup_basic : require\n"
++                                      "#extension GL_KHR_shader_subgroup_quad : require\n"
++                                      "#define DVBRIDGE_PACK_QUAD 1\n"
++                                      "#define DVBRIDGE_PACK_GUI 1\n";
++    const char *first = gui ? (quad ? gui_prelude : gui_version) : (quad ? prelude : NULL);
++    GLuint vs = compile(GL_VERTEX_SHADER, vertex, quad ? version : NULL, quad || gui);
++    GLuint fs = compile(GL_FRAGMENT_SHADER, fragment, first, quad || gui);
+     if (!vs || !fs) {
+         glDeleteShader(vs);
+         glDeleteShader(fs);
+@@ -131,7 +153,11 @@ static bool build_program(struct dvbridge_gl_packer *p, const char *vertex, cons
+     p->words = glGetUniformLocation(p->program, "metadata_words");
+     p->count = glGetUniformLocation(p->program, "packet_count");
+     p->flip = glGetUniformLocation(p->program, "flip_y");
+-    if (!linked || p->input < 0 || p->words < 0 || p->count < 0 || p->flip < 0) {
++    p->gui = gui ? glGetUniformLocation(p->program, "gui") : -1;
++    p->peak = gui ? glGetUniformLocation(p->program, "gui_peak") : -1;
++    p->gamma = gui ? glGetUniformLocation(p->program, "gui_gamma") : -1;
++    if (!linked || p->input < 0 || p->words < 0 || p->count < 0 || p->flip < 0 ||
++        (gui && (p->gui < 0 || p->peak < 0 || p->gamma < 0))) {
+         glDeleteProgram(p->program);
+         p->program = 0;
+         return false;
+@@ -139,8 +165,9 @@ static bool build_program(struct dvbridge_gl_packer *p, const char *vertex, cons
+     return true;
+ }
+ 
++/* Hades: gui: the program that composites Kodi's GUI as well */
+ static struct dvbridge_gl_packer *create_packer(const char *vertex, const char *fragment,
+-                                                bool allow_quad)
++                                                bool allow_quad, bool gui)
+ {
+     struct dvbridge_gl_packer *p = calloc(1, sizeof(*p));
+     if (!p)
+@@ -149,23 +176,38 @@ static struct dvbridge_gl_packer *create_packer(const char *vertex, const char *
+      * where it can (DVBRIDGE_PACK_QUAD), and fetches it otherwise: the same bytes. Where that
+      * does not compile or link, the shaders are made as they are written. Either program, and
+      * the vertex array and sampler it draws with (make_objects()), or no packer. */
+-    p->quad = allow_quad && dvbridge_gl_fragment_quad() && build_program(p, vertex, fragment, true);
+-    if ((!p->quad && !build_program(p, vertex, fragment, false)) ||
++    p->quad = allow_quad && dvbridge_gl_fragment_quad() &&
++              build_program(&p->main, vertex, fragment, true, false);
++    if ((!p->quad && !build_program(&p->main, vertex, fragment, false, false)) ||
+         !make_objects(&p->vao, &p->sampler)) {
+         dvbridge_gl_packer_destroy(p);
+         return NULL;
+     }
++    /* Hades: and the program that composites Kodi's GUI as it packs, only in the form with quad
++     * operations: there each pixel composites the GUI once and the odd pixel of a pair takes its
++     * even pixel's colour from the quad. Without them the odd pixel composites its even pixel's GUI
++     * again, and on the software bridge that form measured slower than the composite and the
++     * packing where a GUI stays still (a seek bar over a tenth of the raster: 24.1 against 17.5 ms;
++     * the player information over 40 %: 28.5 against 23.0 ms), the same bytes; every GPU in the
++     * logs of Hades' users packs with them. Where it is not made, the GUI is composited over the
++     * picture first, as before (dvbridge_gl_packer_gui()). Its errors are not left for
++     * libplacebo. */
++    if (gui && p->quad && !build_program(&p->gui, vertex, fragment, true, true))
++        p->gui.program = 0;
++    dvbridge_gl_drain_errors();
+     return p;
+ }
+ 
+ struct dvbridge_gl_packer *dvbridge_gl_packer_create(const char *vertex, const char *fragment)
+ {
+-    return create_packer(vertex, fragment, true);
++    return create_packer(vertex, fragment, true, true);
+ }
+ 
+ struct dvbridge_gl_packer *dvbridge_gl_packer_create_plain(const char *vertex, const char *fragment)
+ {
+-    return create_packer(vertex, fragment, false);
++    /* (never with quad operations, so never the program that composites the GUI either: the
++     * packer of a check of the bytes never packs a frame with a GUI) */
++    return create_packer(vertex, fragment, false, false);
+ }
+ 
+ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *p)
+@@ -174,7 +216,8 @@ void dvbridge_gl_packer_destroy(struct dvbridge_gl_packer *p)
+         return;
+     glDeleteVertexArrays(1, &p->vao);
+     glDeleteSamplers(1, &p->sampler);
+-    glDeleteProgram(p->program);
++    glDeleteProgram(p->main.program);
++    glDeleteProgram(p->gui.program);
+     free(p);
+ }
+ 
+@@ -183,6 +226,11 @@ bool dvbridge_gl_packer_quad(const struct dvbridge_gl_packer *p)
+     return p && p->quad;
+ }
+ 
++bool dvbridge_gl_packer_gui(const struct dvbridge_gl_packer *p)
++{
++    return p && p->gui.program && !p->gui_failed;
++}
++
+ struct dvbridge_gl_copier {
+     GLuint program, vao, sampler;
+     GLint picture, flip_height, levels, limited;
+@@ -475,7 +523,8 @@ restore:
+ }
+ 
+ static bool pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned framebuffer, int width,
+-                 int height, const uint32_t packets[512], unsigned count, bool flip);
++                 int height, const uint32_t packets[512], unsigned count, bool flip,
++                 const struct pack_program *program, unsigned gui, float peak, float gamma);
+ 
+ bool dvbridge_gl_pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned framebuffer,
+                      int width, int height, const uint32_t packets[512], unsigned count, bool flip)
+@@ -483,7 +532,8 @@ bool dvbridge_gl_pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned f
+     /* (16 packets of 32 words: dvbridge_packets()) */
+     if (!p || !texture || !packets || !count || count > 16 || width != 3840 || height != 2160)
+         return false;
+-    return pack(p, texture, framebuffer, width, height, packets, count, flip);
++    return pack(p, texture, framebuffer, width, height, packets, count, flip, &p->main, 0, 0.0f,
++                0.0f);
+ }
+ 
+ bool dvbridge_gl_pack_no_metadata(struct dvbridge_gl_packer *p, unsigned texture,
+@@ -492,11 +542,43 @@ bool dvbridge_gl_pack_no_metadata(struct dvbridge_gl_packer *p, unsigned texture
+     static const uint32_t none[512];
+     if (!p || !texture || width != 3840 || height != 2160)
+         return false;
+-    return pack(p, texture, framebuffer, width, height, none, 0, flip);
++    return pack(p, texture, framebuffer, width, height, none, 0, flip, &p->main, 0, 0.0f, 0.0f);
++}
++
++bool dvbridge_gl_pack_gui_curve(float peak, float gamma)
++{
++    /* (the GUI white within PQ, and a tone curve that Kodi's composite takes:
++     * CGuiCompositeShaderGLES::ValidGamma()) */
++    return isfinite(peak) && peak > 0.0f && peak <= 1.0f &&
++           (gamma == 0.0f || (gamma >= 1.0f && gamma <= 3.0f));
++}
++
++bool dvbridge_gl_pack_no_metadata_gui(struct dvbridge_gl_packer *p, unsigned texture, unsigned gui,
++                                      float peak, float gamma, unsigned framebuffer, int width,
++                                      int height, bool flip)
++{
++    static const uint32_t none[512];
++    if (!dvbridge_gl_packer_gui(p) || !texture || !gui || width != 3840 || height != 2160 ||
++        !dvbridge_gl_pack_gui_curve(peak, gamma))
++        return false;
++    const bool ok = pack(p, texture, framebuffer, width, height, none, 0, flip, &p->gui, gui, peak,
++                         gamma);
++    /* (a GPU that cannot draw it once is not asked again: the GUI is composited over the picture
++     * first, as before, from the next frame on) */
++    if (!ok) {
++        p->gui_failed = true;
++        fprintf(stderr, "DV transport: the packing that composites the GUI failed; the GUI is "
++                        "composited over the picture from the next frame on\n");
++    }
++    return ok;
+ }
+ 
++/* Hades: program: the main one, or the one that composites Kodi's GUI from its texture gui (unit
++ * 1, with the texture's own filter, as Kodi's composite samples it: no sampler object), its white
++ * peak and its tone curve gamma */
+ static bool pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned framebuffer, int width,
+-                 int height, const uint32_t packets[512], unsigned count, bool flip)
++                 int height, const uint32_t packets[512], unsigned count, bool flip,
++                 const struct pack_program *program, unsigned gui, float peak, float gamma)
+ {
+     /* Errors left by earlier, unrelated GL work are not ours: clear them (bounded), so that the
+      * checks below see only what the pack raised. */
+@@ -525,17 +607,26 @@ static bool pack(struct dvbridge_gl_packer *p, unsigned texture, unsigned frameb
+         goto restore;
+     glViewport(0, 0, width, height);
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-    glUseProgram(p->program);
++    glUseProgram(program->program);
+     glBindVertexArray(p->vao);
+     // libplacebo-owned textures use sampler objects and need not have usable
+     // default texture filtering (e.g. mipmaps may be absent). Own our exact
+     // non-mipmapped sampler without mutating the borrowed texture's state.
+     glBindSampler(0, p->sampler);
+     glBindTexture(GL_TEXTURE_2D, texture);
+-    glUniform1i(p->input, 0);
+-    glUniform4uiv(p->words, 128, packets);
+-    glUniform1ui(p->count, count);
+-    glUniform1ui(p->flip, flip);
++    glUniform1i(program->input, 0);
++    glUniform4uiv(program->words, 128, packets);
++    glUniform1ui(program->count, count);
++    glUniform1ui(program->flip, flip);
++    if (program->gui >= 0) {
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, gui);
++        glBindSampler(1, 0);
++        glUniform1i(program->gui, 1);
++        glUniform1f(program->peak, peak);
++        glUniform1f(program->gamma, gamma);
++        glActiveTexture(GL_TEXTURE0);
++    }
+     glDrawArrays(GL_TRIANGLES, 0, 3);
+     ok = glGetError() == GL_NO_ERROR;
+ restore:
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index 492d5d5..81a9833 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -41,6 +41,28 @@ bool dvbridge_gl_pack(struct dvbridge_gl_packer *packer, unsigned pq_texture,
+ #define DVBRIDGE_GL_PACK_NO_METADATA 1
+ bool dvbridge_gl_pack_no_metadata(struct dvbridge_gl_packer *packer, unsigned pq_texture,
+                                   unsigned framebuffer, int width, int height, bool flip_y);
++/* Hades: the same, with Kodi's GUI composited over the picture as it is packed, instead of into the
++ * picture first (CWinSystemGbmGLESContext::CompositeGui()): the GUI texture gui (Kodi's GUI FBO, of
++ * the raster's size, its last row the top of the screen) sampled where the composite samples it,
++ * with the arithmetic of the composite where fragment shaders have highp (gles_gui_composite.frag,
++ * KODI_GUI_EXACT, PQ in full range) and the blend of its factors: peak, the GUI white in units of
++ * 10000 cd/m2 (its u_pqPeak); gamma, its tone curve (its u_guiGamma: a pure power of 1 to 3, or 0
++ * for the sRGB EOTF). Where the GUI covers nothing, the bytes of dvbridge_gl_pack_no_metadata();
++ * under it, those of the composite and then that packing (measured on the software bridge; a GPU
++ * may round its blend unit apart from the shader by a code here and there). The 3840x2160
++ * picture of 32-bit floats is then neither read and written by the composite nor cleared again
++ * where the GUI drew over its bars. false where the packer has no such program
++ * (dvbridge_gl_packer_gui(): made only in the form with quad operations,
++ * dvbridge_gl_packer_quad(); never by dvbridge_gl_packer_create_plain()), for a peak or a curve
++ * outside those, or where the pack failed: then the packer never packs so again, and the caller
++ * composites the GUI first, as before.
++ * dvbridge_gl_pack_gui_curve(): whether a peak and a curve are ones this packing takes. */
++#define DVBRIDGE_GL_PACK_NO_METADATA_GUI 1
++bool dvbridge_gl_pack_no_metadata_gui(struct dvbridge_gl_packer *packer, unsigned pq_texture,
++                                      unsigned gui, float peak, float gamma, unsigned framebuffer,
++                                      int width, int height, bool flip_y);
++bool dvbridge_gl_packer_gui(const struct dvbridge_gl_packer *packer);
++bool dvbridge_gl_pack_gui_curve(float peak, float gamma);
+ /* Hades: copies a picture from a float texture (first row at the top) into a framebuffer of the
+  * same size, sample for sample, for output as HDR10. A fixed-point framebuffer gets the nearest
+  * of its levels of every value: the shader picks the level, since a framebuffer may also cut a
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index b424a0b..1030b5d 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -50,12 +50,14 @@ enum {
+ 
+ /* Hades: the bridge's own passes that are timed (dvbridge_render_time_passes()), each with a few
+  * queries in flight, read when they have come back (as libplacebo does with its own) */
+-enum { TIMER_ROWS, TIMER_PICTURE, TIMER_PACK_SOURCE, TIMER_PACK_CONVERTED, PASS_TIMERS };
++enum { TIMER_ROWS, TIMER_PICTURE, TIMER_PACK_SOURCE, TIMER_PACK_CONVERTED, TIMER_PACK_LL_GUI,
++       PASS_TIMERS };
+ static const char *const TIMER_NAMES[PASS_TIMERS] = {
+     "bridge: 4:2:2 rows (source transport)",
+     "bridge: picture drawn over (source transport)",
+     "bridge: packing (source transport)",
+-    "bridge: packing (converted transport)"};
++    "bridge: packing (converted transport)",
++    "bridge: packing with GUI (Low-Latency)"};
+ #define TIMER_QUERIES 8
+ #ifndef GL_TIME_ELAPSED_EXT
+ #define GL_TIME_ELAPSED_EXT 0x88BF
+@@ -201,6 +203,11 @@ struct dvbridge_renderer {
+     /* Hades: the GUI white for the GUI read in place by the packer, for the next frame
+      * (dvbridge_render_set_gui_in_place()); 0: not asked. Hades: and its tone curve */
+     float inplace_peak, inplace_gamma;
++    /* Hades: Low-Latency: the picture prepared last takes Kodi's GUI composited by the packer of
++     * the converted transport as it packs (dvbridge_gl_pack_no_metadata_gui()), from this GUI
++     * texture, with this white and tone curve; 0: the caller composites the GUI over the picture */
++    unsigned ll_gui;
++    float ll_gui_peak, ll_gui_gamma;
+     /* Hades: Dolby Vision Low-Latency (dvbridge_render_set_low_latency()): the picture mapped to
+      * ll_mapping, packed without metadata; ll_pattern, the test pattern in its place */
+     bool low_latency, ll_pattern;
+@@ -757,6 +764,7 @@ void dvbridge_renderer_recover(struct dvbridge_renderer *r)
+     r->packed = false;
+     r->hdr10_ready = false;
+     r->tunnel_frame = false;
++    r->ll_gui = 0;
+     if (r->renderer)
+         pl_renderer_reset_errors(r->renderer, NULL);
+ }
+@@ -1595,6 +1603,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     r->residual_drawn = false;
+     r->packed = packed != NULL;
+     r->gui_drawn = 0;
++    r->ll_gui = 0; /* (Hades: set by dvbridge_render_rgb() for the picture it draws) */
+     r->ll_curve_drawn = r->ll_curve_held = false; /* (Hades: dvbridge_render_hdr10plus_curve()) */
+     dvbridge_candidate_destroy(r->pending);
+     r->pending = NULL;
+@@ -1918,6 +1927,20 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     if (r && ok && r->ll_curve_held)
+         note(r, NOTE_HDR10PLUS_LL_FAILED);
+     restore_gl_state(&state);
++    /* Hades: Low-Latency: Kodi's GUI composited by the packer as it packs, where it is asked for
++     * this frame (dvbridge_render_set_gui_in_place(): the caller asks only where its packer can,
++     * and where its composite converts exactly) and its white and tone curve are ones that packing
++     * takes. The picture is drawn whole whatever is drawn over it (Low-Latency has no tiles), so
++     * nothing of it changes; the caller then does not composite the GUI
++     * (dvbridge_render_gui_in_place()). */
++    if (r) {
++        r->ll_gui = ok && r->low_latency && !r->source && r->drawn_gui &&
++                            dvbridge_gl_pack_gui_curve(r->inplace_peak, r->inplace_gamma)
++                        ? r->drawn_gui
++                        : 0;
++        r->ll_gui_peak = r->inplace_peak;
++        r->ll_gui_gamma = r->inplace_gamma;
++    }
+     /* Hades: what was to be drawn over this frame (dvbridge_render_set_drawn()) is this frame's */
+     if (r) {
+         r->drawn_gui = 0;
+@@ -1938,6 +1961,7 @@ bool dvbridge_render_packed(struct dvbridge_renderer *r, const struct pl_frame *
+          * this one was refused is told again) */
+         r->drawn_gui = 0;
+         r->inplace_peak = 0.0f;
++        r->ll_gui = 0;
+     }
+     /* (Hades: the converted transport's direct way also needs quad operations and a picture that
+      * fills the raster, which render() checks: the source transport packs a picture drawn at its own
+@@ -3832,6 +3856,11 @@ void dvbridge_render_set_gui_in_place(struct dvbridge_renderer *r, float peak, f
+ 
+ bool dvbridge_render_gui_in_place(const struct dvbridge_renderer *r)
+ {
++    /* Hades: (Low-Latency: composited by the packer of the converted transport,
++     * dvbridge_render_rgb()) */
++    if (r && r->ready && r->low_latency && !r->packed && !r->source && !r->tunnel_frame &&
++        r->ll_gui)
++        return true;
+     return r && r->ready && r->source && dvbridge_source_gui_in_placed(r->source_packer);
+ }
+ 
+@@ -3885,6 +3914,13 @@ bool dvbridge_render_gui_cache_read(struct dvbridge_renderer *r, unsigned counts
+ 
+ bool dvbridge_render_complete(struct dvbridge_renderer *r)
+ {
++    /* Hades: Low-Latency, whose picture is always whole: a GUI that the packer was to composite is
++     * composited over the picture by the caller instead, after what is drawn into it now (PQ
++     * subtitles, which the GUI covers), as before (dvbridge_render_gui_in_place() then says so) */
++    if (r && r->low_latency && r->ll_gui) {
++        r->ll_gui = 0;
++        return true;
++    }
+     /* only the composed way of the source transport makes its picture in tiles */
+     if (!r || !r->ready || r->packed || !r->source || !r->source_packer)
+         return true;
+@@ -3993,9 +4029,23 @@ bool dvbridge_render_pack(struct dvbridge_renderer *r, struct dvbridge_gl_packer
+     const unsigned rgb = pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, NULL);
+     if (!rgb)
+         return false;
+-    /* Hades: Low-Latency sends no metadata: the picture alone, in the converted transport's layout */
+-    if (r->low_latency)
+-        return !r->source && dvbridge_gl_pack_no_metadata(packer, rgb, framebuffer, width, height, flip);
++    /* Hades: Low-Latency sends no metadata: the picture alone, in the converted transport's layout;
++     * with Kodi's GUI composited as it is packed where the frame takes it
++     * (dvbridge_render_rgb()) */
++    if (r->low_latency) {
++        if (r->source)
++            return false;
++        const int timer = r->ll_gui ? TIMER_PACK_LL_GUI : TIMER_PACK_CONVERTED;
++        timer_begin(r, timer);
++        const bool packed =
++            r->ll_gui
++                ? dvbridge_gl_pack_no_metadata_gui(packer, rgb, r->ll_gui, r->ll_gui_peak,
++                                                   r->ll_gui_gamma, framebuffer, width, height,
++                                                   flip)
++                : dvbridge_gl_pack_no_metadata(packer, rgb, framebuffer, width, height, flip);
++        timer_end(r, timer);
++        return packed;
++    }
+     /* Hades: the active area that the display is sent, taken out to what is drawn over the bars:
+      * measured, or every edge that has bars (dvbridge_candidate_cover()) */
+     if (cover != DVBRIDGE_COVER_NONE) {
+@@ -4029,6 +4079,7 @@ bool dvbridge_render_graphics(struct dvbridge_renderer *r, const void *metadata,
+         return false;
+     /* as render() begins: nothing of the frame before is left */
+     r->ready = false;
++    r->ll_gui = 0;
+     r->tunnel_frame = false;
+     r->refused = NULL;
+     r->not_drawn = NULL;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 8e18313..76660a4 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -717,8 +717,15 @@ void dvbridge_render_set_drawn(struct dvbridge_renderer *renderer, unsigned gui,
+  * picture whole and gives the composite back: false after that); its level 5 block is then made with
+  * every edge that has bars (DVBRIDGE_COVER_MEASURE cannot measure it). can: the packer has the program,
+  * and no frame packed so failed. Hades: gamma, the tone curve of that composite (the exponent of a pure
+- * power, or 0 for the sRGB EOTF of IEC 61966-2-1); another value is not composited in place. */
++ * power, or 0 for the sRGB EOTF of IEC 61966-2-1); another value is not composited in place.
++ * Hades: with Low-Latency the same call asks dvbridge_render_pack() to composite the GUI as it
++ * packs the converted transport (dvbridge_gl_pack_no_metadata_gui(): the caller asks only where
++ * the packer it gives that call has the program, dvbridge_gl_packer_gui()); the picture is drawn
++ * whole as always, and dvbridge_render_gui_in_place() says so for that frame.
++ * dvbridge_render_complete() gives the composite back to the caller. A pack so that fails is not
++ * packed (the packer never packs so again). */
+ #define DVBRIDGE_RENDER_GUI_IN_PLACE 1
++#define DVBRIDGE_RENDER_GUI_IN_PLACE_LL 1
+ void dvbridge_render_set_gui_in_place(struct dvbridge_renderer *renderer, float peak, float gamma);
+ bool dvbridge_render_gui_in_place(const struct dvbridge_renderer *renderer);
+ bool dvbridge_render_can_gui_in_place(const struct dvbridge_renderer *renderer);
+@@ -748,7 +755,8 @@ bool dvbridge_render_gui_cache_tiles(struct dvbridge_renderer *renderer, unsigne
+  * cache [1], read back (waits for the GPU) */
+ bool dvbridge_render_gui_cache_read(struct dvbridge_renderer *renderer, unsigned counts[2]);
+ /* Hades: the picture of the last dvbridge_render_rgb() whole, if it was made in tiles; false where
+- * that could not be done (the picture is then whole only in those tiles) */
++ * that could not be done (the picture is then whole only in those tiles). Hades: and a GUI that the
++ * packer was to composite (dvbridge_render_set_gui_in_place()) is left to the caller again. */
+ bool dvbridge_render_complete(struct dvbridge_renderer *renderer);
+ /* Whether dvbridge_render_packed() may draw a picture of this geometry: full raster, or, with the
+  * source transport, a picture drawn at its own size anywhere (Hades: or one that it scales,
+diff --git a/tools/dvbridge/pack_gles300.frag b/tools/dvbridge/pack_gles300.frag
+index 700e909..d54a7d9 100644
+--- a/tools/dvbridge/pack_gles300.frag
++++ b/tools/dvbridge/pack_gles300.frag
+@@ -15,6 +15,13 @@
+ // Where the GPU has quad operations, the first line of this file is replaced
+ // by version 310 es, the subgroup extensions and a definition of
+ // DVBRIDGE_PACK_QUAD.
++//
++// Hades: for Dolby Vision Low-Latency with Kodi's GUI over the picture
++// (dvbridge_gl_pack_no_metadata_gui()), a definition of DVBRIDGE_PACK_GUI is
++// put after that line as well: the GUI is then composited here, not into the
++// picture first (picture_at()). The packer makes that program only in the
++// form with quad operations (dvbridge_gl_pack.c says why); the text compiles,
++// and gives the same bytes, in both.
+ 
+ precision highp float;
+ precision highp int;
+@@ -50,6 +57,146 @@ uint parity(uint v)
+     return v & 1u;
+ }
+ 
++#ifdef DVBRIDGE_PACK_GUI
++// Hades: the colour of a pixel of the picture with Kodi's GUI over it, as
++// Kodi's CompositeGui() leaves it in pq_input: its composite where fragment
++// shaders have highp (gles_gui_composite.frag, KODI_GUI_EXACT: the GUI's tone
++// curve, gui_gamma, the composite's u_guiGamma: a pure power, or 0 for the
++// sRGB EOTF of IEC 61966-2-1; BT.709 to BT.2020 in linear light; the PQ signal
++// of the GUI white, gui_peak, its u_pqPeak; the coverage squared) and then the
++// blend of its factors (colour a + picture (1 - a)), from the GUI texture
++// sampled where the composite samples it: the pixel centre of the raster, its
++// last row on the first row of the raster, with the texture's own filter.
++// Where the sample's alpha is 0, which the composite discards, the picture as
++// it is: the same bytes wherever the GUI covers nothing. The same expressions
++// as GUI_COMPOSITE of dvbridge_source.c (the packer of the source transport,
++// which does this for frames in the source transport).
++uniform highp sampler2D gui;
++uniform float gui_peak;
++uniform float gui_gamma;
++
++const mat3 bt709_to_bt2020 = mat3(0.627403896, 0.069097289, 0.016391439,
++                                  0.329283038, 0.919540395, 0.088013308,
++                                  0.043313066, 0.011362316, 0.895595253);
++// SMPTE ST 2084
++const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
++const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
++
++vec3 srgb_to_linear(vec3 c)
++{
++    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
++}
++
++vec3 gui_to_linear(vec3 c)
++{
++    return gui_gamma > 0.0 ? pow(c, vec3(gui_gamma)) : srgb_to_linear(c);
++}
++
++vec3 gui_pq(vec3 l)
++{
++    vec3 t = pow(max(l, vec3(0.0)), vec3(m1));
++    return pow((c1 + c2 * t) / (1.0 + c3 * t), vec3(m2));
++}
++
++// (level 0, without implicit derivatives: this runs in control flow that is
++// not uniform within a quad; the GUI texture has no mipmaps, and the composite
++// samples level 0 with the same filter)
++vec4 gui_at(ivec2 p)
++{
++    return textureLod(gui, vec2((float(p.x) + 0.5) / 3840.0,
++                                1.0 - (float(p.y) + 0.5) / 2160.0), 0.0);
++}
++
++// the pixel by itself
++vec3 picture_alone(ivec2 p)
++{
++    vec4 g = gui_at(p);
++    if (g.a == 0.0)
++        return texelFetch(pq_input, p, 0).rgb;
++    // (a black texel is light 0, which the tone curve, the matrix and the GUI
++    // white leave exactly +0: its PQ signal made once, from the texel's red)
++    vec3 colour = all(equal(g.rgb, vec3(0.0)))
++        ? vec3(gui_pq(vec3(g.r)).x)
++        : gui_pq((bt709_to_bt2020 * gui_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);
++    float a = g.a * g.a;
++    // (opaque, a = 1: the picture under it times 1 - a = 0 is nothing; not read)
++    if (a == 1.0)
++        return colour;
++    return colour * a + texelFetch(pq_input, p, 0).rgb * (1.0 - a);
++}
++
++#ifdef DVBRIDGE_PACK_QUAD
++// What the four invocations of a quad say together, from the quad operations
++// (as QUAD_HELPERS of dvbridge_source.c): each swaps with its horizontal and
++// its vertical neighbour, outside any branch of its own.
++bool quad_any(bool b)
++{
++    uint v = b ? 1u : 0u;
++    v |= subgroupQuadSwapHorizontal(v);
++    v |= subgroupQuadSwapVertical(v);
++    return v != 0u;
++}
++
++bool quad_all(bool b)
++{
++    uint v = b ? 1u : 0u;
++    v &= subgroupQuadSwapHorizontal(v);
++    v &= subgroupQuadSwapVertical(v);
++    return v != 0u;
++}
++
++// With quad operations the odd pixel of a pair takes the colour of its even
++// pixel from the invocation next to it, which may be a helper invocation (a
++// quad on an edge of the triangles that a GPU draws the raster with): no
++// invocation of a quad takes another way than the others before that swap,
++// and what may be skipped (no GUI over it, a black or an opaque GUI texel) is
++// skipped only where the whole quad can skip it (as composited_quad() of
++// dvbridge_source.c): the same values as picture_alone(). Each pixel taking
++// its own way, a helper invocation left the picture out of its value on the
++// software bridge: 13 odd pixels of 3840x2160 then had the chroma of the GUI
++// alone, up to 59 codes off.
++vec3 picture_at(ivec2 p)
++{
++    vec4 g = gui_at(p);
++    vec3 r;
++    if (quad_any(g.a != 0.0)) {
++        bool black = quad_all(all(equal(g.rgb, vec3(0.0))));
++        vec3 colour;
++        if (black)
++            colour = vec3(gui_pq(vec3(g.r)).x);
++        else
++            colour = gui_pq((bt709_to_bt2020 * gui_to_linear(clamp(g.rgb, 0.0, 1.0))) * gui_peak);
++        float a = g.a * g.a;
++        if (quad_all(a == 1.0)) {
++            r = colour;
++        } else {
++            vec3 under = texelFetch(pq_input, p, 0).rgb;
++            vec3 mixed = colour * a + under * (1.0 - a);
++            r = g.a == 0.0 ? under : mixed;
++        }
++    } else {
++        r = texelFetch(pq_input, p, 0).rgb;
++    }
++    return r;
++}
++#else
++vec3 picture_at(ivec2 p)
++{
++    return picture_alone(p);
++}
++#endif
++#else
++vec3 picture_alone(ivec2 p)
++{
++    return texelFetch(pq_input, p, 0).rgb;
++}
++
++vec3 picture_at(ivec2 p)
++{
++    return picture_alone(p);
++}
++#endif
++
+ void main()
+ {
+     // The raster position of this fragment: the framebuffer position, its
+@@ -60,7 +207,7 @@ void main()
+         p.y = 2159 - p.y;
+ 
+     // Step 1: the colour of the pixel, clamped to [0, 1].
+-    vec3 rgb = clamp(texelFetch(pq_input, p, 0).rgb, 0.0, 1.0);
++    vec3 rgb = clamp(picture_at(p), 0.0, 1.0);
+ 
+     // The luma of each pixel is its own and the chroma of a pair is that of
+     // its even pixel, because 4:2:2 over HDMI is co-sited: a receiver puts
+@@ -88,11 +235,11 @@ void main()
+         if (got.w == float(p.y * 4096 + pe.x))
+             e = got.rgb;
+         else
+-            e = clamp(texelFetch(pq_input, pe, 0).rgb, 0.0, 1.0);
++            e = clamp(picture_alone(pe), 0.0, 1.0);
+     }
+ #else
+     if (odd)
+-        e = clamp(texelFetch(pq_input, pe, 0).rgb, 0.0, 1.0);
++        e = clamp(picture_alone(pe), 0.0, 1.0);
+ #endif
+ 
+     // Step 2: the luma of the pixel (BT.2020 non-constant luminance).
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index c7e233b..d38d2b3 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -697,6 +697,13 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+               dvbridge_gl_packer_quad(m_packer)
+                   ? "one fetch a pixel (the even pixel of a pair taken from its quad)"
+                   : "two fetches a pixel (the form with quad operations is not made here)");
++  // Hades: ... and whether it can composite the GUI as it packs, for Low-Latency (SetDrawnOver()):
++  // only in the form with quad operations
++  if (m_packer && !dvbridge_gl_packer_gui(m_packer))
++    CLog::Log(LOGINFO, "DVBridge: Low-Latency: the GUI is composited over the picture first, as "
++                       "before: the packing that composites it as it packs is made only where "
++                       "fragment shaders have quad operations, and was not made on this GPU "
++                       "(video/dvguiinplace)");
+   if (!m_renderer || !m_packer)
+     return Fail("renderer-or-packer-initialization");
+   return m_renderer && m_packer;
+@@ -1309,6 +1316,10 @@ void CDVBridgeGLES::SetDrawnOver(unsigned int guiTexture,
+ {
+   dvbridge_render_set_drawn_key(m_renderer, guiTexture ? composite : 0);
+   dvbridge_render_set_drawn(m_renderer, guiTexture, width, height);
++  // Hades: with Low-Latency the GUI is composited by the packer of the converted transport, only
++  // where it has the program for it (made, and no pack with it failed: dvbridge_gl_packer_gui())
++  if (m_lowLatencyOn && !dvbridge_gl_packer_gui(m_packer))
++    inPlacePeak = 0.0f;
+   dvbridge_render_set_gui_in_place(m_renderer, guiTexture ? inPlacePeak : 0.0f, inPlaceGamma);
+ }
+ 
+@@ -1761,10 +1772,18 @@ bool CDVBridgeGLES::Pack(unsigned int framebuffer, int width, int height, bool f
+   if (m_direct)
+     return m_packed = framebuffer == 0 && width == 3840 && height == 2160 && flipY;
+   // Hades: in the transport of the frame (dvbridge_render_pack())
++  const bool lowLatencyGui = m_lowLatencyOn && dvbridge_render_gui_in_place(m_renderer);
+   m_packed = dvbridge_render_pack(m_renderer, m_packer, framebuffer, width, height, flipY,
+                                   cover == Cover::MEASURE ? DVBRIDGE_COVER_MEASURE
+                                   : cover == Cover::BARS  ? DVBRIDGE_COVER_BARS
+                                                           : DVBRIDGE_COVER_NONE);
++  // Hades: a pack that composites the GUI that failed (Low-Latency): this frame is not shown, and
++  // the packer never packs so again (SetDrawnOver())
++  if (!m_packed && lowLatencyGui && !dvbridge_gl_packer_gui(m_packer) &&
++      !std::exchange(m_lowLatencyGuiFailedSaid, true))
++    CLog::Log(LOGWARNING, "DVBridge: the packing that composites the GUI as it packs (Low-Latency) "
++                          "failed on this GPU: that frame was not shown, and the GUI is composited "
++                          "over the picture first from the next frame on");
+   if (!m_packed)
+     return Fail("transport-packing");
+   // Hades: the check of the GUI cache (dvguicachecheck): what the frames that took it copied, and
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index bfddbb1..fc8a9bf 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -682,6 +682,8 @@ private:
+   //! Hades: the upscaler of PreparePlain() (SetUpscaler()), freed before the GPU it is of
+   dvbridge_upscaler m_upscaler{};
+   dvbridge_gl_packer* m_packer = nullptr;
++  //! Hades: a pack that composites the GUI (Low-Latency) failed on this GPU (said once in the log)
++  bool m_lowLatencyGuiFailedSaid = false;
+   pl_tex m_scanout = nullptr;
+   bool m_direct = false;
+   bool m_directUsable = true;
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index e5941da..c21ca11 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -185,7 +185,8 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! Hades: the GUI over a picture of native Dolby Vision in YCbCr, in a frame presented a frame
+     //! ahead, composited by the packer of the transport from the GUI texture, without the 3840x2160
+     //! picture in 32-bit floats that it was composited into (video/dvguiinplace; the same bytes
+-    //! wherever the GUI covers nothing). Off for a measurement of what that saves
++    //! wherever the GUI covers nothing). Hades: and in every frame of Low-Latency, by the packer of
++    //! the converted transport as it packs. Off for a measurement of what that saves
+     bool m_videoDVGuiInPlace;
+     //! Hades: native Dolby Vision output leaves the GUI pass out of the frames where no control is
+     //! dirty and puts the GUI of the frame before over the picture (video/dvguireuse; the same
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index e28b7c7..02f53c7 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -2548,7 +2548,22 @@ void CWinSystemGbmGLESContext::CompositeGui()
+     {
+       m_dvDrawnOver = true;
+       m_dvStats.guiInPlace++;
+-      if (!m_dvGuiInPlaceSaid)
++      // Hades: (Low-Latency: the packer of the converted transport, RenderDVBridge())
++      if (m_dvBridge->LowLatency())
++      {
++        if (!m_dvGuiInPlaceLowLatencySaid)
++        {
++          m_dvGuiInPlaceLowLatencySaid = true;
++          CLog::Log(LOGINFO,
++                    "DVBridge: Low-Latency: the GUI over the picture is composited by the packer "
++                    "of the transport as it packs, from the GUI texture, with the arithmetic of "
++                    "the GUI composite: not into the 3840x2160 picture in 32-bit floats, which the "
++                    "composite read and wrote and the next frame cleared again where the GUI was "
++                    "over its bars (the same bytes, measured on the software bridge; "
++                    "video/dvguiinplace)");
++        }
++      }
++      else if (!m_dvGuiInPlaceSaid)
+       {
+         m_dvGuiInPlaceSaid = true;
+         CLog::Log(LOGINFO,
+@@ -7141,11 +7156,20 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   // <video><dvguiinplace>false</dvguiinplace></video>
+   // (Hades: only where the composite converts exactly, KODI_GUI_EXACT: one with the LUTs of a GPU
+   // without highp in fragment shaders draws other colours, which the packer does not reproduce)
++  // Hades: and with Low-Latency, for every frame: it sends no metadata, so there is no level 5
++  // block to measure, and the packer of the converted transport composites the GUI as it packs
++  // where it has the program for it (CDVBridgeGLES::SetDrawnOver(),
++  // dvbridge_gl_pack_no_metadata_gui()): the composite's read and write of the 3840x2160 picture
++  // of 32-bit floats under the GUI, and the clear of that picture where the GUI was over the bars
++  // of a picture that does not fill the raster, are not made. Measured on the software bridge with
++  // Kodi's composite: the same bytes with a GUI over 10, 40 and 100 % of the screen (idea:
++  // CroqueMr's CB1, #197)
+   float guiInPlace = 0.0f;
+   if (!overlayFree && !captured && drawnTiles && m_guiFbo.IsValid() && m_compositeShader &&
+       m_compositeShader->IsPQ() && !m_compositeLimited &&
+       (!drawnSettings || drawnSettings->GetAdvancedSettings()->m_videoDVGuiInPlace) &&
+-      DVAheadWanted() && m_modeAnnounce.Pending() != CHeldModeAnnouncement::Step::BEFORE_NEXT)
++      (m_dvBridge->LowLatency() || DVAheadWanted()) &&
++      m_modeAnnounce.Pending() != CHeldModeAnnouncement::Step::BEFORE_NEXT)
+   {
+     if (m_compositeShader->IsExact())
+       guiInPlace = m_compositeShader->GetPQPeak();
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index ee617d2..8d8fb9e 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -678,6 +678,8 @@ private:
+   bool m_compositeLimited{false};
+   //! Hades: the packer composited the GUI itself (said once in the log)
+   bool m_dvGuiInPlaceSaid{false};
++  //! Hades: ... in Dolby Vision Low-Latency (said once in the log)
++  bool m_dvGuiInPlaceLowLatencySaid{false};
+   //! Hades: ... or why it does not (the composite is not the exact one; said once)
+   bool m_dvGuiInPlaceNotExactSaid{false};
+   //! Hades: a frame of this native output could not take the GUI over its picture (said once in it)
+-- 
+2.53.0
+

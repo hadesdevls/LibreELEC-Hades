@@ -9,9 +9,9 @@ dovi_tool (MIT); both were read as data, nothing of them runs here. What the RPU
 Hades makes for HDR10 sent as Dolby Vision (tools/dvbridge/dvbridge_hdr10plus.c,
 dvbridge_profile81_metadata()): the header of profile 8.1 as dovi_tool makes it, an identity mapping, the
 colour of BT.2020 PQ (or, for profile 5, the IPT-PQ-c2 matrices of dvbridge_ipt.h), the mastering
-display as the source range, and display management of CM v2.9 with levels 1 and 6 (in that order, as
-dovi_tool writes the blocks; the bridge makes no level 5 for the picture of a whole frame, and none is
-written).
+display as the source range, and display management of CM v2.9 with levels 1, 5 and 6 (in that order,
+as dovi_tool writes the blocks; level 5 is the whole picture, all four offsets 0, as the bridge writes it
+for metadata of its own since it sends no level 5 for an RPU without one).
 """
 import card
 
@@ -113,6 +113,7 @@ def metadata(profile, l1, mastering, max_cll, max_fall, scene_refresh):
         },
         "ext": [
             {"level": 1, "min_pq": l1[0], "max_pq": l1[1], "avg_pq": l1[2]},
+            {"level": 5, "left": 0, "right": 0, "top": 0, "bottom": 0},
             {"level": 6, "max_luminance": card.rnd(max_nits, "L6 max"),
              "min_luminance": card.rnd(min_nits * 10000.0, "L6 min"),
              "max_cll": min(int(max_cll), 65535), "max_fall": min(int(max_fall), 65535)},
@@ -200,6 +201,13 @@ def rpu_payload(m):
             w.u(12, e["min_pq"])
             w.u(12, e["max_pq"])
             w.u(12, e["avg_pq"])
+        elif e["level"] == 5:
+            length = 7
+            w.ue(length)
+            w.u(8, 5)
+            start = len(w.bits)
+            for k in ("left", "right", "top", "bottom"):
+                w.u(13, e[k])
         elif e["level"] == 6:
             length = 8
             w.ue(length)

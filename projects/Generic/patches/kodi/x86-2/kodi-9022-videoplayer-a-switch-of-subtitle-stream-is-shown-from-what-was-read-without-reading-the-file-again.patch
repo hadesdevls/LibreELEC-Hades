@@ -1,0 +1,553 @@
+From 4c9c26610521f63c7abbae40c9a04ecd27c12c27 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:36:46 +0000
+Subject: [PATCH] VideoPlayer: a switch of subtitle stream is shown from what
+ was read, without reading the file again
+
+The demuxer reads every stream of a file, and the player drops the packets of
+the subtitle streams it does not show. On a switch to another stream, those of
+its packets on screen now and the ones read since (the demuxer is ahead of
+playback) were gone: the player took the demuxer back to the playback time
+(RereadSubtitleData()) or, where it could not, seeked. From a streaming service
+that is the file read again from a server that may allow one connection, and
+for a PGS stream the display set on screen now was lost when it began before
+the keyframe the demuxer went back to.
+
+CSubtitleTrackMemory keeps the packets of every subtitle stream of the file as
+they are read (PGS and text: SubRip, plain text, MOV text, ASS/SSA), from the
+last discontinuity of the reading on (a seek, a new file), bounded to 60 s
+before the playback time, 4 MiB per stream and 24 MiB in all. On a switch it
+gives the stream what its decoder needs, through the player's own path for a
+packet (ProcessSubData()):
+- PGS: from its last display set at or before now whose composition state is
+  not "normal" (an epoch start or an acquisition point: everything it shows
+  is in it), or from now on when it has none and the memory began at least
+  10 s before;
+- text: its lines that end after now, when the memory began at least 10 s
+  before;
+and every packet after those up to the last one read, in order; the demuxer
+goes on with the next. When the memory does not hold it, the switch is as
+before. One INFO line per switch, and at the end of the file the most it
+kept. Only for a file on the timeline of its demuxer, as RereadSubtitleData().
+
+Measured: a film with six 1080p PGS tracks (about 12 KB a display set, one of
+60 KB) read 8 s ahead of playback kept at most 1756 KiB, 2366 KiB read 30 s
+ahead; 24 tracks 7010 and 9464 KiB (host test, display sets made as a disc's).
+In a VM (an image of this tree before, a Matroska file with six PGS and two
+SubRip streams from a server that behaves like a streaming CDN), eight switches
+4 s apart: before, the demuxer taken back eight times and, for the two text
+streams, a request to the add-on's resolver and four transfers of the file
+(the search of CSubtitleSeekSearch); now, each of the eight shown from what
+was read, nothing asked of the server, at most 1050 KiB kept.
+Credit: the idea of a switch without a jump is mephis's
+(flhs0606/LibreELEC-Hades, dcfd7435b4); written anew on Hades' seek memory of
+text subtitles, for PGS too and bounded.
+---
+ xbmc/cores/VideoPlayer/SubtitleSeekMemory.h | 282 ++++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp      | 123 +++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h        |  15 ++
+ 3 files changed, 420 insertions(+)
+
+diff --git a/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h b/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
+index 73d9c58..9eab9a5 100644
+--- a/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
++++ b/xbmc/cores/VideoPlayer/SubtitleSeekMemory.h
+@@ -15,6 +15,9 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <deque>
++#include <map>
++#include <string>
++#include <utility>
+ #include <vector>
+ 
+ /*!
+@@ -207,6 +210,285 @@ private:
+   double m_recalledLast{DVD_NOPTS_VALUE};
+ };
+ 
++/*!
++ * \brief The subtitle packets of every subtitle stream of a file as the demuxer reads them, to give
++ *        the stream the user switches to what it needs without reading the file again.
++ *
++ * The demuxer reads every stream of the file and the player drops the packets of the streams it
++ * does not play. On a switch to another subtitle stream, those of its packets that are on screen
++ * now, and the ones read since (the demuxer is ahead of playback), were dropped: the player read
++ * them again by taking the demuxer back to the playback time (CVideoPlayer::RereadSubtitleData()),
++ * or by a seek. From a Debrid service that is a new request to the server for what was read
++ * already, and a seek where the server allows one connection to the file.
++ *
++ * This keeps the packets of every subtitle stream, as they were read, from the last discontinuity
++ * of the reading (a seek, a new file: Reset()) on, bounded in bytes and to KEEP_BEHIND before the
++ * playback time. Recall() gives a stream what its decoder needs to show what is on screen now and
++ * then go on with the demuxer's next packets, or nothing when the memory does not hold it:
++ *  - a PGS stream (Blu-ray graphics): from its last display set that starts an epoch or is an
++ *    acquisition point at or before now (its composition state is not "normal": everything it
++ *    shows is in it, and the decoder drops what came before), or, when it has none since the
++ *    memory began at least PGS_QUIET before now, from now on (nothing it showed can be on screen);
++ *  - a text stream: its lines that end after now, if the memory began at least TEXT_LEAD before
++ *    now (a line that began earlier and is still on screen would be missing).
++ * Every packet of the stream after those, up to the last one read, follows in order.
++ */
++class CSubtitleTrackMemory
++{
++public:
++  struct Packet
++  {
++    double pts{DVD_NOPTS_VALUE};
++    double dts{DVD_NOPTS_VALUE};
++    double duration{0.0};
++    std::vector<uint8_t> data;
++    bool anchor{false}; //!< PGS: a display set whose composition state is not "normal"
++
++    double Start() const { return pts != DVD_NOPTS_VALUE ? pts : dts; }
++    double End() const { return Start() + (duration > 0.0 ? duration : 0.0); }
++  };
++
++  enum class Kind
++  {
++    PGS,
++    TEXT,
++  };
++
++  static constexpr size_t MAX_BYTES_PER_STREAM = 4 * 1024 * 1024;
++  static constexpr size_t MAX_BYTES = 24 * 1024 * 1024;
++  static constexpr size_t PACKET_OVERHEAD = 64;
++  static constexpr double KEEP_BEHIND = 60.0 * DVD_TIME_BASE;
++  static constexpr double TEXT_LEAD = 10.0 * DVD_TIME_BASE;
++  static constexpr double PGS_QUIET = 10.0 * DVD_TIME_BASE;
++
++  //! Whether a PGS packet holds a presentation composition segment whose state is not "normal"
++  static bool IsPgsAnchor(const uint8_t* data, size_t size)
++  {
++    // segments: type (1 byte), length (2), payload; the PCS (0x16) has its composition state at 7
++    size_t pos = 0;
++    while (data && pos + 3 <= size)
++    {
++      const uint8_t type = data[pos];
++      const size_t length = (static_cast<size_t>(data[pos + 1]) << 8) | data[pos + 2];
++      if (type == 0x16 && length >= 8 && pos + 3 + length <= size)
++        return (data[pos + 3 + 7] & 0xC0) != 0;
++      pos += 3 + length;
++    }
++    return false;
++  }
++
++  /*!
++   * \brief A discontinuity of the reading (a seek, a new file): what is kept goes, and the memory
++   *        begins again at the next packet read
++   */
++  void Reset()
++  {
++    m_streams.clear();
++    m_bytes = 0;
++    m_since = DVD_NOPTS_VALUE;
++  }
++
++  //! A packet of any stream was read: the memory begins at the first one after Reset()
++  void NoteRead(double dts)
++  {
++    if (m_since == DVD_NOPTS_VALUE && dts != DVD_NOPTS_VALUE)
++      m_since = dts;
++  }
++
++  /*!
++   * \brief Keep a subtitle packet as it was read
++   * \param playback the playback time now (DVD_NOPTS_VALUE if not known), for KEEP_BEHIND
++   * \return false if it is not kept: no start, empty, too big, or kept already (read again)
++   */
++  bool Remember(int64_t demuxerId,
++                int streamId,
++                Kind kind,
++                double pts,
++                double dts,
++                double duration,
++                const uint8_t* data,
++                size_t size,
++                double playback)
++  {
++    const double start = pts != DVD_NOPTS_VALUE ? pts : dts;
++    NoteRead(start);
++    if (start == DVD_NOPTS_VALUE || !data || size == 0 ||
++        size + PACKET_OVERHEAD > MAX_BYTES_PER_STREAM)
++      return false;
++
++    Stream& s = m_streams[{demuxerId, streamId}];
++    s.kind = kind;
++    // read again (the demuxer went back for the video alone, or to read subtitles again): kept
++    auto at = std::upper_bound(s.packets.begin(), s.packets.end(), start,
++                               [](double t, const Packet& p) { return t < p.Start(); });
++    for (auto it = at; it != s.packets.begin();)
++    {
++      --it;
++      if (it->Start() != start)
++        break;
++      if (it->data.size() == size && std::memcmp(it->data.data(), data, size) == 0)
++        return false;
++    }
++    if (s.evictedUntil != DVD_NOPTS_VALUE && start < s.evictedUntil)
++      return false;
++
++    Packet p;
++    p.pts = pts;
++    p.dts = dts;
++    p.duration = duration == DVD_NOPTS_VALUE ? 0.0 : duration;
++    p.data.assign(data, data + size);
++    p.anchor = kind == Kind::PGS && IsPgsAnchor(data, size);
++    s.packets.insert(at, std::move(p));
++    s.bytes += size + PACKET_OVERHEAD;
++    m_bytes += size + PACKET_OVERHEAD;
++    Trim(s, playback);
++    while (m_bytes > MAX_BYTES)
++    {
++      auto largest =
++          std::max_element(m_streams.begin(), m_streams.end(), [](const auto& a, const auto& b)
++                           { return a.second.bytes < b.second.bytes; });
++      if (largest == m_streams.end() || largest->second.packets.empty())
++        break;
++      EvictFront(largest->second);
++    }
++    m_peakBytes = std::max(m_peakBytes, m_bytes);
++    return true;
++  }
++
++  /*!
++   * \brief What a stream's decoder needs to show what is on screen at now and go on from the
++   *        demuxer's next packet (see the class), in order
++   * \param[out] from the time the packets given back begin at (the display set of a PGS stream)
++   * \param[out] why why nothing is given back, for the log
++   * \return false if the memory does not hold it: the stream has to be read again from the file
++   */
++  bool Recall(int64_t demuxerId,
++              int streamId,
++              Kind kind,
++              double now,
++              std::vector<Packet>& out,
++              double& from,
++              std::string& why) const
++  {
++    out.clear();
++    from = DVD_NOPTS_VALUE;
++    if (now == DVD_NOPTS_VALUE)
++    {
++      why = "the playback time is not known";
++      return false;
++    }
++    if (m_since == DVD_NOPTS_VALUE)
++    {
++      why = "nothing has been read since the reading began again";
++      return false;
++    }
++    const auto it = m_streams.find({demuxerId, streamId});
++    const Stream* s = it != m_streams.end() ? &it->second : nullptr;
++    // (DVD_NOPTS_VALUE is a large positive number: compared only when it is not that)
++    double covered = m_since;
++    if (s && s->evictedUntil != DVD_NOPTS_VALUE)
++      covered = std::max(covered, s->evictedUntil);
++
++    if (kind == Kind::PGS)
++    {
++      // the last display set that holds all it shows, at or before now
++      std::ptrdiff_t anchor = -1;
++      if (s)
++      {
++        for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(s->packets.size()); i++)
++        {
++          if (s->packets[i].Start() > now)
++            break;
++          if (s->packets[i].anchor)
++            anchor = i;
++        }
++      }
++      if (anchor >= 0)
++      {
++        from = s->packets[anchor].Start();
++        out.assign(s->packets.begin() + anchor, s->packets.end());
++        return true;
++      }
++      if (covered > now - PGS_QUIET)
++      {
++        why = "it may show a display set that began before what is kept";
++        return false;
++      }
++      from = now;
++      if (s)
++      {
++        for (const Packet& p : s->packets)
++        {
++          if (p.Start() > now)
++            out.push_back(p);
++        }
++      }
++      return true;
++    }
++
++    if (covered > now - TEXT_LEAD)
++    {
++      why = "a line on screen now may have begun before what is kept";
++      return false;
++    }
++    from = now;
++    if (s)
++    {
++      for (const Packet& p : s->packets)
++      {
++        if (p.End() > now || p.Start() > now)
++          out.push_back(p);
++      }
++    }
++    return true;
++  }
++
++  size_t Bytes() const { return m_bytes; }
++  size_t PeakBytes() const { return m_peakBytes; }
++  void ResetPeak() { m_peakBytes = 0; }
++  size_t Streams() const { return m_streams.size(); }
++  size_t Packets() const
++  {
++    size_t n = 0;
++    for (const auto& [key, s] : m_streams)
++      n += s.packets.size();
++    return n;
++  }
++  double Since() const { return m_since; }
++
++private:
++  struct Stream
++  {
++    Kind kind{Kind::TEXT};
++    std::vector<Packet> packets; //!< in order of start
++    size_t bytes{0};
++    double evictedUntil{DVD_NOPTS_VALUE}; //!< the start of the latest packet that went
++  };
++
++  void EvictFront(Stream& s)
++  {
++    const Packet& p = s.packets.front();
++    s.evictedUntil =
++        s.evictedUntil == DVD_NOPTS_VALUE ? p.Start() : std::max(s.evictedUntil, p.Start());
++    s.bytes -= p.data.size() + PACKET_OVERHEAD;
++    m_bytes -= p.data.size() + PACKET_OVERHEAD;
++    s.packets.erase(s.packets.begin());
++  }
++
++  void Trim(Stream& s, double playback)
++  {
++    while (!s.packets.empty() &&
++           ((playback != DVD_NOPTS_VALUE && s.packets.front().Start() < playback - KEEP_BEHIND) ||
++            s.bytes > MAX_BYTES_PER_STREAM))
++      EvictFront(s);
++  }
++
++  std::map<std::pair<int64_t, int>, Stream> m_streams;
++  size_t m_bytes{0};
++  size_t m_peakBytes{0};
++  double m_since{DVD_NOPTS_VALUE};
++};
++
+ /*!
+  * \brief The text subtitle packets decoded since the last flush, by their times and bytes: a line
+  *        that a search after a seek found in the file (SubtitleSeekSearch.h) and that the demuxer
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index eb9ad18..e7f8c7c 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -1149,6 +1149,8 @@ std::optional<std::chrono::milliseconds> CVideoPlayer::EditionSavedPosition(
+ bool CVideoPlayer::OpenDemuxStream()
+ {
+   CloseDemuxer();
++  // Hades: (CSubtitleTrackMemory) a new demuxer reads from its start
++  m_subtitleTracks.Reset();
+ 
+   CLog::Log(LOGINFO, "Creating Demuxer");
+ 
+@@ -2382,11 +2384,112 @@ void CVideoPlayer::Process()
+       }
+     }
+ 
++    // Hades: the packets of every subtitle stream, for a switch to another (CSubtitleTrackMemory)
++    KeepSubtitlePacket(pStream, pPacket);
++
+     // process the packet
+     ProcessPacket(pStream, pPacket);
+   }
+ }
+ 
++bool CVideoPlayer::SubtitleTracksKept() const
++{
++  return m_pDemuxer && m_pInputStream && m_pInputStream->IsStreamType(DVDSTREAM_TYPE_FILE) &&
++         !m_pInputStream->IsRealtime() && m_offset_pts == 0.0;
++}
++
++namespace
++{
++//! Hades: the kind of a subtitle codec that CSubtitleTrackMemory keeps; false for the others
++bool KeptSubtitleKind(AVCodecID codec, CSubtitleTrackMemory::Kind& kind)
++{
++  switch (codec)
++  {
++    case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
++      kind = CSubtitleTrackMemory::Kind::PGS;
++      return true;
++    case AV_CODEC_ID_SUBRIP:
++    case AV_CODEC_ID_TEXT:
++    case AV_CODEC_ID_MOV_TEXT:
++    case AV_CODEC_ID_ASS:
++    case AV_CODEC_ID_SSA:
++      kind = CSubtitleTrackMemory::Kind::TEXT;
++      return true;
++    default:
++      return false;
++  }
++}
++} // namespace
++
++void CVideoPlayer::KeepSubtitlePacket(const CDemuxStream* stream, const DemuxPacket* packet)
++{
++  if (!packet || !SubtitleTracksKept())
++    return;
++  CSubtitleTrackMemory::Kind kind;
++  if (!stream || stream->type != StreamType::SUBTITLE ||
++      STREAM_SOURCE_MASK(stream->source) != STREAM_SOURCE_DEMUX ||
++      !KeptSubtitleKind(stream->codec, kind))
++  {
++    m_subtitleTracks.NoteRead(packet->dts != DVD_NOPTS_VALUE ? packet->dts : packet->pts);
++    return;
++  }
++  m_subtitleTracks.Remember(stream->demuxerId, packet->iStreamId, kind, packet->pts, packet->dts,
++                            packet->duration, packet->pData,
++                            packet->iSize > 0 ? static_cast<size_t>(packet->iSize) : 0,
++                            m_clock.GetClock() - m_VideoPlayerVideo->GetSubtitleDelay());
++}
++
++bool CVideoPlayer::GiveBackSubtitles()
++{
++  if (!SubtitleTracksKept() || m_CurrentSubtitle.id < 0)
++    return false;
++#ifdef HAVE_DVBRIDGE
++  // the demuxer reads again for the video alone: its packets are being told apart from new ones
++  if (m_videoOnly.active)
++    return false;
++#endif
++  CDemuxStream* stream = m_pDemuxer->GetStream(m_CurrentSubtitle.demuxerId, m_CurrentSubtitle.id);
++  CSubtitleTrackMemory::Kind kind;
++  if (!stream || !KeptSubtitleKind(stream->codec, kind))
++    return false;
++
++  const double now = m_clock.GetClock() - m_VideoPlayerVideo->GetSubtitleDelay();
++  std::vector<CSubtitleTrackMemory::Packet> packets;
++  double from = DVD_NOPTS_VALUE;
++  std::string why;
++  if (!m_subtitleTracks.Recall(m_CurrentSubtitle.demuxerId, m_CurrentSubtitle.id, kind, now,
++                               packets, from, why))
++  {
++    CLog::Log(LOGINFO,
++              "CVideoPlayer: subtitle stream {} at {:.3f} s: not shown from what was read ({}): "
++              "it is read again from the file",
++              m_CurrentSubtitle.id, now / DVD_TIME_BASE, why);
++    return false;
++  }
++
++  for (const CSubtitleTrackMemory::Packet& p : packets)
++  {
++    DemuxPacket* pkt = CDVDDemuxUtils::AllocateDemuxPacket(static_cast<int>(p.data.size()));
++    if (!pkt)
++      break;
++    std::memcpy(pkt->pData, p.data.data(), p.data.size());
++    pkt->iSize = static_cast<int>(p.data.size());
++    pkt->pts = p.pts;
++    pkt->dts = p.dts;
++    pkt->duration = p.duration;
++    pkt->iStreamId = m_CurrentSubtitle.id;
++    pkt->demuxerId = m_CurrentSubtitle.demuxerId;
++    ProcessSubData(stream, pkt);
++  }
++  CLog::Log(LOGINFO,
++            "CVideoPlayer: subtitle stream {} ({}) at {:.3f} s shown from what was read: {} "
++            "packet(s) from {:.3f} s on, the file not read again ({} KiB kept for {} stream(s))",
++            m_CurrentSubtitle.id, kind == CSubtitleTrackMemory::Kind::PGS ? "PGS" : "text",
++            now / DVD_TIME_BASE, packets.size(), from / DVD_TIME_BASE,
++            m_subtitleTracks.Bytes() / 1024, m_subtitleTracks.Streams());
++  return true;
++}
++
+ bool CVideoPlayer::CheckIsCurrent(const CCurrentStream& current,
+                                   CDemuxStream* stream,
+                                   DemuxPacket* pkg)
+@@ -3749,6 +3852,14 @@ void CVideoPlayer::OnExit()
+   CLog::Log(LOGINFO, "CVideoPlayer::OnExit()");
+   m_seekPending->Clear(); // (Hades)
+   DropSeekLeftOut("playback stopped"); // (Hades)
++  // Hades: the most the subtitle packets kept for a switch of stream took (CSubtitleTrackMemory)
++  if (m_subtitleTracks.PeakBytes() > 0)
++    CLog::Log(LOGINFO,
++              "CVideoPlayer: the subtitle packets kept for a switch of stream took at most {} KiB "
++              "(of {} KiB allowed)",
++              m_subtitleTracks.PeakBytes() / 1024, CSubtitleTrackMemory::MAX_BYTES / 1024);
++  m_subtitleTracks.Reset();
++  m_subtitleTracks.ResetPeak();
+ 
+   // set event to inform openfile something went wrong in case openfile is still waiting for this event
+   SetCaching(CACHESTATE_DONE);
+@@ -5226,6 +5337,14 @@ void CVideoPlayer::ReopenSubtitleStream(const SelectionStream& stream)
+   CloseStream(m_CurrentSubtitle, false);
+   const bool opened{OpenStream(m_CurrentSubtitle, stream.demuxerId, stream.id, stream.source)};
+ 
++  // Hades: what the stream needs now, from its packets as they were read (CSubtitleTrackMemory):
++  // the demuxer is not taken back, nothing is asked of the source again. A seek already queued
++  // gives it anyway.
++  if (opened && STREAM_SOURCE_MASK(stream.source) == STREAM_SOURCE_DEMUX &&
++      m_messenger.GetPacketCount(CDVDMsg::PLAYER_SEEK) == 0 &&
++      m_messenger.GetPacketCount(CDVDMsg::PLAYER_SEEK_CHAPTER) == 0 && GiveBackSubtitles())
++    return;
++
+   // For embedded subtitles the demuxer is ahead of playback (AV buffers
+   // are full), so the subtitle packets for the current playback time have
+   // already been read and discarded. Read them again, without interrupting
+@@ -6364,6 +6483,10 @@ void CVideoPlayer::FlushBuffers(double pts, bool accurate, bool sync)
+ #endif
+   CLog::Log(LOGDEBUG, "CVideoPlayer::FlushBuffers - flushing buffers");
+ 
++  // Hades: the reading goes on from elsewhere: the subtitle packets kept for a switch of stream
++  // begin again at what is read next
++  m_subtitleTracks.Reset();
++
+   // Hades: what was read and will not be shown: the BD-J application gets what was held for
+   // it now (a seek, a jump), as without presentation timing
+   ReleaseAllBdjPresented();
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 41ed654..f01f095 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -477,6 +477,18 @@ protected:
+   void SetSubtitleVisibleInternal(bool bVisible);
+   void ReopenSubtitleStream(const SelectionStream& stream);
+   bool RereadSubtitleData();
++  /*!
++   * \brief Hades: whether the subtitle packets of every stream are kept as they are read
++   *        (CSubtitleTrackMemory): a file, not realtime, on the timeline of its demuxer
++   */
++  bool SubtitleTracksKept() const;
++  //! Hades: a packet the demuxer read, kept if it is one of a subtitle stream (m_subtitleTracks)
++  void KeepSubtitlePacket(const CDemuxStream* stream, const DemuxPacket* packet);
++  /*!
++   * \brief Hades: the subtitle stream just opened gets what it needs now from what was read
++   * \return false if the memory does not hold it (the stream is read again from the file)
++   */
++  bool GiveBackSubtitles();
+ 
+   enum SubtitleChange
+   {
+@@ -763,6 +775,9 @@ protected:
+   std::unique_ptr<CVideoPlayerSubtitle> m_VideoPlayerSubtitle;
+   // Hades: the subtitle lines on screen after a seek, stored before where the demuxer reads again
+   std::unique_ptr<CSubtitleSeekSearch> m_subtitleSearch = std::make_unique<CSubtitleSeekSearch>();
++  // Hades: the subtitle packets of every stream as read, for a switch of stream (on the player's
++  // thread only)
++  CSubtitleTrackMemory m_subtitleTracks;
+   uint32_t m_cacheReadRate{0}; //!< bytes/s the cache read while playing (last known)
+   std::unique_ptr<CDVDTeletextData> m_VideoPlayerTeletext;
+   std::unique_ptr<CDVDRadioRDSData> m_VideoPlayerRadioRDS;
+-- 
+2.53.0
+

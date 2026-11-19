@@ -1,0 +1,246 @@
+From d0acfae2a34c65157fc0f401c913f2c104859f29 Mon Sep 17 00:00:00 2001
+From: Kel Modderman <kelvmod@gmail.com>
+Date: Mon, 2 Nov 2026 10:52:48 +1000
+Subject: [PATCH] Add CApplicationMessenger::SendMsgAbortable()
+
+SendMsg() waits for the app thread without a time limit, so a thread
+that sends a message while the app thread is waiting for that thread
+blocks both of them for good.
+
+SendMsgAbortable() also stops waiting when a given event is set. If the
+app thread hasn't taken the message by then, it is dropped and never
+processed: the sender and ProcessMessage() both try to claim it, and
+only the one that gets there first goes on. If the app thread already
+has it, the sender still waits for it to finish, so the payload is
+never used after the call returns.
+
+Both now queue the message through a shared Enqueue().
+
+m_bStop is now atomic, as SendMsg() and SendMsgAbortable() read it on
+the sending thread while Stop() sets it on the app thread.
+
+Assisted-by: Claude
+(cherry picked from commit 7dd114596f1b88a413ccb7ee10038d559dfedf9f)
+(cherry picked from commit 3721fa81a81633ceef1be8d370acc9e01a6a0514)
+---
+ xbmc/messaging/ApplicationMessenger.cpp | 65 ++++++++++++++++++++-----
+ xbmc/messaging/ApplicationMessenger.h   | 22 ++++++++-
+ xbmc/messaging/ThreadMessage.h          |  8 ++-
+ 3 files changed, 82 insertions(+), 13 deletions(-)
+
+diff --git a/xbmc/messaging/ApplicationMessenger.cpp b/xbmc/messaging/ApplicationMessenger.cpp
+index a101170..6e5d0a2 100644
+--- a/xbmc/messaging/ApplicationMessenger.cpp
++++ b/xbmc/messaging/ApplicationMessenger.cpp
+@@ -11,13 +11,16 @@
+ #include "ServiceBroker.h"
+ #include "guilib/GUIMessage.h"
+ #include "messaging/IMessageTarget.h"
++#include "threads/Event.h"
+ #include "threads/SingleLock.h"
+ #include "utils/log.h"
+ #include "windowing/GraphicContext.h"
+ #include "windowing/WinSystem.h"
+ 
++#include <atomic>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <utility>
+ 
+ namespace KODI
+@@ -117,18 +120,10 @@ int CApplicationMessenger::SendMsg(ThreadMessage&& message, bool wait)
+ 
+   ThreadMessage* msg = new ThreadMessage(std::move(message));
+ 
+-  std::unique_lock lock(m_critSection);
++  // once queued the app thread may process and delete msg, so touching it after
++  // this is a race (yarc - "yet another race condition")
++  Enqueue(msg);
+ 
+-  if (msg->dwMessage == TMSG_GUI_MESSAGE)
+-    m_vecWindowMessages.push(msg);
+-  else
+-    m_vecMessages.push(msg);
+-  lock.unlock(); // this releases the lock on the vec of messages and
+-      //   allows the ProcessMessage to execute and therefore
+-      //   delete the message itself. Therefore any access
+-      //   of the message itself after this point constitutes
+-      //   a race condition (yarc - "yet another race condition")
+-      //
+   if (waitEvent) // ... it just so happens we have a spare reference to the
+                  //  waitEvent ... just for such contingencies :)
+   {
+@@ -148,6 +143,15 @@ int CApplicationMessenger::SendMsg(ThreadMessage&& message, bool wait)
+   return -1;
+ }
+ 
++void CApplicationMessenger::Enqueue(ThreadMessage* msg)
++{
++  std::unique_lock lock(m_critSection);
++  if (msg->dwMessage == TMSG_GUI_MESSAGE)
++    m_vecWindowMessages.push(msg);
++  else
++    m_vecMessages.push(msg);
++}
++
+ int CApplicationMessenger::SendMsg(uint32_t messageId)
+ {
+    return SendMsg(ThreadMessage{ messageId }, true);
+@@ -158,6 +162,41 @@ int CApplicationMessenger::SendMsg(uint32_t messageId, int param1, int param2, v
+   return SendMsg(ThreadMessage{ messageId, param1, param2, payload }, true);
+ }
+ 
++bool CApplicationMessenger::SendMsgAbortable(
++    uint32_t messageId, int param1, int param2, void* payload, CEvent& abortEvent)
++{
++  if (m_guiThreadId == CThread::GetCurrentThreadId())
++  {
++    SendMsg(messageId, param1, param2, payload);
++    return true;
++  }
++
++  if (m_bStop || abortEvent.Signaled())
++    return false;
++
++  auto waitEvent = std::make_shared<CEvent>(true);
++  auto claimed = std::make_shared<std::atomic<bool>>(false);
++  ThreadMessage* msg = new ThreadMessage{messageId, param1, param2, payload};
++  msg->waitEvent = waitEvent;
++  msg->claimed = claimed;
++  Enqueue(msg); // msg may be deleted from here on
++
++  // ensure the thread doesn't hold the graphics lock
++  std::optional<CSingleExit> exit;
++  if (CWinSystemBase* winSystem = CServiceBroker::GetWinSystem(); winSystem)
++    exit.emplace(winSystem->GetGfxContext());
++
++  {
++    XbmcThreads::CEventGroup group{waitEvent.get(), &abortEvent};
++    // drop it, unless the app thread has already taken it
++    if (group.wait() == &abortEvent && !claimed->exchange(true))
++      return false;
++  }
++  waitEvent->Wait();
++  // not claimed if Cleanup() released it at shutdown
++  return claimed->load();
++}
++
+ int CApplicationMessenger::SendMsg(uint32_t messageId, int param1, int param2, void* payload, std::string strParam)
+ {
+   return SendMsg(ThreadMessage{messageId, param1, param2, payload, std::move(strParam),
+@@ -228,6 +267,10 @@ void CApplicationMessenger::ProcessMessages()
+ 
+ void CApplicationMessenger::ProcessMessage(ThreadMessage *pMsg)
+ {
++  // the sender gave up waiting and dropped it
++  if (pMsg->claimed && pMsg->claimed->exchange(true))
++    return;
++
+   //special case for this that we handle ourselves
+   if (pMsg->dwMessage == TMSG_CALLBACK)
+   {
+diff --git a/xbmc/messaging/ApplicationMessenger.h b/xbmc/messaging/ApplicationMessenger.h
+index 1ddde58..f6d8589 100644
+--- a/xbmc/messaging/ApplicationMessenger.h
++++ b/xbmc/messaging/ApplicationMessenger.h
+@@ -12,6 +12,7 @@
+ #include "messaging/ThreadMessage.h"
+ #include "threads/Thread.h"
+ 
++#include <atomic>
+ #include <map>
+ #include <memory>
+ #include <queue>
+@@ -312,6 +313,24 @@ public:
+    */
+   int SendMsg(uint32_t messageId, int param1, int param2, void* payload, std::string strParam, std::vector<std::string> params);
+ 
++  /*!
++   * \brief Send a blocking message, but stop waiting once abortEvent is set
++   *
++   * For a thread that the app thread may itself be waiting on. If abortEvent is set before the
++   * app thread takes the message, the message is dropped and never processed. If it is already
++   * being processed, this still waits for it to finish. On the app thread it is processed straight
++   * away. Either way the payload is not touched once this returns.
++   *
++   * \param [in] messageId defined further up in this file
++   * \param [in] param1 value depends on the message being sent
++   * \param [in] param2 value depends on the message being sent
++   * \param [in] payload this is a void pointer that is meant to send larger objects to the receiver
++   * \param [in] abortEvent ends the wait when set
++   * \return true if the message was processed, false if it was dropped
++   */
++  bool SendMsgAbortable(
++      uint32_t messageId, int param1, int param2, void* payload, CEvent& abortEvent);
++
+   /*!
+    * \brief Send a non-blocking message and return immediately
+    *
+@@ -431,6 +450,7 @@ private:
+   CApplicationMessenger const& operator=(CApplicationMessenger const&) = delete;
+ 
+   int SendMsg(ThreadMessage&& msg, bool wait);
++  void Enqueue(ThreadMessage* msg);
+   void ProcessMessage(ThreadMessage *pMsg);
+ 
+   std::queue<ThreadMessage*> m_vecMessages; /*!< queue for regular messages */
+@@ -439,7 +459,7 @@ private:
+   CCriticalSection m_critSection;
+   std::thread::id m_guiThreadId;
+   std::thread::id m_processThreadId;
+-  bool m_bStop{ false };
++  std::atomic<bool> m_bStop{false};
+ };
+ }
+ }
+diff --git a/xbmc/messaging/ThreadMessage.h b/xbmc/messaging/ThreadMessage.h
+index 8360d30..e5702c2 100644
+--- a/xbmc/messaging/ThreadMessage.h
++++ b/xbmc/messaging/ThreadMessage.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+@@ -78,7 +79,8 @@ public:
+       strParam(std::move(other.strParam)),
+       params(std::move(other.params)),
+       waitEvent(std::move(other.waitEvent)),
+-      result(std::move(other.result))
++      result(std::move(other.result)),
++      claimed(std::move(other.claimed))
+   {
+   }
+ 
+@@ -95,6 +97,7 @@ public:
+     params = other.params;
+     waitEvent = other.waitEvent;
+     result = other.result;
++    claimed = other.claimed;
+     return *this;
+   }
+ 
+@@ -111,6 +114,7 @@ public:
+     params = std::move(other.params);
+     waitEvent = std::move(other.waitEvent);
+     result = std::move(other.result);
++    claimed = std::move(other.claimed);
+     return *this;
+   }
+ 
+@@ -138,6 +142,8 @@ public:
+ protected:
+   std::shared_ptr<CEvent> waitEvent;
+   std::shared_ptr<int> result;
++  //! set by whichever of processing or an aborting sender gets there first
++  std::shared_ptr<std::atomic<bool>> claimed;
+ };
+ }
+ }
+-- 
+2.53.0
+

@@ -25,22 +25,44 @@ WHAT IS WRITTEN HERE
   them had to tell. In each of them:
 
   start.txt
-      Which start the folder is of: its number, the build of LibreELEC Hades, and when the PC started.
+      Which start the folder is of: its number, the build of LibreELEC Hades, when the PC started, and
+      where the time came from then (the clock of the PC, or the internet once it has set it: before
+      that, a PC whose clock keeps another time than the one it is read as starts with that time).
       What is in a folder is always of that one start: a folder of the same name that is of another start
       (for example, left by an earlier version) is emptied before this start writes there, and start.txt
       then says what it was.
 
   previous-boot
-      Written right at the start: the journal of the start before this one (journal.txt.gz, and its
+      Written right at the start: the journal of the start BEFORE this one (journal.txt.gz, and its
       kernel lines in journal-kernel.txt.gz), up to its last line. It tells how a start ended that hung or
-      lost its power before it could save anything. While the switch is on, the journal of each start is
-      kept in the PC's storage for this (16 MiB at most); once it is off, that journal is deleted.
+      lost its power before it could save anything. So the journal of a start that stopped is in the
+      folder of the start AFTER it: after a start that stops, start the PC once more with the switch on
+      and look there. While the switch is on, the journal of each start is kept in the PC's storage for
+      this (16 MiB at most); once it is off, that journal is deleted. Where there is no journal of the
+      start before, NONE.txt says why (for example: the switch was off in that start, or it was the very
+      first start of a new installation, which only makes room for your data and keeps nothing) and lists
+      the starts that the journal has.
+      The journal of a start gets to the storage a few seconds into it. Until then, while the switch is on,
+      the kernel's log of the start is copied to the storage every second, and deleted once the journal is
+      there. A start that stopped before that leaves its copy in early-kernel-log.txt.gz: its first lines
+      say which start it was and how far it got (a step of the start, or that the system had started but
+      its journal was not in the storage yet).
+      While the switch is on, the boot menu also starts the system with initcall_debug=1 (and a larger
+      log for the kernel, log_buf_len=1M, so that its first lines stay): it writes a line in the journal
+      when it starts each driver and one when the driver is ready, so that the journal of a start that
+      stopped while drivers started says which one never came back. Turned on in
+      the settings, or by the installer for Windows, that holds from the next start; with the name of the
+      file changed by hand, from the start after the next one. Turned off, the menu goes back to 0.
 
   1-minute, 4-minutes
       About 1 and 4 minutes after the media centre starts: the graphics cards and what is connected to
       each (with the EDID of every display, without its serial number), the kernel log, the last of the
       media centre's log (kodi.log), the warnings of the system, sound devices, USB devices and
-      controllers (USB4 and Thunderbolt too), the state of the network, services, the clock, and
+      controllers (USB4 and Thunderbolt too), the state of the network, services, the clock (the setting
+      Hardware clock and how this start reads the clock; once the time is taken from the internet,
+      whether the clock of the PC keeps local time, as Windows does, or UTC, and a verdict that changed
+      in this start; and what the kernel keeps time with), the interrupts of the devices and which of them
+      share one (interrupts.txt), and
       Bluetooth (bluetooth.txt: the controllers and their firmware, the settings, and of each paired
       device its kind, its state and the connection that it asked for; never a key, and its name only as
       a marker, below). The first of the two also has:

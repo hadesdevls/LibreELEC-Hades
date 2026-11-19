@@ -1,0 +1,416 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 02:29:08 +0000
+Subject: [PATCH] drm/i915: a sink's link set up again once its HPD has been
+ back a moment
+
+intel_hdmi_reset_link() sets up again, with a full modeset, the
+scrambled link of an HDMI sink whose SCDC TMDS_Config no longer matches
+it, at each look of intel_ddi_hotplug() (at the hotplug, then once a
+second for 4 s: linux-9934, 9936, 9981). After a drop of HPD the first
+look is the hotplug of HPD coming back.
+
+Issue #28 (corgeone): an Anthem AVM 90 drops HPD for ~1.0 s and resets
+its SCDC when it switches to another input and back. The look at HPD
+back finds TMDS_Config 0x00 and makes its modeset at once, when the AVM
+is not ready yet: its SCDC then reads back locked, and it shows "No
+signal" for good. The output turned off and on once more (Kodi's
+ToggleDPMS twice, 0.3 s off), any time from ~0.3 s after HPD came back,
+brings the picture back every time, ~3.2 s after the input switch, the
+AVM's own switching time. scdc_recheck=0 and hpd_hold_ms=0 do not help:
+the modeset still comes as HPD comes back. Kodi gets no hot-plug event
+for a held drop (linux-9935), and its relink is for nvidia-drm, which
+does not set the link up again itself: on i915 this is the kernel's.
+
+The modeset now waits until HPD has been back i915.scdc_settle_ms
+(xe.scdc_settle_ms; 500 by default; 0 as before; at most 10000): the
+look that waits is not counted (hdmi_scdc_deferred of linux-9981), and
+the next look, a second later, makes it. The link is then set up from
+scratch, as by the toggle that was measured, once instead of twice. Not
+where the drop is the sink's answer to the output: an LG G5 drops HPD
+~0.4 s after a Dolby Vision or refresh rate change (linux-9934) and had
+its link set up at once, which works; a drop that begins within 3 s of a
+modeset of this output still has it at once. The wait is for a drop
+that no modeset explains: an AV receiver that switches inputs, a display
+turned on. Links that are not scrambled are not looked at, as before.
+
+intel_hdmi_detect() notes when HPD went low and when it came back (the
+live HPD of the port from display version 11, as hpd_hold_ms does; the
+EDID before), and intel_ddi_enable_hdmi() when the output was set up.
+The kernel log says, once each time HPD comes back with the link to set
+up again, that the modeset waits and why, or that the drop was the
+sink's answer and the modeset is made now.
+
+KUnit (drm_hdmi_scdc_settle): which drops are the sink's answer, when
+the modeset waits, and at which look it is made: after an input switch
+1060 ms after HPD came back; after an LG G5's answer at 60 ms, as
+before; with the parameter off; with a longer and with the longest wait.
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c      | 69 ++++++++++++++
+ .../drm/i915/display/intel_display_types.h    | 14 +++
+ drivers/gpu/drm/i915/display/intel_hdmi.c     | 29 ++++++
+ .../drm/i915/display/intel_hdmi_scdc_settle.h | 61 +++++++++++++
+ drivers/gpu/drm/tests/Makefile                |  1 +
+ .../gpu/drm/tests/drm_hdmi_scdc_settle_test.c | 90 +++++++++++++++++++
+ 6 files changed, 264 insertions(+)
+ create mode 100644 drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+ create mode 100644 drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index b97919397..c2a57fc59 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -71,6 +71,7 @@
+ #include "intel_gmbus.h"
+ #include "intel_hdcp.h"
+ #include "intel_hdmi.h"
++#include "intel_hdmi_scdc_settle.h"
+ #include "intel_hotplug.h"
+ #include "intel_hti.h"
+ #include "intel_lspcon.h"
+@@ -3433,6 +3434,10 @@ static void intel_ddi_enable_hdmi(struct intel_atomic_state *state,
+ 			    "[CONNECTOR:%d:%s] Failed to configure sink scrambling/TMDS bit clock ratio\n",
+ 			    connector->base.id, connector->name);
+ 
++	/* Hades: when this output was last set up (intel_hdmi_scdc_settle.h) */
++	WRITE_ONCE(to_intel_connector(connector)->output_set_up_at, jiffies);
++	WRITE_ONCE(to_intel_connector(connector)->output_set_up, true);
++
+ 	if (has_buf_trans_select(display))
+ 		hsw_prepare_hdmi_ddi_buffers(encoder, crtc_state);
+ 
+@@ -4786,6 +4791,66 @@ MODULE_PARM_DESC(scdc_recheck,
+ 	"after a hotplug, with at most 3 modesets in 20 s (big-fella; default "
+ 	"true; false: one retry and no cap, as upstream)");
+ 
++/*
++ * Hades: the modeset of intel_hdmi_reset_link() waits until the sink's HPD has been back this long,
++ * where no modeset of the output explains the drop (intel_hdmi_scdc_settle.h); 0 turns it off
++ */
++static unsigned int scdc_settle_ms = 500;
++module_param(scdc_settle_ms, uint, 0644);
++MODULE_PARM_DESC(scdc_settle_ms,
++	"HDMI: ms that a sink's HPD must have been back, after a drop that no modeset of the output "
++	"explains, before its scrambled link is set up again (at a later look of scdc_recheck, a "
++	"second apart; default 500, 0: at once, as before; at most 10000)");
++
++/*
++ * Hades: intel_hdmi_reset_link() waits for a later look before its modeset, or makes it now
++ * (intel_hdmi_scdc_settle.h); @config: the sink's TMDS_Config, which does not match the link
++ */
++static bool intel_hdmi_scdc_settle(struct intel_connector *connector, u8 config)
++{
++	struct intel_display *display = to_intel_display(connector);
++	const unsigned int settle = min_t(unsigned int, READ_ONCE(scdc_settle_ms),
++						  INTEL_HDMI_SCDC_SETTLE_MAX_MS);
++	const unsigned long set_up_at = READ_ONCE(connector->output_set_up_at);
++	unsigned int since_back = 0, low = 0;
++	long set_up_to_drop = -1;
++	bool back = connector->hpd_back, answers, waits;
++
++	if (back) {
++		since_back = jiffies_to_msecs(jiffies - connector->hpd_back_at);
++		/* (a mismatch long after HPD came back is not one of the looks of that hotplug) */
++		back = since_back < INTEL_HDMI_HPD_BACK_MS;
++		connector->hpd_back = back;
++	}
++	if (back) {
++		low = jiffies_to_msecs(connector->hpd_back_at - connector->hpd_down_at);
++		if (READ_ONCE(connector->output_set_up) &&
++		    time_after_eq(connector->hpd_down_at, set_up_at))
++			set_up_to_drop = jiffies_to_msecs(connector->hpd_down_at - set_up_at);
++	}
++	answers = intel_hdmi_hpd_drop_answers(set_up_to_drop);
++	waits = intel_hdmi_scdc_settle_waits(settle, back, since_back, answers);
++
++	if (back && settle && !connector->hpd_back_said) {
++		connector->hpd_back_said = true;
++		if (waits)
++			drm_info(display->drm,
++				 "[CONNECTOR:%d:%s] Sink's TMDS config 0x%02x doesn't match the link %u ms after its HPD came back, from %u ms low that no modeset of this output explains: the modeset waits for a look %u ms or more after HPD came back (scdc_settle_ms)\n",
++				 connector->base.base.id, connector->base.name, config,
++				 since_back, low, settle);
++		else if (answers)
++			drm_info(display->drm,
++				 "[CONNECTOR:%d:%s] Sink's TMDS config 0x%02x doesn't match the link %u ms after its HPD came back, from %u ms low that began %ld ms after a modeset of this output, its answer to it: modeset now\n",
++				 connector->base.base.id, connector->base.name, config,
++				 since_back, low, set_up_to_drop);
++	}
++	if (waits)
++		connector->hdmi_scdc_deferred = true;
++	else
++		connector->hpd_back = false;
++	return waits;
++}
++
+ /*
+  * Hades: whether intel_ddi_hotplug() looks at an HDMI sink's SCDC once more
+  * after the pass $retries of a hotplug (0: the hotplug itself). Four times
+@@ -4873,6 +4938,10 @@ static int intel_hdmi_reset_link(struct intel_encoder *encoder,
+ 	    crtc_state->hdmi_scrambling)
+ 		return 0;
+ 
++	/* Hades: not yet where the sink's HPD has just come back (intel_hdmi_scdc_settle.h) */
++	if (scdc_recheck && intel_hdmi_scdc_settle(connector, config))
++		return 0;
++
+ 	/*
+ 	 * HDMI 2.0 says that one should not send scrambled data
+ 	 * prior to configuring the sink scrambling, and that
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 88197fb74..e3887c213 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -618,6 +618,20 @@ struct intel_connector {
+ 	 * connected since hpd_low_since (intel_hdmi_detect, i915.hpd_hold_ms) */
+ 	bool hpd_held;
+ 	unsigned long hpd_low_since;
++	/*
++	 * Hades: i915.scdc_settle_ms (intel_hdmi_scdc_settle.h): the sink's HPD as
++	 * intel_hdmi_detect() last saw it (low since hpd_down_at), when it came back (hpd_back_at,
++	 * held in hpd_back until intel_hdmi_reset_link() has made or decided its modeset), whether
++	 * the kernel log said that, and when this output was last set up (intel_ddi_enable_hdmi(),
++	 * output_set_up_at)
++	 */
++	bool hpd_down;
++	bool hpd_back;
++	bool hpd_back_said;
++	bool output_set_up;
++	unsigned long hpd_down_at;
++	unsigned long hpd_back_at;
++	unsigned long output_set_up_at;
+ 
+ 	/* since POLL and HPD connectors may use the same HPD line keep the native
+ 	   state of connector->polled in case hotplug storm detection changes it */
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index 25710e4ef..d586f26ec 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -3811,6 +3811,29 @@ static bool intel_hdmi_hpd_hold(struct intel_connector *connector)
+ 	return false;
+ }
+ 
++/*
++ * Hades: when the sink's HPD went low, and when it came back, for i915.scdc_settle_ms
++ * (intel_hdmi_scdc_settle.h). On display version 11 and later from the live HPD of the port, as
++ * the hold of hpd_hold_ms; before that, from the EDID that detect reads or not.
++ */
++static void intel_hdmi_hpd_low(struct intel_connector *connector)
++{
++	if (connector->hpd_down)
++		return;
++	connector->hpd_down = true;
++	connector->hpd_down_at = jiffies;
++}
++
++static void intel_hdmi_hpd_high(struct intel_connector *connector)
++{
++	if (!connector->hpd_down)
++		return;
++	connector->hpd_down = false;
++	connector->hpd_back_at = jiffies;
++	connector->hpd_back = true;
++	connector->hpd_back_said = false;
++}
++
+ static enum drm_connector_status
+ intel_hdmi_detect(struct drm_connector *_connector, bool force)
+ {
+@@ -3834,6 +3857,7 @@ intel_hdmi_detect(struct drm_connector *_connector, bool force)
+ 
+ 	if (DISPLAY_VER(display) >= 11 &&
+ 	    !intel_digital_port_connected(encoder)) {
++		intel_hdmi_hpd_low(connector); /* Hades */
+ 		/* big-fella: a short HPD drop isn't an unplug (hpd_hold_ms) */
+ 		if (intel_hdmi_hpd_hold(connector))
+ 			status = connector_status_connected;
+@@ -3850,6 +3874,11 @@ intel_hdmi_detect(struct drm_connector *_connector, bool force)
+ 
+ 	if (intel_hdmi_set_edid(&connector->base))
+ 		status = connector_status_connected;
++	/* Hades: i915.scdc_settle_ms (intel_hdmi_scdc_settle.h) */
++	if (status == connector_status_connected)
++		intel_hdmi_hpd_high(connector);
++	else
++		intel_hdmi_hpd_low(connector);
+ 
+ out:
+ 	intel_display_power_put(display, POWER_DOMAIN_GMBUS, wakeref);
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+new file mode 100644
+index 000000000..f5bab193f
+--- /dev/null
++++ b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Hades: i915.scdc_settle_ms (xe.scdc_settle_ms), the modeset that sets up again the scrambled link
++ * of an HDMI sink whose HPD has just come back (issue #28).
++ *
++ * A sink that drops HPD resets its SCDC: TMDS_Config reads 0, and it cannot read a scrambled link
++ * until the source writes it again, which intel_hdmi_reset_link() does with a full modeset at the
++ * looks of intel_ddi_hotplug() (at the hotplug, then once a second for 4 s: linux-9934, 9936,
++ * 9981). The first look after a drop is the hotplug of HPD coming back. An Anthem AVM 90 drops
++ * HPD for ~1.0 s when it switches to another input and back, and a modeset at that moment never
++ * shows: the AVM is not ready yet; its SCDC reads back locked, and it shows "No signal" for good.
++ * The output turned off and on once more, any time from ~0.3 s after HPD came back, brings the
++ * picture back every time (corgeone's measurement: the picture ~3.2 s after the input switch).
++ *
++ * So that modeset waits until HPD has been back this long: the look that it waits through is not
++ * counted (hdmi_scdc_deferred, linux-9981), and a later look, a second apart, makes it. Not where
++ * the drop is the sink's answer to the output: a TV that drops HPD as it changes picture mode
++ * (an LG G5, ~0.4 s after a Dolby Vision or refresh rate change: linux-9934) began its drop
++ * within INTEL_HDMI_HPD_ANSWER_MS of a modeset of this output, and has its link set up again at
++ * once, as before. The wait is for a drop that no modeset explains: an AV receiver that switches
++ * inputs, a display turned on. 0 turns it off.
++ */
++#ifndef __INTEL_HDMI_SCDC_SETTLE_H__
++#define __INTEL_HDMI_SCDC_SETTLE_H__
++
++#include <linux/types.h>
++
++/* a drop of HPD that begins this soon after a modeset of the output is the sink's answer to it */
++#define INTEL_HDMI_HPD_ANSWER_MS		3000
++/* the longest wait: the looks after a hotplug end some 14 s after it (hdmi_scdc_look_again()) */
++#define INTEL_HDMI_SCDC_SETTLE_MAX_MS	10000
++/* a look later than this after HPD came back is not one of the looks of that hotplug */
++#define INTEL_HDMI_HPD_BACK_MS		15000
++
++/*
++ * The drop of HPD is the sink's answer to the output. @set_up_to_drop_ms: from the last modeset of
++ * the output to the start of the drop; negative where the drop came first, or either is not known.
++ */
++static inline bool intel_hdmi_hpd_drop_answers(long set_up_to_drop_ms)
++{
++	return set_up_to_drop_ms >= 0 && set_up_to_drop_ms <= INTEL_HDMI_HPD_ANSWER_MS;
++}
++
++/*
++ * The modeset that sets up the link again waits for a later look:
++ * @settle_ms: i915.scdc_settle_ms (0: never; above INTEL_HDMI_SCDC_SETTLE_MAX_MS, that)
++ * @back: HPD came back, and no modeset has been decided since
++ * @since_back_ms: since it came back
++ * @answers: intel_hdmi_hpd_drop_answers() of that drop
++ */
++static inline bool intel_hdmi_scdc_settle_waits(unsigned int settle_ms, bool back,
++							unsigned int since_back_ms, bool answers)
++{
++	if (!settle_ms || !back || answers)
++		return false;
++	if (settle_ms > INTEL_HDMI_SCDC_SETTLE_MAX_MS)
++		settle_ms = INTEL_HDMI_SCDC_SETTLE_MAX_MS;
++	return since_back_ms < settle_ms;
++}
++
++#endif /* __INTEL_HDMI_SCDC_SETTLE_H__ */
+diff --git a/drivers/gpu/drm/tests/Makefile b/drivers/gpu/drm/tests/Makefile
+index d52af2f71..de914f9f8 100644
+--- a/drivers/gpu/drm/tests/Makefile
++++ b/drivers/gpu/drm/tests/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_DRM_KUNIT_TEST) += \
+ 	drm_edid_eeodb_test.o \
+ 	drm_hdmi_gmp_hdr_test.o \
+ 	drm_hdmi_vsif_test.o \
++	drm_hdmi_scdc_settle_test.o \
+ 	drm_dp_mst_helper_test.o \
+ 	drm_exec_test.o \
+ 	drm_format_helper_test.o \
+diff --git a/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+new file mode 100644
+index 000000000..b35b8369c
+--- /dev/null
++++ b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Hades: KUnit tests of intel_hdmi_scdc_settle.h, i915.scdc_settle_ms (issue #28): which drops of
++ * HPD are the sink's answer to a modeset of the output, and when the modeset that sets up the link
++ * again waits, with the looks of intel_ddi_hotplug() (at the hotplug, then a second apart) as they
++ * come after an AV receiver's input switch and after an LG G5's answer to a Dolby Vision start.
++ */
++#include <kunit/test.h>
++
++#include "../i915/display/intel_hdmi_scdc_settle.h"
++
++static void drm_test_scdc_settle_answers(struct kunit *test)
++{
++	/* not known, or the drop first */
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_hpd_drop_answers(-1));
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_hpd_drop_answers(0));
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_hpd_drop_answers(400));	/* LG G5 (linux-9934) */
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_hpd_drop_answers(INTEL_HDMI_HPD_ANSWER_MS));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_hpd_drop_answers(INTEL_HDMI_HPD_ANSWER_MS + 1));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_hpd_drop_answers(600000));	/* an input switch */
++}
++
++static void drm_test_scdc_settle_waits(struct kunit *test)
++{
++	/* off, no drop seen, or the sink's answer: never */
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_scdc_settle_waits(0, true, 0, false));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_scdc_settle_waits(500, false, 0, false));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_scdc_settle_waits(500, true, 50, true));
++	/* a drop that no modeset explains: until HPD has been back that long */
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_scdc_settle_waits(500, true, 0, false));
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_scdc_settle_waits(500, true, 499, false));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_scdc_settle_waits(500, true, 500, false));
++	/* no longer than the looks last */
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_scdc_settle_waits(60000, true, 9999, false));
++	KUNIT_EXPECT_FALSE(test,
++			   intel_hdmi_scdc_settle_waits(60000, true, INTEL_HDMI_SCDC_SETTLE_MAX_MS,
++							false));
++}
++
++/*
++ * The look that makes the modeset, in ms after HPD came back: the looks come at the hotplug (some
++ * 60 ms after HPD, the time of the EDID read), then a second apart; the first one at which the
++ * modeset does not wait makes it. -1: none of 14.
++ */
++static int settle_modeset_at(unsigned int settle_ms, long set_up_to_drop_ms)
++{
++	const bool answers = intel_hdmi_hpd_drop_answers(set_up_to_drop_ms);
++	unsigned int look;
++
++	for (look = 0; look < 14; look++) {
++		const unsigned int at = 60 + look * 1000;
++
++		if (!intel_hdmi_scdc_settle_waits(settle_ms, true, at, answers))
++			return at;
++	}
++	return -1;
++}
++
++static void drm_test_scdc_settle_looks(struct kunit *test)
++{
++	/* issue #28: the AVM 90 back after an input switch, the last modeset minutes before */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(500, 180000), 1060);
++	/* ... no modeset of the output known: the same */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(500, -1), 1060);
++	/* an LG G5 that dropped HPD 0.4 s after a Dolby Vision start: at once, as before */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(500, 400), 60);
++	/* off: at once */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(0, 180000), 60);
++	/* a longer wait, a whole number of looks */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(1500, 180000), 2060);
++	/* the longest wait still ends within the looks */
++	KUNIT_EXPECT_EQ(test, settle_modeset_at(4000000000u, 180000), 10060);
++}
++
++static struct kunit_case drm_hdmi_scdc_settle_tests[] = {
++	KUNIT_CASE(drm_test_scdc_settle_answers),
++	KUNIT_CASE(drm_test_scdc_settle_waits),
++	KUNIT_CASE(drm_test_scdc_settle_looks),
++	{ }
++};
++
++static struct kunit_suite drm_hdmi_scdc_settle_test_suite = {
++	.name = "drm_hdmi_scdc_settle",
++	.test_cases = drm_hdmi_scdc_settle_tests,
++};
++
++kunit_test_suite(drm_hdmi_scdc_settle_test_suite);
++
++MODULE_DESCRIPTION("KUnit tests of i915.scdc_settle_ms (Hades)");
++MODULE_LICENSE("Dual MIT/GPL");
+-- 
+2.53.0
+

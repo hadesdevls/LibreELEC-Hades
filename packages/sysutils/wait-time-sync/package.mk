@@ -9,6 +9,13 @@ PKG_URL=""
 PKG_DEPENDS_TARGET="make:host gcc:host"
 PKG_LONGDESC="A simple tool and systemd service to wait until NTP time is synced"
 
+post_makeinstall_target() {
+  # Hades: the wait of "Wait for network before starting Kodi" (kodi-waitonnetwork.service)
+  mkdir -p ${INSTALL}/usr/lib/libreelec
+  cp ${PKG_DIR}/scripts/network-wait ${INSTALL}/usr/lib/libreelec
+  chmod 0755 ${INSTALL}/usr/lib/libreelec/network-wait
+}
+
 post_install() {
   enable_service wait-time-sync.service
 }

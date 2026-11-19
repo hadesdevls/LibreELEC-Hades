@@ -1,0 +1,522 @@
+From 070daf905aed301c763e1b2472738890295d6855 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:07:35 +0000
+Subject: [PATCH] nvidia-drm: a flip held until a time (NV_FLIP_TIME_RAW_NS),
+ and Media VRR (NV_VRR_MEDIA)
+
+A client that plays a video with VRR active (VRR_ENABLED) wants each picture to
+start at its time: every 41.708 ms for 23.976 fps, or every 20.854 ms where
+each picture goes twice (a display whose VRR starts at 40 Hz). With VRR active,
+NVKMS starts a frame when a flip arrives, so a flip that leaves the CPU when a
+timer fires starts its frame when the timer fired and the commit went through.
+
+NVKMS can do better, and has the means already. The window channel of every
+NVDisplay HAL (Volta on, so Turing to Blackwell) takes a timestamp with a flip
+(validTimeStampBits 64, nvkms-evo3.c), and the flip of a layer with a non-zero
+timeStamp is held by the display engine "until PTIMER >= timeStamp"
+(NvKmsFlipCommonParams, SET_PRESENT_CONTROL TIMESTAMP_MODE). KAPI never set it.
+Blackwell also has Media VRR: a refresh rate, fractional, that a flip asks for
+and the display engine keeps by itself (NVKMS_REQUESTED_VRR_TYPE_MEDIA,
+targetRefreshRate with its divider of 1.001, supportsVirtualRefreshRate).
+KAPI never asked for it either.
+
+Three properties of the CRTC:
+- NV_FLIP_TIME_RAW_NS (every head): the earliest time at which the flip of the
+  commit may be shown, in ns of CLOCK_MONOTONIC_RAW, the CPU clock of RM's
+  GPU-CPU time correlation (the one NVKMS uses to turn the raster generator's
+  timestamps into CPU time). KAPI turns it into PTIMER time with that
+  correlation, read again once a second at most, and puts it in the main
+  layer's timeStamp. It holds for one commit: a duplicated state has 0. A time
+  more than a second from the correlation's reading, or a correlation that
+  cannot be read, holds nothing: the flip goes out as before.
+- NV_VRR_MEDIA (where the GPU has Media VRR): the mode set of the head asks
+  for NVKMS_REQUESTED_VRR_TYPE_MEDIA instead of gaming VRR. A change of it is a
+  mode set. Without VRR_ENABLED the head keeps the refresh rate of its mode,
+  as before.
+- NV_VRR_MEDIA_TARGET (likewise): the refresh rate that the flips ask for
+  while VRR is active (Hz << 1, bit 0 for the divider of 1.001); NVKMS
+  validates it against the display's VRR range.
+
+Nothing changes for a client that does not set them: their defaults are 0,
+and KAPI asks for gaming VRR, as before. Kodi's "Video at its own rate with VRR
+(no change of mode)" sets them.
+
+Checked: the five modules build against Linux 7.3.5 with the compiler of the
+image; the patch applies with --fuzz=0 after the series before it, from
+nvidia-open-kernel-modules-9072 to 9075. Not run on a GPU: whether the display engine starts a VRR frame at the time of a held flip,
+and the offset of RM's correlation, are measured on hardware by the log of
+Kodi's presentation.
+---
+ kernel-open/common/inc/nvkms-kapi.h           | 27 +++++
+ kernel-open/nvidia-drm/nvidia-drm-crtc.c      | 62 ++++++++++++
+ kernel-open/nvidia-drm/nvidia-drm-crtc.h      |  8 ++
+ kernel-open/nvidia-drm/nvidia-drm-drv.c       | 28 ++++++
+ kernel-open/nvidia-drm/nvidia-drm-priv.h      |  7 ++
+ .../kapi/include/nvkms-kapi-internal.h        | 14 +++
+ .../kapi/interface/nvkms-kapi.h               | 27 +++++
+ src/nvidia-modeset/kapi/src/nvkms-kapi.c      | 99 +++++++++++++++++++
+ 8 files changed, 272 insertions(+)
+
+diff --git a/kernel-open/common/inc/nvkms-kapi.h b/kernel-open/common/inc/nvkms-kapi.h
+index 29968a7..3113022 100644
+--- a/kernel-open/common/inc/nvkms-kapi.h
++++ b/kernel-open/common/inc/nvkms-kapi.h
+@@ -191,6 +191,12 @@ struct NvKmsKapiDeviceResourcesInfo {
+ 
+         NvBool supportsColorPassthrough;
+ 
++        /*
++         * Hades: the GPU has Media VRR, a refresh rate programmed at flip time
++         * (NVKMS supportsVirtualRefreshRate: Blackwell): hadesVrrMedia.
++         */
++        NvBool hadesSupportsVirtualRefreshRate;
++
+         NvBool contiguousPhysicalMappings;
+ 
+         /*
+@@ -482,6 +488,27 @@ struct NvKmsKapiHeadModeSetConfig {
+      * NV_HDMI_VRR_OFF, whose change needs a mode set.
+      */
+     NvBool hadesHdmiVrrOff;
++
++    /*
++     * Hades: the earliest time at which the flip of this head may be shown, in
++     * nanoseconds of CLOCK_MONOTONIC_RAW (the CPU clock of RM's GPU-CPU time
++     * correlation); 0 for none. KmsFlip() turns it into the PTIMER time of the
++     * main layer's timeStamp ("block the flip until PTIMER >= timeStamp"). With
++     * VRR active the display engine then starts the frame at that time. A time
++     * more than a second from now is not taken. nvidia-drm sets it from
++     * NV_FLIP_TIME_RAW_NS, for one commit.
++     */
++    NvU64 hadesFlipTimeRawNs;
++
++    /*
++     * Hades: Media VRR for the mode set of this head (NVKMS_REQUESTED_VRR_TYPE_MEDIA,
++     * where the GPU has it: hadesSupportsVirtualRefreshRate), from NV_VRR_MEDIA;
++     * a change of it needs a mode set. And the refresh rate that its flips ask
++     * for while VRR is active, from NV_VRR_MEDIA_TARGET: the rate in Hz shifted
++     * left by one, with bit 0 for the divider of 1.001 (0: the rate of the mode).
++     */
++    NvBool hadesVrrMedia;
++    NvU16 hadesVrrMediaTarget;
+ };
+ 
+ /* Hades: the route of getHdr10PlusRoutes() that asks for hadesHdmiVrrOff */
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-crtc.c b/kernel-open/nvidia-drm/nvidia-drm-crtc.c
+index b2dd046..fbe63cb 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-crtc.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-crtc.c
+@@ -1927,6 +1927,18 @@ static int nv_drm_atomic_crtc_get_property(
+     const struct nv_drm_crtc_state *nv_drm_crtc_state =
+         to_nv_crtc_state_const(state);
+ 
++    /* Hades: NV_FLIP_TIME_RAW_NS, NV_VRR_MEDIA, NV_VRR_MEDIA_TARGET */
++    if (property == nv_dev->nv_crtc_hades_flip_time_property) {
++        *val = nv_drm_crtc_state->hades_flip_time;
++        return 0;
++    } else if (property == nv_dev->nv_crtc_hades_vrr_media_property) {
++        *val = nv_drm_crtc_state->hades_vrr_media;
++        return 0;
++    } else if (property == nv_dev->nv_crtc_hades_vrr_media_target_property) {
++        *val = nv_drm_crtc_state->hades_vrr_media_target;
++        return 0;
++    }
++
+     if (property == nv_dev->nv_crtc_regamma_tf_property) {
+         *val = nv_drm_crtc_state->regamma_tf;
+         return 0;
+@@ -1964,6 +1976,18 @@ static int nv_drm_atomic_crtc_set_property(
+         to_nv_crtc_state(state);
+     NvBool replaced = false;
+ 
++    /* Hades: NV_FLIP_TIME_RAW_NS, NV_VRR_MEDIA, NV_VRR_MEDIA_TARGET */
++    if (property == nv_dev->nv_crtc_hades_flip_time_property) {
++        nv_drm_crtc_state->hades_flip_time = val;
++        return 0;
++    } else if (property == nv_dev->nv_crtc_hades_vrr_media_property) {
++        nv_drm_crtc_state->hades_vrr_media = !!val;
++        return 0;
++    } else if (property == nv_dev->nv_crtc_hades_vrr_media_target_property) {
++        nv_drm_crtc_state->hades_vrr_media_target = (NvU16)val;
++        return 0;
++    }
++
+     if (property == nv_dev->nv_crtc_regamma_tf_property) {
+         if (val != nv_drm_crtc_state->regamma_tf) {
+             nv_drm_crtc_state->regamma_tf = val;
+@@ -2666,6 +2690,10 @@ nv_drm_atomic_crtc_duplicate_state(struct drm_crtc *crtc)
+         drm_property_blob_get(nv_state->regamma_lut);
+     }
+     nv_state->regamma_divisor = nv_old_state->regamma_divisor;
++    /* Hades: the time of a flip is one commit's; Media VRR stays */
++    nv_state->hades_flip_time = 0;
++    nv_state->hades_vrr_media = nv_old_state->hades_vrr_media;
++    nv_state->hades_vrr_media_target = nv_old_state->hades_vrr_media_target;
+     nv_state->regamma_drm_lut_surface = nv_old_state->regamma_drm_lut_surface;
+     if (nv_state->regamma_drm_lut_surface) {
+         kref_get(&nv_state->regamma_drm_lut_surface->base.refcount);
+@@ -2902,6 +2930,18 @@ static int nv_drm_crtc_atomic_check(struct drm_crtc *crtc,
+         }
+     }
+ 
++    /*
++     * Hades: Media VRR is chosen by the mode set of the head (KAPI vrrType): a
++     * change of NV_VRR_MEDIA is a mode set, so a commit without
++     * DRM_MODE_ATOMIC_ALLOW_MODESET that changes it is refused
++     * (drm_atomic_check_only())
++     */
++    if (req_config->modeSetConfig.hadesVrrMedia !=
++        nv_crtc_state->hades_vrr_media) {
++        req_config->modeSetConfig.hadesVrrMedia = nv_crtc_state->hades_vrr_media;
++        crtc_state->mode_changed = true;
++    }
++
+     if (crtc_state->mode_changed) {
+         drm_mode_to_nvkms_display_mode(&crtc_state->mode,
+                                        &req_config->modeSetConfig.mode);
+@@ -2941,6 +2981,10 @@ static int nv_drm_crtc_atomic_check(struct drm_crtc *crtc,
+ 
+ #if defined(NV_DRM_CRTC_STATE_HAS_VRR_ENABLED)
+     req_config->modeSetConfig.vrrEnabled = crtc_state->vrr_enabled;
++    /* Hades: the time of this commit's flip, and the rate of Media VRR */
++    req_config->modeSetConfig.hadesFlipTimeRawNs = nv_crtc_state->hades_flip_time;
++    req_config->modeSetConfig.hadesVrrMediaTarget =
++        nv_crtc_state->hades_vrr_media_target;
+     req_config->flags.vrrEnabledChanged =
+         old_crtc_state->vrr_enabled != crtc_state->vrr_enabled;
+ #endif
+@@ -3034,6 +3078,24 @@ static void nv_drm_crtc_install_properties(
+     struct nv_drm_crtc *nv_crtc = to_nv_crtc(crtc);
+     struct nv_drm_crtc_state *nv_crtc_state = to_nv_crtc_state(crtc->state);
+ 
++    /*
++     * Hades: NV_FLIP_TIME_RAW_NS on every head (the window channels of NVKMS
++     * take a timestamp from Volta on); NV_VRR_MEDIA and NV_VRR_MEDIA_TARGET
++     * where the GPU has Media VRR
++     */
++    if (nv_dev->nv_crtc_hades_flip_time_property) {
++        drm_object_attach_property(
++            &crtc->base, nv_dev->nv_crtc_hades_flip_time_property, 0);
++    }
++    if (nv_dev->hadesSupportsVirtualRefreshRate &&
++        nv_dev->nv_crtc_hades_vrr_media_property &&
++        nv_dev->nv_crtc_hades_vrr_media_target_property) {
++        drm_object_attach_property(
++            &crtc->base, nv_dev->nv_crtc_hades_vrr_media_property, 0);
++        drm_object_attach_property(
++            &crtc->base, nv_dev->nv_crtc_hades_vrr_media_target_property, 0);
++    }
++
+     if (nv_crtc->olut_caps.supported) {
+         if (nv_dev->nv_crtc_regamma_tf_property) {
+             drm_object_attach_property(
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-crtc.h b/kernel-open/nvidia-drm/nvidia-drm-crtc.h
+index b5b9fa7..a00fa23 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-crtc.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-crtc.h
+@@ -180,6 +180,14 @@ struct nv_drm_crtc_state {
+ 
+     NvBool postcomp_color_passthrough;
+     NvBool postcomp_color_passthrough_changed;
++
++    /*
++     * Hades: NV_FLIP_TIME_RAW_NS (one commit: not carried into the next
++     * state), NV_VRR_MEDIA and NV_VRR_MEDIA_TARGET
++     */
++    NvU64 hades_flip_time;
++    NvBool hades_vrr_media;
++    NvU16 hades_vrr_media_target;
+ };
+ 
+ static inline struct nv_drm_crtc_state *to_nv_crtc_state(struct drm_crtc_state *state)
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index 1a3c678..94a269f 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -694,6 +694,32 @@ static int nv_drm_create_properties(struct nv_drm_device *nv_dev)
+         return -ENOMEM;
+     }
+ 
++    /*
++     * Hades: NV_FLIP_TIME_RAW_NS, the earliest time at which the flip of a
++     * commit may be shown, in ns of CLOCK_MONOTONIC_RAW (0: none; one commit);
++     * NV_VRR_MEDIA, Media VRR for the mode set of the head where the GPU has it;
++     * and NV_VRR_MEDIA_TARGET, the refresh rate that its flips ask for while VRR
++     * is active (Hz << 1, bit 0 for the divider of 1.001). See
++     * hadesFlipTimeRawNs, hadesVrrMedia and hadesVrrMediaTarget of KAPI.
++     */
++    nv_dev->nv_crtc_hades_flip_time_property =
++        drm_property_create_range(nv_dev->dev, 0, "NV_FLIP_TIME_RAW_NS",
++                                  0, U64_MAX);
++    if (nv_dev->nv_crtc_hades_flip_time_property == NULL) {
++        return -ENOMEM;
++    }
++    nv_dev->nv_crtc_hades_vrr_media_property =
++        drm_property_create_bool(nv_dev->dev, 0, "NV_VRR_MEDIA");
++    if (nv_dev->nv_crtc_hades_vrr_media_property == NULL) {
++        return -ENOMEM;
++    }
++    nv_dev->nv_crtc_hades_vrr_media_target_property =
++        drm_property_create_range(nv_dev->dev, 0, "NV_VRR_MEDIA_TARGET",
++                                  0, 2047);
++    if (nv_dev->nv_crtc_hades_vrr_media_target_property == NULL) {
++        return -ENOMEM;
++    }
++
+     // Dithering mode property
+     nv_dev->nv_connector_dithering_mode_property =
+         drm_property_create_enum(nv_dev->dev, 0,
+@@ -1047,6 +1073,8 @@ static int nv_drm_dev_load(struct drm_device *dev)
+     nv_dev->supportsSyncpts = resInfo.caps.supportsSyncpts;
+ 
+     nv_dev->supportsColorPassthrough = resInfo.caps.supportsColorPassthrough;
++    nv_dev->hadesSupportsVirtualRefreshRate =
++        resInfo.caps.hadesSupportsVirtualRefreshRate;
+ 
+     nv_dev->isSocDgpuDisplayNeedingWar = resInfo.caps.isSocDgpuDisplayNeedingWar;
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index 671d901..f7556ab 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -173,6 +173,8 @@ struct nv_drm_device {
+ 
+     NvBool supportsSyncpts;
+     NvBool supportsColorPassthrough;
++    /* Hades: Media VRR (NV_VRR_MEDIA) */
++    NvBool hadesSupportsVirtualRefreshRate;
+     NvBool isSocDgpuDisplayNeedingWar;
+     NvBool subOwnershipGranted;
+     NvBool hasFramebufferConsole;
+@@ -212,6 +214,11 @@ struct nv_drm_device {
+     struct drm_property *nv_crtc_regamma_lut_size_property;
+     struct drm_property *nv_crtc_regamma_divisor_property;
+ 
++    /* Hades: NV_FLIP_TIME_RAW_NS, NV_VRR_MEDIA, NV_VRR_MEDIA_TARGET */
++    struct drm_property *nv_crtc_hades_flip_time_property;
++    struct drm_property *nv_crtc_hades_vrr_media_property;
++    struct drm_property *nv_crtc_hades_vrr_media_target_property;
++
+     struct drm_property *nv_crtc_color_passthrough_property;
+ 
+     struct drm_property *nv_connector_dithering_mode_property;
+diff --git a/src/nvidia-modeset/kapi/include/nvkms-kapi-internal.h b/src/nvidia-modeset/kapi/include/nvkms-kapi-internal.h
+index 4cdfe36..cf106d0 100644
+--- a/src/nvidia-modeset/kapi/include/nvkms-kapi-internal.h
++++ b/src/nvidia-modeset/kapi/include/nvkms-kapi-internal.h
+@@ -134,8 +134,22 @@ struct NvKmsKapiDevice {
+         NvBool supportsColorPassthrough;
+ 
+         NvBool supportsFlipSynchronizedInfoframes;
++
++        /* Hades: NVKMS supportsVirtualRefreshRate (Media VRR) */
++        NvBool hadesSupportsVirtualRefreshRate;
+     } caps;
+ 
++    /*
++     * Hades: the last GPU-CPU time correlation of RM (PTIMER and
++     * CLOCK_MONOTONIC_RAW, in ns), for hadesFlipTimeRawNs
++     * (HadesFlipTimeToPtimer()); failed: it could not be read, said once.
++     */
++    struct {
++        NvU64 cpuNs;
++        NvU64 gpuNs;
++        NvBool failed;
++    } hadesTime;
++
+     NvU64 supportedSurfaceMemoryFormats[NVKMS_KAPI_LAYER_MAX];
+     NvBool supportsICtCp[NVKMS_KAPI_LAYER_MAX];
+ 
+diff --git a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+index 29968a7..3113022 100644
+--- a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
++++ b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+@@ -191,6 +191,12 @@ struct NvKmsKapiDeviceResourcesInfo {
+ 
+         NvBool supportsColorPassthrough;
+ 
++        /*
++         * Hades: the GPU has Media VRR, a refresh rate programmed at flip time
++         * (NVKMS supportsVirtualRefreshRate: Blackwell): hadesVrrMedia.
++         */
++        NvBool hadesSupportsVirtualRefreshRate;
++
+         NvBool contiguousPhysicalMappings;
+ 
+         /*
+@@ -482,6 +488,27 @@ struct NvKmsKapiHeadModeSetConfig {
+      * NV_HDMI_VRR_OFF, whose change needs a mode set.
+      */
+     NvBool hadesHdmiVrrOff;
++
++    /*
++     * Hades: the earliest time at which the flip of this head may be shown, in
++     * nanoseconds of CLOCK_MONOTONIC_RAW (the CPU clock of RM's GPU-CPU time
++     * correlation); 0 for none. KmsFlip() turns it into the PTIMER time of the
++     * main layer's timeStamp ("block the flip until PTIMER >= timeStamp"). With
++     * VRR active the display engine then starts the frame at that time. A time
++     * more than a second from now is not taken. nvidia-drm sets it from
++     * NV_FLIP_TIME_RAW_NS, for one commit.
++     */
++    NvU64 hadesFlipTimeRawNs;
++
++    /*
++     * Hades: Media VRR for the mode set of this head (NVKMS_REQUESTED_VRR_TYPE_MEDIA,
++     * where the GPU has it: hadesSupportsVirtualRefreshRate), from NV_VRR_MEDIA;
++     * a change of it needs a mode set. And the refresh rate that its flips ask
++     * for while VRR is active, from NV_VRR_MEDIA_TARGET: the rate in Hz shifted
++     * left by one, with bit 0 for the divider of 1.001 (0: the rate of the mode).
++     */
++    NvBool hadesVrrMedia;
++    NvU16 hadesVrrMediaTarget;
+ };
+ 
+ /* Hades: the route of getHdr10PlusRoutes() that asks for hadesHdmiVrrOff */
+diff --git a/src/nvidia-modeset/kapi/src/nvkms-kapi.c b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+index ba4e19a..ba1d50d 100644
+--- a/src/nvidia-modeset/kapi/src/nvkms-kapi.c
++++ b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+@@ -56,6 +56,7 @@
+ #include <ctrl/ctrl2080/ctrl2080gpu.h> /* NV2080_CTRL_CMD_GPU_GET_INFO_V2 */
+ #include <ctrl/ctrl2080/ctrl2080fb.h> /* NV2080_CTRL_CMD_FB_GET_SEMAPHORE_SURFACE_LAYOUT */
+ #include <ctrl/ctrl2080/ctrl2080unix.h> /* NV2080_CTRL_CMD_OS_UNIX_GC6_BLOCKER_REFCNT */
++#include <ctrl/ctrl2080/ctrl2080tmr.h> /* Hades: NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO */
+ 
+ #include "ctrl/ctrl003e.h" /* NV003E_CTRL_CMD_GET_SURFACE_PHYS_PAGES */
+ #include "ctrl/ctrl0041.h" /* NV0041_CTRL_SURFACE_INFO */
+@@ -516,6 +517,9 @@ static NvBool KmsAllocateDevice(struct NvKmsKapiDevice *device)
+     device->caps.maxCursorSizeInPixels = paramsAlloc->reply.maxCursorSize;
+     device->caps.supportsFlipSynchronizedInfoframes =
+         paramsAlloc->reply.supportsFlipSynchronizedInfoframes;
++    /* Hades: Media VRR (hadesVrrMedia) */
++    device->caps.hadesSupportsVirtualRefreshRate =
++        paramsAlloc->reply.supportsVirtualRefreshRate;
+ 
+     device->caps.supportsColorPassthrough =
+         paramsAlloc->reply.supportsColorPassthrough;
+@@ -1242,6 +1246,8 @@ static NvBool GetDeviceResourcesInfo
+     info->caps.maxCursorSizeInPixels = device->caps.maxCursorSizeInPixels;
+ 
+     info->caps.supportsColorPassthrough = device->caps.supportsColorPassthrough;
++    info->caps.hadesSupportsVirtualRefreshRate =
++        device->caps.hadesSupportsVirtualRefreshRate;
+ 
+     info->caps.pitchAlignment = NV_EVO_PITCH_ALIGNMENT;
+ 
+@@ -3648,6 +3654,15 @@ static NvBool NvKmsKapiRequestedModeSetConfigToKms(
+         /* Hades: NV_HDMI_VRR_OFF of nvidia-drm (nvHadesHdmiVrrLeftOff()) */
+         paramsHead->allowAdaptiveSync = headModeSetConfig->hadesHdmiVrrOff ?
+             NVKMS_ALLOW_ADAPTIVE_SYNC_DISABLED : NVKMS_ALLOW_ADAPTIVE_SYNC_ALL;
++        /*
++         * Hades: Media VRR where the client asks for it and the GPU has it
++         * (NVKMS refuses a mode set that asks for it elsewhere); gaming VRR, as
++         * before, otherwise
++         */
++        paramsHead->vrrType =
++            (headModeSetConfig->hadesVrrMedia &&
++             device->caps.hadesSupportsVirtualRefreshRate) ?
++            NVKMS_REQUESTED_VRR_TYPE_MEDIA : NVKMS_REQUESTED_VRR_TYPE_GAMING;
+ 
+         /* Apply dithering settings */
+         paramsHead->flip.dithering.state = headModeSetConfig->dithering.state;
+@@ -3784,6 +3799,65 @@ static NvBool IsHeadConfigValid(
+     return NV_TRUE;
+ }
+ 
++/*
++ * Hades: the PTIMER time of a time of CLOCK_MONOTONIC_RAW (hadesFlipTimeRawNs),
++ * by RM's GPU-CPU time correlation: the one that NVKMS takes to turn the
++ * timestamps of the raster generator into CPU time (nvUpdateGpuCpuTimeDiff(),
++ * the CPU clock of NV2080_TIMER_GPU_CPU_TIME_CPU_CLK_ID_PLATFORM_API, which RM
++ * reads with os_get_monotonic_time_ns_hr()). Read again once the time asked for
++ * is more than a second from the last reading, so that the two clocks cannot
++ * drift apart. FALSE, and no time for the flip, where the correlation cannot
++ * be read or the time is more than a second from a fresh reading: a time that
++ * far is no time a client asks for its next frames, and the flip is not held
++ * for it.
++ */
++static NvBool HadesFlipTimeToPtimer(struct NvKmsKapiDevice *device,
++                                    NvU64 rawNs,
++                                    NvU64 *pPtimer)
++{
++    const NvU64 window = 1000000000ULL;
++    NvS64 offset;
++
++    if ((device->hadesTime.cpuNs == 0) ||
++        (rawNs > device->hadesTime.cpuNs + window) ||
++        (rawNs + window < device->hadesTime.cpuNs)) {
++        NV2080_CTRL_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO_PARAMS params = { 0 };
++
++        params.cpuClkId =
++            DRF_NUM(2080, _TIMER_GPU_CPU_TIME, _CPU_CLK_ID_SOURCE,
++                    NV2080_TIMER_GPU_CPU_TIME_CPU_CLK_ID_PLATFORM_API) |
++            DRF_NUM(2080, _TIMER_GPU_CPU_TIME, _CPU_CLK_ID_PROCESSOR,
++                    NV2080_TIMER_GPU_CPU_TIME_CPU_CLK_ID_PROCESSOR_CPU);
++        params.sampleCount = 1;
++
++        if ((nvRmApiControl(device->hRmClient,
++                            device->hRmSubDevice,
++                            NV2080_CTRL_CMD_TIMER_GET_GPU_CPU_TIME_CORRELATION_INFO,
++                            &params, sizeof(params)) != NVOS_STATUS_SUCCESS) ||
++            (params.samples[0].cpuTime == 0) ||
++            (params.samples[0].gpuTime == 0)) {
++            if (!device->hadesTime.failed) {
++                nvKmsKapiLogDeviceDebug(
++                    device,
++                    "Hades: the GPU-CPU time correlation could not be read: flips are not held for NV_FLIP_TIME_RAW_NS");
++                device->hadesTime.failed = NV_TRUE;
++            }
++            return NV_FALSE;
++        }
++        device->hadesTime.cpuNs = params.samples[0].cpuTime;
++        device->hadesTime.gpuNs = params.samples[0].gpuTime;
++    }
++
++    if ((rawNs > device->hadesTime.cpuNs + window) ||
++        (rawNs + window < device->hadesTime.cpuNs)) {
++        return NV_FALSE;
++    }
++
++    offset = (NvS64)(rawNs - device->hadesTime.cpuNs);
++    *pPtimer = (NvU64)((NvS64)device->hadesTime.gpuNs + offset);
++    return NV_TRUE;
++}
++
+ static NvBool KmsFlip(
+     struct NvKmsKapiDevice *device,
+     const struct NvKmsKapiRequestedModeSetConfig *requestedConfig,
+@@ -3910,6 +3984,31 @@ static NvBool KmsFlip(
+             flipParams->allowVrr = NV_TRUE;
+         }
+ 
++        /*
++         * Hades: the refresh rate of Media VRR that this flip asks for
++         * (NV_VRR_MEDIA_TARGET; NVKMS validates it against the display's VRR
++         * range and ignores it where the head has no Media VRR), and the time
++         * until which the display engine holds the flip of the main layer
++         * (NV_FLIP_TIME_RAW_NS: HadesFlipTimeToPtimer())
++         */
++        if (headModeSetConfig->vrrEnabled &&
++            (headModeSetConfig->hadesVrrMediaTarget != 0) &&
++            device->caps.hadesSupportsVirtualRefreshRate) {
++            flipParams->targetRefreshRate =
++                headModeSetConfig->hadesVrrMediaTarget >> 1;
++            flipParams->targetRefreshRateDivider =
++                (headModeSetConfig->hadesVrrMediaTarget & 1) != 0;
++        }
++        if (headModeSetConfig->hadesFlipTimeRawNs != 0) {
++            NvU64 ptimer = 0;
++
++            if (HadesFlipTimeToPtimer(device,
++                                      headModeSetConfig->hadesFlipTimeRawNs,
++                                      &ptimer)) {
++                flipParams->layer[NVKMS_MAIN_LAYER].timeStamp = ptimer;
++            }
++        }
++
+         if (device->lutCaps.olut.supported && headRequestedConfig->flags.olutChanged) {
+             flipParams->olut.specified = TRUE;
+             flipParams->olut.enabled = headModeSetConfig->olut.enabled;
+-- 
+2.53.0
+

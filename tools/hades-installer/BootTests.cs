@@ -12,8 +12,10 @@ namespace Hades.Installer
     {
         // The two menus as scripts/mkimage of 1.0 writes them (the lines that matter here), with a wait and the options:
         // gmp, dce: the value of each option in every entry that starts the system; crlf: Windows line ends
-        static string Syslinux(string timeout, string say, string gmp = "0", string dce = "0", bool crlf = false, string extra = "")
+        static string Syslinux(string timeout, string say, string gmp = "0", string dce = "0", bool crlf = false, string extra = "",
+                               string audio = null)
         {
+            dce += audio == null ? "" : " i915.pcon_hd_audio=" + audio;
             string t = "# hades-features: storage-anywhere other-disks-hidden boot-choices\n" +
                        "SAY Wait for run mode to start automatically in " + say + "\nSAY\nDEFAULT run\n" + timeout + "PROMPT 1\n" +
                        "INCLUDE /hades/menu.cfg\n\nLABEL run\n  MENU LABEL Run (recommended)\n  KERNEL /KERNEL\n" +
@@ -24,13 +26,14 @@ namespace Hades.Installer
             return crlf ? t.Replace("\n", "\r\n") : t;
         }
 
-        static string Grub(string timeout, string gmp = "0", string dce = "0")
+        static string Grub(string timeout, string gmp = "0", string dce = "0", string audio = null)
         {
             Func<string, string, string> entry = delegate(string name, string args)
             {
                 return "menuentry \"" + name + "\" --class hades-x {\n\tterminal_output console\n\tlinux /KERNEL " + args + "\n}\n";
             };
-            string options = " i915.hdmi_hdr_gmp=" + gmp + " amdgpu.dvbridge_dce=" + dce;
+            string options = " i915.hdmi_hdr_gmp=" + gmp + " amdgpu.dvbridge_dce=" + dce +
+                             (audio == null ? "" : " i915.pcon_hd_audio=" + audio);
             return "# hades-features: storage-anywhere other-disks-hidden boot-choices\n" + timeout + "set default=\"Run\"\n" +
                    entry("Run", "boot=UUID=0511-0515 grub_portable quiet lockdown=integrity" + options) +
                    entry("Run (internal disks read-only)", "boot=UUID=0511-0515 grub_portable quiet" + options) +
@@ -112,6 +115,12 @@ namespace Hades.Installer
                 Grub("set timeout=\"05\"\n", "1"), "read/5/");
             one("an option with another value", Syslinux("TIMEOUT 050\n", say5, "2"), Grub("set timeout=\"05\"\n", "2"), "read/5/");
             one("none at all", null, null, "unread/0/");
+            one("with the option of the sound on", Syslinux("TIMEOUT 030\n", say3, "0", "0", false, "", "1"),
+                Grub("set timeout=\"03\"\n", "0", "0", "1"), "read/3/i915.pcon_hd_audio");
+            one("with all three options on", Syslinux("TIMEOUT 030\n", say3, "1", "1", false, "", "1"),
+                Grub("set timeout=\"03\"\n", "1", "1", "1"), "read/3/i915.hdmi_hdr_gmp,amdgpu.dvbridge_dce,i915.pcon_hd_audio");
+            one("with the option of the sound off (the word with 0)", Syslinux("TIMEOUT 030\n", say3, "0", "0", false, "", "0"),
+                Grub("set timeout=\"03\"\n", "0", "0", "0"), "read/3/");
             // (the installer entry does not count: on there alone is nothing)
             string onlyInstaller = Syslinux("TIMEOUT 050\n", say5).Replace("installer quiet systemd.debug_shell vga=current", "installer quiet i915.hdmi_hdr_gmp=1");
             one("an option on in the installer entry only", onlyInstaller, null, "read/5/");
@@ -127,7 +136,7 @@ namespace Hades.Installer
         // (they start at 1 MiB and are 4 MiB long), as an image of 1.0 has them at 5 s with the options off. feature: it
         // says boot-choices; words: how many places carry the two option words (6 in an image of 1.0); timeouts: how many
         // TIMEOUT lines.
-        static byte[] BootImage(bool feature, int words, int timeouts, out long[] wait, out long[] gmp)
+        static byte[] BootImage(bool feature, int words, int timeouts, out long[] wait, out long[] gmp, bool audio = false)
         {
             long[] unused;
             byte[] img = MakeImage(4, true, out unused, 4, true, 1);
@@ -144,7 +153,7 @@ namespace Hades.Installer
             gmp = new long[words];
             for (int i = 0; i < words; ++i)
             {
-                Put(img, places[i], " quiet i915.hdmi_hdr_gmp=0 amdgpu.dvbridge_dce=0\n");
+                Put(img, places[i], " quiet i915.hdmi_hdr_gmp=0 amdgpu.dvbridge_dce=0" + (audio ? " i915.pcon_hd_audio=0" : "") + "\n");
                 gmp[i] = places[i] + " quiet i915.hdmi_hdr_gmp=".Length;
             }
             wait = new long[] { sy + syslinux.IndexOf("TIMEOUT ") + 8, gr + 14,
@@ -253,6 +262,42 @@ namespace Hades.Installer
                           Engine.Patches(plan, false, true, null, false, old).Count == 9);
             }
 
+            // the option of the sound (i915.pcon_hd_audio): carried into an image that has its word; an image made before
+            // it (the words of 1.0 only) is still one this installer updates, and the option is not carried there nor said
+            {
+                long[] w3, g3;
+                File.WriteAllBytes(raw, BootImage(true, 6, 1, out w3, out g3, true));
+                ImagePlan withAudio = Engine.Plan(raw, true, null, null);
+                File.WriteAllBytes(raw, BootImage(true, 6, 1, out w3, out g3));
+                ImagePlan before = Engine.Plan(raw, true, null, null);
+                var audioOn = BootMenus.FromText(Syslinux("TIMEOUT 050\n", BootMenus.Words(5), "0", "0", false, "", "1"),
+                                                 Grub("set timeout=\"05\"\n", "0", "0", "1"));
+                List<Patch> carried3 = BootMenus.Keep(withAudio, audioOn);
+                bool sixOnes = carried3.Count == 6 && audioOn.NotCarried.Count == 0;
+                foreach (Patch p in carried3) sixOnes &= withAudio.OptionOffsets[2].Contains(p.Offset) && Encoding.ASCII.GetString(p.Bytes) == "1";
+                bool beforeTaken = !Throws(delegate { BootMenus.Keep(before, audioOn); });
+                List<Patch> beforePatches = beforeTaken ? BootMenus.Keep(before, audioOn) : null;
+                var said = new BootKept();
+                said.Old = audioOn; said.ImageKnows = true; said.ImageWait = 5; said.Patches = 0;
+                bool spanish3 = L.Spanish;
+                L.Spanish = false;
+                string nothingSaid = said.Text();
+                List<Patch> again = BootMenus.Keep(withAudio, audioOn);
+                string saidEn = said.Text();
+                L.Spanish = true;
+                string saidEs = said.Text();
+                L.Spanish = spanish3;
+                Check("the option of the sound: an image with its word has six of them and an update from menus with it on writes " +
+                      "the six 1s; an image of 1.0 without the word is still updated, the option is not carried and the last panel " +
+                      "does not say it; with the image that carries it, the panel says it (\"" + saidEn + "\")",
+                      withAudio.OptionOffsets[2].Count == 6 && before.OptionOffsets[2].Count == 0 && sixOnes && beforeTaken &&
+                          beforePatches.Count == 0 && audioOn.NotCarried.Count == 0 && nothingSaid == "" && again.Count == 6 &&
+                          saidEn == "The boot menu starts with surround sound through the USB-C adapter, as before the update." &&
+                          saidEs == "El menú de arranque arranca con sonido envolvente por el adaptador USB-C, como antes de la actualización.");
+                BootMenus.Keep(before, audioOn);
+                Check("the option of the sound, not carried into an image without its word, is said so for the log",
+                      audioOn.NotCarried.Count == 1 && audioOn.NotCarried[0] == "i915.pcon_hd_audio");
+            }
             // images whose lines are not the ones this installer knows, and older images
             Func<bool, int, int, ImagePlan> plan2 = delegate(bool feature, int words, int timeouts)
             {
@@ -460,6 +505,119 @@ namespace Hades.Installer
             File.Delete(without);
             File.Delete(before);
             File.Delete(updated);
+        }
+
+        // The kernel line of the diagnostics (initcall_debug, Engine.DiagnosticsKernelLine): an image of 1.0 with the choices
+        // and, on the eight entries of its two menus, the word at 0; words: how many. Two of them at the chunks of the scan,
+        // which start at 1 MiB and are 4 MiB long: one whole at the end of a chunk, in what the scan carries over to the next
+        // (found there again, and to be counted once), one across the end of a chunk (whole only in the next one).
+        static byte[] DiagLineImage(int words, out long[] value, out long[] buffer, bool withBuffer = true, string unit = "M")
+        {
+            long[] wait, gmp;
+            byte[] img = BootImage(true, 6, 1, out wait, out gmp);
+            string text = withBuffer ? " vga=current initcall_debug=0 log_buf_len=0" + unit + "\n" : " vga=current initcall_debug=0\n";
+            long[] places = { P1 * S + 60000, P1 * S + 61000, P1 * S + 62000, P1 * S + 63000, 25L * 1048576 - text.Length - 1,
+                              33L * 1048576 - 20, 45L * 1048576, 60L * 1048576, 62L * 1048576 };
+            value = new long[words];
+            buffer = new long[withBuffer ? words : 0];
+            for (int i = 0; i < words; ++i)
+            {
+                Put(img, places[i], text);
+                value[i] = places[i] + " vga=current initcall_debug=".Length;
+                if (withBuffer) buffer[i] = places[i] + " vga=current initcall_debug=0 log_buf_len=".Length;
+            }
+            return img;
+        }
+
+        // Found on the eight entries; set to 1 with the diagnostics, and only then; not carried by an update; left as it is
+        // where the image has another number of words, or was not read through
+        static void DiagLine(string directory)
+        {
+            string raw = Path.Combine(directory, "diagline.img"), packed = raw + ".gz";
+            long[] value, buffer;
+            byte[] img = DiagLineImage(BootMenus.DiagLineEntries, out value, out buffer);
+            File.WriteAllBytes(raw, img);
+            using (var f = File.Create(packed))
+            using (var gz = new System.IO.Compression.GZipStream(f, System.IO.Compression.CompressionMode.Compress))
+                gz.Write(img, 0, img.Length);
+            var all = new List<long>(value);
+            all.AddRange(buffer);
+            foreach (string path in new[] { raw, packed })
+            {
+                string kind = Engine.IsGzip(path) ? "compressed" : "uncompressed";
+                ImagePlan plan = Engine.Plan(path, true, null, null);
+                bool found = plan.DiagLineOffsets.Count == value.Length && plan.DiagBufferOffsets.Count == buffer.Length;
+                for (int i = 0; found && i < value.Length; ++i) found &= plan.DiagLineOffsets[i] == value[i] && plan.DiagBufferOffsets[i] == buffer[i];
+                Check(kind + " image with the kernel line of the diagnostics: the eight words of each of its two are found where they " +
+                      "are, each once (those at the end of a chunk of the scan too), and the six of each option of Kodi's display are " +
+                      "still found", found && plan.OptionOffsets[0].Count == 6 && plan.OptionOffsets[1].Count == 6 && plan.SwitchOffset >= 0);
+
+                List<Patch> on = Engine.Patches(plan, false, true, null, true), off = Engine.Patches(plan, false, true, null, false);
+                bool ones = on.Count == 1 + all.Count;
+                foreach (long v in all)
+                {
+                    bool there = false;
+                    foreach (Patch p in on) there |= p.Offset == v && Encoding.ASCII.GetString(p.Bytes) == "1";
+                    ones &= there;
+                }
+                Check(kind + " image: with the diagnostics, the switch and the sixteen values at 1 (" + on.Count + " patches); without " +
+                      "them, nothing (" + off.Count + ")", ones && off.Count == 0);
+
+                var target = new ProbeStream(Disk(P1Size * S));
+                var part = new Engine.Target();
+                part.Stream = target; part.Capacity = P1Size * S; part.From = plan.System.Start; part.Length = plan.System.Size;
+                Engine.Write(plan, new[] { part }, on, null, null);
+                var sys = new byte[P1Size * S];
+                target.Position = 0;
+                target.Read(sys, 0, sys.Length);
+                long differ = 0;
+                for (int i = 0; i < sys.Length; ++i) differ += sys[i] != img[P1 * S + i] ? 1 : 0;
+                bool written = true;
+                foreach (long v in value) written &= Encoding.ASCII.GetString(sys, (int)(v - P1 * S), 2) == "1 ";
+                foreach (long v in buffer) written &= Encoding.ASCII.GetString(sys, (int)(v - P1 * S), 3) == "1M\n";
+                Check(kind + " image written with the diagnostics: the menus say initcall_debug=1 log_buf_len=1M, and nothing else " +
+                      "differs but the name of the switch (" + differ + " bytes)", part.Result.Verified && written && differ == all.Count + 2);
+
+                // an update: the old menus had the diagnostics on (and the Intel option); the box is off now
+                const string there2 = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+                var old = BootMenus.FromText(Syslinux("TIMEOUT 050\n", BootMenus.Words(5), "1", "0", false, " initcall_debug=1 log_buf_len=1M"),
+                                             Grub("set timeout=\"05\"\n", "1", "0"));
+                List<Patch> update = Engine.Patches(plan, false, false, there2, false, old);
+                bool untouched = true;
+                foreach (Patch p in update) untouched &= !all.Contains(p.Offset);
+                Check(kind + " image: an update keeps the option of Kodi's display that the old menus had on, and not the kernel line " +
+                      "of the diagnostics, which follows the box (" + Choices(old) + ")",
+                      untouched && Choices(old) == "read/5/i915.hdmi_hdr_gmp" && update.Count > 0);
+                Check(kind + " image: the log says that the words are set",
+                      Engine.DiagnosticsKernelLineSummary(plan).EndsWith("initcall_debug=1 log_buf_len=1M in its 8 places", StringComparison.Ordinal));
+            }
+
+            // an image read only at its head (a USB drive before Operations reads it through), one of 1.0 without the words, ones
+            // with seven or nine places, and one with initcall_debug alone
+            ImagePlan head = Engine.Plan(raw, false, null, null);
+            Func<int, bool, string, ImagePlan> with = delegate(int words, bool withBuffer, string unit)
+            {
+                long[] v, b;
+                File.WriteAllBytes(raw, DiagLineImage(words, out v, out b, withBuffer, unit));
+                return Engine.Plan(raw, true, null, null);
+            };
+            ImagePlan none = with(0, true, "M"), seven = with(7, true, "M"), nine = with(9, true, "M"), alone = with(8, false, "M");
+            // (log_buf_len in another unit, 0K, is not the word that scripts/mkimage writes: it is not counted)
+            ImagePlan kilo = with(8, true, "K");
+            Check("the kernel line of the diagnostics is left as the image has it where the image was not read through, has no such " +
+                  "words (1.0), has seven or nine places, or has initcall_debug without log_buf_len or with log_buf_len=0K; the switch is " +
+                  "turned all the same",
+                  Engine.DiagnosticsKernelLine(head).Count == 0 && Engine.Patches(head, false, true, null, true).Count == 1 &&
+                      Engine.DiagnosticsKernelLine(none).Count == 0 && Engine.Patches(none, false, true, null, true).Count == 1 &&
+                      Engine.DiagnosticsKernelLine(seven).Count == 0 && Engine.DiagnosticsKernelLine(nine).Count == 0 &&
+                      Engine.DiagnosticsKernelLine(alone).Count == 0 && alone.DiagLineOffsets.Count == 8 && alone.DiagBufferOffsets.Count == 0 &&
+                      Engine.DiagnosticsKernelLine(kilo).Count == 0 && kilo.DiagLineOffsets.Count == 8 && kilo.DiagBufferOffsets.Count == 0 &&
+                      Engine.DiagnosticsKernelLineSummary(seven).Contains("7 and 7 places, 8 of each expected") &&
+                      Engine.DiagnosticsKernelLineSummary(alone).Contains("8 and 0 places") &&
+                      Engine.DiagnosticsKernelLineSummary(none).Contains("not in this image") &&
+                      Engine.DiagnosticsKernelLineSummary(head).Contains("not read through"));
+            File.Delete(raw);
+            File.Delete(packed);
         }
     }
 }

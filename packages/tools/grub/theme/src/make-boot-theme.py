@@ -7,13 +7,14 @@
 # (Jost) and each entry of the menu explained in a line.
 #
 #   make-boot-theme.py --jost <Jost-VariableFont_wght.ttf> --brand <make-brand-images.py> --out <folder>
-#                      --bios-out <folder> [--zopflipng <zopflipng>]
+#                      --bios-out <folder> --splash <folder> [--zopflipng <zopflipng>]
 #
 # writes into <folder> what GRUB reads from EFI/BOOT/hades: theme.cfg (which grub.cfg reads), fonts/
 # (the fonts that GRUB writes its own text with, .pf2, and the licence of Jost), and a folder for each
 # mode that has a theme of its own (SETS; the folder is named WIDTHxHEIGHT), with
-# theme.txt, the background, one picture per entry (icons/<class>.png) and the pieces of the bar of the
-# chosen entry and of the line of the countdown.
+# theme.txt, the background, one picture per entry (icons/<class>.png), the pieces of the bar of the
+# chosen entry and of the line of the countdown, and boot.png, the picture of the start (made from the
+# splash screens of the system in --splash, distributions/LibreELEC/splash: boot_picture).
 #
 # What GRUB can do, and why the theme is made so:
 #   - GRUB draws text only with fonts of one bit per pixel (grub-core/font/font.c), without smoothing.
@@ -23,6 +24,11 @@
 #     its console, with fonts made here from Jost at sizes where one bit per pixel reads well.
 #   - The sizes of a theme are pixels. Each mode in SETS has its own set, and the menu is drawn in the
 #     mode that the firmware is in where it has one (write_cfg): in the common case nothing switches.
+#   - When an entry starts, GRUB clears its terminal (and, with grub-9001 and quiet_start, does so also
+#     when the wait runs out, without writing "Booting `Run'"). The terminal of the theme is the whole
+#     screen and its background is boot.png, the splash screen that the system draws next, as it lands on
+#     that screen: so the screen goes from the menu to that picture at once and nothing moves until the
+#     interface, with no box of the terminal in between (write_cfg).
 #
 # Needs Python 3 with Pillow (FreeType) and NumPy, as the brand script does. The same files every time.
 import argparse
@@ -321,6 +327,38 @@ def background(W, H, s, dy, d):
     return B.to8(img)
 
 
+def boot_picture(W, H):
+    """The picture of the start on a screen of WxH: what the init draws next on that screen, pixel for pixel. The init
+    takes the splash screen of the height of the screen, or the one of 1080 lines where there is none of that height
+    (load_splash), and ply-image "fit" (plymouth-lite-9000) makes it as large as fits with its own proportions, with
+    the pixels that ply_image_resize() picks (the size is worked out in integers, the step in a C float), not at all
+    where it fits as it is, and puts it in the middle of black (left and top halved down). Returns RGB in 8 bits, and
+    the name of the picture it was made from."""
+    name = "splash-%d.png" % H
+    path = os.path.join(ARGS.splash, name)
+    if not os.path.exists(path):
+        name = "splash-1080.png"
+        path = os.path.join(ARGS.splash, name)
+    src = np.asarray(Image.open(path).convert("RGB"))
+    h, w = src.shape[:2]
+    if w * H > h * W:
+        nw, nh = W, h * W // w
+    else:
+        nw, nh = w * H // h, H
+    nw, nh = max(1, nw), max(1, nh)
+    if (nw, nh) == (w, h):
+        scaled = src
+    else:
+        sx, sy = np.float32(float(w) / nw), np.float32(float(h) / nh)
+        xs = (np.arange(nw, dtype=np.float32) * sx).astype(np.int64)
+        ys = (np.arange(nh, dtype=np.float32) * sy).astype(np.int64)
+        scaled = src[ys][:, xs]
+    out = np.zeros((H, W, 3), np.uint8)
+    left, top = (W - nw) // 2, (H - nh) // 2
+    out[top:top + nh, left:left + nw] = scaled
+    return out, name
+
+
 # "Horizon", the look chosen on 2026-11-03 out of three (the other two: the composition of the splash
 # screen with a table under it, and the splash screen with a short chooser under a line of light): a
 # title card, the eclipse large at the right, its light falling on a column at the left with a heading
@@ -357,6 +395,8 @@ def theme_set(name, W, H, d):
     for e in ENTRIES:
         save("%s/icons/%s.png" % (name, e[0]), row_picture(e, iw, row_h, s, d))
     gap = int(round(d["row_gap"] * s))
+    boot, made_from = boot_picture(W, H)
+    save(name + "/boot.png", boot)
     fname = "Jost Regular %d" % count_px
     lines = [
         "# LibreELEC Hades: the boot menu on a screen of %dx%d (written by make-boot-theme.py)" % (W, H),
@@ -364,6 +404,11 @@ def theme_set(name, W, H, d):
         'desktop-image: "background.png"',
         'desktop-color: "#000000"',
         'terminal-font: "%s"' % fname,
+        "# (the terminal is the whole screen, and theme.cfg gives it boot.png as its background, the splash",
+        "# screen of the system on this screen (%s): GRUB clears the terminal when an entry starts, and" % made_from,
+        "# the screen is then that picture, not a black box over the menu)",
+        'terminal-left: "0"', 'terminal-top: "0"', 'terminal-width: "100%"', 'terminal-height: "100%"',
+        'terminal-border: "0"',
         "+ boot_menu {",
         "  left = %d" % mx, "  top = %d" % int(round(d["menu_y"] * s + dy)),
         "  width = %d" % mw, "  height = %d" % (len(ENTRIES) * (row_h + gap)),
@@ -479,11 +524,32 @@ def write_cfg(made):
     the terminal says it got (gfxterm_mode, grub-9000; a GRUB that does not say it gets the text menu).
     Every entry of grub.cfg starts with "terminal_output console", which gives the screen back to the
     mode that the firmware had where GRUB switched it (grub_video_gop_fini), so that the kernel starts in
-    the mode it started in before, in every case."""
+    the mode it started in before, in every case; where nothing was switched it leaves the screen as it is
+    (the console of the firmware writes nothing until it has text to write: term/efi/console.c), and an
+    error of an entry is written there, on the picture, as before.
+
+    Where a theme is used, the picture of the start is the background of its terminal (background_image),
+    and quiet_start is set (grub-9001): when an entry starts, by a key or when the wait runs out, GRUB
+    clears the terminal, which the theme makes the whole screen, and the screen is that picture. It is
+    the user's own oemsplash where the boot partition has one, found as the init finds it (load_splash)
+    and stretched over the screen as the init stretches it; or else boot.png of the set. Where it cannot
+    be loaded, quiet_start is not set: the entries start as before.
+
+    The fonts are loaded from hades_fonts: with Secure Boot GRUB is locked down (lockdown=y) and refuses a
+    font from a disk (the shim_lock verifier, grub-core/kern/efi/sb.c), so it takes them from the memdisk
+    that packages/tools/grub puts into bootx64.efi, the same files; otherwise from the boot partition, as
+    before. A GRUB without that memdisk, locked down, loads none: the text menu, as before."""
     lines = [
         "# LibreELEC Hades: the look of the boot menu (packages/tools/grub/theme, written by",
         "# make-boot-theme.py). A theme is used only in the mode it is drawn for, and the mode of the",
         "# firmware is kept where it has one.",
+        "# The fonts: GRUB started with Secure Boot is locked down and loads a font only from inside its",
+        "# own program (the memdisk of bootx64.efi, packages/tools/grub); otherwise the ones here.",
+        'if [ "${lockdown}" = "y" ]; then',
+        '  set hades_fonts="(memdisk)/fonts"',
+        "else",
+        '  set hades_fonts="${prefix}/hades/fonts"',
+        "fi",
     ]
     fonts = []
     for _, _, _, fname in made:
@@ -496,10 +562,12 @@ def write_cfg(made):
         for i, (name, W, H, _) in enumerate(sets):
             out.append('%s%s [ "${gfxterm_mode}" = "%dx%d" ]; then' % (indent, "if" if i == 0 else "elif", W, H))
             out.append('%s  set theme="${prefix}/hades/%s/theme.txt"' % (indent, name))
+            out.append('%s  set hades_boot="${prefix}/hades/%s/boot.png"' % (indent, name))
+            out.append('%s  set hades_lines="%d"' % (indent, H))
         return out
 
-    lines.append('if loadfont "${prefix}/hades/fonts/%s"; then' % fonts[0])
-    lines += ['  loadfont "${prefix}/hades/fonts/%s"' % f for f in fonts[1:]]
+    lines.append('if loadfont "${hades_fonts}/%s"; then' % fonts[0])
+    lines += ['  loadfont "${hades_fonts}/%s"' % f for f in fonts[1:]]
     # (the terminal writes with the font that gfxterm_font names, or else with the last one loaded,
     # here the largest: with it the terminal does not start, "glyphs too large to fit on screen"
     # (gfxterm.c), measured in QEMU. The smallest one, which fits every mode of the list.)
@@ -511,6 +579,30 @@ def write_cfg(made):
               "    if terminal_output gfxterm; then"]
     lines += pick("      ", [m for m in made if (m[1], m[2]) in FALLBACK])
     lines += ["      else", "        terminal_output console", "      fi", "    fi", "  fi", "fi"]
+    # (GRUB's script has no && in a condition: the ifs are nested. A test of a file without a device is a
+    # test of the boot partition, the root that GRUB was started from.)
+    lines += [
+        "# The picture of the start, the background of the terminal (see make-boot-theme.py: write_cfg)",
+        'if [ -n "${theme}" ]; then',
+        '  if [ -f "/oemsplash-${hades_lines}.png" ]; then',
+        '    set hades_start="/oemsplash-${hades_lines}.png"',
+        '  elif [ -f "/oemsplash-1080.png" ]; then',
+        '    set hades_start="/oemsplash-1080.png"',
+        '  elif [ -f "/oemsplash.png" ]; then',
+        '    set hades_start="/oemsplash.png"',
+        "  fi",
+        '  if [ -n "${hades_start}" ]; then',
+        '    if background_image "${hades_start}"; then',
+        "      set quiet_start=1",
+        "    fi",
+        "  fi",
+        '  if [ "${quiet_start}" != "1" ]; then',
+        '    if background_image -m normal "${hades_boot}"; then',
+        "      set quiet_start=1",
+        "    fi",
+        "  fi",
+        "fi",
+    ]
     with open(os.path.join(ARGS.out, "theme.cfg"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
@@ -522,6 +614,8 @@ def main():
     p.add_argument("--brand", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--bios-out", required=True, help="the folder of the BIOS menu (syslinux)")
+    p.add_argument("--splash", required=True,
+                   help="the splash screens of the system (distributions/LibreELEC/splash), for boot.png")
     p.add_argument("--zopflipng", help="zopflipng, to make every picture smaller without changing a pixel")
     ARGS = p.parse_args()
     B = load_brand(ARGS.brand, ARGS.jost)

@@ -1,7 +1,7 @@
 // LibreELEC Hades installer for Windows: its tests. --selftest writes images to files and to memory, never
-// to a disk; --capture draws the window with made-up disks, in both languages; --list says how the disks of
-// this PC are classified, reading nothing from them. What they write is for whoever works on the program:
-// it is in English.
+// to a disk; --capture draws the window with made-up disks, in both languages. What they write is for whoever
+// works on the program: it is in English. They are built only into LibreELEC-Hades-Installer-tests.exe
+// (build.ps1, /define:HADES_TESTS), never into the program that is published.
 // SPDX-License-Identifier: GPL-2.0-or-later
 using System;
 using System.Collections.Generic;
@@ -277,6 +277,14 @@ namespace Hades.Installer
             output = new StreamWriter(Path.Combine(directory, "selftest.txt"), false, new UTF8Encoding(false));
             try
             {
+                // (the mutation tests of Secure Boot run only its part: HADES_SELFTEST_ONLY=secureboot)
+                if (Environment.GetEnvironmentVariable("HADES_SELFTEST_ONLY") == "secureboot")
+                {
+                    SecureBootParts(directory, realImage);
+                    Say(failures > 0 ? "FAILED: " + failures : notRun > 0 ? "PASSED, BUT " + notRun + " PART(S) NOT RUN: see above" : "ALL PASSED");
+                    output.Close();
+                    return failures;
+                }
                 long[] hideAt;
                 byte[] img = MakeImage(4, true, out hideAt);
                 string raw = Path.Combine(directory, "synthetic.img"), packed = raw + ".gz";
@@ -407,6 +415,8 @@ namespace Hades.Installer
                 BootText();
                 BootMarked();
                 BootPatches(directory);
+                DiagLine(directory);
+                FirmwareBootChecks();
                 File.WriteAllBytes(raw, MakeImage(3, false, out unused));
                 ImagePlan odd = Engine.Plan(raw, true, null, null);
                 Check("an image whose menus are not the known ones (3 entries that hide disks) is not installed on an internal disk, " +
@@ -460,6 +470,7 @@ namespace Hades.Installer
                 WindowsMount();
                 Classification(realImage);
                 if (realImage != null) Real(directory, realImage);
+                SecureBootParts(directory, realImage);
                 foreach (string f in new[] { raw, packed, raw + ".sha256", Path.Combine(directory, "internal.img") })
                     File.Delete(f);
             }
@@ -1602,6 +1613,9 @@ namespace Hades.Installer
         public static int Capture(string directory, string image)
         {
             captureFailures = 0;
+            Directory.CreateDirectory(directory);
+            captureSecureImage = MakeSbImage(directory, "sb-capture.img", false, false, false, false);
+            File.WriteAllText(captureSecureImage.Path + ".sha256", Sha(captureSecureImage.Image, 0, captureSecureImage.Image.Length) + "  sb-capture.img" + (char)10);
             // the window in each language, at the three scales that matter, light and dark. The first (100 %, light) is
             // in the folders "en" and "es"; the others in "en-150", "en-200", "en-dark" and so on. The scale is the one
             // that is drawn: what the display has is not asked.
@@ -1619,10 +1633,12 @@ namespace Hades.Installer
                     CaptureIn(Path.Combine(directory, (spanish ? "es" : "en") + set.Name), image);
                 }
             }
+            foreach (string f in new[] { captureSecureImage.Path, captureSecureImage.Path + ".sha256" }) File.Delete(f);
             return captureFailures;
         }
 
         static int captureFailures;
+        static SbSynth captureSecureImage;
 
         static void CaptureIn(string directory, string image)
         {
@@ -1836,8 +1852,13 @@ namespace Hades.Installer
                 File.WriteAllText(Path.Combine(directory, "6-state.txt"), "update ready: " + form.UpdateReady + "; scanning: " +
                                   form.Scanning + "; status: " + form.StatusText + "\r\n");
                 Save(form, Path.Combine(directory, "6-usb-with-hades.png"));
+                // "Restart into LibreELEC Hades" in the notice of a USB drive that has Hades, with its box for a shortcut off (ticked and fixed
+                // only where this desktop has that shortcut already); not while it is updated
+                bool made = FirmwareBoot.ShortcutMade;
+                bool restartUsb = form.RestartOffered && form.RestartInNotice && form.ShortcutBoxesTicked == made;
                 form.ShowWorking(300);
                 Save(form, Path.Combine(directory, "17-updating.png"));
+                bool restartOffWorking = !form.RestartOffered;
                 form.EndWorking();
                 using (ConfirmForm confirm = MainForm.AskUpdate(has, Path.GetFileName(image ?? L.T("image", "imagen"))))
                 {
@@ -1863,6 +1884,7 @@ namespace Hades.Installer
                 kept.Files = 137;
                 form.ShowDone(has, Place.Usb, true, kept);
                 Save(form, Path.Combine(directory, "8-updated.png"));
+                bool restartDone = form.DoneRestartOffered && form.ShortcutBoxesTicked == made;
                 // (and with the choices of its boot menus carried: 3 s and HDR over HDMI on the Intel graphics)
                 kept.Boot = new BootKept();
                 kept.Boot.Old = BootMenus.FromText(Syslinux("TIMEOUT 030\n", BootMenus.Words(3), "1"), Grub("set timeout=\"03\"\n", "1"));
@@ -1879,46 +1901,39 @@ namespace Hades.Installer
                 kept.Boot.Patches = 0;
                 form.ShowDone(has, Place.Usb, true, kept);
                 Save(form, Path.Combine(directory, "8c-updated-boot-menu-before-1.0.png"));
+                // ... and with the panel gone: not for a drive without Hades; under the options of a disk inside the PC that has Hades
+                // (next to files: made up for this, and taken back), with either way of installing
+                form.HideDone();
+                Pump(delegate { return true; }, 1);
+                form.SelectDisk(stick);
+                Pump(delegate { return true; }, 1);
+                bool restartNotWithout = !form.RestartOffered;
+                second.HasHades = true;
+                bool restartInside = false;
+                try
+                {
+                    form.ShowInternal();
+                    Pump(delegate { return !form.Scanning; }, 180);
+                    restartInside = form.SelectDisk(second);
+                    form.ChooseBeside();
+                    Pump(delegate { return true; }, 1);
+                    restartInside &= form.RestartOffered && !form.RestartInNotice;
+                    Save(form, Path.Combine(directory, "6b-internal-with-hades.png"));
+                    form.ChooseWhole();
+                    Pump(delegate { return true; }, 1);
+                    restartInside &= form.RestartOffered;
+                }
+                finally { second.HasHades = false; }
+                bool restartOk = restartUsb && restartOffWorking && restartDone && restartNotWithout && restartInside;
+                if (!restartOk) ++captureFailures;
+                File.WriteAllText(Path.Combine(directory, "32-restart-state.txt"),
+                                  (restartOk ? "ok:   " : "FAIL: ") + "\"Restart into LibreELEC Hades\" next to the drive. In the notice of a USB " +
+                                  "drive that has Hades, with its box for a shortcut off (the desktop has the shortcut already: " + made + "): " +
+                                  restartUsb + "; not while it is updated: " + restartOffWorking + "; in the panel of an update: " + restartDone +
+                                  "; not for a drive without Hades: " + restartNotWithout + "; under the options of a disk inside the PC that " +
+                                  "has Hades, both ways: " + restartInside + "\r\n");
             }
-        }
-
-        // How the disks of this PC are classified. Nothing is read from them but what Windows says of them.
-        // image: the path of an image, as if it had been chosen in the window (it is not opened).
-        public static int ListDisks(string file, string image)
-        {
-            L.Spanish = false;
-            using (var w = new StreamWriter(file, false, new UTF8Encoding(false)))
-            {
-                Keep keep = Disks.Keeping(image);
-                List<string> guarded = Disks.Protected();
-                w.WriteLine("UEFI: " + Native.Uefi + "; Secure Boot: " + Pc.SecureBoot + "; administrator: " + Pc.Elevated +
-                            "; letters that are not touched: " + new string(keep.Letters.ToArray()) + "; protected disks: " + guarded.Count);
-                w.WriteLine("Windows (" + keep.Windows + ":) is on disk " + string.Join(", ", keep.WindowsDisks) +
-                            "; what is kept is, by where its volumes are, on:");
-                var told = new List<string>();
-                foreach (Extent e in keep.Extents)
-                {
-                    string line = "   disk " + e.Disk + " at " + e.Offset + ", " + e.Length + " bytes";
-                    if (!told.Contains(line)) { told.Add(line); w.WriteLine(line); }
-                }
-                foreach (string path in new[] { Application.ExecutablePath, image })
-                {
-                    if (path == null) continue;
-                    var on = new List<string>();
-                    foreach (Extent e in Native.Extents(path)) on.Add("disk " + e.Disk + " at " + e.Offset);
-                    w.WriteLine("   " + path + ": " + (on.Count > 0 ? string.Join(", ", on) : "NOT KNOWN (only its letter counts)"));
-                }
-                foreach (DiskInfo d in Disks.List())
-                {
-                    w.WriteLine("disk " + d.Number + ": " + d.Title + "; " + d.Detail + "; partitions " + d.Partitions.Count +
-                                "; style " + d.PartitionStyle);
-                    w.WriteLine("   USB: " + (d.Size <= 0 ? "no medium" : Disks.Classify(d, Place.Usb, 1L << 30, keep, guarded) ?? "OFFERED"));
-                    string inside = d.Size <= 0 ? "no medium" : Disks.Classify(d, Place.Internal, 1L << 30, keep, guarded);
-                    string whole = Disks.Refusal(d, Place.Internal, 1L << 30, keep, guarded, true);
-                    w.WriteLine("   internal: " + (inside ?? (whole == null ? "OFFERED" : "OFFERED TO MAKE ROOM ONLY (not whole: " + whole + ")")));
-                }
-            }
-            return 0;
+            CaptureSecure(directory, stick, has);
         }
     }
 }

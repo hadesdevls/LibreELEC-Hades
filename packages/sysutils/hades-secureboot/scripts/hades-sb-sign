@@ -1,0 +1,596 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present Hades
+#
+# LibreELEC Hades: the Authenticode signature of a UEFI program (GRUB, the kernel) with the Secure Boot key of
+# this computer, and the check of such a signature.
+#
+# Why this and not sbsign: sbsigntools needs gnu-efi, the headers of binutils and the ccan library to be built for
+# the target; this needs the Python and the openssl program that the system has already. It makes the same bytes
+# as sbsign 0.9.4 (Debian 13, Ubuntu 26.04) for the same file, key, certificate and signing time: the same regions
+# of the file are hashed (sbsigntools src/image.c, image_find_regions(), including its padding to 8 bytes and its
+# "endjunk" region), the same PKCS#7 structure is written (src/idc.c, IDC_set(), and the attributes that OpenSSL's
+# PKCS7_sign_add_signer() and PKCS7_dataFinal() add: contentType, signingTime, messageDigest and the
+# SMIMECapabilities of OpenSSL 3), and the same PE checksum (image_pecoff_update_checksum()). The tests of the
+# build compare the two byte for byte. The private key is used only by openssl (pkeyutl -sign); nothing here does
+# RSA by itself.
+#
+# Usage:
+#   hades-sb-sign sign --key KEY --cert CERT --in FILE --out FILE [--signing-time YYMMDDHHMMSSZ]
+#   hades-sb-sign verify --cert CERT --in FILE        exactly one signature, made with CERT, over this file
+#   hades-sb-sign check --anchor CA --in FILE [--anchor CA ...]
+#                                                     every signature, each up to one of the anchors (tests)
+#   hades-sb-sign hash --in FILE                      the Authenticode SHA-256 of the file
+# KEY may have text before its PEM block (the key slot of the storage, /storage/.hades-secureboot/key). CERT is
+# PEM or DER. Exit status 0 when it worked, 1 when the file or the signature is not right, 2 on a usage error.
+# Nothing is written to OUT unless the signature was made and checked; OUT is written next to itself and renamed.
+
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+OPENSSL = os.environ.get("HADES_SB_OPENSSL", "/usr/bin/openssl")
+
+# ---- DER
+
+
+def der_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def tlv(tag, content):
+    return bytes([tag]) + der_len(len(content)) + content
+
+
+def seq(*parts):
+    return tlv(0x30, b"".join(parts))
+
+
+def der_set(*parts):
+    return tlv(0x31, b"".join(parts))
+
+
+def oid(dotted):
+    n = [int(x) for x in dotted.split(".")]
+    body = bytes([40 * n[0] + n[1]])
+    for v in n[2:]:
+        chunk = [v & 0x7F]
+        v >>= 7
+        while v:
+            chunk.append(0x80 | (v & 0x7F))
+            v >>= 7
+        body += bytes(reversed(chunk))
+    return tlv(0x06, body)
+
+
+NULL = b"\x05\x00"
+
+
+def integer(v):
+    b = v.to_bytes(max(1, (v.bit_length() + 8) // 8), "big")
+    return tlv(0x02, b)
+
+
+def read_tlv(buf, at):
+    """(tag, start of content, end of content) of the element at `at`"""
+    if at + 2 > len(buf):
+        raise ValueError("DER: truncated")
+    tag = buf[at]
+    n = buf[at + 1]
+    at += 2
+    if n & 0x80:
+        k = n & 0x7F
+        if k == 0 or k > 4 or at + k > len(buf):
+            raise ValueError("DER: bad length")
+        n = int.from_bytes(buf[at:at + k], "big")
+        at += k
+    if at + n > len(buf):
+        raise ValueError("DER: element longer than its container")
+    return tag, at, at + n
+
+
+def children(buf, start, end):
+    out = []
+    at = start
+    while at < end:
+        tag, s, e = read_tlv(buf, at)
+        if e > end:
+            raise ValueError("DER: child past its parent")
+        out.append((tag, at, s, e))
+        at = e
+    return out
+
+
+OID_SHA256 = "2.16.840.1.101.3.4.2.1"
+OID_RSA = "1.2.840.113549.1.1.1"
+OID_SIGNED_DATA = "1.2.840.113549.1.7.2"
+OID_CONTENT_TYPE = "1.2.840.113549.1.9.3"
+OID_MESSAGE_DIGEST = "1.2.840.113549.1.9.4"
+OID_SIGNING_TIME = "1.2.840.113549.1.9.5"
+OID_SMIME_CAPS = "1.2.840.113549.1.9.15"
+OID_SPC_INDIRECT = "1.3.6.1.4.1.311.2.1.4"
+OID_SPC_PE_IMAGE = "1.3.6.1.4.1.311.2.1.15"
+
+# "<<<Obsolete>>>" in UTF-16BE, as sbsigntools writes it (idc.c, obsolete[])
+OBSOLETE = "<<<Obsolete>>>".encode("utf-16-be")
+
+# The SMIMECapabilities that OpenSSL 3 puts in a signature made by PKCS7_sign_add_signer() without
+# PKCS7_NOSMIMECAP (sbsign): AES-256, -192 and -128 in CBC, 3DES, RC2 with 128, 64 and 40 bits, DES.
+SMIME_CAPS = seq(
+    seq(oid("2.16.840.1.101.3.4.1.42")),
+    seq(oid("2.16.840.1.101.3.4.1.22")),
+    seq(oid("2.16.840.1.101.3.4.1.2")),
+    seq(oid("1.2.840.113549.3.7")),
+    seq(oid("1.2.840.113549.3.2"), integer(128)),
+    seq(oid("1.2.840.113549.3.2"), integer(64)),
+    seq(oid("1.3.14.3.2.7")),
+    seq(oid("1.2.840.113549.3.2"), integer(40)),
+)
+
+# ---- PE (sbsigntools src/image.c)
+
+
+class Pe:
+    def __init__(self, data):
+        self.buf = bytearray(data)
+        self.parse()
+        self.find_regions()
+        # an image whose regions end past its size (they are rounded to 8 bytes) is padded with zeros and
+        # read again, and the padding is hashed (image_load(): "reparse")
+        if self.data_size > len(self.buf):
+            self.buf += b"\0" * (self.data_size - len(self.buf))
+            self.parse()
+            self.find_regions()
+
+    def u16(self, at):
+        return struct.unpack_from("<H", self.buf, at)[0]
+
+    def u32(self, at):
+        return struct.unpack_from("<I", self.buf, at)[0]
+
+    def parse(self):
+        b = self.buf
+        if len(b) < 64 or b[0:2] != b"MZ":
+            raise ValueError("not a PE file (no MZ header)")
+        pe = self.u32(0x3C)
+        if pe + 24 > len(b) or b[pe:pe + 4] != b"PE\0\0":
+            raise ValueError("not a PE file (no PE header)")
+        machine = self.u16(pe + 4)
+        self.sections = self.u16(pe + 6)
+        opt_size = self.u16(pe + 20)
+        opt = pe + 24
+        magic = self.u16(opt)
+        if machine in (0x8664, 0xAA64):
+            if magic != 0x20B:
+                raise ValueError("invalid a.out machine type")
+            dd = opt + 112
+            min_size = 112
+        elif machine in (0x14C, 0x1C2):
+            if magic != 0x10B:
+                raise ValueError("invalid a.out machine type")
+            dd = opt + 96
+            min_size = 96
+        else:
+            raise ValueError("invalid PE header magic")
+        if opt_size < min_size + 8 * 5:
+            raise ValueError("PE optional header too small for the certificate table entry")
+        self.checksum_at = opt + 64
+        self.header_size = self.u32(opt + 60)
+        self.sigdir_at = dd + 8 * 4
+        self.cert_addr = self.u32(self.sigdir_at)
+        self.cert_table_size = self.u32(self.sigdir_at + 4)
+        self.scn_at = opt + opt_size
+        if self.scn_at + 40 * self.sections > len(b):
+            raise ValueError("section table past the end of the file")
+
+    def find_regions(self):
+        regions = []
+        nbytes = 0
+        regions.append((0, self.checksum_at))
+        nbytes += self.checksum_at + 4
+        regions.append((self.checksum_at + 4, self.sigdir_at - (self.checksum_at + 4)))
+        nbytes += self.sigdir_at - (self.checksum_at + 4) + 8
+        regions.append((self.sigdir_at + 8, self.header_size - (self.sigdir_at + 8)))
+        nbytes += self.header_size - (self.sigdir_at + 8)
+        for i in range(self.sections):
+            s = self.scn_at + 40 * i
+            size = self.u32(s + 16)
+            offset = self.u32(s + 20)
+            if not size:
+                continue
+            regions.append((offset, size))
+            nbytes += size
+        regions.sort(key=lambda r: r[0])
+        if nbytes + self.cert_table_size < len(self.buf):
+            # (sbsign starts the region of what is left at the sum of the sizes, not at the end of the last region)
+            regions.append((nbytes, len(self.buf) - nbytes - self.cert_table_size))
+        last = regions[-1]
+        self.regions = regions
+        self.data_size = (last[0] + last[1] + 7) & ~7
+        for off, size in regions:
+            if off < 0 or size < 0 or off + size > max(len(self.buf), self.data_size):
+                raise ValueError("a region of the file is past its end")
+
+    def digest(self):
+        h = hashlib.sha256()
+        for off, size in self.regions:
+            h.update(bytes(self.buf[off:off + size]))
+        return h.digest()
+
+    def signatures(self):
+        """[(offset of the WIN_CERTIFICATE, PKCS#7 bytes)] of the certificate table"""
+        out = []
+        if not self.cert_table_size:
+            return out
+        at, end = self.cert_addr, self.cert_addr + self.cert_table_size
+        if end > len(self.buf):
+            raise ValueError("the certificate table is past the end of the file")
+        while at + 8 <= end:
+            length, rev, ctype = struct.unpack_from("<IHH", self.buf, at)
+            if length < 8 or at + length > end:
+                break
+            if rev == 0x200 and ctype == 2:
+                out.append((at, bytes(self.buf[at + 8:at + length])))
+            at += (length + 7) & ~7
+        return out
+
+    def signed_bytes(self, pkcs7):
+        """The file with the signature appended, as image_add_signature() and image_write() do"""
+        if self.cert_table_size:
+            raise ValueError("the file is signed already")
+        tot = len(pkcs7) + 8
+        aligned = (tot + 7) & ~7
+        sig = struct.pack("<IHH", tot, 0x200, 2) + pkcs7 + b"\0" * (aligned - tot)
+        out = bytearray(self.buf[:self.data_size])
+        struct.pack_into("<II", out, self.sigdir_at, self.data_size, len(sig))
+        csum = csum_bytes(0, out[:self.checksum_at])
+        csum = csum_bytes(csum, out[self.checksum_at + 4:])
+        csum = csum_bytes(csum, sig)
+        csum = (csum + len(out) + len(sig)) & 0xFFFFFFFF
+        struct.pack_into("<I", out, self.checksum_at, csum)
+        return bytes(out) + sig
+
+
+def csum_bytes(csum, data):
+    n = len(data) // 2
+    for (w,) in struct.iter_unpack("<H", bytes(data[:n * 2])):
+        csum += w
+        csum = (csum >> 16) + (csum & 0xFFFF)
+    if len(data) % 2:
+        csum += data[-1]
+        csum = (csum >> 16) + (csum & 0xFFFF)
+    return csum
+
+# ---- certificates
+
+
+def load_cert(path):
+    raw = open(path, "rb").read()
+    if b"-----BEGIN CERTIFICATE-----" in raw:
+        import base64
+        text = raw.split(b"-----BEGIN CERTIFICATE-----", 1)[1].split(b"-----END CERTIFICATE-----", 1)[0]
+        raw = base64.b64decode(b"".join(text.split()))
+    tag, s, e = read_tlv(raw, 0)
+    if tag != 0x30 or e != len(raw):
+        raise ValueError(path + ": not one X.509 certificate")
+    return raw
+
+
+def cert_issuer_serial(cert):
+    """(issuer Name, serial INTEGER) of a certificate, each as its whole DER element"""
+    _, s, e = read_tlv(cert, 0)
+    tbs = children(cert, s, e)[0]
+    parts = children(cert, tbs[2], tbs[3])
+    i = 1 if parts[0][0] == 0xA0 else 0
+    serial = cert[parts[i][1]:parts[i][3]]
+    issuer = cert[parts[i + 2][1]:parts[i + 2][3]]
+    return issuer, serial
+
+
+def cert_subject_text(cert):
+    _, s, e = read_tlv(cert, 0)
+    tbs = children(cert, s, e)[0]
+    parts = children(cert, tbs[2], tbs[3])
+    i = 1 if parts[0][0] == 0xA0 else 0
+    subj = parts[i + 4]
+    names = []
+    for rdn in children(cert, subj[2], subj[3]):
+        for atv in children(cert, rdn[2], rdn[3]):
+            kids = children(cert, atv[2], atv[3])
+            names.append(cert[kids[1][2]:kids[1][3]].decode("utf-8", "replace"))
+    return "/".join(names)
+
+# ---- openssl
+
+
+def run_openssl(args, stdin=None):
+    p = subprocess.run([OPENSSL] + args, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError("openssl " + args[0] + " failed: " + p.stderr.decode("utf-8", "replace").strip())
+    return p.stdout
+
+
+def rsa_sign(keyfile, digest, work):
+    d = os.path.join(work, "digest")
+    sig = os.path.join(work, "sig")
+    with open(d, "wb") as f:
+        f.write(digest)
+    run_openssl(["pkeyutl", "-sign", "-inkey", keyfile, "-pkeyopt", "digest:sha256", "-in", d, "-out", sig])
+    return open(sig, "rb").read()
+
+
+def rsa_verify(cert_der, digest, signature, work):
+    c = os.path.join(work, "cert.der")
+    pub = os.path.join(work, "pub.pem")
+    d = os.path.join(work, "vdigest")
+    s = os.path.join(work, "vsig")
+    for path, data in ((c, cert_der), (d, digest), (s, signature)):
+        with open(path, "wb") as f:
+            f.write(data)
+    run_openssl(["x509", "-inform", "DER", "-in", c, "-noout", "-pubkey", "-out", pub])
+    p = subprocess.run([OPENSSL, "pkeyutl", "-verify", "-pubin", "-inkey", pub, "-pkeyopt", "digest:sha256",
+                        "-in", d, "-sigfile", s], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode == 0
+
+# ---- the PKCS#7 of Authenticode
+
+
+def spc_indirect(pe_digest):
+    peimage = seq(tlv(0x03, b"\x00"), tlv(0xA0, tlv(0xA2, tlv(0x80, OBSOLETE))))
+    return seq(seq(oid(OID_SPC_PE_IMAGE), peimage), seq(seq(oid(OID_SHA256), NULL), tlv(0x04, pe_digest)))
+
+
+def signed_attributes(idc, signing_time):
+    # (the messageDigest is the hash of the SEQUENCE without its tag and length: idc.c writes buf+2, len-2)
+    _, s, e = read_tlv(idc, 0)
+    content = idc[s:e]
+    attrs = [
+        seq(oid(OID_CONTENT_TYPE), der_set(oid(OID_SPC_INDIRECT))),
+        seq(oid(OID_SIGNING_TIME), der_set(tlv(0x17, signing_time.encode("ascii")))),
+        seq(oid(OID_MESSAGE_DIGEST), der_set(tlv(0x04, hashlib.sha256(content).digest()))),
+        seq(oid(OID_SMIME_CAPS), der_set(SMIME_CAPS)),
+    ]
+    # DER: the elements of a SET OF in the order of their encodings
+    attrs.sort()
+    return b"".join(attrs)
+
+
+def make_pkcs7(pe_digest, cert, keyfile, signing_time, work):
+    idc = spc_indirect(pe_digest)
+    attrs = signed_attributes(idc, signing_time)
+    sig = rsa_sign(keyfile, hashlib.sha256(der_set(attrs)).digest(), work)
+    issuer, serial = cert_issuer_serial(cert)
+    signer = seq(integer(1), seq(issuer, serial), seq(oid(OID_SHA256), NULL), tlv(0xA0, attrs),
+                 seq(oid(OID_RSA), NULL), tlv(0x04, sig))
+    signed = seq(integer(1), der_set(seq(oid(OID_SHA256), NULL)), seq(oid(OID_SPC_INDIRECT), tlv(0xA0, idc)),
+                 tlv(0xA0, cert), der_set(signer))
+    return seq(oid(OID_SIGNED_DATA), tlv(0xA0, signed))
+
+
+def parse_pkcs7(p7):
+    """(pe digest, signed attributes as a SET, messageDigest, certificates, (issuer, serial), signature)"""
+    _, s, e = read_tlv(p7, 0)
+    top = children(p7, s, e)
+    if p7[top[0][1]:top[0][3]] != oid(OID_SIGNED_DATA) or top[1][0] != 0xA0:
+        raise ValueError("not a PKCS#7 signedData")
+    sd = children(p7, top[1][2], top[1][3])
+    sd = children(p7, sd[0][2], sd[0][3])
+    k = 0
+    k += 1  # version
+    k += 1  # digest algorithms
+    ci = children(p7, sd[k][2], sd[k][3])
+    k += 1
+    if p7[ci[0][1]:ci[0][3]] != oid(OID_SPC_INDIRECT):
+        raise ValueError("not Authenticode content")
+    idc_tag, idc_s, idc_e = read_tlv(p7, ci[1][2])
+    idc = children(p7, idc_s, idc_e)
+    dig = children(p7, idc[1][2], idc[1][3])
+    alg = children(p7, dig[0][2], dig[0][3])
+    if p7[alg[0][1]:alg[0][3]] != oid(OID_SHA256):
+        raise ValueError("the image hash is not SHA-256")
+    pe_digest = p7[dig[1][2]:dig[1][3]]
+    idc_content = p7[idc_s:idc_e]
+    certs = []
+    if sd[k][0] == 0xA0:
+        for c in children(p7, sd[k][2], sd[k][3]):
+            certs.append(p7[c[1]:c[3]])
+        k += 1
+    if sd[k][0] == 0xA1:
+        k += 1
+    signers = children(p7, sd[k][2], sd[k][3])
+    if len(signers) != 1:
+        raise ValueError("not one signer")
+    si = children(p7, signers[0][2], signers[0][3])
+    ias = children(p7, si[1][2], si[1][3])
+    who = (p7[ias[0][1]:ias[0][3]], p7[ias[1][1]:ias[1][3]])
+    if si[3][0] != 0xA0:
+        raise ValueError("no signed attributes")
+    attrs = p7[si[3][2]:si[3][3]]
+    md = None
+    ctype = None
+    for a in children(p7, si[3][2], si[3][3]):
+        parts = children(p7, a[2], a[3])
+        name = p7[parts[0][1]:parts[0][3]]
+        vals = children(p7, parts[1][2], parts[1][3])
+        if name == oid(OID_MESSAGE_DIGEST):
+            md = p7[vals[0][2]:vals[0][3]]
+        if name == oid(OID_CONTENT_TYPE):
+            ctype = p7[vals[0][1]:vals[0][3]]
+    if ctype != oid(OID_SPC_INDIRECT):
+        raise ValueError("the contentType attribute is not Authenticode")
+    if md != hashlib.sha256(idc_content).digest():
+        raise ValueError("the messageDigest attribute is not the hash of the content")
+    # version, signer, digest algorithm, [0] signed attributes, signature algorithm, signature, and maybe [1]
+    # unsigned attributes after it (a countersignature)
+    dalg = children(p7, si[2][2], si[2][3])
+    if p7[dalg[0][1]:dalg[0][3]] != oid(OID_SHA256):
+        raise ValueError("the signer's digest is not SHA-256")
+    if len(si) < 6 or si[5][0] != 0x04:
+        raise ValueError("no signature after the signed attributes")
+    sig = p7[si[5][2]:si[5][3]]
+    return pe_digest, der_set(attrs), certs, who, sig
+
+
+def find_signer(certs, who):
+    for c in certs:
+        if cert_issuer_serial(c) == who:
+            return c
+    return None
+
+# ---- commands
+
+
+def cmd_sign(a):
+    data = open(a["in"], "rb").read()
+    pe = Pe(data)
+    if pe.cert_table_size:
+        raise ValueError(a["in"] + " is signed already")
+    cert = load_cert(a["cert"])
+    st = a.get("signing-time") or time.strftime("%y%m%d%H%M%SZ", time.gmtime())
+    if len(st) != 13 or not st[:12].isdigit() or st[12] != "Z":
+        raise ValueError("--signing-time: YYMMDDHHMMSSZ")
+    out = a["out"]
+    with tempfile.TemporaryDirectory(prefix="hades-sb-") as work:
+        p7 = make_pkcs7(pe.digest(), cert, a["key"], st, work)
+        signed = pe.signed_bytes(p7)
+        # the signature is checked before anything is written: the hash, and the RSA signature with the
+        # certificate's public key
+        check = Pe(signed)
+        sigs = check.signatures()
+        if len(sigs) != 1:
+            raise RuntimeError("the signed file does not have one signature")
+        d, attrs, certs, who, sig = parse_pkcs7(sigs[0][1])
+        if d != check.digest() or d != pe.digest():
+            raise RuntimeError("the signed file does not hash as the file that was signed")
+        if not rsa_verify(cert, hashlib.sha256(attrs).digest(), sig, work):
+            raise RuntimeError("the signature does not verify with the certificate")
+    tmp = out + ".part"
+    with open(tmp, "wb") as f:
+        f.write(signed)
+        f.flush()
+        os.fsync(f.fileno())
+    if open(tmp, "rb").read() != signed:
+        os.unlink(tmp)
+        raise RuntimeError(tmp + " does not read back as written")
+    os.replace(tmp, out)
+    return 0
+
+
+def cmd_verify(a):
+    data = open(a["in"], "rb").read()
+    pe = Pe(data)
+    sigs = pe.signatures()
+    if len(sigs) != 1:
+        print(a["in"] + ": %d signatures, one expected" % len(sigs))
+        return 1
+    cert = load_cert(a["cert"])
+    d, attrs, certs, who, sig = parse_pkcs7(sigs[0][1])
+    if d != pe.digest():
+        print(a["in"] + ": the signature is not of this file")
+        return 1
+    if who != cert_issuer_serial(cert):
+        print(a["in"] + ": signed with another key")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="hades-sb-") as work:
+        if not rsa_verify(cert, hashlib.sha256(attrs).digest(), sig, work):
+            print(a["in"] + ": the signature does not verify")
+            return 1
+    print(a["in"] + ": signed by " + cert_subject_text(cert) + ", sha256 " + d.hex())
+    return 0
+
+
+def cmd_check(a):
+    data = open(a["in"], "rb").read()
+    pe = Pe(data)
+    sigs = pe.signatures()
+    print("%s: Authenticode sha256 %s, %d signature(s)" % (a["in"], pe.digest().hex(), len(sigs)))
+    bad = 0 if sigs else 1
+    with tempfile.TemporaryDirectory(prefix="hades-sb-") as work:
+        anchors = []
+        for path in a["anchor"]:
+            anchors.append(path)
+        for n, (at, p7) in enumerate(sigs):
+            d, attrs, certs, who, sig = parse_pkcs7(p7)
+            leaf = find_signer(certs, who)
+            ok_hash = d == pe.digest()
+            ok_sig = leaf is not None and rsa_verify(leaf, hashlib.sha256(attrs).digest(), sig, work)
+            chain = "no signer certificate"
+            ok_chain = False
+            if leaf is not None:
+                lf = os.path.join(work, "leaf%d.der" % n)
+                open(lf, "wb").write(leaf)
+                lp = os.path.join(work, "leaf%d.pem" % n)
+                run_openssl(["x509", "-inform", "DER", "-in", lf, "-out", lp])
+                inter = os.path.join(work, "inter%d.pem" % n)
+                with open(inter, "wb") as f:
+                    for c in certs:
+                        if c != leaf:
+                            cf = os.path.join(work, "c.der")
+                            open(cf, "wb").write(c)
+                            f.write(run_openssl(["x509", "-inform", "DER", "-in", cf]))
+                for anchor in anchors:
+                    ap = os.path.join(work, "anchor.pem")
+                    raw = load_cert(anchor)
+                    open(os.path.join(work, "anchor.der"), "wb").write(raw)
+                    run_openssl(["x509", "-inform", "DER", "-in", os.path.join(work, "anchor.der"), "-out", ap])
+                    args = [OPENSSL, "verify", "-no_check_time", "-purpose", "any", "-partial_chain", "-CAfile", ap]
+                    if os.path.getsize(inter):
+                        args += ["-untrusted", inter]
+                    p = subprocess.run(args + [lp], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if p.returncode == 0:
+                        ok_chain = True
+                        chain = "up to " + cert_subject_text(raw)
+                        break
+                if not ok_chain:
+                    chain = "to none of the anchors"
+            print("  signature %d: signer %s; image hash %s; RSA %s; chain %s" % (
+                n + 1, cert_subject_text(leaf) if leaf else "?", "matches" if ok_hash else "DOES NOT MATCH",
+                "valid" if ok_sig else "INVALID", chain))
+            if not (ok_hash and ok_sig and ok_chain):
+                bad = 1
+    return bad
+
+
+def cmd_hash(a):
+    print(Pe(open(a["in"], "rb").read()).digest().hex())
+    return 0
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("sign", "verify", "check", "hash"):
+        sys.stderr.write(__doc__ if __doc__ else "usage: hades-sb-sign sign|verify|check|hash ...\n")
+        return 2
+    a = {"anchor": []}
+    rest = argv[2:]
+    i = 0
+    while i < len(rest):
+        k = rest[i]
+        if not k.startswith("--") or i + 1 >= len(rest):
+            sys.stderr.write("hades-sb-sign: bad argument " + k + "\n")
+            return 2
+        if k == "--anchor":
+            a["anchor"].append(rest[i + 1])
+        else:
+            a[k[2:]] = rest[i + 1]
+        i += 2
+    need = {"sign": ("key", "cert", "in", "out"), "verify": ("cert", "in"), "check": ("in",), "hash": ("in",)}
+    for k in need[argv[1]]:
+        if k not in a:
+            sys.stderr.write("hades-sb-sign: --" + k + " is needed\n")
+            return 2
+    try:
+        return {"sign": cmd_sign, "verify": cmd_verify, "check": cmd_check, "hash": cmd_hash}[argv[1]](a)
+    except (ValueError, RuntimeError, OSError) as e:
+        sys.stderr.write("hades-sb-sign: " + str(e) + "\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

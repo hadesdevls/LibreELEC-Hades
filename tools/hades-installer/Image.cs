@@ -52,9 +52,18 @@ namespace Hades.Installer
         // and the seconds each says; and where the value (0 or 1) of each kernel option is (BootMenus.Options)
         public List<long>[] WaitOffsets = { new List<long>(), new List<long>(), new List<long>() };
         public List<int>[] WaitValues = { new List<int>(), new List<int>(), new List<int>() };
-        public List<long>[] OptionOffsets = { new List<long>(), new List<long>() };
+        public List<long>[] OptionOffsets = { new List<long>(), new List<long>(), new List<long>() };
         // The wait that the image writes by itself, where its three lines say the same, once each; 0 otherwise
         public int BootWait;
+        // Where the values (0 or 1) of the kernel line of the diagnostics are ("initcall_debug=", BootMenus.DiagLine, and
+        // "log_buf_len=", BootMenus.DiagBuffer, the 0 or 1 of 0M or 1M), on every entry of the two boot menus: eight of
+        // each in an image that has it
+        public List<long> DiagLineOffsets = new List<long>(), DiagBufferOffsets = new List<long>();
+        // Secure Boot (SecureBoot.cs, Fat.cs): whether the image has what it takes to start with it (/secureboot with shim and
+        // MokManager), found by Engine.ProbeSecureBoot (SecureState, 0: not looked at, 1: it has it, 2: it has not) and, when the image
+        // is read through, everything that the change needs (Sb; Sb.Known says whether it is all there and as it has to be).
+        public int SecureState;
+        public SbSystem Sb;
     }
 
     sealed class WriteResult
@@ -94,6 +103,10 @@ namespace Hades.Installer
     {
         public long Offset;
         public byte[] Bytes;
+        // The patch changes the FAT or the root directory of the system partition, and a patch that comes later and is made from the
+        // result of this one (DiagFolder puts its folder where the FAT of the image, with this change, has free clusters) may cover
+        // the same bytes.
+        public bool Layered;
     }
 
     static class Engine
@@ -144,6 +157,37 @@ namespace Hades.Installer
                 f.Read(tail, 0, 4);
                 return BitConverter.ToUInt32(tail, 0);
             }
+        }
+
+        internal static Stream OpenImage(string path) { return Open(path); }
+        internal static void SkipForward(Stream source, long count) { Skip(source, count); }
+        internal static int ReadFull(Stream source, byte[] buffer, int count) { return Fill(source, buffer, count); }
+
+        // Whether the image has /secureboot with shim and MokManager: the system partition is read from its start until the folder
+        // has been read (or there is none). It can take as long as unpacking the image up to that folder, so the window does it
+        // in the background. Sets plan.SecureState; never throws.
+        public static void ProbeSecureBoot(ImagePlan plan)
+        {
+            try
+            {
+                var c = new SbCollector(plan, true);
+                using (Stream source = Open(plan.Path))
+                {
+                    Skip(source, plan.System.Start);
+                    var buffer = new byte[1 << 20];
+                    long done = plan.System.Start;
+                    while (!c.Settled && done < plan.System.End)
+                    {
+                        int want = (int)Math.Min(buffer.Length, plan.System.End - done);
+                        int read = Fill(source, buffer, want);
+                        if (read <= 0) break;
+                        c.Feed(done, buffer, 0, read);
+                        done += read;
+                    }
+                }
+                plan.SecureState = c.S.HasSecureDir ? 1 : 2;
+            }
+            catch (Exception) { plan.SecureState = 2; }
         }
 
         static Stream Open(string path)
@@ -304,6 +348,7 @@ namespace Hades.Installer
                 int keep = Math.Max(Math.Max(Math.Max(hide.Length, others.Length), names.Length + UuidLength),
                                     Math.Max(choices.Length, BootMenus.SayLine.Length + BootMenus.SayWords + 1)) - 1;
                 var buffer = new byte[keep + Chunk];
+                var secure = new SbCollector(plan, false);
                 var super = new byte[2048]; // the start of the storage partition
                 plan.Tail = new byte[TailSize];
                 int carried = 0;
@@ -355,6 +400,7 @@ namespace Hades.Installer
                         if (from < to)
                             Buffer.BlockCopy(buffer, carried + (int)(from - done), super, (int)(from - plan.Storage.Start), (int)(to - from));
                     }
+                    secure.Feed(done, buffer, carried, read);
                     done += read;
                     // the last bytes of the image, whatever the chunks were: only what is new in this buffer
                     if (read >= TailSize) Buffer.BlockCopy(buffer, have - TailSize, plan.Tail, 0, TailSize);
@@ -371,10 +417,15 @@ namespace Hades.Installer
                 plan.HideOffsets.Sort();
                 plan.StorageUuidOffsets.Sort();
                 foreach (List<long> o in plan.OptionOffsets) o.Sort();
+                plan.DiagLineOffsets.Sort();
+                plan.DiagBufferOffsets.Sort();
                 if (plan.WaitValues[0].Count == 1 && plan.WaitValues[1].Count == 1 && plan.WaitValues[2].Count == 1 &&
                     plan.WaitValues[0][0] == plan.WaitValues[1][0] && plan.WaitValues[1][0] == plan.WaitValues[2][0])
                     plan.BootWait = plan.WaitValues[0][0];
                 plan.StorageUuidInFs = Ext4Uuid(super);
+                secure.Finish();
+                plan.Sb = secure.S;
+                plan.SecureState = secure.S.Known || secure.S.HasSecureDir ? 1 : 2;
                 plan.Scanned = true;
             }
             return plan;
@@ -618,19 +669,62 @@ namespace Hades.Installer
             return Make(plan.SwitchOffset, Encoding.ASCII.GetBytes(SwitchOn));
         }
 
+        // With the diagnostics on, the kernel line of the diagnostics on as well: initcall_debug=1 and log_buf_len=1M on every
+        // entry of the two boot menus (scripts/mkimage writes 0 and 0M), so that the very first start of what is written has
+        // the kernel note each driver that it starts, with room in its log for that; the journal of a start that hangs then
+        // names the driver that did not return. The system does the same when its switch is turned (hades-diag,
+        // kernel-line.sh), and at a start after the switch was turned by hand. Only where the image has both words on its
+        // eight entries, each once: an image from before them has none, and the system of a newer image gives them at its
+        // first start with the diagnostics on; menus that have them elsewhere than this installer knows are left as they are,
+        // and so is an image that was not read through (Plan with scan): nothing else knows where the words are.
+        public static List<Patch> DiagnosticsKernelLine(ImagePlan plan)
+        {
+            var patches = new List<Patch>();
+            if (!plan.Scanned || plan.DiagLineOffsets.Count != BootMenus.DiagLineEntries ||
+                plan.DiagBufferOffsets.Count != BootMenus.DiagLineEntries) return patches;
+            foreach (long at in plan.DiagLineOffsets) patches.Add(Make(at, Encoding.ASCII.GetBytes("1")));
+            foreach (long at in plan.DiagBufferOffsets) patches.Add(Make(at, Encoding.ASCII.GetBytes("1")));
+            return patches;
+        }
+
+        // What DiagnosticsKernelLine does with this image, for the log
+        public static string DiagnosticsKernelLineSummary(ImagePlan plan)
+        {
+            if (!plan.Scanned) return "the kernel line of the diagnostics: the image was not read through, initcall_debug left as it is";
+            int n = plan.DiagLineOffsets.Count, b = plan.DiagBufferOffsets.Count;
+            if (n == 0 && b == 0) return "the kernel line of the diagnostics: not in this image (its system sets it at its first start with them on)";
+            if (n != BootMenus.DiagLineEntries || b != BootMenus.DiagLineEntries)
+                return "the kernel line of the diagnostics: " + n + " and " + b + " places, " + BootMenus.DiagLineEntries +
+                       " of each expected: left as the image has it";
+            return "the kernel line of the diagnostics: initcall_debug=1 log_buf_len=1M in its " + n + " places";
+        }
+
         // Every change that is made to an image as it is written, and nothing else decides them.
         // inside: for a disk inside the PC. table: the whole image is written, with its partition table.
         // storage: an update: the identifier of the storage that the disk already has (null: an install).
-        // diagnostics: with the switch of the diagnostics turned on. boot: an update: what the old boot menus said of the
-        // start (their wait and kernel options), carried into the new ones where the image can take it (BootMenus.Keep).
+        // diagnostics: with the switch of the diagnostics turned on, and their kernel line (DiagnosticsKernelLine). boot: an
+        // update: what the old boot menus said of the start (their wait and kernel options), carried into the new ones where
+        // the image can take it (BootMenus.Keep). The kernel line of the diagnostics is not carried: it follows the box.
+        // secure: the change for Secure Boot (SecureBoot.Build): shim, GRUB and the kernel signed, and the key slot. It writes the entries of KERNEL
+        // and of the certificate in the root directory, and the switch of the diagnostics another one: they do not cover the same bytes, but if they
+        // ever did the later patch wins, and the switch is the one that goes later.
         public static List<Patch> Patches(ImagePlan plan, bool inside, bool table, string storage, bool diagnostics,
-                                          BootChoices boot = null)
+                                          BootChoices boot = null, SbBuild secure = null)
         {
             var patches = new List<Patch>();
             if (storage != null) patches.AddRange(KeepStorage(plan, storage));
             if (inside) patches.AddRange(ForInternalDisk(plan));
             if (inside && table) patches.AddRange(SystemAsEfi(plan));
-            if (diagnostics) patches.Add(DiagnosticsOn(plan));
+            if (secure != null)
+            {
+                patches.AddRange(secure.System);
+                patches.AddRange(secure.Storage);
+            }
+            if (diagnostics)
+            {
+                patches.Add(DiagnosticsOn(plan));
+                patches.AddRange(DiagnosticsKernelLine(plan));
+            }
             if (boot != null) patches.AddRange(BootMenus.Keep(plan, boot));
             return patches;
         }

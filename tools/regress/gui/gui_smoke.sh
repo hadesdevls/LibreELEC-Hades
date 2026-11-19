@@ -71,16 +71,6 @@ dd if=p2.img of=vm.img bs=1M oflag=seek_bytes seek=$((s2 * 512)) conv=notrunc st
 rm -f p1.img p2.img
 
 # --- start the VM
-pgrep -f "Xvfb :98" > /dev/null || { setsid nohup Xvfb :98 -screen 0 1920x1080x24 +extension GLX -nolisten tcp > xvfb.log 2>&1 < /dev/null & sleep 2; }
-export DISPLAY=:98 LIBGL_ALWAYS_SOFTWARE=1 SDL_VIDEODRIVER=x11
-setsid nohup qemu-system-x86_64 -enable-kvm -machine q35 -m 6144 -smp 4 -cpu host \
-  -display sdl,gl=on -device virtio-vga-gl,xres=1920,yres=1080 -nic none \
-  -audiodev none,id=snd0 -device ich9-intel-hda -device hda-duplex,audiodev=snd0 \
-  -monitor unix:$W/qm.sock,server,nowait -serial file:$W/serial.log -serial unix:$W/sh.sock,server,nowait \
-  -drive if=none,id=d0,file=$W/vm.img,format=raw -device virtio-blk-pci,drive=d0 \
-  -kernel "$KERNEL" -append "boot=UUID=$BOOTUUID disk=UUID=$DISKUUID grub_portable quiet video=Virtual-1:1920x1080 console=ttyS0,115200" \
-  > qemu.log 2>&1 < /dev/null &
-sleep 4
 stopvm() { python3 -I - "$W" << 'PY'
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX)
@@ -92,7 +82,42 @@ try:
 except Exception: pass
 PY
 }
-trap stopvm EXIT
+# The X server of the display :98 is closed on the way out only when this script started it (its process number,
+# checked to be that server's): one that was running before is someone else's and stays. The VM is quit first, as
+# its window is on that display.
+XVFB_PID=
+cleanup() {
+  stopvm
+  [ -n "$XVFB_PID" ] || return 0
+  local cmd
+  cmd=$(tr '\0' ' ' < "/proc/$XVFB_PID/cmdline" 2> /dev/null) || true
+  case "$cmd" in
+    "Xvfb :98 "*)
+      kill "$XVFB_PID" 2> /dev/null
+      # (gone: no such process, or one that has ended and waits to be reaped)
+      gone() { local s; s=$(cut -d' ' -f3 "/proc/$XVFB_PID/stat" 2> /dev/null) || return 0; [ "$s" = Z ]; }
+      for _ in 1 2 3 4 5 6 7 8 9 10; do gone && break; sleep 0.3; done
+      if gone; then log "# closed the Xvfb :98 that this run started (pid $XVFB_PID)"
+      else log "# the Xvfb :98 that this run started (pid $XVFB_PID) did not close"; fi ;;
+  esac
+  return 0
+}
+trap cleanup EXIT
+if ! pgrep -f "^Xvfb :98 " > /dev/null; then
+  setsid nohup Xvfb :98 -screen 0 1920x1080x24 +extension GLX -nolisten tcp > xvfb.log 2>&1 < /dev/null &
+  sleep 2
+  XVFB_PID=$(pgrep -f "^Xvfb :98 " | head -n 1)
+  [ -n "$XVFB_PID" ] || fail_early boot "Xvfb :98 did not start (xvfb.log)"
+fi
+export DISPLAY=:98 LIBGL_ALWAYS_SOFTWARE=1 SDL_VIDEODRIVER=x11
+setsid nohup qemu-system-x86_64 -enable-kvm -machine q35 -m 6144 -smp 4 -cpu host \
+  -display sdl,gl=on -device virtio-vga-gl,xres=1920,yres=1080 -nic none \
+  -audiodev none,id=snd0 -device ich9-intel-hda -device hda-duplex,audiodev=snd0 \
+  -monitor unix:$W/qm.sock,server,nowait -serial file:$W/serial.log -serial unix:$W/sh.sock,server,nowait \
+  -drive if=none,id=d0,file=$W/vm.img,format=raw -device virtio-blk-pci,drive=d0 \
+  -kernel "$KERNEL" -append "boot=UUID=$BOOTUUID disk=UUID=$DISKUUID grub_portable quiet video=Virtual-1:1920x1080 console=ttyS0,115200" \
+  > qemu.log 2>&1 < /dev/null &
+sleep 4
 G="python3 -I $KIT/g.py $W"
 up=0
 for i in $(seq 1 72); do

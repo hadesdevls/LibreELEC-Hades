@@ -122,21 +122,21 @@ namespace Hades.Installer
         // The name to show: a disk that Windows gives no name is called by its number
         public string ShownName { get { return Name.Length > 0 ? Name : L.T("Drive ", "Unidad ") + Number; } }
 
-        public string Title { get { return ShownName + "  ·  " + Words.Size(Size); } }
+        public string Title { get { return ShownName + " (" + Words.Size(Size) + ")"; } }
 
         public string Detail
         {
             get
             {
                 var sb = new StringBuilder(BusName);
-                if (HasHades) sb.Append(L.T("  ·  has LibreELEC Hades", "  ·  tiene LibreELEC Hades"));
+                if (HasHades) sb.Append(L.T(", has LibreELEC Hades", ", tiene LibreELEC Hades"));
                 if (Volumes.Count == 0)
-                    sb.Append(Partitions.Count == 0 ? L.T("  ·  empty, no partitions", "  ·  vacío, sin particiones")
-                                                    : L.T("  ·  no drive letter in Windows", "  ·  sin letra de unidad en Windows"));
+                    sb.Append(Partitions.Count == 0 ? L.T(", empty (no partitions)", ", vacío (sin particiones)")
+                                                    : L.T(", no drive letter in Windows", ", sin letra de unidad en Windows"));
                 foreach (VolumeInfo v in Volumes)
                 {
-                    sb.Append("  ·  ").Append(v.Letter).Append(':');
-                    if (v.Label.Length > 0) sb.Append(L.T(" “", " «")).Append(v.Label).Append(L.T("”", "»"));
+                    sb.Append(", ").Append(v.Letter).Append(':');
+                    if (v.Label.Length > 0) sb.Append(L.T(" \"", " «")).Append(v.Label).Append(L.T("\"", "»"));
                     if (v.Ready) sb.Append(' ').Append(Words.Size(v.Used)).Append(L.T(" used", " ocupados"));
                 }
                 return sb.ToString();

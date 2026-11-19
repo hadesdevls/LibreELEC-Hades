@@ -18,9 +18,10 @@ pre_configure_init() {
     rm -rf .${TARGET_NAME}-init
 }
 
-# Hades: ply-image in the system as well, for the notice "one display" that Kodi's start draws
-# (kodi-display-notice), built as the one of the initramfs. The two builds share the folder of the
-# sources: each one makes its program again, whatever the other left there.
+# Hades: ply-image in the system as well, built as the one of the initramfs (the notices of Kodi's
+# start used it; hades-picture draws them now, with ply-image's arithmetic, and ply-image stays
+# there to draw a picture by hand). The two builds share the folder of the sources: each one makes
+# its program again, whatever the other left there.
 pre_configure_target() {
   cd ${PKG_BUILD}
     rm -rf .${TARGET_NAME}

@@ -32,6 +32,8 @@
 #     the menu of before or the new one;
 #   - a menu that has the new lines already is left as it is: a second update does nothing;
 #   - syslinux.cfg (BIOS) is not touched: syslinux loads the kernel from its own partition.
+# Before the menu, GRUB itself (efi_update; with Secure Boot, sb_update: GRUB signed for this computer, shim and
+# MokManager) and the theme of its menu (theme_update), each where the boot partition has it.
 # Then the entries that lock the kernel down get the words that ask for DMA translation, in both menus (dma_update
 # below), as scripts/mkimage writes them since 1.0.
 # Last, the menus (GRUB and syslinux) are given for the one start that follows the update a block that makes them
@@ -163,6 +165,8 @@ flash_is() {
 efi_update() {
   local dir="$BOOT_ROOT/EFI/BOOT" src="$SYSTEM_ROOT/usr/share/grub" name todo="" was
   for name in bootx64.efi bootia32.efi; do
+    # (with Secure Boot, bootx64.efi is shim: sb_update)
+    [ "$name" = bootx64.efi ] && sb_installed && continue
     if [ -f "$dir/$name" ] && [ -f "$src/$name" ] && ! same "$src/$name" "$dir/$name"; then
       todo="$todo $name"
     fi
@@ -187,6 +191,139 @@ efi_update() {
     fi
   done
   sync
+  if [ "$was" = ro ] && ! mount -o remount,ro "$BOOT_ROOT"; then
+    say "the boot partition could not be made read-only again"
+  fi
+  return 0
+}
+
+# Secure Boot (packages/sysutils/hades-secureboot). A boot partition that starts with Secure Boot, as the installer for
+# Windows makes it when its box "Start with Secure Boot" is ticked, has the certificate of the key of this computer at
+# its top (HADES-SB.CER), shim as EFI/BOOT/bootx64.efi, MokManager as EFI/BOOT/mmx64.efi and GRUB, signed with that key,
+# as EFI/BOOT/grubx64.efi. The init that applies the update signed the new GRUB already (hades_sb_update in its init,
+# which put it in HADES_SB_DIR) and the new KERNEL. Here GRUB takes the place of the one of before, and shim and
+# MokManager become the ones of the new system, each one written as efi_update writes a file: next to its place, written
+# through and read back, then renamed over it, so that a power cut leaves the one of before or the new one, each of
+# them signed. GRUB goes first: a new GRUB with the shim of before starts, and so does the GRUB of before with a new
+# shim. Without a signed GRUB (an init of before Secure Boot signs nothing), GRUB is left as it is, signed for this
+# computer, and that is said. Nothing else on the partition is touched; fbx64.efi is never written.
+sb_installed() {
+  [ -f "$BOOT_ROOT/HADES-SB.CER" ] && [ -f "$BOOT_ROOT/EFI/BOOT/mmx64.efi" ] && [ -f "$BOOT_ROOT/EFI/BOOT/grubx64.efi" ]
+}
+
+# sb_put <from> <name in EFI/BOOT> <what it is, for the log>
+sb_put() {
+  local to="$BOOT_ROOT/EFI/BOOT/$2"
+  if [ ! -f "$1" ]; then
+    say "Secure Boot: $3 is left as it is: the update has no new one"
+    return 0
+  fi
+  same "$1" "$to" && return 0
+  rm -f "$to.new"
+  if cp "$1" "$to.new" && sync "$to.new" && same "$to.new" "$1" && mv -f "$to.new" "$to" && sync "$to" "${to%/*}" && same "$to" "$1"; then
+    say "Secure Boot: EFI/BOOT/$2 is now $3 of this system"
+  elif same "$to" "$1"; then
+    say "Secure Boot: EFI/BOOT/$2 is now $3 of this system, but it could not all be written through"
+  else
+    rm -f "$to.new"
+    say "Secure Boot: EFI/BOOT/$2 could not be replaced: it is $3 of before"
+  fi
+}
+
+sb_update() {
+  local was
+  sb_installed || return 0
+  was=$(flash_is)
+  if [ "$was" = ro ] && ! mount -o remount,rw "$BOOT_ROOT"; then
+    say "Secure Boot: GRUB, shim and MokManager are left as they are: the boot partition could not be made writable"
+    return 0
+  fi
+  if [ -n "$HADES_SB_DIR" ] && [ -f "$HADES_SB_DIR/grubx64.efi.signed" ]; then
+    sb_put "$HADES_SB_DIR/grubx64.efi.signed" grubx64.efi "GRUB, signed for this computer,"
+  else
+    say "Secure Boot: GRUB is left as it is, signed for this computer: this update did not sign a new one"
+  fi
+  sb_put "$SYSTEM_ROOT/usr/share/hades-secureboot/mmx64.efi" mmx64.efi "MokManager"
+  sb_put "$SYSTEM_ROOT/usr/share/hades-secureboot/shimx64.efi" bootx64.efi "shim"
+  sync
+  if [ "$was" = ro ] && ! mount -o remount,ro "$BOOT_ROOT"; then
+    say "the boot partition could not be made read-only again"
+  fi
+  return 0
+}
+
+# The look of the GRUB menu, EFI/BOOT/hades (packages/tools/grub/theme). An update in place wrote GRUB itself
+# (efi_update) and never this, so a drive kept the theme it was installed with: since the theme draws the picture of
+# the start (boot.png, theme.cfg), it would start as before while a new image did not. The system carries the theme in
+# usr/share/grub/hades. Each file of it that the boot partition does not have, or has with other bytes, is written as
+# <file>.new, written through to the device and read back, and renamed over the one of before, as efi_update does;
+# theme.cfg, the one file that grub.cfg reads and that makes the menu use the others, goes last, and only when every
+# other file is in place. A power cut, a full partition or a file that cannot be written leaves the theme.cfg of before
+# (GRUB with a theme.cfg of before and some new pictures draws the menu of before: it reads only what that theme.cfg
+# names), and the next update writes what is missing. Files of the old theme that the new one has not stay; nothing
+# reads them. Only where the boot partition has the GRUB menu and the new system has the theme: an update to a system
+# without it changes nothing here. The files are written only if the partition has room for all of them and 1 MiB
+# more. (The busybox of the initramfs has no find: the folder is walked by the shell.)
+theme_files() {
+  local e
+  for e in "$1"/*; do
+    if [ -d "$e" ]; then
+      theme_files "$e" "$2"
+    elif [ -f "$e" ]; then
+      echo "${e#$2/}"
+    fi
+  done
+}
+
+theme_update() {
+  local src="$SYSTEM_ROOT/usr/share/grub/hades" dir="$BOOT_ROOT/EFI/BOOT/hades" f todo="" need=0 free was failed="" written=0
+  [ -f "$src/theme.cfg" ] || return 0
+  [ -f "$MENU" ] || return 0
+  for f in $(theme_files "$src" "$src"); do
+    [ "$f" = theme.cfg ] && continue
+    if [ ! -f "$dir/$f" ] || ! same "$src/$f" "$dir/$f"; then
+      todo="$todo $f"
+      need=$((need + $(ls -ln "$src/$f" | awk '{ print $5 }')))
+    fi
+  done
+  if [ ! -f "$dir/theme.cfg" ] || ! same "$src/theme.cfg" "$dir/theme.cfg"; then
+    todo="$todo theme.cfg"
+    need=$((need + $(ls -ln "$src/theme.cfg" | awk '{ print $5 }')))
+  fi
+  [ -z "$todo" ] && return 0
+  free=$(df -Pk "$BOOT_ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }')
+  if [ -z "$free" ] || [ $((free * 1024)) -lt $((need + 1048576)) ]; then
+    say "the theme of the boot menu is left as it is: the boot partition has no room for the new one ($((need / 1024)) KiB)"
+    return 0
+  fi
+
+  was=$(flash_is)
+  if [ "$was" = ro ] && ! mount -o remount,rw "$BOOT_ROOT"; then
+    say "the theme of the boot menu is left as it is: the boot partition could not be made writable"
+    return 0
+  fi
+  # (theme.cfg is last in the list: it is written only when nothing before it failed)
+  for f in $todo; do
+    [ "$f" = theme.cfg ] && [ -n "$failed" ] && break
+    case "$f" in
+      */*) mkdir -p "$dir/${f%/*}" 2>/dev/null ;;
+      *) mkdir -p "$dir" 2>/dev/null ;;
+    esac
+    rm -f "$dir/$f.new"
+    if cp "$src/$f" "$dir/$f.new" && sync "$dir/$f.new" && same "$dir/$f.new" "$src/$f" &&
+       mv -f "$dir/$f.new" "$dir/$f" && same "$dir/$f" "$src/$f"; then
+      written=$((written + 1))
+    else
+      rm -f "$dir/$f.new"
+      failed="$failed $f"
+    fi
+  done
+  sync
+  if [ -z "$failed" ]; then
+    say "the theme of the boot menu is now the one of this system ($written file(s) written)"
+  else
+    say "the theme of the boot menu keeps its theme.cfg of before ($written file(s) written); these could not be written:$failed"
+  fi
   if [ "$was" = ro ] && ! mount -o remount,ro "$BOOT_ROOT"; then
     say "the boot partition could not be made read-only again"
   fi
@@ -785,6 +922,8 @@ wait_update() {
 }
 
 efi_update
+sb_update
+theme_update
 menu_update
 dma_update
 wait_update

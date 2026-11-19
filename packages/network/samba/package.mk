@@ -13,6 +13,12 @@ PKG_NEED_UNPACK="$(get_pkg_directory heimdal) $(get_pkg_directory e2fsprogs)"
 PKG_LONGDESC="A free SMB / CIFS fileserver and client."
 PKG_BUILD_FLAGS="+lto"
 
+# Hades: --with-pie in place of --without-pie: the programs of Samba (smbd and nmbd, which run as root and listen on
+# the network, the RPC helpers, smbclient, smbpasswd...) are position-independent executables, loaded at a random
+# address. Samba adds -fPIE and -pie to its programs only (wafsamba.py: "only specify PIE flags for binaries"): its
+# libraries, libsmbclient among them (through which Kodi plays from SMB), do not change. The option has to be given:
+# without it Samba's waf, which parses its options with argparse, takes the default of --with-pie (false) and never
+# checks the compiler, whatever the help of the option says.
 configure_package() {
   #PKG_WAF_VERBOSE="-v"
 
@@ -62,7 +68,7 @@ configure_package() {
                       --without-ldap \
                       --without-libarchive \
                       --without-pam \
-                      --without-pie \
+                      --with-pie \
                       --without-regedit \
                       --without-systemd \
                       --without-utmp \

@@ -131,8 +131,8 @@ namespace Hades.Installer
 
         public override string ToString()
         {
-            string name = Partition.Letter + ":" + (Volume.Label.Length > 0 ? L.T(" “", " «") + Volume.Label + L.T("”", "»") : "");
-            return name + "  ·  " + Words.Size(Volume.Size - Volume.Used) + L.T(" free", " libres");
+            string name = Partition.Letter + ":" + (Volume.Label.Length > 0 ? L.T(" \"", " «") + Volume.Label + L.T("\"", "»") : "");
+            return name + " (" + Words.Size(Volume.Size - Volume.Used) + L.T(" free)", " libres)");
         }
     }
 
@@ -158,7 +158,7 @@ namespace Hades.Installer
         {
             return L.T(
                 "✔  Nothing is erased: Windows shrinks a partition of that disk and Hades uses the space that frees up.\r\n" +
-                "✔  It can be undone: “Remove LibreELEC Hades” gives the space back to that partition.\r\n" +
+                "✔  It can be undone: \"Remove LibreELEC Hades\" gives the space back to that partition.\r\n" +
                 "✘  That disk loses the space you give it. Shrinking can take a while, and Windows decides how much is possible.\r\n" +
                 "✘  Back up what matters first: changing partitions carries some risk (a power cut, for instance).",
                 "✔  No se borra nada: Windows encoge una partición de ese disco y Hades usa el hueco.\r\n" +
@@ -173,7 +173,7 @@ namespace Hades.Installer
             return L.T(
                 "✔  The simplest and most robust way: the whole disk is for Hades.\r\n" +
                 "✘  Everything on that disk is ERASED, and there is no way back.\r\n" +
-                "•  To undo it, “Remove LibreELEC Hades” leaves the disk empty and ready for Windows.",
+                "•  To undo it, \"Remove LibreELEC Hades\" leaves the disk empty and ready for Windows.",
                 "✔  Lo más simple y robusto: todo el disco es para Hades.\r\n" +
                 "✘  Se BORRA todo lo que hay en ese disco, sin vuelta atrás.\r\n" +
                 "•  Para deshacerlo, «Quitar LibreELEC Hades» lo deja vacío y listo para Windows.") +
@@ -182,6 +182,15 @@ namespace Hades.Installer
 
         readonly Panel header = new Panel();     // the band at the top; in direction B the bar at the left
         readonly LinkLabel language = new LinkLabel();
+        readonly LinkLabel restart = new LinkLabel(); // "Restart into LibreELEC Hades..." (FirmwareBoot), above the language
+        // The same, as a button where it is seen: next to a drive that has Hades (in the notice of a USB drive, under the options of a
+        // disk inside the PC) and in the last panel; each with the box for a shortcut on the desktop, off until the user ticks it
+        readonly Panel restartRow = new Panel();
+        readonly PillButton restartButton = new PillButton();
+        readonly CheckBox restartShortcut = new ThemedCheck();
+        readonly PillButton doneRestart = new PillButton();
+        readonly CheckBox doneShortcut = new ThemedCheck();
+        bool shortcutWanted;     // what the user set those boxes to (the two say the same, and the question starts so)
         readonly StepHead one = new StepHead(), two = new StepHead();
         readonly Panel line1 = new Panel();
         readonly Label imageLabel = new Label();
@@ -204,6 +213,7 @@ namespace Hades.Installer
         readonly Label sizeUnit = new Label();
         readonly LinkLabel remove = new LinkLabel();
         readonly CheckBox diagnostics = new ThemedCheck();
+        readonly CheckBox secureBox = new ThemedCheck();
         readonly SlimBar bar = new SlimBar();
         readonly Label status = new Label();
         readonly PillButton go = new PillButton();
@@ -237,6 +247,9 @@ namespace Hades.Installer
         bool rewording;          // the volumes are being named in the other language: none was chosen anew
         bool diskDiagnostics;    // the Hades of the chosen disk has its diagnostics on (read when the disk is chosen)
         bool? diagnosticsAsked;  // what the user set the box of the diagnostics to; null: not touched, it follows the disk
+        bool diskSecure;         // the Hades of the chosen disk has its certificate of Secure Boot (HADES-SB.CER on its system partition)
+        bool? secureAsked;       // what the user set the box of Secure Boot to; null: not touched, it follows the disk
+        SbJob doneSecure;        // what the last panel says of Secure Boot (null: it was not asked for)
         DiskInfo doneDisk;       // what the last panel says (ShowDone), to say it in the other language
         Place donePlace;
         bool doneUpdated;
@@ -260,6 +273,18 @@ namespace Hades.Installer
             language.LinkClicked += delegate { SwitchLanguage(); };
             language.BackColor = Color.Transparent;
             header.Controls.Add(language);
+            restart.LinkClicked += delegate { AskRestart(); };
+            restart.BackColor = Color.Transparent;
+            header.Controls.Add(restart);
+            restartButton.Outline = true;
+            restartButton.Click += delegate { AskRestart(); };
+            // (a click or the space bar, not a change that this program makes)
+            restartShortcut.Click += delegate { shortcutWanted = restartShortcut.Checked; };
+            restartRow.Controls.AddRange(new Control[] { restartButton, restartShortcut });
+            restartRow.Visible = false;
+            doneRestart.Outline = true;
+            doneRestart.Click += delegate { AskRestart(); };
+            doneShortcut.Click += delegate { shortcutWanted = doneShortcut.Checked; };
 
             one.Number = 1;
             two.Number = 2;
@@ -293,12 +318,14 @@ namespace Hades.Installer
             sizeBox.ValueChanged += delegate { UpdateState(); };
             sizeUnit.Text = "GB";
             remove.LinkClicked += delegate { StartRemove(); };
-            options.Controls.AddRange(new Control[] { notice, beside, whole, explain, volumeLabel, volumeBox, sizeLabel, sizeBox,
+            // (the row of the restart goes inside the notice of a USB drive, and here for a disk inside the PC: PlaceRestartRow)
+            options.Controls.AddRange(new Control[] { restartRow, notice, beside, whole, explain, volumeLabel, volumeBox, sizeLabel, sizeBox,
                                                       sizeUnit, remove });
 
             // (for every way of installing and for an update: under what each of them asks)
             // (a click or the space bar, not a change that this program makes)
             diagnostics.Click += delegate { diagnosticsAsked = diagnostics.Checked; };
+            secureBox.Click += delegate { SecureClicked(); };
 
             bar.Maximum = 1000;
             go.Click += delegate { Start(); };
@@ -308,9 +335,11 @@ namespace Hades.Installer
             donePanel.Visible = false;
             close.Click += delegate { Close(); };
             donePanel.Controls.Add(close);
+            donePanel.Controls.Add(doneRestart);
+            donePanel.Controls.Add(doneShortcut);
 
             Controls.AddRange(new Control[] { donePanel, header, one, line1, imageLabel, imageButton, two, usb, inside, listFrame, missing,
-                                              refresh, options, stages, diagnostics, bar, status, go, update });
+                                              refresh, options, stages, secureBox, diagnostics, bar, status, go, update });
             // the header is the last stop of the Tab key: the keyboard starts where it did, not at the language link
             header.TabIndex = Controls.Count;
 
@@ -328,7 +357,7 @@ namespace Hades.Installer
         // again when the window is moved to a display of another scale.
         int X0 { get { return 216; } }   // the bar at the side
         int Top0 { get { return 36; } }   // the top of the first step
-        const int WindowHeight = 700;
+        const int WindowHeight = 718;
 
         // a control of the content, x and y from the left of the content
         void B(Control c, int x, int y, int w, int h) { c.SetBounds(Ui.S(X0 + x), Ui.S(y), Ui.S(w), Ui.S(h)); }
@@ -349,6 +378,10 @@ namespace Hades.Installer
             language.DisabledLinkColor = Color.FromArgb(128, 134, 150);
             R(language, 24, WindowHeight - 44, 168, 22);
             language.TextAlign = ContentAlignment.MiddleLeft;
+            restart.Font = Ui.F(12.5f);
+            restart.LinkColor = restart.VisitedLinkColor = Ui.InkSoft;
+            restart.ActiveLinkColor = Color.White;
+            R(restart, 24, WindowHeight - 92, 180, 42);
 
             one.Numbered = two.Numbered = false; // the steps are numbered in the bar at the side
             B(one, 24, T, 560, 28);
@@ -383,6 +416,11 @@ namespace Hades.Installer
             notice.BackColor = Ui.CalloutBack;
             notice.ForeColor = Ui.Dark ? Ui.Text : Color.FromArgb(70, 50, 10);
             notice.Bar = Ui.CalloutBar;
+            // (where the row of the restart goes, and the size of the notice, are set by UpdateState: they depend on what is chosen)
+            restartButton.Font = doneRestart.Font = Ui.F(13f);
+            restartButton.ForeColor = doneRestart.ForeColor = Ui.Text;
+            restartShortcut.Font = doneShortcut.Font = Ui.F(13f);
+            restartShortcut.ForeColor = doneShortcut.ForeColor = Ui.Text;
             R(beside, 2, 0, 330, 24);
             R(whole, 338, 0, 330, 24);
             beside.ForeColor = whole.ForeColor = Ui.Text;
@@ -405,10 +443,12 @@ namespace Hades.Installer
             remove.ActiveLinkColor = Ui.Text;
             remove.DisabledLinkColor = Ui.TextOff;
 
-            B(diagnostics, 26, T + 512, 710, 24);
+            B(secureBox, 26, T + 512, 710, 22);
+            secureBox.ForeColor = Ui.Text;
+            B(diagnostics, 26, T + 534, 710, 22);
             diagnostics.ForeColor = Ui.Text;
-            B(bar, 24, T + 540, 712, 16);
-            B(status, 24, T + 558, 712, 22);
+            B(bar, 24, T + 560, 712, 16);
+            B(status, 24, T + 578, 712, 22);
             status.ForeColor = Ui.Soft;
 
             go.Font = Ui.F(15f, "semi");
@@ -416,8 +456,8 @@ namespace Hades.Installer
             update.Font = go.Font;
             update.ForeColor = Color.White;
             update.BackColor = Ui.Green;
-            B(update, 24, T + 586, 372, 46);
-            B(go, 24, T + 586, 712, 46); // (UpdateState sets where it is)
+            B(update, 24, T + 604, 372, 46);
+            B(go, 24, T + 604, 712, 46); // (UpdateState sets where it is)
 
             donePanel.SetBounds(Ui.S(X0), 0, Ui.S(760), Ui.S(WindowHeight));
             donePanel.BackColor = Ui.Back;
@@ -504,10 +544,12 @@ namespace Hades.Installer
         // The texts that do not depend on what is chosen, in the language of now. (UpdateState sets the rest.)
         void SetTexts()
         {
-            Text = L.T("LibreELEC Hades · Installer", "LibreELEC Hades · Instalador");
+            Text = L.T("LibreELEC Hades Installer", "Instalador de LibreELEC Hades");
             language.Text = L.Spanish ? "English" : "Español"; // each in its own language
+            restart.Text = L.T("Restart into LibreELEC Hades...", "Reiniciar en LibreELEC Hades...");
+            restartButton.Text = doneRestart.Text = FirmwareBoot.Title;
             one.Text = L.T("LibreELEC Hades image", "Imagen de LibreELEC Hades");
-            imageButton.Text = L.T("Choose another…", "Elegir otra…");
+            imageButton.Text = L.T("Choose another...", "Elegir otra...");
             two.Text = L.T("Where do you want it?", "¿Dónde lo quieres?");
             usb.Text = L.T("On a USB drive (recommended)", "En una unidad USB (recomendado)");
             inside.Text = Native.Uefi ? L.T("On a secondary internal disk", "En un disco interno secundario")
@@ -518,7 +560,7 @@ namespace Hades.Installer
             whole.Text = L.T("Use the whole disk (everything is erased)", "Usar el disco entero (se borra todo)");
             volumeLabel.Text = L.T("Partition to shrink:", "Partición que cede el sitio:");
             sizeLabel.Text = L.T("Space for Hades:", "Espacio para Hades:");
-            remove.Text = L.T("Remove LibreELEC Hades from an internal disk…", "Quitar LibreELEC Hades de un disco interno…");
+            remove.Text = L.T("Remove LibreELEC Hades from an internal disk...", "Quitar LibreELEC Hades de un disco interno...");
             update.Text = L.T("Update LibreELEC Hades  (keeps your settings)", "Actualizar LibreELEC Hades  (conserva tus ajustes)");
             close.Text = L.T("Close", "Cerrar");
             header.Invalidate();
@@ -661,6 +703,13 @@ namespace Hades.Installer
             }
             try { plan = Engine.Plan(path, false, null, null); }
             catch (Exception e) { imageState = "unusable"; imageDetail = e.Message; UpdateState(); return; }
+            // whether the image can start with Secure Boot (shim and MokManager in /secureboot): it takes the reading of the image up to
+            // that folder, so it is done meanwhile, and the box of Secure Boot waits for it
+            ImagePlan probed = plan;
+            var probe = new BackgroundWorker();
+            probe.DoWork += delegate { Engine.ProbeSecureBoot(probed); };
+            probe.RunWorkerCompleted += delegate { if (plan == probed || (plan != null && plan.Path == probed.Path)) UpdateState(); };
+            probe.RunWorkerAsync();
             string expected = Engine.ExpectedHash(path);
             if (expected == null)
             {
@@ -775,11 +824,17 @@ namespace Hades.Installer
             // so that an update keeps them (UpdateState, which also knows whether the image can turn them on).
             // Read each time a disk is chosen and each time the list is made again.
             diskDiagnostics = false;
+            diskSecure = false;
             if (disk != null && disk.HasHades)
             {
                 PartitionInfo system, storage;
-                if (Test != null) diskDiagnostics = Test.Diagnostics.Contains(disk);
-                else if (Disks.FindHades(disk, out system, out storage)) diskDiagnostics = Disks.DiagnosticsOn(disk.Number, system);
+                if (Test != null) { diskDiagnostics = Test.Diagnostics.Contains(disk); diskSecure = Test.Secure.Contains(disk); }
+                else if (Disks.FindHades(disk, out system, out storage))
+                {
+                    diskDiagnostics = Disks.DiagnosticsOn(disk.Number, system);
+                    // (and whether it has its certificate of Secure Boot: the box then starts ticked, and an update keeps it)
+                    diskSecure = SbDisk.CertOnDisk(disk.Number, system) != null;
+                }
             }
             if (disk != null && Where == Place.Internal)
             {
@@ -928,7 +983,7 @@ namespace Hades.Installer
             {
                 sb.AppendLine(L.T("The drives offered here are the ones connected by USB (sticks, external disks, cards) that the image fits on.",
                                   "Aquí se ofrecen las unidades conectadas por USB (memorias, discos externos, tarjetas) en las que cabe la imagen."));
-                sb.AppendLine(L.T("If you have just plugged yours in, wait a few seconds and press “Refresh list”.",
+                sb.AppendLine(L.T("If you have just plugged yours in, wait a few seconds and press \"Refresh list\".",
                                   "Si acabas de conectar la tuya, espera unos segundos y pulsa «Actualizar lista»."));
             }
             else
@@ -961,17 +1016,17 @@ namespace Hades.Installer
             switch (imageState)
             {
                 case "ok":
-                    imageLabel.Text = name + Words.Size(plan.Size) + L.T("  ·  checked: it arrived complete", "  ·  comprobada: ha llegado entera");
+                    imageLabel.Text = name + Words.Size(plan.Size) + L.T(", checked: it arrived complete", ", comprobada: ha llegado entera");
                     color = Ui.Ok;
                     usable = true;
                     break;
                 case "checking":
-                    imageLabel.Text = name + L.T("Checking that it arrived complete…", "Comprobando que ha llegado entera…");
+                    imageLabel.Text = name + L.T("Checking that it arrived complete...", "Comprobando que ha llegado entera...");
                     break;
                 case "unchecked":
                     imageLabel.Text = name + Words.Size(plan.Size) +
-                                      L.T("  ·  its .sha256 file is missing: there is no way to check that it arrived complete",
-                                          "  ·  sin su archivo .sha256: no se puede comprobar que llegó entera");
+                                      L.T(", its .sha256 file is missing: there is no way to check that it arrived complete",
+                                          ", sin su archivo .sha256: no se puede comprobar que llegó entera");
                     color = Ui.Warn;
                     usable = true;
                     break;
@@ -990,20 +1045,35 @@ namespace Hades.Installer
             stages.Visible = busy && showSteps;
             notice.Visible = !internalPlace;
             beside.Visible = whole.Visible = explain.Visible = internalPlace;
-            volumeLabel.Visible = volumeBox.Visible = sizeLabel.Visible = sizeBox.Visible = sizeUnit.Visible = besideMode && disk != null;
-            remove.Visible = internalPlace;
+            // (not for a disk that has Hades already: nothing is put next to it, so there is no partition to shrink, and the row of the
+            // restart is there instead)
+            volumeLabel.Visible = volumeBox.Visible = sizeLabel.Visible = sizeBox.Visible = sizeUnit.Visible =
+                besideMode && disk != null && !disk.HasHades;
+            // (on a USB drive: when the chosen one has Hades, to make it a normal drive again)
+            remove.Visible = internalPlace || (disk != null && disk.HasHades);
+            remove.Text = internalPlace ? L.T("Remove LibreELEC Hades from an internal disk...", "Quitar LibreELEC Hades de un disco interno...")
+                                        : L.T("Remove LibreELEC Hades from this drive...", "Quitar LibreELEC Hades de esta unidad...");
             explain.Text = beside.Checked ? BesideText(plan) : WholeText(plan);
             missing.Text = internalPlace ? L.T("Don't see your disk?", "¿No aparece tu disco?")
                                          : L.T("Don't see your drive?", "¿No aparece tu unidad?");
 
+            // the box of Secure Boot: offered when the image can do it; it starts as the Hades of the chosen disk is (ticked when it has its
+            // certificate), and then as the user sets it
+            bool canSecure = plan != null && plan.SecureState == 1;
+            bool wantSecure = canSecure && (secureAsked ?? diskSecure);
             if (Pc.SecureBoot == 1)
-                notice.Text = L.T("This PC has Secure Boot turned on. Hades does not start with Secure Boot yet: to try it here you will " +
-                                  "have to turn it off in the BIOS, and turn it back on for the games that require it.",
-                                  "Este PC tiene Secure Boot activado. Hades todavía no arranca con Secure Boot: para probarlo aquí " +
-                                  "habrá que desactivarlo en la BIOS, y volver a activarlo para los juegos que lo exigen.");
+                notice.Text = wantSecure
+                    ? L.T("This PC has Secure Boot turned on. Hades will start with it, using a key of its own: the first time, a blue " +
+                          "screen asks you to accept that key (this installer tells you how when it is done).",
+                          "Este PC tiene Secure Boot activado. Hades arrancará con él, con una clave propia: la primera vez, una pantalla " +
+                          "azul te pide aceptar esa clave (este instalador te dice cómo cuando termine).")
+                    : L.T("This PC has Secure Boot turned on. Without the Secure Boot option below Hades does not start. Tick that option " +
+                          "(recommended if you use Secure Boot), or, only if you want, turn Secure Boot off in the BIOS and back on afterwards.",
+                          "Este PC tiene Secure Boot activado. Sin la opción de Secure Boot de abajo, Hades no arranca. Marca esa opción " +
+                          "(lo recomendado si usas Secure Boot), o, solo si quieres, desactívalo en la BIOS y vuelve a activarlo después.");
             else if (disk != null && disk.HasHades)
-                notice.Text = L.T("This drive already has Hades. “Update” replaces only the system and keeps your settings and add-ons. " +
-                                  "“Install from scratch” erases the whole drive, with everything Hades has stored on it.",
+                notice.Text = L.T("This drive already has Hades. \"Update\" replaces only the system and keeps your settings and add-ons. " +
+                                  "\"Install from scratch\" erases the whole drive, with everything Hades has stored on it.",
                                   "Esta unidad ya tiene Hades. «Actualizar» cambia solo el sistema y conserva tus ajustes y addons. " +
                                   "«Instalar de cero» la borra entera, con lo que Hades tenga guardado.");
             else
@@ -1011,6 +1081,7 @@ namespace Hades.Installer
                                   "It is the safest way to try it, and the drive can be taken to another PC.",
                                   "La unidad se borra entera y queda solo para Hades. Windows y los discos de este PC no se tocan. " +
                                   "Es la forma más segura de probarlo, y se puede llevar a otro PC.");
+            PlaceRestartRow(disk != null && disk.HasHades, internalPlace);
 
             string problem = null;
             if (busy) problem = null;
@@ -1021,8 +1092,10 @@ namespace Hades.Installer
                 problem = internalPlace ? L.T("Choose a disk from the list.", "Elige un disco de la lista.")
                                         : L.T("Choose a drive from the list.", "Elige una unidad de la lista.");
             else if (internalPlace && scanning)
-                problem = L.T("Reading the image to prepare it for an internal disk…", "Leyendo la imagen para prepararla para un disco interno…");
+                problem = L.T("Reading the image to prepare it for an internal disk...", "Leyendo la imagen para prepararla para un disco interno...");
             else if (internalPlace && (plan == null || !plan.Scanned)) problem = "";
+            else if (wantSecure && (scanning || plan == null || !plan.Scanned))
+                problem = L.T("Reading the image to prepare Secure Boot...", "Leyendo la imagen para preparar Secure Boot...");
             // (each of these is one line of the window: it has to fit)
             else if (internalPlace && !besideMode && disk.Kept != null)
             {
@@ -1060,7 +1133,7 @@ namespace Hades.Installer
             update.Visible = has;
             update.Enabled = !busy && has && usable && plan != null && plan.Scanned;
             update.BackColor = Ui.Green;
-            B(go, has ? 404 : 24, Top0 + 586, has ? 332 : 712, 46);
+            B(go, has ? 404 : 24, Top0 + 604, has ? 332 : 712, 46);
             go.Text = has ? (!internalPlace ? L.T("Install from scratch  (erases the drive)", "Instalar de cero  (borra la unidad)")
                              : besideMode ? L.T("Make room and install", "Hacer sitio e instalar")
                              : L.T("Erase the disk and install from scratch", "Borrar el disco e instalar de cero"))
@@ -1073,13 +1146,14 @@ namespace Hades.Installer
             // (with an image that cannot be used, what is wrong with it is said next to the image)
             if (has && usable && !busy && !donePanel.Visible && (problem == null || problem.Length == 0 || besideMode))
                 status.Text = scanning || plan == null || !plan.Scanned
-                    ? L.T("Reading the image…", "Leyendo la imagen…")
+                    ? L.T("Reading the image...", "Leyendo la imagen...")
                     : L.T("This drive already has Hades. Updating replaces the system and keeps your settings and add-ons.",
                           "Esta unidad ya tiene Hades. Actualizar cambia el sistema y conserva tus ajustes y addons.");
             imageButton.Enabled = refresh.Enabled = list.Enabled = usb.Enabled = !busy;
             // (the two links stay enabled while a disk is worked on, only dimmed: Windows would draw them in a grey that cannot be
             // read; what they do is refused while busy, SwitchLanguage and StartRemove)
             language.LinkColor = language.VisitedLinkColor = busy ? Ui.TextOffOnInk : Ui.InkSoft;
+            restart.LinkColor = restart.VisitedLinkColor = language.LinkColor;
             remove.LinkColor = remove.VisitedLinkColor = busy ? Ui.TextOff : (Ui.Dark ? Ui.WarmText : Color.FromArgb(40, 80, 170));
             // The box of the diagnostics. An image from before them has no switch to turn on: the box is off
             // and says why. One that has them on already writes them on whatever is asked: the box is on,
@@ -1096,6 +1170,15 @@ namespace Hades.Installer
                       "Guardar diagnóstico ahí, para averiguar por qué algo no funciona (mira LEEME.txt)")
                 : L.T("Save diagnostics there (this image cannot: a more recent one is needed)",
                       "Guardar diagnóstico ahí (esta imagen no sabe: hace falta una más reciente)");
+            if (!busy) secureBox.Checked = wantSecure;
+            secureBox.Enabled = !busy && canSecure;
+            string secureText = L.T("Start with Secure Boot (if this PC keeps Secure Boot on)",
+                                    "Arrancar con Secure Boot (si este PC lo tiene activado)");
+            secureBox.Text = plan == null || plan.SecureState == 0
+                ? secureText + L.T(": checking the image...", ": comprobando la imagen...")
+                : canSecure ? secureText
+                : L.T("Start with Secure Boot (this image cannot: a more recent one is needed)",
+                      "Arrancar con Secure Boot (esta imagen no sabe: hace falta una más reciente)");
             inside.Enabled = !busy && Native.Uefi;
             beside.Enabled = whole.Enabled = volumeBox.Enabled = sizeBox.Enabled = !busy;
 
@@ -1107,11 +1190,54 @@ namespace Hades.Installer
             if (donePanel.Visible) stepState[0] = stepState[1] = stepState[2] = 2;
             stepSub[0] = imagePath == null ? "" : Path.GetFileName(imagePath);
             stepSub[1] = disk == null ? (internalPlace ? L.T("Choose a disk", "Elige un disco") : L.T("Choose a drive", "Elige una unidad")) : disk.Title;
-            stepSub[2] = donePanel.Visible ? L.T("Done", "Hecho") : busy ? L.T("Working…", "Trabajando…")
+            stepSub[2] = donePanel.Visible ? L.T("Done", "Hecho") : busy ? L.T("Working...", "Trabajando...")
                          : ready ? L.T("Ready", "Listo") : "";
             one.SetState(stepState[0]);
             two.SetState(stepState[1]);
             header.Invalidate();
+            // Secure Boot needs the image read through, once (where the boot loader and the kernel are)
+            if (wantSecure && usable && !busy && plan != null && !plan.Scanned && !scanning) Scan();
+        }
+
+        // "Restart into LibreELEC Hades" next to a drive that has Hades: on a USB drive in its notice, which grows to hold it; on a disk
+        // inside the PC under its options, where the partition to shrink would be. Off while a disk is worked on.
+        void PlaceRestartRow(bool show, bool internalPlace)
+        {
+            restartRow.Visible = show;
+            bool inNotice = show && !internalPlace;
+            R(notice, 0, 0, 712, inNotice ? 104 : 60);
+            notice.Padding = new Padding(Ui.S(16), Ui.S(8), Ui.S(10), Ui.S(inNotice ? 8 + 46 : 8));
+            if (!show) return;
+            // (inside the notice, as a control of it: it is drawn over the notice, never under it)
+            Control parent = inNotice ? (Control)notice : options;
+            if (restartRow.Parent != parent) restartRow.Parent = parent;
+            int width = inNotice ? 712 - 16 - 10 : 712;
+            R(restartRow, inNotice ? 16 : 0, inNotice ? 58 : 134, width, 36);
+            restartRow.BackColor = inNotice ? notice.BackColor : Ui.Back;
+            R(restartButton, 0, 0, 262, 36);
+            R(restartShortcut, 278, 6, width - 278, 24);
+            restartButton.Enabled = !busy;
+            SetShortcutBox(restartShortcut);
+        }
+
+        // A box for the shortcut on the desktop: as the user set it (off until then); ticked, and fixed, when the desktop has that
+        // shortcut already. Ticking it makes nothing by itself: the shortcut is made when the PC is restarted with it ticked.
+        void SetShortcutBox(CheckBox box)
+        {
+            bool made = FirmwareBoot.ShortcutMade;
+            box.Text = FirmwareBoot.ShortcutText(made);
+            box.Checked = made || shortcutWanted;
+            box.Enabled = !busy && !made;
+        }
+
+        // The question of the restart (FirmwareBoot), from the link, from the button next to the drive or from the last panel. Its box
+        // for the shortcut starts as the boxes of the window are, and they show afterwards what it was left at.
+        void AskRestart()
+        {
+            if (busy) return; // (the link is only dimmed then, and the button is off)
+            shortcutWanted = FirmwareBoot.Ask(this, false, shortcutWanted);
+            SetShortcutBox(restartShortcut);
+            SetShortcutBox(doneShortcut);
         }
 
         // Why the image cannot be used, when it cannot.
@@ -1215,27 +1341,30 @@ namespace Hades.Installer
             string image = imagePath;
             ImagePlan chosen = plan;
             bool diagnose = diagnostics.Checked && chosen.SwitchOffset >= 0;
+            SbJob secureJob = NewSecureJob(chosen);
 
             if (besideMode)
             {
                 if (choice == null || choice.Spare <= 0) return;
                 long storage = (long)sizeBox.Value * 1073741824L;
-                using (ConfirmForm confirm = AskBeside(disk, choice.Partition.Letter, storage + chosen.System.Size))
+                using (ConfirmForm confirm = AskBeside(disk, choice.Partition.Letter, storage + chosen.System.Size, SecureNote(false)))
                     if (confirm.ShowDialog(this) != DialogResult.OK) return;
-                Log.Line("start beside: disk " + disk.Number + " " + disk.Name + ", volume " + choice.Partition.Letter + ", storage " + storage);
+                Log.Line("start beside: disk " + disk.Number + " " + disk.Name + ", volume " + choice.Partition.Letter + ", storage " + storage +
+                         (secureJob != null ? ", Secure Boot" : ""));
                 showSteps = true;
-                Run(delegate { Operations.InstallBeside(disk, choice.Partition, storage, chosen, diagnose, Report); },
-                    delegate { ShowDone(disk, place, false); });
+                Run(delegate { Operations.InstallBeside(disk, choice.Partition, storage, chosen, diagnose, Report, secureJob); },
+                    delegate { ShowDone(disk, place, false, null, secureJob); });
                 return;
             }
 
             // (the button is off for such a disk, and Operations.InstallWhole looks at the disk again and refuses)
             if (disk.Kept != null) return;
-            using (ConfirmForm confirm = AskErase(disk))
+            using (ConfirmForm confirm = AskErase(disk, SecureNote(false)))
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
-            Log.Line("start whole " + place + ": disk " + disk.Number + " " + disk.Name + " <- " + image);
+            Log.Line("start whole " + place + ": disk " + disk.Number + " " + disk.Name + " <- " + image + (secureJob != null ? ", Secure Boot" : ""));
             showSteps = true;
-            Run(delegate { Operations.InstallWhole(disk, chosen, place, diagnose, Report); }, delegate { ShowDone(disk, place, false); });
+            Run(delegate { Operations.InstallWhole(disk, chosen, place, diagnose, Report, secureJob); },
+                delegate { ShowDone(disk, place, false, null, secureJob); });
         }
 
         void StartUpdate()
@@ -1245,23 +1374,75 @@ namespace Hades.Installer
             Place place = Where;
             ImagePlan chosen = plan;
             bool diagnose = diagnostics.Checked && chosen.SwitchOffset >= 0;
-            using (ConfirmForm confirm = AskUpdate(disk, Path.GetFileName(imagePath), place == Place.Internal && chosen.HidesOtherDisks))
+            using (ConfirmForm confirm = AskUpdate(disk, Path.GetFileName(imagePath), place == Place.Internal && chosen.HidesOtherDisks, SecureNote(true)))
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
-            RunUpdate(disk, chosen, place, diagnose, imagePath, false);
+            RunUpdate(disk, chosen, place, diagnose, imagePath, false, false);
+        }
+
+        // The job of Secure Boot of this install or update, from the box (null: the box is off, and nothing changes in what is written)
+        SbJob NewSecureJob(ImagePlan chosen)
+        {
+            if (!secureBox.Checked || chosen == null || chosen.SecureState != 1) return null;
+            var job = new SbJob();
+            job.Enabled = true;
+            return job;
+        }
+
+        // What the questions before writing say of Secure Boot ("" when the box is off and the Hades of the disk had none)
+        string SecureNote(bool updating)
+        {
+            bool on = secureBox.Checked && plan != null && plan.SecureState == 1;
+            if (!on)
+                return updating && diskSecure
+                    ? L.T("Secure Boot is turned off for this update: the boot of Hades goes back to the one without Secure Boot, and the PC needs " +
+                          "Secure Boot turned off in the BIOS until you update with the option ticked again.",
+                          "Secure Boot está desmarcado en esta actualización: el arranque de Hades vuelve a ser el de sin Secure Boot, y el PC " +
+                          "necesita Secure Boot desactivado en la BIOS hasta que actualices con la opción marcada otra vez.")
+                    : "";
+            return updating && diskSecure
+                ? L.T("Secure Boot: GRUB and the kernel are signed again with the key that this Hades already keeps. There is nothing to accept again " +
+                      "on the blue screen.",
+                      "Secure Boot: GRUB y el kernel se firman otra vez con la clave que este Hades ya guarda. No hay que aceptar nada otra vez " +
+                      "en la pantalla azul.")
+                : L.T("Secure Boot: the installer makes a key for this PC and, when it is done, shows you a 4-digit code to type on the blue screen " +
+                      "of the first start.",
+                      "Secure Boot: el instalador crea una clave para este PC y, al terminar, te muestra un código de 4 cifras para escribir en la " +
+                      "pantalla azul del primer arranque.");
         }
 
         // take: the system partition is taken from the programs that have it open. Never the first time: a
         // partition that is in use is left as it was, and the user is asked (AskTake). Either they close
         // what has it open and update again, or they have it taken, and the update is done once more.
-        void RunUpdate(DiskInfo disk, ImagePlan chosen, Place place, bool diagnose, string image, bool take)
+        void RunUpdate(DiskInfo disk, ImagePlan chosen, Place place, bool diagnose, string image, bool take, bool newKey)
         {
+            SbJob secureJob = NewSecureJob(chosen);
+            if (secureJob != null) secureJob.AllowNewKey = newKey;
             Log.Line("start update " + place + (take ? ", taking the partition" : "") + ": disk " + disk.Number + " " + disk.Name +
-                     " <- " + image);
+                     " <- " + image + (secureJob != null ? ", Secure Boot" + (newKey ? " with a new key" : "") : ""));
             showSteps = true;
-            Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Update(disk, chosen, place, diagnose, Report, take); },
-                delegate(object result) { ShowDone(disk, place, true, result as DiagKeep); },
+            Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Update(disk, chosen, place, diagnose, Report, take, secureJob); },
+                delegate(object result) { ShowDone(disk, place, true, result as DiagKeep, secureJob); },
                 delegate(Exception error)
                 {
+                    var key = error as SecureKeyException;
+                    if (key != null)
+                    {
+                        // nothing was written: either a new key is made if the user wants it, or the update goes on without Secure Boot
+                        if (key.Kind == 1)
+                        {
+                            bool again;
+                            using (ConfirmForm ask = new ConfirmForm(L.T("A new Secure Boot key", "Una clave nueva de Secure Boot"), false, key.Message,
+                                                                    null, L.T("Make a new key and update", "Crear una clave nueva y actualizar")))
+                                again = ask.ShowDialog(this) == DialogResult.OK;
+                            Log.Line("secure boot: the key of the disk is not in its storage: the user " + (again ? "has a new one made" : "does not"));
+                            if (again) RunUpdate(disk, chosen, place, diagnose, image, take, true);
+                            else LoadDisks();
+                            return true;
+                        }
+                        MessageBox.Show(this, key.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        LoadDisks();
+                        return true;
+                    }
                     if (take || !(error is PartitionInUseException)) return false;
                     PartitionInfo system, storage;
                     char letter = Disks.FindHades(disk, out system, out storage) ? system.Letter : '\0';
@@ -1271,10 +1452,152 @@ namespace Hades.Installer
                         taken = ask.ShowDialog(this) == DialogResult.OK;
                     Log.Line("the partition is in use (WSL running: " + wsl + "): the user " +
                              (taken ? "has it taken" : "leaves it as it is"));
-                    if (taken) RunUpdate(disk, chosen, place, diagnose, image, true);
+                    if (taken) RunUpdate(disk, chosen, place, diagnose, image, true, newKey);
                     else LoadDisks();
                     return true;
                 });
+        }
+
+        // A click on the box of Secure Boot: ticking it opens what it means, in plain words, and only a Yes keeps it ticked.
+        void SecureClicked()
+        {
+            if (busy || plan == null) return;
+            if (secureBox.Checked)
+            {
+                if (!AskSecure())
+                {
+                    secureAsked = false;
+                    secureBox.Checked = false;
+                    UpdateState();
+                    return;
+                }
+                secureAsked = true;
+            }
+            else
+            {
+                secureAsked = false;
+                var disk = list.SelectedItem as DiskInfo;
+                if (diskSecure && disk != null && disk.HasHades && SecureAnswer == null)
+                    MessageBox.Show(this, SecureNote(true), Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            UpdateState();
+        }
+
+        // For the tests: the answer to the explanation, which cannot be clicked
+#pragma warning disable 649 // (set only by the tests, which the published program does not carry: there it stays null)
+        public static Func<bool> SecureAnswer;
+#pragma warning restore 649
+
+        bool AskSecure()
+        {
+            if (SecureAnswer != null) return SecureAnswer();
+            Cursor = Cursors.WaitCursor;
+            Enroll.Look look;
+            try { look = Test != null ? Test.Look : LookAtFirmware(); }
+            finally { Cursor = Cursors.Default; }
+            using (ConfirmForm ask = AskSecureForm(look))
+                return ask.ShowDialog(this) == DialogResult.OK;
+        }
+
+        // What is read of the PC before the box is ticked: Secure Boot on or off, whether the database of the firmware has a CA of Microsoft for
+        // third parties, BitLocker on the drive of Windows. All of it reading.
+        public static Enroll.Look LookAtFirmware()
+        {
+            int locker = -1;
+            try
+            {
+                string drive = Environment.GetEnvironmentVariable("SystemDrive");
+                if (!string.IsNullOrEmpty(drive)) locker = Disks.Encrypted(drive[0]);
+            }
+            catch (Exception) { }
+            return Enroll.Examine(new WindowsFirmware(), Pc.SecureBoot, locker);
+        }
+
+        public static ConfirmForm AskSecureForm(Enroll.Look look)
+        {
+            var sb = new StringBuilder();
+            // (the points are numbered as they are shown: the ones about BitLocker and the certificate of Microsoft are there only when they apply)
+            int n = 0;
+            Func<string> next = delegate { return (++n).ToString() + ".  "; };
+            if (look != null && look.SecureBoot == 0)
+            {
+                sb.AppendLine(L.T("Secure Boot is off on this PC now, and Hades starts without this option. Tick it only if you are going to turn " +
+                                  "Secure Boot on.",
+                                  "Secure Boot está desactivado ahora en este PC, y Hades arranca sin esta opción. Márcala solo si vas a activar " +
+                                  "Secure Boot."));
+                sb.AppendLine();
+            }
+            sb.AppendLine(next() + L.T("The installer makes a key that belongs to this PC alone. It is kept in the Hades storage and nowhere else.",
+                                       "El instalador crea una llave que es solo de este PC. Se guarda en el almacenamiento de Hades y en ningún otro sitio."));
+            sb.AppendLine();
+            sb.AppendLine(next() + L.T("What it writes in the firmware of this PC, once, when it finishes: a request of about 1 KB for the boot program " +
+                                       "of Hades (shim) to offer that key at the next start of Hades. Nothing else: it does not change the Secure Boot " +
+                                       "lists of the PC (db, KEK, PK, dbx), the boot order or the start of Windows, and nothing of it stays running.",
+                                       "Lo que escribe en el firmware de este PC, una vez, al terminar: una petición de 1 KB más o menos para que el " +
+                                       "programa de arranque de Hades (shim) ofrezca esa llave al arrancar Hades la próxima vez. Nada más: no cambia " +
+                                       "las listas de Secure Boot del PC (db, KEK, PK, dbx), el orden de arranque ni el arranque de Windows, y no deja " +
+                                       "nada en marcha."));
+            sb.AppendLine();
+            sb.AppendLine(next() + L.T("The first time Hades starts, a blue screen appears (it is normal). Choose “Enroll MOK”, “Continue”, “Yes”, type " +
+                                       "the 4-digit code that this installer shows you when it is done, and choose “Reboot”. It is done once; after " +
+                                       "that Hades starts with no questions.",
+                                       "La primera vez que arranque Hades sale una pantalla azul (es normal). Elige «Enroll MOK», «Continue», «Yes», " +
+                                       "escribe el código de 4 cifras que te mostrará este instalador al terminar, y elige «Reboot». Se hace una vez; " +
+                                       "después Hades arranca sin preguntas."));
+            if (look != null && look.BitLocker == 1)
+            {
+                sb.AppendLine();
+                sb.AppendLine(next() + L.T("This PC uses BitLocker. Accepting the key does not ask for its recovery key, but changing Secure Boot in " +
+                                           "the BIOS can: have your recovery key at hand.",
+                                           "Este PC usa BitLocker. Aceptar la llave no pide su clave de recuperación, pero cambiar Secure Boot en la " +
+                                           "BIOS puede pedirla: ten a mano tu clave de recuperación."));
+            }
+            sb.AppendLine();
+            sb.AppendLine(next() + L.T("When it starts with Secure Boot, the boot program of Hades (it comes from Debian 13) updates, in the firmware, a " +
+                                       "list that blocks old Linux boot loaders with known faults (from before February 2025). If this PC has another " +
+                                       "Linux with Secure Boot that has not been updated since then, update it first. Windows is not affected.",
+                                       "Al arrancar con Secure Boot, el arranque de Hades (que viene de Debian 13) actualiza en el firmware una lista " +
+                                       "que bloquea cargadores de Linux antiguos con fallos conocidos (de antes de febrero de 2025). Si este PC tiene " +
+                                       "otro Linux con Secure Boot sin actualizar desde entonces, actualízalo antes. A Windows no le afecta."));
+            if (look != null && look.ThirdPartyCa == 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine(next() + L.T("The firmware of this PC does not have the Microsoft certificate that Linux boot programs use (“Microsoft " +
+                                           "3rd Party UEFI CA”), so Hades will not start with Secure Boot on. In the BIOS look for “Allow Microsoft " +
+                                           "3rd Party UEFI CA” or similar, and turn it on.",
+                                           "El firmware de este PC no tiene el certificado de Microsoft que usan los programas de arranque de Linux " +
+                                           "(«Microsoft 3rd Party UEFI CA»), así que Hades no arrancará con Secure Boot activado. En la BIOS busca " +
+                                           "«Allow Microsoft 3rd Party UEFI CA» o parecido, y actívalo."));
+            }
+            sb.AppendLine();
+            sb.Append(L.T("Without this option nothing changes: Hades starts as it always did, and Secure Boot has to be off in the BIOS.",
+                          "Sin esta opción no cambia nada: Hades arranca como siempre, y Secure Boot tiene que estar desactivado en la BIOS."));
+            return new ConfirmForm(L.T("Start with Secure Boot", "Arrancar con Secure Boot"), false, sb.ToString(), null,
+                                   L.T("Use Secure Boot", "Usar Secure Boot"));
+        }
+
+        // "Remove LibreELEC Hades": a request of this installer to enrol its key that is still waiting in the firmware (Hades was never
+        // started to finish it) is offered to be deleted. The key that is enrolled already stays: it is harmless once its storage is gone.
+        void AskClearPending()
+        {
+            try
+            {
+                var fw = new WindowsFirmware();
+                if (!Enroll.Pending(fw)) return;
+                bool yes;
+                using (ConfirmForm ask = new ConfirmForm(L.T("A request is waiting in the firmware", "Hay una petición esperando en el firmware"), false,
+                    L.T("This installer asked the firmware to offer the Secure Boot key of Hades on the next start, and Hades was never started to " +
+                        "finish it. Delete that request?\r\n\r\nA key that was accepted already stays in the firmware; without the Hades storage " +
+                        "nothing can be signed with it any more. README.txt tells how to delete it from the blue screen.",
+                        "Este instalador pidió al firmware que ofreciera la llave de Secure Boot de Hades en el próximo arranque, y no se llegó a " +
+                        "arrancar Hades para terminarlo. ¿Borrar esa petición?\r\n\r\nUna llave que ya se aceptó se queda en el firmware; sin el " +
+                        "almacenamiento de Hades ya no se puede firmar nada con ella. LEEME.txt dice cómo borrarla desde la pantalla azul."),
+                    null, L.T("Delete the request", "Borrar la petición")))
+                    yes = ask.ShowDialog(this) == DialogResult.OK;
+                Log.Line("secure boot: a request of this installer was pending: the user " + (yes ? "deletes it" : "leaves it"));
+                if (yes) Log.Line("secure boot: " + Enroll.Clear(fw));
+            }
+            catch (Exception e) { Log.Line("secure boot: the pending request could not be looked at: " + e.Message); }
         }
 
         void StartRemove()
@@ -1284,7 +1607,7 @@ namespace Hades.Installer
             if (disk == null || !disk.HasHades)
             {
                 MessageBox.Show(this, L.T(
-                    "In the list, choose the internal disk that has Hades (it says so under its name: “has LibreELEC Hades”).\r\n\r\n" +
+                    "In the list, choose the internal disk that has Hades (it says so under its name: \"has LibreELEC Hades\").\r\n\r\n" +
                     "Removing it deletes the Hades partitions and gives their space back to the partition that it came from. " +
                     "If the whole disk was for Hades, it is left empty and ready for Windows.",
                     "Elige en la lista el disco interno que tiene Hades (lo dice bajo su nombre: «tiene LibreELEC Hades»).\r\n\r\n" +
@@ -1293,12 +1616,14 @@ namespace Hades.Installer
                                 L.T("Remove LibreELEC Hades", "Quitar LibreELEC Hades"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            using (ConfirmForm confirm = AskRemove(disk))
+            Place place = Where;
+            using (ConfirmForm confirm = AskRemove(disk, place == Place.Usb))
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
-            Log.Line("start uninstall: disk " + disk.Number + " " + disk.Name);
+            if (Test == null) AskClearPending();
+            Log.Line("start uninstall: " + place + " disk " + disk.Number + " " + disk.Name);
             string image = imagePath; // (the image that is chosen is not erased either)
             showSteps = removing = true;
-            Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Uninstall(disk, image, Report); },
+            Run(delegate(object s, DoWorkEventArgs e) { e.Result = Operations.Uninstall(disk, image, Report, place); },
                 delegate(object result)
                 {
                     bar.Value = 0;
@@ -1311,7 +1636,7 @@ namespace Hades.Installer
 
         // The questions before a disk is changed. (Made here, so that the screenshots of the tests show them as they are asked.)
 
-        public static ConfirmForm AskErase(DiskInfo disk)
+        public static ConfirmForm AskErase(DiskInfo disk, string secureNote = "")
         {
             var sb = new StringBuilder();
             sb.AppendLine(disk.Title).AppendLine(disk.Detail).AppendLine(SerialLine(disk));
@@ -1319,12 +1644,13 @@ namespace Hades.Installer
                 sb.AppendLine().AppendLine(L.T("It holds " + Words.Size(disk.UsedBytes) + " of files, which will be lost.",
                                                "Tiene " + Words.Size(disk.UsedBytes) + " de archivos, que se perderán."));
             sb.AppendLine().Append(L.T("No other disk of this PC is touched.", "No se toca ningún otro disco de este PC."));
+            if (secureNote.Length > 0) sb.AppendLine().AppendLine().Append(secureNote);
             return new ConfirmForm(L.T("EVERYTHING on this disk will be ERASED", "Se va a BORRAR TODO lo que hay en este disco"), true,
                                    sb.ToString(), L.T("ERASE", "BORRAR"), L.T("Erase and install", "Borrar e instalar"));
         }
 
         // smaller: how much smaller the partition of that letter will be
-        public static ConfirmForm AskBeside(DiskInfo disk, char letter, long smaller)
+        public static ConfirmForm AskBeside(DiskInfo disk, char letter, long smaller, string secureNote = "")
         {
             string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "Partition " + letter + ": will be made " + Words.Size(smaller) + " smaller, and the two Hades partitions will be " +
@@ -1334,7 +1660,7 @@ namespace Hades.Installer
                 "La partición " + letter + ": se hará " + Words.Size(smaller) + " más pequeña y en ese hueco se crearán las dos " +
                 "particiones de Hades.\r\n\r\n" +
                 "Tus archivos de " + letter + ": no se borran. Ningún otro disco se toca.\r\n" +
-                "No apagues el PC mientras dure.");
+                "No apagues el PC mientras dure.") + (secureNote.Length > 0 ? "\r\n\r\n" + secureNote : "");
             return new ConfirmForm(L.T("Make room on " + letter + ": and install LibreELEC Hades",
                                        "Hacer sitio en " + letter + ": e instalar LibreELEC Hades"), false, details,
                                    L.T("INSTALL", "INSTALAR"), L.T("Make room and install", "Hacer sitio e instalar"));
@@ -1342,7 +1668,7 @@ namespace Hades.Installer
 
         // hidesOthers: the disk is inside the PC and the image hides the other internal disks by itself (the
         // Hades that is replaced may be one that saw them)
-        public static ConfirmForm AskUpdate(DiskInfo disk, string imageName, bool hidesOthers = false)
+        public static ConfirmForm AskUpdate(DiskInfo disk, string imageName, bool hidesOthers = false, string secureNote = "")
         {
             string others = !hidesOthers ? "" : L.T(
                 "\r\n\r\nWith this version, Hades inside the PC does not see the other NVMe and SATA disks. An entry of its " +
@@ -1361,7 +1687,8 @@ namespace Hades.Installer
                 "La partición de arranque de Hades (Windows la llama LIBREELEC) se sustituye entera: si guardaste " +
                 "algo ahí a mano, cópialo antes. Lo que su diagnóstico haya guardado ahí (la carpeta hades-diag) se conserva: el " +
                 "instalador lo copia a la partición nueva, lo comprueba y lo dice al terminar.\r\n" +
-                "No desconectes la unidad ni apagues el PC mientras dure.") + others;
+                "No desconectes la unidad ni apagues el PC mientras dure.") + others +
+                (secureNote.Length > 0 ? "\r\n\r\n" + secureNote : "");
             return new ConfirmForm(L.T("Update LibreELEC Hades on this drive", "Actualizar LibreELEC Hades en esta unidad"), false, details,
                                    L.T("UPDATE", "ACTUALIZAR"), L.T("Update", "Actualizar"));
         }
@@ -1403,8 +1730,19 @@ namespace Hades.Installer
                                    L.T("Take it and update", "Tomarla y actualizar"));
         }
 
-        public static ConfirmForm AskRemove(DiskInfo disk)
+        // usb: a USB drive, which is then left as a normal drive
+        public static ConfirmForm AskRemove(DiskInfo disk, bool usb = false)
         {
+            if (usb)
+                return new ConfirmForm(L.T("Remove LibreELEC Hades from this drive", "Quitar LibreELEC Hades de esta unidad"), true,
+                                       disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
+                    "LibreELEC Hades is removed from this drive, with everything it has stored (settings, add-ons). A drive with nothing " +
+                    "else on it is erased and left as a normal USB drive: one empty exFAT volume, which Windows, Mac and most TVs can " +
+                    "read. Another partition that you made on it is not touched.\r\n\r\nNo other disk of this PC is touched.",
+                    "Se quita LibreELEC Hades de esta unidad, con lo que tenga guardado (ajustes, addons). Una unidad que no tiene nada " +
+                    "más se borra y queda como una unidad USB normal: un volumen exFAT vacío, que leen Windows, Mac y la mayoría de las " +
+                    "teles. Otra partición que hayas creado en ella no se toca.\r\n\r\nNo se toca ningún otro disco de este PC."),
+                                       L.T("REMOVE", "QUITAR"), L.T("Remove LibreELEC Hades", "Quitar LibreELEC Hades"));
             string details = disk.Title + "\r\n" + SerialLine(disk) + "\r\n\r\n" + L.T(
                 "The Hades partitions on this disk are deleted, with everything Hades has stored (settings, add-ons).\r\n\r\n" +
                 "If Hades shares the disk with your files, they are not touched and their partition gets the space back. " +
@@ -1428,7 +1766,7 @@ namespace Hades.Installer
             for (int i = donePanel.Controls.Count - 1; i >= 0; --i)
             {
                 Control c = donePanel.Controls[i];
-                if (c == close) continue;
+                if (c == close || c == doneRestart || c == doneShortcut) continue;
                 donePanel.Controls.RemoveAt(i);
                 c.Dispose();
             }
@@ -1476,11 +1814,59 @@ namespace Hades.Installer
                 y += (int)Math.Ceiling(h / Ui.Scale) + 8;
             }
 
+            // Secure Boot: the code of the blue screen of the first start, and the steps
+            if (doneSecure != null && doneSecure.Enabled)
+            {
+                y += 6;
+                bool coded = doneSecure.Code != null, kept = doneSecure.KeyKept;
+                Label sbHead = text(kept ? L.T("Secure Boot: nothing to accept again", "Secure Boot: no hay que aceptar nada otra vez")
+                                         : coded ? L.T("Secure Boot: one step the first time", "Secure Boot: un paso la primera vez")
+                                                 : L.T("Secure Boot: accept the key on the first start", "Secure Boot: acepta la llave en el primer arranque"),
+                                    15f, "semi", Ui.Text);
+                R(sbHead, x, y, W, 24);
+                y += 30;
+                string how3 = kept
+                    ? L.T("This Hades keeps its key: GRUB and the kernel were signed again with it, and the PC already accepts it.",
+                          "Este Hades guarda su llave: GRUB y el kernel se firmaron otra vez con ella, y el PC ya la acepta.")
+                    : coded
+                    ? L.T("The first time Hades starts, a blue screen appears. Choose “Enroll MOK”, “Continue”, “Yes”, type this code and choose " +
+                          "“Reboot”. It is asked only once. Keep the code until then.",
+                          "La primera vez que arranque Hades sale una pantalla azul. Elige «Enroll MOK», «Continue», «Yes», escribe este código y elige " +
+                          "«Reboot». Solo se pide una vez. Guarda el código hasta entonces.")
+                    : L.T("This PC did not take the request that makes the blue screen offer the key by itself. On the first start choose " +
+                          "“Enroll key from disk”, the disk of Hades, the file HADES-SB.CER, then “Continue”, “Yes” and “Reboot”. No code is asked for.",
+                          "Este PC no ha aceptado la petición que hace que la pantalla azul ofrezca la llave sola. En el primer arranque elige " +
+                          "«Enroll key from disk», el disco de Hades, el archivo HADES-SB.CER, y después «Continue», «Yes» y «Reboot». No se pide código.");
+                if (coded)
+                {
+                    Label code = text(string.Join(" ", System.Linq.Enumerable.Select(doneSecure.Code.ToCharArray(), c => c.ToString())),
+                                      30f, "semi", Ui.Text);
+                    code.BackColor = Ui.Surface;
+                    code.TextAlign = ContentAlignment.MiddleCenter;
+                    R(code, x, y, 168, 56);
+                    Label steps = text(how3, 12.5f, "", Ui.Soft);
+                    R(steps, x + 184, y - 2, W - 184, 62);
+                    y += 62;
+                }
+                else
+                {
+                    Label steps = text(how3, 12.5f, "", Ui.Soft);
+                    int h = TextRenderer.MeasureText(how3, steps.Font, new Size(Ui.S(W), 0), TextFormatFlags.WordBreak).Height;
+                    steps.SetBounds(Ui.S(x), Ui.S(y), Ui.S(W), h + Ui.S(2));
+                    y += (int)Math.Ceiling(h / Ui.Scale) + 6;
+                }
+            }
+
             // how to start it
             y += 8;
             Label how = text(L.T("How to start it", "Cómo arrancarlo"), 15f, "semi", Ui.Text);
             R(how, x, y, W, 24);
             y += 32;
+            // ... from here, with the box for a shortcut on the desktop (FirmwareBoot); and by hand, the cards
+            R(doneRestart, x, y, 262, 36);
+            R(doneShortcut, x + 278, y + 6, W - 278, 24);
+            SetShortcutBox(doneShortcut);
+            y += 36 + 12;
             int cw = (W - 24) / 3;
             string[] titles =
             {
@@ -1493,7 +1879,7 @@ namespace Hades.Installer
                 place == Place.Usb ? L.T("Leave the drive plugged in.", "Deja la unidad conectada.") : L.T("Nothing else to do first.", "No hay que hacer nada antes."),
                 L.T("As soon as it turns on, press the key of the boot menu several times.", "Nada más encender, pulsa varias veces la tecla del menú de arranque."),
                 place == Place.Usb ? L.T("The entry that says UEFI.", "La entrada que diga UEFI.")
-                                   : L.T(name + ", not “Windows Boot Manager”.", name + ", no «Windows Boot Manager».")
+                                   : L.T(name + ", not \"Windows Boot Manager\".", name + ", no «Windows Boot Manager».")
             };
             for (int i = 0; i < 3; ++i)
             {
@@ -1517,8 +1903,9 @@ namespace Hades.Installer
             if (!updated)
             {
                 var first = new Callout();
-                first.Text = L.T("The first time, Hades prepares its space and restarts by itself: choose it again in the menu.",
-                                 "La primera vez, Hades prepara su espacio y se reinicia solo: vuelve a elegirlo en el menú.");
+                // (an image with hades-bootnext restarts into itself on UEFI; an older one, or a start by BIOS, goes by the boot order)
+                first.Text = L.T("The first time, Hades prepares its space and restarts by itself; if Windows starts, choose Hades again.",
+                                 "La primera vez, Hades prepara su espacio y se reinicia solo; si arranca Windows, vuelve a elegir Hades.");
                 first.Font = Ui.F(13f);
                 first.ForeColor = Ui.Dark ? Ui.Text : Color.FromArgb(70, 50, 10);
                 first.BackColor = Ui.CalloutBack;
@@ -1558,7 +1945,7 @@ namespace Hades.Installer
             var sb = new StringBuilder();
             sb.AppendLine(L.T("To go back to Windows, shut Hades down and turn the PC on without pressing anything.",
                               "Para volver a Windows, apaga Hades y enciende el PC sin pulsar nada."));
-            if (Pc.SecureBoot == 1)
+            if (Pc.SecureBoot == 1 && !(doneSecure != null && doneSecure.Enabled))
                 sb.AppendLine(L.T("Secure Boot is turned on in this PC: Hades will not start until it is turned off in the BIOS. Turn it back on whenever you want to play something that requires it.",
                                   "Secure Boot está activado en este PC: Hades no arrancará hasta desactivarlo en la BIOS. Vuelve a activarlo cuando quieras jugar a algo que lo exija."));
             if (place == Place.Usb)
@@ -1566,7 +1953,7 @@ namespace Hades.Installer
                               "Si Windows dice que hay que formatear una unidad, pulsa Cancelar: es la parte de Hades, que Windows no sabe leer."));
             else
             {
-                sb.AppendLine(L.T("To remove it: open this program, choose “internal disk”, the disk, and “Remove LibreELEC Hades”.",
+                sb.AppendLine(L.T("To remove it: open this program, choose \"internal disk\", the disk, and \"Remove LibreELEC Hades\".",
                                   "Para quitarlo: abre este programa, elige «disco interno», el disco, y «Quitar LibreELEC Hades»."));
                 sb.Append(L.T("If you ever reinstall Windows, unplug this disk first, or Windows may put its own startup files on it.",
                               "Si algún día reinstalas Windows, desconecta antes este disco o Windows puede usar su arranque."));
@@ -1578,8 +1965,9 @@ namespace Hades.Installer
         }
 
         // diag: what became of the folder hades-diag in an update
-        public void ShowDone(DiskInfo disk, Place place, bool updated, DiagKeep diag = null)
+        public void ShowDone(DiskInfo disk, Place place, bool updated, DiagKeep diag = null, SbJob secure = null)
         {
+            doneSecure = secure;
             doneDisk = disk;
             donePlace = place;
             doneUpdated = updated;
@@ -1621,14 +2009,18 @@ namespace Hades.Installer
         }
 
         // For the screenshots of the tests: disks that are not those of this PC.
+#pragma warning disable 649 // (set only by the tests, which the published program does not carry: there Test stays null)
         public sealed class TestData
         {
             public List<DiskInfo> Disks = new List<DiskInfo>();
             public Keep Keep = new Keep(); // what must not be erased, on those disks
             public long Spare;
             public List<DiskInfo> Diagnostics = new List<DiskInfo>(); // those whose Hades has its diagnostics on
+            public List<DiskInfo> Secure = new List<DiskInfo>();      // those whose Hades has its certificate of Secure Boot
+            public Enroll.Look Look = new Enroll.Look();               // what the PC says (BitLocker, the CA of Microsoft)
         }
         public static TestData Test;
+#pragma warning restore 649
         public void ShowInternal() { inside.Checked = true; }
         public void SelectFirst() { if (list.Items.Count > 0) list.SelectedIndex = 0; }
         public void ChooseWhole() { whole.Checked = true; }
@@ -1651,8 +2043,8 @@ namespace Hades.Installer
             // (what Operations says: the stage and its own byte count, as the step that is marked)
             long total = 3000L << 20, part = permille < 600 ? (permille - 50) * total / 550 : (permille - 600) * total / 400;
             if (removal) { status.Text = stages.Stages[stages.Stage]; return; }
-            status.Text = permille < 600 ? L.T("Writing…  ", "Escribiendo…  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total)
-                                         : L.T("Verifying…  ", "Verificando…  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total);
+            status.Text = permille < 600 ? L.T("Writing...  ", "Escribiendo...  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total)
+                                         : L.T("Verifying...  ", "Verificando...  ") + Words.Size(part) + L.T(" of ", " de ") + Words.Size(total);
         }
         public void EndWorking()
         {
@@ -1698,8 +2090,29 @@ namespace Hades.Installer
         public DiskInfo FirstOffered() { return list.Items.Count > 0 ? (DiskInfo)list.Items[0] : null; }
         public List<DiskInfo> ExcludedDisks { get { return excluded; } }
         public int Offered { get { return list.Items.Count; } }
-        public bool Scanning { get { return scanning || imageState == "checking"; } }
+        public bool Scanning { get { return scanning || imageState == "checking" || (plan != null && plan.SecureState == 0); } }
+        // the box of Secure Boot: what it shows, whether it can be set, its text, and a click of the user on it (the explanation is answered by
+        // SecureAnswer)
+        public bool SecureTicked { get { return secureBox.Checked; } }
+        public bool SecureCanBeSet { get { return secureBox.Enabled; } }
+        public string SecureText { get { return secureBox.Text; } }
+        public string NoticeText { get { return notice.Text; } }
+        public bool SecureKnown { get { return plan != null && plan.SecureState == 1; } }
+        public void ClickSecure()
+        {
+            if (secureBox.Enabled) InvokeOnClick(secureBox, EventArgs.Empty);
+            UpdateState();
+        }
         public bool UpdateReady { get { return update.Visible && update.Enabled; } }
+        // "Restart into LibreELEC Hades" next to the chosen drive and in the last panel: whether it is on show and can be pressed, whether it
+        // lies on the notice, and what its boxes for a shortcut show
+        public bool RestartOffered { get { return restartRow.Visible && restartButton.Visible && restartButton.Enabled; } }
+        public bool RestartInNotice
+        {
+            get { return notice.Visible && restartRow.Parent == notice && notice.ClientRectangle.Contains(restartRow.Bounds); }
+        }
+        public bool DoneRestartOffered { get { return donePanel.Visible && doneRestart.Visible && doneRestart.Enabled; } }
+        public bool ShortcutBoxesTicked { get { return restartShortcut.Checked || doneShortcut.Checked; } }
         public string StatusText { get { return status.Text; } }
     }
 }

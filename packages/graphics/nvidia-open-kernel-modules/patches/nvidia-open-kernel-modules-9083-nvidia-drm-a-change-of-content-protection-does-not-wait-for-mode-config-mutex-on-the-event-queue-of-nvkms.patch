@@ -1,0 +1,239 @@
+From 8c436fa88e61469b62a43752c8b989ba3f216f8c Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 04:24:50 +0000
+Subject: [PATCH] nvidia-drm: a change of content protection does not wait for
+ mode_config.mutex on the event queue of NVKMS
+
+9081 moved the handler of a display change off nvkms_kthread_q, where the
+flip events that a blocking commit waits for come in turn, and said in the
+kernel log any event that takes over 100 ms in nvidia-drm. On the RTX 4080
+SUPER, at each start of Kodi with three
+displays, that line named the events that held the queue: "an event of NVKMS
+(type 6) took 3160 ms", "(type 7) took 3017 ms", 3130 and 3097 ms in the next
+start, each as long as the commit waited, with "Flip event timeout" for every
+head of the commit and the late flip events right after
+(NVKMS_EVENT_TYPE_DPY_CONTENT_PROTECTION_CHANGED is 6,
+NVKMS_EVENT_TYPE_DPY_CP_TOPOLOGY_CHANGED 7: nvkms-api-types.h). Both handlers
+take dev->mode_config.mutex there: nv_drm_handle_display_cp_change() to find
+the encoder (it already left the DRM update to a work item, "so that it
+doesn't block flip events"), and nv_drm_handle_display_cp_topology_change()
+to find it and set the topology blob.
+
+Each change is now noted on the queue, a copy of the topology with it, and
+applied in turn by the content protection work, which runs on the system
+workqueue and already takes mode_config.mutex and connection_mutex: the
+connector's cp and cp_event_pending as before, then the update of its content
+protection property; the topology blob and its uevent as before. A change that
+cannot be noted (no memory) is handled as before. The notes left when the
+device goes are freed after the work is cancelled.
+
+Not in driver 580 (nvidia-legacy-open): its nvidia-drm has no events of
+content protection.
+
+Checked: the five modules build against Linux 7.3.5 with the compiler of
+the image, with no new warning; the patch applies with --fuzz=0 after 9000
+to 9082. Not run on a GPU: with three displays, a start of Kodi should have no
+"Flip event timeout" line and no "an event of NVKMS (type 6/7) took" line.
+---
+ kernel-open/nvidia-drm/nvidia-drm-drv.c     |   8 ++
+ kernel-open/nvidia-drm/nvidia-drm-encoder.c | 105 ++++++++++++++++++++
+ kernel-open/nvidia-drm/nvidia-drm-encoder.h |   4 +
+ kernel-open/nvidia-drm/nvidia-drm-priv.h    |   7 ++
+ 4 files changed, 124 insertions(+)
+
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index a0d76f2..19c3c69 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -1035,6 +1035,9 @@ static void nv_drm_handle_content_protection_event_work(struct work_struct *work
+     mutex_lock(&dev->mode_config.mutex);
+     drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
+ 
++    /* Hades: what NVKMS said of content protection, in turn */
++    nv_drm_hades_apply_cp_events(nv_dev);
++
+     drm_connector_list_iter_begin(dev, &conn_iter);
+ 
+     drm_for_each_connector_iter(connector, &conn_iter) {
+@@ -1291,6 +1294,8 @@ static void nv_drm_dev_unload(struct drm_device *dev)
+     atomic_set(&nv_dev->enable_event_handling, false);
+     cancel_delayed_work_sync(&nv_dev->hotplug_event_work);
+     cancel_delayed_work_sync(&nv_dev->content_protection_event_work);
++    /* Hades: the changes of content protection that the work did not apply */
++    nv_drm_hades_free_cp_events(nv_dev);
+ 
+     /* Clean up output polling */
+ 
+@@ -2420,6 +2425,9 @@ void nv_drm_register_drm_device(const struct NvKmsKapiGpuInfo *gpu_info)
+     nv_dev->gpu_mig_device = gpu_info->migDevice;
+ 
+     mutex_init(&nv_dev->lock);
++    /* Hades: nv_drm_hades_apply_cp_events() */
++    spin_lock_init(&nv_dev->hades_cp_lock);
++    INIT_LIST_HEAD(&nv_dev->hades_cp_events);
+ 
+     /* Allocate DRM device */
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-encoder.c b/kernel-open/nvidia-drm/nvidia-drm-encoder.c
+index af76180..2c70b92 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-encoder.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-encoder.c
+@@ -355,6 +355,99 @@ void nv_drm_hades_mark_changed_displays(struct nv_drm_device *nv_dev)
+     mutex_unlock(&dev->mode_config.mutex);
+ }
+ 
++/*
++ * Hades: a change of content protection or of its topology that NVKMS said,
++ * applied by the content protection work. The handlers of these events took
++ * dev->mode_config.mutex on nvkms_kthread_q, where the flip events that a
++ * blocking commit waits for come in turn: on an RTX 4080 SUPER
++ * (the line of 9081) an event of type 6 (content protection
++ * changed) or 7 (its topology changed) held the queue 3.0 to 3.2 s at each start
++ * of Kodi with three displays, as long as the commit waited, every flip event of
++ * its three heads behind it. They are noted here (a copy of the topology) and
++ * applied in turn by the work, which takes that mutex on the system workqueue.
++ * Where the note cannot be made (no memory), as before.
++ */
++struct nv_drm_hades_cp_event {
++    struct list_head list;
++    NvKmsKapiDisplay hDisplay;
++    bool topology;
++    enum NvKmsContentProtection cp;
++    NvU8 data[NVKMS_HDCP_TOPOLOGY_SIZE];
++};
++
++static bool nv_drm_hades_queue_cp_event(struct nv_drm_device *nv_dev,
++                                        NvKmsKapiDisplay hDisplay,
++                                        bool topology,
++                                        enum NvKmsContentProtection cp,
++                                        const void *data)
++{
++    struct nv_drm_hades_cp_event *event = nv_drm_calloc(1, sizeof(*event));
++    unsigned long flags;
++
++    if (event == NULL) {
++        return false;
++    }
++    event->hDisplay = hDisplay;
++    event->topology = topology;
++    event->cp = cp;
++    if (topology && data != NULL) {
++        memcpy(event->data, data, sizeof(event->data));
++    }
++    spin_lock_irqsave(&nv_dev->hades_cp_lock, flags);
++    list_add_tail(&event->list, &nv_dev->hades_cp_events);
++    spin_unlock_irqrestore(&nv_dev->hades_cp_lock, flags);
++    schedule_delayed_work(&nv_dev->content_protection_event_work, 0);
++    return true;
++}
++
++/* Hades: called with dev->mode_config.mutex and connection_mutex held */
++void nv_drm_hades_apply_cp_events(struct nv_drm_device *nv_dev)
++{
++    struct drm_device *dev = nv_dev->dev;
++    struct nv_drm_hades_cp_event *event, *next;
++    unsigned long flags;
++    LIST_HEAD(events);
++
++    spin_lock_irqsave(&nv_dev->hades_cp_lock, flags);
++    list_splice_init(&nv_dev->hades_cp_events, &events);
++    spin_unlock_irqrestore(&nv_dev->hades_cp_lock, flags);
++
++    list_for_each_entry_safe(event, next, &events, list) {
++        struct nv_drm_encoder *nv_encoder =
++            get_nv_encoder_from_nvkms_display(dev, event->hDisplay);
++
++        if (nv_encoder == NULL) {
++            if (event->topology) {
++                NV_DRM_DEV_LOG_ERR(nv_dev, "Encoder not found for display %d",
++                                   event->hDisplay);
++            }
++        } else if (event->topology) {
++            nv_drm_connector_update_topology_property(nv_encoder->nv_connector,
++                                                      event->data);
++        } else {
++            nv_encoder->nv_connector->cp = event->cp;
++            nv_encoder->nv_connector->cp_event_pending = true;
++        }
++        list_del(&event->list);
++        nv_drm_free(event);
++    }
++}
++
++void nv_drm_hades_free_cp_events(struct nv_drm_device *nv_dev)
++{
++    struct nv_drm_hades_cp_event *event, *next;
++    unsigned long flags;
++    LIST_HEAD(events);
++
++    spin_lock_irqsave(&nv_dev->hades_cp_lock, flags);
++    list_splice_init(&nv_dev->hades_cp_events, &events);
++    spin_unlock_irqrestore(&nv_dev->hades_cp_lock, flags);
++    list_for_each_entry_safe(event, next, &events, list) {
++        list_del(&event->list);
++        nv_drm_free(event);
++    }
++}
++
+ void nv_drm_handle_display_cp_change(struct nv_drm_device *nv_dev,
+                                      NvKmsKapiDisplay hDisplay,
+                                      enum NvKmsContentProtection cp)
+@@ -362,6 +455,11 @@ void nv_drm_handle_display_cp_change(struct nv_drm_device *nv_dev,
+     struct drm_device *dev = nv_dev->dev;
+     struct nv_drm_encoder *nv_encoder = NULL;
+ 
++    /* Hades: off the event queue (nv_drm_hades_queue_cp_event()) */
++    if (nv_drm_hades_queue_cp_event(nv_dev, hDisplay, false, cp, NULL)) {
++        return;
++    }
++
+     mutex_lock(&dev->mode_config.mutex);
+     nv_encoder = get_nv_encoder_from_nvkms_display(dev, hDisplay);
+     if (nv_encoder == NULL) {
+@@ -386,6 +484,13 @@ void nv_drm_handle_display_cp_topology_change(struct nv_drm_device *nv_dev,
+     struct drm_device *dev = nv_dev->dev;
+     struct nv_drm_encoder *nv_encoder = NULL;
+ 
++    /* Hades: off the event queue (nv_drm_hades_queue_cp_event()) */
++    if (nv_drm_hades_queue_cp_event(nv_dev, hDisplay, true,
++                                    NVKMS_CONTENT_PROTECTION_OFF,
++                                    topology)) {
++        return;
++    }
++
+     mutex_lock(&dev->mode_config.mutex);
+ 
+     nv_encoder = get_nv_encoder_from_nvkms_display(dev, hDisplay);
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-encoder.h b/kernel-open/nvidia-drm/nvidia-drm-encoder.h
+index 9af4c37..71b0708 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-encoder.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-encoder.h
+@@ -59,6 +59,10 @@ static inline struct nv_drm_encoder *to_nv_encoder(
+ struct drm_encoder*
+ nv_drm_add_encoder(struct drm_device *dev, NvKmsKapiDisplay hDisplay);
+ 
++/* Hades: the changes of content protection that NVKMS said, applied and freed */
++void nv_drm_hades_apply_cp_events(struct nv_drm_device *nv_dev);
++void nv_drm_hades_free_cp_events(struct nv_drm_device *nv_dev);
++
+ /* Hades: the displays that nv_drm_handle_display_change() noted */
+ void nv_drm_hades_mark_changed_displays(struct nv_drm_device *nv_dev);
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index f53b2b0..c0f203f 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -179,6 +179,13 @@ struct nv_drm_device {
+      * one bit (nvDpyIdToNvU32())
+      */
+     atomic_t hades_changed_displays;
++    /*
++     * Hades: the changes of content protection and of its topology that NVKMS
++     * said, applied by the content protection work in turn
++     * (nv_drm_hades_apply_cp_events())
++     */
++    spinlock_t hades_cp_lock;
++    struct list_head hades_cp_events;
+     /* Hades: Media VRR (NV_VRR_MEDIA) */
+     NvBool hadesSupportsVirtualRefreshRate;
+     NvBool isSocDgpuDisplayNeedingWar;

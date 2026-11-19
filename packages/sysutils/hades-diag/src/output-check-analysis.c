@@ -32,11 +32,13 @@ static uint64_t word(uint64_t seed, uint32_t stream, uint32_t index)
 #define S_DD 101u
 #define S_DE 102u
 #define S_BIT(v, c, b) (200u + 24u * (v) + 8u * (c) + (b))
+#define S_ONE_DA(c) (300u + 2u * (c))
+#define S_ONE_DB(c) (301u + 2u * (c))
 
 uint32_t oc_pixel(const struct oc_picture *p, uint64_t seed, uint32_t index)
 {
 	const uint32_t z = (uint32_t)word(seed, S_Z, index) & 0xffffffu;
-	uint32_t da, db, half;
+	uint32_t da, db, half, mask;
 
 	switch (p->kind) {
 	case OC_Z:
@@ -68,6 +70,19 @@ uint32_t oc_pixel(const struct oc_picture *p, uint64_t seed, uint32_t index)
 		if (word(seed, S_BIT(p->variant, p->channel, p->bit), index) & 1u)
 			return z ^ (1u << (8u * (2u - p->channel) + p->bit));
 		return z;
+	case OC_ONE_A:
+	case OC_ONE_B:
+	case OC_ONE_C:
+		if (p->channel > 2)
+			return z;
+		mask = 0xffu << (8u * (2u - p->channel));
+		da = (uint32_t)word(seed, S_ONE_DA(p->channel), index) & mask;
+		db = (uint32_t)word(seed, S_ONE_DB(p->channel), index) & mask;
+		if (p->kind == OC_ONE_A)
+			return z ^ da;
+		if (p->kind == OC_ONE_B)
+			return z ^ db;
+		return z ^ da ^ db;
 	}
 	return z;
 }
@@ -94,6 +109,19 @@ static bool relation(const struct oc_crc *z, const struct oc_crc *a, const struc
 		if (z->v[i] ^ a->v[i] ^ b->v[i] ^ c->v[i])
 			return false;
 	return true;
+}
+
+/* The values (bit i: value i) where crc(Z) ^ crc(A) ^ crc(B) ^ crc(C) is not 0 */
+static uint32_t broken(const struct oc_crc *z, const struct oc_crc *a, const struct oc_crc *b,
+		       const struct oc_crc *c, unsigned int values)
+{
+	uint32_t d = 0;
+	unsigned int i;
+
+	for (i = 0; i < values; i++)
+		if (z->v[i] ^ a->v[i] ^ b->v[i] ^ c->v[i])
+			d |= 1u << i;
+	return d;
 }
 
 /* The values (bit i: value i) that differ between x and y */
@@ -124,9 +152,12 @@ void oc_analyse(const struct oc_measure *m, struct oc_result *r)
 	}
 	for (t = 0; t < OC_TRIALS; t++)
 		all_measured = all_measured && m->a[t].measured && m->b[t].measured && m->c[t].measured;
-	for (c = 0; c < 3; c++)
+	for (c = 0; c < 3; c++) {
 		for (b = 0; b < 8; b++)
 			all_measured = all_measured && m->bits[c][b][0].measured;
+		all_measured = all_measured && m->one_a[c].measured && m->one_b[c].measured &&
+			       m->one_c[c].measured;
+	}
 	if (!all_measured) {
 		r->verdict = OC_NOT_JUDGED;
 		r->reasons = OC_R_INCOMPLETE;
@@ -153,10 +184,19 @@ void oc_analyse(const struct oc_measure *m, struct oc_result *r)
 
 	/* Exactness: overlapping changes keep it only through a pipe linear over the bits. */
 	for (t = 0; t < OC_TRIALS; t++)
-		if (!relation(&m->z, &m->a[t], &m->b[t], &m->c[t], n))
+		if (!relation(&m->z, &m->a[t], &m->b[t], &m->c[t], n)) {
 			r->trials_failed++;
+			r->values_broken |= broken(&m->z, &m->a[t], &m->b[t], &m->c[t], n);
+		}
 	if (r->trials_failed)
 		r->reasons |= OC_R_TRANSFORMED;
+
+	/* Where: one component of the input changed at a time (output-check.h). */
+	for (c = 0; c < 3; c++) {
+		r->channel_broken[c] = broken(&m->z, &m->one_a[c], &m->one_b[c], &m->one_c[c], n);
+		if (r->channel_broken[c])
+			r->reasons |= OC_R_TRANSFORMED;
+	}
 
 	/* Every bit of every component reaches the CRC (a second set of pixels, where measured, rules out a
 	 * CRC that happened to be equal). */

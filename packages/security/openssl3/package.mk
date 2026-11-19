@@ -25,6 +25,15 @@ PKG_SOURCE_DIR="openssl-${PKG_VERSION}"
 PKG_DEPENDS_HOST="ccache:host"
 PKG_DEPENDS_TARGET="autotools:host gcc:host"
 PKG_LONGDESC="The libraries of OpenSSL 3 (libssl.so.3 and libcrypto.so.3, from its long-term series), for Python 3.14 and for programs that were built against them"
+# Hades: compiler hardening ("+hardening": the stack protector of every function with an array or an address
+# taken, _FORTIFY_SOURCE=2 and -Werror=format-security), without BIND_NOW, which makes loading slower (config/optimize).
+# OpenSSL faces the network and parses certificates, so it takes the full set. Measured against the build without it
+# (in the system of the image, the two in turns, retired instructions read from the hardware counters): TLS 1.3 in
+# AES-GCM or ChaCha20-Poly1305 +0.54 to +0.96 %, handshakes (ECDSA P-256 or RSA-2048, X25519 or the default groups)
+# +0.31 to +0.66 %, sha256 and sha384 the same (assembly); in time, inside the spread of every measure; the same bytes
+# out. The exported symbols, their versions and the sonames are the same, so the add-ons of LibreELEC's repository that
+# ask for these libraries by name (decision 0027) load as before.
+PKG_BUILD_FLAGS="+hardening -bindnow"
 PKG_TOOLCHAIN="configure"
 
 PKG_OPENSSL3_PREFIX="/usr/lib/openssl-3"

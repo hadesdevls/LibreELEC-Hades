@@ -8,7 +8,7 @@ PKG_SHA256="e704ca70bcccd41baf409f6d54119add52a03f34e6eea3f11c6304f1553b4397"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_SITE="http://www.kodi.tv"
 PKG_URL="https://github.com/xbmc/xbmc/archive/${PKG_VERSION}.tar.gz"
-PKG_DEPENDS_TARGET="toolchain plymouth-lite libplacebo JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
+PKG_DEPENDS_TARGET="toolchain plymouth-lite hades-picture libplacebo JsonSchemaBuilder:host TexturePacker:host Python3 zlib systemd lzo pcre2 swig:host libass curl exiv2 fontconfig fribidi tinyxml tinyxml2 libjpeg-turbo freetype libcdio taglib libxml2 libxslt nlohmann-json sqlite ffmpeg crossguid libdvdnav libfmt libfstrcmp flatbuffers:host flatbuffers libudfread spdlog libxkbcommon"
 PKG_DEPENDS_UNPACK="commons-lang3 commons-text groovy"
 PKG_DEPENDS_HOST="toolchain"
 PKG_LONGDESC="A free and open source cross-platform media player."
@@ -126,8 +126,21 @@ configure_package() {
     KODI_CEC="-DENABLE_CEC=OFF"
   fi
 
-  if [ "${CEC_FRAMEWORK_SUPPORT}" = "yes" ]; then
+  # Hades: not in Generic, where adapters of the kernel come and go: the CEC adapter of a
+  # DisplayPort output (DP-AUX, a DP to HDMI converter) is unregistered 1 s after its hot-plug goes
+  # low (drm_dp_cec.c) and comes back as a new node, and a Pulse-Eight adapter can be plugged in
+  # later. The patch stops Kodi's search for adapters once it finds one of the kernel.
+  if [ "${CEC_FRAMEWORK_SUPPORT}" = "yes" -a "${PROJECT}" != "Generic" ]; then
     PKG_PATCH_DIRS+=" cec-framework"
+  fi
+
+  # Hades: the second folder of Hades' patches of Kodi, projects/Generic/patches/kodi/x86-2.
+  # scripts/unpack applies the project's folders named in PKG_PATCH_DIRS after the one of the
+  # architecture (x86), whose four-figure numbers are taken: kodi-9001 to kodi-9022 in the folder
+  # above it and kodi-9023 to kodi-9984 in x86. The series goes on there from kodi-9001 again,
+  # as x86 did after the patches of the Intel fork in the first versions.
+  if [ "${TARGET_ARCH}" = "x86_64" ]; then
+    PKG_PATCH_DIRS+=" x86-2"
   fi
 
   if [ "${KODI_OPTICAL_SUPPORT}" = yes ]; then
@@ -387,9 +400,14 @@ post_makeinstall_target() {
   mkdir -p ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-config ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi-display-notice ${INSTALL}/usr/lib/kodi
-  # Hades: the notice "one display" as a picture (brand/notice), which kodi-display-notice draws
+  # Hades: the notice on the screen when Kodi stops at every start (kodi.service)
+  cp ${PKG_DIR}/scripts/kodi-failed-notice ${INSTALL}/usr/lib/kodi
+  # Hades: the cards of the notices "one display" and "Kodi could not start" (brand/notice), which
+  # kodi-display-notice and kodi-failed-notice lay over the splash screen with hades-picture, and the
+  # letters with which it writes the version of the system on the second
   mkdir -p ${INSTALL}/usr/lib/kodi/notice
-  cp ${PKG_DIR}/brand/notice/notice-*.png ${INSTALL}/usr/lib/kodi/notice
+  cp ${PKG_DIR}/brand/notice/display-*.png ${PKG_DIR}/brand/notice/failed-o*-*.png \
+     ${PKG_DIR}/brand/notice/font-*.png ${PKG_DIR}/brand/notice/font-*.txt ${INSTALL}/usr/lib/kodi/notice
   cp ${PKG_DIR}/scripts/kodi-safe-mode ${INSTALL}/usr/lib/kodi
   cp ${PKG_DIR}/scripts/kodi.sh ${INSTALL}/usr/lib/kodi
 

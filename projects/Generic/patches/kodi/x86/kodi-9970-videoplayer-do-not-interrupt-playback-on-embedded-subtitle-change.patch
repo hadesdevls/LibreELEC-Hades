@@ -1,0 +1,210 @@
+From 4ab093cf4ca2e01114a7d6fd00cde3bb3daa320d Mon Sep 17 00:00:00 2001
+From: Alexander Golovanov <sasha_spb_ru@yahoo.com>
+Date: Sat, 7 Nov 2026 13:15:41 +0300
+Subject: [PATCH] [VideoPlayer] Do not interrupt playback on embedded subtitle
+ change
+
+Since #27770 the player is seeked back to the current time when the
+embedded subtitle stream changes, to read again the subtitle packets
+the demuxer has already read ahead and discarded. The seek flushes audio
+and video, so the sound is cut for about a second on every change.
+
+Seek only the demuxer instead and drop the packets it replays for
+the running audio and video streams, their players already have them.
+The subtitle stream gets the packets it missed and playback goes on.
+
+This is done for a file except while fast-forwarding or rewinding, where
+the demuxer discards frames and no audio is played. Paused, a player
+seek would flush and decode the video again for nothing; with tempo it
+would cut the audio. In all other cases the player is seeked as before.
+
+(cherry picked from commit 38eaf96)
+(cherry picked from commit 08b7d97c3eff0254dbc6f2577d9b285ca0d219c6)
+---
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp | 84 ++++++++++++++++++++++++--
+ xbmc/cores/VideoPlayer/VideoPlayer.h   |  4 ++
+ 2 files changed, 82 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 1e96112..12e86cf 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -2137,9 +2137,11 @@ void CVideoPlayer::Process()
+         m_pDemuxer->FillBuffer(fillBuffer);
+     }
+ 
+-    // if the queues are full, no need to read more
+-    if ((!m_VideoPlayerAudio->AcceptsData() && m_CurrentAudio.id >= 0) ||
+-        (!m_VideoPlayerVideo->AcceptsData() && m_CurrentVideo.id >= 0))
++    // If the queues are full, no need to read more, unless the full queue belongs
++    // to a stream that replays: its replayed packets are dropped and never reach it
++    if ((!m_VideoPlayerAudio->AcceptsData() && m_CurrentAudio.id >= 0 &&
++         !m_CurrentAudio.replaying) ||
++        (!m_VideoPlayerVideo->AcceptsData() && m_CurrentVideo.id >= 0 && !m_CurrentVideo.replaying))
+     {
+       if (m_playSpeed == DVD_PLAYSPEED_PAUSE &&
+           m_demuxerSpeed != DVD_PLAYSPEED_PAUSE)
+@@ -2291,6 +2293,13 @@ void CVideoPlayer::Process()
+       break;
+     }
+ 
++    // Drop the packets the demuxer replays after a subtitle stream change
++    if (IsReplayedPacket(pStream, pPacket))
++    {
++      CDVDDemuxUtils::FreeDemuxPacket(pPacket);
++      continue;
++    }
++
+     // see if we can find something better to play
+     CheckBetterStream(m_CurrentAudio,    pStream);
+     CheckBetterStream(m_CurrentVideo,    pStream);
+@@ -2364,6 +2373,30 @@ bool CVideoPlayer::CheckIsCurrent(const CCurrentStream& current,
+     return false;
+ }
+ 
++bool CVideoPlayer::IsReplayedPacket(CDemuxStream* stream, DemuxPacket* packet)
++{
++  for (CCurrentStream* current : {&m_CurrentAudio, &m_CurrentVideo})
++  {
++    if (!current->replaying || !CheckIsCurrent(*current, stream, packet))
++      continue;
++
++    // A packet without timestamps can't be told from a new one, the stream keeps replaying
++    const double dts{packet->dts != DVD_NOPTS_VALUE ? packet->dts : packet->pts};
++    if (dts == DVD_NOPTS_VALUE)
++      return false;
++
++    // current->dts is the last dts the stream got, up to it the packets are replayed and
++    // the first one past it ends the replay
++    if (current->dts != DVD_NOPTS_VALUE && dts <= current->dts)
++      return true;
++
++    current->replaying = false;
++    return false;
++  }
++
++  return false;
++}
++
+ void CVideoPlayer::ProcessPacket(CDemuxStream* pStream, DemuxPacket* pPacket)
+ {
+   // process packet if it belongs to selected stream.
+@@ -5168,12 +5201,13 @@ void CVideoPlayer::ReopenSubtitleStream(const SelectionStream& stream)
+ 
+   // For embedded subtitles the demuxer is ahead of playback (AV buffers
+   // are full), so the subtitle packets for the current playback time have
+-  // already been read and discarded. Seek back to the current time so they
+-  // get re-read, mirroring what audio stream switching does.
++  // already been read and discarded. Read them again, without interrupting
++  // playback if possible, otherwise seek back to the current time like
++  // audio stream switching does.
+   // A seek already queued re-reads them as well and must not be overridden.
+   if (opened && STREAM_SOURCE_MASK(stream.source) == STREAM_SOURCE_DEMUX &&
+       m_messenger.GetPacketCount(CDVDMsg::PLAYER_SEEK) == 0 &&
+-      m_messenger.GetPacketCount(CDVDMsg::PLAYER_SEEK_CHAPTER) == 0)
++      m_messenger.GetPacketCount(CDVDMsg::PLAYER_SEEK_CHAPTER) == 0 && !RereadSubtitleData())
+   {
+     CDVDMsgPlayerSeek::CMode mode;
+     mode.time = static_cast<double>(GetUpdatedTime());
+@@ -5185,6 +5219,41 @@ void CVideoPlayer::ReopenSubtitleStream(const SelectionStream& stream)
+   }
+ }
+ 
++bool CVideoPlayer::RereadSubtitleData()
++{
++  // Seeks the demuxer back on its own. The stream players keep their data, the packets
++  // the demuxer replays for them are dropped in Process(). Only for a file, other inputs
++  // seek in their own way and may reset the demuxer or restart the timeline. Not while
++  // fast-forwarding or rewinding, the demuxer discards frames there. The player time
++  // has to be the demuxer time. Returns false if not done, the player has to seek then.
++  const bool ffrw{
++      m_playSpeed != DVD_PLAYSPEED_NORMAL && m_playSpeed != DVD_PLAYSPEED_PAUSE &&
++      !m_processInfo->IsTempoAllowed(static_cast<float>(m_playSpeed) / DVD_PLAYSPEED_NORMAL)};
++  if (ffrw || m_offset_pts != 0.0 || !m_pInputStream->IsStreamType(DVDSTREAM_TYPE_FILE))
++    return false;
++
++  // Replayed packets are found by dts, the demuxer has to be ahead of the clock
++  const double clock{GetCaughtUpClock()};
++  for (const CCurrentStream* current : {&m_CurrentAudio, &m_CurrentVideo})
++  {
++    if (current->id >= 0 && (current->dts == DVD_NOPTS_VALUE || current->dts < clock))
++      return false;
++  }
++
++  // The playback time has EDL cuts removed, the demuxer time hasn't
++  const std::chrono::milliseconds time{
++      m_Edl.GetTimeAfterRestoringCuts(std::chrono::milliseconds{GetUpdatedTime()})};
++
++  if (!m_pDemuxer->SeekTime(static_cast<double>(time.count()), true))
++    return false;
++
++  m_CurrentAudio.replaying = m_CurrentAudio.id >= 0;
++  m_CurrentVideo.replaying = m_CurrentVideo.id >= 0;
++
++  CLog::LogF(LOGDEBUG, "re-reading subtitle data from demuxer time {}", time.count());
++  return true;
++}
++
+ void CVideoPlayer::SetSubtitleVerticalPosition(int value, bool save)
+ {
+   m_processInfo->GetVideoSettingsLocked().SetSubtitleVerticalPosition(value, save);
+@@ -5502,6 +5571,7 @@ bool CVideoPlayer::OpenStream(CCurrentStream& current, int64_t demuxerId, int iS
+     current.demuxerId = demuxerId;
+     current.source = source;
+     current.demuxDisabled = false;
++    current.replaying = false;
+     current.hint = hint;
+     current.stream = (void*)stream;
+     current.lastdts = DVD_NOPTS_VALUE;
+@@ -6279,10 +6349,12 @@ void CVideoPlayer::FlushBuffers(double pts, bool accurate, bool sync)
+   }
+ 
+   m_CurrentAudio.dts         = DVD_NOPTS_VALUE;
++  m_CurrentAudio.replaying = false;
+   m_CurrentAudio.startpts    = startpts;
+   m_CurrentAudio.packets = 0;
+ 
+   m_CurrentVideo.dts         = DVD_NOPTS_VALUE;
++  m_CurrentVideo.replaying = false;
+   m_CurrentVideo.startpts    = startpts;
+   m_CurrentVideo.packets = 0;
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 7720ee2..bcbccae 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -138,6 +138,7 @@ public:
+   int changes; // remembered counter from stream to track codec changes
+   bool inited;
+   bool demuxDisabled; // disabled in the demuxer since it was opened
++  bool replaying; // Demuxer re-reads what was already delivered, up to dts
+   unsigned int packets;
+   IDVDStreamPlayer::ESyncState syncState;
+   double starttime;
+@@ -177,6 +178,7 @@ public:
+     changes = 0;
+     inited = false;
+     demuxDisabled = false;
++    replaying = false;
+     packets = 0;
+     syncState = IDVDStreamPlayer::SYNC_STARTING;
+     starttime = DVD_NOPTS_VALUE;
+@@ -454,6 +456,7 @@ protected:
+   bool CloseStream(CCurrentStream& current, bool bWaitForBuffers);
+ 
+   bool CheckIsCurrent(const CCurrentStream& current, CDemuxStream* stream, DemuxPacket* pkg);
++  bool IsReplayedPacket(CDemuxStream* stream, DemuxPacket* packet);
+   void ProcessPacket(CDemuxStream* pStream, DemuxPacket* pPacket);
+   void ProcessAudioData(CDemuxStream* pStream, DemuxPacket* pPacket);
+   void ProcessVideoData(CDemuxStream* pStream, DemuxPacket* pPacket);
+@@ -473,6 +476,7 @@ protected:
+ 
+   void SetSubtitleVisibleInternal(bool bVisible);
+   void ReopenSubtitleStream(const SelectionStream& stream);
++  bool RereadSubtitleData();
+ 
+   enum SubtitleChange
+   {
+-- 
+2.53.0
+

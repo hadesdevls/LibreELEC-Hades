@@ -3,8 +3,9 @@
 /*
  * Host test of output-check-analysis.c: the test pictures, and the judgement of the CRCs of pipes and CRCs
  * modelled here (the identity, curves, range conversion, truncation, dither in time and in space, swapped
- * components, an inversion; a CRC-32 over the whole output, three CRC-16 one per component, a sum that is no
- * CRC, a CRC that never changes). Each case says what the check must answer. Exit status 0: all as expected.
+ * components, an inversion, a curve on red alone, green mixed with red; a CRC-32 over the whole output,
+ * three CRC-16 one per component, a sum that is no CRC, a CRC that never changes). Each case says what the
+ * check must answer, and where the relation breaks. Exit status 0: all as expected.
  */
 #include "output-check.h"
 
@@ -40,6 +41,8 @@ enum pipe_kind {
 	P_SPATIAL,	/* a fixed dither by position, of a value scaled by 257/256 (a prescale) */
 	P_SWAP_RB,	/* red and blue exchanged */
 	P_INVERT,	/* every bit inverted */
+	P_CURVE_RED,	/* a curve on red alone, green and blue as they are */
+	P_MIX_RG,	/* green made from red and green (a colour conversion), red and blue as they are */
 };
 
 static unsigned int frame_no;
@@ -119,6 +122,10 @@ static uint32_t pipe_apply(enum pipe_kind kind, uint32_t rgb, uint32_t pos)
 		return ((rgb & 255) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 255);
 	case P_INVERT:
 		return rgb ^ 0xffffff;
+	case P_CURVE_RED:
+		return ((uint32_t)f_gamma((rgb >> 16) & 255, 0, pos) << 16) | (rgb & 0xffff);
+	case P_MIX_RG:
+		return (rgb & 0xff00ff) | (((((rgb >> 16) & 255) + ((rgb >> 8) & 255) + 1) / 2) << 8);
 	}
 	return rgb;
 }
@@ -252,6 +259,14 @@ static void measure(enum crc_kind ck, enum pipe_kind pk, const struct options *o
 		HOLD(&e, false, &m->e);
 		HOLD(&f, false, &m->f);
 	}
+	for (c = 0; c < 3; c++) {
+		struct oc_picture a = {.kind = OC_ONE_A, .channel = c}, bb = {.kind = OC_ONE_B, .channel = c},
+				  cc = {.kind = OC_ONE_C, .channel = c};
+
+		HOLD(&a, false, &m->one_a[c]);
+		HOLD(&bb, false, &m->one_b[c]);
+		HOLD(&cc, false, &m->one_c[c]);
+	}
 	for (c = 0; c < 3; c++)
 		for (b = 0; b < 8; b++) {
 			struct oc_picture q = {.kind = OC_BIT, .channel = c, .bit = b};
@@ -292,7 +307,7 @@ static void test_pictures(void)
 {
 	unsigned int t, c, b, v;
 	uint32_t i;
-	unsigned int half = 0, both = 0;
+	unsigned int half = 0, both = 0, one_changed[3] = {0, 0, 0};
 
 	for (i = 0; i < W * H; i++) {
 		for (t = 0; t < OC_TRIALS; t++) {
@@ -317,6 +332,19 @@ static void test_pictures(void)
 			if (dd || ee)
 				both++;
 		}
+		for (c = 0; c < 3; c++) {
+			struct oc_picture z = {.kind = OC_Z}, a = {.kind = OC_ONE_A, .channel = c},
+					  bb = {.kind = OC_ONE_B, .channel = c}, cc = {.kind = OC_ONE_C, .channel = c};
+			const uint32_t mask = 0xffu << (8 * (2 - c));
+			const uint32_t zz = oc_pixel(&z, SEED, i), da = oc_pixel(&a, SEED, i) ^ zz,
+				       db = oc_pixel(&bb, SEED, i) ^ zz;
+
+			CHECK(!(da & ~mask) && !(db & ~mask), "pixel %u: the pictures of %s alone change 0x%06x 0x%06x",
+			      i, oc_channel_name(c), da, db);
+			CHECK((zz ^ oc_pixel(&a, SEED, i) ^ oc_pixel(&bb, SEED, i) ^ oc_pixel(&cc, SEED, i)) == 0,
+			      "pixel %u: Z ^ A ^ B ^ C of %s alone", i, oc_channel_name(c));
+			one_changed[c] += da != 0;
+		}
 		for (c = 0; c < 3; c++)
 			for (b = 0; b < 8; b++)
 				for (v = 0; v < 2; v++) {
@@ -329,6 +357,10 @@ static void test_pictures(void)
 					      oc_channel_name(c), d);
 				}
 	}
+	/* a component alone: random bytes, so nearly every pixel changes */
+	for (c = 0; c < 3; c++)
+		CHECK(one_changed[c] > W * H * 9 / 10, "%s alone changes %u of %u pixels", oc_channel_name(c),
+		      one_changed[c], W * H);
 	/* random halves: within a few per cent of one half */
 	CHECK(half > W * H * 2 / 5 && half < W * H * 3 / 5, "calibration half has %u of %u pixels", half, W * H);
 	CHECK(both > W * H * 9 / 10, "calibration changes %u of %u pixels", both, W * H);
@@ -387,8 +419,11 @@ static void test_edges(void)
 
 	/* each picture unmeasured on its own */
 	{
-		struct oc_crc *fields[] = {&m.z, &m.z_end, &m.d, &m.e, &m.f, &m.a[0], &m.a[1], &m.b[0], &m.b[1],
-					   &m.c[0], &m.c[1], &m.bits[0][0][0], &m.bits[2][7][0], &m.bits[1][4][0]};
+		struct oc_crc *fields[] = {&m.z,	   &m.z_end,	      &m.d,		&m.e,
+					   &m.f,	   &m.a[0],	      &m.a[1],		&m.b[0],
+					   &m.b[1],	   &m.c[0],	      &m.c[1],		&m.bits[0][0][0],
+					   &m.bits[2][7][0], &m.bits[1][4][0], &m.one_a[0],	&m.one_b[1],
+					   &m.one_c[2]};
 
 		for (k = 0; k < sizeof(fields) / sizeof(fields[0]); k++) {
 			m = m0;
@@ -533,6 +568,48 @@ int main(void)
 	      NULL);
 	judge("crc16x3 dither in time", C_CRC16X3, P_TEMPORAL, NULL, OC_NOT_EXACT,
 	      OC_R_UNSTABLE | OC_R_DRIFT | OC_R_TRANSFORMED | OC_R_CRC_NOT_LINEAR, 0, NULL);
+
+	/* Where it breaks: by value of the CRC, and one component of the input at a time */
+	judge("crc16x3 identity, where", C_CRC16X3, P_IDENTITY, NULL, OC_EXACT, 0, 0, &r);
+	CHECK(r.values_broken == 0 && r.channel_broken[0] == 0 && r.channel_broken[1] == 0 &&
+	      r.channel_broken[2] == 0, "identity: broken %x, alone %x %x %x", r.values_broken,
+	      r.channel_broken[0], r.channel_broken[1], r.channel_broken[2]);
+	judge("crc16x3 curve on every component, where", C_CRC16X3, P_GAMMA, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0,
+	      &r);
+	CHECK(r.values_broken == 7 && r.channel_broken[0] == 1 && r.channel_broken[1] == 2 &&
+	      r.channel_broken[2] == 4, "curve: broken %x, alone %x %x %x (expected 7, 1 2 4)", r.values_broken,
+	      r.channel_broken[0], r.channel_broken[1], r.channel_broken[2]);
+	judge("crc16x3 curve on red alone", C_CRC16X3, P_CURVE_RED, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0, &r);
+	CHECK(r.values_broken == 1 && r.channel_broken[0] == 1 && r.channel_broken[1] == 0 &&
+	      r.channel_broken[2] == 0, "curve on red: broken %x, alone %x %x %x (expected 1, 1 0 0)",
+	      r.values_broken, r.channel_broken[0], r.channel_broken[1], r.channel_broken[2]);
+	judge("crc16x3 green mixed with red", C_CRC16X3, P_MIX_RG, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0, &r);
+	CHECK(r.values_broken == 2 && r.channel_broken[0] == 2 && r.channel_broken[1] == 2 &&
+	      r.channel_broken[2] == 0, "mix: broken %x, alone %x %x %x (expected 2, 2 2 0)", r.values_broken,
+	      r.channel_broken[0], r.channel_broken[1], r.channel_broken[2]);
+	CHECK(r.changed_values[0] == 3 && r.changed_values[1] == 2 && r.changed_values[2] == 4,
+	      "mix: the bits of red change %x, of green %x, of blue %x (expected 3 2 4)", r.changed_values[0],
+	      r.changed_values[1], r.changed_values[2]);
+	judge("crc16x3 red and blue swapped, where", C_CRC16X3, P_SWAP_RB, NULL, OC_EXACT, 0, 0, &r);
+	CHECK(!r.values_broken && !r.channel_broken[0] && !r.channel_broken[1] && !r.channel_broken[2],
+	      "swap: nothing breaks");
+	judge("crc32 curve on red alone", C_CRC32, P_CURVE_RED, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0, &r);
+	CHECK(r.values_broken == 1 && r.channel_broken[0] == 1 && !r.channel_broken[1] && !r.channel_broken[2],
+	      "crc32, curve on red: broken %x, alone %x %x %x", r.values_broken, r.channel_broken[0],
+	      r.channel_broken[1], r.channel_broken[2]);
+	/* a trial of one component alone that breaks makes the verdict, the others holding */
+	{
+		struct oc_measure m;
+		struct oc_result q;
+
+		measure(C_CRC16X3, P_IDENTITY, NULL, &m);
+		m.one_c[1].v[1] ^= 0x10;
+		oc_analyse(&m, &q);
+		CHECK(q.verdict == OC_NOT_EXACT && q.reasons == OC_R_TRANSFORMED && q.trials_failed == 0 &&
+		      q.channel_broken[1] == 2 && !q.channel_broken[0] && !q.channel_broken[2],
+		      "green alone broken by hand: verdict %d reasons %x alone %x %x %x", q.verdict, q.reasons,
+		      q.channel_broken[0], q.channel_broken[1], q.channel_broken[2]);
+	}
 
 	/* What is not a CRC, or measures nothing */
 	judge("sum of the bytes, identity", C_SUM, P_IDENTITY, NULL, OC_NOT_JUDGED,

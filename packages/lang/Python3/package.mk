@@ -135,6 +135,14 @@ pre_configure_target() {
   # (tgetent, UP...) to whoever loads it. The programs that use readline link ncurses in; Python's
   # readline module did not, and could not be imported ("undefined symbol: UP").
   export LIBREADLINE_LIBS="-lreadline -lncursesw"
+
+  # Hades: compiler hardening where it costs nothing measurable: _FORTIFY_SOURCE=2, -Werror=format-security and the
+  # stack protector of the functions with a character array (-fstack-protector, 36 functions of libpython). The
+  # whole set of "+hardening" (-fstack-protector-strong, 1729 functions, the loop of the interpreter among them) costs
+  # +0.4 to +1.7 % of the instructions of the interpreter's work and +2.4 % of its start; this one +0.0 to +0.4 % and
+  # +0.8 % (0.4 million instructions, a tenth of a millisecond), measured against the build without it in the system
+  # of the image (retired instructions, hardware counters): the same output, the same exported symbols.
+  export CFLAGS+=" -fstack-protector -Wformat -Werror=format-security -D_FORTIFY_SOURCE=2"
 }
 
 post_makeinstall_target() {

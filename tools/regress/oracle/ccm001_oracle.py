@@ -733,7 +733,7 @@ def selftest(sets=(), samples=4000, seed=1, mut=()):
     #    reconstruction to 12 bit: h = (v + 8) >> 4
     expect('recon', s_recon(1000, 0, 1, 12, mut) == 63)
     expect('recon-res', s_recon(1000, 9, 0, 12, mut) == 63 and s_recon(1000, -9, 0, 12, mut) == 62)
-    #    NLQ, Tron's constants: offset 512, R 1<<20, S 2048, T 0, EL 10, denom 23
+    #    NLQ, the constants of a FEL test clip: offset 512, R 1<<20, S 2048, T 0, EL 10, denom 23
     #    e = 513: rr = 1 -> 2 - 1 = 1; dq = 2048; r = 2048 >> 8 = 8
     expect('nlq-1', s_nlq(513, 512, 0, 2048, 1 << 20, 10, 23, mut) == 8)
     #    e = 511: rr = -1 -> -2 + 1 = -1; dq = -2048; r = -8

@@ -1,0 +1,118 @@
+From 0468ffacd99e9dd1d62f740d91470601a2debcf1 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:22:26 +0000
+Subject: [PATCH] avcodec/dovi_rpudec: keep an RPU whose CRC32 holds without
+ its terminator
+
+Since "parse RPU forward, don't try to find end" (ef167512ab5d) the RPU
+parser reads the payload, then expects the CRC32 and the 0x80 terminator
+right after it (or after one zero padding byte, 5e95a3ddfbdb). An RPU
+whose 0x80 is missing or is another byte is rejected as "Unexpected RPU
+format": the picture then carries no Dolby Vision metadata at all, the
+decoder drops its RPU buffer too, and a player cannot show it in Dolby
+Vision, although nothing of what the RPU says was lost.
+
+The terminator carries no data. The CRC32 that follows the payload proves
+the payload and also that it ends where the parser ended: a misparse
+would have to land on four bytes that are the CRC32 of what precedes
+them. So when the terminator is not there, compute the CRC32 at that
+position (and after the padding byte, where the payload ended on a byte
+boundary and a zero byte follows) and keep the RPU if it holds; warn once
+per context. An RPU whose CRC32 does not hold there is rejected as
+before. RPUs with the terminator in place take the same path as before:
+nothing is computed for them unless AV_EF_CRCCHECK asks for it.
+
+dovi_tool (MIT) finds the CRC32 from the end of the RPU instead, after
+stripping trailing zero bytes, and requires the 0x80; this does not go
+that far: only the CRC32 at the position the parser reached is trusted,
+so that no metadata of a payload that the parser may have misread is
+kept.
+
+Tested on hand-made RPUs (profiles 8.1 and 5, CM v2.9, with and without
+a padding byte): with the terminator, unchanged; without it, or with
+another byte in its place, kept and the same AVDOVIMetadata as with it;
+without it and with a wrong CRC32, rejected (tools/regress/rpu of
+LibreELEC Hades). Not verified on the file of CB1's issue #208, of which
+there is no sample.
+---
+ libavcodec/dovi_rpu.h    |  1 +
+ libavcodec/dovi_rpudec.c | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/libavcodec/dovi_rpu.h b/libavcodec/dovi_rpu.h
+index 1b74983..76f1476 100644
+--- a/libavcodec/dovi_rpu.h
++++ b/libavcodec/dovi_rpu.h
+@@ -87,6 +87,7 @@ typedef struct DOVIContext {
+     AVDOVIDataMapping *vdr[DOVI_MAX_DM_ID+1]; ///< RefStruct references
+     uint8_t *rpu_buf; ///< temporary buffer
+     unsigned rpu_buf_sz;
++    int unterminated_logged; ///< av_log_once() state: an RPU kept without its terminator
+ 
+ } DOVIContext;
+ 
+diff --git a/libavcodec/dovi_rpudec.c b/libavcodec/dovi_rpudec.c
+index 28025da..b87bf62 100644
+--- a/libavcodec/dovi_rpudec.c
++++ b/libavcodec/dovi_rpudec.c
+@@ -275,6 +275,13 @@ static int parse_ext_v2(DOVIContext *s, GetBitContext *gb, AVDOVIDmData *dm,
+     return 0;
+ }
+ 
++/* The CRC32 of an RPU's payload followed by that CRC32 (big-endian) is 0. */
++static int rpu_crc32_holds(const uint8_t *rpu, size_t size, size_t crc_pos)
++{
++    return crc_pos + 4 <= size &&
++           !av_crc(av_crc_get_table(AV_CRC_32_IEEE), UINT32_MAX, rpu, crc_pos + 4);
++}
++
+ static int parse_ext_blocks(DOVIContext *s, GetBitContext *gb, int ver,
+                             int compression, int err_recognition)
+ {
+@@ -366,6 +373,7 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
+     uint8_t use_nlq;
+     uint8_t profile;
+     uint8_t compression = s->cfg.dv_profile ? s->cfg.dv_md_compression : 0;
++    size_t rpu_avail; /* the bytes of the RPU, its trailing zero bytes included */
+ 
+     if (rpu_size < 5)
+         return AVERROR_INVALIDDATA;
+@@ -407,6 +415,7 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
+             s->rpu_buf[i] = get_bits(gb, 8);
+         rpu = s->rpu_buf;
+         rpu_size = emdf_payload_size;
++        rpu_avail = rpu_size;
+ 
+         /* Validate EMDF footer */
+         emdf_protection = get_bits(gb, 5 + 12);
+@@ -416,6 +425,7 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
+         VALIDATE(rpu[0], 25, 25); /* NAL prefix */
+         rpu++;
+         rpu_size--;
++        rpu_avail = rpu_size;
+         /* Strip trailing padding zero bytes */
+         while (rpu_size && !rpu[rpu_size - 1])
+             rpu_size--;
+@@ -749,11 +759,22 @@ int ff_dovi_rpu_parse(DOVIContext *s, const uint8_t *rpu, size_t rpu_size,
+      * AV_EF_CRCCHECK is requested. Note that this situation is extremely
+      * unlikely, there shouldn't be non-zero data after payload. */
+     int pad = aligned && show_bits(gb, 8) == 0;
++    size_t crc_pos = get_bits_count(gb) / 8; /* the CRC32, padding aside */
+     skip_bits(gb, 32); /* CRC32 */
+     int term_unpadded = get_bits(gb, 8) == 0x80;       /* terminator w/o padding */
+     int term_padded = pad && show_bits(gb, 8) == 0x80; /* terminator w/ padding */
+ 
+     if (!term_unpadded && !term_padded) {
++        /* No terminator after the CRC32. The terminator carries no data, while
++         * the CRC32 proves both the payload and that it ends where it was
++         * parsed to: keep the RPU if its CRC32 holds there (after the padding
++         * byte, if any). */
++        if (rpu_crc32_holds(rpu, rpu_avail, crc_pos) ||
++            (pad && rpu_crc32_holds(rpu, rpu_avail, crc_pos + 1))) {
++            av_log_once(s->logctx, AV_LOG_WARNING, AV_LOG_DEBUG, &s->unterminated_logged,
++                        "RPU without its 0x80 terminator kept: its CRC32 holds\n");
++            return 0;
++        }
+         avpriv_request_sample(s->logctx, "Unexpected RPU format");
+         ff_dovi_ctx_unref(s);
+         return AVERROR_PATCHWELCOME;

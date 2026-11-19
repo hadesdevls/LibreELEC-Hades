@@ -11,8 +11,9 @@
 # the highest folder start-N here, whichever is higher. So a name start-N is never given to two starts of one
 # system, not even in a copy of the folder that was taken before an update. (The boot partition is FAT, which does
 # not tell start-3 from START-3: a name in any letter case counts.)
-# Each folder of a start has a note, start.txt: the number of the start, the build, when the system started, and
-# a mark of that start (a random word, made once in /run, which every start begins empty). Before anything of a
+# Each folder of a start has a note, start.txt: the number of the start, the build, when the system started, where
+# the time of the system came from then (clock_said), and a mark of that start (a random word, made once in /run,
+# which every start begins empty). Before anything of a
 # start is written into its folder (by collect.sh, watch-dv.sh and shutdown.sh, with the boot partition writable
 # and the lock of its writers held), own_start makes sure that the folder is of this start: a folder of that name
 # that is of another start, or of a version before this one (which wrote no note), is emptied first, and the
@@ -48,6 +49,25 @@ next_start() {
 
 # The build, as os-release names it
 this_build() { sed -n 's/^VERSION="*\([^"]*\)"*$/\1/p' /etc/os-release 2>/dev/null; }
+
+# Where the time of the system comes from now: from the network (connman, or systemd-timesyncd, said that it set it),
+# or, until then, from the clock of the computer (the RTC), read as local time or as UTC as /etc/adjtime says. A clock
+# that keeps another time than the one it is read as (a computer whose clock keeps UTC, read as local time) puts the
+# time of "started" off by the time zone until then: the snapshots measure what the clock keeps, once the time is set
+# from the network (results.txt, "what the clock of the computer keeps").
+clock_said() {
+  local m="local time"
+  if [ -e /run/connman/ntp-synchronized ] || [ -e /run/systemd/timesync/synchronized ]; then
+    echo "set from the network"
+  else
+    if sed -n 3p /etc/adjtime 2>/dev/null | grep -q -x UTC; then
+      m=UTC
+      # (the setting Hardware clock on Automatic, and the clock measured to keep UTC: see hades_clock_mode in the init)
+      [ -e /run/hades/rtc-never-written ] && m="UTC, as it was measured to keep"
+    fi
+    echo "not set from the network yet: the clock of the computer, read as $m (/etc/adjtime)"
+  fi
+}
 
 # The mark of this start: made at random the first time that it is asked for, then the same for every script of
 # the diagnostics until the system stops. Empty where it cannot be made: then nothing of the start is written.
@@ -95,6 +115,7 @@ own_start() {
     echo "start: ${1#start-}"
     echo "build: $(this_build)"
     echo "started: $(date -u -d @$(($(date +%s) - ${up:-0})) '+%F %T' 2>/dev/null) UTC"
+    echo "clock: $(clock_said)"
     echo "mark: $m"
     if [ -n "$was" ]; then echo "emptied first: a folder $1 of another start was here ($was)"; fi
   } > $D/$1/start.txt && echo $FILTERED > $D/$1/.filtered

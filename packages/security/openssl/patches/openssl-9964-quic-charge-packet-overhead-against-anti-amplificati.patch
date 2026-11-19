@@ -1,0 +1,228 @@
+From aaa0f30e1c5be3558ade592e3d0e3c2bee7294e6 Mon Sep 17 00:00:00 2001
+From: Jakub Zelenka <jakub.zelenka@openssl.foundation>
+Date: Sat, 3 Oct 2026 21:52:00 +0200
+Subject: [PATCH] quic: charge packet overhead against anti-amplification
+ credit
+
+RFC 9000 s. 8.1 limits what a server may send on an unvalidated path to
+three times the UDP payload bytes received. Credit is added per received
+datagram using its full UDP payload length, but only the payload bytes of
+each sent packet were consumed, leaving the header, packet number and
+AEAD tag uncharged. The server could therefore exceed the limit, the more
+so for datagrams carrying little payload such as ACK only ones.
+
+Charge the packet overhead along with the payload, and allow sending when
+the credit exactly equals the size so the full three times can be used.
+Without that a flight which exactly fits loses its last datagram, and a
+coalesced datagram can lose its trailing packet, leaving an Initial
+datagram below 1200 bytes.
+
+Add a packetiser test checking that an Initial datagram is withheld until
+the credit covers its full wire size and that exactly that size is charged.
+
+Assisted-by: Claude:claude-fable-5-1
+Reviewed-by: Tomas Mraz <tomas@openssl.foundation>
+Reviewed-by: Mounir Idrassi <mounir.idrassi@idrix.fr>
+Merge-date: Mon Nov 16 17:45:32 2026
+Merged-from: https://github.com/openssl/openssl/pull/33092
+(cherry picked from commit 8c9fa2b82709e37b8d21240700f28e0a1f62d825)
+---
+ ssl/quic/quic_txp.c  | 24 +++++++++++----
+ test/quic_txp_test.c | 72 ++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 84 insertions(+), 12 deletions(-)
+
+diff --git a/ssl/quic/quic_txp.c b/ssl/quic/quic_txp.c
+index 9058c92..ebba1cf 100644
+--- a/ssl/quic/quic_txp.c
++++ b/ssl/quic/quic_txp.c
+@@ -478,6 +478,9 @@ void ossl_quic_tx_packetiser_set_validated(OSSL_QUIC_TX_PACKETISER *txp)
+  * `SIZE_MAX - 1`. If the current unvalidated credit is already `SIZE_MAX`,
+  * the function does nothing.
+  *
++ * Credit and consumption are both measured in UDP payload bytes (RFC 9000
++ * s. 8.1), so callers credit whole received datagrams.
++ *
+  * @param txp    A pointer to the OSSL_QUIC_TX_PACKETISER structure to update.
+  * @param credit The amount of credit to add, multiplied by 3.
+  */
+@@ -520,19 +523,19 @@ void ossl_quic_tx_packetiser_consume_unvalidated_credit(OSSL_QUIC_TX_PACKETISER
+  * Checks if the QUIC TX packetiser has sufficient unvalidated credit.
+  *
+  * This function determines whether the unvalidated credit of the specified
+- * QUIC TX packetiser exceeds the required credit value (`req_credit`).
+- * If the unvalidated credit is greater than `req_credit`, the function
++ * QUIC TX packetiser is at least the required credit value (`req_credit`).
++ * If the unvalidated credit is at least `req_credit`, the function
+  * returns 1 (true); otherwise, it returns 0 (false).
+  *
+  * @param txp        A pointer to the OSSL_QUIC_TX_PACKETISER structure to check.
+  * @param req_credit The required credit value to compare against.
+  *
+- * @return 1 if the unvalidated credit exceeds `req_credit`, 0 otherwise.
++ * @return 1 if the unvalidated credit is at least `req_credit`, 0 otherwise.
+  */
+ int ossl_quic_tx_packetiser_check_unvalidated_credit(OSSL_QUIC_TX_PACKETISER *txp,
+     size_t req_credit)
+ {
+-    return (txp->unvalidated_credit > req_credit);
++    return (txp->unvalidated_credit >= req_credit);
+ }
+ 
+ OSSL_QUIC_TX_PACKETISER *ossl_quic_tx_packetiser_new(const OSSL_QUIC_TX_PACKETISER_ARGS *args)
+@@ -1002,12 +1005,21 @@ int ossl_quic_tx_packetiser_generate(OSSL_QUIC_TX_PACKETISER *txp,
+             /* Nothing was generated for this EL, so skip. */
+             continue;
+ 
++        /*
++         * The RFC 9000 s. 8.1 limit applies to bytes sent on the wire, so the
++         * packet overhead (header, PN, AEAD tag) is charged along with the
++         * payload. Without a padding pass pkt_overhead is still the
++         * pre-generation estimate, which can only overstate the charge.
++         */
+         if (!ossl_quic_tx_packetiser_check_unvalidated_credit(txp,
+-                pkt[enc_level].h.bytes_appended)) {
++                pkt[enc_level].h.bytes_appended
++                    + pkt[enc_level].geom.pkt_overhead)) {
+             res = TXP_ERR_SPACE;
+             goto out;
+         }
+-        ossl_quic_tx_packetiser_consume_unvalidated_credit(txp, pkt[enc_level].h.bytes_appended);
++        ossl_quic_tx_packetiser_consume_unvalidated_credit(txp,
++            pkt[enc_level].h.bytes_appended
++                + pkt[enc_level].geom.pkt_overhead);
+ 
+         rc = txp_pkt_commit(txp, &pkt[enc_level], archetype,
+             &txpim_pkt_reffed);
+diff --git a/test/quic_txp_test.c b/test/quic_txp_test.c
+index 50f51cc..38006e7 100644
+--- a/test/quic_txp_test.c
++++ b/test/quic_txp_test.c
+@@ -123,7 +123,7 @@ static void demux_default_handler(QUIC_URXE *e, void *arg,
+     ossl_qrx_inject_urxe(h->qrx, e);
+ }
+ 
+-static int helper_init(struct helper *h)
++static int helper_init(struct helper *h, int validated)
+ {
+     int rc = 0;
+     size_t i;
+@@ -223,10 +223,11 @@ static int helper_init(struct helper *h)
+         goto err;
+ 
+     /*
+-     * Our helper should always skip validation
+-     * as the tests are not written to expect delayed connections
++     * Skip validation unless the script opts out with OP_NO_VALIDATION(),
++     * as most tests are not written to expect delayed connections.
+      */
+-    ossl_quic_tx_packetiser_set_validated(h->txp);
++    if (validated)
++        ossl_quic_tx_packetiser_set_validated(h->txp);
+ 
+     if (!TEST_ptr(h->demux = ossl_quic_demux_new(h->bio2, 8,
+                       fake_now, NULL)))
+@@ -275,6 +276,8 @@ err:
+ #define OPK_STREAM_TXFC_BUMP 21 /* Bump stream TXFC CWM */
+ #define OPK_HANDSHAKE_COMPLETE 22 /* Mark handshake as complete */
+ #define OPK_NOP 23 /* No-op */
++#define OPK_NO_VALIDATION 24 /* Run with an unvalidated TXP (must be first op) */
++#define OPK_ADD_CREDIT 25 /* Add unvalidated path credit */
+ 
+ struct script_op {
+     uint32_t opcode;
+@@ -332,6 +335,10 @@ struct script_op {
+     { OPK_HANDSHAKE_COMPLETE }
+ #define OP_NOP() \
+     { OPK_NOP }
++#define OP_NO_VALIDATION() \
++    { OPK_NO_VALIDATION }
++#define OP_ADD_CREDIT(credit) \
++    { OPK_ADD_CREDIT, (credit) }
+ 
+ static int schedule_handshake_done(struct helper *h)
+ {
+@@ -1273,6 +1280,51 @@ static const struct script_op script_18[] = {
+     OP_END
+ };
+ 
++/* 19. Initial datagram gated by anti-amplification credit */
++static int flush_qtx(struct helper *h)
++{
++    ossl_qtx_finish_dgram(h->args.qtx);
++    ossl_qtx_flush_net(h->args.qtx);
++    return 1;
++}
++
++static int check_credit_19(struct helper *h)
++{
++    /*
++     * No credit must remain after the 1200 byte datagram, confirming the
++     * full wire size of the packet is charged.
++     */
++    return TEST_false(ossl_quic_tx_packetiser_check_unvalidated_credit(h->txp,
++        1));
++}
++
++static const struct script_op script_19[] = {
++    OP_NO_VALIDATION(),
++    OP_PROVIDE_SECRET(QUIC_ENC_LEVEL_INITIAL, QRL_SUITE_AES128GCM, secret_1),
++    OP_CRYPTO_SEND(QUIC_PN_SPACE_INITIAL, crypto_1),
++    /* no credit, nothing can be sent */
++    OP_TXP_GENERATE_NONE(),
++    OP_CHECK(flush_qtx),
++    OP_RX_PKT_NONE(),
++    /* 3 * 399 = 1197 does not cover the 1200 byte datagram, still blocked */
++    OP_ADD_CREDIT(399),
++    OP_TXP_GENERATE_NONE(),
++    OP_CHECK(flush_qtx),
++    OP_RX_PKT_NONE(),
++    /* 3 * 400 = 1200 exactly covers the datagram including packet overhead */
++    OP_ADD_CREDIT(1),
++    OP_TXP_GENERATE(),
++    OP_RX_PKT(),
++    OP_EXPECT_DGRAM_LEN(1200, 1200),
++    OP_CHECK(check_credit_19),
++    OP_NEXT_FRAME(),
++    OP_EXPECT_FRAME(OSSL_QUIC_FRAME_TYPE_CRYPTO),
++    OP_EXPECT_NO_FRAME(),
++    OP_RX_PKT_NONE(),
++    OP_TXP_GENERATE_NONE(),
++    OP_END
++};
++
+ static const struct script_op *const scripts[] = {
+     script_1,
+     script_2,
+@@ -1291,7 +1343,8 @@ static const struct script_op *const scripts[] = {
+     script_15,
+     script_16,
+     script_17,
+-    script_18
++    script_18,
++    script_19
+ };
+ 
+ static void skip_padding(struct helper *h)
+@@ -1315,7 +1368,7 @@ static int run_script(int script_idx, const struct script_op *script)
+     QUIC_CHANNEL *ch = NULL;
+     QUIC_RSTREAM_QPARM *rsqp = NULL;
+ 
+-    if (!helper_init(&h))
++    if (!helper_init(&h, script->opcode != OPK_NO_VALIDATION))
+         goto err;
+ 
+     if (!TEST_ptr(ch = OPENSSL_zalloc(sizeof(QUIC_CHANNEL))))
+@@ -1603,6 +1656,13 @@ static int run_script(int script_idx, const struct script_op *script)
+             break;
+         case OPK_NOP:
+             break;
++        case OPK_NO_VALIDATION:
++            /* Handled by run_script() when initialising the helper. */
++            break;
++        case OPK_ADD_CREDIT:
++            ossl_quic_tx_packetiser_add_unvalidated_credit(h.txp,
++                (size_t)op->arg0);
++            break;
+         default:
+             TEST_error("bad opcode");
+             goto err;

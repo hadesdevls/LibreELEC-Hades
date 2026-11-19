@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <inttypes.h>
 #include <math.h>
 #include <poll.h>
@@ -113,6 +114,52 @@ static void kernel_log(const char *fmt, ...)
 		/* nothing more to do: the report has it */
 	}
 	close(fd);
+}
+
+/* The first line of a small file, without its end of line, into buf ("" where it cannot be read) */
+static void first_line(const char *path, char *buf, size_t size)
+{
+	FILE *f = fopen(path, "r");
+
+	buf[0] = '\0';
+	if (!f)
+		return;
+	if (!fgets(buf, (int)size, f))
+		buf[0] = '\0';
+	fclose(f);
+	buf[strcspn(buf, "\n")] = '\0';
+}
+
+/*
+ * What the result holds for: the running kernel ("system:") and the parameters of the driver that decide
+ * the tunnel and its pipe ("parameters:", those of /sys/module/<driver>/parameters whose names start with
+ * dvbridge, dv_ or enable_dv). Kodi takes a result as this card's only while both are the same as now: a
+ * new kernel or another value of one of them asks for a new check.
+ */
+static void say_system(const char *driver)
+{
+	char release[128], version[256], dir[128], path[384], value[64];
+	struct dirent **names = NULL;
+	int n, i;
+
+	first_line("/proc/sys/kernel/osrelease", release, sizeof(release));
+	first_line("/proc/sys/kernel/version", version, sizeof(version));
+	say("system: %s %s\n", release, version);
+	snprintf(dir, sizeof(dir), "/sys/module/%s/parameters", driver);
+	say("parameters:");
+	n = scandir(dir, &names, NULL, alphasort);
+	for (i = 0; i < n; i++) {
+		const char *p = names[i]->d_name;
+
+		if (!strncmp(p, "dvbridge", 8) || !strncmp(p, "dv_", 3) || !strncmp(p, "enable_dv", 9)) {
+			snprintf(path, sizeof(path), "%s/%s", dir, p);
+			first_line(path, value, sizeof(value));
+			say(" %s.%s=%s", driver, p, value);
+		}
+		free(names[i]);
+	}
+	free(names);
+	say("\n");
 }
 
 static void finish(const char *result, const char *reason, const char *summary, const char *meaning)
@@ -938,6 +985,14 @@ static int all_pictures(struct run *r)
 		if ((n = picture(r, &d, &r->m.d)) || (n = picture(r, &e, &r->m.e)) || (n = picture(r, &f, &r->m.f)))
 			return n;
 	}
+	for (c = 0; c < 3; c++) {
+		struct oc_picture a = {.kind = OC_ONE_A, .channel = c}, bb = {.kind = OC_ONE_B, .channel = c},
+				  cc = {.kind = OC_ONE_C, .channel = c};
+
+		if ((n = picture(r, &a, &r->m.one_a[c])) || (n = picture(r, &bb, &r->m.one_b[c])) ||
+		    (n = picture(r, &cc, &r->m.one_c[c])))
+			return n;
+	}
 	for (c = 0; c < 3; c++)
 		for (b = 0; b < 8; b++) {
 			struct oc_picture q = {.kind = OC_BIT, .channel = c, .bit = b};
@@ -971,6 +1026,58 @@ static void say_crc(const char *name, const struct oc_crc *c, unsigned int value
 	for (i = 0; i < values; i++)
 		say(" %08" PRIx32, c->v[i]);
 	say("\n");
+}
+
+/* The values of a mask, each with the components whose bits change it ("value 0 (red)"), into buf */
+static void value_names(uint32_t mask, const struct oc_result *res, unsigned int values, char *buf, size_t size)
+{
+	size_t len = 0;
+	unsigned int i, c;
+
+	buf[0] = '\0';
+	for (i = 0; i < values; i++) {
+		size_t before;
+
+		if (!(mask & (1u << i)))
+			continue;
+		len += (size_t)snprintf(buf + len, size > len ? size - len : 0, "%svalue %u (", len ? ", " : "", i);
+		before = len;
+		for (c = 0; c < 3; c++)
+			if (res->changed_values[c] & (1u << i))
+				len += (size_t)snprintf(buf + len, size > len ? size - len : 0, "%s%s",
+							len > before ? "+" : "", oc_channel_name(c));
+		if (len == before)
+			len += (size_t)snprintf(buf + len, size > len ? size - len : 0, "no component");
+		len += (size_t)snprintf(buf + len, size > len ? size - len : 0, ")");
+		if (len >= size)
+			break;
+	}
+}
+
+/* Where the relation broke: by value of the CRC, and one component of the input at a time (output-check.h);
+ * each value is named by the components whose bits change it, as measured (one value: all three) */
+static void where_text(const struct oc_result *res, unsigned int values)
+{
+	char all[256], one[3][256], line[512];
+	unsigned int c;
+
+	value_names(res->values_broken, res, values, all, sizeof(all));
+	say("exactness by value of the CRC (every component changed): %s\n",
+	    res->values_broken ? all : "every value holds");
+	for (c = 0; c < 3; c++)
+		value_names(res->channel_broken[c], res, values, one[c], sizeof(one[c]));
+	say("exactness, one component changed at a time: red: %s%s; green: %s%s; blue: %s%s\n",
+	    res->channel_broken[0] ? "breaks in " : "holds", res->channel_broken[0] ? one[0] : "",
+	    res->channel_broken[1] ? "breaks in " : "holds", res->channel_broken[1] ? one[1] : "",
+	    res->channel_broken[2] ? "breaks in " : "holds", res->channel_broken[2] ? one[2] : "");
+	if (!res->values_broken && !res->channel_broken[0] && !res->channel_broken[1] && !res->channel_broken[2])
+		return;
+	snprintf(line, sizeof(line),
+		 "where: every component changed: %#x; red alone: %#x, green alone: %#x, blue alone: %#x (bit i: value "
+		 "i of the CRC; red, green, blue change %#x, %#x, %#x)\n",
+		 res->values_broken, res->channel_broken[0], res->channel_broken[1], res->channel_broken[2],
+		 res->changed_values[0], res->changed_values[1], res->changed_values[2]);
+	kernel_log("%s", line);
 }
 
 static void verdict_text(const struct oc_result *res, const struct run *r)
@@ -1011,6 +1118,7 @@ static void verdict_text(const struct oc_result *res, const struct run *r)
 	say("bits: %s\n", ll ? lost : "each of the 24 bits of a pixel changes the CRC");
 	say("values changed by the bits of red, green and blue: %#x, %#x, %#x\n", res->changed_values[0],
 	    res->changed_values[1], res->changed_values[2]);
+	where_text(res, r->values);
 
 	switch (res->verdict) {
 	case OC_EXACT:
@@ -1174,6 +1282,7 @@ next:
 	}
 	say("device: %s, driver %s, output %s, CRTC %d (index %d), primary plane %u\n", o.node, o.driver,
 	    o.connector_name, o.crtc_id, o.crtc_index, o.plane_id);
+	say_system(o.driver);
 
 	crc_dir(&o, dir, sizeof(dir));
 	snprintf(path, sizeof(path), "%s/data", dir);

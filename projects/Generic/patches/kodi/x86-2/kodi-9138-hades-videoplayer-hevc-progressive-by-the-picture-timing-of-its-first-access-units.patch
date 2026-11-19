@@ -1,0 +1,691 @@
+From a11390f63a8116752775a2ca32ecc9ae19d475a5 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 04:58:02 +0000
+Subject: [PATCH] [Hades] VideoPlayer: HEVC progressive by the picture timing
+ of its first access units
+
+A HEVC stream whose VUI has frame_field_info_present_flag is not known to be progressive from its
+parameter sets (PROGRESSIVE_VIDEO::Check()): FFmpeg's decoder marks a picture as interlaced where the
+pic_struct of its picture timing SEI says a field. Such a stream never got a mode at its own rate (25
+Hz for 25p), the whole-number multiples, or "Video at its own rate with VRR": an HDR10+ film on a
+Samsung Odyssey G60SD ("not known to be progressive: HEVC:
+frame_field_info_present_flag is 1"). The flag is common in remuxes of discs, where every picture is a
+frame.
+
+Now the demuxer reads the picture timing of the first access units of such a stream, without decoding,
+before the streams go to the player (CDVDDemuxFFmpeg::PrefetchForPictureTiming(), as
+PrefetchForSoftTelecine() reads the flags of MPEG-2 pictures, and with the packets that the reads ahead
+before it took): where 24 access units with their timing all say a whole progressive picture (pic_struct
+0, 7 or 8, from a source that is not interlaced) and none says otherwise
+(PROGRESSIVE_VIDEO::CPictureTimingProof, HevcPictureTiming()), the stream is progressive
+(CDemuxStreamVideo::progressiveByTiming, CDVDStreamInfo::progressive). The first choice of a mode has
+it: one change of mode, not a second one once pictures come. A field (pic_struct 1, 2, 9 to 12), a frame
+of two fields (3 to 6) or an interlaced source denies it at once, and too few access units read in 1.5 s
+leave it as before. A picture marked as interlaced later still makes the stream not progressive for the
+rest of the file, as for any stream (CRenderManager::UpdateProgressive()).
+
+Only a file read from its start by a plain input (not a disc, a live stream or a transport stream whose
+streams are made as they come), and not where the two tracks of a Dolby Vision stream are joined. Native
+Dolby Vision output does not take it (CVideoPlayer::OpenVideoStream()): it keeps the cadence it always
+had. kodi.log says what the picture timing said for each such stream.
+
+And only where its verdict can change Kodi's choice of a mode (PROGRESSIVE_VIDEO::PictureTimingNotNeeded()):
+with "Adjust display refresh rate" on, and "Video at its own rate with VRR" not off, or whole-number
+multiples with a whitelist of the user, or, without one, a frame rate whose own rate, twice it or 2.5
+times it is a refresh rate of 30 Hz or less but 24 Hz (25p, 29.97p and 30p, which Kodi's default
+whitelist gives a mode of their own only when they are progressive). Elsewhere the reading ahead would
+delay the start for nothing: a film at 23.976 with the VRR of videos off, the default, takes no time
+for it, and kodi.log says why its timing was not read. Where the settings or the frame rate are not
+known, it is read.
+
+Checked: a host test (picture_timing_test.cpp: parameter sets and access units made bit by bit, with
+emulation prevention, length fields of 1 to 4 bytes and Annex B; the proof; when it is read, both
+ways) with its mutants, built with
+ProgressiveVideo.cpp and the FFmpeg headers of the build folder; the changed files and the sources that
+include them compile with the commands of the image's build. Not run on a stream in Kodi.
+---
+ xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h |   5 +
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 164 ++++++++++++++++++
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |   4 +
+ xbmc/cores/VideoPlayer/DVDStreamInfo.cpp      |  12 ++
+ xbmc/cores/VideoPlayer/DVDStreamInfo.h        |   4 +
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        |  12 ++
+ xbmc/utils/ProgressiveVideo.cpp               | 117 ++++++++++++-
+ xbmc/utils/ProgressiveVideo.h                 | 163 +++++++++++++++++
+ 8 files changed, 477 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+index 5e0691b..9808f22 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemux.h
+@@ -172,6 +172,11 @@ public:
+   //! Hades: the rate of the coded frames of such a film (iFpsRate and iFpsScale before)
+   int codedFpsRate = 0;
+   int codedFpsScale = 0;
++  //! Hades: a HEVC stream whose VUI has frame_field_info_present_flag, and whose first access
++  //! units, read before playback, say whole progressive pictures in their picture timing
++  //! (PROGRESSIVE_VIDEO::CPictureTimingProof, CDVDDemuxFFmpeg::PrefetchForPictureTiming()): it is
++  //! progressive for Kodi (CDVDStreamInfo::progressive)
++  bool progressiveByTiming = false;
+   int iHeight = 0; // height of the stream reported by the demuxer
+   int iWidth = 0; // width of the stream reported by the demuxer
+   double fAspect = 0; // display aspect of stream
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index e0616ee..9b103c6 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -44,6 +44,8 @@
+ #include "utils/URIUtils.h"
+ #include "utils/XTimeUtils.h"
+ #include "utils/log.h"
++#include "windowing/GraphicContext.h"
++#include "windowing/WholeMultiple.h"
+ #include "windowing/WinSystem.h"
+ 
+ #include <algorithm>
+@@ -878,6 +880,11 @@ bool CDVDDemuxFFmpeg::Open(const std::shared_ptr<CDVDInputStream>& pInput, bool
+     ChooseHdrStream();
+ #endif
+ 
++  // Hades: HEVC that only its picture timing could make interlaced, from its first access units
++  // (after the two above, whose reads ahead it goes on from)
++  if (!fileinfo)
++    PrefetchForPictureTiming();
++
+   // Hades: the editions of a Matroska file (ffmpeg-9940), for the cuts of the one chosen before
+   // playback (VideoPlayer); kodi.log says what there is
+   m_mkvEditions = {};
+@@ -2462,6 +2469,163 @@ void CDVDDemuxFFmpeg::PrefetchForSoftTelecine()
+   }
+ }
+ 
++// Hades: a HEVC stream whose VUI has frame_field_info_present_flag is not known to be progressive
++// from its parameter sets (PROGRESSIVE_VIDEO::Check()): FFmpeg's decoder marks a picture as
++// interlaced where the pic_struct of its picture timing SEI says a field. Kodi then never gave it a
++// mode at its own rate (25 Hz for 25p), and "Video at its own rate with VRR" never took it (the
++// HDR10+ film of the Samsung Odyssey G60SD of the test of 2026-11-18). The picture timing of its
++// first access units is read here, without decoding, before the streams are given to the player,
++// so that the first choice of a mode has it (no second change of mode): progressive where
++// CPictureTimingProof says so. As PrefetchForSoftTelecine(), only a file read from its start by a
++// plain input; the packets that the reads ahead before it took are looked at first, and those read
++// here are added after them (ReadFrame() gives them all first, in order). Not where the two tracks
++// of a Dolby Vision stream are joined (their packets go through CDVLayerMerge). Only where the
++// verdict can change Kodi's choice of a mode (PictureTimingNotNeeded()): nothing is read, and no
++// time taken, for a film at 23.976 with the VRR of videos off.
++void CDVDDemuxFFmpeg::PrefetchForPictureTiming()
++{
++  using namespace PROGRESSIVE_VIDEO;
++  static constexpr size_t MAX_PACKETS = 1200;
++  static constexpr size_t MAX_BYTES = 48 * 1024 * 1024;
++  static constexpr auto MAX_TIME = std::chrono::milliseconds(1500);
++
++  if (!m_pFormatContext || !m_pInput || !m_pInput->IsStreamType(DVDSTREAM_TYPE_FILE) ||
++      m_pInput->IsRealtime() || m_checkTransportStream)
++    return;
++#ifdef HAVE_DVBRIDGE
++  if (m_dvBaseIndex >= 0)
++    return;
++#endif
++
++  struct Probe
++  {
++    CDemuxStreamVideo* video = nullptr;
++    int lengthSize = 0;
++    CPictureTimingProof proof;
++  };
++  std::map<int, Probe> probes;
++  // only where what it says can change a choice of a mode: no time is taken for a film at 23.976
++  // with the VRR of videos off (PictureTimingNotNeeded())
++  PictureTimingNeed need;
++  if (const auto component = CServiceBroker::GetSettingsComponent(); component)
++  {
++    if (const auto settings = component->GetSettings(); settings)
++    {
++      need.settingsRead = true;
++      need.adjustRefreshRate = settings->GetInt(CSettings::SETTING_VIDEOPLAYER_ADJUSTREFRESHRATE) !=
++                               ADJUST_REFRESHRATE_OFF;
++      need.vrrVideo = settings->GetInt(CSettings::SETTING_VIDEOSCREEN_HADESVRRVIDEOMODE) != 0;
++      need.userWhitelist = !settings->GetList(CSettings::SETTING_VIDEOSCREEN_WHITELIST).empty();
++      need.wholeMultiple = settings->GetBool(KODI::WINDOWING::WHOLE_MULTIPLE_SETTING);
++    }
++  }
++  for (unsigned int i = 0; i < m_pFormatContext->nb_streams; ++i)
++  {
++    const AVStream* st = m_pFormatContext->streams[i];
++    if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
++        st->codecpar->codec_id != AV_CODEC_ID_HEVC ||
++        (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
++      continue;
++    auto* video = dynamic_cast<CDemuxStreamVideo*>(GetStream(static_cast<int>(i)));
++    if (!video || video->interlaced || video->filmCadence != KODI::FIELDCADENCE::Cadence::UNKNOWN)
++      continue;
++    const Result scan = Check(AV_CODEC_ID_HEVC, st->codecpar->extradata,
++                              static_cast<size_t>(std::max(st->codecpar->extradata_size, 0)));
++    if (scan.progressive || !scan.byPictureTiming)
++      continue;
++    need.fps = video->iFpsRate > 0 && video->iFpsScale > 0
++                   ? static_cast<double>(video->iFpsRate) / video->iFpsScale
++                   : 0.0;
++    if (const char* why = PictureTimingNotNeeded(need))
++    {
++      CLog::Log(
++          LOGINFO,
++          "CDVDDemuxFFmpeg: stream {} is HEVC whose VUI has frame_field_info_present_flag; its "
++          "picture timing is not read ahead ({:.3f} fps): {}",
++          i, need.fps, why);
++      continue;
++    }
++    probes[static_cast<int>(i)] = {
++        video,
++        HevcLengthSize(st->codecpar->extradata,
++                       static_cast<size_t>(std::max(st->codecpar->extradata_size, 0))),
++        {}};
++  }
++  if (probes.empty())
++    return;
++
++  const auto allDone = [&probes]
++  { return std::ranges::all_of(probes, [](const auto& p) { return p.second.proof.Done(); }); };
++  const auto look = [&probes](const AVPacket* packet)
++  {
++    const auto it = probes.find(packet->stream_index);
++    if (it == probes.end() || packet->size <= 0 || it->second.proof.Done())
++      return;
++    it->second.proof.Add(
++        HevcPictureTiming(packet->data, static_cast<size_t>(packet->size), it->second.lengthSize));
++  };
++  // (what was read ahead already, then on from there)
++  size_t bytes = 0;
++  for (const AVPacket* packet : m_prefetched)
++  {
++    look(packet);
++    bytes += static_cast<size_t>(std::max(packet->size, 0));
++  }
++  const auto begin = std::chrono::steady_clock::now();
++  m_timeout.Set(2s);
++  while (!allDone() && m_prefetched.size() < MAX_PACKETS && bytes < MAX_BYTES &&
++         std::chrono::steady_clock::now() - begin < MAX_TIME &&
++         !(m_abortRequested || (m_cancelCheck && m_cancelCheck())))
++  {
++    AVPacket* packet = av_packet_alloc();
++    if (!packet)
++      break;
++    if (av_read_frame(m_pFormatContext, packet) < 0)
++    {
++      av_packet_free(&packet);
++      break;
++    }
++    bytes += static_cast<size_t>(std::max(packet->size, 0));
++    m_prefetched.push_back(packet);
++    look(packet);
++  }
++  m_timeout.SetInfinite();
++  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now() - begin)
++                      .count();
++
++  for (auto& [index, probe] : probes)
++  {
++    const CPictureTimingProof& proof = probe.proof;
++    switch (proof.Get())
++    {
++      case CPictureTimingProof::Verdict::PROGRESSIVE:
++        probe.video->progressiveByTiming = true;
++        CLog::Log(LOGINFO,
++                  "CDVDDemuxFFmpeg: stream {} is HEVC whose VUI has frame_field_info_present_flag; "
++                  "the picture timing of its first {} access units says whole progressive "
++                  "pictures ({} of them timed; {} packets, {} KiB read ahead, {} ms): it is "
++                  "progressive",
++                  index, proof.Units(), proof.Timed(), m_prefetched.size(), bytes / 1024, ms);
++        break;
++      case CPictureTimingProof::Verdict::NOT_PROGRESSIVE:
++        CLog::Log(LOGINFO,
++                  "CDVDDemuxFFmpeg: stream {} is HEVC whose picture timing says pic_struct {} with "
++                  "source_scan_type {} in its access unit {}: not taken as progressive, as before",
++                  index, proof.PicStruct(), proof.SourceScanType(), proof.DeniedAt());
++        break;
++      case CPictureTimingProof::Verdict::UNKNOWN:
++        CLog::Log(LOGINFO,
++                  "CDVDDemuxFFmpeg: stream {} is HEVC whose VUI has frame_field_info_present_flag; "
++                  "{} of its first {} access units had their picture timing (it takes {}; {} "
++                  "packets, {} KiB read ahead, {} ms): not known to be progressive, as before",
++                  index, proof.Timed(), proof.Units(), CPictureTimingProof::MIN_TIMED,
++                  m_prefetched.size(), bytes / 1024, ms);
++        break;
++    }
++  }
++}
++
+ // Hades: a film whose pictures are in the fields of interlaced video (3:2 pulldown, 2:2) or
+ // repeated in its frames (a film at 25 in 29.97): told from its start, decoded as it was read ahead
+ // (PrefetchForSoftTelecine()), and from points further on (SampleForFieldCadence()), before the
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 25a82e0..83cd863 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -314,6 +314,10 @@ protected:
+   //! (PrefetchForSoftTelecine()); ReadFrame() gives them first, as if they had not been read
+   std::deque<AVPacket*> m_prefetched;
+   void PrefetchForSoftTelecine();
++  //! Hades: a HEVC stream whose VUI has frame_field_info_present_flag is progressive where the
++  //! picture timing of its first access units says so (PROGRESSIVE_VIDEO::CPictureTimingProof),
++  //! read with what was read ahead already
++  void PrefetchForPictureTiming();
+   //! Hades: a DVD title that was read before it was played (CDiscSoftTelecineScan): what the stream
+   //! says of itself changes as the title does
+   void ApplyDiscSoftTelecine(CDemuxStream* stream);
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+index be1445a..41a1f4e 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.cpp
+@@ -57,6 +57,7 @@ void CDVDStreamInfo::Clear()
+   codedFpsScale = 0;
+   progressive = false;
+   progressiveReason = {};
++  progressiveByTiming = false;
+   height   = 0;
+   width    = 0;
+   aspect   = 0.0;
+@@ -249,6 +250,7 @@ void CDVDStreamInfo::Assign(const CDVDStreamInfo& right, bool withextradata)
+   codedFpsScale = right.codedFpsScale;
+   progressive = right.progressive;
+   progressiveReason = right.progressiveReason;
++  progressiveByTiming = right.progressiveByTiming;
+   height   = right.height;
+   width    = right.width;
+   aspect   = right.aspect;
+@@ -338,6 +340,7 @@ void CDVDStreamInfo::Assign(const CDemuxStream& right, bool withextradata)
+     // from the demuxer's extradata even when it is not copied: the value describes the stream
+     // (Hades: a film put back together from its fields, decoded before playback, is shown in
+     // whole pictures at its own rate for the whole stream: FieldCadence.h)
++    progressiveByTiming = false;
+     if (filmCadence != KODI::FIELDCADENCE::Cadence::UNKNOWN)
+     {
+       progressive = true;
+@@ -355,6 +358,15 @@ void CDVDStreamInfo::Assign(const CDemuxStream& right, bool withextradata)
+           right.codec, right.extraData.GetData(), right.extraData.GetSize());
+       progressive = scan.progressive;
+       progressiveReason = scan.reason;
++      // (Hades: what only the picture timing could bar, its first access units showed not to)
++      if (!scan.progressive && scan.byPictureTiming && stream->progressiveByTiming)
++      {
++        progressive = true;
++        progressiveByTiming = true;
++        progressiveReason = "HEVC: frame_field_info_present_flag is 1, and the picture timing of "
++                            "its first access units, read before playback, says whole progressive "
++                            "pictures";
++      }
+     }
+     height    = stream->iHeight;
+     width     = stream->iWidth;
+diff --git a/xbmc/cores/VideoPlayer/DVDStreamInfo.h b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+index ad52b49..948b9ce 100644
+--- a/xbmc/cores/VideoPlayer/DVDStreamInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDStreamInfo.h
+@@ -73,6 +73,10 @@ public:
+   //! from codec, extradata and interlaced.
+   bool progressive;
+   std::string_view progressiveReason; //!< for the log
++  //! Hades: progressive by what the picture timing of its first access units said
++  //! (CDemuxStreamVideo::progressiveByTiming): native Dolby Vision output does not take it
++  //! (CVideoPlayer::OpenVideoStream())
++  bool progressiveByTiming;
+   int height; // height of the stream reported by the demuxer
+   int width; // width of the stream reported by the demuxer
+   double aspect; // display aspect as reported by demuxer
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 1accf28..e8021fe 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -5936,6 +5936,18 @@ bool CVideoPlayer::OpenVideoStream(CDVDStreamInfo& hint, bool reset)
+     DVBRIDGE::VideoStreamOpened(hint);
+     nativeDV = DVBRIDGE::WantsNativeOutputMode(hint);
+     m_renderManager.SetNativeDVStream(nativeDV);
++    // Hades: native Dolby Vision output keeps the cadence it always had: a stream that is
++    // progressive only by the picture timing of its first access units is not so for it
++    // (CDemuxStreamVideo::progressiveByTiming)
++    if (nativeDV && hint.progressiveByTiming)
++    {
++      hint.progressive = false;
++      hint.progressiveByTiming = false;
++      hint.progressiveReason = "HEVC: frame_field_info_present_flag is 1; the picture timing of "
++                               "its first access units is not taken for native Dolby Vision "
++                               "output, which keeps the cadence it always had";
++      CLog::Log(LOGINFO, "CVideoPlayer::OpenVideoStream - {}", hint.progressiveReason);
++    }
+     if (!nativeDV && hint.dovi.dv_profile != 0)
+       DVBRIDGE::DolbyVisionWithoutNativeOutput(hint);
+     // Hades: a video played in a window (a video screensaver, a skin's video control) gets no
+diff --git a/xbmc/utils/ProgressiveVideo.cpp b/xbmc/utils/ProgressiveVideo.cpp
+index efe07be..dc5f0aa 100644
+--- a/xbmc/utils/ProgressiveVideo.cpp
++++ b/xbmc/utils/ProgressiveVideo.cpp
+@@ -552,8 +552,9 @@ HevcSpsRead ReadHevcSps(std::span<const uint8_t> nal)
+   if (fieldSeq)
+     return {{false, "HEVC: field_seq_flag is 1, the pictures are fields"}, colour};
+   if (frameFieldInfo)
+-    return {{false, "HEVC: frame_field_info_present_flag is 1, picture timing may signal fields"},
+-            colour};
++    return {
++        {false, "HEVC: frame_field_info_present_flag is 1, picture timing may signal fields", true},
++        colour};
+   return {{true, "HEVC: no field_seq_flag and no frame_field_info_present_flag"}, colour};
+ }
+ 
+@@ -645,6 +646,9 @@ Result CheckHevc(std::span<const uint8_t> data)
+     return {false, "HEVC: hvcC ends early"};
+ 
+   Result result{false, "HEVC: no sequence parameter set in the extradata"};
++  // Hades: a set whose only bar is frame_field_info_present_flag leaves it to the picture timing
++  // (byPictureTiming), unless another set says more
++  std::optional<Result> byTiming;
+   for (const auto& nal : nals)
+   {
+     if (nal.size() < 3 || ((nal[0] >> 1) & 0x3f) != HEVC_NAL_SPS)
+@@ -654,10 +658,90 @@ Result CheckHevc(std::span<const uint8_t> data)
+     if ((((nal[0] & 1) << 5) | (nal[1] >> 3)) != 0) // nuh_layer_id
+       return {false, "HEVC: a sequence parameter set of another layer"};
+     result = HevcSps(nal);
+-    if (!result.progressive)
++    if (result.byPictureTiming)
++      byTiming = result;
++    else if (!result.progressive)
+       return result;
+   }
+-  return result;
++  return byTiming.value_or(result);
++}
++
++// Hades: the NAL units of an access unit: each with a length field of lengthSize bytes (1 to 4, as
++// its hvcC says), or an Annex B byte stream (lengthSize 0)
++std::vector<std::span<const uint8_t>> AccessUnitNals(std::span<const uint8_t> data, int lengthSize)
++{
++  if (lengthSize == 0)
++    return AnnexBNals(data);
++  std::vector<std::span<const uint8_t>> nals;
++  if (lengthSize < 1 || lengthSize > 4)
++    return nals;
++  const size_t fieldSize = static_cast<size_t>(lengthSize);
++  size_t pos = 0;
++  while (data.size() - pos >= fieldSize)
++  {
++    size_t length = 0;
++    for (size_t i = 0; i < fieldSize; i++)
++      length = (length << 8) | data[pos + i];
++    pos += fieldSize;
++    if (length > data.size() - pos)
++      break;
++    nals.push_back(data.subspan(pos, length));
++    pos += length;
++  }
++  return nals;
++}
++
++constexpr unsigned int HEVC_NAL_SEI_PREFIX = 39;
++constexpr unsigned int HEVC_SEI_PIC_TIMING = 1;
++
++// Hades: an ff_byte coded value of a SEI message (payloadType, payloadSize): 0xFF bytes and the last
++// one, summed; false where the RBSP ends first
++bool SeiValue(std::span<const uint8_t> rbsp, size_t& pos, size_t& value)
++{
++  value = 0;
++  while (pos < rbsp.size())
++  {
++    const uint8_t byte = rbsp[pos++];
++    value += byte;
++    if (byte != 0xFF)
++      return true;
++  }
++  return false;
++}
++
++// Hades: the pic_timing of a prefix SEI NAL unit of the base layer, as FFmpeg's HEVC decoder reads
++// it with frame_field_info_present_flag (hevc/sei.c, decode_nal_sei_pic_timing()): pic_struct u(4),
++// source_scan_type u(2), duplicate_flag u(1)
++void ReadSeiPictureTiming(std::span<const uint8_t> nal, PROGRESSIVE_VIDEO::PictureTiming& timing)
++{
++  const std::vector<uint8_t> rbsp = Rbsp(nal.subspan(2));
++  size_t pos = 0;
++  // (messages up to the rbsp_trailing_bits)
++  while (pos < rbsp.size() && !(rbsp.size() - pos == 1 && rbsp[pos] == 0x80))
++  {
++    size_t type = 0;
++    size_t size = 0;
++    if (!SeiValue(rbsp, pos, type) || !SeiValue(rbsp, pos, size) || size > rbsp.size() - pos)
++      return;
++    if (type == HEVC_SEI_PIC_TIMING && size > 0)
++    {
++      CRbspReader br(std::span<const uint8_t>(rbsp).subspan(pos, size));
++      const uint32_t picStruct = br.Bits(4);
++      const uint32_t sourceScanType = br.Bits(2);
++      if (!br.Failed())
++      {
++        const bool frame = PROGRESSIVE_VIDEO::WholeProgressiveFrame(picStruct, sourceScanType);
++        if (!timing.found || (timing.wholeFrames && !frame))
++        {
++          timing.picStruct = picStruct;
++          timing.sourceScanType = sourceScanType;
++        }
++        timing.wholeFrames = (!timing.found || timing.wholeFrames) && frame;
++        timing.found = true;
++      }
++    }
++    pos += size;
++  }
+ }
+ } // namespace
+ 
+@@ -682,6 +766,31 @@ Result Check(AVCodecID codec, const uint8_t* extradata, size_t size)
+   }
+ }
+ 
++int HevcLengthSize(const uint8_t* extradata, size_t size)
++{
++  // (an hvcC record, as HevcNals() takes one: lengthSizeMinusOne in its byte 21)
++  if (extradata && size >= 23 &&
++      (extradata[0] == 1 || (extradata[0] == 0 && (extradata[1] != 0 || extradata[2] > 1))))
++    return (extradata[21] & 3) + 1;
++  return 0;
++}
++
++PictureTiming HevcPictureTiming(const uint8_t* data, size_t size, int lengthSize)
++{
++  PictureTiming timing;
++  if (!data || size == 0)
++    return timing;
++  for (const auto& nal : AccessUnitNals(std::span<const uint8_t>(data, size), lengthSize))
++  {
++    // (a prefix SEI of the base layer: nuh_layer_id 0)
++    if (nal.size() < 3 || ((nal[0] >> 1) & 0x3f) != HEVC_NAL_SEI_PREFIX ||
++        (((nal[0] & 1) << 5) | (nal[1] >> 3)) != 0)
++      continue;
++    ReadSeiPictureTiming(nal, timing);
++  }
++  return timing;
++}
++
+ std::optional<Colour> HevcVuiColour(const uint8_t* extradata, size_t size)
+ {
+   std::vector<std::span<const uint8_t>> nals;
+diff --git a/xbmc/utils/ProgressiveVideo.h b/xbmc/utils/ProgressiveVideo.h
+index 9358e5a..8e1f35f 100644
+--- a/xbmc/utils/ProgressiveVideo.h
++++ b/xbmc/utils/ProgressiveVideo.h
+@@ -25,6 +25,10 @@ struct Result
+   bool progressive{false};
+   //! why, for the log
+   std::string_view reason;
++  //! Hades: not progressive only because the VUI of a HEVC stream has frame_field_info_present_flag:
++  //! the pic_struct of the picture timing SEIs of its access units can show that it is
++  //! (HevcPictureTiming(), CPictureTimingProof)
++  bool byPictureTiming{false};
+ };
+ 
+ /*!
+@@ -72,4 +76,163 @@ struct Colour
+  * nothing where one has none, one is cut or invalid, one is of another layer, or there is none
+  */
+ std::optional<Colour> HevcVuiColour(const uint8_t* extradata, size_t size);
++
++/*!
++ * \brief Hades: a pic_struct of the picture timing SEI (H.265, table D.2) and its
++ *        source_scan_type that make a whole progressive picture: a frame (0), or a frame shown
++ *        twice or three times (7, 8), from a source that is not interlaced (source_scan_type 1,
++ *        progressive, or 2, unknown; 0 is interlaced). FFmpeg 9 marks a picture as interlaced for
++ *        the fields (1, 2, 9 to 12); the frames of two fields (3 to 6) it does not mark, but they are
++ *        interlaced video, and are not taken here either.
++ */
++constexpr bool WholeProgressiveFrame(unsigned int picStruct, unsigned int sourceScanType)
++{
++  return (picStruct == 0 || picStruct == 7 || picStruct == 8) && sourceScanType != 0;
++}
++
++//! Hades: what the picture timing SEIs of an access unit of HEVC say
++struct PictureTiming
++{
++  bool found{false}; //!< a pic_timing SEI of the base layer was read
++  bool wholeFrames{false}; //!< ... and each one says a whole progressive picture
++  unsigned int picStruct{0}; //!< the first one's (or the first that is not a whole picture)
++  unsigned int sourceScanType{0};
++};
++
++/*!
++ * \brief Hades: the picture timing of a HEVC access unit whose sequence has
++ *        frame_field_info_present_flag (Result::byPictureTiming)
++ * \param lengthSize the length fields of its NAL units (HevcLengthSize()), 0 for Annex B
++ */
++PictureTiming HevcPictureTiming(const uint8_t* data, size_t size, int lengthSize);
++
++//! Hades: the size of the length fields of the NAL units of a HEVC stream, from its extradata: an
++//! hvcC record's (1 to 4); 0 for Annex B
++int HevcLengthSize(const uint8_t* extradata, size_t size);
++
++/*!
++ * \brief Hades: whether the first access units of such a stream show that it is progressive, read
++ *        before playback (CDVDDemuxFFmpeg::PrefetchForPictureTiming())
++ *
++ * FFmpeg's HEVC decoder marks a picture as interlaced only through the pic_struct of a picture
++ * timing SEI, and keeps the last one for an access unit without one. PROGRESSIVE where MIN_TIMED
++ * access units had their timing, each a whole progressive picture (WholeProgressiveFrame()), and none
++ * said otherwise: the stream is then taken as progressive, as one without the flag is, from its first
++ * choice of a mode on (one change of mode, not two). NOT_PROGRESSIVE at the first one that says
++ * fields or interlaced video: as before. UNKNOWN otherwise (too few read): as before. A later picture
++ * marked as interlaced still makes the stream not progressive for the rest of the file (the render
++ * manager, CRenderManager::UpdateProgressive()), as for any stream. Pure: a test runs it on the host.
++ */
++class CPictureTimingProof
++{
++public:
++  static constexpr unsigned int MIN_TIMED = 24;
++
++  enum class Verdict
++  {
++    UNKNOWN,
++    PROGRESSIVE,
++    NOT_PROGRESSIVE,
++  };
++
++  void Add(const PictureTiming& timing)
++  {
++    ++m_units;
++    if (!timing.found)
++      return;
++    ++m_timed;
++    if (!timing.wholeFrames && !m_denied)
++    {
++      m_denied = true;
++      m_deniedAt = m_units;
++      m_picStruct = timing.picStruct;
++      m_sourceScanType = timing.sourceScanType;
++    }
++  }
++  Verdict Get() const
++  {
++    if (m_denied)
++      return Verdict::NOT_PROGRESSIVE;
++    return m_timed >= MIN_TIMED ? Verdict::PROGRESSIVE : Verdict::UNKNOWN;
++  }
++  //! nothing more to read
++  bool Done() const { return Get() != Verdict::UNKNOWN; }
++  unsigned int Units() const { return m_units; }
++  unsigned int Timed() const { return m_timed; }
++  //! where it was denied: the access unit, its pic_struct and source_scan_type
++  unsigned int DeniedAt() const { return m_deniedAt; }
++  unsigned int PicStruct() const { return m_picStruct; }
++  unsigned int SourceScanType() const { return m_sourceScanType; }
++
++private:
++  unsigned int m_units{0};
++  unsigned int m_timed{0};
++  bool m_denied{false};
++  unsigned int m_deniedAt{0};
++  unsigned int m_picStruct{0};
++  unsigned int m_sourceScanType{0};
++};
++
++//! Hades: what decides whether the picture timing of such a stream is read before playback
++//! (PictureTimingNotNeeded())
++struct PictureTimingNeed
++{
++  bool settingsRead{false}; //!< the four settings below were read
++  bool adjustRefreshRate{true}; //!< videoplayer.adjustrefreshrate is not off
++  bool vrrVideo{true}; //!< videoscreen.hadesvrrvideomode is not off
++  bool userWhitelist{false}; //!< videoscreen.whitelist has modes
++  bool wholeMultiple{false}; //!< videoscreen.hadeswholemultiple
++  double fps{0.0}; //!< the frame rate that the demuxer gives the stream; 0 where it has none
++};
++
++/*!
++ * \brief Hades: a refresh rate that Kodi's default whitelist takes only for a video known to be
++ *        progressive: 30 Hz or less, but 24 Hz (CResolutionUtils::FindResolutionFromWhitelist(),
++ *        ExactRateElsewhere.h RateTaken()). Of a rate that a video asks for, with a margin over the
++ *        0.01 Hz within which a mode matches it: a mode that matches 23.976 is always taken.
++ */
++constexpr bool HalfRefreshRate(double rate)
++{
++  return rate > 0.0 && rate <= 30.02 && (rate < 23.92 || rate > 24.08);
++}
++
++/*!
++ * \brief Hades: whether the picture timing of a HEVC stream that only it could make interlaced
++ *        (Result::byPictureTiming) is read before playback, and if not, why
++ *
++ * Whether such a stream is progressive (CDVDStreamInfo::progressive) changes only Kodi's choice of
++ * a mode for it:
++ * - "Video at its own rate with VRR" takes only a progressive video (VRR_VIDEO::Decide());
++ * - with a whitelist of the user, a mode that is a whole-number multiple of the frame rate is kept
++ *   only for one (WholeMultipleKeep());
++ * - without one, a mode of 30 Hz or less but 24 Hz is taken only for one (HalfRefreshRate()): the
++ *   video's own rate, twice it or 2.5 times it (the steps of FindResolutionFromWhitelist(), and
++ *   ExactRateElsewhere.h);
++ * and none of that is asked with "Adjust display refresh rate" off. Where none of it can change, the
++ * up to 1.5 s of reading ahead (CDVDDemuxFFmpeg::PrefetchForPictureTiming()) would delay the start
++ * for nothing: a film at 23.976 with the VRR of videos off is not read. The frame rate is the
++ * demuxer's, which the player's first choice uses. Where the settings could not be read, or the
++ * stream has no frame rate, it is read, as before. Pure: a test runs it on the host.
++ *
++ * \return nullptr where it is read; else why not, for the log
++ */
++constexpr const char* PictureTimingNotNeeded(const PictureTimingNeed& n)
++{
++  if (!n.settingsRead)
++    return nullptr;
++  if (!n.adjustRefreshRate)
++    return "\"Adjust display refresh rate\" is off: no mode is chosen for the video";
++  if (n.vrrVideo)
++    return nullptr;
++  if (n.userWhitelist)
++    return n.wholeMultiple ? nullptr
++                           : "a whitelist of the user chooses the mode, whole-number multiples are "
++                             "off, and \"Video at its own rate with VRR\" is off";
++  // (twice the rate, or 2.5 times it, is 30 Hz or less only for a rate of 15 Hz or less, which is
++  // such a refresh rate itself)
++  if (!(n.fps > 0.0) || HalfRefreshRate(n.fps))
++    return nullptr;
++  return "at its frame rate Kodi chooses the same mode for a progressive video, and \"Video at "
++         "its own rate with VRR\" is off";
++}
+ } // namespace PROGRESSIVE_VIDEO
+-- 
+2.53.0
+

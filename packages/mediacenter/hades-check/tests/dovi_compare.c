@@ -12,7 +12,8 @@
  *    type 2, its header, the profile that FFmpeg guesses from it, no enhancement layer, no residual;
  *  - the RPU of every picture as the HEVC decoder exports it (AV_FRAME_DATA_DOVI_METADATA), against
  *    dvbridge_profile81_metadata() (tools/dvbridge/dvbridge_hdr10plus.c, compiled in) for the same
- *    level 1, mastering display and content light; for profile 5 that RPU as dovi_tool makes profile 5
+ *    level 1, mastering display and content light, and its level 5 of the whole picture (all four
+ *    offsets 0); for profile 5 that RPU as dovi_tool makes profile 5
  *    of it (profile5_config(): the header of profile 8.1 with vdr_rpu_profile 0 and the base layer in
  *    full range, the same identity mapping, the IPT-PQ-c2 matrices and signal_color_space 2), the
  *    matrices taken from tools/dvbridge/dvbridge_ipt.h and checked against dovi_tool's.
@@ -147,6 +148,14 @@ static void compare(const AVDOVIMetadata *got, const AVDOVIMetadata *want, long 
             snprintf(w, sizeof(w), "frame %ld L6 min_luminance", frame), EQ(w, g->l6.min_luminance, x->l6.min_luminance);
             snprintf(w, sizeof(w), "frame %ld L6 max_cll", frame), EQ(w, g->l6.max_cll, x->l6.max_cll);
             snprintf(w, sizeof(w), "frame %ld L6 max_fall", frame), EQ(w, g->l6.max_fall, x->l6.max_fall);
+        } else if (x->level == 5) {
+            /* the active area: the function writes the whole picture, all four offsets 0 */
+            snprintf(w, sizeof(w), "frame %ld L5 left_offset", frame), EQ(w, g->l5.left_offset, x->l5.left_offset);
+            snprintf(w, sizeof(w), "frame %ld L5 right_offset", frame), EQ(w, g->l5.right_offset, x->l5.right_offset);
+            snprintf(w, sizeof(w), "frame %ld L5 top_offset", frame), EQ(w, g->l5.top_offset, x->l5.top_offset);
+            snprintf(w, sizeof(w), "frame %ld L5 bottom_offset", frame), EQ(w, g->l5.bottom_offset, x->l5.bottom_offset);
+            snprintf(w, sizeof(w), "frame %ld L5 of the reference: the whole picture", frame);
+            EQ(w, x->l5.left_offset | x->l5.right_offset | x->l5.top_offset | x->l5.bottom_offset, 0);
         } else {
             snprintf(w, sizeof(w), "frame %ld ext block of level %d: not compared here", frame, x->level);
             EQ(w, x->level, -1);

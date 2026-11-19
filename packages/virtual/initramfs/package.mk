@@ -12,6 +12,9 @@ PKG_DEPENDS_TARGET="toolchain initramfs:init"
 PKG_SECTION="virtual"
 PKG_LONGDESC="Metapackage for installing initramfs"
 
+# Hades: the init draws the picture of the start on each display at its own size (hades-picture)
+PKG_DEPENDS_INIT+=" hades-picture:init"
+
 if [ "${INITRAMFS_PARTED_SUPPORT}" = yes ]; then
   PKG_DEPENDS_INIT+=" parted:init"
 fi

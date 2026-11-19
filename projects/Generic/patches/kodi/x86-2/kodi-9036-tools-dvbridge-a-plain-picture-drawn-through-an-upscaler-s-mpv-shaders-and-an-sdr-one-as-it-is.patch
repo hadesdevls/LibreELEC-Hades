@@ -1,0 +1,502 @@
+From d2e1825a9fe0208e8585e28adda4a368f1e80ac8 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 05:39:42 +0000
+Subject: [PATCH] tools/dvbridge: a plain picture drawn through an upscaler's
+ mpv shaders, and an SDR one as it is
+
+The prescalers of mpv (RAVU, FSRCNNX) work on the luma plane of a
+picture as it is coded, before its chroma is scaled and before it is
+converted to RGB. Kodi's GLES renderer cannot host them: it converts
+and scales in one shader pass into RGB. libplacebo's renderer can,
+through pl_mpv_user_shader_parse(), and it is the renderer that the
+bridge already draws plain pictures with.
+
+dvbridge_upscale loads an upscaler's shader files (a fixed list of
+names, each under 2 MB, read from the folder the caller gives) and
+dvbridge_render_set_upscaler() hands them to the following pictures of
+dvbridge_render_plain(), after Hades' own hooks, for a plain picture
+that is not sent over the tunnel. libplacebo decides per pass whether
+it runs, by the shader's own conditions (RAVU only for a picture drawn
+more than 1.41 times its size in width and height, FSRCNNX more than
+1.3 times); dvbridge_render_upscaled() says whether the last picture
+was drawn with them.
+
+A shader that this GPU cannot draw never costs a picture: when
+libplacebo turns a hook off, or the render fails with the hooks, the
+picture is drawn again without them, and they stay off until another
+upscaler is set (dvbridge_render_upscaler_failed()). Measured on the
+software bridge with a compute shader that the GLES backend cannot
+create: the picture comes out byte for byte as without an upscaler.
+
+A plain picture can now also be SDR (dvbridge_plain::sdr and
+::sdr_primaries: the BT.709, BT.601 or BT.2020 matrix and the primaries
+that Kodi's own shaders take for it, BT.1886), drawn as it is into
+BT.709, so that an SDR video can be upscaled. Nothing maps it: a
+mapping to a display or HDR over the tunnel refuses it, as an SDR
+picture does not belong there.
+
+Without an upscaler set, every picture is drawn as before: on the
+software bridge, HDR10 drawn as it is, mapped to SDR and adapted to a
+display give the same bytes as before this change.
+---
+ tools/dvbridge/CMakeLists.txt     |   3 +-
+ tools/dvbridge/dvbridge_render.c  | 109 +++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_render.h  |  35 +++++++++
+ tools/dvbridge/dvbridge_upscale.c | 119 ++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_upscale.h |  75 +++++++++++++++++++
+ 5 files changed, 340 insertions(+), 1 deletion(-)
+ create mode 100644 tools/dvbridge/dvbridge_upscale.c
+ create mode 100644 tools/dvbridge/dvbridge_upscale.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 4cd0d7e..f340f1b 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -18,7 +18,8 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_cache.c dvbridge_verify.c dvbridge_guimask.c
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+                                 dvbridge_measure.c dvbridge_measured.c
+-                                dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c)
++                                dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c
++                                dvbridge_upscale.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 60488c8..d5a0188 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -13,6 +13,7 @@
+ #include "dvbridge_gl_pack.h"
+ #include "dvbridge_placebo.h"
+ #include "dvbridge_source.h"
++#include "dvbridge_upscale.h"
+ #include <libavutil/dovi_meta.h>
+ #include <libplacebo/shaders/custom.h>
+ #include <libplacebo/opengl.h>
+@@ -238,6 +239,13 @@ struct dvbridge_renderer {
+     size_t gamut_held_bytes;
+     struct dvbridge_gamut_made gamut_made;
+     bool gamut_other, gamut_ahead_off;
++    /* Hades: the upscaler of the pictures of dvbridge_render_hdr10() and dvbridge_render_plain()
++     * (dvbridge_render_set_upscaler(); NULL: none), and whether the last of them was drawn with it */
++    const struct dvbridge_upscaler *upscaler;
++    bool upscaled;
++    /* ... a render with it failed on this GPU (libplacebo turned one of its shaders off): the pictures are drawn
++     * without it until another one is set (upscale_retry()) */
++    bool upscale_tried, upscale_failed;
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -2503,6 +2511,40 @@ static bool value_within(float v, float lo, float hi)
+     return isfinite(v) && v >= lo && v <= hi;
+ }
+ 
++void dvbridge_render_set_upscaler(struct dvbridge_renderer *r, const struct dvbridge_upscaler *u)
++{
++    if (!r)
++        return;
++    if (u != r->upscaler)
++        r->upscale_failed = false;
++    r->upscaler = u;
++    r->upscaled = false;
++}
++
++bool dvbridge_render_upscaled(const struct dvbridge_renderer *r)
++{
++    return r && r->upscaled;
++}
++
++bool dvbridge_render_upscaler_failed(const struct dvbridge_renderer *r)
++{
++    return r && r->upscale_failed;
++}
++
++/* Hades: after a render with the upscaler's shaders that failed: whether to make it again without them (they are
++ * noted as failed until another upscaler is set, and the errors that libplacebo keeps reset). The caller makes it
++ * again; where that draws, the shaders were why. A picture is never lost to a shader that this GPU cannot draw. */
++static bool upscale_retry(struct dvbridge_renderer *r, bool ok)
++{
++    if (ok || !r->upscale_tried)
++        return false;
++    r->upscale_failed = true;
++    r->upscale_tried = false;
++    pl_renderer_reset_errors(r->renderer, NULL);
++    dvbridge_gl_drain_errors();
++    return true;
++}
++
+ void dvbridge_render_set_hdr10plus(struct dvbridge_renderer *r, const struct dvbridge_plain_hdr10plus *h)
+ {
+     if (!r)
+@@ -2782,6 +2824,31 @@ static bool plain_color(struct dvbridge_color *out, const struct dvbridge_plain
+             return false;
+     if (p->max_luma && p->min_luma >= p->max_luma)
+         return false;
++    /* Hades: an SDR picture (dvbridge_plain::sdr): its matrix and primaries, BT.1886, no HDR metadata */
++    if (p->sdr != DVBRIDGE_PLAIN_HDR) {
++        enum pl_color_system sys;
++        enum pl_color_primaries prim;
++        switch (p->sdr) {
++        case DVBRIDGE_PLAIN_SDR_BT709: sys = PL_COLOR_SYSTEM_BT_709; break;
++        case DVBRIDGE_PLAIN_SDR_BT601: sys = PL_COLOR_SYSTEM_BT_601; break;
++        case DVBRIDGE_PLAIN_SDR_BT2020: sys = PL_COLOR_SYSTEM_BT_2020_NC; break;
++        default: return false;
++        }
++        switch (p->sdr_primaries) {
++        case DVBRIDGE_PLAIN_PRIM_BT709: prim = PL_COLOR_PRIM_BT_709; break;
++        case DVBRIDGE_PLAIN_PRIM_BT601_625: prim = PL_COLOR_PRIM_BT_601_625; break;
++        case DVBRIDGE_PLAIN_PRIM_BT601_525: prim = PL_COLOR_PRIM_BT_601_525; break;
++        case DVBRIDGE_PLAIN_PRIM_BT2020: prim = PL_COLOR_PRIM_BT_2020; break;
++        default: return false;
++        }
++        if (p->hlg)
++            return false;
++        *out = (struct dvbridge_color){
++            .color = {.primaries = prim, .transfer = PL_COLOR_TRC_BT_1886},
++            .repr = {.sys = sys, .levels = p->full_range ? PL_COLOR_LEVELS_FULL : PL_COLOR_LEVELS_LIMITED},
++        };
++        return true;
++    }
+     *out = (struct dvbridge_color){
+         .color = {.primaries = PL_COLOR_PRIM_BT_2020,
+                   .transfer = p->hlg ? PL_COLOR_TRC_HLG : PL_COLOR_TRC_PQ,
+@@ -2838,6 +2905,13 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         r->not_drawn = "the colour of the picture (HDR10 or HLG) could not be mapped";
+         return false;
+     }
++    /* Hades: an SDR picture is drawn as it is (for an upscaler): never through a mapping to a display, which is
++     * made for HDR, nor into the tunnel */
++    const bool sdr = plain && plain->sdr != DVBRIDGE_PLAIN_HDR;
++    if (sdr && (r->hdr10_mapping.enabled || r->tunnel)) {
++        r->not_drawn = "an SDR picture is drawn as it is, and a mapping to a display, or HDR over the tunnel, is on";
++        return false;
++    }
+     if (!plain && !map_layers(r, &mapped, source, metadata, bytes, &paired)) {
+         r->refused = dvbridge_map_color_refused(metadata, bytes);
+         if (!r->refused)
+@@ -2894,6 +2968,18 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         .color = mapped.color,
+         .crop = {view.dst_x, view.dst_y, view.dst_x + view.dst_width, view.dst_y + view.dst_height},
+     };
++    /* Hades: an SDR picture goes out in BT.709, as Kodi's own shaders draw one without HDR (the primaries of
++     * BT.601 or BT.2020 converted in linear light and clipped, CConvertMatrix): the same conversion, no gamut
++     * mapping */
++    struct pl_color_map_params sdr_map;
++    if (sdr) {
++        target.color.primaries = PL_COLOR_PRIM_BT_709;
++        sdr_map = pl_color_map_default_params;
++        sdr_map.gamut_mapping = &pl_gamut_map_clip;
++        sdr_map.tone_mapping_function = &pl_tone_map_clip;
++        sdr_map.inverse_tone_mapping = false;
++        sdr_map.gamut_expansion = false;
++    }
+     /* (the levels step down the reconstruction: a plain picture has none) */
+     bool ccm_composed = false;
+     struct pl_render_params params = base_params(r, &ccm_composed, plain ? 0 : r->step);
+@@ -2901,6 +2987,8 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     /* (a plain picture is no Dolby Vision one: libplacebo looks at this only for one) */
+     if (plain)
+         params.dovi_ccm_bl_transfer = PL_COLOR_TRC_UNKNOWN;
++    if (sdr)
++        params.color_map_params = &sdr_map;
+     struct picture_clamp clamped = {.codes = codes, .levels = 1023.0f};
+     const struct pl_hook hook = {
+         .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &clamped,
+@@ -2997,12 +3085,30 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+             r->clean_place[3] = place.height;
+         }
+     }
++    /* Hades: the upscaler's shaders (dvbridge_render_set_upscaler()), after the bridge's own hooks: a plain
++     * picture only (the planes of a Dolby Vision one are composed after the stage where the shaders read its
++     * luma), not into the tunnel, and not after they failed on this GPU. They read the luma as it is coded (the
++     * signal: SDR, PQ or HLG), before anything is mapped. */
++    const struct dvbridge_upscaler *up = r->upscaler;
++    const bool upscale = plain && !tunnel && up && up->method != DVBRIDGE_UPSCALE_OFF && up->num_hooks > 0 &&
++                         !r->upscale_failed;
++    const struct pl_hook *with_upscaler[4 + DVBRIDGE_UPSCALE_HOOKS];
++    if (upscale && params.num_hooks <= 4) {
++        for (int i = 0; i < params.num_hooks; ++i)
++            with_upscaler[i] = params.hooks[i];
++        for (int i = 0; i < up->num_hooks; ++i)
++            with_upscaler[params.num_hooks + i] = up->hooks[i];
++        params.hooks = with_upscaler;
++        params.num_hooks += up->num_hooks;
++    }
++    r->upscale_tried = upscale && params.hooks == with_upscaler;
+     time_render(r, &params);
+     const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
+     bool ok = rendered && (peak_hook ? to_display.called : clamped.called) && (!plain || signal_clamped) &&
+               (!trim.on || trim.called);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+     const bool clean = !(errors.errors & ~PL_RENDER_ERR_DOVI_COMPOSER) && !errors.num_disabled_hooks;
++    r->upscaled = r->upscale_tried && rendered && clean;
+     if (!rendered)
+         r->not_drawn = WHY_PLACEBO;
+     else if (!ok)
+@@ -3081,6 +3187,9 @@ bool dvbridge_render_plain(struct dvbridge_renderer *r, const struct pl_frame *s
+     save_gl_state(&state);
+     const bool fine = fine_gamut_table(r, false);
+     r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
++    /* Hades: without the upscaler's shaders where a render with them failed */
++    if (upscale_retry(r, r->hdr10_ready))
++        r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+     if (gamut_table_retry(r, fine, r->hdr10_ready)) {
+         r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 98abc82..89b0e77 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -174,7 +174,42 @@ struct dvbridge_plain {
+      * is (no mapping). */
+ #define DVBRIDGE_RENDER_PLAIN_HDR10PLUS 1
+     struct dvbridge_plain_hdr10plus hdr10plus;
++    /* Hades: an SDR picture drawn as it is, for an upscaler (dvbridge_render_set_upscaler()): its matrix
++     * (DVBRIDGE_PLAIN_SDR_*) and its primaries (DVBRIDGE_PLAIN_PRIM_*), the BT.1886 transfer; it goes out in
++     * BT.709, as Kodi's shaders draw an SDR picture (the primaries converted and clipped), and nothing is mapped
++     * (a mapping that is on refuses it). DVBRIDGE_PLAIN_HDR (0): an HDR10 or HLG picture, as before. */
++#define DVBRIDGE_RENDER_PLAIN_SDR 1
++    int sdr;
++    int sdr_primaries;
+ };
++enum {
++    DVBRIDGE_PLAIN_HDR = 0,
++    DVBRIDGE_PLAIN_SDR_BT709 = 1,  /* the BT.709 matrix */
++    DVBRIDGE_PLAIN_SDR_BT601 = 2,  /* the BT.601 matrix */
++    DVBRIDGE_PLAIN_SDR_BT2020 = 3, /* the BT.2020 matrix for non-constant luminance */
++};
++enum {
++    DVBRIDGE_PLAIN_PRIM_BT709 = 0,
++    DVBRIDGE_PLAIN_PRIM_BT601_625 = 1, /* BT.470 B/G (PAL) */
++    DVBRIDGE_PLAIN_PRIM_BT601_525 = 2, /* SMPTE 170M (NTSC) */
++    DVBRIDGE_PLAIN_PRIM_BT2020 = 3,
++};
++/* Hades: the upscaler that the following pictures of dvbridge_render_plain() are drawn with (dvbridge_upscale.h):
++ * its shaders run on the luma of the picture as it is coded, before anything is mapped, and what is left to the
++ * size of its place is scaled as before. The caller keeps it alive while it is set. NULL, or an OFF one: none, and
++ * every picture is drawn as before, bit for bit. Not for Dolby Vision (reconstructed or native), nor for HDR over
++ * the tunnel. */
++#define DVBRIDGE_RENDER_UPSCALER 1
++struct dvbridge_upscaler;
++void dvbridge_render_set_upscaler(struct dvbridge_renderer *renderer, const struct dvbridge_upscaler *upscaler);
++/* Hades: the last render of dvbridge_render_plain() drew its picture with the upscaler's shaders given to
++ * libplacebo, and libplacebo turned none of them off (a shader has its own
++ * conditions as well: RAVU runs only for a picture drawn more than 1.41 times its size in width and height,
++ * FSRCNNX more than 1.3 times) */
++bool dvbridge_render_upscaled(const struct dvbridge_renderer *renderer);
++/* Hades: a render with the upscaler's shaders failed on this GPU (libplacebo turned one of them off, or the render
++ * failed with them and drew without them): the pictures are drawn without them until another upscaler is set */
++bool dvbridge_render_upscaler_failed(const struct dvbridge_renderer *renderer);
+ bool dvbridge_render_plain(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+                           const struct dvbridge_plain *plain, struct dvbridge_view view,
+                           int width, int height);
+diff --git a/tools/dvbridge/dvbridge_upscale.c b/tools/dvbridge/dvbridge_upscale.c
+new file mode 100644
+index 0000000..f5591db
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_upscale.c
+@@ -0,0 +1,119 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: see dvbridge_upscale.h. */
++#include "dvbridge_upscale.h"
++
++#include <libplacebo/shaders/custom.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static const char *const FILES_RAVU[] = {"ravu-lite-ar-r4.hook", NULL};
++static const char *const FILES_FSRCNNX8[] = {"FSRCNNX_x2_8-0-4-1.glsl", NULL};
++static const char *const FILES_FSRCNNX16[] = {"FSRCNNX_x2_16-0-4-1.glsl", NULL};
++static const char *const FILES_NONE[] = {NULL};
++
++/* the largest of the files is 247 kB: anything over 2 MB is not one of them */
++#define FILE_MAX (2L * 1024 * 1024)
++
++const char *dvbridge_upscale_name(int method)
++{
++    switch (method) {
++    case DVBRIDGE_UPSCALE_OFF: return "off (Kodi's scaling)";
++    case DVBRIDGE_UPSCALE_RAVU: return "RAVU lite (r4)";
++    case DVBRIDGE_UPSCALE_FSRCNNX8: return "FSRCNNX x2 (8-0-4-1)";
++    case DVBRIDGE_UPSCALE_FSRCNNX16: return "FSRCNNX x2 (16-0-4-1)";
++    default: return NULL;
++    }
++}
++
++const char *const *dvbridge_upscale_files(int method)
++{
++    switch (method) {
++    case DVBRIDGE_UPSCALE_RAVU: return FILES_RAVU;
++    case DVBRIDGE_UPSCALE_FSRCNNX8: return FILES_FSRCNNX8;
++    case DVBRIDGE_UPSCALE_FSRCNNX16: return FILES_FSRCNNX16;
++    default: return FILES_NONE;
++    }
++}
++
++void dvbridge_upscale_free(struct dvbridge_upscaler *u)
++{
++    if (!u)
++        return;
++    for (int i = 0; i < u->num_hooks; ++i)
++        pl_mpv_user_shader_destroy(&u->hooks[i]);
++    *u = (struct dvbridge_upscaler){0};
++}
++
++static char *read_file(const char *path, size_t *len)
++{
++    FILE *f = fopen(path, "rb");
++    if (!f)
++        return NULL;
++    char *buf = NULL;
++    if (fseek(f, 0, SEEK_END) == 0) {
++        const long n = ftell(f);
++        if (n > 0 && n < FILE_MAX && fseek(f, 0, SEEK_SET) == 0) {
++            buf = malloc((size_t)n + 1);
++            if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
++                buf[n] = 0;
++                *len = (size_t)n;
++            } else {
++                free(buf);
++                buf = NULL;
++            }
++        }
++    }
++    fclose(f);
++    return buf;
++}
++
++bool dvbridge_upscale_load(struct dvbridge_upscaler *u, pl_gpu gpu, int method, const char *dir, char *why,
++                           size_t why_len)
++{
++    if (!u)
++        return false;
++    *u = (struct dvbridge_upscaler){0};
++    if (why && why_len)
++        why[0] = 0;
++    if (method == DVBRIDGE_UPSCALE_OFF)
++        return true;
++    if (!dvbridge_upscale_name(method) || !gpu || !dir) {
++        if (why && why_len)
++            snprintf(why, why_len, "unknown upscaler %d, or no GPU or folder", method);
++        return false;
++    }
++    const char *const *files = dvbridge_upscale_files(method);
++    for (int i = 0; files[i]; ++i) {
++        if (u->num_hooks >= DVBRIDGE_UPSCALE_HOOKS) {
++            if (why && why_len)
++                snprintf(why, why_len, "too many shader files");
++            dvbridge_upscale_free(u);
++            return false;
++        }
++        char path[1024];
++        snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
++        size_t len = 0;
++        char *text = read_file(path, &len);
++        const bool read = text != NULL;
++        const struct pl_hook *hook = text ? pl_mpv_user_shader_parse(gpu, text, len) : NULL;
++        free(text);
++        if (!hook) {
++            if (why && why_len)
++                snprintf(why, why_len, "%s %s", path,
++                         read ? "could not be read by libplacebo as an mpv shader" : "could not be read");
++            dvbridge_upscale_free(u);
++            return false;
++        }
++        u->hooks[u->num_hooks++] = hook;
++    }
++    u->method = method;
++    return true;
++}
+diff --git a/tools/dvbridge/dvbridge_upscale.h b/tools/dvbridge/dvbridge_upscale.h
+new file mode 100644
+index 0000000..a18984f
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_upscale.h
+@@ -0,0 +1,75 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_UPSCALE_H
++#define DVBRIDGE_UPSCALE_H
++/* Hades: the upscalers that an expert can choose instead of Kodi's own scaling (videoplayer.hadesupscaler*), off
++ * by default. Each is a set of mpv user shaders (the hook format that libplacebo reads,
++ * pl_mpv_user_shader_parse()) drawn by libplacebo's renderer in the bridge, with the picture
++ * (dvbridge_render_set_upscaler()): they double the luma of the picture, and what is left to its size on the
++ * screen, and its chroma, is scaled as the bridge scales any other picture (libplacebo's Lanczos 3).
++ *
++ * Which ones, and why (measured on the host with libplacebo's renderer, Mesa's software OpenGL ES 3.1: pictures
++ * made smaller and drawn back at their size, PSNR and SSIM of the luma against the original, and Delta E ITP for
++ * HDR10, when the upscalers were chosen for 1.1):
++ * - RAVU lite, radius 4 (bjin/mpv-prescalers): nearer to the original than Lanczos 3 at its edges (+0.1 to
++ *   +1.3 dB of PSNR), about the same elsewhere, at 2 to 3 times its cost;
++ * - FSRCNNX x2 8-0-4-1 (igv/FSRCNN-TensorFlow): much nearer at the edges (+0.3 to +3.4 dB), the same in Delta E ITP
++ *   on film in HDR10, at 5 to 13 times the cost of Lanczos 3 (it lifts very smooth dark gradients by a fifth
++ *   of a code: a synthetic test picture showed it);
++ * - FSRCNNX x2 16-0-4-1: the nearest of all, on film, on animation and on HDR10 (+0.4 to +4.7 dB, and the lowest
++ *   Delta E ITP), at 14 to 38 times the cost of Lanczos 3 (a graphics card, not a small integrated one).
++ * Not taken, by the same measurements: FSR 1 with or without RCAS (farther than Lanczos 3 on animation, about the
++ * same on film), Anime4K (farther than Lanczos 3 on animation at 2x, and it changes flat areas of film), NNEDI3
++ * (its picture lands a pixel away at 2x), the EWA filters of libplacebo (no nearer than Lanczos 3 but at 2x on
++ * film); ArtCNN needs compute shaders, which libplacebo's OpenGL ES backend does not give.
++ *
++ * The shader files are third-party, kept byte for byte as their authors publish them, with their licences
++ * (LGPL-3.0-or-later, all three), in Kodi's system folder (system/hades/upscalers, SOURCES.md there); this reads them
++ * from the folder it is given. Nothing here holds GL state; the hooks are of the GPU they are loaded for and freed
++ * with dvbridge_upscale_free() before it is destroyed. */
++#include <stdbool.h>
++#include <stddef.h>
++
++#include <libplacebo/gpu.h>
++#include <libplacebo/renderer.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The values of the settings (stable: they are kept in guisettings.xml) */
++enum dvbridge_upscale_method {
++    DVBRIDGE_UPSCALE_OFF = 0,       /* Kodi's own scaling */
++    DVBRIDGE_UPSCALE_RAVU = 1,      /* RAVU lite, radius 4 */
++    DVBRIDGE_UPSCALE_FSRCNNX8 = 2,  /* FSRCNNX x2 8-0-4-1 */
++    DVBRIDGE_UPSCALE_FSRCNNX16 = 3, /* FSRCNNX x2 16-0-4-1 */
++    DVBRIDGE_UPSCALE_COUNT
++};
++
++#define DVBRIDGE_UPSCALE_HOOKS 2
++
++struct dvbridge_upscaler {
++    int method; /* enum dvbridge_upscale_method; OFF: nothing to draw with */
++    const struct pl_hook *hooks[DVBRIDGE_UPSCALE_HOOKS];
++    int num_hooks;
++};
++
++/* A short name for the log ("FSRCNNX x2 (16-0-4-1)"), or NULL for an unknown method */
++const char *dvbridge_upscale_name(int method);
++/* The shader files the method reads, in the order they are drawn (NULL-terminated) */
++const char *const *dvbridge_upscale_files(int method);
++/* Loads the shaders of method for gpu from the folder dir (a local path). On failure nothing is kept, *u is OFF,
++ * and why (why_len bytes) says what failed. OFF loads nothing and succeeds. */
++bool dvbridge_upscale_load(struct dvbridge_upscaler *u, pl_gpu gpu, int method, const char *dir, char *why,
++                           size_t why_len);
++void dvbridge_upscale_free(struct dvbridge_upscaler *u);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+-- 
+2.53.0
+

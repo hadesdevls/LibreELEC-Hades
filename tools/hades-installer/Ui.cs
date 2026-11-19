@@ -20,7 +20,9 @@ namespace Hades.Installer
     static class Ui
     {
         public static float Scale = 1f;     // the display's DPI / 96 (the tests set it to draw 150 % and 200 %)
+#pragma warning disable 649 // (set only by the tests, which the published program does not carry: there it stays false)
         public static bool FixedScale;      // the tests: the scale is theirs, not the display's
+#pragma warning restore 649
         public static bool Dark;            // Windows' "app mode" (the tests set it)
 
         public static int S(int px) { return (int)Math.Round(px * Scale); }

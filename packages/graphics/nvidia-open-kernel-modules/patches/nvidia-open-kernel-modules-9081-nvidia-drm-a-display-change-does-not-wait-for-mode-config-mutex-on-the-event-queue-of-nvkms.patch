@@ -1,0 +1,200 @@
+From 56a7fd989cbea3ad67ce38085d0599067739e094 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:24:23 +0000
+Subject: [PATCH] nvidia-drm: a display change does not wait for
+ mode_config.mutex on the event queue of NVKMS
+
+KAPI's events reach nvidia-drm one at a time on nvkms_kthread_q, the flip
+events that a blocking commit waits for among them; NVIDIA's own comments
+say so (nv_drm_handle_hotplug_event() and nv_drm_handle_display_cp_change()
+were moved off that queue for it). nv_drm_handle_display_change(), the
+handler of NVKMS_EVENT_TYPE_DPY_CHANGED, still takes dev->mode_config.mutex
+there, only to find the encoder of the display. A thread that holds that
+mutex and waits for a lock of the commit (a probe of a connector by the DRM
+master: drm_helper_probe_single_connector_modes() takes connection_mutex
+under it) then holds up every flip event behind the display change until the
+commit gives up waiting for them.
+
+On an RTX 4080 SUPER an LG C5 pulses its hot-plug line
+after a change of mode (Kodi logs each such event 1 to 2 s later), and the
+commits whose flip events did not come were changes of mode: the first one
+of Kodi at a start (3.4 s, "Flip event timeout on head 2"), one of Dolby
+Vision, and the one that turns off the outputs that Kodi does not use, where
+the three heads of the commit timed out one after the other and a flip event
+came only as the commit gave up ("WARNING: ... __nv_drm_handle_flip_event",
+from the nvidia-modeset thread, the second the last timeout was logged).
+That a display change was the event that waited is what this reading of the
+code and the logs says; no log says it.
+
+- nv_drm_handle_display_change() notes the display (an atomic mask: a
+  NvKmsKapiDisplay is one bit, nvDpyIdToNvU32()) and schedules the hotplug
+  work, as before; the hotplug work, on the system workqueue, finds each
+  noted display and marks its connector for the next detect under
+  mode_config.mutex, and then sends the hotplug event, as before. A detect
+  of userspace answers from the connector's last state until then, as it
+  did between the event and the work before: the hotplug event that asks it
+  again comes after the mark.
+- An event that takes over 100 ms in nvidia-drm is said in the kernel log,
+  with its type and the time: the flip events behind it waited as long.
+  This says whether an event of nvidia-drm held the queue on the next test.
+
+The dynamic displays of DisplayPort MST are left as they are.
+
+Checked: the five modules build against Linux 7.3.5 with the compiler of
+the image, with no new warning; the patch applies with --fuzz=0 after
+9000 to 9080. Not run on a GPU: with three displays and the LG C5, the
+kernel log of a start should have no "Flip event timeout" line; where one
+comes, a line "Hades: an event of NVKMS (type N) took M ms" says whether an
+event of nvidia-drm held the others.
+---
+ kernel-open/nvidia-drm/nvidia-drm-drv.c     | 17 +++++++
+ kernel-open/nvidia-drm/nvidia-drm-encoder.c | 50 +++++++++++++++++----
+ kernel-open/nvidia-drm/nvidia-drm-encoder.h |  3 ++
+ kernel-open/nvidia-drm/nvidia-drm-priv.h    |  6 +++
+ 4 files changed, 68 insertions(+), 8 deletions(-)
+
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index 087c456..3b20068 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -158,6 +158,12 @@ static const struct drm_mode_config_funcs nv_mode_config_funcs = {
+ static void nv_drm_event_callback(const struct NvKmsKapiEvent *event)
+ {
+     struct nv_drm_device *nv_dev = event->privateData;
++    /*
++     * Hades: how long this event holds nvkms_kthread_q, where the flip events
++     * that a blocking commit waits for come in turn: said where it is over
++     * 100 ms
++     */
++    const unsigned long hades_start = jiffies;
+ 
+     mutex_lock(&nv_dev->lock);
+ 
+@@ -204,6 +210,14 @@ static void nv_drm_event_callback(const struct NvKmsKapiEvent *event)
+ done:
+ 
+     mutex_unlock(&nv_dev->lock);
++
++    if (time_after(jiffies, hades_start + msecs_to_jiffies(100))) {
++        NV_DRM_DEV_LOG_INFO(
++            nv_dev,
++            "Hades: an event of NVKMS (type %u) took %u ms in nvidia-drm: the flip events behind it on NVKMS's event queue waited as long",
++            (unsigned int)event->type,
++            jiffies_to_msecs(jiffies - hades_start));
++    }
+ }
+ 
+ struct nv_drm_mst_display_info {
+@@ -990,6 +1004,9 @@ static void nv_drm_handle_hotplug_event(struct work_struct *work)
+     struct nv_drm_device *nv_dev =
+         container_of(dwork, struct nv_drm_device, hotplug_event_work);
+ 
++    /* Hades: the displays whose change NVKMS said, marked before the event */
++    nv_drm_hades_mark_changed_displays(nv_dev);
++
+     drm_kms_helper_hotplug_event(nv_dev->dev);
+ }
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-encoder.c b/kernel-open/nvidia-drm/nvidia-drm-encoder.c
+index 06174fa..af76180 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-encoder.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-encoder.c
+@@ -300,25 +300,59 @@ get_nv_encoder_from_nvkms_display(struct drm_device *dev,
+     return NULL;
+ }
+ 
++/*
++ * Hades: this runs on nvkms_kthread_q, where every event of NVKMS is handled in
++ * turn, the flip events that a blocking commit waits for among them. It took
++ * dev->mode_config.mutex there to find the encoder; a thread that holds that
++ * mutex and waits for a lock of the commit (a probe of a connector:
++ * drm_helper_probe_single_connector_modes() takes connection_mutex under it)
++ * then held up every flip event behind the display change until the commit
++ * gave up waiting, 3 s for each of its CRTCs. The display is noted here and
++ * found, and its connector marked, by the hotplug work, which runs on the
++ * system workqueue and sends the hotplug event right after
++ * (nv_drm_hades_mark_changed_displays()), as NVIDIA already does for the
++ * hotplug event and for a change of content protection.
++ */
+ void nv_drm_handle_display_change(struct nv_drm_device *nv_dev,
+                                   NvKmsKapiDisplay hDisplay)
+ {
+-    struct drm_device *dev = nv_dev->dev;
+-    struct nv_drm_encoder *nv_encoder = NULL;
++    if (hDisplay == 0) {
++        return;
++    }
+ 
+-    mutex_lock(&dev->mode_config.mutex);
++    atomic_or((int)hDisplay, &nv_dev->hades_changed_displays);
+ 
+-    nv_encoder = get_nv_encoder_from_nvkms_display(dev, hDisplay);
++    schedule_delayed_work(&nv_dev->hotplug_event_work, 0);
++}
+ 
+-    mutex_unlock(&dev->mode_config.mutex);
++/*
++ * Hades: the connectors of the displays whose change NVKMS said, marked for the
++ * next detect (from the hotplug work, before its hotplug event)
++ */
++void nv_drm_hades_mark_changed_displays(struct nv_drm_device *nv_dev)
++{
++    struct drm_device *dev = nv_dev->dev;
++    NvU32 changed = (NvU32)atomic_xchg(&nv_dev->hades_changed_displays, 0);
+ 
+-    if (nv_encoder == NULL) {
++    if (changed == 0) {
+         return;
+     }
+ 
+-    nv_drm_connector_mark_connection_status_dirty(nv_encoder->nv_connector);
++    mutex_lock(&dev->mode_config.mutex);
+ 
+-    schedule_delayed_work(&nv_dev->hotplug_event_work, 0);
++    while (changed != 0) {
++        const NvU32 hDisplay = changed & (~changed + 1);
++        struct nv_drm_encoder *nv_encoder =
++            get_nv_encoder_from_nvkms_display(dev, hDisplay);
++
++        changed &= ~hDisplay;
++        if (nv_encoder != NULL && nv_encoder->nv_connector != NULL) {
++            nv_drm_connector_mark_connection_status_dirty(
++                nv_encoder->nv_connector);
++        }
++    }
++
++    mutex_unlock(&dev->mode_config.mutex);
+ }
+ 
+ void nv_drm_handle_display_cp_change(struct nv_drm_device *nv_dev,
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-encoder.h b/kernel-open/nvidia-drm/nvidia-drm-encoder.h
+index c0fe6d3..9af4c37 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-encoder.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-encoder.h
+@@ -59,6 +59,9 @@ static inline struct nv_drm_encoder *to_nv_encoder(
+ struct drm_encoder*
+ nv_drm_add_encoder(struct drm_device *dev, NvKmsKapiDisplay hDisplay);
+ 
++/* Hades: the displays that nv_drm_handle_display_change() noted */
++void nv_drm_hades_mark_changed_displays(struct nv_drm_device *nv_dev);
++
+ void nv_drm_handle_display_change(struct nv_drm_device *nv_dev,
+                                   NvKmsKapiDisplay hDisplay);
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index 9a8501f..04f0352 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -173,6 +173,12 @@ struct nv_drm_device {
+ 
+     NvBool supportsSyncpts;
+     NvBool supportsColorPassthrough;
++    /*
++     * Hades: the displays whose change NVKMS said and that the hotplug work
++     * has yet to mark (nv_drm_handle_display_change()): NvKmsKapiDisplay is
++     * one bit (nvDpyIdToNvU32())
++     */
++    atomic_t hades_changed_displays;
+     /* Hades: Media VRR (NV_VRR_MEDIA) */
+     NvBool hadesSupportsVirtualRefreshRate;
+     NvBool isSocDgpuDisplayNeedingWar;

@@ -56,17 +56,41 @@ namespace Hades.Installer
                 double part = total > 0 ? (double)done / total : 0;
                 // writing is the first 60 % of the bar, reading back the rest
                 int permille = (int)(stage == Engine.Verifying ? 600 + 400 * part : 50 + 550 * part);
-                report(permille, StageText(stage) + "…  " + Words.Size(done) + L.T(" of ", " de ") + Words.Size(total));
+                report(permille, StageText(stage) + "...  " + Words.Size(done) + L.T(" of ", " de ") + Words.Size(total));
+            };
+        }
+
+        // The image read through before it is written, the first 5 % of the bar
+        static Engine.Progress ScanBar(Report report)
+        {
+            return delegate(string stage, long done, long total)
+            {
+                double part = total > 0 ? (double)done / total : 0;
+                report((int)(50 * part), StageText(stage) + "...  " + Words.Size(done) + L.T(" of ", " de ") + Words.Size(total));
             };
         }
 
         // The whole disk for Hades: everything on it is erased and the image is written as it is (USB), or
         // with its boot menus and its partition table changed for a disk inside the PC. diagnostics: with
-        // the switch of its diagnostics turned on.
-        public static WriteResult InstallWhole(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report)
+        // the switch of its diagnostics turned on, and their kernel line (Engine.DiagnosticsKernelLine).
+        public static WriteResult InstallWhole(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, SbJob secure = null)
         {
-            report(0, L.T("Preparing the disk…", "Preparando el disco…"));
-            List<Patch> patches = Engine.Patches(plan, place == Place.Internal, true, null, diagnostics);
+            try
+            {
+                return InstallWholeCore(disk, plan, place, diagnostics, report, secure != null && secure.Enabled ? secure : null);
+            }
+            finally { if (secure != null) secure.Dispose(); }
+        }
+
+        static WriteResult InstallWholeCore(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, SbJob secure)
+        {
+            // (an image for a USB drive has not been read through: with the diagnostics on it is, once, for where its kernel
+            // line of the diagnostics is, so that the first start of the drive has it; and so it is for Secure Boot, which needs to
+            // know where the boot loader and the kernel are)
+            if ((diagnostics || secure != null) && !plan.Scanned) plan = Engine.Plan(plan.Path, true, ScanBar(report), null);
+            report(0, L.T("Preparing the disk...", "Preparando el disco..."));
+            SbBuild build = secure != null ? secure.PrepareInstall(plan) : null;
+            List<Patch> patches = Engine.Patches(plan, place == Place.Internal, true, null, diagnostics, null, build);
             DiskInfo now = Current(disk, place, plan.Size, Disks.Keeping(plan.Path), true);
             // Each volume of the disk written out and dismounted first, taken from the programs that have it open: Windows
             // erases a disk whose volume is in use all the same, and what that volume still had to write must not land on
@@ -84,9 +108,11 @@ namespace Hades.Installer
             using (FileStream target = Native.OpenDisk(disk.Number, true))
                 result = Engine.WriteWhole(plan, target, disk.Size, patches, Bar(report), null);
             Disks.Refresh(disk.Number);
-            Log.Line("whole " + place + (diagnostics ? ", diagnostics on" : "") + ": " + result.Bytes + " bytes, written " + result.Written +
-                     ", read back " + result.ReadBack);
+            Log.Line("whole " + place + (diagnostics ? ", diagnostics on (" + Engine.DiagnosticsKernelLineSummary(plan) + ")" : "") + ": " +
+                     result.Bytes + " bytes, written " + result.Written + ", read back " + result.ReadBack);
             if (!result.Verified) throw new IOException(Mismatch);
+            // (only now, with everything written and read back: the request to the firmware)
+            if (secure != null) secure.Finish();
             return result;
         }
 
@@ -162,7 +188,17 @@ namespace Hades.Installer
         // Hades next to what a disk already has: one of its volumes is made smaller, and two partitions
         // are added in the room that leaves. No file of the disk is touched.
         public static void InstallBeside(DiskInfo disk, PartitionInfo volume, long storageSize, ImagePlan plan, bool diagnostics,
-                                         Report report)
+                                         Report report, SbJob secure = null)
+        {
+            try
+            {
+                InstallBesideCore(disk, volume, storageSize, plan, diagnostics, report, secure != null && secure.Enabled ? secure : null);
+            }
+            finally { if (secure != null) secure.Dispose(); }
+        }
+
+        static void InstallBesideCore(DiskInfo disk, PartitionInfo volume, long storageSize, ImagePlan plan, bool diagnostics,
+                                      Report report, SbJob secure)
         {
             if (!plan.Scanned || !plan.StorageAnywhere)
                 throw new InvalidOperationException(L.T(
@@ -171,7 +207,8 @@ namespace Hades.Installer
             if (!Native.Uefi)
                 throw new InvalidOperationException(L.T("This PC does not start by UEFI: Hades can only be installed on a USB drive.",
                                                         "Este PC no arranca por UEFI: Hades solo se puede instalar en una unidad USB."));
-            List<Patch> patches = Engine.Patches(plan, true, false, null, diagnostics);
+            SbBuild build = secure != null ? secure.PrepareInstall(plan) : null;
+            List<Patch> patches = Engine.Patches(plan, true, false, null, diagnostics, null, build);
             // (nothing is erased: the disk may be the one that this program or the image is on)
             Keep keep = Disks.Keeping(plan.Path);
             DiskInfo now = Current(disk, Place.Internal, plan.Size, keep, false);
@@ -210,8 +247,8 @@ namespace Hades.Installer
             bool shrunk = false;
             try
             {
-                report(10, L.T("Making room on " + target.Letter + ": (Windows moves files if it needs to; this can take a while)…",
-                               "Haciendo sitio en " + target.Letter + ": (Windows mueve archivos si hace falta; puede tardar)…"));
+                report(10, L.T("Making room on " + target.Letter + ": (Windows moves files if it needs to; this can take a while)...",
+                               "Haciendo sitio en " + target.Letter + ": (Windows mueve archivos si hace falta; puede tardar)..."));
                 Disks.Resize(disk.Number, target.Number, Down(oldSize - need));
                 shrunk = true;
                 PartitionInfo small = null;
@@ -228,14 +265,15 @@ namespace Hades.Installer
                 if (storageRoom < plan.Storage.Size)
                     throw new InvalidOperationException(L.T("Not enough room was left.", "No quedó sitio suficiente."));
 
-                report(30, L.T("Creating the Hades partitions…", "Creando las particiones de Hades…"));
+                report(30, L.T("Creating the Hades partitions...", "Creando las particiones de Hades..."));
                 system = Disks.Create(disk.Number, systemAt, plan.System.Size, Disks.EfiType);
                 storage = Disks.Create(disk.Number, storageAt, storageRoom, Disks.LinuxType);
                 if (system.Size < plan.System.Size || storage.Size < plan.Storage.Size || system.Offset < small.End ||
                     storage.Offset < system.End || storage.End > oldEnd)
                     throw new InvalidOperationException(L.T("The new partitions are not where they were asked for.",
                                                             "Las particiones creadas no están donde se pidieron."));
-                Log.Line("beside" + (diagnostics ? ", diagnostics on" : "") + ": volume " + target.Letter + ": " + oldSize + " -> " + small.Size +
+                Log.Line("beside" + (diagnostics ? ", diagnostics on (" + Engine.DiagnosticsKernelLineSummary(plan) + ")" : "") + ": volume " +
+                         target.Letter + ": " + oldSize + " -> " + small.Size +
                          "; system #" + system.Number + " at " +
                          system.Offset + " (" + system.Size + "); storage #" + storage.Number + " at " + storage.Offset + " (" + storage.Size + ")");
 
@@ -259,6 +297,7 @@ namespace Hades.Installer
                          "; storage written " + parts[1].Result.Written + ", read back " + parts[1].Result.ReadBack);
                 if (!parts[0].Result.Verified || !parts[1].Result.Verified) throw new IOException(Mismatch);
                 Disks.Refresh(disk.Number);
+                if (secure != null) secure.Finish();
             }
             catch (Exception e)
             {
@@ -266,7 +305,7 @@ namespace Hades.Installer
                 string undone = "";
                 try
                 {
-                    report(0, L.T("It could not be completed. Undoing the changes…", "No se pudo completar. Deshaciendo los cambios…"));
+                    report(0, L.T("It could not be completed. Undoing the changes...", "No se pudo completar. Deshaciendo los cambios..."));
                     if (storage != null) Disks.Delete(disk.Number, storage.Number, storage.Offset);
                     if (system != null) Disks.Delete(disk.Number, system.Number, system.Offset);
                     if (shrunk) Disks.Resize(disk.Number, target.Number, oldSize);
@@ -278,7 +317,7 @@ namespace Hades.Installer
                 {
                     Log.Line("undo failed: " + again);
                     undone = L.T(" It could not be undone completely (" + again.Message + "): your files are still on " + target.Letter +
-                                 ":, but some space may have been left unallocated. Use “Remove LibreELEC Hades” or Disk Management " +
+                                 ":, but some space may have been left unallocated. Use \"Remove LibreELEC Hades\" or Disk Management " +
                                  "in Windows.",
                                  " No se pudo deshacer del todo (" + again.Message + "): tus archivos siguen en " + target.Letter +
                                  ":, pero puede haber quedado espacio sin asignar. Usa «Quitar LibreELEC Hades» o la Administración de " +
@@ -299,9 +338,19 @@ namespace Hades.Installer
         // what became of them in the same result (DiagKeep.Boot).
         // A system partition that some program has open is left alone (PartitionInUseException), unless
         // take says to take it from that program (Native.OpenPartition): the user is asked first.
-        public static DiagKeep Update(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take = false)
+        public static DiagKeep Update(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take = false,
+                                      SbJob secure = null)
         {
-            report(0, L.T("Preparing the update…", "Preparando la actualización…"));
+            try
+            {
+                return UpdateCore(disk, plan, place, diagnostics, report, take, secure != null && secure.Enabled ? secure : null);
+            }
+            finally { if (secure != null) secure.Dispose(); }
+        }
+
+        static DiagKeep UpdateCore(DiskInfo disk, ImagePlan plan, Place place, bool diagnostics, Report report, bool take, SbJob secure)
+        {
+            report(0, L.T("Preparing the update...", "Preparando la actualización..."));
             // (only the system partition of Hades is written, through a handle that cannot write outside it)
             Keep keep = Disks.Keeping(plan.Path);
             DiskInfo now = Current(disk, place, 0, keep, false);
@@ -323,8 +372,21 @@ namespace Hades.Installer
                     "expected format). Nothing was touched.",
                     "No se puede leer el almacenamiento de Hades de ese disco (la partición que guarda tus ajustes no tiene el " +
                     "formato esperado). No se ha tocado nada."));
-            List<Patch> patches = Engine.Patches(plan, !now.Removable, false, existing, diagnostics);
-            Log.Line("update" + (diagnostics ? ", diagnostics on" : "") + (take ? ", taking the partition if it is in use" : "") +
+            // Secure Boot: which key signs, from the state of the disk (read only): the certificate on its system partition, the key slot of its
+            // storage. A key that is made new goes into the slot only once the system partition has been taken, further down.
+            SbBuild build = null;
+            bool writeSlot = false;
+            if (secure != null)
+            {
+                byte[] oldCert = SbDisk.CertOnDisk(now.Number, system);
+                SbSlot slot = null;
+                try { slot = SbDisk.SlotOnDisk(now.Number, storage); }
+                catch (Exception e) { Log.Line("secure boot: the key slot could not be read: " + e.Message); }
+                build = secure.PrepareUpdate(plan, oldCert, slot, out writeSlot);
+            }
+            List<Patch> patches = Engine.Patches(plan, !now.Removable, false, existing, diagnostics, null, build);
+            Log.Line("update" + (diagnostics ? ", diagnostics on (" + Engine.DiagnosticsKernelLineSummary(plan) + ")" : "") +
+                     (take ? ", taking the partition if it is in use" : "") +
                      ": system #" + system.Number + " at " + system.Offset + "; the storage is " + existing +
                      " (the image names " + plan.StorageUuid + ")");
             var part = new Engine.Target();
@@ -334,14 +396,14 @@ namespace Hades.Installer
                 // what the old boot menus say of the start (their wait, the kernel options of Kodi's display), carried into
                 // the new ones (BootMenus): read before anything is written, and so the patches are made again with it
                 BootChoices boot = BootMenus.Read(DiagFolder.Reader(stream, system.Size), system.Size);
-                patches = Engine.Patches(plan, !now.Removable, false, existing, diagnostics, boot);
+                patches = Engine.Patches(plan, !now.Removable, false, existing, diagnostics, boot, build);
                 var bootKept = new BootKept();
                 bootKept.Old = boot;
                 bootKept.ImageKnows = plan.HasBootChoices;
                 bootKept.ImageWait = plan.BootWait;
                 bootKept.Patches = BootMenus.Keep(plan, boot).Count;
                 Log.Line("update: " + bootKept.Summary());
-                report(30, L.T("Reading what the diagnostics saved…", "Leyendo lo que guardó el diagnóstico…"));
+                report(30, L.T("Reading what the diagnostics saved...", "Leyendo lo que guardó el diagnóstico..."));
                 kept = DiagFolder.Prepare(plan, stream, system.Size, patches);
                 kept.Boot = bootKept;
                 Log.Line("update: hades-diag before writing: " + kept.Summary());
@@ -351,10 +413,20 @@ namespace Hades.Installer
                 part.Capacity = system.Size;
                 part.From = plan.System.Start;
                 part.Length = plan.System.Size;
+                // the new key into the slot of the storage (an empty slot, of a clean file system), before the system partition is written: if it
+                // does not go in, nothing was written, and if the system partition then fails the key is there for the next try
+                if (writeSlot)
+                {
+                    report(40, L.T("Saving the key of this PC in the Hades storage...", "Guardando la clave de este PC en el almacenamiento de Hades..."));
+                    using (FileStream slotStream = Native.OpenPartition(now.Number, storage.Number, storage.Offset, storage.Size))
+                        SbSlot.WriteTo(slotStream, storage.Size, secure.Key.Pem());
+                    Log.Line("secure boot: the key is in the key slot of the storage");
+                }
                 Engine.Write(plan, new[] { part }, all, Bar(report), null);
                 if (part.Result.Verified) DiagFolder.Confirm(kept, DiagFolder.Reader(stream, system.Size), system.Size);
             }
             Disks.Refresh(now.Number);
+            if (secure != null && part.Result.Verified) secure.Finish();
             Log.Line("update: written " + part.Result.Written + ", read back " + part.Result.ReadBack);
             Log.Line("update: hades-diag: " + kept.Summary());
             if (!part.Result.Verified)
@@ -369,13 +441,23 @@ namespace Hades.Installer
             return kept;
         }
 
-        // Takes Hades off an internal disk. Next to anything else: its two partitions go, and the volume
-        // before them gets the room back. A disk with nothing but Hades: it is erased and left with one
-        // empty NTFS volume. imagePath: the image that is chosen in the window, if any, which is kept too.
-        public static string Uninstall(DiskInfo disk, string imagePath, Report report)
+        // The partition table that a disk is left with when Hades is taken off it whole: MBR for a USB drive, as Windows
+        // formats a removable one and as an old TV reads it; GPT for a disk inside the PC, and for a USB drive larger than
+        // the 2 TiB that an MBR table can hold.
+        public static bool RemovalMbr(Place place, long size)
+        {
+            return place == Place.Usb && size > 0 && size <= (1L << 41);
+        }
+
+        // Takes Hades off an internal disk, or off a USB drive (place). Next to anything else: its two partitions go, and
+        // the volume before them gets the room back. A disk with nothing but Hades: it is erased and left with one empty
+        // volume, NTFS (exFAT on a USB drive, which TVs and other computers read too). imagePath: the image that is chosen
+        // in the window, if any, which is kept too. A USB drive that holds this program, the image or files of the user is
+        // not offered at all (Disks.Classify), as for an install.
+        public static string Uninstall(DiskInfo disk, string imagePath, Report report, Place place = Place.Internal)
         {
             Keep keep = Disks.Keeping(imagePath);
-            DiskInfo now = Current(disk, Place.Internal, 0, keep, false);
+            DiskInfo now = Current(disk, place, 0, keep, false);
             PartitionInfo system, storage;
             if (!Disks.FindHades(now, out system, out storage))
                 throw new InvalidOperationException(NotFound);
@@ -385,21 +467,24 @@ namespace Hades.Installer
             // (never a disk with anything else on it, nor one that holds what must be kept)
             if (how == Removal.WholeDisk)
             {
-                report(200, L.T("Erasing the disk…", "Borrando el disco…"));
+                report(200, L.T("Erasing the disk...", "Borrando el disco..."));
                 // (as before an install on the whole disk: nothing of its volumes may land on the one that is made)
                 foreach (PartitionInfo p in now.Partitions) Native.FlushAndDismount(disk.Number, p);
                 Disks.Clear(disk.Number);
                 System.Threading.Thread.Sleep(1500);
-                Disks.InitializeGpt(disk.Number);
-                report(600, L.T("Creating an empty partition for Windows…", "Creando una partición vacía para Windows…"));
+                bool mbr = RemovalMbr(place, now.Size);
+                if (mbr) Disks.InitializeMbr(disk.Number);
+                else Disks.InitializeGpt(disk.Number);
+                report(600, L.T("Creating an empty partition for Windows...", "Creando una partición vacía para Windows..."));
                 // (the label of the new volume, which is written to the disk)
-                char letter = Disks.MakeDataVolume(disk.Number, L.T("Data", "Datos"));
+                char letter = Disks.MakeDataVolume(disk.Number, L.T("Data", "Datos"), place == Place.Usb ? "exFAT" : "NTFS", mbr);
                 Disks.Refresh(disk.Number);
-                Log.Line("uninstall: whole disk " + disk.Number + " -> " + letter + ":");
+                Log.Line("uninstall: whole " + (place == Place.Usb ? "USB drive " : "disk ") + disk.Number + " -> " + letter + ": (" +
+                         (mbr ? "MBR" : "GPT") + ")");
                 return L.T("The disk is empty and Windows sees it as " + letter + ":.",
                            "El disco está vacío y Windows lo ve como " + letter + ":.");
             }
-            report(200, L.T("Deleting the Hades partitions…", "Borrando las particiones de Hades…"));
+            report(200, L.T("Deleting the Hades partitions...", "Borrando las particiones de Hades..."));
             Disks.Delete(disk.Number, storage.Number, storage.Offset);
             Disks.Delete(disk.Number, system.Number, system.Offset);
             // the volume that gets the room back, as Windows numbers it now
@@ -421,7 +506,7 @@ namespace Hades.Installer
                            "Las particiones de Hades se han borrado. El espacio queda sin asignar: puedes añadirlo a un volumen desde " +
                            "la Administración de discos de Windows.");
             }
-            report(600, L.T("Giving the space back to " + before.Letter + ":…", "Devolviendo el espacio a " + before.Letter + ":…"));
+            report(600, L.T("Giving the space back to " + before.Letter + ":...", "Devolviendo el espacio a " + before.Letter + ":..."));
             long least, most;
             Disks.SupportedSize(disk.Number, before.Number, out least, out most);
             if (most > before.Size) Disks.Resize(disk.Number, before.Number, most);

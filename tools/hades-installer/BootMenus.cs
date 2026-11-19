@@ -1,7 +1,8 @@
 // LibreELEC Hades installer for Windows: the choices of the start that the boot menus keep, carried across an update.
 // The boot menus of the system partition (syslinux.cfg for BIOS, EFI/BOOT/grub.cfg for UEFI) are the one place where
 // Hades keeps how long they wait (LibreELEC settings, System, Boot menu) and the kernel options that Kodi's display
-// settings turn on (i915.hdmi_hdr_gmp, amdgpu.dvbridge_dce); the system changes them in place (internal-disks). An
+// settings turn on (i915.hdmi_hdr_gmp, amdgpu.dvbridge_dce; i915.pcon_hd_audio in its sound settings); the system
+// changes them in place (internal-disks). An
 // update replaces the system partition whole, menus included: so the old menus are read before the partition is written
 // over, and what they say goes into the new one. An image whose menus say "boot-choices" in their first line writes
 // each choice in a form whose length does not depend on its value (scripts/mkimage): the wait with a fixed number of
@@ -27,6 +28,8 @@ namespace Hades.Installer
         public bool Read;                                 // the menus were read (one of them at least)
         public bool Marked;                               // the first line of one of them says boot-choices (1.0 or later)
         public string Detail = "";                        // for the log, in English
+        // (BootMenus.Keep) options on here that the image has no word for (made before the option): not carried
+        public List<string> NotCarried = new List<string>();
 
         public string Summary()
         {
@@ -44,7 +47,17 @@ namespace Hades.Installer
         // The wait that the menus of before 1.0 had by themselves (1.0 RC6 to 1.0 RC8)
         public const int WaitBefore = 10;
         // The kernel options, as on the kernel line (the order of scripts/mkimage)
-        public static readonly string[] Options = { "i915.hdmi_hdr_gmp", "amdgpu.dvbridge_dce" };
+        public static readonly string[] Options = { "i915.hdmi_hdr_gmp", "amdgpu.dvbridge_dce", "i915.pcon_hd_audio" };
+        // The options that every image that says boot-choices has (those of 1.0); an image made before a later one
+        // (i915.pcon_hd_audio) has no word for it, and it is not carried there
+        public const int OptionsOf10 = 2;
+        // The kernel line of the diagnostics (scripts/mkimage, DIAG_KERNEL_LINE): two words on each of the four entries of
+        // each menu, the installer's too, each with one byte that is 0 or 1: initcall_debug=0|1, and log_buf_len=0M|1M,
+        // which goes with it (1 MiB for the kernel's log, so that the lines of initcall_debug do not push the first lines of
+        // the start out of it; 0M is no size). Not a choice that an update carries: it follows the box of the diagnostics
+        // (Engine.DiagnosticsKernelLine)
+        public const string DiagLine = "initcall_debug", DiagBuffer = "log_buf_len";
+        public const int DiagLineEntries = 8;
         // The lines of the wait, up to their value; the value has a fixed length: three digits, two, and the end of the
         // line that says it, 13 characters ("10 seconds...", "5 seconds... ", "1 second...  ")
         public const string TimeoutLine = "\nTIMEOUT ", GrubLine = "\nset timeout=\"", SayLine = "\nSAY Wait for run mode to start automatically in ";
@@ -274,7 +287,8 @@ namespace Hades.Installer
             if (choices == null || !choices.Read || !plan.HasBootChoices) return patches;
             if (!plan.Scanned) throw new InvalidOperationException("The image was not scanned.");
             bool known = plan.WaitOffsets[0].Count == 1 && plan.WaitOffsets[1].Count == 1 && plan.WaitOffsets[2].Count == 1;
-            foreach (List<long> o in plan.OptionOffsets) known &= o.Count == 6;
+            for (int i = 0; i < Options.Length; ++i)
+                known &= plan.OptionOffsets[i].Count == 6 || (i >= OptionsOf10 && plan.OptionOffsets[i].Count == 0);
             if (!known)
                 throw new InvalidDataException(L.T(
                     "The boot menus of this image are not the ones this installer knows (the lines of their wait and options). " +
@@ -287,9 +301,13 @@ namespace Hades.Installer
                 patches.Add(Make(plan.WaitOffsets[1][0], choices.Wait.ToString("D2")));
                 patches.Add(Make(plan.WaitOffsets[2][0], Words(choices.Wait)));
             }
+            choices.NotCarried.Clear();
             for (int i = 0; i < Options.Length; ++i)
                 if (choices.On.Contains(Options[i]))
+                {
+                    if (plan.OptionOffsets[i].Count == 0) choices.NotCarried.Add(Options[i]);
                     foreach (long at in plan.OptionOffsets[i]) patches.Add(Make(at, "1"));
+                }
             return patches;
         }
 
@@ -339,6 +357,29 @@ namespace Hades.Installer
                     if ((v != (byte)'0' && v != (byte)'1') || (after != (byte)' ' && after != (byte)'\n')) continue;
                     plan.OptionOffsets[i].Add(where);
                 }
+            }
+            // the kernel line of the diagnostics: its two words, each a word of its own on the line, its value one byte (0 or
+            // 1), and after it the end of the word: a blank or the end of the line for initcall_debug, "M" for log_buf_len
+            DiagWords(plan, buffer, have, bufferStart, DiagLine, null, plan.DiagLineOffsets);
+            DiagWords(plan, buffer, have, bufferStart, DiagBuffer, "M", plan.DiagBufferOffsets);
+        }
+
+        static void DiagWords(ImagePlan plan, byte[] buffer, int have, long bufferStart, string name, string unit, List<long> into)
+        {
+            byte[] word = Encoding.ASCII.GetBytes(" " + name + "=");
+            int tail = unit == null ? 0 : unit.Length;
+            foreach (int at in Engine.Find(buffer, have, word))
+            {
+                int value = at + word.Length;
+                if (value + tail + 2 > have) continue;
+                long where = bufferStart + value;
+                if (where < plan.System.Start || where >= plan.System.End || into.Contains(where)) continue;
+                byte v = buffer[value];
+                if (v != (byte)'0' && v != (byte)'1') continue;
+                if (unit != null && Encoding.ASCII.GetString(buffer, value + 1, tail) != unit) continue;
+                byte after = buffer[value + 1 + tail];
+                if (after != (byte)' ' && after != (byte)'\n') continue;
+                into.Add(where);
             }
         }
 
@@ -402,8 +443,10 @@ namespace Hades.Installer
                               "espera " + Old.Wait + (Old.Wait == 1 ? " segundo" : " segundos")));
             var options = new List<string>();
             foreach (string o in Old.On)
-                options.Add(o == BootMenus.Options[0] ? L.T("HDR over HDMI on the Intel graphics", "HDR por HDMI en la gráfica Intel")
-                                                      : L.T("Dolby Vision on the Radeon", "Dolby Vision en la Radeon"));
+                if (!Old.NotCarried.Contains(o))
+                    options.Add(o == BootMenus.Options[0] ? L.T("HDR over HDMI on the Intel graphics", "HDR por HDMI en la gráfica Intel")
+                              : o == BootMenus.Options[2] ? L.T("surround sound through the USB-C adapter", "sonido envolvente por el adaptador USB-C")
+                                                          : L.T("Dolby Vision on the Radeon", "Dolby Vision en la Radeon"));
             if (options.Count > 0)
                 parts.Add(L.T("starts with " + string.Join(" and with ", options.ToArray()),
                               "arranca con " + string.Join(" y con ", options.ToArray())));

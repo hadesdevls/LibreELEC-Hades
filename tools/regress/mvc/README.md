@@ -25,8 +25,8 @@ makes goes into `$MVC_WORK`.
 | 9 | `abs_diff_view_idx_minus1` narrowed and used before its check | series | `f9.sh`: three values out of range refused, with their value; no UBSan report |
 | 10 | a prefix NAL unit of four bytes taken for a truncated one | series | `prefix.sh`: no "Failed to parse header of NALU (type 14)" |
 | 11 | `mvcC` count of five bits in the mov demuxer | not shipped (`twin.sh` leaves libavformat out); Kodi reads the box | `kodi/mvcc_count_test.cpp`: Kodi reads seven bits, keeps five in `avcC`, refuses a merge that five bits cannot count |
-| 12 | FATE registration | not shipped | — |
-| 13 | corrective commits later in the series | not a defect of the code that is built | — |
+| 12 | FATE registration | not shipped | none |
+| 13 | corrective commits later in the series | not a defect of the code that is built | none |
 | N1 | an IDR access unit in a packet that begins with the dependent view of the unit before: idr() runs before that view's picture is finished, which puts it back among the references of its view | fix 9009 | `jmlayouts.sh` on `x-sd540x2`, `x-f4x2`, `f5-replace-shared`: both packet layouts against JM (without the fix: 11 of 50 pictures of the second view differ, from the IDR on) |
 | N2 | field-coded MVC (MVCICT-1) in that same layout, decoder opened without the reorder depth that probing finds (as Kodi opens it): 225 pictures of the second view for 150 | **open**, known since fix 9002 (its description says so); not a format of Blu-ray 3D (progressive only) | `flush.sh` (reported as known by the verdict); with the probed depth (`jmlayouts.sh`) both layouts are JM's |
 | C1 | a concern the review left unverified: film grain not synthesized where the view switch ends the base view picture | series (`ff_h264_field_end()` synthesizes it whatever `in_setup` is) | `grain.sh`: with both views decoded, the base view of a stream with a film grain SEI is the stock decoder's (on the series of August it is not, and differs between runs) |
@@ -48,7 +48,7 @@ run-mvc.sh <stage>...                                       # base twins streams
 The verdict (`results/verdict.txt`) is read line by line from the results of each stage and ends with the count
 of failures (exit 1 when there is one). What the inputs are, and the variables that name them (required), is in `env.sh`: the
 FFmpeg source of the recipe (checked against `PKG_SHA256`), JM 19.1 (`ldecod`, the reference decoder, built
-for Hades with `gcc` only; SHA256 `166f3572…`), the ITU-T H.264.1 MVC bitstreams (zip, SHA256 checked), the two streams
+for Hades with `gcc` only; SHA256 `166f3572...`), the ITU-T H.264.1 MVC bitstreams (zip, SHA256 checked), the two streams
 of the reference encoder (SHA256 checked) and, for `kodi/`, a Kodi tree.
 
 The decoders are built as twin.sh builds them, on a small host FFmpeg (`host.sh`): `ship` (the tree), `rev` (the

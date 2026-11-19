@@ -1,0 +1,499 @@
+From bc373d21d3cce7b92ad420542c5f33d9c9f96d33 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:36:46 +0000
+Subject: [PATCH] application, VideoPlayer: a disc image behind an address that
+ does not say so plays as a disc
+
+Kodi takes a disc image by the extension of its address. A streaming add-on
+gives the address of its resolver, often without the name of the file, and a
+CDN may give the file an address without an extension and tell what it is by
+its type (application/x-iso9660-image) or by the name in its
+Content-Disposition. Such a Blu-ray image was opened as a video file and did
+not play: measured in a VM (an image of this tree before), an add-on address
+without extension that redirects to an .iso, and one whose CDN address has
+no extension but the type of an image, played nothing in 180 s.
+
+Now:
+- CApplicationPlay, after the add-on resolved the item, asks an address of a
+  web server once where it leads and what it is (CCurlFile::ProbeTarget(): a
+  HEAD, or a GET that stops at its first data where HEAD is refused, as
+  Stat() asks), when its extension says nothing of a video, sound or
+  playlist and its type is not known (or is the generic one). A disc image
+  plays as a disc from the address it leads to, with the add-on's options;
+  the choices for a disc (its menu, the main title, the list of titles)
+  apply as for any other image. An address that only its type or name says
+  is an image is remembered as one (CHttpSourceMemory), and
+  URIUtils::IsDiscImage() and CURL::IsDiscImage() take it so.
+- The stream factory of the player takes where an address leads from what
+  was asked a moment ago (by that probe, or by the HEAD that asks a stream
+  for its type, CCurlFile::Stat(), which now remembers its redirect) instead
+  of opening it again: one request less to the add-on's resolver at every
+  start (measured at the start of a Matroska file: three requests to the
+  resolver before, two now: the two HEADs that ask its type, as before).
+- What the factory finds is a disc image (by the extension of where the
+  address led, or its type) is opened as a disc, where nothing before found
+  it.
+One INFO line for each decision. Measured after, in the same VM (with the
+volume of the image kept and read in pieces, the commits that follow): the
+add-on address without extension played its main title in 2.6 to 2.9 s, the
+CDN address told by its type in 2.3 to 2.5 s.
+Credit: the idea of recognising an image
+behind a redirect or by its type is mephis's (flhs0606/LibreELEC-Hades,
+4fdd375477); written anew here, with one request instead of a probe of its
+own, and without its other changes.
+---
+ xbmc/URL.cpp                                  |   9 +-
+ xbmc/application/ApplicationPlay.cpp          | 107 ++++++++++++++++++
+ .../DVDInputStreams/DVDFactoryInputStream.cpp |  78 ++++++++++---
+ xbmc/filesystem/CurlFile.cpp                  |  93 +++++++++++++++
+ xbmc/filesystem/CurlFile.h                    |  17 +++
+ xbmc/utils/URIUtils.cpp                       |   6 +-
+ 6 files changed, 292 insertions(+), 18 deletions(-)
+
+diff --git a/xbmc/URL.cpp b/xbmc/URL.cpp
+index 2bb0054..40eb712 100644
+--- a/xbmc/URL.cpp
++++ b/xbmc/URL.cpp
+@@ -13,6 +13,7 @@
+ #include "ServiceBroker.h"
+ #include "Util.h"
+ #include "filesystem/File.h"
++#include "filesystem/HttpSourceMemory.h"
+ #include "filesystem/StackDirectory.h"
+ #include "network/Network.h"
+ #include "utils/FileExtensionProvider.h"
+@@ -822,7 +823,13 @@ bool CURL::IsDiscImage() const
+   if (IsStack() || IsMultiPath())
+     return false;
+ 
+-  return HasExtension(".img|.iso|.nrg|.udf");
++  if (HasExtension(".img|.iso|.nrg|.udf"))
++    return true;
++
++  // Hades: an address that only the type its server gave the file says is a disc image
++  // (CApplicationPlay asked; XFILE::CHttpSourceMemory)
++  return (IsProtocol("http") || IsProtocol("https")) &&
++         XFILE::CHttpSourceMemory::IsKnownDiscImage(Get());
+ }
+ 
+ bool CURL::IsPicture() const
+diff --git a/xbmc/application/ApplicationPlay.cpp b/xbmc/application/ApplicationPlay.cpp
+index 58a10f2..06a76ff 100644
+--- a/xbmc/application/ApplicationPlay.cpp
++++ b/xbmc/application/ApplicationPlay.cpp
+@@ -16,8 +16,10 @@
+ #include "cores/AudioEngine/Interfaces/AE.h"
+ #include "cores/playercorefactory/PlayerCoreFactory.h"
+ #include "dialogs/GUIDialogBusy.h"
++#include "filesystem/CurlFile.h"
+ #include "filesystem/DirectoryFactory.h"
+ #include "filesystem/DiscDirectoryHelper.h"
++#include "filesystem/HttpSourceMemory.h"
+ #include "messaging/ApplicationMessenger.h"
+ #include "music/MusicFileItemClassify.h"
+ #include "playlists/PlayList.h"
+@@ -29,6 +31,7 @@
+ #include "settings/SettingsComponent.h"
+ #include "threads/IRunnable.h"
+ #include "utils/DiscsUtils.h"
++#include "utils/FileExtensionProvider.h"
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
+ #include "video/Bookmark.h"
+@@ -395,6 +398,107 @@ void FillInMimeTypeKeepingGuiAlive(CFileItem& item)
+                                                                   start)
+                 .count());
+ }
++
++//! Hades: asks where an address leads and what its server says it is (DetectDiscImage())
++class CTargetProbe : public IRunnable
++{
++public:
++  explicit CTargetProbe(std::string url) : m_url(std::move(url)) {}
++  void Run() override
++  {
++    XFILE::CCurlFile file;
++    m_ok = file.ProbeTarget(CURL(m_url), m_target, m_mimeType, m_fileName);
++  }
++
++  const std::string m_url;
++  bool m_ok{false};
++  std::string m_target;
++  std::string m_mimeType;
++  std::string m_fileName;
++};
++
++/*!
++ * \brief Hades: a disc image behind an address that does not say so.
++ *
++ * A Debrid add-on gives Kodi the address of its resolver, often without the name of the file,
++ * which sends to the CDN of the service; and a CDN may give the file an address without an
++ * extension, telling what it is by its type (application/x-iso9660-image) or by the name in its
++ * Content-Disposition. Kodi takes a disc image by the extension of its address, everywhere: such an
++ * image was opened as a video file, which it is not, and did not play.
++ *
++ * An address of a web server whose extension says nothing of a video, sound or playlist, and whose
++ * type is not known (or is the generic one), is asked once where it leads and what it is (a HEAD,
++ * CCurlFile::ProbeTarget()). A disc image is played as a disc from the address it leads to (with
++ * the options of the add-on's address): the choices for a disc (its menu, the main title, the list
++ * of titles) then apply as for any other image. An address that leads to anything else is played as
++ * before; the stream factory takes what was asked here instead of asking again
++ * (CDVDFactoryInputStream).
++ */
++void DetectDiscImage(CFileItem& item)
++{
++  const std::string path{item.GetDynPath()};
++  if (!URIUtils::IsProtocol(path, "http") && !URIUtils::IsProtocol(path, "https"))
++    return;
++  if (item.IsDiscImage() || !item.ContentLookup() || item.IsPVR() || item.IsLiveTV() ||
++      MUSIC::IsAudio(item) || !item.GetProperty("inputstream").asString().empty())
++    return;
++  const auto& extensions = CServiceBroker::GetFileExtensionProvider();
++  if (URIUtils::HasExtension(path, extensions.GetVideoExtensions() + "|" +
++                                       extensions.GetMusicExtensions() +
++                                       "|.m3u8|.mpd|.ism|.strm|.m3u|.pls"))
++    return;
++  if (const std::string mime{item.GetMimeType()};
++      !mime.empty() && mime != "application/octet-stream" && mime != "binary/octet-stream" &&
++      !XFILE::CHttpSourceMemory::IsDiscImageMimeType(mime))
++    return;
++
++  const auto start = std::chrono::steady_clock::now();
++  CTargetProbe probe{path};
++  if (CServiceBroker::GetAppMessenger()->IsProcessThread())
++    CGUIDialogBusy::Wait(&probe, 100, false);
++  else
++    probe.Run();
++  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now() - start)
++                      .count();
++  if (!probe.m_ok)
++  {
++    CLog::Log(LOGINFO,
++              "CApplicationPlay: {} could not be asked where it leads ({} ms): the stream is "
++              "played as before",
++              XFILE::CHttpSourceMemory::ShortForLog(path), ms);
++    return;
++  }
++
++  const bool byAddress{URIUtils::HasExtension(probe.m_target, ".img|.iso|.nrg|.udf")};
++  const bool byType{XFILE::CHttpSourceMemory::IsDiscImageMimeType(probe.m_mimeType)};
++  const bool byName{!probe.m_fileName.empty() &&
++                    URIUtils::HasExtension(probe.m_fileName, ".img|.iso|.nrg|.udf")};
++  if (!byAddress && !byType && !byName)
++  {
++    CLog::Log(LOGINFO, "CApplicationPlay: {} leads to {} ({}; {} ms): not a disc image",
++              XFILE::CHttpSourceMemory::ShortForLog(path),
++              XFILE::CHttpSourceMemory::ShortForLog(probe.m_target),
++              probe.m_mimeType.empty() ? "no type" : probe.m_mimeType, ms);
++    return;
++  }
++
++  CURL target{probe.m_target};
++  target.SetProtocolOptions(CURL(path).GetProtocolOptions());
++  if (!byAddress)
++    XFILE::CHttpSourceMemory::RememberDiscImage(target.Get());
++  item.SetDynPath(target.Get());
++  if (!probe.m_mimeType.empty())
++    item.SetMimeType(probe.m_mimeType);
++  CLog::Log(
++      LOGINFO,
++      "CApplicationPlay: {} leads to a disc image, as {} says: {} ({} ms); it plays as a disc",
++      XFILE::CHttpSourceMemory::ShortForLog(path),
++      byAddress ? "the extension of the address it sends to"
++      : byType  ? fmt::format("the type its server gives it ({})", probe.m_mimeType)
++                : fmt::format("the name its server gives it ({})", probe.m_fileName),
++      XFILE::CHttpSourceMemory::ShortForLog(target.Get()), ms);
++}
+ } // namespace
+ 
+ CApplicationPlay::GatherPlaybackDetailsResult CApplicationPlay::GatherPlaybackDetails(
+@@ -432,6 +536,9 @@ CApplicationPlay::GatherPlaybackDetailsResult CApplicationPlay::GatherPlaybackDe
+   if (!ResolvePath())
+     return GatherPlaybackDetailsResult::RESULT_ERROR;
+ 
++  // Hades: a disc image behind an address that does not say so (a Debrid add-on's resolver)
++  DetectDiscImage(m_item);
++
+   if (!isStack)
+   {
+     // May be set even if restarting (eg. moving between stack parts)
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDFactoryInputStream.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDFactoryInputStream.cpp
+index a11d66b..dbe17a9 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDFactoryInputStream.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDFactoryInputStream.cpp
+@@ -28,15 +28,20 @@
+ #include "addons/addoninfo/AddonType.h"
+ #include "cores/VideoPlayer/Interface/InputStreamConstants.h"
+ #include "filesystem/CurlFile.h"
++#include "filesystem/HttpSourceMemory.h"
+ #include "filesystem/IFileTypes.h"
+ #include "storage/MediaManager.h"
++#include "utils/DiscsUtils.h"
+ #include "utils/FileUtils.h"
+ #include "utils/URIUtils.h"
++#include "utils/log.h"
+ #include "video/VideoFileItemClassify.h"
+ 
++#include <chrono>
+ #include <memory>
+ 
+ using namespace KODI;
++using namespace std::chrono_literals;
+ 
+ std::shared_ptr<CDVDInputStream> CDVDFactoryInputStream::CreateInputStream(IVideoPlayer* pPlayer, const CFileItem &fileitem, bool scanforextaudio)
+ {
+@@ -143,30 +148,71 @@ std::shared_ptr<CDVDInputStream> CDVDFactoryInputStream::CreateInputStream(IVide
+     if (finalFileitem.ContentLookup())
+     {
+       CURL origUrl(finalFileitem.GetDynURL());
+-      XFILE::CCurlFile curlFile;
+-      // try opening the url to resolve all redirects if any
+-      try
++      // Hades: where the address leads was asked a moment ago (CApplicationPlay asks an address
++      // that says nothing of what it is): not asked again, which was one more request to the
++      // add-on's resolver and one more transfer from the CDN, for a source that may allow one
++      if (const auto resolved =
++              XFILE::CHttpSourceMemory::FindByOrigin(finalFileitem.GetDynPath(), 30s);
++          resolved.has_value())
+       {
+-        if (curlFile.Open(finalFileitem.GetDynURL()))
+-        {
+-          CURL finalUrl(curlFile.GetURL());
+-          finalUrl.SetProtocolOptions(origUrl.GetProtocolOptions());
+-          finalUrl.SetUserName(origUrl.GetUserName());
+-          finalUrl.SetPassword(origUrl.GetPassWord());
+-          finalFileitem.SetDynPath(finalUrl.Get());
+-        }
+-        curlFile.Close();
++        CURL finalUrl(resolved->target);
++        finalUrl.SetProtocolOptions(origUrl.GetProtocolOptions());
++        finalUrl.SetUserName(origUrl.GetUserName());
++        finalUrl.SetPassword(origUrl.GetPassWord());
++        finalFileitem.SetDynPath(finalUrl.Get());
++        if (finalFileitem.GetMimeType().empty() && !resolved->mimeType.empty())
++          finalFileitem.SetMimeType(resolved->mimeType);
++        CLog::Log(LOGINFO,
++                  "CDVDFactoryInputStream - {} leads to {}, as it was asked a moment ago: not "
++                  "asked again",
++                  XFILE::CHttpSourceMemory::ShortForLog(origUrl.Get()),
++                  XFILE::CHttpSourceMemory::ShortForLog(resolved->target));
+       }
+-      catch (XFILE::CRedirectException *pRedirectEx)
++      else
+       {
+-        if (pRedirectEx)
++        XFILE::CCurlFile curlFile;
++        // try opening the url to resolve all redirects if any
++        try
+         {
+-          delete pRedirectEx->m_pNewFileImp;
+-          delete pRedirectEx;
++          if (curlFile.Open(finalFileitem.GetDynURL()))
++          {
++            CURL finalUrl(curlFile.GetURL());
++            finalUrl.SetProtocolOptions(origUrl.GetProtocolOptions());
++            finalUrl.SetUserName(origUrl.GetUserName());
++            finalUrl.SetPassword(origUrl.GetPassWord());
++            finalFileitem.SetDynPath(finalUrl.Get());
++            // Hades: an image that only its type says is one (XFILE::CHttpSourceMemory)
++            if (XFILE::CHttpSourceMemory::IsDiscImageMimeType(
++                    curlFile.GetHttpHeader().GetMimeType()))
++              XFILE::CHttpSourceMemory::RememberDiscImage(finalUrl.Get());
++          }
++          curlFile.Close();
++        }
++        catch (XFILE::CRedirectException* pRedirectEx)
++        {
++          if (pRedirectEx)
++          {
++            delete pRedirectEx->m_pNewFileImp;
++            delete pRedirectEx;
++          }
+         }
+       }
+     }
+ 
++    // Hades: the address led to a disc image (its extension, or its type): opened as a disc, which
++    // the file reader cannot play; normally CApplicationPlay found it before (DetectDiscImage())
++    if (finalFileitem.IsDiscImage())
++    {
++      CLog::Log(LOGINFO, "CDVDFactoryInputStream - {} leads to a disc image, {}: opened as a disc",
++                XFILE::CHttpSourceMemory::ShortForLog(fileitem.GetDynPath()),
++                XFILE::CHttpSourceMemory::ShortForLog(finalFileitem.GetDynPath()));
++#ifdef HAVE_LIBBLURAY
++      if (::UTILS::DISCS::IsBlurayDiscImage(finalFileitem))
++        return std::make_shared<CDVDInputStreamBluray>(pPlayer, finalFileitem);
++#endif
++      return std::make_shared<CDVDInputStreamNavigator>(pPlayer, finalFileitem);
++    }
++
+     if (finalFileitem.IsType(".m3u8"))
+       return std::make_shared<CDVDInputStreamFFmpeg>(finalFileitem);
+ 
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index 1d0af22..fca8347 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -1914,6 +1914,15 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
+ 
+   SetCorrectHeaders(m_state);
+ 
++  // Hades: where the address led, for the stream factory of the player, which would otherwise
++  // open the address once more to find it (CHttpSourceMemory)
++  if (url2.IsProtocol("http") || url2.IsProtocol("https"))
++  {
++    if (const std::string efurl = GetInfoString(CURLINFO_EFFECTIVE_URL);
++        !efurl.empty() && CHttpSourceMemory::Key(efurl) != CHttpSourceMemory::Key(m_url))
++      CHttpSourceMemory::RememberRedirect(m_url, efurl, m_state->m_httpheader.GetMimeType());
++  }
++
+   if (buffer)
+   {
+     *buffer = {};
+@@ -1948,6 +1957,90 @@ int CCurlFile::Stat(const CURL& url, struct __stat64* buffer)
+   return 0;
+ }
+ 
++bool CCurlFile::ProbeTarget(const CURL& url,
++                            std::string& target,
++                            std::string& mimeType,
++                            std::string& fileName)
++{
++  if (m_opened)
++    return false;
++
++  CURL url2(url);
++  ParseAndCorrectUrl(url2);
++  const std::string asked{m_url};
++
++  assert(m_state->m_easyHandle == NULL);
++  g_curlInterface.easy_acquire(url2.GetProtocol().c_str(), url2.GetHostName().c_str(),
++                               &m_state->m_easyHandle, NULL);
++
++  const long timeout =
++      CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_curlconnecttimeout;
++  SetCommonOptions(m_state);
++  SetRequestHeaders(m_state);
++  g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_TIMEOUT, timeout);
++  g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOBODY, 1);
++  CURLcode result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++
++  // A server that answers HEAD with nothing or an error (an address signed for GET only): a GET
++  // that stops at its first data, as Stat() does
++  if (result == CURLE_GOT_NOTHING || result == CURLE_HTTP_RETURNED_ERROR ||
++      result == CURLE_RECV_ERROR)
++  {
++    SetCommonOptions(m_state);
++    SetRequestHeaders(m_state);
++    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_TIMEOUT, timeout);
++    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_XFERINFOFUNCTION,
++                                transfer_abort_callback);
++    g_curlInterface.easy_setopt(m_state->m_easyHandle, CURLOPT_NOPROGRESS, 0);
++    result = PerformWithTransientRetries(m_state->m_easyHandle, url, __FUNCTION__);
++  }
++
++  const bool ok = result == CURLE_OK || result == CURLE_ABORTED_BY_CALLBACK;
++  if (ok)
++  {
++    target = GetInfoString(CURLINFO_EFFECTIVE_URL);
++    if (target.empty())
++      target = asked;
++    mimeType = m_state->m_httpheader.GetMimeType();
++    fileName = FileNameOfDisposition(m_state->m_httpheader.GetValue("content-disposition"));
++    if (CHttpSourceMemory::Key(target) != CHttpSourceMemory::Key(asked))
++      CHttpSourceMemory::RememberRedirect(asked, target, mimeType);
++  }
++  g_curlInterface.easy_release(&m_state->m_easyHandle, NULL);
++  return ok;
++}
++
++std::string CCurlFile::FileNameOfDisposition(const std::string& disposition)
++{
++  // attachment; filename="Name.iso"; filename*=UTF-8''Name%20.iso (RFC 6266: filename* first)
++  std::string lower{disposition};
++  StringUtils::ToLower(lower);
++  if (const size_t ext = lower.find("filename*="); ext != std::string::npos)
++  {
++    std::string value = disposition.substr(ext + 10);
++    if (const size_t end = value.find(';'); end != std::string::npos)
++      value.erase(end);
++    if (const size_t quotes = value.find("''"); quotes != std::string::npos)
++      value.erase(0, quotes + 2);
++    StringUtils::Trim(value);
++    return CURL::Decode(value);
++  }
++  if (const size_t plain = lower.find("filename="); plain != std::string::npos)
++  {
++    std::string value = disposition.substr(plain + 9);
++    if (!value.empty() && value[0] == '"')
++    {
++      const size_t end = value.find('"', 1);
++      return value.substr(1, end == std::string::npos ? std::string::npos : end - 1);
++    }
++    if (const size_t end = value.find(';'); end != std::string::npos)
++      value.erase(end);
++    StringUtils::Trim(value);
++    return value;
++  }
++  return {};
++}
++
+ ssize_t CCurlFile::CReadState::Read(void* lpBuf, size_t uiBufSize)
+ {
+   /* only request 1 byte, for truncated reads (only if not eof) */
+diff --git a/xbmc/filesystem/CurlFile.h b/xbmc/filesystem/CurlFile.h
+index e0dd46c..d10e828 100644
+--- a/xbmc/filesystem/CurlFile.h
++++ b/xbmc/filesystem/CurlFile.h
+@@ -87,6 +87,23 @@ namespace XFILE
+       const std::string& GetURL() const { return m_url; }
+       std::string GetRedirectURL();
+ 
++      /*!
++       * \brief Hades: where an address leads and what the server says it is, asked once: a HEAD,
++       *        or a GET that stops at its first data where HEAD is refused, the redirects
++       *        followed (as Stat() asks). A redirect is remembered (CHttpSourceMemory).
++       * \param[out] target the address it ended at
++       * \param[out] mimeType the type the server gave the file there
++       * \param[out] fileName the name its Content-Disposition gives the file, if any
++       * \return false if the server could not be asked or answered with an error
++       */
++      bool ProbeTarget(const CURL& url,
++                       std::string& target,
++                       std::string& mimeType,
++                       std::string& fileName);
++
++      //! Hades: the file name of a Content-Disposition header ("" if it names none)
++      static std::string FileNameOfDisposition(const std::string& disposition);
++
+       /* static function that will get content type of a file */
+       static bool GetHttpHeader(const CURL &url, CHttpHeader &headers);
+       static bool GetMimeType(const CURL &url, std::string &content, const std::string &useragent="");
+diff --git a/xbmc/utils/URIUtils.cpp b/xbmc/utils/URIUtils.cpp
+index 4d62c78..eea5dcd 100644
+--- a/xbmc/utils/URIUtils.cpp
++++ b/xbmc/utils/URIUtils.cpp
+@@ -16,6 +16,7 @@
+ #include "Util.h"
+ #ifdef HAVE_LIBBLURAY
+ #include "filesystem/BlurayDirectory.h"
++#include "filesystem/HttpSourceMemory.h"
+ #endif
+ #include "filesystem/MultiPathDirectory.h"
+ #include "filesystem/SpecialProtocol.h"
+@@ -1248,7 +1249,10 @@ bool URIUtils::IsDiscImage(const std::string& file)
+   if (IsContainerPath(file))
+     return false;
+ 
+-  return HasExtension(file, ".img|.iso|.nrg|.udf");
++  // Hades: or an address that only the type its server gave the file says is a disc image
++  // (XFILE::CHttpSourceMemory)
++  return HasExtension(file, ".img|.iso|.nrg|.udf") ||
++         XFILE::CHttpSourceMemory::IsKnownDiscImage(file);
+ }
+ 
+ bool URIUtils::IsDiscImageStack(const std::string& file)
+-- 
+2.53.0
+

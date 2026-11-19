@@ -1,0 +1,531 @@
+From 431a01e68f665f1aaeea9d76176a699c17e8d459 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:30:33 +0000
+Subject: [PATCH] ActiveAE: a device change event over the bound of a second is
+ acted on later, not dropped
+
+ActiveAE acts on a device change event by closing its output, listing the
+outputs again and opening it again, three times within a second at most:
+any more were dropped ("received N device change events within one
+second") and never acted on later, so the outputs stayed as the last
+listing found them until another event came. A mode set of the display
+brings two events (the ELD of the TV goes, and comes back), two mode sets
+within a second bring four, and the one dropped can be the one with which
+the TV's audio data came back: an HDMI output listed without the TV's name
+and with the channels and formats of no display. The second was also one
+of the wall clock (time_t), which a step of the clock back kept full for
+as long as the step, every event dropped meanwhile.
+
+CDeviceChangePace (ActiveAEDeviceChangePace.h) keeps the bound, over any
+second of the steady clock, and keeps an event over it: the outputs are
+listed again once, for every event kept, when the oldest listing of that
+second is a second old. A one-shot timer sends the wake-up then, as a
+device change event marked as such; an event acted on before it covers the
+ones kept, and the wake-up then does nothing, so that no listing is made
+twice for the same events and a storm of events makes no more listings than
+before. kodi.log says when an event is kept, and when the outputs are
+listed again for the ones kept.
+
+TestActiveAEDeviceChangePace.cpp runs it on the host: the fourth event
+kept and listed once, a wake-up that an event covered, a storm bounded with
+its last event listed, and no event of a run left without a listing after
+it.
+---
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.cpp |  69 ++++--
+ .../AudioEngine/Engines/ActiveAE/ActiveAE.h   |  13 +-
+ .../ActiveAE/ActiveAEDeviceChangePace.h       | 103 +++++++++
+ .../AudioEngine/Sinks/test/CMakeLists.txt     |   1 +
+ .../test/TestActiveAEDeviceChangePace.cpp     | 212 ++++++++++++++++++
+ 5 files changed, 382 insertions(+), 16 deletions(-)
+ create mode 100644 xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEDeviceChangePace.h
+ create mode 100644 xbmc/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChangePace.cpp
+
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+index a91f0c9..a5c9f88 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp
+@@ -65,6 +65,10 @@ constexpr std::chrono::milliseconds RAW_SILENCE_WAIT_MAX{500};
+ // 6.2 s (NVIDIA, leaving native Dolby Vision for a mode on FRL).
+ constexpr std::chrono::milliseconds DISPLAY_LOST_RETRY{10000};
+ 
++// Hades: the mark of the device change event that a wake-up for the events kept sends
++// (CActiveAE::DeviceChangeWakeUp()); the others carry no data
++constexpr uint8_t DEVICE_CHANGE_WAKE_UP = 1;
++
+ // Hades: whether the samples of a GUI sound, as it was converted, are those of a packet: the same
+ // sample format, number of channels and of planes (CActiveAE::MixSounds())
+ bool SoundFitsPacket(const CSoundPacket* sound, const CSoundPacket& packet)
+@@ -387,6 +391,8 @@ void CActiveAE::Dispose()
+     m_isWinSysReg = false;
+   }
+ 
++  // (Hades: no wake-up of the device change events kept comes after this)
++  m_extDeviceChangeTimer.Stop(true);
+   m_bStop = true;
+   m_outMsgEvent.Set();
+   StopThread();
+@@ -836,24 +842,29 @@ void CActiveAE::StateMachine(int signal, Protocol *port, Message *msg)
+           return;
+         case CActiveAEControlProtocol::DEVICECHANGE:
+         {
+-          time_t now;
+-          time(&now);
+-          // Hades: told without debug logging, with how long the output was closed (a cut in the
+-          // sound of whatever plays)
++          // Hades: Kodi's bound of three listings of the outputs within a second, with an event
++          // over it kept and acted on once when the bound allows, not dropped for good
++          // (CDeviceChangePace); the wake-up for that comes back here, marked
+           const auto changeStart = std::chrono::steady_clock::now();
+-          CLog::Log(LOGINFO, "CActiveAE - device change event: the output is closed, the outputs "
+-                             "are listed again and it is opened again");
+-          while (!m_extLastDeviceChange.empty() && (now - m_extLastDeviceChange.front() > 0))
++          const bool wakeUp = msg->data && msg->data[0] == DEVICE_CHANGE_WAKE_UP;
++          switch (m_extDeviceChangePace.Event(changeStart, wakeUp))
+           {
+-            m_extLastDeviceChange.pop();
+-          }
+-          if (m_extLastDeviceChange.size() > 2)
+-          {
+-            CLog::Log(LOGWARNING, "CActiveAE - received {} device change events within one second",
+-                      m_extLastDeviceChange.size());
+-            return;
++            case INTERNAL::CDeviceChangePace::Action::NOTHING:
++            case INTERNAL::CDeviceChangePace::Action::KEEP:
++              return;
++            case INTERNAL::CDeviceChangePace::Action::KEEP_FIRST:
++              if (KeepDeviceChangeForLater(changeStart))
++                return;
++              break;
++            case INTERNAL::CDeviceChangePace::Action::ACT:
++              break;
+           }
+-          m_extLastDeviceChange.push(now);
++          // Hades: told without debug logging, with how long the output was closed (a cut in the
++          // sound of whatever plays)
++          CLog::Log(LOGINFO,
++                    "CActiveAE - device change event{}: the output is closed, the outputs are "
++                    "listed again and it is opened again",
++                    wakeUp ? " (for the events kept over the bound of a second)" : "");
+           UnconfigureSink();
+           m_controlPort.PurgeOut(CActiveAEControlProtocol::DEVICECHANGE);
+           m_sink.EnumerateSinkList(true, "");
+@@ -4933,6 +4944,34 @@ void CActiveAE::DeviceChange()
+   m_controlPort.SendOutMessage(CActiveAEControlProtocol::DEVICECHANGE);
+ }
+ 
++void CActiveAE::DeviceChangeWakeUp()
++{
++  // (on the thread of the timer: a message, as DeviceChange() sends)
++  m_controlPort.SendOutMessage(CActiveAEControlProtocol::DEVICECHANGE, &DEVICE_CHANGE_WAKE_UP,
++                               sizeof(DEVICE_CHANGE_WAKE_UP));
++}
++
++bool CActiveAE::KeepDeviceChangeForLater(std::chrono::steady_clock::time_point now)
++{
++  const auto wait =
++      INTERNAL::CDeviceChangePace::Wait(m_extDeviceChangePace.Due().value_or(now), now);
++  // (one wake-up at a time: one set before, for events that a listing covered since, goes)
++  m_extDeviceChangeTimer.Stop(true);
++  if (!m_extDeviceChangeTimer.Start(wait))
++  {
++    CLog::Log(LOGERROR, "CActiveAE - a device change event over the bound of a second: no "
++                        "wake-up could be set for it, so it is acted on now");
++    m_extDeviceChangePace.Covered();
++    return false;
++  }
++  CLog::Log(LOGINFO,
++            "CActiveAE - a device change event after {} listings of the outputs within a "
++            "second: kept, and the outputs are listed again in {} ms, once for every event "
++            "until then",
++            INTERNAL::CDeviceChangePace::MOST, wait.count());
++  return true;
++}
++
+ void CActiveAE::DefaultDeviceChange()
+ {
+   m_controlPort.SendOutMessage(CActiveAEControlProtocol::DEFAULTDEVICECHANGE);
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+index 6c4dfb9..d0e1d3d 100644
+--- a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "ActiveAEDeviceChangePace.h"
+ #include "ActiveAESink.h"
+ #include "cores/AudioEngine/Engines/ActiveAE/ActiveAEBuffer.h"
+ #include "cores/AudioEngine/Interfaces/AESound.h"
+@@ -16,6 +17,7 @@
+ #include "guilib/DispResource.h"
+ #include "threads/SystemClock.h"
+ #include "threads/Thread.h"
++#include "threads/Timer.h"
+ 
+ #include <atomic>
+ #include <list>
+@@ -398,6 +400,12 @@ protected:
+   //! Hades: whether the encoder of this format opens for 5.1 at 48 kHz (once for each format)
+   bool EncoderOpens(CAEStreamInfo::DataType type);
+   void HandleDeviceCountChange(const std::string& driver, bool defaultDeviceChanged);
++  //! Hades: a device change event over the bound of a second is kept: a wake-up for the time
++  //! when the outputs are listed again for it (CDeviceChangePace); false where none could be set
++  //! (it is acted on now then)
++  bool KeepDeviceChangeForLater(std::chrono::steady_clock::time_point now);
++  //! Hades: the wake-up of the device change events kept: a device change event of its own
++  void DeviceChangeWakeUp();
+   bool NeedReconfigureBuffers();
+   bool NeedReconfigureSink();
+   void ApplySettingsToFormat(AEAudioFormat& format,
+@@ -512,7 +520,10 @@ protected:
+   XbmcThreads::EndTime<> m_extDrainTimer;
+   std::chrono::milliseconds m_extKeepConfig;
+   bool m_extDeferData;
+-  std::queue<time_t> m_extLastDeviceChange;
++  //! Hades: the device change events acted on within the last second, and those kept to act on
++  //! once when the bound allows (ActiveAEDeviceChangePace.h), with the wake-up for them
++  INTERNAL::CDeviceChangePace m_extDeviceChangePace;
++  CTimer m_extDeviceChangeTimer{[this] { DeviceChangeWakeUp(); }};
+   bool m_extSuspended = false;
+   bool m_isWinSysReg = false;
+ 
+diff --git a/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEDeviceChangePace.h b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEDeviceChangePace.h
+new file mode 100644
+index 0000000..b23a1d6
+--- /dev/null
++++ b/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAEDeviceChangePace.h
+@@ -0,0 +1,103 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++#include <cstddef>
++#include <deque>
++#include <optional>
++
++/*!
++ * Hades: the device change events that ActiveAE acts on now, and those it keeps to act on once,
++ * a little later, so that none is lost.
++ *
++ * A device change event (DEVICECHANGE: the ELD controls of ALSA and its cards, PipeWire, X11's
++ * RandR) closes the output, lists the outputs again and opens it again. Kodi acted on three within
++ * a second of the wall clock and dropped any more, never acting on them later ("received N device
++ * change events within one second"): the outputs stayed as the last listing found them until
++ * another event came. A mode set of the display brings two (the ELD of the TV goes, and comes back),
++ * two mode sets within a second bring four, and the one dropped can be the one with which the TV's
++ * audio data came back: an HDMI output listed without the TV's name ("HDMI #0") and with the
++ * channels and formats of no display. And the second of the wall clock stayed full for as long as a
++ * step of the clock back lasted (the clock set at boot), dropping every event meanwhile.
++ *
++ * CDeviceChangePace keeps Kodi's bound (MOST listings within any WINDOW, of the steady clock) and
++ * keeps an event over it: the outputs are listed again once, for every event kept, when the bound
++ * allows (Due(): the oldest listing of the window is WINDOW old). ActiveAE sets a wake-up for that
++ * time with the first event kept (KEEP_FIRST), which comes back as a device change event of its
++ * own. An event acted on before then covers what was kept: the wake-up then does nothing (NOTHING),
++ * so that no listing is made twice for the same events.
++ *
++ * Nothing of ActiveAE is here: a test runs it on the host (TestActiveAEDeviceChangePace.cpp).
++ */
++namespace ActiveAE::INTERNAL
++{
++
++class CDeviceChangePace
++{
++public:
++  using Clock = std::chrono::steady_clock;
++  //! the listings made within WINDOW at most (Kodi's bound)
++  static constexpr size_t MOST = 3;
++  static constexpr Clock::duration WINDOW = std::chrono::seconds(1);
++
++  enum class Action
++  {
++    ACT, //!< list the outputs again now (this covers what was kept before)
++    KEEP_FIRST, //!< kept: the outputs are listed again at Due(), for which a wake-up is set now
++    KEEP, //!< kept: the wake-up that is set covers it
++    NOTHING, //!< a wake-up whose events a listing made meanwhile has covered
++  };
++
++  /*!
++   * \brief A device change event at now
++   * \param wakeUp the event is the wake-up that a KEEP_FIRST set
++   */
++  Action Event(Clock::time_point now, bool wakeUp = false)
++  {
++    while (!m_acted.empty() && now - m_acted.front() >= WINDOW)
++      m_acted.pop_front();
++    if (wakeUp && !m_due)
++      return Action::NOTHING;
++    if (m_acted.size() >= MOST)
++    {
++      // (a time kept from before is in the window still: no listing came since, so its wake-up is
++      // set; once that time passes, the oldest listing has left the window and an event is acted
++      // on, also where its wake-up went to a state that listed the outputs its own way)
++      const bool first = !m_due;
++      m_due = m_acted.front() + WINDOW;
++      return first ? Action::KEEP_FIRST : Action::KEEP;
++    }
++    m_acted.push_back(now);
++    m_due.reset();
++    return Action::ACT;
++  }
++
++  //! When the outputs are listed again for the events kept, while some are
++  std::optional<Clock::time_point> Due() const { return m_due; }
++
++  //! The outputs are listed now outside the bound (no wake-up could be set): nothing is kept
++  void Covered() { m_due.reset(); }
++
++  //! How long a wake-up for due waits from now: whole milliseconds, never less than one
++  static std::chrono::milliseconds Wait(Clock::time_point due, Clock::time_point now)
++  {
++    if (due <= now)
++      return std::chrono::milliseconds(1);
++    return std::max(std::chrono::milliseconds(1),
++                    std::chrono::ceil<std::chrono::milliseconds>(due - now));
++  }
++
++private:
++  std::deque<Clock::time_point> m_acted; //!< the listings made, within WINDOW
++  std::optional<Clock::time_point> m_due;
++};
++
++} // namespace ActiveAE::INTERNAL
+diff --git a/xbmc/cores/AudioEngine/Sinks/test/CMakeLists.txt b/xbmc/cores/AudioEngine/Sinks/test/CMakeLists.txt
+index e85a3a3..9a070e9 100644
+--- a/xbmc/cores/AudioEngine/Sinks/test/CMakeLists.txt
++++ b/xbmc/cores/AudioEngine/Sinks/test/CMakeLists.txt
+@@ -1,4 +1,5 @@
+ set(SOURCES TestActiveAEDeviceChange.cpp
++            TestActiveAEDeviceChangePace.cpp
+             TestActiveAEErrorRetry.cpp
+             TestActiveAEFollowDisplay.cpp
+             TestActiveAEKeptOutputs.cpp)
+diff --git a/xbmc/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChangePace.cpp b/xbmc/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChangePace.cpp
+new file mode 100644
+index 0000000..2dc9423
+--- /dev/null
++++ b/xbmc/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChangePace.cpp
+@@ -0,0 +1,212 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "cores/AudioEngine/Engines/ActiveAE/ActiveAEDeviceChangePace.h"
++
++#include <algorithm>
++#include <chrono>
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++using namespace ActiveAE::INTERNAL;
++using namespace std::chrono_literals;
++using Action = CDeviceChangePace::Action;
++using Clock = CDeviceChangePace::Clock;
++
++namespace
++{
++const Clock::time_point T0 = Clock::time_point() + 1000s;
++
++/*!
++ * The engine as AE_TOP_CONFIGURED drives the pace: every event, and the wake-up that a kept one
++ * sets, which comes back as an event of its own at its time (m_extDeviceChangeTimer)
++ */
++struct Engine
++{
++  CDeviceChangePace pace;
++  std::optional<Clock::time_point> wakeUp;
++  std::vector<Clock::time_point> listings; //!< when the outputs were listed again
++
++  void Event(Clock::time_point now, bool isWakeUp = false)
++  {
++    switch (pace.Event(now, isWakeUp))
++    {
++      case Action::ACT:
++        listings.push_back(now);
++        break;
++      case Action::KEEP_FIRST:
++        ASSERT_TRUE(pace.Due());
++        // (the timer of CTimer calls back once its wait has passed)
++        wakeUp = now + CDeviceChangePace::Wait(*pace.Due(), now);
++        break;
++      case Action::KEEP:
++      case Action::NOTHING:
++        break;
++    }
++  }
++
++  //! the events of a run, in order, with the wake-ups that come between them
++  void Run(const std::vector<Clock::time_point>& events, Clock::time_point end)
++  {
++    for (const auto at : events)
++    {
++      DueWakeUps(at);
++      Event(at);
++    }
++    DueWakeUps(end);
++  }
++
++  void DueWakeUps(Clock::time_point until)
++  {
++    while (wakeUp && *wakeUp <= until)
++    {
++      const auto at = *std::exchange(wakeUp, std::nullopt);
++      Event(at, true);
++    }
++  }
++};
++} // namespace
++
++TEST(TestActiveAEDeviceChangePace, ActsOnThreeEventsWithinASecond)
++{
++  CDeviceChangePace pace;
++  EXPECT_EQ(pace.Event(T0), Action::ACT);
++  EXPECT_EQ(pace.Event(T0 + 100ms), Action::ACT);
++  EXPECT_EQ(pace.Event(T0 + 200ms), Action::ACT);
++  EXPECT_FALSE(pace.Due());
++}
++
++// Kodi dropped the fourth for good
++TEST(TestActiveAEDeviceChangePace, KeepsTheFourthAndListsOnceWhenTheBoundAllows)
++{
++  CDeviceChangePace pace;
++  pace.Event(T0);
++  pace.Event(T0 + 100ms);
++  pace.Event(T0 + 200ms);
++  EXPECT_EQ(pace.Event(T0 + 300ms), Action::KEEP_FIRST);
++  ASSERT_TRUE(pace.Due());
++  EXPECT_EQ(*pace.Due(), T0 + 1s);
++  EXPECT_EQ(pace.Event(T0 + 400ms), Action::KEEP);
++  EXPECT_EQ(pace.Event(T0 + 900ms), Action::KEEP);
++  // the wake-up: one listing for the three kept
++  EXPECT_EQ(pace.Event(T0 + 1s, true), Action::ACT);
++  EXPECT_FALSE(pace.Due());
++  // and a wake-up that comes again finds nothing kept
++  EXPECT_EQ(pace.Event(T0 + 1s + 1ms, true), Action::NOTHING);
++}
++
++TEST(TestActiveAEDeviceChangePace, AnEventActedOnBeforeTheWakeUpCoversTheKeptOnes)
++{
++  CDeviceChangePace pace;
++  pace.Event(T0);
++  pace.Event(T0 + 600ms);
++  pace.Event(T0 + 700ms);
++  EXPECT_EQ(pace.Event(T0 + 800ms), Action::KEEP_FIRST);
++  EXPECT_EQ(*pace.Due(), T0 + 1s);
++  // an event after the oldest left the window, before the wake-up came
++  EXPECT_EQ(pace.Event(T0 + 1s + 1ms), Action::ACT);
++  EXPECT_FALSE(pace.Due());
++  EXPECT_EQ(pace.Event(T0 + 1s + 5ms, true), Action::NOTHING);
++}
++
++TEST(TestActiveAEDeviceChangePace, EventsASecondApartAreAllActedOn)
++{
++  CDeviceChangePace pace;
++  for (int i = 0; i < 20; ++i)
++    EXPECT_EQ(pace.Event(T0 + i * 1s), Action::ACT);
++}
++
++// A storm of events (every 10 ms for 5 s): never more than three listings within a second, and the
++// last event is always listed, at most a second after it
++TEST(TestActiveAEDeviceChangePace, AStormIsBoundedAndItsLastEventIsListed)
++{
++  Engine engine;
++  std::vector<Clock::time_point> events;
++  for (int i = 0; i < 500; ++i)
++    events.push_back(T0 + i * 10ms);
++  engine.Run(events, T0 + 60s);
++  ASSERT_FALSE(engine.listings.empty());
++  for (size_t i = 0; i + CDeviceChangePace::MOST < engine.listings.size(); ++i)
++    EXPECT_GE(engine.listings[i + CDeviceChangePace::MOST] - engine.listings[i],
++              CDeviceChangePace::WINDOW)
++        << "listing " << i;
++  EXPECT_GE(engine.listings.back(), events.back());
++  EXPECT_LE(engine.listings.back() - events.back(), CDeviceChangePace::WINDOW);
++  // (the bound: three in the first second, then the wake-ups)
++  EXPECT_LE(engine.listings.size(), 5u * CDeviceChangePace::MOST + 1);
++}
++
++// Whatever the run, every event is followed by a listing: none is lost
++TEST(TestActiveAEDeviceChangePace, NoEventIsLeftWithoutAListingAfterIt)
++{
++  const std::vector<std::vector<int>> runs = {
++      {0, 1, 2, 3},
++      {0, 100, 200, 300, 400, 1500},
++      {0, 999, 1000, 1001, 1002, 1003, 2500, 2501, 2502, 2503},
++      {0, 5, 10, 15, 20, 25, 30, 990, 995, 1999, 2000, 2001, 2002},
++      {0, 300, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700},
++  };
++  for (const auto& run : runs)
++  {
++    Engine engine;
++    std::vector<Clock::time_point> events;
++    for (const int ms : run)
++      events.push_back(T0 + ms * 1ms);
++    engine.Run(events, T0 + 60s);
++    ASSERT_FALSE(engine.listings.empty());
++    for (const auto at : events)
++      EXPECT_TRUE(std::any_of(engine.listings.begin(), engine.listings.end(),
++                              [at](Clock::time_point listing) { return listing >= at; }));
++    for (size_t i = 0; i + CDeviceChangePace::MOST < engine.listings.size(); ++i)
++      EXPECT_GE(engine.listings[i + CDeviceChangePace::MOST] - engine.listings[i],
++                CDeviceChangePace::WINDOW);
++  }
++}
++
++// A wake-up that went to a state that lists the outputs its own way (the display being reset, an
++// error) left its time behind: the next event over the bound sets a wake-up of its own
++TEST(TestActiveAEDeviceChangePace, AWakeUpThatWentElsewhereDoesNotStopTheNext)
++{
++  CDeviceChangePace pace;
++  pace.Event(T0);
++  pace.Event(T0 + 10ms);
++  pace.Event(T0 + 20ms);
++  EXPECT_EQ(pace.Event(T0 + 30ms), Action::KEEP_FIRST);
++  // (its wake-up came while suspended: not seen here)
++  pace.Event(T0 + 5s);
++  pace.Event(T0 + 5s + 10ms);
++  // the first of this burst was acted on: nothing is kept
++  EXPECT_FALSE(pace.Due());
++  pace.Event(T0 + 5s + 20ms);
++  EXPECT_EQ(pace.Event(T0 + 5s + 30ms), Action::KEEP_FIRST);
++}
++
++TEST(TestActiveAEDeviceChangePace, KeptEventsListedAnotherWayLeaveNothingDue)
++{
++  CDeviceChangePace pace;
++  pace.Event(T0);
++  pace.Event(T0 + 10ms);
++  pace.Event(T0 + 20ms);
++  EXPECT_EQ(pace.Event(T0 + 30ms), Action::KEEP_FIRST);
++  pace.Covered();
++  EXPECT_FALSE(pace.Due());
++  EXPECT_EQ(pace.Event(T0 + 40ms, true), Action::NOTHING);
++  // (the bound still holds: the next one is kept, and sets a wake-up of its own)
++  EXPECT_EQ(pace.Event(T0 + 50ms), Action::KEEP_FIRST);
++}
++
++TEST(TestActiveAEDeviceChangePace, TheWaitIsInWholeMillisecondsAndNeverNone)
++{
++  EXPECT_EQ(CDeviceChangePace::Wait(T0 + 1500us, T0), 2ms);
++  EXPECT_EQ(CDeviceChangePace::Wait(T0 + 1s, T0), 1000ms);
++  EXPECT_EQ(CDeviceChangePace::Wait(T0, T0), 1ms);
++  EXPECT_EQ(CDeviceChangePace::Wait(T0, T0 + 1s), 1ms);
++}
+-- 
+2.53.0
+

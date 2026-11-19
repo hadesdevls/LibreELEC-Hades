@@ -706,10 +706,11 @@ namespace Hades.Installer
                 }
                 if (runStart >= 0) mine.Add(Make(systemStart + image.ClusterAt(runStart), Join(run)));
 
-                // nothing that another change of the update changes
+                // nothing that another change of the update changes (but the FAT and the root directory of a change that was made
+                // in the new partition first: the free clusters, the free entries, were taken from the partition with it)
                 foreach (Patch p in mine)
                     foreach (Patch o in others)
-                        if (p.Offset < o.Offset + o.Bytes.Length && o.Offset < p.Offset + p.Bytes.Length)
+                        if (!o.Layered && p.Offset < o.Offset + o.Bytes.Length && o.Offset < p.Offset + p.Bytes.Length)
                             return keep.Fail(DiagKeep.Outcome.NotKept, DiagKeep.Cause.Failed, "it would change what another change of the update changes");
 
                 // what the patches make, read back as it would be read on the disk

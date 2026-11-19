@@ -30,7 +30,9 @@ namespace Hades.Installer
         const string HadesLabel = "LIBREELEC";
 
         // Tests only: a virtual disk (a .vhd attached to Windows) counts as an internal one.
+#pragma warning disable 649 // (set only by the tests, which the published program does not carry: there it stays false)
         public static bool AllowVirtual;
+#pragma warning restore 649
 
         public static List<DiskInfo> List()
         {
@@ -232,7 +234,7 @@ namespace Hades.Installer
                 if (!d.Removable) return L.T("it is not connected by USB (", "no está conectado por USB (") + d.BusName + ")";
             }
             else if (!(d.Fixed || (AllowVirtual && d.Virtual)))
-                return d.Removable ? L.T("it is connected by USB: choose “On a USB drive”", "está conectado por USB: elige «Unidad USB»")
+                return d.Removable ? L.T("it is connected by USB: choose \"On a USB drive\"", "está conectado por USB: elige «Unidad USB»")
                                    : L.T("it is not an internal disk of a kind that this program knows (",
                                          "no es un disco interno que este programa conozca (") + d.BusName + ")";
             if (d.IsReadOnly) return L.T("it is write-protected", "está protegido contra escritura");
@@ -269,18 +271,18 @@ namespace Hades.Installer
                     return L.T("Plug in a USB stick or a USB disk. The list updates by itself.",
                                "Conecta una memoria o un disco USB. La lista se actualiza sola.");
                 return there == 1
-                    ? L.T("The USB drive that is plugged in cannot be used here: “Don't see your drive?” says why.",
+                    ? L.T("The USB drive that is plugged in cannot be used here: \"Don't see your drive?\" says why.",
                           "La unidad USB conectada no se puede usar aquí: «¿No aparece tu unidad?» dice por qué.")
-                    : L.T("None of the " + there + " USB drives plugged in can be used here: “Don't see your drive?” says why.",
+                    : L.T("None of the " + there + " USB drives plugged in can be used here: \"Don't see your drive?\" says why.",
                           "Ninguna de las " + there + " unidades USB conectadas se puede usar aquí: «¿No aparece tu unidad?» dice por qué.");
             }
             if (there == 0)
                 return L.T("This PC has no internal disk other than the Windows one.",
                            "Este PC no tiene ningún disco interno que no sea el de Windows.");
             return there == 1
-                ? L.T("This PC has one more internal disk, but it is not offered: “Don't see your disk?” says why.",
+                ? L.T("This PC has one more internal disk, but it is not offered: \"Don't see your disk?\" says why.",
                       "Este PC tiene otro disco interno, pero no se ofrece: «¿No aparece tu disco?» dice por qué.")
-                : L.T("This PC has " + there + " more internal disks, but none of them is offered: “Don't see your disk?” says why.",
+                : L.T("This PC has " + there + " more internal disks, but none of them is offered: \"Don't see your disk?\" says why.",
                       "Este PC tiene otros " + there + " discos internos, pero ninguno se ofrece: «¿No aparece tu disco?» dice por qué.");
         }
 
@@ -337,12 +339,17 @@ namespace Hades.Installer
             catch (Exception e) { Log.Line("refresh: " + e.Message); }
         }
 
-        public static void InitializeGpt(int number)
+        public static void InitializeGpt(int number) { Initialize(number, 2); }
+
+        // (as Windows formats a removable drive: an MBR partition table, which an old TV reads too)
+        public static void InitializeMbr(int number) { Initialize(number, 1); }
+
+        static void Initialize(int number, ushort style)
         {
             using (ManagementObject d = FindDisk(number))
             {
                 ManagementBaseObject p = d.GetMethodParameters("Initialize");
-                p["PartitionStyle"] = (ushort)2;
+                p["PartitionStyle"] = style;
                 Check(d.InvokeMethod("Initialize", p, null), L.T("prepare the disk", "preparar el disco"));
             }
         }
@@ -407,15 +414,18 @@ namespace Hades.Installer
             }
         }
 
-        // One NTFS volume over the whole disk, with a drive letter: a disk that Windows can use again.
-        public static char MakeDataVolume(int disk, string label)
+        // One volume over the whole disk, with a drive letter: a disk that Windows can use again. NTFS, or exFAT for a USB
+        // drive (which TVs and other computers read too). mbr: the disk has an MBR partition table (InitializeMbr), where
+        // the partition is of the kind that NTFS and exFAT have (7) and has no GPT type.
+        public static char MakeDataVolume(int disk, string label, string fileSystem = "NTFS", bool mbr = false)
         {
             using (ManagementObject d = FindDisk(disk))
             {
                 ManagementBaseObject a = d.GetMethodParameters("CreatePartition");
                 a["UseMaximumSize"] = true;
                 a["AssignDriveLetter"] = true;
-                a["GptType"] = BasicType;
+                if (mbr) a["MbrType"] = (ushort)7;
+                else a["GptType"] = BasicType;
                 Check(d.InvokeMethod("CreatePartition", a, null), L.T("create the data partition", "crear la partición de datos"));
             }
             System.Threading.Thread.Sleep(1500);
@@ -424,13 +434,13 @@ namespace Hades.Installer
                 if (d.Number != disk) continue;
                 foreach (PartitionInfo p in d.Partitions)
                 {
-                    if (p.Letter == '\0' || p.GptType != BasicType) continue;
+                    if (p.Letter == '\0' || (mbr ? p.GptType.Length != 0 : p.GptType != BasicType)) continue;
                     using (ManagementObject part = FindPartition(disk, p.Number))
                     {
                         foreach (ManagementObject volume in part.GetRelated("MSFT_Volume"))
                         {
                             ManagementBaseObject f = volume.GetMethodParameters("Format");
-                            f["FileSystem"] = "NTFS";
+                            f["FileSystem"] = fileSystem;
                             f["FileSystemLabel"] = label;
                             f["Full"] = false;
                             f["Force"] = true;
@@ -556,6 +566,7 @@ namespace Hades.Installer
             return true;
         }
 
+#if HADES_TESTS
         // Tests only: a drive letter for a partition that has none.
         public static void AddLetter(int disk, int partition, char letter)
         {
@@ -565,6 +576,47 @@ namespace Hades.Installer
                 a["AccessPath"] = letter + ":";
                 Check(p.InvokeMethod("AddAccessPath", a, null), "give the partition a drive letter");
             }
+        }
+#endif
+
+        // --list: how the disks of this PC are classified, into a text file, in English, for whoever works on the program. Nothing
+        // is read from the disks but what Windows says of them, and nothing is written but that file. image: the path of an image,
+        // as if it had been chosen in the window (it is not opened).
+        public static int ListToFile(string file, string image)
+        {
+            L.Spanish = false;
+            using (var w = new StreamWriter(file, false, new UTF8Encoding(false)))
+            {
+                Keep keep = Keeping(image);
+                List<string> guarded = Protected();
+                w.WriteLine("UEFI: " + Native.Uefi + "; Secure Boot: " + Pc.SecureBoot + "; administrator: " + Pc.Elevated +
+                            "; letters that are not touched: " + new string(keep.Letters.ToArray()) + "; protected disks: " + guarded.Count);
+                w.WriteLine("Windows (" + keep.Windows + ":) is on disk " + string.Join(", ", keep.WindowsDisks) +
+                            "; what is kept is, by where its volumes are, on:");
+                var told = new List<string>();
+                foreach (Extent e in keep.Extents)
+                {
+                    string line = "   disk " + e.Disk + " at " + e.Offset + ", " + e.Length + " bytes";
+                    if (!told.Contains(line)) { told.Add(line); w.WriteLine(line); }
+                }
+                foreach (string path in new[] { Application.ExecutablePath, image })
+                {
+                    if (path == null) continue;
+                    var on = new List<string>();
+                    foreach (Extent e in Native.Extents(path)) on.Add("disk " + e.Disk + " at " + e.Offset);
+                    w.WriteLine("   " + path + ": " + (on.Count > 0 ? string.Join(", ", on) : "NOT KNOWN (only its letter counts)"));
+                }
+                foreach (DiskInfo d in List())
+                {
+                    w.WriteLine("disk " + d.Number + ": " + d.Title + "; " + d.Detail + "; partitions " + d.Partitions.Count +
+                                "; style " + d.PartitionStyle);
+                    w.WriteLine("   USB: " + (d.Size <= 0 ? "no medium" : Classify(d, Place.Usb, 1L << 30, keep, guarded) ?? "OFFERED"));
+                    string inside = d.Size <= 0 ? "no medium" : Classify(d, Place.Internal, 1L << 30, keep, guarded);
+                    string whole = Refusal(d, Place.Internal, 1L << 30, keep, guarded, true);
+                    w.WriteLine("   internal: " + (inside ?? (whole == null ? "OFFERED" : "OFFERED TO MAKE ROOM ONLY (not whole: " + whole + ")")));
+                }
+            }
+            return 0;
         }
     }
 
@@ -687,6 +739,7 @@ namespace Hades.Installer
             return Open(@"\\.\PhysicalDrive" + number, write);
         }
 
+#if HADES_TESTS
         // A folder, held open as a program that shows or serves its files holds it. (For the tests.)
         public static SafeFileHandle OpenFolder(string path)
         {
@@ -695,6 +748,7 @@ namespace Hades.Installer
             if (folder.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
             return folder;
         }
+#endif
 
         // One partition, locked and with no file system mounted on it, so that it can be written whole.
         // It is opened by its number, so Windows is asked where the partition behind the handle starts

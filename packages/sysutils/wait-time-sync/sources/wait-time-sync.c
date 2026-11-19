@@ -12,7 +12,8 @@
 #define POLL_FREQ 10
 
 /* Hades: flag files created by the NTP clients once they have synchronized the
- * clock. When the RTC runs in local time (/etc/adjtime says LOCAL) they keep the
+ * clock. When the RTC runs in local time (/etc/adjtime says LOCAL), or is read as
+ * UTC without being written (/run/hades/rtc-never-written), they keep the
  * kernel's STA_UNSYNC set, so that it never writes the RTC, and adjtimex() keeps
  * returning TIME_ERROR. */
 static const char *const sync_flags[] = {

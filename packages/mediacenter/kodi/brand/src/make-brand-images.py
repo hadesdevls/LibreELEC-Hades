@@ -18,8 +18,10 @@
 #
 # writes four folders: kodi/ (what the recipe of Kodi installs), boot/ (the splash screen of the
 # start of the system, distributions/LibreELEC/splash), settings/ (the two pictures of the settings
-# add-on of LibreELEC that carried its logo) and notice/ (the notice that the start shows where several
-# displays are connected, packages/mediacenter/kodi/brand/notice, which kodi-display-notice draws).
+# add-on of LibreELEC that carried its logo) and notice/ (the cards of the notices that the start of Kodi
+# lays over the splash screen, packages/mediacenter/kodi/brand/notice: "one display", which
+# kodi-display-notice shows where several displays are connected, and "Kodi could not start", which
+# kodi-failed-notice shows; hades-picture draws them).
 #
 # Needs Python 3 with Pillow (FreeType) and NumPy. The light is computed in floating point and brought
 # to 8 bits with noise (dither): a soft glow on black shows bands on a good display otherwise. Where
@@ -50,9 +52,32 @@ NOTICE_EN = ("LibreELEC Hades shows on one display: normally the TV connected ov
              "The other displays turn off in a few seconds.")
 NOTICE_ES = ("LibreELEC Hades se muestra en una sola pantalla: normalmente la TV conectada por HDMI.",
              "Las demás pantallas se apagan en unos segundos.")
+# Kodi stopped at its start three times in a row (kodi-failed-notice), with the diagnostics off and on
+FAILED_EN = "LibreELEC Hades could not start its interface (Kodi), and it keeps trying."
+FAILED_ES = "LibreELEC Hades no ha podido iniciar su interfaz (Kodi), y lo sigue intentando."
+FAILED_OFF_EN = "For a report, rename DIAG-OFF.TXT to DIAG-ON.TXT on the partition LIBREELEC and start again."
+FAILED_OFF_ES = "Para un informe, cambia DIAG-OFF.TXT por DIAG-ON.TXT en la partición LIBREELEC y vuelve a arrancar."
+FAILED_ON_EN = "The diagnostics are on: they are saved in the folder hades-diag of the partition LIBREELEC."
+FAILED_ON_ES = "El diagnóstico está activado: se guarda en la carpeta hades-diag de la partición LIBREELEC."
+# where the card of a notice starts, how high it is and where the baseline of its first line is, in lines of 1080;
+# and whether it has a fifth line, for the version of the system, which the program that draws it writes
+# (hades-picture: notice/font-<height>, made here)
+CARD = (830, 190, 58, False)
+CARD_VERSION = (814, 220, 50, True)
+# the notices, by the name of their cards (notice/<name>-<height>.png)
+NOTICES = (("display", NOTICE_EN, NOTICE_ES, CARD),
+           ("failed-off", (FAILED_EN, FAILED_OFF_EN), (FAILED_ES, FAILED_OFF_ES), CARD_VERSION),
+           ("failed-on", (FAILED_EN, FAILED_ON_EN), (FAILED_ES, FAILED_ON_ES), CARD_VERSION))
+# the line of the version: its size, weight and colour (those of the Spanish lines, smaller), its distance from the
+# line above it, and the letters of the atlas (printable ASCII; another one is written as "?")
+VERSION_PX, VERSION_WEIGHT, VERSION_GAP = 17, 340, 36
+FONT_CHARS = [chr(c) for c in range(32, 127)]
+FONT_PHASES = 4
 NOTICE_TEXT = np.array([0.90, 0.92, 0.96])
 NOTICE_SOFT = np.array([0.58, 0.61, 0.67])
-PLATE = np.array([0.05, 0.055, 0.07])
+# whole steps, as the tile: a card is one flat colour where it has nothing on it (it was 0.05, 0.055 and
+# 0.07, a quarter of a step less, which the noise of to8() spread over every pixel: four times the bytes)
+PLATE = np.array([13.0, 14.0, 18.0]) / 255.0
 
 # The heights of screen that have a picture of their own for the start of the system. Another height
 # gets the one of 1080 lines, made larger or smaller by the program that draws it.
@@ -331,14 +356,19 @@ def line_mask(text, px, weight, ss=4):
     return a, base // ss
 
 
-def notice(h):
-    """The splash screen of a screen of h lines with the notice "one display" on a card under the name:
-    a picture of a screen at its left, whose corner has the point of first light, and the notice in
-    English and in Spanish. The rest is the splash screen as it is, so that only the card appears."""
+def card(h, en, es, layout):
+    """The card of a notice for the splash screen of a screen of h lines: its bottom rows, from just above
+    the card, with the card under the name: a picture of a screen at its left, whose corner has the point
+    of first light, and the notice in English (en, two lines) and in Spanish (es). The splash screen is
+    black in those rows (main() checks it), so the program that draws a notice lays the card over the
+    bottom of the splash screen of that height (hades-picture), and only the card appears. layout: CARD, or
+    CARD_VERSION for a card with a fifth line that the program writes. Returns the card, and where that line
+    goes: its left and its baseline in the rows of the card, and the right end of the text of the card."""
+    top, high, first, version = layout
     w = 2 * int(0.625 * h)
     s = h / 1080.0
     img = tall(w, h)
-    x0, y0, pw, ph = 70 * s, 830 * s, w - 140 * s, 190 * s
+    x0, y0, pw, ph = 70 * s, top * s, w - 140 * s, high * s
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64) + 0.5
     r = 22 * s
     qx = np.clip(np.abs(xx - (x0 + pw / 2)) - (pw / 2 - r), 0, None)
@@ -362,23 +392,67 @@ def notice(h):
     q = np.hypot(xx - (cx + fw / 2 - 6 * s), yy - (cy - fh / 2 + 6 * s))
     dot = np.clip(np.clip(4.5 * s - q + 0.5, 0, 1) + 0.5 * np.exp(-q / (6 * s)) * (q > 4.5 * s), 0, 1)
     img = img * (1 - dot[..., None]) + WARM[None, None, :] * dot[..., None]
-    y = y0 + 58 * s
-    lines = ((NOTICE_EN[0], 23, NOTICE_TEXT, 400), (NOTICE_EN[1], 23, NOTICE_TEXT, 400),
-             (NOTICE_ES[0], 19, NOTICE_SOFT, 340), (NOTICE_ES[1], 19, NOTICE_SOFT, 340))
+    y = y0 + first * s
+    lines = ((en[0], 23, NOTICE_TEXT, 400), (en[1], 23, NOTICE_TEXT, 400),
+             (es[0], 19, NOTICE_SOFT, 340), (es[1], 19, NOTICE_SOFT, 340))
     for i, (text, px, colour, weight) in enumerate(lines):
         ink, base = line_mask(text, px * s, weight)
         x, top = int(round(x0 + 180 * s)), int(round(y)) - base
-        if x + ink.shape[1] > x0 + pw:
-            raise SystemExit("the notice does not fit its card at %d lines" % h)
+        if x + ink.shape[1] > x0 + pw - 24 * s:
+            raise SystemExit("the notice %r does not fit its card at %d lines" % (text, h))
         part = img[top:top + ink.shape[0], x:x + ink.shape[1]]
         part[:] = part * (1 - ink[..., None]) + colour[None, None, :] * ink[..., None]
-        y += (32 if i != 1 else 44) * s
-    return to8(img)
+        if i < 3:
+            y += (32 if i != 1 else 44) * s
+    # (from two lines above the card: its round edge reaches half a pixel out of it)
+    cut = int(np.floor(y0)) - 2
+    where = None
+    if version:
+        # (where the other lines start: line_mask() sets a line two pixels into its mask)
+        where = (int(round(x0 + 180 * s)) + 2, int(round(y + VERSION_GAP * s)) - cut, x0 + pw - 24 * s, h - cut)
+    return to8(img[cut:], PLATE), where
+
+
+def font(h, where, ss=4):
+    """The letters of the line of the version of a card of a screen of h lines, for the program that writes it
+    (hades-picture, picture.c): an atlas of 8 bits, each printable ASCII character in a cell of its own, drawn
+    FONT_PHASES times, a quarter of a pixel further right each time (a row of cells for each), as line_mask()
+    draws a line, four times as large and brought down by averaging; and its numbers: the size of a cell, the row
+    of the baseline in it and the column where a letter at a whole pixel starts, the place of the line on the card
+    (its left in 1/256 of a pixel, its baseline in the rows of the card, the right end of the text), its colour, and
+    the advance of each letter in 1/256 of a pixel; and the height of the cards that it is for."""
+    s = h / 1080.0
+    f = ImageFont.truetype(ARGS.jost, int(round(VERSION_PX * s * ss)), layout_engine=ImageFont.Layout.BASIC)
+    f.set_variation_by_axes([VERSION_WEIGHT])
+    boxes = [f.getbbox(c, anchor="ls") for c in FONT_CHARS]
+    pad = 2
+    up = -min(b[1] for b in boxes)
+    down = max(b[3] for b in boxes)
+    left = -min(0, min(b[0] for b in boxes))
+    cw = -(-(max(b[2] for b in boxes) + left) // ss) + 2 * pad + 1
+    base = pad + -(-up // ss)
+    ch = base + -(-down // ss) + pad
+    atlas = np.zeros((FONT_PHASES * ch, len(FONT_CHARS) * cw), np.uint8)
+    for i, c in enumerate(FONT_CHARS):
+        for ph in range(FONT_PHASES):
+            img = Image.new("L", (cw * ss, ch * ss), 0)
+            ImageDraw.Draw(img).text((pad * ss + ph * ss // FONT_PHASES, base * ss), c, font=f, fill=255, anchor="ls")
+            a = np.asarray(img, dtype=np.float64).reshape(ch, ss, cw, ss).mean(axis=(1, 3))
+            atlas[ph * ch:(ph + 1) * ch, i * cw:(i + 1) * cw] = np.clip(np.rint(a), 0, 255).astype(np.uint8)
+    colour = np.rint(NOTICE_SOFT * 255).astype(int)
+    adv = [int(round(f.getlength(c) / ss * 256)) for c in FONT_CHARS]
+    text = ("hades-font 1 cell %d %d baseline %d pad %d phases %d first %d count %d\n"
+            "strip %d line %d %d %d colour %d %d %d\n"
+            "advance %s\n") % (cw, ch, base, pad, FONT_PHASES, ord(FONT_CHARS[0]), len(FONT_CHARS),
+                                where[3], int(round(where[0] * 256)), where[1], int(where[2]), colour[0], colour[1],
+                                colour[2],
+                                " ".join(str(a) for a in adv))
+    return atlas, text
 
 
 def smaller(path):
     """A PNG written again by zopflipng, only where it is smaller and every pixel is the same, which is
-    checked here (the notices: they go into the system, 5 MB as Pillow writes them)."""
+    checked here (the cards of the notices, which go into the system)."""
     tmp = path + ".z.png"
     subprocess.run([ARGS.zopflipng, "-y", path, tmp], check=True, stdout=subprocess.DEVNULL)
     a = np.asarray(Image.open(path).convert("RGBA"))
@@ -413,19 +487,36 @@ def main():
         save("kodi/icon%dx%d.png" % (n, n), icon(n), optimize=True)
 
     # the splash screen of the start of the system, one for each height of screen in the list
+    boots = {}
     for h in BOOT_HEIGHTS:
-        save("boot/splash-%d.png" % h, boot(h, splash), optimize=True)
+        boots[h] = boot(h, splash)
+        save("boot/splash-%d.png" % h, boots[h], optimize=True)
 
     # the settings add-on of LibreELEC: the logo at the foot of its window, and the side of its wizard
     save("settings/logo.png", white(wide(440, 128)), optimize=True)
     save("settings/wizard.png", panel(*WIZARD), optimize=True)
 
-    # the notice "one display", for each height of the start (last: the pictures above are the same
+    # the cards of the notices, for each height of the start (last: the pictures above are the same
     # whether or not these are made)
+    fonts = {}
+    for name, en, es, layout in NOTICES:
+        for h in BOOT_HEIGHTS:
+            strip, where = card(h, en, es, layout)
+            if where:
+                if fonts.setdefault(h, where) != where:
+                    raise SystemExit("the cards of %d lines with a version do not put it in one place" % h)
+            under = boots[h][h - strip.shape[0]:]
+            if under.shape[:2] != strip.shape[:2] or under.any():
+                raise SystemExit("the splash screen of %d lines is not black where the card of a notice goes" % h)
+            save("notice/%s-%d.png" % (name, h), strip, optimize=True)
+            if ARGS.zopflipng:
+                smaller(os.path.join(ARGS.out, "notice/%s-%d.png" % (name, h)))
+    # the letters of the line of the version, for each height (no noise: they are drawn over a flat colour)
     for h in BOOT_HEIGHTS:
-        save("notice/notice-%d.png" % h, notice(h), optimize=True)
-        if ARGS.zopflipng:
-            smaller(os.path.join(ARGS.out, "notice/notice-%d.png" % h))
+        atlas, text = font(h, fonts[h])
+        save("notice/font-%d.png" % h, atlas, optimize=True)
+        with open(os.path.join(ARGS.out, "notice/font-%d.txt" % h), "w") as t:
+            t.write(text)
 
 
 if __name__ == "__main__":

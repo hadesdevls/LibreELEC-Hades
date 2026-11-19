@@ -1,0 +1,222 @@
+From 74d5cb138511a0f7875db6261f131d57e0797182 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 06:46:40 +0000
+Subject: [PATCH] guilib: what opening a window over a video costs the thread
+ that presents its frames, in the log
+
+On GBM the thread that opens a window and draws it is the one that also presents the frames of the
+video. A user of another build (Tiger Lake-H) saw about a second of dropped and skipped frames each
+time the player information opened, beginning half a second after "Loading skin file:
+.../DialogPlayerProcessInfo.xml": that build reads the skin file of the dialog at its first open.
+Hades loads the windows most often opened over a video ahead, while the menus are idle
+(CWindowPreload), so that their first open is as their second; nothing said whether that held for
+a given open (a window is read again where conditions of its includes changed since,
+CGUIWindow::NeedLoad(), and nothing is loaded ahead while a modal dialog stays open), nor what an
+open still costs: its textures are allocated at each open (Kodi frees them at each close), and its
+first frame processes and draws every control.
+
+Now the init of a window opened over the video (the full screen video is the active window) and
+its first frame, processed and drawn, are timed, on the application thread only. A few opens are
+timed at once (the player information brings the seek bar with it), the oldest given up for a newer
+one; no member is added to the class, and a window closed or destroyed before its first frame is not
+timed further. "Read now" is what NeedLoad() says before the init, or a load during it (the controls
+made again, m_controlsGeneration), as for a window that chooses its file at its init. kodi.log says
+it at INFO where the open cost 12 ms or more or read the skin file, otherwise with debug logging
+only, for example (measured in the test machine, the dialog loaded ahead):
+
+  GUI: DialogPlayerProcessInfo.xml opened over a video in 15.1 ms of the thread that presents its
+  frames (12.2 ms to open, its skin file loaded already; 3.0 ms for its first frame)
+
+A call of the steady clock and a look at four pointers a pass of each window: nothing that a frame
+of the video could notice.
+---
+ xbmc/guilib/GUIWindow.cpp | 117 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 117 insertions(+)
+
+diff --git a/xbmc/guilib/GUIWindow.cpp b/xbmc/guilib/GUIWindow.cpp
+index 26e19d03..ed91e95 100644
+--- a/xbmc/guilib/GUIWindow.cpp
++++ b/xbmc/guilib/GUIWindow.cpp
+@@ -16,6 +16,7 @@
+ #include "GUIInfoManager.h"
+ #include "GUIWindowManager.h"
+ #include "ServiceBroker.h"
++#include "WindowIDs.h"
+ #include "addons/Skin.h"
+ #include "input/WindowTranslator.h"
+ #include "input/actions/Action.h"
+@@ -32,11 +33,53 @@
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ 
++#include <array>
++#include <chrono>
+ #include <mutex>
+ #include <ranges>
+ 
+ using namespace KODI;
+ 
++namespace
++{
++/*!
++ * Hades: what opening a window over a video costs the thread that also presents the frames of the
++ * video: from the window's init (its skin file loaded if it was not, its textures allocated,
++ * OnInitWindow()) to the end of its first frame (processed and drawn). The windows most often opened
++ * over a video are loaded ahead while the menus are idle (CWindowPreload); this says, for each open
++ * over a video, whether that held and what the open still cost. On the application thread only (a
++ * window opens and draws there); a few opens at once (the player information brings the seek bar
++ * with it), the oldest given up for a newer one.
++ */
++struct OpenOverVideo
++{
++  const CGUIWindow* window = nullptr; //!< the window opened, until its first frame is drawn
++  std::chrono::steady_clock::time_point init; //!< when its init began
++  double initMs = 0.0; //!< its init
++  double frameMs = 0.0; //!< its first frame, processed and drawn
++  bool loaded = false; //!< its skin file was read at this open
++  bool processed = false; //!< its first frame was processed
++};
++std::array<OpenOverVideo, 4> g_opensOverVideo;
++
++//! the open of this window being timed, if any
++OpenOverVideo* OpenOverVideoOf(const CGUIWindow* window)
++{
++  for (OpenOverVideo& open : g_opensOverVideo)
++    if (open.window == window)
++      return &open;
++  return nullptr;
++}
++
++double MsSince(std::chrono::steady_clock::time_point from)
++{
++  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
++}
++
++//! a line at INFO where the open cost a refresh or more, or read the skin file; otherwise debug
++constexpr double OPEN_OVER_VIDEO_INFO_MS = 12.0;
++} // namespace
++
+ bool CGUIWindow::icompare::operator()(const std::string &s1, const std::string &s2) const
+ {
+   return StringUtils::CompareNoCase(s1, s2) < 0;
+@@ -66,6 +109,9 @@ CGUIWindow::CGUIWindow(int id, const std::string &xmlFile)
+ 
+ CGUIWindow::~CGUIWindow()
+ {
++  // Hades: not timed any further (g_opensOverVideo)
++  if (OpenOverVideo* open = OpenOverVideoOf(this))
++    *open = OpenOverVideo{};
+ }
+ 
+ bool CGUIWindow::Load(const std::string& strFileName, bool bContainsPath)
+@@ -331,6 +377,25 @@ void CGUIWindow::DoProcess(unsigned int currentTime, CDirtyRegionList &dirtyregi
+ {
+   // Hades: shown in this pass of the GUI, also where it is not processed again below
+   m_passes.Shown();
++  // Hades: the first frame of a window opened over a video, timed (g_opensOverVideo)
++  OpenOverVideo* const firstFrame = [this]
++  {
++    OpenOverVideo* open = OpenOverVideoOf(this);
++    return open && !open->processed ? open : nullptr;
++  }();
++  struct ProcessTime
++  {
++    OpenOverVideo* open;
++    std::chrono::steady_clock::time_point start;
++    ~ProcessTime()
++    {
++      if (open)
++      {
++        open->frameMs += MsSince(start);
++        open->processed = true;
++      }
++    }
++  } processTime{firstFrame, std::chrono::steady_clock::now()};
+   if (!IsControlDirty() && CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_guiSmartRedraw)
+     return;
+ 
+@@ -361,6 +426,13 @@ void CGUIWindow::DoRender()
+   // to occur.
+   if (!m_bAllocated) return;
+ 
++  OpenOverVideo* const firstFrame = [this]
++  {
++    OpenOverVideo* open = OpenOverVideoOf(this);
++    return open && open->processed ? open : nullptr;
++  }();
++  const auto renderStart = std::chrono::steady_clock::now();
++
+   CServiceBroker::GetWinSystem()->GetGfxContext().SetRenderingResolution(m_coordsRes, m_needsScaling);
+ 
+   CServiceBroker::GetWinSystem()->GetGfxContext().AddGUITransform();
+@@ -368,6 +440,23 @@ void CGUIWindow::DoRender()
+   CServiceBroker::GetWinSystem()->GetGfxContext().RemoveTransform();
+ 
+   if (CGUIControlProfiler::IsRunning()) CGUIControlProfiler::Instance().EndFrame();
++
++  // Hades: the open of this window over a video, said once its first frame is drawn
++  // (g_opensOverVideo)
++  if (firstFrame)
++  {
++    OpenOverVideo& open = *firstFrame;
++    open.frameMs += MsSince(renderStart);
++    const double total = open.initMs + open.frameMs;
++    CLog::Log(open.loaded || total >= OPEN_OVER_VIDEO_INFO_MS ? LOGINFO : LOGDEBUG,
++              "GUI: {} opened over a video in {:.1f} ms of the thread that presents its frames "
++              "({:.1f} ms to open, {}; {:.1f} ms for its first frame)",
++              GetProperty("xmlfile").asString(), total, open.initMs,
++              open.loaded ? "its skin file read now: it had not been loaded ahead"
++                          : "its skin file loaded already",
++              open.frameMs);
++    open = OpenOverVideo{};
++  }
+ }
+ 
+ void CGUIWindow::AfterRender()
+@@ -619,8 +708,33 @@ bool CGUIWindow::OnMessage(CGUIMessage& message)
+   case GUI_MSG_WINDOW_INIT:
+     {
+       CLog::Log(LOGDEBUG, "------ Window Init ({}) ------", GetProperty("xmlfile").asString());
++      // Hades: an open over a video is timed to the end of its first frame (g_opensOverVideo)
++      const auto init = std::chrono::steady_clock::now();
++      const bool overVideo = GetID() != WINDOW_FULLSCREEN_VIDEO &&
++                             CServiceBroker::GetGUI()->GetWindowManager().GetActiveWindow() ==
++                                 WINDOW_FULLSCREEN_VIDEO &&
++                             CServiceBroker::GetAppMessenger()->IsProcessThread();
++      // (read now: what NeedLoad() says, or the controls made again by a load at this init, as for a
++      // window that chooses its file in AllocResources())
++      const uint32_t controlsBefore = m_controlsGeneration;
++      const bool needLoad = overVideo && (NeedLoad() || m_loadType == LOAD_EVERY_TIME);
+       if (m_dynamicResourceAlloc || !m_bAllocated) AllocResources(false);
++      const bool load = overVideo && (needLoad || m_controlsGeneration != controlsBefore);
+       OnInitWindow();
++      if (overVideo)
++      {
++        // this window's slot, or a free one, or the oldest
++        OpenOverVideo* slot = OpenOverVideoOf(this);
++        if (!slot)
++          for (OpenOverVideo& open : g_opensOverVideo)
++            if (!slot || (slot->window && (!open.window || open.init < slot->init)))
++              slot = &open;
++        *slot = OpenOverVideo{};
++        slot->window = this;
++        slot->init = init;
++        slot->loaded = load;
++        slot->initMs = MsSince(init);
++      }
+       return true;
+     }
+     break;
+@@ -628,6 +742,9 @@ bool CGUIWindow::OnMessage(CGUIMessage& message)
+   case GUI_MSG_WINDOW_DEINIT:
+     {
+       CLog::Log(LOGDEBUG, "------ Window Deinit ({}) ------", GetProperty("xmlfile").asString());
++      // Hades: a window closed before its first frame was drawn is not timed further
++      if (OpenOverVideo* open = OpenOverVideoOf(this))
++        *open = OpenOverVideo{};
+       OnDeinitWindow(message.GetParam1());
+       // now free the window
+       if (m_dynamicResourceAlloc) FreeResources();
+-- 
+2.53.0
+

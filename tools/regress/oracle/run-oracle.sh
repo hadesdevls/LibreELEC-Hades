@@ -37,31 +37,37 @@ FF=${ORACLE_FFMPEG:?set ORACLE_FFMPEG to the FFmpeg prefix with the DV patches}
 FFB=${ORACLE_FFMPEG_BENCH:?set ORACLE_FFMPEG_BENCH to the host FFmpeg prefix of the bridge}
 GLW=${ORACLE_GLW:?set ORACLE_GLW to the folder with the GL headers (inc/) and mkshim.py}
 VASTUB=${ORACLE_VASTUB:?set ORACLE_VASTUB to the folder with the stub of va/va.h}
-FIDTOOLS=${ORACLE_FIDTOOLS:?set ORACLE_FIDTOOLS to the folder of ref_dump.c and the layer tools}
-FIDBENCH_C=${ORACLE_FIDBENCH:?set ORACLE_FIDBENCH to fidbench.c}
+# the fidelity bench: ref_dump.c, layers.h, upload.h and fidbench.c (by default those of tools/regress/dvbridge/src)
+FIDTOOLS=${ORACLE_FIDTOOLS:-$(cd "$HERE/../dvbridge/src" && pwd)}
+FIDBENCH_C=${ORACLE_FIDBENCH:-$FIDTOOLS/fidbench.c}
 LE_BUILD=${ORACLE_LE_BUILD:?set ORACLE_LE_BUILD to a build folder of LibreELEC}
 SAMPLES=${ORACLE_SAMPLES:?set ORACLE_SAMPLES to the folder of the sample videos}
-CLIPS=${ORACLE_CLIPS:-"tf tron"}
+CLIPS=${ORACLE_CLIPS:-"fel-a fel-b"}
 GPU_ENV="MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_ALWAYS_SOFTWARE=1 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json"
 MEM=${ORACLE_MEM:-3G}
 LPDIR=packages/addons/addon-depends/multimedia-tools-depends/libplacebo
 B=$WORK/build
 PY="python3 -I"
 
-clip_file() {
-  case $1 in
-    tf) echo "$SAMPLES/Transformers DV FEL.mkv" ;;
-    tron) echo "$SAMPLES/Tron Legacy DV FEL.mkv" ;;
-    *) echo "$SAMPLES/$1.mkv" ;;
-  esac
-}
 clip_sha() {
   case $1 in
-    tf) echo 850fcc8e5716446be4079cc3e0c1f386ab065bc5d92163f93665c394206417d1 ;;
-    tron) echo 21dd84a0c9c7809a322d58eb10a8d1445cbff0d0ac43713e49d0af62140643f6 ;;
+    fel-a) echo 850fcc8e5716446be4079cc3e0c1f386ab065bc5d92163f93665c394206417d1 ;;
+    fel-b) echo 21dd84a0c9c7809a322d58eb10a8d1445cbff0d0ac43713e49d0af62140643f6 ;;
     *) echo "${ORACLE_SHA_1:-unknown}" ;;
   esac
 }
+# each clip is <name>.mkv in ORACLE_SAMPLES or, where there is none, the .mkv there whose SHA-256 is that of the clip
+# (looked for once, here)
+declare -A CLIP_PATH
+for c in $CLIPS; do
+  CLIP_PATH[$c]="$SAMPLES/$c.mkv"
+  if [ ! -e "${CLIP_PATH[$c]}" ]; then
+    for g in "$SAMPLES"/*.mkv; do
+      if [ -e "$g" ] && [ "$(sha256sum < "$g" | cut -c1-64)" = "$(clip_sha $c)" ]; then CLIP_PATH[$c]=$g; break; fi
+    done
+  fi
+done
+clip_file() { echo "${CLIP_PATH[$1]}"; }
 fail() { echo "FAIL: $*"; exit 1; }
 item() { echo "ORACLE-ITEM $1: $2 | $3"; }
 cap() {

@@ -1,0 +1,730 @@
+From a293ff25223fb4456a62ed02c8f8d91fcd12534b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:36:46 +0000
+Subject: [PATCH] filesystem: a refused address is asked again where it came
+ from, and a server that allows one connection gets one
+
+A streaming add-on hands Kodi the address of its resolver, which redirects to the
+service's CDN with a token in the address. The token runs out after a while,
+and a CDN may allow one or two connections to a file. Kodi kept only the
+address it was sent to, and opened a second connection on every seek (the
+multiple sessions of CCurlFile::Seek()). Measured in a VM with a server that
+behaves like such a CDN (an image of this tree before the change, the
+add-on's address redirecting to the CDN):
+- a CDN that allows one connection: the seek's second connection was refused
+  (HTTP 403) and the video never went on (two seeks, 61 s each, then the
+  player gave the source up);
+- with two, from a server that sends at 450 KiB/s, the third seek was refused
+  the same way while it still counted the connection just closed;
+- a token that ran out while the video played: the next seek was refused and
+  playback ended with an error.
+
+Now:
+- XFILE::CHttpSourceMemory keeps, for all of Kodi, where an address
+  redirected to (the latest 64), the servers that allow one connection to a
+  file, and the addresses that only the type their server gave says are disc
+  images. An address is kept without the options Kodi adds after '|', and is
+  never logged whole (ShortForLog(): the host and the name of the file,
+  nothing between that may be a token).
+- CCurlFile::Seek(), when the new connection is refused with 403, 429 or 503
+  while another connection of the file is open, closes that one and asks
+  again at once, and once more after 0.3 s (a server notices a closed
+  connection only when it next writes to it); the file is read over one
+  connection from then on. When one connection took what two did not, at the
+  same address, every file of that server is read over one.
+- A refusal of the address itself (401, 403, 404, 410) is then asked again,
+  once, at the address it came from through a redirect: its own, or the one
+  the memory knows (the player opens the address its stream factory
+  resolved), which sends to a new one; CCurlFile::Open() does the same for an
+  address refused at once (a token used by an earlier request).
+- Still refused by a server that allows one connection: asked again after
+  0.5 s and after 1 s more.
+- The subtitle search after a seek (CSubtitleSeekSearch) reads the file over
+  a connection of its own: not from a server known to allow one.
+Each step says what it did in one INFO line. Where no server refuses
+anything, nothing changes: the second session of a seek is kept as before.
+What happens when the address it came from is refused too is as before
+(CFileCache gives the source up and the player ends with an error).
+
+Measured after, in the same VM: one connection allowed, the first seek's
+second connection was refused once and the file then read over one, and the
+seeks went on in 1.5 s, as with two; the token run out, the seek was refused
+three times (at once, at once over one connection, after 0.3 s), the address
+was asked again where it came from, and the video went on in 1.8 s; at
+450 KiB/s with two, every seek went on in 1.8 s.
+---
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp |  10 ++
+ xbmc/filesystem/CMakeLists.txt         |   2 +
+ xbmc/filesystem/CurlFile.cpp           | 208 +++++++++++++++++++++++
+ xbmc/filesystem/CurlFile.h             |   6 +
+ xbmc/filesystem/HttpSourceMemory.cpp   | 223 +++++++++++++++++++++++++
+ xbmc/filesystem/HttpSourceMemory.h     |  80 +++++++++
+ 6 files changed, 529 insertions(+)
+ create mode 100644 xbmc/filesystem/HttpSourceMemory.cpp
+ create mode 100644 xbmc/filesystem/HttpSourceMemory.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index 38089df..eb9ad18 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -48,6 +48,7 @@
+ #include "cores/VideoPlayer/Process/ProcessInfo.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderManager.h"
+ #include "dialogs/GUIDialogKaiToast.h"
++#include "filesystem/HttpSourceMemory.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIUtils.h"
+ #include "guilib/StereoscopicsManager.h"
+@@ -6296,6 +6297,15 @@ void CVideoPlayer::StartSubtitleSearch(double target)
+   auto* ffmpeg = dynamic_cast<CDVDDemuxFFmpeg*>(m_pDemuxer.get());
+   if (!ffmpeg || ffmpeg->GetDemuxerId() != m_CurrentSubtitle.demuxerId)
+     return;
++  // Hades: the search reads the file over a connection of its own: not from a server that refused
++  // a second connection to a file (XFILE::CHttpSourceMemory), where it would take the player's
++  if (XFILE::CHttpSourceMemory::AllowsOneConnectionFor(m_item.GetDynPath()))
++  {
++    CLog::Log(LOGINFO,
++              "CSubtitleSeekSearch: not searched: the server of the video allows one connection to "
++              "it, which the player has");
++    return;
++  }
+   CDVDDemuxFFmpeg::MatroskaStream stream;
+   if (!ffmpeg->GetMatroskaStream(m_CurrentSubtitle.id, stream))
+     return;
+diff --git a/xbmc/filesystem/CMakeLists.txt b/xbmc/filesystem/CMakeLists.txt
+index 7909d28..18cdfe5 100644
+--- a/xbmc/filesystem/CMakeLists.txt
++++ b/xbmc/filesystem/CMakeLists.txt
+@@ -25,6 +25,7 @@ set(SOURCES AddonsDirectory.cpp
+             FTPDirectory.cpp
+             FTPParse.cpp
+             HTTPDirectory.cpp
++            HttpSourceMemory.cpp
+             IDirectory.cpp
+             IFile.cpp
+             ImageFile.cpp
+@@ -92,6 +93,7 @@ set(HEADERS AddonsDirectory.h
+             FileFactory.h
+             HttpClientFactory.h
+             HTTPDirectory.h
++            HttpSourceMemory.h
+             IDirectory.h
+             IFile.h
+             IHttpClient.h
+diff --git a/xbmc/filesystem/CurlFile.cpp b/xbmc/filesystem/CurlFile.cpp
+index 5b487b8..1d0af22 100644
+--- a/xbmc/filesystem/CurlFile.cpp
++++ b/xbmc/filesystem/CurlFile.cpp
+@@ -9,6 +9,7 @@
+ #include "CurlFile.h"
+ 
+ #include "File.h"
++#include "HttpSourceMemory.h"
+ #include "ServiceBroker.h"
+ #include "URL.h"
+ #include "filesystem/SpecialProtocol.h"
+@@ -60,6 +61,30 @@ constexpr auto proxyType2CUrlProxyType{make_map<XFILE::CCurlFile::ProxyType, lon
+ 
+ std::vector<uint8_t> cachedCaCertsBlob; // cached CA certs file
+ 
++/*!
++ * \brief Hades: an answer that says the address no longer gives the file to whoever asks: a token
++ *        in it that ran out (401, 403), a link that was taken away or expired (404, 410). The
++ *        address it came from, through a redirect, can be asked again for a new one.
++ */
++bool RefusesTheAddress(long httpCode)
++{
++  return httpCode == 401 || httpCode == 403 || httpCode == 404 || httpCode == 410;
++}
++
++/*!
++ * \brief Hades: an answer a server gives a connection beyond the ones it allows to a file: 403
++ *        (as many CDNs do, a token valid for one connection), 429 (too many requests) or 503.
++ */
++bool RefusesAnotherConnection(long httpCode)
++{
++  return httpCode == 403 || httpCode == 429 || httpCode == 503;
++}
++
++std::string HostOf(const std::string& url)
++{
++  return CURL(url).GetHostName();
++}
++
+ } // unnamed namespace
+ 
+ #define FILLBUFFER_OK         0
+@@ -517,6 +542,7 @@ void CCurlFile::Close()
+   m_oldState = NULL;
+ 
+   m_url.clear();
++  m_origUrl.clear();
+   m_referer.clear();
+   m_cookie.clear();
+ 
+@@ -1150,6 +1176,9 @@ bool CCurlFile::Open(const CURL& url)
+ 
+   CURL url2(url);
+   ParseAndCorrectUrl(url2);
++  // Hades: the address asked, before any redirect, and where it came from (CHttpSourceMemory)
++  const std::string asked{m_url};
++  m_origUrl.clear();
+ 
+   std::string redactPath = CURL::GetRedacted(m_url);
+   CLog::Log(LOGDEBUG, "CurlFile::{} - <{}>", __FUNCTION__, redactPath);
+@@ -1170,6 +1199,37 @@ bool CCurlFile::Open(const CURL& url)
+ 
+   m_httpresponse = m_state->Connect(m_bufferSize);
+ 
++  // Hades: an address that a redirect sent another file of Kodi to (the player opens the address
++  // its stream factory resolved; a Debrid add-on's resolver sends to its CDN with a token), refused
++  // as a CDN refuses it once the token ran out or was used: the address it came from is asked
++  // again, once, and sends to a new one
++  if (RefusesTheAddress(m_httpresponse) && (url2.IsProtocol("http") || url2.IsProtocol("https")))
++  {
++    if (const auto from = CHttpSourceMemory::FindByTarget(asked); from.has_value())
++    {
++      CLog::Log(LOGINFO,
++                "CCurlFile::Open - {} refused the address (HTTP {}), which a redirect of {} sent "
++                "to: asked again at {}",
++                CHttpSourceMemory::ShortForLog(asked), m_httpresponse,
++                CHttpSourceMemory::ShortForLog(from->origin),
++                CHttpSourceMemory::ShortForLog(from->origin));
++      m_state->Disconnect();
++      m_url = from->origin;
++      m_origUrl = from->origin;
++      SetCommonOptions(m_state,
++                       m_failOnError && !CServiceBroker::GetLogging().CanLogComponent(LOGCURL));
++      SetRequestHeaders(m_state);
++      m_state->m_sendRange = m_seekable;
++      m_state->m_bRetry = m_allowRetry;
++      m_httpresponse = m_state->Connect(m_bufferSize);
++      CLog::Log(LOGINFO, "CCurlFile::Open - {} answered HTTP {}{}",
++                CHttpSourceMemory::ShortForLog(from->origin), m_httpresponse,
++                RefusesTheAddress(m_httpresponse) || m_httpresponse < 0
++                    ? ": the file cannot be opened"
++                    : ": the file is opened");
++    }
++  }
++
+   long hte = 0;
+ 
+   // Allow HTTP response code 0 for file:// protocol
+@@ -1223,6 +1283,16 @@ bool CCurlFile::Open(const CURL& url)
+                 __FUNCTION__, redactPath);
+       m_multisession = false;
+     }
++    // Hades: a server that refused a second connection to a file before (Seek()) has its files
++    // read over one connection
++    else if (CHttpSourceMemory::AllowsOneConnection(url2.GetHostName()))
++    {
++      CLog::Log(LOGINFO,
++                "CCurlFile::Open - {}: the server refused a second connection to a file before, "
++                "so this file is read over one connection",
++                CHttpSourceMemory::ShortForLog(m_url));
++      m_multisession = false;
++    }
+   }
+ 
+   if(StringUtils::EqualsNoCase(m_state->m_httpheader.GetValue("Transfer-Encoding"), "chunked"))
+@@ -1249,13 +1319,147 @@ bool CCurlFile::Open(const CURL& url)
+       std::string redactEfpath = CURL::GetRedacted(efurl);
+       CLog::Log(LOGDEBUG, "CCurlFile::{} - <{}> Effective URL is {}", __FUNCTION__, redactPath,
+                 redactEfpath);
++      // Hades: kept, for a refusal of the address it sent to (Seek()), and for the other files
++      if (m_origUrl.empty())
++        m_origUrl = m_url;
++      CHttpSourceMemory::RememberRedirect(m_url, efurl, m_state->m_httpheader.GetMimeType());
+     }
+     m_url = efurl;
+   }
+ 
++  // Hades: an address that is itself where a redirect of another file sent to
++  if (m_origUrl.empty())
++  {
++    if (const auto from = CHttpSourceMemory::FindByTarget(m_url); from.has_value())
++      m_origUrl = from->origin;
++  }
++
+   return true;
+ }
+ 
++long CCurlFile::Reconnect(int64_t position, int64_t knownSize)
++{
++  m_state->Disconnect();
++  m_state->m_fileSize = knownSize;
++  SetCommonOptions(m_state);
++  SetRequestHeaders(m_state);
++  m_state->m_filePos = position;
++  m_state->m_sendRange = true;
++  m_state->m_bRetry = m_allowRetry;
++  return m_state->Connect(m_bufferSize);
++}
++
++long CCurlFile::AfterRefusal(long response, int64_t position, int64_t knownSize)
++{
++  // Another connection of this file is open (the multiple sessions of Seek()): a server that allows
++  // one connection to a file refuses the second. The first one is closed and this one asked for
++  // again at once; the file is read over one connection from now on. A server known to allow one
++  // connection may refuse the new one while it still counts the one this file just closed (Seek()
++  // closes its connection before it makes the new one): the same.
++  bool oneConnection = false;
++  bool hadSecond = false;
++  bool askedOrigin = false;
++  if (RefusesAnotherConnection(response) &&
++      (m_oldState || CHttpSourceMemory::AllowsOneConnection(HostOf(m_url))))
++  {
++    oneConnection = true;
++    hadSecond = m_oldState != nullptr;
++    if (hadSecond)
++      CLog::Log(LOGINFO,
++                "CCurlFile::Seek - {} refused a second connection to the file (HTTP {}) at byte "
++                "{}: the first one is closed, and the file read over one connection",
++                CHttpSourceMemory::ShortForLog(m_url), response, position);
++    else
++      CLog::Log(LOGINFO,
++                "CCurlFile::Seek - {} refused the connection (HTTP {}) at byte {}, as a server "
++                "that allows one may while it still counts the one just closed: asked again",
++                CHttpSourceMemory::ShortForLog(m_url), response, position);
++    delete m_oldState;
++    m_oldState = nullptr;
++    m_multisession = false;
++    response = Reconnect(position, knownSize);
++    CLog::Log(LOGINFO, "CCurlFile::Seek - {} answered HTTP {} over the one connection",
++              CHttpSourceMemory::ShortForLog(m_url), response);
++
++    // a server that notices a closed connection only when it next writes to it counts it a moment
++    // longer: asked once more after a short wait, before the address is taken for refused
++    if (RefusesAnotherConnection(response) && !(m_readAbort && *m_readAbort))
++    {
++      KODI::TIME::Sleep(std::chrono::milliseconds(300));
++      response = Reconnect(position, knownSize);
++      CLog::Log(LOGINFO,
++                "CCurlFile::Seek - {} answered HTTP {} over the one connection after 0.3 s",
++                CHttpSourceMemory::ShortForLog(m_url), response);
++    }
++  }
++
++  // The address refused (a token in it that ran out): the address it came from, through a redirect
++  // (the add-on's resolver), is asked again, and sends to a new one
++  if (RefusesTheAddress(response))
++  {
++    std::string origin{m_origUrl};
++    if (origin.empty())
++    {
++      if (const auto from = CHttpSourceMemory::FindByTarget(m_url); from.has_value())
++        origin = from->origin;
++    }
++    if (!origin.empty() && CHttpSourceMemory::Key(origin) != CHttpSourceMemory::Key(m_url))
++    {
++      CLog::Log(LOGINFO,
++                "CCurlFile::Seek - {} refused the address at byte {} (HTTP {}): asked again at the "
++                "address it came from, {}",
++                CHttpSourceMemory::ShortForLog(m_url), position, response,
++                CHttpSourceMemory::ShortForLog(origin));
++      askedOrigin = true;
++      m_url = origin;
++      m_origUrl = origin;
++      response = Reconnect(position, knownSize);
++      if (const std::string efurl = GetInfoString(CURLINFO_EFFECTIVE_URL); !efurl.empty())
++        m_url = efurl;
++      if (response >= 200 && response < 300)
++      {
++        CHttpSourceMemory::RememberRedirect(origin, m_url, m_state->m_httpheader.GetMimeType());
++        CLog::Log(LOGINFO,
++                  "CCurlFile::Seek - {} sent to a new address, {}: the file goes on "
++                  "from byte {}",
++                  CHttpSourceMemory::ShortForLog(origin), CHttpSourceMemory::ShortForLog(m_url),
++                  position);
++      }
++      else
++        CLog::Log(LOGWARNING, "CCurlFile::Seek - {} answered HTTP {} too",
++                  CHttpSourceMemory::ShortForLog(origin), response);
++    }
++  }
++
++  // Still refused by a server that allows one connection: it notices a closed connection only when
++  // it next writes to it, so it may still count the one just closed. Asked again after half a
++  // second and after a second more.
++  for (int attempt = 1; oneConnection && attempt <= 2 && RefusesAnotherConnection(response);
++       attempt++)
++  {
++    if (m_readAbort && *m_readAbort)
++      break;
++    KODI::TIME::Sleep(std::chrono::milliseconds(500 * attempt));
++    response = Reconnect(position, knownSize);
++    CLog::Log(LOGINFO, "CCurlFile::Seek - {} answered HTTP {} over the one connection (try {})",
++              CHttpSourceMemory::ShortForLog(m_url), response, attempt + 1);
++  }
++
++  // The second connection was what the server refused (one connection took what two did not, at
++  // the same address): every file of the server is read over one connection from now on. A refusal
++  // that a new address answered was the address (its token), not the second connection.
++  if (hadSecond && !askedOrigin && response >= 200 && response < 300 &&
++      !CHttpSourceMemory::AllowsOneConnection(HostOf(m_url)))
++  {
++    CHttpSourceMemory::RememberOneConnection(HostOf(m_url));
++    CLog::Log(LOGINFO,
++              "CCurlFile::Seek - {} allows one connection to a file: the files of the server are "
++              "read over one connection from now on",
++              CHttpSourceMemory::ShortForLog(m_url));
++  }
++  return response;
++}
++
+ bool CCurlFile::OpenForWrite(const CURL& url, bool bOverWrite)
+ {
+   if(m_opened)
+@@ -1562,6 +1766,10 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
+   m_state->m_bRetry = m_allowRetry;
+ 
+   long response = m_state->Connect(m_bufferSize);
++  // Hades: a refusal of this connection: another one of the file that the server does not allow,
++  // or an address whose token ran out (AfterRefusal())
++  if (RefusesAnotherConnection(response) || RefusesTheAddress(response))
++    response = AfterRefusal(response, nextPos, knownSize);
+   if(response < 0 && (m_state->m_fileSize == 0 || m_state->m_fileSize != m_state->m_filePos))
+   {
+     if(m_multisession)
+diff --git a/xbmc/filesystem/CurlFile.h b/xbmc/filesystem/CurlFile.h
+index ce3ecfc..e0dd46c 100644
+--- a/xbmc/filesystem/CurlFile.h
++++ b/xbmc/filesystem/CurlFile.h
+@@ -155,6 +155,10 @@ namespace XFILE
+       void SetCorrectHeaders(CReadState* state);
+       bool Service(const std::string& strURL, std::string& strHTML);
+       std::string GetInfoString(int infoType);
++      //! Hades: the connection of m_state made again at a position (Seek())
++      long Reconnect(int64_t position, int64_t knownSize);
++      //! Hades: what is done when a server refuses the connection Seek() made (CHttpSourceMemory)
++      long AfterRefusal(long response, int64_t position, int64_t knownSize);
+ 
+     protected:
+       CReadState* m_state;
+@@ -163,6 +167,8 @@ namespace XFILE
+       int64_t m_writeOffset = 0;
+ 
+       std::string m_url;
++      //! Hades: the address a redirect came from, to ask again when the one it sent to is refused
++      std::string m_origUrl;
+       std::string m_userAgent;
+       ProxyType m_proxytype = ProxyType::HTTP;
+       std::string m_proxyhost;
+diff --git a/xbmc/filesystem/HttpSourceMemory.cpp b/xbmc/filesystem/HttpSourceMemory.cpp
+new file mode 100644
+index 0000000..ae0f39e
+--- /dev/null
++++ b/xbmc/filesystem/HttpSourceMemory.cpp
+@@ -0,0 +1,223 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "HttpSourceMemory.h"
++
++#include <algorithm>
++#include <cctype>
++#include <deque>
++#include <mutex>
++
++using namespace XFILE;
++
++namespace
++{
++std::mutex g_lock;
++std::deque<CHttpSourceMemory::Redirect> g_redirects; // newest last
++std::deque<std::string> g_discImages;
++std::deque<std::string> g_oneConnection;
++
++bool EqualsNoCase(std::string_view a, std::string_view b)
++{
++  return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
++                                            [](char x, char y)
++                                            {
++                                              return std::tolower(static_cast<unsigned char>(x)) ==
++                                                     std::tolower(static_cast<unsigned char>(y));
++                                            });
++}
++
++template<typename T>
++void Bound(std::deque<T>& list, std::size_t max)
++{
++  while (list.size() > max)
++    list.pop_front();
++}
++} // namespace
++
++std::string CHttpSourceMemory::Key(std::string_view url)
++{
++  const std::size_t bar = url.find('|');
++  return std::string(bar == std::string_view::npos ? url : url.substr(0, bar));
++}
++
++std::string CHttpSourceMemory::ShortForLog(std::string_view url)
++{
++  const std::string key = Key(url);
++  const std::size_t scheme = key.find("://");
++  if (scheme == std::string::npos)
++    return "(an address)";
++  const std::size_t hostStart = scheme + 3;
++  std::size_t hostEnd = key.find_first_of("/?#", hostStart);
++  std::string host =
++      key.substr(hostStart, hostEnd == std::string::npos ? std::string::npos : hostEnd - hostStart);
++  // user and password, if any, are not the host
++  if (const std::size_t at = host.rfind('@'); at != std::string::npos)
++    host = host.substr(at + 1);
++  std::string path = hostEnd == std::string::npos ? std::string{} : key.substr(hostEnd);
++  if (const std::size_t q = path.find_first_of("?#"); q != std::string::npos)
++    path = path.substr(0, q);
++  std::string name;
++  if (const std::size_t slash = path.rfind('/'); slash != std::string::npos)
++    name = path.substr(slash + 1);
++  // the last part of the path names the file; what is between may be a token
++  std::string out = key.substr(0, hostStart) + host;
++  if (!name.empty())
++    out += (path.find('/') != path.rfind('/') ? "/.../" : "/") + name;
++  return out;
++}
++
++void CHttpSourceMemory::RememberRedirect(const std::string& origin,
++                                         const std::string& target,
++                                         const std::string& mimeType)
++{
++  if (origin.empty() || target.empty())
++    return;
++  const std::string from = Key(origin);
++  const std::string to = Key(target);
++  if (from == to)
++    return;
++  std::lock_guard lock(g_lock);
++  std::erase_if(g_redirects, [&](const Redirect& r) { return r.origin == from && r.target == to; });
++  g_redirects.push_back({from, to, mimeType, std::chrono::steady_clock::now()});
++  Bound(g_redirects, MAX_REDIRECTS);
++}
++
++std::optional<CHttpSourceMemory::Redirect> CHttpSourceMemory::FindByTarget(
++    const std::string& target)
++{
++  const std::string key = Key(target);
++  std::lock_guard lock(g_lock);
++  for (auto it = g_redirects.rbegin(); it != g_redirects.rend(); ++it)
++  {
++    if (it->target == key)
++      return *it;
++  }
++  return std::nullopt;
++}
++
++std::optional<CHttpSourceMemory::Redirect> CHttpSourceMemory::FindByOrigin(
++    const std::string& origin, std::chrono::steady_clock::duration maxAge)
++{
++  const std::string key = Key(origin);
++  const auto now = std::chrono::steady_clock::now();
++  std::lock_guard lock(g_lock);
++  for (auto it = g_redirects.rbegin(); it != g_redirects.rend(); ++it)
++  {
++    if (it->origin == key)
++    {
++      if (now - it->at > maxAge)
++        return std::nullopt;
++      return *it;
++    }
++  }
++  return std::nullopt;
++}
++
++void CHttpSourceMemory::RememberDiscImage(const std::string& url)
++{
++  const std::string key = Key(url);
++  if (key.empty())
++    return;
++  std::lock_guard lock(g_lock);
++  std::erase(g_discImages, key);
++  g_discImages.push_back(key);
++  Bound(g_discImages, MAX_DISC_IMAGES);
++}
++
++bool CHttpSourceMemory::IsKnownDiscImage(std::string_view url)
++{
++  // only an address of a web server can be one (the check is made for every path Kodi asks about)
++  if (url.size() < 7 || !(EqualsNoCase(url.substr(0, 7), "http://") ||
++                          (url.size() >= 8 && EqualsNoCase(url.substr(0, 8), "https://"))))
++    return false;
++  const std::string key = Key(url);
++  std::lock_guard lock(g_lock);
++  return std::ranges::find(g_discImages, key) != g_discImages.end();
++}
++
++void CHttpSourceMemory::RememberOneConnection(const std::string& host)
++{
++  if (host.empty())
++    return;
++  std::lock_guard lock(g_lock);
++  if (std::ranges::any_of(g_oneConnection,
++                          [&](const std::string& h) { return EqualsNoCase(h, host); }))
++    return;
++  g_oneConnection.push_back(host);
++  Bound(g_oneConnection, MAX_ONE_CONNECTION_HOSTS);
++}
++
++bool CHttpSourceMemory::AllowsOneConnection(const std::string& host)
++{
++  if (host.empty())
++    return false;
++  std::lock_guard lock(g_lock);
++  return std::ranges::any_of(g_oneConnection,
++                             [&](const std::string& h) { return EqualsNoCase(h, host); });
++}
++
++bool CHttpSourceMemory::AllowsOneConnectionFor(const std::string& url)
++{
++  const auto hostOf = [](const std::string& u)
++  {
++    const std::size_t scheme = u.find("://");
++    if (scheme == std::string::npos)
++      return std::string{};
++    std::string host = u.substr(scheme + 3, u.find_first_of("/?#|", scheme + 3) - (scheme + 3));
++    if (const std::size_t at = host.rfind('@'); at != std::string::npos)
++      host = host.substr(at + 1);
++    if (const std::size_t colon = host.rfind(':');
++        colon != std::string::npos && host.find(']') == std::string::npos)
++      host = host.substr(0, colon);
++    return host;
++  };
++  if (AllowsOneConnection(hostOf(url)))
++    return true;
++  const std::string key = Key(url);
++  std::string target;
++  {
++    std::lock_guard lock(g_lock);
++    for (auto it = g_redirects.rbegin(); it != g_redirects.rend(); ++it)
++    {
++      if (it->origin == key)
++      {
++        target = it->target;
++        break;
++      }
++    }
++  }
++  return !target.empty() && AllowsOneConnection(hostOf(target));
++}
++
++bool CHttpSourceMemory::IsDiscImageMimeType(std::string_view mimeType)
++{
++  // (the type alone, without its parameters)
++  const std::size_t semi = mimeType.find(';');
++  std::string_view type = mimeType.substr(0, semi);
++  while (!type.empty() && std::isspace(static_cast<unsigned char>(type.back())))
++    type.remove_suffix(1);
++  while (!type.empty() && std::isspace(static_cast<unsigned char>(type.front())))
++    type.remove_prefix(1);
++  for (std::string_view known :
++       {"application/x-iso9660-image", "application/x-cd-image", "application/x-iso-image",
++        "application/x-udf-image", "application/vnd.efi.iso"})
++  {
++    if (EqualsNoCase(type, known))
++      return true;
++  }
++  return false;
++}
++
++void CHttpSourceMemory::Clear()
++{
++  std::lock_guard lock(g_lock);
++  g_redirects.clear();
++  g_discImages.clear();
++  g_oneConnection.clear();
++}
+diff --git a/xbmc/filesystem/HttpSourceMemory.h b/xbmc/filesystem/HttpSourceMemory.h
+new file mode 100644
+index 0000000..e4b1d6d
+--- /dev/null
++++ b/xbmc/filesystem/HttpSourceMemory.h
+@@ -0,0 +1,80 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <chrono>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace XFILE
++{
++/*!
++ * \brief What Kodi learned of an HTTP source while it used it, for the next connection to it.
++ *
++ * A Debrid add-on gives Kodi the address of its resolver, which sends to the service's CDN with a
++ * token in the address; the token runs out after a while, and the CDN may allow only one or two
++ * connections to a file. Each connection is a file of its own in Kodi (CCurlFile), and the player
++ * opens several: what one learns is kept here for the others.
++ *  - Where an address redirected to: a CDN that later refuses the address it sent to (its token
++ *    ran out) is asked again at the address it came from, which sends to a new one.
++ *  - That a file is a disc image, when only the type the server gave it says so (an address
++ *    without the extension of an image): Kodi takes an image by its extension everywhere.
++ *  - The servers that refused a second connection to a file while one was open: their files are
++ *    read over one connection from then on.
++ *
++ * Bounded (the latest of each), thread safe; an address is kept without the options Kodi adds after
++ * '|', and is never logged whole (its token is in it): see ShortForLog().
++ */
++class CHttpSourceMemory
++{
++public:
++  struct Redirect
++  {
++    std::string origin; //!< the address that was asked
++    std::string target; //!< where it sent to, in the end
++    std::string mimeType; //!< the type the server gave the file there, if any
++    std::chrono::steady_clock::time_point at;
++  };
++
++  static constexpr std::size_t MAX_REDIRECTS = 64;
++  static constexpr std::size_t MAX_DISC_IMAGES = 16;
++  static constexpr std::size_t MAX_ONE_CONNECTION_HOSTS = 32;
++
++  static void RememberRedirect(const std::string& origin,
++                               const std::string& target,
++                               const std::string& mimeType);
++  //! The latest redirect that ended at this address
++  static std::optional<Redirect> FindByTarget(const std::string& target);
++  //! The latest redirect of this address, if it is not older than maxAge
++  static std::optional<Redirect> FindByOrigin(const std::string& origin,
++                                              std::chrono::steady_clock::duration maxAge);
++
++  //! An address whose file is a disc image, though it has not the extension of one
++  static void RememberDiscImage(const std::string& url);
++  static bool IsKnownDiscImage(std::string_view url);
++
++  //! A server that refused a second connection to a file while one was open
++  static void RememberOneConnection(const std::string& host);
++  static bool AllowsOneConnection(const std::string& host);
++  //! The same for an address: its server's, or that of where it redirected to last
++  static bool AllowsOneConnectionFor(const std::string& url);
++
++  //! The MIME types servers give a disc image (ISO 9660 or UDF)
++  static bool IsDiscImageMimeType(std::string_view mimeType);
++
++  //! An address as it is kept: without the options Kodi adds after '|'
++  static std::string Key(std::string_view url);
++  //! An address for the log, without what may hold a token: "https://host/.../name"
++  static std::string ShortForLog(std::string_view url);
++
++  //! For the tests
++  static void Clear();
++};
++} // namespace XFILE
+-- 
+2.53.0
+

@@ -1,0 +1,328 @@
+From 3d32048dfeb48ebf7f80a701b7cd991ff4965256 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 00:24:23 +0000
+Subject: [PATCH] nvkms, nvidia-drm: NV_VRR_ACTIVE, read-only: whether VRR
+ is active on the head
+
+A client that flips with VRR_ENABLED has no way to tell whether VRR is
+active on the head. On other drivers it reads the vblanks of the CRTC
+(drm_crtc_get_sequence): one for each flip with VRR, two or more between
+flips at a fixed refresh. nvidia-drm has no vblanks with its defaults
+(nv_drm_vblank_module_param is off, drm_vblank_init() is not called, and
+DRM_IOCTL_CRTC_GET_SEQUENCE fails with EOPNOTSUPP). Kodi's "Video at its own
+rate with VRR" took that as VRR not on, after 5 s, on every NVIDIA GPU: on
+an RTX 4080 SUPER the VRR packet of the
+output said "VRR on" (the VTEM of 9064) and the flips went with VRR_ENABLED
+1, and Kodi turned VRR off again. Loading nvidia-drm with vblank=1 would
+change the events and the vblank references of every commit, Dolby Vision's
+among them.
+
+NVKMS knows. A flip whose main layer changes sets vrr.active of its api
+head to the allowVrr of that flip (nvSetVrrActive() from nvPreFlip()), but
+only while the device has VRR enabled from its mode set
+(pDevEvo->vrr.enabled: nvEnableVrr(), where some active head has VRR in its
+timings); and SetVrrHwStateOneDisp() puts a hardware head in one-shot mode,
+its refreshes started by the flips, only where its timings have VRR. So
+"VRR active on the head" is pDevEvo->vrr.enabled, vrr.active of the api head
+and timings.vrr.type of the api head other than NVKMS_VRR_TYPE_NONE.
+
+- NVKMS: a Hades dpy attribute, NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE
+  (read-only, the last of the enum): bit 0 that, bits 8-15 the VRR of the
+  timings (0 none, 1 gaming, 2 media); 0 where no head drives the dpy.
+- KAPI: getDisplayVrrActive(), as getDisplayOutputLink() of 9057.
+- nvidia-drm: NV_VRR_ACTIVE, an immutable range property of every CRTC
+  (0..0xffff), set after a commit is applied for each CRTC of it whose mode
+  changed or that has VRR_ENABLED in its old or new state, from the first
+  display of its head; 0 for a CRTC that is off. Nothing is asked of NVKMS
+  for the other commits: nothing of VRR changes in them.
+
+Nothing changes in what goes out. Not in driver 580 (nvidia-legacy-open):
+Maxwell, Pascal and Volta have no HDMI VRR (supportsHDMIVRR is FALSE in
+nvEvo94, nvEvo97 and nvEvoC3, as 9051 says), and Kodi's own-rate video
+fails closed there as before.
+
+Checked: the five modules build against Linux 7.3.5 with the compiler of
+the image, with no new warning; the patch applies with --fuzz=0 after
+9000 to 9078. Not run on a GPU: Kodi's log says what the property gave
+("VRR is on at the output ... (the driver: VRR active on the head
+(NV_VRR_ACTIVE) ...)" or "the driver says that VRR is not active on the
+head").
+---
+ kernel-open/common/inc/nvkms-kapi.h           | 16 ++++++++
+ kernel-open/nvidia-drm/nvidia-drm-crtc.c      |  5 +++
+ kernel-open/nvidia-drm/nvidia-drm-drv.c       | 16 ++++++++
+ kernel-open/nvidia-drm/nvidia-drm-modeset.c   | 34 ++++++++++++++++
+ kernel-open/nvidia-drm/nvidia-drm-priv.h      |  2 +
+ src/nvidia-modeset/interface/nvkms-api.h      | 11 +++++
+ .../kapi/interface/nvkms-kapi.h               | 16 ++++++++
+ src/nvidia-modeset/kapi/src/nvkms-kapi.c      | 14 +++++++
+ src/nvidia-modeset/src/nvkms-attributes.c     | 40 +++++++++++++++++++
+ 9 files changed, 154 insertions(+)
+
+diff --git a/kernel-open/common/inc/nvkms-kapi.h b/kernel-open/common/inc/nvkms-kapi.h
+index 98ab09e..7ba5531 100644
+--- a/kernel-open/common/inc/nvkms-kapi.h
++++ b/kernel-open/common/inc/nvkms-kapi.h
+@@ -1838,6 +1838,22 @@ struct NvKmsKapiFunctionsTable {
+         NvU32 *link
+     );
+ 
++    /*!
++     * Hades: whether VRR is active on the head that drives a display, as NVKMS
++     * has it after its last flip (NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE): bit 0
++     * VRR active (the head runs in one-shot mode, its refreshes started by the
++     * flips); bits 8-15 the VRR of the timings of its mode set, 0 none, 1
++     * gaming, 2 media. 0 where no head drives it.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayVrrActive)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *value
++    );
++
+     /*!
+      * Hades: the passive DisplayPort dual-mode adaptor behind the TMDS output
+      * of a display's connector (NV_KMS_DPY_ATTRIBUTE_HADES_DUAL_MODE_ADAPTOR):
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-crtc.c b/kernel-open/nvidia-drm/nvidia-drm-crtc.c
+index fbe63cb..4c5e96f 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-crtc.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-crtc.c
+@@ -3087,6 +3087,11 @@ static void nv_drm_crtc_install_properties(
+         drm_object_attach_property(
+             &crtc->base, nv_dev->nv_crtc_hades_flip_time_property, 0);
+     }
++    /* Hades: NV_VRR_ACTIVE, on every head */
++    if (nv_dev->nv_crtc_hades_vrr_active_property) {
++        drm_object_attach_property(
++            &crtc->base, nv_dev->nv_crtc_hades_vrr_active_property, 0);
++    }
+     if (nv_dev->hadesSupportsVirtualRefreshRate &&
+         nv_dev->nv_crtc_hades_vrr_media_property &&
+         nv_dev->nv_crtc_hades_vrr_media_target_property) {
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-drv.c b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+index a6b203c..087c456 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-drv.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-drv.c
+@@ -720,6 +720,22 @@ static int nv_drm_create_properties(struct nv_drm_device *nv_dev)
+         return -ENOMEM;
+     }
+ 
++    /*
++     * Hades: NV_VRR_ACTIVE, read-only, on every CRTC: whether VRR is active
++     * on its head as NVKMS has it after the last flip of a commit that asked
++     * for VRR_ENABLED, or stopped asking (bit 0), and the VRR of the timings of
++     * its mode set (bits 8-15: 0 none, 1 gaming, 2 media). See
++     * getDisplayVrrActive() of KAPI. Set where the commit changes the mode of
++     * the CRTC or has VRR_ENABLED in its old or new state; 0 for a CRTC that
++     * is off.
++     */
++    nv_dev->nv_crtc_hades_vrr_active_property =
++        drm_property_create_range(nv_dev->dev, DRM_MODE_PROP_IMMUTABLE,
++                                  "NV_VRR_ACTIVE", 0, 0xffff);
++    if (nv_dev->nv_crtc_hades_vrr_active_property == NULL) {
++        return -ENOMEM;
++    }
++
+     // Dithering mode property
+     nv_dev->nv_connector_dithering_mode_property =
+         drm_property_create_enum(nv_dev->dev, 0,
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-modeset.c b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+index 4367194..31a6f2c 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-modeset.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+@@ -567,6 +567,40 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
+         }
+     }
+ 
++    /*
++     * Hades: NV_VRR_ACTIVE of each CRTC of the commit whose mode changed or
++     * that has VRR_ENABLED in its old or new state: what NVKMS did with VRR in
++     * the flip of this commit (nvSetVrrActive() ran in it), so that a client
++     * that flips with VRR_ENABLED can tell whether VRR is active without
++     * vblanks (nvidia-drm has none with its defaults). Not asked for the
++     * other commits: nothing of VRR changes in them.
++     */
++    if (commit && nv_dev->nv_crtc_hades_vrr_active_property) {
++        for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
++            const struct NvKmsKapiHeadModeSetConfig *head_config =
++                &to_nv_crtc_state(new_crtc_state)->req_config.modeSetConfig;
++            NvU32 value = 0;
++            bool asked = drm_atomic_crtc_needs_modeset(new_crtc_state);
++
++#if defined(NV_DRM_CRTC_STATE_HAS_VRR_ENABLED)
++            asked = asked || old_crtc_state->vrr_enabled ||
++                    new_crtc_state->vrr_enabled;
++#endif
++            if (!asked) {
++                continue;
++            }
++            if (new_crtc_state->active && (head_config->numDisplays > 0) &&
++                !nvKms->getDisplayVrrActive(nv_dev->pDevice,
++                                            head_config->displays[0],
++                                            &value)) {
++                value = 0;
++            }
++            drm_object_property_set_value(&crtc->base,
++                                          nv_dev->nv_crtc_hades_vrr_active_property,
++                                          value);
++        }
++    }
++
+ #if NV_DRM_HADES_BROADCAST_RGB
+     /*
+      * Hades: the RGB range that "Broadcast RGB" gave a head that was set again
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-priv.h b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+index 643e47b..9a8501f 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-priv.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-priv.h
+@@ -218,6 +218,8 @@ struct nv_drm_device {
+     struct drm_property *nv_crtc_hades_flip_time_property;
+     struct drm_property *nv_crtc_hades_vrr_media_property;
+     struct drm_property *nv_crtc_hades_vrr_media_target_property;
++    /* Hades: NV_VRR_ACTIVE, read-only */
++    struct drm_property *nv_crtc_hades_vrr_active_property;
+ 
+     struct drm_property *nv_crtc_color_passthrough_property;
+ 
+diff --git a/src/nvidia-modeset/interface/nvkms-api.h b/src/nvidia-modeset/interface/nvkms-api.h
+index f49b79c..8602633 100644
+--- a/src/nvidia-modeset/interface/nvkms-api.h
++++ b/src/nvidia-modeset/interface/nvkms-api.h
+@@ -2865,6 +2865,17 @@ enum NvKmsDpyAttribute {
+      * Read-only.
+      */
+     NV_KMS_DPY_ATTRIBUTE_HADES_DUAL_MODE_ADAPTOR,
++
++    /*
++     * Hades: whether VRR is active on the head that drives the dpy, as the last
++     * flip of the head left it (nvSetVrrActive()): bit 0 is 1 where the device
++     * has VRR enabled (pDevEvo->vrr.enabled), the head has it active
++     * (apiHeadState vrr.active) and the timings of its mode set have VRR, which
++     * is where SetVrrHwStateOneDisp() puts the head in one-shot mode; bits 8-15
++     * the VRR of those timings, 0 none, 1 gaming, 2 media. 0 where no head
++     * drives the dpy. Read-only.
++     */
++    NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE,
+ };
+ 
+ /*
+diff --git a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+index 98ab09e..7ba5531 100644
+--- a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
++++ b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+@@ -1838,6 +1838,22 @@ struct NvKmsKapiFunctionsTable {
+         NvU32 *link
+     );
+ 
++    /*!
++     * Hades: whether VRR is active on the head that drives a display, as NVKMS
++     * has it after its last flip (NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE): bit 0
++     * VRR active (the head runs in one-shot mode, its refreshes started by the
++     * flips); bits 8-15 the VRR of the timings of its mode set, 0 none, 1
++     * gaming, 2 media. 0 where no head drives it.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getDisplayVrrActive)
++    (
++        struct NvKmsKapiDevice *device,
++        NvKmsKapiDisplay display,
++        NvU32 *value
++    );
++
+     /*!
+      * Hades: the passive DisplayPort dual-mode adaptor behind the TMDS output
+      * of a display's connector (NV_KMS_DPY_ATTRIBUTE_HADES_DUAL_MODE_ADAPTOR):
+diff --git a/src/nvidia-modeset/kapi/src/nvkms-kapi.c b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+index 46f9dec..07dcc18 100644
+--- a/src/nvidia-modeset/kapi/src/nvkms-kapi.c
++++ b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+@@ -1543,6 +1543,19 @@ static NvBool GetDisplayOutputLink(
+                                 NV_KMS_DPY_ATTRIBUTE_HADES_OUTPUT_LINK, link);
+ }
+ 
++/* Hades: NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE; 0 when NVKMS does not say */
++static NvBool GetDisplayVrrActive(
++    struct NvKmsKapiDevice *device,
++    NvKmsKapiDisplay display,
++    NvU32 *value)
++{
++    if (value != NULL) {
++        *value = 0;
++    }
++    return GetHadesDpyAttribute(device, display,
++                                NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE, value);
++}
++
+ /* Hades: NV_KMS_DPY_ATTRIBUTE_HADES_DUAL_MODE_ADAPTOR; 0 when NVKMS does not say */
+ static NvBool GetDisplayDualModeAdaptor(
+     struct NvKmsKapiDevice *device,
+@@ -4614,6 +4627,7 @@ NvBool nvKmsKapiGetFunctionsTableInternal
+     funcsTable->getDisplayColorBpc = GetDisplayColorBpc;
+     funcsTable->getDisplayDdcI2cPort = GetDisplayDdcI2cPort;
+     funcsTable->getDisplayOutputLink = GetDisplayOutputLink;
++    funcsTable->getDisplayVrrActive = GetDisplayVrrActive;
+     funcsTable->getDisplayDualModeAdaptor = GetDisplayDualModeAdaptor;
+     funcsTable->getHdr10PlusRoutes = GetHdr10PlusRoutes;
+ 
+diff --git a/src/nvidia-modeset/src/nvkms-attributes.c b/src/nvidia-modeset/src/nvkms-attributes.c
+index 23b141b..b38ee87 100644
+--- a/src/nvidia-modeset/src/nvkms-attributes.c
++++ b/src/nvidia-modeset/src/nvkms-attributes.c
+@@ -1253,6 +1253,40 @@ static NvBool GetHadesDualModeAdaptor(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue)
+     return TRUE;
+ }
+ 
++/*
++ * Hades: NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE (nvkms-api.h): what the last
++ * flip of the head left (nvSetVrrActive() sets vrr.active of each api head
++ * whose main layer a flip changes, to the allowVrr of that flip, and only
++ * while the device has VRR enabled; SetVrrHwStateOneDisp() puts a head in
++ * one-shot mode only where its timings have VRR).
++ */
++static NvBool GetHadesVrrActive(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue)
++{
++    const NVDispEvoRec *pDispEvo = pDpyEvo->pDispEvo;
++    const NVDevEvoRec *pDevEvo = pDispEvo->pDevEvo;
++    const NvU32 apiHead = pDpyEvo->apiHead;
++    const NVDispApiHeadStateEvoRec *pApiHeadState;
++    NvU32 type;
++
++    *pValue = 0;
++    if (apiHead == NV_INVALID_HEAD) {
++        return TRUE;
++    }
++    pApiHeadState = &pDispEvo->apiHeadState[apiHead];
++    if (nvDpyIdListIsEmpty(pApiHeadState->activeDpys)) {
++        return TRUE;
++    }
++    switch (pApiHeadState->timings.vrr.type) {
++    case NVKMS_VRR_TYPE_GAMING: type = 1; break;
++    case NVKMS_VRR_TYPE_MEDIA: type = 2; break;
++    default: type = 0; break;
++    }
++    *pValue = (NvS64)((type << 8) |
++                      ((pDevEvo->vrr.enabled && pApiHeadState->vrr.active &&
++                        (type != 0)) ? 1 : 0));
++    return TRUE;
++}
++
+ static const struct {
+     NvBool (*set)(NVDpyEvoPtr pDpyEvo, NvS64 value);
+     NvBool (*get)(const NVDpyEvoRec *pDpyEvo, NvS64 *pValue);
+@@ -1465,6 +1499,12 @@ static const struct {
+         .getValidValues = NULL,
+         .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
+     },
++    [NV_KMS_DPY_ATTRIBUTE_HADES_VRR_ACTIVE] = {
++        .set            = NULL,
++        .get            = GetHadesVrrActive,
++        .getValidValues = NULL,
++        .type           = NV_KMS_ATTRIBUTE_TYPE_INTEGER,
++    },
+     [NV_KMS_DPY_ATTRIBUTE_HADES_DUAL_MODE_ADAPTOR] = {
+         .set            = NULL,
+         .get            = GetHadesDualModeAdaptor,

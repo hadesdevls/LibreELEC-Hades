@@ -12,7 +12,7 @@ using System.Text;
 
 namespace Hades.Installer
 {
-    static class VhdTest
+    static partial class VhdTest
     {
         const long VhdMegabytes = 24000;
         static string vhd;
@@ -1082,6 +1082,10 @@ namespace Hades.Installer
                                 check("the system partition of Hades, with the letter " + second + ":, is still found as such", false);
                         }
                     }
+
+                    // ---- Secure Boot: an install with the box ticked, and updates with it and without it, with the request to the firmware going to a firmware
+                    // in memory (the real one is never written by a test). Last, with installs of its own.
+                    SecureBoot(plan, check, say, ref notRun);
                 }
                 catch (Exception e)
                 {

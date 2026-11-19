@@ -26,6 +26,14 @@
  *   is linear over the bits; and each of the 24 bits of a pixel, changed alone in half of the pixels, must
  *   change the CRC, so that no bit is dropped (dropping a bit, as a truncation does, is linear).
  *
+ * Where it breaks: a driver that gives one value per component (amdgpu: red, green, blue) lets the relation be
+ * looked at value by value. The exactness pictures change all three components, so a value that breaks says
+ * that its component of the output is not linear, not from which input. Three more trials change one
+ * component of the input at a time: through a pipe that keeps the components apart (a curve, a range, a
+ * rounding of each), only the value of that component breaks; one that mixes them (a colour conversion)
+ * breaks the values of the others too. The report says both, by the names of the components whose bits
+ * change each value (measured, not assumed).
+ *
  * What it cannot tell: a pipe that swaps bits or always inverts some (linear and keeping every bit) looks
  * exact to it; no display pipe is known to do that. It measures the pipe up to where the driver takes its CRC,
  * not the HDMI encoder, the cable or the display. amdgpu takes it in the output timing generator, after the
@@ -53,12 +61,15 @@ enum oc_kind {
 	OC_E,		/* Z ^ dE: random bits on the pixels of the other half */
 	OC_F,		/* Z ^ dD ^ dE */
 	OC_BIT,		/* Z with one bit of one component changed in a random half of the pixels */
+	OC_ONE_A,	/* Z ^ dA1(channel): random bits of one component only, on every pixel */
+	OC_ONE_B,	/* Z ^ dB1(channel) */
+	OC_ONE_C,	/* Z ^ dA1(channel) ^ dB1(channel) */
 };
 
 struct oc_picture {
 	enum oc_kind kind;
 	unsigned int trial;	/* OC_A, OC_B, OC_C: 0 .. OC_TRIALS - 1 */
-	unsigned int channel;	/* OC_BIT: 0 red, 1 green, 2 blue */
+	unsigned int channel;	/* OC_BIT, OC_ONE_*: 0 red, 1 green, 2 blue */
 	unsigned int bit;	/* OC_BIT: 0 (least significant) .. 7 */
 	unsigned int variant;	/* OC_BIT: 0, or 1 for a second set of pixels */
 };
@@ -81,6 +92,7 @@ struct oc_measure {
 	struct oc_crc a[OC_TRIALS], b[OC_TRIALS], c[OC_TRIALS];
 	struct oc_crc d, e, f;
 	struct oc_crc bits[3][8][2];
+	struct oc_crc one_a[3], one_b[3], one_c[3];	/* one component of the input changed */
 	unsigned int held;		/* pictures held for two frames, each compared with itself */
 	unsigned int held_changes;	/* of them, those whose two frames gave two CRCs */
 };
@@ -107,6 +119,10 @@ struct oc_result {
 	unsigned int trials_failed;	/* of the OC_TRIALS exactness relations */
 	/* for each component, the CRC values (bit i: value i) that its bits changed */
 	uint32_t changed_values[3];
+	/* the values (bit i: value i) where the relation of an exactness trial broke */
+	uint32_t values_broken;
+	/* for each component of the input changed alone, the values where its relation broke */
+	uint32_t channel_broken[3];
 };
 
 void oc_analyse(const struct oc_measure *m, struct oc_result *r);

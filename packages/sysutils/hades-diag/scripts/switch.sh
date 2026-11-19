@@ -19,6 +19,10 @@
 # What the diagnostics do once it is on begins with the next start (start.sh is run before Kodi, and the init keeps
 # the journal of a start in the storage while it is on). Turned off, the diagnostics that are running write nothing
 # more (they look at the switch before each write), and what they saved stays.
+# Once the switch says what was asked for, and the lock is given back, the kernel line of the boot menus is made to say
+# the same (kernel-line.sh: initcall_debug=1 while it is on, 0 while it is off, from the next start). What that says
+# goes to the standard error, which the settings write to kodi.log; its outcome does not change what this says of the
+# switch or its exit status: where it could not be done, the next start does it (hades-diag-kernel-line.service).
 #
 # Exit status:
 #    0  status: told. on, off: the partition says so, looked at again after the change (or did so already)
@@ -59,9 +63,17 @@ LOCK=$RUNDIR/hades-flash.lock
 OFF_COPY=/usr/lib/hades-diag/DIAG-OFF.TXT
 OFF=DIAG-OFF.TXT
 ON=DIAG-ON.TXT
+KERNEL_LINE=/usr/lib/hades-diag/kernel-line.sh
 
 say() {
   echo "switch: $1" >&2
+}
+
+# The kernel line of the boot menus made to say what the switch says (after the lock is given back: internal-disks
+# takes it again)
+kernel_line() {
+  [ -f "$KERNEL_LINE" ] && sh "$KERNEL_LINE" < /dev/null > /dev/null
+  return 0
 }
 
 # How the boot partition is mounted: ro, rw or not-mounted
@@ -207,6 +219,7 @@ change() {
   fi
   if [ "$(state)" = "$want" ]; then
     echo "$want"
+    kernel_line
     exit 0
   fi
   if [ "$want" = off ] && [ -n "$(not_files)" ]; then
@@ -214,7 +227,8 @@ change() {
     exit 20
   fi
 
-  trap 'leave || exit 22' EXIT
+  # (with the switch as asked for, and the partition read-only again and the lock given back: the kernel line)
+  trap 'st=$?; leave || exit 22; [ $st -eq 0 ] && kernel_line; exit $st' EXIT
   trap 'stopped' HUP INT QUIT TERM USR1 USR2 ALRM
   if ! lock; then
     say "something else is writing to $FLASH"

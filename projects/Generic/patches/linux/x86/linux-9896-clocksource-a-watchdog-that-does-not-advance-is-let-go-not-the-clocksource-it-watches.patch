@@ -1,0 +1,484 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:35:32 +0000
+Subject: [PATCH] clocksource: a watchdog that does not advance is let go, not
+ the clocksource it watches
+
+The watchdog compares the advance of a watched clocksource with the advance
+of its watchdog over the same interval, and marks the watched clocksource
+unstable when the two differ by more than the allowed skew. A watchdog that
+stops, or goes backwards, advances by 0 (clocksource_delta() gives 0 for
+both), so the watched clocksource is marked unstable for the fault of its
+watchdog, and the best clocksource left is selected in its place: usually
+that same watchdog.
+
+LibreELEC Hades issue #22 (AMD FX-8350 on a Gigabyte GA-970A-UD3, SB950
+southbridge, Linux 7.3.4), 70 s into a video:
+
+  clocksource: Marking clocksource tsc unstable due to frequency skew
+  clocksource: Watchdog                    hpet interval:                0ns
+  clocksource: Clocksource                  tsc interval:        506659789ns
+  clocksource: Switched to clocksource hpet
+
+From then on the system clock ran at 0.873 of real time: the display showed
+275 frames of a 24.000 Hz mode in each 10 s that Kodi measured, where it had
+shown 240 until that moment, and the gap between two frames, 41.8 ms until
+then, measured 36.5 ms. The sound broke up, and the system hung within a
+few minutes. The TSC was the right one: its refined calibration against the
+same HPET at boot gave 4000.066 MHz (4000.341 MHz by the PIT), and the
+frames kept their 24 Hz while it was the clocksource.
+
+So a watchdog that did not advance at all while the watched clocksource
+advanced by half the watchdog interval or more (WATCHDOG_STOPPED_MIN_NS)
+gives a verdict of its own, WD_FREQ_WATCHDOG_STOPPED:
+- the watchdog is marked unstable, which rates it 0, so that it is never
+  selected again, as the clocksource or as the watchdog
+  (clocksource_select_watchdog() now leaves unstable clocksources out);
+- the watched clocksource keeps its rating;
+- there is no watchdog, and no check, until the kthread selects the next
+  one, which checks the clocksource from new reference readouts on.
+A clocksource that runs at another rate than a watchdog that advances is
+still marked unstable, as before. The check comes after the one of
+max_idle_ns, within which a counter that runs always advances, so a pair
+that works never takes this path; a resume resets the readouts first
+(watchdog_reset_pending), as before.
+
+The kernel log says what was done:
+
+  clocksource: Watchdog hpet did not advance while tsc advanced 506659789ns
+  clocksource: Marking clocksource hpet unstable, not tsc: tsc stays and the next watchdog checks it
+  clocksource: Watchdog acpi_pm checks the clocksources from now on
+
+KUnit tests (CONFIG_CLOCKSOURCE_WATCHDOG_KUNIT_TEST, built into
+clocksource.c) cover the watchdog that stopped and the one that went
+backwards, a pair that works, a clocksource at another rate (still marked),
+the bound of WATCHDOG_STOPPED_MIN_NS and a gap longer than max_idle_ns (a
+reset). Four of the seven fail without the check, and two with the old
+verdict of a skew in its place.
+---
+ kernel/time/clocksource.c                |  79 ++++++++
+ kernel/time/clocksource_watchdog_kunit.c | 231 +++++++++++++++++++++++
+ lib/Kconfig.debug                        |  15 ++
+ 3 files changed, 325 insertions(+)
+ create mode 100644 kernel/time/clocksource_watchdog_kunit.c
+
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index 58c0ca11c..a99191f6e 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -120,6 +120,8 @@ static DECLARE_WORK(watchdog_work, clocksource_watchdog_work);
+ static DEFINE_SPINLOCK(watchdog_lock);
+ static int watchdog_running;
+ static atomic_t watchdog_reset_pending;
++/* A watchdog was found stopped and let go: the kthread selects the next one */
++static bool watchdog_replace;
+ 
+ /* Watchdog interval: 0.5sec. */
+ #define WATCHDOG_INTERVAL		(HZ >> 1)
+@@ -153,6 +155,13 @@ static atomic_t watchdog_reset_pending;
+ /* Number of attempts to read the watchdog */
+ #define WATCHDOG_FREQ_RETRIES		3
+ 
++/*
++ * The least that a watched clocksource must have advanced for a watchdog that
++ * did not advance at all to be taken as stopped: half the watchdog interval,
++ * in which any free-running counter that can be a watchdog moves many times.
++ */
++#define WATCHDOG_STOPPED_MIN_NS		(NSEC_PER_SEC / 4)
++
+ /* Five reads local and remote for inter CPU skew detection */
+ #define WATCHDOG_REMOTE_MAX_SEQ		10
+ 
+@@ -249,6 +258,7 @@ enum wd_result {
+ 	WD_FREQ_TIMEOUT,
+ 	WD_FREQ_RESET,
+ 	WD_FREQ_SKEWED,
++	WD_FREQ_WATCHDOG_STOPPED,
+ 	WD_CPU_TIMEOUT,
+ 	WD_CPU_SKEWED,
+ };
+@@ -504,6 +514,18 @@ static bool watchdog_check_freq(struct clocksource *cs, bool reset_pending)
+ 		if (max_delta > cs->max_idle_ns || max_delta > watchdog->max_idle_ns)
+ 			goto reset;
+ 
++		/*
++		 * A watchdog that did not advance at all while the clocksource
++		 * advanced by a good part of the watchdog interval has stopped
++		 * or gone backwards: clocksource_delta() gives 0 for both, and
++		 * within max_idle_ns a counter that runs gives more. It is no
++		 * reference for the clocksource, which is not judged by it.
++		 */
++		if (!wd_delta && cs_delta >= WATCHDOG_STOPPED_MIN_NS) {
++			watchdog_data.result = WD_FREQ_WATCHDOG_STOPPED;
++			return false;
++		}
++
+ 		/*
+ 		 * Calculate and validate the skew against the allowed PPM
+ 		 * value of the maximum delta plus the watchdog readout
+@@ -584,6 +606,34 @@ static void watchdog_print_freq_skew(struct clocksource *cs)
+ 	pr_warn("Clocksource %20s interval: %16lluns\n", cs->name, watchdog_data.cs_delta);
+ }
+ 
++/*
++ * The watchdog did not advance while @cs did (WD_FREQ_WATCHDOG_STOPPED): the
++ * watchdog is the one that is broken. It is marked unstable, so that it is
++ * never selected again, as the clocksource or as the watchdog, and @cs keeps
++ * its rating; clocksource_watchdog_kthread() selects the next watchdog, which
++ * checks @cs from new reference readouts on. Called with watchdog_lock held.
++ */
++static void watchdog_handle_stopped(struct clocksource *cs)
++{
++	struct clocksource *wd = watchdog;
++
++	pr_warn("Watchdog %s did not advance while %s advanced %lluns\n",
++		wd->name, cs->name, watchdog_data.cs_delta);
++	pr_warn("Marking clocksource %s unstable, not %s: %s stays and the next watchdog checks it\n",
++		wd->name, cs->name, cs->name);
++
++	cs->flags &= ~CLOCK_SOURCE_WATCHDOG;
++
++	/* As clocksource_mark_unstable() does, so that the kthread rates it 0 */
++	if (!list_empty(&wd->list) && list_empty(&wd->wd_list))
++		list_add(&wd->wd_list, &watchdog_list);
++	__clocksource_unstable(wd);
++
++	/* No watchdog, and no check, until the kthread selects the next one */
++	watchdog = NULL;
++	watchdog_replace = true;
++}
++
+ static void watchdog_handle_remote_timeout(struct clocksource *cs)
+ {
+ 	pr_info_once("Watchdog remote CPU %u read timed out\n", watchdog_data.curr_cpu);
+@@ -627,6 +677,10 @@ static void watchdog_check_result(struct clocksource *cs)
+ 		watchdog_print_freq_skew(cs);
+ 		break;
+ 
++	case WD_FREQ_WATCHDOG_STOPPED:
++		watchdog_handle_stopped(cs);
++		return;
++
+ 	case WD_CPU_TIMEOUT:
+ 		/* Remote check timed out. Try again next cycle. */
+ 		watchdog_handle_remote_timeout(cs);
+@@ -744,6 +798,10 @@ static void clocksource_select_watchdog(bool fallback)
+ 		if (fallback && cs == old_wd)
+ 			continue;
+ 
++		/* Nor one that was found broken (watchdog_handle_stopped()) */
++		if (cs->flags & CLOCK_SOURCE_UNSTABLE)
++			continue;
++
+ 		/* Pick the best watchdog. */
+ 		if (!watchdog || cs->rating > watchdog->rating)
+ 			watchdog = cs;
+@@ -777,6 +835,7 @@ static int __clocksource_watchdog_kthread(void)
+ {
+ 	struct clocksource *cs, *tmp;
+ 	unsigned long flags;
++	bool replace;
+ 	int select = 0;
+ 
+ 	spin_lock_irqsave(&watchdog_lock, flags);
+@@ -791,10 +850,26 @@ static int __clocksource_watchdog_kthread(void)
+ 			select = 1;
+ 		}
+ 	}
++	replace = watchdog_replace;
++	watchdog_replace = false;
+ 	/* Check if the watchdog timer needs to be stopped. */
+ 	clocksource_stop_watchdog();
+ 	spin_unlock_irqrestore(&watchdog_lock, flags);
+ 
++	/* A watchdog found stopped is rated 0 now: the next one takes its place */
++	if (replace) {
++		struct clocksource *wd;
++
++		clocksource_select_watchdog(false);
++		spin_lock_irqsave(&watchdog_lock, flags);
++		wd = watchdog;
++		if (wd)
++			pr_info("Watchdog %s checks the clocksources from now on\n", wd->name);
++		else
++			pr_warn("No other clocksource can be the watchdog: the clocksources are not checked any more\n");
++		spin_unlock_irqrestore(&watchdog_lock, flags);
++	}
++
+ 	return select;
+ }
+ 
+@@ -1614,3 +1689,7 @@ static int __init boot_override_clock(char* str)
+ }
+ 
+ __setup("clock=", boot_override_clock);
++
++#if defined(CONFIG_CLOCKSOURCE_WATCHDOG) && defined(CONFIG_CLOCKSOURCE_WATCHDOG_KUNIT_TEST)
++#include "clocksource_watchdog_kunit.c"
++#endif
+diff --git a/kernel/time/clocksource_watchdog_kunit.c b/kernel/time/clocksource_watchdog_kunit.c
+new file mode 100644
+index 000000000..cf5e9d6c7
+--- /dev/null
++++ b/kernel/time/clocksource_watchdog_kunit.c
+@@ -0,0 +1,231 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * KUnit tests for the verdicts of the clocksource watchdog, built into
++ * clocksource.c (CONFIG_CLOCKSOURCE_WATCHDOG_KUNIT_TEST).
++ *
++ * A clocksource of 1 GHz is watched by a 32-bit watchdog of 14.31818 MHz, the
++ * pair of an x86 TSC and HPET; neither is registered, and the watchdog of the
++ * system is put back after each test. The readouts are set by the tests.
++ */
++#include <kunit/test.h>
++
++#define WDK_WD_HZ	14318180U
++#define WDK_HALF_S	(NSEC_PER_SEC / 2)
++
++static u64 wdk_wd_count;
++static u64 wdk_cs_count;
++
++static u64 wdk_wd_read(struct clocksource *cs)
++{
++	return wdk_wd_count;
++}
++
++static u64 wdk_cs_read(struct clocksource *cs)
++{
++	return wdk_cs_count;
++}
++
++static struct clocksource wdk_wd = {
++	.name	= "wdk-wd",
++	.read	= wdk_wd_read,
++	.mask	= CLOCKSOURCE_MASK(32),
++};
++
++static struct clocksource wdk_cs = {
++	.name	= "wdk-cs",
++	.read	= wdk_cs_read,
++	.mask	= CLOCKSOURCE_MASK(64),
++};
++
++static struct clocksource *wdk_saved_watchdog;
++
++/* The watchdog ticks of @ns at WDK_WD_HZ */
++static u64 wdk_wd_ticks(u64 ns)
++{
++	return div_u64(ns * WDK_WD_HZ, NSEC_PER_SEC);
++}
++
++static int wdk_init(struct kunit *test)
++{
++	unsigned long flags;
++
++	wdk_wd.rating = 250;
++	wdk_wd.flags = CLOCK_SOURCE_IS_CONTINUOUS;
++	wdk_cs.rating = 300;
++	wdk_cs.flags = CLOCK_SOURCE_IS_CONTINUOUS | CLOCK_SOURCE_MUST_VERIFY;
++	__clocksource_update_freq_scale(&wdk_wd, 1, WDK_WD_HZ);
++	__clocksource_update_freq_scale(&wdk_cs, 1, NSEC_PER_SEC);
++	INIT_LIST_HEAD(&wdk_wd.list);
++	INIT_LIST_HEAD(&wdk_wd.wd_list);
++	INIT_LIST_HEAD(&wdk_cs.list);
++	INIT_LIST_HEAD(&wdk_cs.wd_list);
++	wdk_wd_count = 0x80000000ULL;
++	wdk_cs_count = 1000000000ULL;
++
++	spin_lock_irqsave(&watchdog_lock, flags);
++	wdk_saved_watchdog = watchdog;
++	watchdog = &wdk_wd;
++	spin_unlock_irqrestore(&watchdog_lock, flags);
++	return 0;
++}
++
++static void wdk_exit(struct kunit *test)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&watchdog_lock, flags);
++	watchdog = wdk_saved_watchdog;
++	watchdog_replace = false;
++	spin_unlock_irqrestore(&watchdog_lock, flags);
++}
++
++/* One run of the watchdog over wdk_cs, as clocksource_watchdog() makes it */
++static bool wdk_check(enum wd_result *result)
++{
++	bool ok;
++
++	/* (in softirq context there; its readouts disable interrupts themselves) */
++	spin_lock_bh(&watchdog_lock);
++	ok = watchdog_check_freq(&wdk_cs, false);
++	*result = watchdog_data.result;
++	spin_unlock_bh(&watchdog_lock);
++	return ok;
++}
++
++/* The first run takes the reference readouts */
++static void wdk_first_run(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_cs.flags &= ~CLOCK_SOURCE_WATCHDOG;
++
++	KUNIT_ASSERT_FALSE(test, wdk_check(&result));
++	KUNIT_ASSERT_EQ(test, result, WD_FREQ_RESET);
++}
++
++/* The verdict of a run whose readouts advanced by @wd_ns and @cs_ns */
++static bool wdk_run(struct kunit *test, u64 wd_ns, u64 cs_ns, enum wd_result *result)
++{
++	wdk_wd_count = (wdk_wd_count + wdk_wd_ticks(wd_ns)) & wdk_wd.mask;
++	wdk_cs_count += cs_ns;
++	return wdk_check(result);
++}
++
++static void wdk_handle(void)
++{
++	spin_lock_bh(&watchdog_lock);
++	watchdog_check_result(&wdk_cs);
++	spin_unlock_bh(&watchdog_lock);
++}
++
++/* Issue #22: the HPET read the same 0.5 s apart, and the TSC was marked unstable for it */
++static void wdk_stopped_watchdog_is_let_go(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, 506659789, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_WATCHDOG_STOPPED);
++
++	wdk_handle();
++	KUNIT_EXPECT_FALSE(test, wdk_cs.flags & CLOCK_SOURCE_UNSTABLE);
++	KUNIT_EXPECT_EQ(test, wdk_cs.rating, 300);
++	KUNIT_EXPECT_TRUE(test, wdk_wd.flags & CLOCK_SOURCE_UNSTABLE);
++	KUNIT_EXPECT_EQ(test, wdk_wd.rating, 0);
++	KUNIT_EXPECT_NULL(test, watchdog);
++	KUNIT_EXPECT_TRUE(test, watchdog_replace);
++	/* The next check of the clocksource starts from new reference readouts */
++	KUNIT_EXPECT_FALSE(test, wdk_cs.flags & CLOCK_SOURCE_WATCHDOG);
++}
++
++/* A watchdog that went backwards is let go the same way */
++static void wdk_backwards_watchdog_is_let_go(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	wdk_wd_count -= 1000;
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, WDK_HALF_S, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_WATCHDOG_STOPPED);
++}
++
++/* With no watchdog, nothing is checked and nothing is marked */
++static void wdk_no_watchdog_checks_nothing(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	wdk_run(test, 0, WDK_HALF_S, &result);
++	wdk_handle();
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, WDK_HALF_S, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_NO_WATCHDOG);
++	KUNIT_EXPECT_FALSE(test, wdk_cs.flags & CLOCK_SOURCE_UNSTABLE);
++}
++
++/* A pair that runs at the same rate passes, as before */
++static void wdk_healthy_pair_passes(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	KUNIT_EXPECT_TRUE(test, wdk_run(test, WDK_HALF_S, WDK_HALF_S, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_SUCCESS);
++	KUNIT_EXPECT_TRUE(test, wdk_run(test, WDK_HALF_S, WDK_HALF_S, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_SUCCESS);
++}
++
++/* A clocksource at another rate than a watchdog that advances is still the one marked */
++static void wdk_skewed_clocksource_is_still_marked(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, WDK_HALF_S, WDK_HALF_S + WDK_HALF_S / 5, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_SKEWED);
++	/* ... and a watchdog that advances a little is not taken as stopped */
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, NSEC_PER_MSEC, WDK_HALF_S, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_SKEWED);
++}
++
++/* Below WATCHDOG_STOPPED_MIN_NS of the clocksource a still watchdog is not judged stopped */
++static void wdk_short_interval_is_not_a_stop(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, WATCHDOG_STOPPED_MIN_NS - 1, &result));
++	KUNIT_EXPECT_NE(test, result, WD_FREQ_WATCHDOG_STOPPED);
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, WATCHDOG_STOPPED_MIN_NS, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_WATCHDOG_STOPPED);
++}
++
++/* A run whose readouts are further apart than the watchdog can tell is a reset, as before */
++static void wdk_long_gap_is_a_reset(struct kunit *test)
++{
++	enum wd_result result;
++
++	wdk_first_run(test);
++	KUNIT_EXPECT_FALSE(test, wdk_run(test, 0, wdk_wd.max_idle_ns + NSEC_PER_SEC, &result));
++	KUNIT_EXPECT_EQ(test, result, WD_FREQ_RESET);
++}
++
++static struct kunit_case clocksource_watchdog_cases[] = {
++	KUNIT_CASE(wdk_stopped_watchdog_is_let_go),
++	KUNIT_CASE(wdk_backwards_watchdog_is_let_go),
++	KUNIT_CASE(wdk_no_watchdog_checks_nothing),
++	KUNIT_CASE(wdk_healthy_pair_passes),
++	KUNIT_CASE(wdk_skewed_clocksource_is_still_marked),
++	KUNIT_CASE(wdk_short_interval_is_not_a_stop),
++	KUNIT_CASE(wdk_long_gap_is_a_reset),
++	{}
++};
++
++static struct kunit_suite clocksource_watchdog_suite = {
++	.name		= "clocksource_watchdog",
++	.init		= wdk_init,
++	.exit		= wdk_exit,
++	.test_cases	= clocksource_watchdog_cases,
++};
++kunit_test_suite(clocksource_watchdog_suite);
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 6b24a2c89..2557194a6 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -3370,6 +3370,21 @@ config TEST_FPU
+ 
+ 	  If unsure, say N.
+ 
++config CLOCKSOURCE_WATCHDOG_KUNIT_TEST
++	bool "KUnit tests for the verdicts of the clocksource watchdog" if !KUNIT_ALL_TESTS
++	depends on KUNIT=y
++	select CLOCKSOURCE_WATCHDOG
++	default KUNIT_ALL_TESTS
++	help
++	  Builds into kernel/time/clocksource.c the KUnit tests of the
++	  verdicts that the clocksource watchdog draws from the readouts of
++	  a watched clocksource and of its watchdog: a watchdog that stopped
++	  or went backwards is let go, and the clocksource is not marked
++	  unstable because of it; a clocksource that runs at another rate
++	  than a watchdog that advances is still marked unstable.
++
++	  If unsure, say N.
++
+ config TEST_CLOCKSOURCE_WATCHDOG
+ 	tristate "Test clocksource watchdog in kernel space"
+ 	depends on CLOCKSOURCE_WATCHDOG
+-- 
+2.53.0
+

@@ -1,0 +1,256 @@
+From 07acaf0643e0ea4225d1a2e84e6881e390f66841 Mon Sep 17 00:00:00 2001
+From: Ryan Hooper <ryanh@openssl.foundation>
+Date: Wed, 23 Sep 2026 16:02:21 -0400
+Subject: [PATCH] DTLS 1.3: Retire a CertificateRequest on completion, not by
+ acking it
+
+dtls1_stop_timer_for_read_flight() had no case for TLS_ST_SR_FINISHED,
+so completing post-handshake authentication by processing the
+client's Certificate and Finished fell through to the unconditional
+clear at the bottom of the function, discarding any other, unrelated
+flight that happened to still be outstanding at the same time, such
+as a NewSessionTicket whose ACK was lost.
+
+Simply adding TLS_ST_SR_FINISHED to the existing "keep whatever is
+still unacknowledged" gate is not enough: a CertificateRequest is
+never acknowledged by an ACK record at all. RFC9147 section 5.8.1
+lets WAITING end either on an ACK or on receiving the next flight,
+and a CertificateRequest relies solely on the latter -- the client's
+Certificate and Finished. Treating it the same as a message that
+becomes acknowledged the normal way would keep it queued, and
+retransmitted, forever.
+
+Add dtls1_retire_sent_certificate_request_messages(), which removes
+any queued CertificateRequest unconditionally on TLS_ST_SR_FINISHED,
+before the existing gate decides whether anything else still needs
+to be preserved. Gate the "something else may still be outstanding"
+path on having actually retired one, so the ordinary end of the
+initial handshake -- which also reaches TLS_ST_SR_FINISHED, but has
+no CertificateRequest to retire -- keeps going through the
+unconditional clear exactly as before.
+
+Also fix pqueue_insert(): inserting into an empty queue left the new
+head's next pointer unchanged instead of clearing it, so a later
+insert could walk into a stale, dangling pointer left over from an
+earlier, freed item. This was latent until
+dtls1_retire_sent_certificate_request_messages() started freeing and
+reinserting items in the same pass, which surfaced it as a hang.
+
+Fixes: #32878
+Assisted-by: Claude:claude-sonnet-5
+Reviewed-by: Tomas Mraz <tomas@openssl.foundation>
+Reviewed-by: Matt Caswell <matt@openssl.foundation>
+Merge-date: Fri Nov 13 17:22:22 2026
+Merged-from: https://github.com/openssl/openssl/pull/32934
+(cherry picked from commit bdbcfcbbbe957a6b56142080ea03c167e6978732)
+---
+ ssl/d1_lib.c                |  65 ++++++++++++++++++++---
+ test/dtls13_internal_test.c | 102 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 159 insertions(+), 8 deletions(-)
+
+diff --git a/ssl/d1_lib.c b/ssl/d1_lib.c
+index cdbe5cd..76f9edf 100644
+--- a/ssl/d1_lib.c
++++ b/ssl/d1_lib.c
+@@ -288,6 +288,47 @@ void dtls1_clear_sent_buffer(SSL_CONNECTION *s, int keep_unacked_msgs)
+             pqueue_insert(&s->d1->sent_messages, item);
+ }
+ 
++/*
++ * Retire every queued CertificateRequest regardless of acknowledgment
++ * status, and report whether any was found. A CertificateRequest never
++ * receives an explicit ACK (rfc9147 5.8.1: receiving the next flight, not
++ * just an ACK, ends WAITING) -- the client's Finished is that next flight,
++ * and completes it implicitly. Entries of any other type are left
++ * untouched.
++ */
++static int dtls1_retire_sent_certificate_request_messages(SSL_CONNECTION *s)
++{
++    pitem *item = NULL;
++    pqueue *remaining_sent_messages = pqueue_new();
++    pqueue *sent_messages = &s->d1->sent_messages;
++    int retired = 0;
++
++    while ((item = pqueue_pop(sent_messages)) != NULL) {
++        dtls_sent_msg *sent_msg = (dtls_sent_msg *)item->data;
++
++        if (sent_msg->msg_info.msg_type != SSL3_MT_CERTIFICATE_REQUEST) {
++            pqueue_insert(remaining_sent_messages, item);
++            continue;
++        }
++
++        if (sent_msg->saved_retransmit_state.wrlmethod != NULL
++            && s->rlayer.wrl != sent_msg->saved_retransmit_state.wrl
++            && !dtls1_wrl_has_other_owner(sent_msg->saved_retransmit_state.wrl,
++                sent_messages, remaining_sent_messages))
++            sent_msg->saved_retransmit_state.wrlmethod->free(sent_msg->saved_retransmit_state.wrl);
++
++        dtls1_sent_msg_free(sent_msg);
++        pitem_free(item);
++        retired = 1;
++    }
++
++    while ((item = pqueue_pop(remaining_sent_messages)) != NULL)
++        pqueue_insert(sent_messages, item);
++
++    pqueue_free(remaining_sent_messages);
++    return retired;
++}
++
+ /*
+  * Before RECORD_LAYER_clear() frees s->rlayer.wrl, null out any
+  * saved_retransmit_state.wrl pointers in the sent_messages queue that
+@@ -635,17 +676,25 @@ void dtls1_stop_timer(SSL_CONNECTION *s)
+ }
+ 
+ /*
+- * Retire the timer and the retransmit buffer now that we have finished
+- * reading a flight.
+- *
+- * rfc9147: section 5.8.4. Each category of post-handshake message has its own
+- * reliability state machine. A KeyUpdate or NewSessionTicket from the peer
+- * acknowledges nothing of ours, so if our own post-handshake flight is still
+- * missing an ACK we must keep it buffered and leave its retransmit timer
+- * running. Fully acknowledged messages are still released.
++ * Retire the timer and retransmit buffer now that a flight has finished
++ * reading. Post-handshake message categories acknowledge nothing of each
++ * other (rfc9147 5.8.4), so an unrelated message must not discard our own
++ * still-unacknowledged flight. A CertificateRequest is retired here
++ * explicitly, since it completes via the next flight rather than an ACK
++ * (rfc9147 5.8.1); every other occurrence of TLS_ST_SR_FINISHED, including
++ * ordinary handshake completion, still falls through to the unconditional
++ * clear below.
+  */
+ void dtls1_stop_timer_for_read_flight(SSL_CONNECTION *s)
+ {
++    if (SSL_CONNECTION_IS_DTLS13(s)
++        && s->statem.hand_state == TLS_ST_SR_FINISHED
++        && dtls1_retire_sent_certificate_request_messages(s)
++        && dtls_any_sent_messages_are_missing_acknowledge(s)) {
++        dtls1_clear_sent_buffer(s, 1);
++        return;
++    }
++
+     if (SSL_CONNECTION_IS_DTLS13(s)
+         && (s->statem.hand_state == TLS_ST_SR_KEY_UPDATE
+             || s->statem.hand_state == TLS_ST_CR_KEY_UPDATE
+diff --git a/test/dtls13_internal_test.c b/test/dtls13_internal_test.c
+index 3366ad4..7fe13c1 100644
+--- a/test/dtls13_internal_test.c
++++ b/test/dtls13_internal_test.c
+@@ -4189,6 +4189,107 @@ end:
+     SSL_CTX_free(cctx);
+     return testresult;
+ }
++
++/*
++ * If the server sends a CertificateRequest followed by a ticket that gets
++ * lost, the client's next flight -- Certificate and Finished -- implicitly
++ * acks only the request. Processing that flight must retire the request,
++ * but must not also discard the unrelated, still unacknowledged ticket or
++ * stop its retransmission.
++ */
++static int test_dtls13_cert_req_finished_preserves_ticket(void)
++{
++    SSL_CTX *sctx = NULL, *cctx = NULL;
++    SSL *server = NULL, *client = NULL;
++    SSL_CONNECTION *sc;
++    dtls_sent_msg *msg;
++    piterator iter;
++    pitem *item;
++    unsigned char buf[2048];
++    int ret, dropped, found, testresult = 0;
++
++    ticket_count = 0;
++    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
++            DTLS_client_method(), DTLS1_3_VERSION, DTLS1_3_VERSION,
++            &sctx, &cctx, cert, privkey))
++        || !TEST_true(SSL_CTX_set_num_tickets(sctx, 0)))
++        goto end;
++    SSL_CTX_set_post_handshake_auth(cctx, 1);
++    SSL_CTX_set_session_cache_mode(cctx, SSL_SESS_CACHE_CLIENT);
++    SSL_CTX_sess_set_new_cb(cctx, count_ticket);
++    if (!TEST_true(create_ssl_objects(sctx, cctx, &server, &client, NULL, NULL))
++        || !TEST_true(create_ssl_connection(server, client, SSL_ERROR_NONE)))
++        goto end;
++    sc = SSL_CONNECTION_FROM_SSL(server);
++
++    /* Request PHA first; the client answers it before the ticket exists. */
++    SSL_set_verify(server, SSL_VERIFY_PEER, NULL);
++    if (!TEST_true(SSL_verify_client_post_handshake(server))
++        || !TEST_int_eq(SSL_do_handshake(server), 1)
++        || !TEST_size_t_eq(pqueue_size(&sc->d1->sent_messages), 1))
++        goto end;
++
++    /* The client answers the CertificateRequest with Certificate+Finished. */
++    ret = SSL_read(client, buf, 1);
++    if (!TEST_int_eq(SSL_get_error(client, ret), SSL_ERROR_WANT_READ))
++        goto end;
++
++    /*
++     * Now send a ticket -- sequenced after the CertificateRequest -- and
++     * lose it before the client ever sees it.
++     */
++    if (!TEST_true(SSL_new_session_ticket(server))
++        || !TEST_int_eq(SSL_do_handshake(server), 1)
++        || !TEST_size_t_eq(pqueue_size(&sc->d1->sent_messages), 2))
++        goto end;
++    dropped = 0;
++    while (BIO_read(SSL_get_rbio(client), buf, sizeof(buf)) > 0)
++        dropped++;
++    if (!TEST_int_gt(dropped, 0))
++        goto end;
++
++    /*
++     * The server processes the client's response. This must retire the
++     * CertificateRequest, but must not touch the still-unacknowledged,
++     * unrelated ticket.
++     */
++    ret = SSL_read(server, buf, 1);
++    if (!TEST_int_eq(SSL_get_error(server, ret), SSL_ERROR_WANT_READ)
++        || !TEST_int_eq(sc->post_handshake_auth, SSL_PHA_EXT_RECEIVED)
++        || !TEST_size_t_eq(pqueue_size(&sc->d1->sent_messages), 1)
++        || !TEST_false(ossl_time_is_zero(sc->d1->next_timeout)))
++        goto end;
++    found = 0;
++    iter = pqueue_iterator(&sc->d1->sent_messages);
++    while ((item = pqueue_next(&iter)) != NULL) {
++        msg = item->data;
++
++        if (msg->msg_info.msg_type == SSL3_MT_NEWSESSION_TICKET)
++            found++;
++    }
++    if (!TEST_int_eq(found, 1))
++        goto end;
++
++    /*
++     * Confirm the surviving entry is a genuinely live retransmit, not just
++     * an uncollected leftover: force it and let the client process it.
++     */
++    sc->d1->next_timeout = ossl_time_subtract(ossl_time_now(), ossl_seconds2time(1));
++    if (!TEST_int_gt(DTLSv1_handle_timeout(server), 0))
++        goto end;
++    ret = SSL_read(client, buf, 1);
++    if (!TEST_int_eq(SSL_get_error(client, ret), SSL_ERROR_WANT_READ)
++        || !TEST_int_eq(ticket_count, 1))
++        goto end;
++
++    testresult = 1;
++end:
++    SSL_free(server);
++    SSL_free(client);
++    SSL_CTX_free(sctx);
++    SSL_CTX_free(cctx);
++    return testresult;
++}
+ #endif /* OPENSSL_NO_DTLS1_3 */
+ 
+ int setup_tests(void)
+@@ -4231,6 +4332,7 @@ int setup_tests(void)
+     ADD_ALL_TESTS(test_dtls13_keyupdate_preserves_flight, 2);
+     ADD_TEST(test_dtls13_cert_req_preserves_flight);
+     ADD_ALL_TESTS(test_dtls13_pha_keyupdate_shared_wrl, 2);
++    ADD_TEST(test_dtls13_cert_req_finished_preserves_ticket);
+ #endif
+     return 1;
+ }

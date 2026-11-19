@@ -54,6 +54,10 @@ int main()
   Check(!CHdmiVrrOff::Wanted(true, true, true, true, 2160, 0), "Wanted: no refresh");
   Check(!CHdmiVrrOff::Wanted(true, true, true, true, -1, 60000), "Wanted: negative lines");
   Check(!CHdmiVrrOff::Wanted(true, true, true, true, 2160, -50000), "Wanted: negative refresh");
+  // (fixA) where the driver has a slot for HDR10+ next to the EMP of HDMI VRR (NV_HDR10PLUS_WITH_VRR, 9082):
+  // never, which keeps VRR for the video; without it, as before
+  Check(!CHdmiVrrOff::Wanted(true, true, true, true, 2160, 60000, true), "Wanted: HDR10+ has a slot next to the EMP");
+  Check(CHdmiVrrOff::Wanted(true, true, true, true, 2160, 60000, false), "Wanted: Turing and Ampere, as before");
   // every one of the 64 combinations of the four booleans and the two limits: wanted only when all hold
   for (int m = 0; m < 64; ++m)
   {

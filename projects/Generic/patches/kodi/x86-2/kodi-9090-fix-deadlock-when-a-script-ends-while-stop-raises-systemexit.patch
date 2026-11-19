@@ -1,0 +1,123 @@
+From f7a8de51339615e094f0c256d9a265bbbe67e961 Mon Sep 17 00:00:00 2001
+From: Kel Modderman <kelvmod@gmail.com>
+Date: Sun, 1 Nov 2026 20:09:30 +1000
+Subject: [PATCH] Fix deadlock when a script ends while stop() raises
+ SystemExit
+
+CPythonInvoker::stop() raises SystemExit in a script that didn't stop in
+5 seconds. It released m_critical to take the GIL, then took m_critical
+back while holding the GIL, but onExecutionDone() takes m_critical first
+and then the GIL. A script that ended just as stop() gave up waiting for
+it could leave the two waiting for each other. stop() runs with
+CScriptInvocationManager's lock held, so the main thread then blocks in
+CScriptInvocationManager::Process() and Kodi's GUI freezes. Disabling an
+add-on whose service is just ending is enough to get there.
+
+stop() no longer takes m_critical back. Without it, onExecutionDone()
+could end the script's interpreter while stop() is still waiting for the
+GIL with a thread state of that interpreter, which ending it frees on
+Python 3.14. So stop() counts its thread state while it exists, and
+onExecutionDone() waits for the count to drop before it ends the
+interpreter, then drops a SystemExit queued for its own thread, as the
+script has already ended.
+
+Assisted-by: Claude
+(cherry picked from commit 662fefd4dd6bb492fba0925e1a03eadf09e70bbf)
+(cherry picked from commit e8f012a0ee54acb413e1be4caf5a65f47afc33d5)
+---
+ xbmc/interfaces/python/PythonInvoker.cpp | 34 ++++++++++++++++++------
+ xbmc/interfaces/python/PythonInvoker.h   |  2 ++
+ 2 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/xbmc/interfaces/python/PythonInvoker.cpp b/xbmc/interfaces/python/PythonInvoker.cpp
+index aac5253..78a13c7 100644
+--- a/xbmc/interfaces/python/PythonInvoker.cpp
++++ b/xbmc/interfaces/python/PythonInvoker.cpp
+@@ -541,22 +541,27 @@ bool CPythonInvoker::stop(bool abort)
+ 
+     // Since we released the m_critical it's possible that the state is cleaned up
+     // so we need to recheck for m_threadState == NULL
++    PyThreadState* ts = nullptr;
+     if (m_threadState != NULL && !python.IsGilLost())
+     {
+-      PyThreadState* ts = PyThreadState_New(m_threadState->interp);
++      ts = PyThreadState_New(m_threadState->interp);
+       if (ts == nullptr)
+       {
+         CLog::LogF(LOGERROR, "({}, {}) PyThreadState_New failed", GetId(), m_sourceFile);
+         return false;
+       }
++      // onExecutionDone() waits for it before ending the interpreter, which would free ts
++      ++m_raisingExit;
++    }
++    // grabbing the GIL while holding m_critical is asking for a deadlock, and so is taking
++    // m_critical back while holding the GIL: onExecutionDone() takes m_critical, then the GIL
++    lock.unlock();
+ 
+-      {
+-        // grabbing the PyLock while holding the m_critical is asking for a deadlock
+-        CSingleExit ex2(m_critical);
+-        PyEval_RestoreThread(ts);
+-      }
++    if (ts != nullptr)
++    {
++      PyEval_RestoreThread(ts);
+ 
+-      PyThreadState* state = PyInterpreterState_ThreadHead(m_threadState->interp);
++      PyThreadState* state = PyInterpreterState_ThreadHead(ts->interp);
+       while (state)
+       {
+         // Raise a SystemExit exception in python threads; writing async_exc directly goes
+@@ -571,8 +576,8 @@ bool CPythonInvoker::stop(bool abort)
+ 
+       PyThreadState_Clear(ts);
+       PyThreadState_DeleteCurrent();
++      --m_raisingExit;
+     }
+-    lock.unlock();
+ 
+     setState(InvokerStateFailed);
+   }
+@@ -590,6 +595,19 @@ void CPythonInvoker::onExecutionDone()
+ 
+     PyEval_RestoreThread(m_threadState);
+ 
++    // let stop() finish with its thread state of this interpreter before ending it; a
++    // SystemExit it raised in this thread has nothing left to stop
++    if (m_raisingExit > 0)
++      CLog::Log(LOGDEBUG, "CPythonInvoker({}, {}): waiting for stop() to raise SystemExit", GetId(),
++                m_sourceFile);
++    while (m_raisingExit > 0)
++    {
++      PyEval_SaveThread();
++      KODI::TIME::Sleep(1ms);
++      PyEval_RestoreThread(m_threadState);
++    }
++    PyThreadState_SetAsyncExc(m_threadState->thread_id, nullptr);
++
+     onDeinitialization();
+ 
+     // Clear any lingering Python error state early, so it cannot affect
+diff --git a/xbmc/interfaces/python/PythonInvoker.h b/xbmc/interfaces/python/PythonInvoker.h
+index bd6f36d..8ca8d4d 100644
+--- a/xbmc/interfaces/python/PythonInvoker.h
++++ b/xbmc/interfaces/python/PythonInvoker.h
+@@ -14,6 +14,7 @@
+ #include "threads/CriticalSection.h"
+ #include "threads/Event.h"
+ 
++#include <atomic>
+ #include <map>
+ #include <string>
+ #include <vector>
+@@ -63,6 +64,7 @@ private:
+   PyThreadState* m_threadState;
+   PyThreadState* m_mainThreadState{nullptr};
+   bool m_stop = false;
++  std::atomic<int> m_raisingExit{0}; // stop() thread states in this interpreter
+   CEvent m_stoppedEvent;
+ 
+   XBMCAddon::AddonClass::Ref<XBMCAddon::Python::PythonLanguageHook> m_languageHook;
+-- 
+2.53.0
+

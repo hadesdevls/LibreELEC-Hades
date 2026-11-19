@@ -1,0 +1,440 @@
+From 16b3c914ffc9793d56d9bc04c3c78f45657e8da9 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 03:36:46 +0000
+Subject: [PATCH] filesystem: the UDF volume of an image on the network is kept
+ a minute after its last reader and read in pieces
+
+Opening a disc image mounts its UDF volume again and again, each from a reader
+of its own: whether it is a Blu-ray, the list of its titles, the player (seven
+mounts in one opening, measured by bd4 of 1.0). Over the network every mount
+is a dozen reads of the image, each a request to the server; the list of
+titles of an image from a streaming service read it all again.
+
+CUDFContext now keeps the volume of an image that is not on a local disk
+mounted for 60 s after its last holder lets go, and the next holder within
+that time takes it as it is (one INFO line). Nothing of the image is held
+meanwhile: CUDFBlockInput::Suspend() closes the image (no connection to the
+server, no handle on a file), and its next read opens it again. That answers
+what had kept this for after 1.0 (it touched Kodi's shutdown with an HTTP
+connection open, and a source that allows one connection): no connection
+stays open, and a volume left at shutdown has no file to close. One volume is
+kept at a time; a local image is as before.
+
+The readers of a volume read a block or a few at a time, and two of them can
+take turns at two places of the image: measured while a Blu-ray image of
+173 MB opened in a VM, 2 KiB at each turn. With two connections to the server
+CCurlFile kept one at each place; from a server that allows one connection
+(CCurlFile then reads a file over one), every turn was a new request: 325
+requests and 29 s to open it (over two connections it had taken 54 requests
+and 5 s). CUDFBlockInput now reads such an image in pieces of 128 KiB and
+keeps the last eight (1 MiB, taken as they are read); a read of fewer bytes is
+answered from them, and a piece that came short is used for that read only.
+A larger read, and an image on a local disk, are read as before. One INFO
+line when an image is read so, and one when its volume is closed with what
+the pieces answered.
+Measured in the same VM, from a server that allows one connection: 4474
+small reads while the image opened, 4273 answered from the pieces, 201 pieces
+read; the image played 2.3 to 2.8 s after it was asked for, with 12 transfers.
+---
+ xbmc/filesystem/UDFBlockInput.cpp | 128 +++++++++++++++++++++++++++++-
+ xbmc/filesystem/UDFBlockInput.h   |  42 ++++++++++
+ xbmc/filesystem/UDFContext.cpp    |  65 ++++++++++++++-
+ xbmc/filesystem/UDFContext.h      |   9 +++
+ 4 files changed, 239 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/filesystem/UDFBlockInput.cpp b/xbmc/filesystem/UDFBlockInput.cpp
+index a25510b..5a8df53 100644
+--- a/xbmc/filesystem/UDFBlockInput.cpp
++++ b/xbmc/filesystem/UDFBlockInput.cpp
+@@ -8,8 +8,14 @@
+ 
+ #include "UDFBlockInput.h"
+ 
++#include "HttpSourceMemory.h"
++#include "URL.h"
+ #include "filesystem/File.h"
++#include "utils/URIUtils.h"
++#include "utils/log.h"
+ 
++#include <algorithm>
++#include <cstring>
+ #include <mutex>
+ 
+ #include <udfread/udfread.h>
+@@ -18,7 +24,18 @@ int CUDFBlockInput::Close(udfread_block_input* bi)
+ {
+   auto m_bi = reinterpret_cast<UDF_BI*>(bi);
+ 
+-  m_bi->fp->Close();
++  std::unique_lock lock(m_bi->lock);
++  if (m_bi->open)
++    m_bi->fp->Close();
++  m_bi->open = false;
++
++  // Hades: what the pieces kept did for this mount of the volume (ReadThroughPieces())
++  if (!m_bi->pieces.empty() && m_bi->reads > 0)
++    CLog::Log(LOGINFO,
++              "CUDFBlockInput: of {} small reads of the volume of {}, {} were answered from the "
++              "pieces kept; {} piece(s) of {} KiB read from the image",
++              m_bi->reads, XFILE::CHttpSourceMemory::ShortForLog(m_bi->path), m_bi->readsFromMemory,
++              m_bi->piecesRead, PIECE_BYTES / 1024);
+ 
+   return 0;
+ }
+@@ -27,7 +44,80 @@ uint32_t CUDFBlockInput::Size(udfread_block_input* bi)
+ {
+   auto m_bi = reinterpret_cast<UDF_BI*>(bi);
+ 
+-  return static_cast<uint32_t>(m_bi->fp->GetLength() / UDF_BLOCK_SIZE);
++  // (as it was when the image was opened: the image may be closed now, see Suspend())
++  return static_cast<uint32_t>(m_bi->length / UDF_BLOCK_SIZE);
++}
++
++bool CUDFBlockInput::OpenAgain(UDF_BI& bi)
++{
++  // Hades: the image was closed while nothing read the volume (Suspend()): opened again
++  if (bi.open)
++    return true;
++
++  if (!bi.fp->Open(bi.path))
++  {
++    CLog::Log(LOGERROR, "CUDFBlockInput::Read - the image {} could not be opened again",
++              CURL::GetRedacted(bi.path));
++    return false;
++  }
++  bi.open = true;
++  CLog::Log(LOGDEBUG, "CUDFBlockInput::Read - the image {} opened again for a read of its volume",
++            CURL::GetRedacted(bi.path));
++  return true;
++}
++
++int CUDFBlockInput::ReadThroughPieces(UDF_BI& bi, int64_t pos, uint8_t* out, int64_t size)
++{
++  // Hades: (PIECE_BYTES) the blocks asked for, from the pieces kept; a piece that is not kept is
++  // read from the image in place of the one used longest ago. The image does not change while it
++  // is mounted, so a piece kept stays right.
++  bi.reads++;
++  bool allKept = true;
++  int64_t done = 0;
++  while (done < size)
++  {
++    const int64_t at = pos + done;
++    if (at >= bi.length)
++      break;
++    const int64_t start = at - at % PIECE_BYTES;
++
++    bool whole = true;
++    auto piece = std::ranges::find(bi.pieces, start, &Piece::start);
++    if (piece == bi.pieces.end())
++    {
++      allKept = false;
++      piece = std::ranges::min_element(bi.pieces, {}, &Piece::used);
++      piece->start = -1;
++      const int64_t want = std::min(PIECE_BYTES, bi.length - start);
++      piece->data.resize(static_cast<std::size_t>(want));
++      if (!OpenAgain(bi) || bi.fp->Seek(start, SEEK_SET) != start)
++        return done > 0 ? static_cast<int>(done / UDF_BLOCK_SIZE) : -1;
++      const ssize_t got = bi.fp->Read(piece->data.data(), static_cast<size_t>(want));
++      if (got <= 0)
++        return done > 0 ? static_cast<int>(done / UDF_BLOCK_SIZE) : static_cast<int>(got);
++      piece->data.resize(static_cast<std::size_t>(got));
++      bi.piecesRead++;
++      // a piece that came short (a read that failed on the way) answers this read only
++      whole = got == want;
++      if (whole)
++        piece->start = start;
++    }
++    piece->used = whole ? ++bi.tick : 0;
++
++    const int64_t offset = at - start;
++    const int64_t have = static_cast<int64_t>(piece->data.size()) - offset;
++    if (have <= 0)
++      break;
++    const int64_t n = std::min(size - done, have);
++    std::memcpy(out + done, piece->data.data() + offset, static_cast<std::size_t>(n));
++    done += n;
++    if (!whole)
++      break;
++  }
++  if (allKept)
++    bi.readsFromMemory++;
++
++  return static_cast<int>(done / UDF_BLOCK_SIZE);
+ }
+ 
+ int CUDFBlockInput::Read(
+@@ -37,11 +127,18 @@ int CUDFBlockInput::Read(
+   std::unique_lock lock(m_bi->lock);
+ 
+   int64_t pos = static_cast<int64_t>(lba) * UDF_BLOCK_SIZE;
++  ssize_t size = blocks * UDF_BLOCK_SIZE;
++
++  // Hades: a small read of an image that is not on a local disk, from the pieces kept
++  if (!m_bi->pieces.empty() && size < PIECE_BYTES)
++    return ReadThroughPieces(*m_bi, pos, static_cast<uint8_t*>(buf), size);
++
++  if (!OpenAgain(*m_bi))
++    return -1;
+ 
+   if (m_bi->fp->Seek(pos, SEEK_SET) != pos)
+     return -1;
+ 
+-  ssize_t size = blocks * UDF_BLOCK_SIZE;
+   ssize_t read = m_bi->fp->Read(buf, size);
+   if (read > 0)
+     return static_cast<int>(read / UDF_BLOCK_SIZE);
+@@ -59,10 +156,24 @@ udfread_block_input* CUDFBlockInput::GetBlockInput(const std::string& file)
+     if (m_bi)
+     {
+       m_bi->fp = fp;
++      m_bi->path = file;
++      m_bi->length = fp->GetLength();
++      m_bi->open = true;
+       m_bi->bi.close = CUDFBlockInput::Close;
+       m_bi->bi.read = CUDFBlockInput::Read;
+       m_bi->bi.size = CUDFBlockInput::Size;
+ 
++      // Hades: (PIECE_BYTES) an image that is not on a local disk, and whose length is known, is
++      // read through pieces kept; their memory is taken as they are read
++      if (!URIUtils::IsHD(file) && m_bi->length > 0)
++      {
++        m_bi->pieces.resize(PIECES_KEPT);
++        CLog::Log(LOGINFO,
++                  "CUDFBlockInput: the image {} is not on a local disk: its volume is read in "
++                  "pieces of {} KiB, the last {} kept",
++                  XFILE::CHttpSourceMemory::ShortForLog(file), PIECE_BYTES / 1024, PIECES_KEPT);
++      }
++
+       return &m_bi->bi;
+     }
+ 
+@@ -71,3 +182,14 @@ udfread_block_input* CUDFBlockInput::GetBlockInput(const std::string& file)
+ 
+   return nullptr;
+ }
++
++void CUDFBlockInput::Suspend()
++{
++  if (!m_bi)
++    return;
++
++  std::unique_lock lock(m_bi->lock);
++  if (m_bi->open)
++    m_bi->fp->Close();
++  m_bi->open = false;
++}
+diff --git a/xbmc/filesystem/UDFBlockInput.h b/xbmc/filesystem/UDFBlockInput.h
+index e7cfc88..adde33c 100644
+--- a/xbmc/filesystem/UDFBlockInput.h
++++ b/xbmc/filesystem/UDFBlockInput.h
+@@ -10,7 +10,10 @@
+ 
+ #include "threads/CriticalSection.h"
+ 
++#include <cstdint>
+ #include <memory>
++#include <string>
++#include <vector>
+ 
+ #include <udfread/blockinput.h>
+ 
+@@ -27,17 +30,56 @@ public:
+ 
+   udfread_block_input* GetBlockInput(const std::string& file);
+ 
++  /*!
++   * \brief Hades: closes the image while nothing reads the volume (CUDFContext keeps the volume of
++   *        an image that is not on a local disk mounted for a while after its last reader let go);
++   *        the next read opens it again. Nothing of the image is held meanwhile: no connection to
++   *        a server, no handle on a file.
++   */
++  void Suspend();
++
++  /*!
++   * \brief Hades: an image that is not on a local disk is read in pieces of this size, and the
++   *        last PIECES_KEPT of them are kept (1 MiB): a read of fewer bytes is answered from them.
++   *        The readers of a volume read a block or a few at a time and can take turns at two
++   *        places of the image (measured while a Blu-ray image opened: 2 KiB at each turn); from
++   *        a server that allows one connection, each turn was a new request (325 requests and 29 s
++   *        to open an image of 173 MB, measured in a VM).
++   */
++  static constexpr int64_t PIECE_BYTES = 128 * 1024;
++  static constexpr std::size_t PIECES_KEPT = 8;
++
+ private:
+   static int Close(udfread_block_input* bi);
+   static uint32_t Size(udfread_block_input* bi);
+   static int Read(udfread_block_input* bi, uint32_t lba, void* buf, uint32_t nblocks, int flags);
+ 
++  struct Piece
++  {
++    int64_t start{-1};
++    std::vector<uint8_t> data;
++    uint64_t used{0};
++  };
++
+   struct UDF_BI
+   {
+     struct udfread_block_input bi;
+     std::shared_ptr<XFILE::CFile> fp{nullptr};
+     CCriticalSection lock;
++    //! Hades: the image, to open again after Suspend(); its length, as it was when it was opened
++    std::string path;
++    int64_t length{0};
++    bool open{false};
++    //! Hades: the pieces kept (PIECE_BYTES; none for an image on a local disk) and what they did
++    std::vector<Piece> pieces;
++    uint64_t tick{0};
++    uint64_t reads{0};
++    uint64_t readsFromMemory{0};
++    uint64_t piecesRead{0};
+   };
+ 
++  static bool OpenAgain(UDF_BI& bi);
++  static int ReadThroughPieces(UDF_BI& bi, int64_t pos, uint8_t* out, int64_t size);
++
+   std::unique_ptr<UDF_BI> m_bi{nullptr};
+ };
+diff --git a/xbmc/filesystem/UDFContext.cpp b/xbmc/filesystem/UDFContext.cpp
+index ab9707f..0cfa52e 100644
+--- a/xbmc/filesystem/UDFContext.cpp
++++ b/xbmc/filesystem/UDFContext.cpp
+@@ -8,10 +8,13 @@
+ 
+ #include "UDFContext.h"
+ 
++#include "HttpSourceMemory.h"
+ #include "URL.h"
+ #include "threads/CriticalSection.h"
++#include "utils/URIUtils.h"
+ #include "utils/log.h"
+ 
++#include <chrono>
+ #include <map>
+ #include <mutex>
+ 
+@@ -25,6 +28,20 @@ CCriticalSection g_mountLock;
+ 
+ //! Volumes currently mounted, so that concurrent readers of one image share a single mount
+ std::map<std::string, std::weak_ptr<CUDFContext>, std::less<>> g_mounts;
++
++/*!
++ * Hades: the volume of an image that is not on a local disk, kept mounted for this long after its
++ * last reader let go, with the image closed (CUDFBlockInput::Suspend()). Opening a disc image
++ * mounts its volume again and again: whether it is a Blu-ray, the list of its titles, the player,
++ * each from a reader of its own (seven mounts in one opening, measured by bd4 of 1.0) - and over
++ * the network every mount is a dozen requests to the server. The next reader within this time
++ * takes the volume as it is; the image is opened again at its first read.
++ */
++constexpr auto KEEP_IDLE = std::chrono::seconds(60);
++
++std::unique_ptr<CUDFContext> g_idle;
++std::string g_idleImage;
++std::chrono::steady_clock::time_point g_idleSince;
+ } // namespace
+ 
+ CUDFContext::~CUDFContext()
+@@ -58,6 +75,29 @@ bool CUDFContext::Mount(const std::string& image)
+   return true;
+ }
+ 
++void CUDFContext::Release(CUDFContext* context)
++{
++  // Hades: (KEEP_IDLE) only the volume of an image that is not on a local disk is kept, with its
++  // image closed; the one kept before goes. The images are closed outside the lock (closing one
++  // over the network stops its cache).
++  if (!context->m_keepIdle)
++  {
++    delete context;
++    return;
++  }
++  context->m_blockInput.Suspend();
++  std::unique_ptr<CUDFContext> previous;
++  {
++    std::unique_lock lock(g_mountLock);
++    previous = std::move(g_idle);
++    g_idle.reset(context);
++    g_idleImage = context->m_image;
++    g_idleSince = std::chrono::steady_clock::now();
++  }
++  CLog::LogF(LOGDEBUG, "UDF volume of {} kept for {} s, its image closed",
++             CURL::GetRedacted(context->m_image), KEEP_IDLE.count());
++}
++
+ std::shared_ptr<CUDFContext> CUDFContext::Get(const std::string& image)
+ {
+   std::unique_lock lock(g_mountLock);
+@@ -70,10 +110,30 @@ std::shared_ptr<CUDFContext> CUDFContext::Get(const std::string& image)
+     g_mounts.erase(it);
+   }
+ 
++  // Hades: the volume kept after its last reader, taken again (KEEP_IDLE); one that is too old,
++  // or of another image, goes
++  if (g_idle && std::chrono::steady_clock::now() - g_idleSince > KEEP_IDLE)
++    g_idle.reset();
++  if (g_idle && g_idleImage == image)
++  {
++    std::shared_ptr<CUDFContext> context{g_idle.release(), &CUDFContext::Release};
++    context->m_reuses++;
++    CLog::Log(LOGINFO,
++              "CUDFContext: the volume of the disc image {} was still mounted: taken again "
++              "without reading it from the image ({} time(s))",
++              URIUtils::IsInternetStream(image) ? CHttpSourceMemory::ShortForLog(image)
++                                                : CURL::GetRedacted(image),
++              context->m_reuses);
++    g_mounts[image] = context;
++    return context;
++  }
++
+   // Cannot use make_shared as the constructor is private
+-  std::shared_ptr<CUDFContext> context{new CUDFContext()};
+-  if (!context->Mount(image))
++  std::unique_ptr<CUDFContext> mounted{new CUDFContext()};
++  if (!mounted->Mount(image))
+     return nullptr;
++  mounted->m_image = image;
++  mounted->m_keepIdle = !URIUtils::IsHD(image);
+ 
+   // One line per mount, so a run of reads that is sharing one mount is distinguishable from one
+   // that is re-mounting for every file
+@@ -82,6 +142,7 @@ std::shared_ptr<CUDFContext> CUDFContext::Get(const std::string& image)
+   // Forget any volumes that have since been unmounted
+   std::erase_if(g_mounts, [](const auto& mount) { return mount.second.expired(); });
+ 
++  std::shared_ptr<CUDFContext> context{mounted.release(), &CUDFContext::Release};
+   g_mounts[image] = context;
+ 
+   return context;
+diff --git a/xbmc/filesystem/UDFContext.h b/xbmc/filesystem/UDFContext.h
+index d908a2d..1fd4890 100644
+--- a/xbmc/filesystem/UDFContext.h
++++ b/xbmc/filesystem/UDFContext.h
+@@ -46,6 +46,9 @@ public:
+    that would leave a handle open on the image and, on Windows, stop the user deleting or renaming
+    it. A single open is therefore no cheaper than before; to make a run of opens share one mount,
+    hold a CUDFMount across them.
++   Hades: the volume of an image that is not on a local disk is kept mounted for a minute after its
++   last holder let go, with its image closed (no handle, no connection: it is opened again at the
++   next read), and the next holder of it within that minute takes it as it is.
+    \param image path to the image
+    \return the mounted volume, or nullptr if the image could not be mounted
+    */
+@@ -56,9 +59,15 @@ public:
+ private:
+   CUDFContext() = default;
+   bool Mount(const std::string& image);
++  //! Hades: the last holder let go (the deleter of what Get() hands out)
++  static void Release(CUDFContext* context);
+ 
+   CUDFBlockInput m_blockInput;
+   udfread* m_udf{nullptr};
++  //! Hades: the image, and whether its volume is kept after its last holder (Release())
++  std::string m_image;
++  bool m_keepIdle{false};
++  unsigned int m_reuses{0};
+ };
+ 
+ /*!
+-- 
+2.53.0
+

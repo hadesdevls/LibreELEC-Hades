@@ -1,0 +1,514 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 LibreELEC Hades
+#
+# run-kodi-host.sh: the host tests of Kodi's headers and logic that Hades changed, each against the Kodi tree of
+# REGRESS_KODI_REF (lib/regress.sh: rg_kodi), built with g++ and AddressSanitizer/UndefinedBehaviorSanitizer (and
+# ThreadSanitizer where threads take part), and each in both directions: it passes on the tree, and every mutant of
+# mutants.py that names it (a copy of the tree with one rule of the code changed, made by mutate.py) makes it fail
+# with the number of failed checks written there. A few tests carry a model of the rule before inside themselves
+# (-DOLD_RULE and the like): those runs must fail too.
+#   existing  settings_resize_test.cpp and vrr_test.cpp (the settings window when the mode changes; HDMI VRR left
+#             off with native Dolby Vision), vrr_gui_test.cpp (the setting "HDMI variable refresh rate (VRR)":
+#             HdmiVrrOff.h), vrr_video_test.cpp ("Video at its own rate with VRR": VrrVideo.h, with the rule of 1.1
+#             for which flips are paced, which must fail, and its mutants) and
+#             display_modes_test.cpp (the mode of the menus of each display: DisplayModeMemory.h),
+#             exact_rate_test.cpp (a mode at the video's rate at another size of the display, without a whitelist
+#             of the user: ExactRateElsewhere.h), video_size_test.cpp ("Adjust display resolution": the mode of the
+#             video's size at the refresh rate Kodi chose, VideoSizeMode.h), picture_timing_test.cpp (HEVC with frame_field_info_present_flag
+#             progressive by the picture timing of its first access units: ProgressiveVideo.cpp, with the FFmpeg
+#             headers of the build folder),
+#             vrr_pacer_bench.cpp (how exact Kodi's own timing of flips is on this host: a measure, its numbers
+#             in the item; the item says only that it built and ran, the numbers are no verdict)
+#   policy    the choice of output of a Dolby Vision video (DVPlaybackPolicy.h), what a Dolby Vision video with
+#             HDR10+ of its own is sent with (dualhdr_test.cpp), the passes of the interface loop (VideoPasses.h),
+#             and the strings of the projector settings in Estuary
+#   window    the windows loaded ahead (WindowPreload.h), the frame that ends the Dolby Vision signal
+#             (DVEndOfStream.h; dvbridge_eos.h on the software GPU)
+#   modes     the modes of the display read again (ModeListRefresh.h), the resolutions replaced
+#             (ResolutionListReplace.h)
+#   output    the output of native Dolby Vision: frames ahead (DVAhead.h, with the 10 s windows of real logs, an
+#             input), dual-mode connectors, the frame tests, the wake, the pictures kept, the lag, the
+#             presentation fixes of 1.0 RC3, the link set up again after a hot-plug (HotplugRelink.h), and the
+#             change of mode from TMDS to HDMI FRL with the way back from its hang (FrlModeChange.h)
+#   linkdepth the depth of the link (LinkDepth.h) and what in the sources writes "max bpc" (src_check.py)
+#   fix       a render that libplacebo failed (dvbridge_render.c on the software GPU, a real profile 7 stream as
+#             input), the reads of the connector (DRMConnector.cpp), what a replacement retires (RetiredKept.h),
+#             the callers of both, the list of the audio outputs (ActiveAESink.cpp)
+#   own       the trace of a seek (SeekTrace.h, SeekPending.h, ModeChangeTime.h), the module xbmcaddon through the
+#             build's swig, pwr() of hades-diag's watch-dv.sh with the image's busybox, and the plane of the speakers
+#             of the player information through Kodi's data cache and the audio engine's clear of it (speakers_test.cpp:
+#             HadesPlayerInfo.h with DataCacheCore.cpp and AEChannelInfo.cpp)
+#   ux        the depth of a scrolling label, Kodi's TestActiveAEFollowDisplay with googletest, the Bluetooth logic
+#             of the LibreELEC settings add-on
+#   overlay   the GL matrix stacks: no function of Kodi pops a level that it did not push (overlay/matrix_balance.py)
+#   stereo    Blu-ray 3D: the plane offsets (Kodi's TestBlurayOffsetMetadata with googletest; on the access units
+#             of a real MVC stream, an input) and the depth of a subtitle
+# usage: run-kodi-host.sh all | verdict [<log>] | <stage>...      (settings: lib/regress.sh)
+# Needs REGRESS_KODI_GIT, REGRESS_LE_BUILD (googletest, swig, libdrm and GLES headers, busybox), REGRESS_SOURCES
+# (libplacebo, FFmpeg, LibreELEC-settings) and REGRESS_INPUTS (inputs-kodi-host.tsv).
+# The windows of output/dvahead_test.cpp: one row per "last 10 s" line of DVBridge in a kodi.log: the set of logs,
+# the log, GL_RENDERER, the native output it is in, the time, "last", frames shown, kept, not shown, with GUI
+# elements, prepare avg/max, present avg/max, the longest gap, presentations over 1.5 refresh periods, frames ahead,
+# flips known, longest flip gap, flips late, GPU avg/max, frames timed, frames standing still (tab separated). The
+# runner gives the set as the first 12 hexadecimal digits of the SHA256 of its name.
+set -uo pipefail
+. "$(dirname "$0")/../lib/regress.sh"
+rg_init kodi-host
+H=$RG_REGRESS/kodi-host
+MUT="$RG_PY $H/mutate.py"
+CXX="g++ -std=c++20 -O1 -g -Wall -Wextra"
+SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
+export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} UBSAN_OPTIONS=${UBSAN_OPTIONS:-print_stacktrace=1}
+STAGES="existing policy window modes output linkdepth fix own ux overlay stereo"
+SWIG_HADES_LINES=66 # the lines of the generated xbmcaddon module with the text of Hades' typemap
+IN=$RG_W/in
+VP=xbmc/cores/VideoPlayer/DVDCodecs/Video
+GB=xbmc/windowing/gbm
+
+kodi() { rg_kodi || rg_fail "no Kodi tree of $REGRESS_KODI_REF"; }
+inputs() { rg_inputs "$H/inputs-kodi-host.tsv" "$IN" > "$RG_W/logs/inputs.log" 2>&1; local e=$?; cat "$RG_W/logs/inputs.log"; return $e; }
+# the libdrm headers of the build folder's sysroot, in a folder of their own
+drminc() {
+  local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/drminc
+  [ -f "$s/xf86drmMode.h" ] && [ -d "$s/libdrm" ] || { echo "no libdrm headers in $s" >&2; return 1; }
+  mkdir -p "$d" && ln -sfn "$s/xf86drm.h" "$d/xf86drm.h" && ln -sfn "$s/xf86drmMode.h" "$d/xf86drmMode.h" && ln -sfn "$s/libdrm" "$d/libdrm"
+  echo "$d"
+}
+# the headers of FFmpeg of the build folder's sysroot (libavcodec, libavutil), in a folder of their own
+ffinc() {
+  local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/ffinc
+  [ -f "$s/libavcodec/codec_id.h" ] && [ -f "$s/libavutil/pixdesc.h" ] || { echo "no FFmpeg headers in $s" >&2; return 1; }
+  # (made once: the mutants build at once, and a link made again is missing for a moment)
+  local x
+  mkdir -p "$d" && for x in libavcodec libavutil; do
+    [ "$(readlink "$d/$x")" = "$s/$x" ] || ln -sfn "$s/$x" "$d/$x" || return 1
+  done
+  echo "$d"
+}
+# googletest of the build folder (libfmt's copy), built once
+gtest() {
+  local gt d=$RG_SHARED/gtest
+  gt=$(ls -d "$REGRESS_LE_BUILD"/build/libfmt-*/test/gtest 2> /dev/null | sort | tail -n 1)
+  [ -f "$gt/gmock-gtest-all.cc" ] || { echo "no googletest in $REGRESS_LE_BUILD" >&2; return 1; }
+  if [ ! -f "$d/gtest-all.o" ] || [ "$(cat "$d/from" 2> /dev/null)" != "$gt" ]; then
+    rg_fresh "$d"
+    printf '#include <gtest/gtest.h>\nint main(int argc, char** argv)\n{\n  testing::InitGoogleTest(&argc, argv);\n  return RUN_ALL_TESTS();\n}\n' > "$d/main.cpp"
+    g++ -std=c++20 -O1 -pthread -w -I"$gt" -c "$gt/gmock-gtest-all.cc" -o "$d/gtest-all.o" > "$d/build.log" 2>&1 &&
+      g++ -std=c++20 -O1 -pthread -I"$gt" -c "$d/main.cpp" -o "$d/main.o" >> "$d/build.log" 2>&1 || { cat "$d/build.log" >&2; return 1; }
+    echo "$gt" > "$d/from"
+  fi
+  echo "$gt"
+}
+
+# ------------------------------------------------------------------------------------------------- the tests
+# build <test> <tree> <dir>: the test against a tree into <dir> (<dir>/t and <dir>/build.log); WERR=-Werror for the
+# tree as it is (a mutant may leave a parameter unused)
+build() {
+  local t=$1 K=$2 D=$3 X=$2/xbmc S=$H
+  mkdir -p "$D"
+  {
+    case $t in
+      p5always) $CXX $SAN -I $K/$VP -I $X $S/policy/p5always_test.cpp -o $D/t ;;
+      policy) $CXX ${WERR:-} -I $K/$VP $S/policy/policy_test.cpp -o $D/t ;;
+      videopasses_missed|videopasses) $CXX ${WERR:-} $SAN -I $X/application $S/policy/${t}_test.cpp -o $D/t ;;
+      dvconvert|gap_policy|dualhdr) $CXX ${WERR:-} $SAN -I $K/$VP $S/policy/${t}_test.cpp -o $D/t ;;
+      reachable) $CXX ${WERR:-} $SAN -I $K/$VP $S/policy/reachable_test.cpp -o $D/t ;;
+      reachable-old-rule) $CXX $SAN -DOLD_RULE -I $K/$VP $S/policy/reachable_test.cpp -o $D/t ;;
+      anyhz) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/policy/anyhz_test.cpp -o $D/t ;;
+      strings) cp $S/policy/projector_strings.py $D/t ;;
+      widths) cp $S/policy/measure_es.py $D/t ;;
+      windowpreload) $CXX ${WERR:-} $SAN -I $X/guilib $S/window/windowpreload_test.cpp -o $D/t ;;
+      dveos) $CXX ${WERR:-} $SAN -I $K/$GB $S/window/dveos_test.cpp -o $D/t ;;
+      eos) RG_BRIDGE_SKIP="dvbridge_fel dvbridge_dmabuf" EXTRA_CF="$SAN" LDEXTRA="$SAN" \
+             rg_bridge "$K" "$LP" "$FF" $S/window/eos_test.c $D/t || { cat $D/t.build.log; false; } ;;
+      modelist) $CXX ${WERR:-} -Wshadow $SAN -I $X -I $K/$GB $S/modes/modelist_test.cpp -o $D/t ;;
+      reslist-address|reslist-thread) $CXX ${WERR:-} -Wshadow -pthread -fsanitize=${t#reslist-} -I $X $S/modes/reslist_test.cpp -o $D/t ;;
+      dvahead|dvrepeatkeep|presentlag) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB $S/output/${t}_test.cpp -o $D/t ;;
+      dualmode|dualmode-table) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB -I $K/$GB/drm $S/output/dualmode_test.cpp -o $D/t ;;
+      dvframetest|drmwake) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB/drm $S/output/${t}_test.cpp -o $D/t ;;
+      dvframetest-old-rule|presentlag-old-rule) $CXX $SAN -DOLD_RULE $S/output/${t%-old-rule}_test.cpp -o $D/t ;;
+      *_test) $CXX ${WERR:-} -Wshadow $SAN -I $X -I $K/$GB -I $S/output/presfix $S/output/presfix/$t.cpp -o $D/t ;;
+      linkdepth) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/linkdepth/linkdepth_test.cpp -o $D/t ;;
+      src_check) cp $S/linkdepth/src_check.py $D/t ;;
+      render_refused) RG_BRIDGE_SKIP="dvbridge_fel dvbridge_dmabuf" EXTRA_CF="$SAN" \
+                        LDEXTRA="$SAN -Wl,--wrap=pl_renderer_get_errors" \
+                        rg_bridge "$K" "$LP" "$FF" $S/fix/render_refused_test.c $D/t || { cat $D/t.build.log; false; } ;;
+      drmconnector-*) [ -x $D/conn ] || $CXX $SAN -fno-sanitize-recover=all -DHAVE_FORGET -I $S/fix/stubs -I $K/$GB/drm -I $X \
+                        -isystem $DRM -isystem $DRM/libdrm $K/$GB/drm/DRMConnector.cpp $K/$GB/drm/DRMObject.cpp \
+                        $S/fix/drmconnector_test.cpp -o $D/conn ;;
+      retiredkept) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -I $X $S/fix/retiredkept_test.cpp -o $D/t ;;
+      pieces) $RG_PY $S/fix/pieces_gen.py $K $D/gen && $CXX $SAN -fno-sanitize-recover=all -I $D/gen -I $S/fix/stubs \
+                -I $K/$GB/drm -I $X -isystem $DRM -isystem $DRM/libdrm $K/$GB/drm/DRMConnector.cpp $K/$GB/drm/DRMObject.cpp \
+                $S/fix/pieces_test.cpp -o $D/t ;;
+      aesink-*) [ -x $D/aesink-address ] || {
+                  $RG_PY $S/fix/aesink_gen.py $K $D/gen &&
+                  for san in address thread; do
+                    f="-fsanitize=$san"; [ $san = address ] && f=$SAN
+                    $CXX -pthread $f -I $D/gen -I $X -I $X/platform/posix -isystem $FF/include $S/fix/aesink_test.cpp \
+                      $X/cores/AudioEngine/Utils/AEDeviceInfo.cpp $X/cores/AudioEngine/Utils/AEChannelInfo.cpp -o $D/aesink-$san || return 1
+                  done; } ;;
+      seek) $CXX ${WERR:-} $SAN -I $X/cores/VideoPlayer -I $X/utils $S/own/seek_test.cpp -o $D/t -lpthread ;;
+      # (Kodi's own files built as they are: not with -Werror, which their warnings would stop)
+      speakers) $CXX $SAN -pthread -DTARGET_POSIX -DTARGET_LINUX -I $S/own/speakers_stub -I $X $X/cores/DataCacheCore.cpp \
+                  $X/platform/posix/threads/RecursiveMutex.cpp $X/cores/AudioEngine/Utils/AEChannelInfo.cpp \
+                  $S/own/speakers_test.cpp -o $D/t ;;
+      swig) cp $S/own/swig_check.py $D/t ;;
+      fadelabel) mkdir -p $D/src $D/stub/guilib/guiinfo $D/stub/utils $D/stub/windowing &&
+                   cp $X/guilib/GUIFadeLabelControl.cpp $X/guilib/GUIFadeLabelControl.h $S/ux/fadelabel_depth_test.cpp $D/src/ &&
+                   cp $S/ux/fadelabel_stubs.h $D/stub/stubs.h &&
+                   for h in GUIControl.h GUILabel.h GUIMessage.h ServiceBroker.h guilib/guiinfo/GUIInfoLabel.h utils/Random.h \
+                            windowing/WinSystem.h; do printf '#pragma once\n#include "stubs.h"\n' > $D/stub/$h; done &&
+                   g++ -std=c++20 -Wall -O1 $SAN -I $D/stub -I $X $D/src/GUIFadeLabelControl.cpp $D/src/fadelabel_depth_test.cpp -o $D/t ;;
+      audio-follow) $CXX -pthread -I $GT -I $X -c $X/cores/AudioEngine/Sinks/test/TestActiveAEFollowDisplay.cpp -o $D/t.o &&
+                      g++ -pthread -o $D/t $D/t.o $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o ;;
+      offsets) $CXX $SAN -pthread -I $S/stereo/stub -I $X -I $X/cores/VideoPlayer/DVDDemuxers -I $GT \
+                 $X/cores/VideoPlayer/DVDDemuxers/test/TestBlurayOffsetMetadata.cpp $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp \
+                 $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      aus) $CXX $SAN -I $S/stereo/stub -I $X/cores/VideoPlayer/DVDDemuxers $S/stereo/aus_test.cpp \
+             $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp -o $D/t ;;
+      depth) $RG_PY $S/stereo/depth_gen.py $K $D/gen && $CXX $SAN -I $S/stereo/stub -I $X/cores/VideoPlayer/DVDDemuxers \
+               $D/gen/depth_test.cpp $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp -o $D/t ;;
+      settings_resize) $CXX -pthread $SAN -I $X $H/settings_resize_test.cpp -o $D/t ;;
+      settings_resize-D*) $CXX -pthread $SAN -D${t#settings_resize-D} -I $X $H/settings_resize_test.cpp -o $D/t ;;
+      settings_resize-tsan) $CXX -pthread -fsanitize=thread -I $X $H/settings_resize_test.cpp -o $D/t ;;
+      vrr) $CXX -Wno-mismatched-new-delete $SAN -pthread -I $X $H/vrr_test.cpp -o $D/t ;;
+      vrr_gui|vrr_video|display_modes|exact_rate|video_size) $CXX ${WERR:-} -Wshadow $SAN -I $X $H/${t}_test.cpp -o $D/t ;;
+      # (Kodi's own file as it is: not with -Werror)
+      picture_timing) $CXX $SAN -I $X -isystem "$(ffinc)" $H/picture_timing_test.cpp $X/utils/ProgressiveVideo.cpp -o $D/t ;;
+      vrr_video-old-rule) $CXX $SAN -DOLD_RULE -I $X $H/vrr_video_test.cpp -o $D/t ;;
+      # (a measure of time: no sanitizer, optimised as the image is)
+      vrr_pacer) $CXX ${WERR:-} -O2 -I $X $H/vrr_pacer_bench.cpp -o $D/t ;;
+      *) echo "no test $t"; false ;;
+    esac
+  } > "$D/build.log" 2>&1 < /dev/null
+}
+# run <test> <tree> <dir>: the test's run, its whole output on stdout
+run() {
+  local t=$1 K=$2 D=$3 e
+  case $t in
+    modelist) if [ "$K" = "$KT" ]; then $D/t 20000; else $D/t 4000; fi ;;
+    reslist-address|reslist-thread) e=0
+      [ $t = reslist-address ] && { $D/t same || e=1; }
+      $D/t race new 20000 || e=1
+      # (the way before, which the test carries: it must be shown wrong)
+      $D/t race old 20000 > $D/old.log 2>&1; echo "the way before: exit $?; $(grep -c 'ERROR: \|WARNING: ThreadSanitizer' $D/old.log) sanitizer reports"
+      return $e ;;
+    dvahead) $D/t $IN/windows-hashed.tsv $IN/windows-new-hashed.tsv ;;
+    dualmode-table) $D/t > $D/out.log 2>&1; grep -a '^table:' $D/out.log > $D/table.txt
+      diff $H/ref/dualmode-table.txt $D/table.txt | grep '^[<>]' | sed 's/^/FAIL: table line differs: /' | head -n 2000
+      echo "table: $(wc -l < $D/table.txt) lines, ref/dualmode-table.txt $(wc -l < $H/ref/dualmode-table.txt)"
+      cmp -s $H/ref/dualmode-table.txt $D/table.txt ;;
+    strings) $RG_PY $D/t $K ;;
+    src_check) $RG_PY $D/t $K ;;
+    eos) env $RG_GPU_ENV LP_NUM_THREADS=${LP_NUM_THREADS:-4} timeout 900 $D/t ;;
+    render_refused) env $RG_GPU_ENV LP_NUM_THREADS=${LP_NUM_THREADS:-4} timeout 1200 $D/t $IN/BL_EL.mkv ;;
+    drmconnector-*) ( cd $D && ./conn ${t#drmconnector-} ) ;;
+    pieces) ( cd $D && ./t ) ;;
+    aesink-same) $D/aesink-address same > $D/same.txt; e=$?; cat $D/same.txt
+      diff $H/ref/aesink-same.txt $D/same.txt | grep '^[<>]' | sed 's/^/FAIL: differs from ref\/aesink-same.txt: /'
+      [ $e = 0 ] && cmp -s $H/ref/aesink-same.txt $D/same.txt ;;
+    aesink-race) e=0
+      for san in thread address; do
+        TSAN_OPTIONS="halt_on_error=0 report_signal_unsafe=0" timeout 1200 $D/aesink-$san race 300 > $D/race-$san.log 2>&1 || e=1
+        echo "race ($san): $(grep -c 'WARNING: ThreadSanitizer' $D/race-$san.log) ThreadSanitizer reports, $(grep -c 'ERROR: AddressSanitizer' $D/race-$san.log) AddressSanitizer errors; $(grep '^race:' $D/race-$san.log)"
+        grep -q 'WARNING: ThreadSanitizer\|ERROR: AddressSanitizer' $D/race-$san.log && e=1
+      done
+      return $e ;;
+    swig) $RG_PY $D/t $K "$REGRESS_LE_BUILD" $D/out > $D/out.txt 2>&1; e=$?; cat $D/out.txt
+      local n; n=$(sed -n 's/^lines with Hades text: //p' $D/out.txt)
+      [ "$n" = "$SWIG_HADES_LINES" ] || echo "FAIL: lines with Hades text ${n:-none}, $SWIG_HADES_LINES expected"
+      return $e ;;
+    widths) $RG_PY $D/t $K ;;
+    aus) $RG_PY $H/stereo/mkaus.py $IN/bd1080.264 $D/aus && $D/t $D/aus ;;
+    settings_resize-tsan) TSAN_OPTIONS=halt_on_error=1 timeout 180 $D/t ;;
+    settings_resize*) timeout 120 $D/t ;;
+    vrr_pacer) timeout 60 $D/t 10 ;;
+    *) $D/t ;;
+  esac
+}
+# the line that says a test passed, and the line of a failed check
+pass_re() {
+  case $1 in
+    p5always) echo '^ALL PASSED: [0-9]+ of [0-9]+$' ;;
+    policy) echo '^policy: [0-9]+ checks, 0 failed' ;;
+    reachable) echo '^REACHABLE-TEST: [0-9]+ cases .*, 0 wrong' ;;
+    anyhz) echo '^ANYHZ-TEST PASSED' ;;
+    strings) echo '^PROJECTOR-STRINGS PASSED' ;;
+    widths) echo 'rows over their space: 0' ;;
+    dveos) echo '^X1 16 cases, 0 failed' ;;
+    eos) echo '^eos: [0-9]+ checks, 0 failed' ;;
+    modelist) echo '^PASSED: 0 of [0-9]+ checks failed' ;;
+    reslist-*) echo '^race new: [0-9]+ lists made again, [0-9]+ reads, 0 entries read half made$' ;;
+    dualmode-table) echo '^table: [0-9]+ lines' ;;
+    *_test) echo '(-TEST PASSED|^HDRSETTLE-TEST: [0-9]+ checks, 0 failed)' ;;
+    linkdepth) echo 'LINKDEPTH-TEST PASSED' ;;
+    src_check) echo '^SRC-CHECK PASSED' ;;
+    render_refused) echo '^RENDER-REFUSED PASSED' ;;
+    drmconnector-*) echo ' PASSED \(0 failed\)$' ;;
+    retiredkept) echo '^RETIRED-KEPT PASSED' ;;
+    pieces) echo '^PIECES PASSED' ;;
+    aesink-same) echo 'SAME DONE' ;;
+    aesink-race) echo '^race \(address\): 0 ThreadSanitizer reports, 0 AddressSanitizer errors' ;;
+    seek) echo '^PASSED: [0-9]+ passed, 0 failed' ;;
+    speakers) echo '^SPEAKERS-TEST PASSED$' ;;
+    swig) echo "^lines with Hades text: $SWIG_HADES_LINES\$" ;;
+    fadelabel) echo '^PASSED: 0 of [0-9]+ passes' ;;
+    audio-follow|offsets) echo '^\[  PASSED  \] [0-9]+ tests' ;;
+    aus|depth) echo '^0 failed$' ;;
+    settings_resize*) echo '^[0-9]+ checks, 0 failed' ;;
+    vrr|vrr_gui|vrr_video|display_modes|exact_rate|video_size|picture_timing) echo '^PASSED$' ;;
+    vrr_pacer) echo '^interval against the one asked for: ' ;;
+    *) echo '^ALL PASSED' ;;
+  esac
+}
+fail_re() {
+  case $1 in
+    audio-follow|offsets) echo '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' ;;
+    widths) echo 'OVER' ;;
+    reachable*) echo '^WRONG' ;;
+    *) echo '^FAIL' ;;
+  esac
+}
+# the tests that run with the GPU or a minute's wait, one at a time
+heavy() { case $1 in eos|render_refused|drmconnector-bounded|pieces|aesink-race|reslist-*) return 0 ;; *) return 1 ;; esac; }
+
+# check <test>...: each test against the tree as it is: built (WERR=-Werror where its flags take it), run, judged
+check() {
+  local t D L v
+  for t in "$@"; do
+    D=$RG_W/t/$t L=$RG_W/logs/$t.log
+    rg_fresh "$D"
+    if ! WERR=-Werror build $t "$KT" "$D"; then
+      rg_item "$t" FAILED "not built: $(grep -a -m1 -E 'error|FAIL' $D/build.log | cut -c1-180)"; continue
+    fi
+    rg_log "$L" run $t "$KT" "$D"
+    v=$(rg_pass "$L" "$(pass_re $t)" "$(fail_re $t)")
+    rg_item "$t" "$(rg_say "$v")" "$(rg_rest "$v")"
+  done
+}
+# must_fail <test> <expected>: a test built with the rule before it carries (-DOLD_RULE and the like) must fail
+must_fail() {
+  local t=$1 want=$2 D=$RG_W/t/$1 L=$RG_W/logs/$1.log v
+  rg_fresh "$D"
+  build $t "$KT" "$D" || { rg_item "$t" FAILED "not built: $(grep -a -m1 error $D/build.log | cut -c1-180)"; return; }
+  rg_log "$L" run $t "$KT" "$D"
+  if [ "$want" = exit ]; then
+    [ "$(rg_exit $L)" != 0 ] && [ -n "$(rg_exit $L)" ] && v="PASSED it fails as it must: exit $(rg_exit $L)" || v="FAILED it passes: exit $(rg_exit $L)"
+  else v=$(rg_fails "$L" "$want" "$(fail_re $t)"); fi
+  rg_item "$t" "$(rg_say "$v")" "$(rg_rest "$v")"
+}
+# mutants <test>...: every mutant of mutants.py that names one of these tests, in parallel (the heavy ones one at a
+# time): the tree copied with the mutant's edit, the test built against it and run; it must fail as written there
+mutants() {
+  local list=$RG_W/mutants-$1.txt name t want n=0
+  $MUT list "$@" > "$list" || { rg_item "mutants-$1" FAILED "mutate.py list failed"; return; }
+  while read -r name t want; do
+    n=$((n + 1))
+    while [ "$(jobs -r | wc -l)" -ge "$RG_JOBS" ]; do wait -n; done
+    if heavy $t; then mutant_one "$name" "$t"; else mutant_one "$name" "$t" & fi
+  done < "$list"
+  wait
+  while read -r name t want; do mutant_item "$name" "$t" "$want"; done < "$list"
+  [ $n -gt 0 ] || rg_item "mutants-$1" FAILED "no mutant names $*"
+}
+mutant_one() { # <mutant> <test>: into $RG_W/m/<mutant>/<test>
+  local name=$1 t=$2 M=$RG_W/m/$1 D
+  D=$M/run-$t
+  rg_fresh "$D"
+  ( flock 9
+    [ -d "$M/tree" ] || $MUT make "$name" "$KT" "$M/tree" > "$M/make.log" 2>&1 ) 9> "$M.lock"
+  [ -d "$M/tree" ] && grep -q '^mutant ' "$M/make.log" || { echo "no tree" > "$D/state"; return; }
+  build $t "$M/tree" "$D" || { echo "not built" > "$D/state"; return; }
+  rg_log "$D/run.log" run $t "$M/tree" "$D"
+  echo ran > "$D/state"
+}
+mutant_item() { # <mutant> <test> <expected>
+  local name=$1 t=$2 want=$3 M=$RG_W/m/$1 D v e
+  D=$M/run-$t
+  case "$(cat $D/state 2> /dev/null)" in
+    "no tree") v="FAILED the mutant no longer applies: $(grep -a -m1 -E 'NOT APPLIED|no mutant|exists' $M/make.log | cut -c1-200)" ;;
+    "not built")
+      if [ "$want" = static ] && grep -a -q 'error: static assertion failed' $D/build.log; then
+        v="PASSED it fails as it must: a static assertion of the test fails ($(grep -a -m1 'static assertion failed' $D/build.log | sed 's/.*error: //' | cut -c1-100))"
+      else v="FAILED the test does not build against the mutant: $(grep -a -m1 -E 'error|FAIL' $D/build.log | cut -c1-160)"; fi ;;
+    ran) e=$(rg_exit $D/run.log)
+      if [ "$want" = exit ]; then
+        if [ -n "$e" ] && [ "$e" != 0 ]; then v="PASSED it fails as it must: exit $e; $(grep -a -m1 -E 'ERROR: [A-Za-z]+Sanitizer|WARNING: ThreadSanitizer|^FAIL' $D/run.log | cut -c1-120)"
+        else v="FAILED nothing fails on the mutant: exit $e"; fi
+      else v=$(rg_fails "$D/run.log" "$want" "$(fail_re $t)"); fi ;;
+    *) v="FAILED it did not run" ;;
+  esac
+  rg_item "$t.mut.$name" "$(rg_say "$v")" "$(rg_rest "$v")"
+}
+# done with the mutated trees of these mutants (their logs stay)
+mutants_clean() { local m; for m in "$RG_W"/m/*/tree; do [ -d "$m" ] && rg_rm "$m"; done; return 0; }
+
+# ------------------------------------------------------------------------------------------------- the stages
+KT=$(kodi) || exit 1
+echo "Kodi tree: $KT ($(rg_kodi_commit 2> /dev/null | cut -c1-12))"
+
+stage_existing() {
+  check settings_resize vrr settings_resize-tsan vrr_gui vrr_video vrr_pacer display_modes exact_rate video_size     picture_timing
+  must_fail settings_resize-DOLD_RULE 11
+  must_fail settings_resize-DIS_PLAYING_RULE 3
+  must_fail settings_resize-DNO_SIGNAL 11
+  must_fail settings_resize-DNO_VIDEO_PLAYS 1
+  must_fail vrr_video-old-rule 4
+  mutants settings_resize vrr vrr_gui vrr_video display_modes exact_rate video_size picture_timing
+  mutants_clean
+}
+stage_policy() {
+  # (widths: those strings where Estuary shows them, measured with its fonts by Pillow)
+  check p5always policy videopasses_missed videopasses dvconvert reachable gap_policy dualhdr anyhz strings widths
+  must_fail reachable-old-rule 6
+  mutants p5always policy videopasses_missed videopasses dvconvert reachable gap_policy dualhdr anyhz strings widths
+  mutants_clean
+}
+stage_window() {
+  LP=$(rg_lp_shared) && FF=$(rg_ff_bridge) || rg_fail "libplacebo or FFmpeg not built"
+  check windowpreload dveos eos
+  mutants windowpreload dveos eos
+  mutants_clean
+}
+stage_modes() {
+  check modelist reslist-address reslist-thread
+  local t
+  for t in reslist-address reslist-thread; do
+    grep -q 'the way before: exit [1-9][0-9]*; [1-9][0-9]* sanitizer reports' $RG_W/logs/$t.log &&
+      rg_item $t.old "PASSED" "the way before is shown wrong: $(grep -m1 'the way before' $RG_W/logs/$t.log)" ||
+      rg_item $t.old "FAILED" "the way before is not shown wrong: $(grep -m1 'the way before' $RG_W/logs/$t.log)"
+  done
+  mutants modelist reslist-address reslist-thread
+  mutants_clean
+}
+stage_output() {
+  inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
+  # (the sets of logs by the SHA256 of their names: see the head of this file)
+  local f
+  for f in windows windows-new; do
+    $RG_PY -c 'import hashlib, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    f = line.rstrip("\n").split("\t")
+    f[0] = hashlib.sha256(f[0].encode()).hexdigest()[:12]
+    sys.stdout.write("\t".join(f) + "\n")' "$IN/$f.tsv" > "$IN/$f-hashed.tsv" || rg_fail "the windows $f"
+  done
+  check dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
+    finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
+    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test
+  must_fail dvframetest-old-rule 4
+  must_fail presentlag-old-rule 5
+  mutants dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
+    finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
+    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test
+  mutants_clean
+}
+stage_linkdepth() {
+  check linkdepth src_check
+  mutants linkdepth src_check
+  mutants_clean
+}
+stage_fix() {
+  inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
+  LP=$(rg_lp_shared) && FF=$(rg_ff_bridge) || rg_fail "libplacebo or FFmpeg not built"
+  DRM=$(drminc) || rg_fail "no libdrm headers"
+  # ("bounded" waits a minute: it runs beside the others)
+  check drmconnector-bounded &
+  check render_refused drmconnector-connected drmconnector-never drmconnector-kept drmconnector-failed retiredkept \
+    pieces aesink-same aesink-race
+  wait
+  mutants render_refused drmconnector-never drmconnector-kept drmconnector-failed drmconnector-bounded retiredkept \
+    pieces aesink-same aesink-race
+  mutants_clean
+}
+stage_own() {
+  local bb L
+  check seek swig speakers
+  mutants seek swig speakers
+  mutants_clean
+  # pwr() of watch-dv.sh (hades-diag, the LibreELEC tree of REGRESS_LE_REF) with the image's busybox; its six
+  # mutations are made by the test itself, on the function it takes out of the script
+  bb=$(ls "$REGRESS_LE_BUILD"/install_pkg/busybox-*/usr/bin/busybox 2> /dev/null | head -n 1)
+  rg_le_tree $RG_W/le packages/sysutils/hades-diag/scripts/watch-dv.sh
+  L=$RG_W/logs/pwr.log
+  if [ -z "$bb" ]; then rg_item pwr FAILED "no busybox in $REGRESS_LE_BUILD/install_pkg"
+  else
+    rg_log "$L" bash $H/own/pwr_test.sh "$bb" $RG_W/le/packages/sysutils/hades-diag/scripts/watch-dv.sh
+    rg_item pwr "$(rg_say "$(rg_pass "$L" '^PWR TEST PASSED$' '^FAIL|^PWR TEST FAILED')")" "$(rg_rest "$(rg_pass "$L" '^PWR TEST PASSED$' '^FAIL|^PWR TEST FAILED')")"
+    local p
+    for p in P1 P2 P3 P4 P5 P6; do
+      grep -a -q "^mutation $p caught$" $L && rg_item pwr.mut.$p PASSED "caught" ||
+        rg_item pwr.mut.$p FAILED "$(grep -a -m1 "MUTATION $p" $L || echo 'no line of it')"
+    done
+  fi
+}
+stage_ux() {
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  check fadelabel audio-follow
+  mutants fadelabel audio-follow
+  mutants_clean
+  # the Bluetooth logic of the LibreELEC settings add-on: bluetooth.py of its recipe (archive checked against
+  # PKG_SHA256, every patch with -F0), and the same with the part of LibreELEC-settings-9019 that changes it reversed
+  local P=packages/mediacenter/LibreELEC-settings ver sha tb S=$RG_W/settings L p
+  ver=$(rg_pkgvar $P PKG_VERSION); sha=$(rg_pkgvar $P PKG_SHA256)
+  tb=$(rg_source LibreELEC-settings "LibreELEC-settings-$ver.tar.gz")
+  rg_fresh $S/src $S/before
+  rg_le_tree $S/le $P/patches
+  if [ -z "$tb" ] || [ "$(sha256sum < "$tb" | cut -c1-64)" != "$sha" ]; then
+    rg_item bt-addon FAILED "no LibreELEC-settings-$ver.tar.gz with PKG_SHA256 in REGRESS_SOURCES"
+    rg_item bt-addon.without-9019 FAILED "no LibreELEC-settings source"; return 0
+  fi
+  tar -xzf "$tb" --strip-components=1 -C $S/src
+  for p in $(ls $S/le/$P/patches/*.patch | sort); do
+    patch -d $S/src -p1 -F0 -s --no-backup-if-mismatch < "$p" || { rg_item bt-addon FAILED "patch $(basename $p) does not apply"; return 0; }
+  done
+  L=$RG_W/logs/bt-addon.log
+  rg_log "$L" $RG_PY $H/ux/addon_logic_test.py $S/src/resources/lib/modules/bluetooth.py
+  rg_item bt-addon "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  mkdir -p $S/before/resources/lib/modules && cp $S/src/resources/lib/modules/bluetooth.py $S/before/resources/lib/modules/
+  $RG_PY - $S/le/$P/patches/LibreELEC-settings-9019-*.patch $S/before/9019-bluetooth.patch <<'PY'
+import sys
+text = open(sys.argv[1], encoding='utf-8').read()
+at = text.index('diff --git a/resources/lib/modules/bluetooth.py b/resources/lib/modules/bluetooth.py')
+end = text.find('\ndiff --git ', at + 1)
+open(sys.argv[2], 'w', encoding='utf-8').write(text[at:] if end < 0 else text[at:end + 1])
+PY
+  L=$RG_W/logs/bt-addon.without-9019.log
+  if patch -R -p1 -F0 -s -d $S/before < $S/before/9019-bluetooth.patch; then
+    rg_log "$L" $RG_PY $H/ux/addon_logic_test.py $S/before/resources/lib/modules/bluetooth.py
+    [ "$(rg_exit $L)" != 0 ] && rg_item bt-addon.without-9019 PASSED "it fails without 9019: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item bt-addon.without-9019 FAILED "it passes without 9019"
+  else rg_item bt-addon.without-9019 FAILED "the part of 9019 that changes bluetooth.py does not reverse"; fi
+}
+# the GL matrix stacks (CMatrixGLStack): every C++ source of the tree, no function pops a level that it did not push
+# (a Pop() on a level pushed by a caller restores the caller's matrix in the middle of its drawing); and a copy of the
+# tree whose OverlayRendererGLES.cpp has lost its first glMatrixModview.Push() must fail it, naming that file
+stage_overlay() {
+  local K L M f=xbmc/cores/VideoPlayer/VideoRenderers/OverlayRendererGLES.cpp v
+  K=$(kodi)
+  L=$RG_W/logs/matrix-balance.log
+  rg_log "$L" $RG_PY "$H/overlay/matrix_balance.py" "$K"
+  v=$(rg_pass "$L" '^[1-9][0-9]* uses of a matrix stack in functions checked, 0 unbalanced$' '^UNBALANCED')
+  rg_item matrix-balance "$(rg_say "$v")" "$(rg_rest "$v")"
+  M=$RG_W/matrix-mut
+  rg_fresh "$M"
+  cp -as "$K/." "$M/" || rg_fail "the tree of links"
+  rm -f "$M/$f"
+  if $RG_PY -c "import sys; s = open(sys.argv[1], encoding='utf-8').read(); o = 'glMatrixModview.Push();'; assert o in s; open(sys.argv[2], 'w', encoding='utf-8').write(s.replace(o, '', 1))" "$K/$f" "$M/$f"; then
+    L=$RG_W/logs/matrix-balance-mutant.log
+    rg_log "$L" $RG_PY "$H/overlay/matrix_balance.py" "$M"
+    rg_item matrix-balance-mutant "$([ "$(rg_exit "$L")" = 1 ] && grep -a -q "^UNBALANCED: $f: " "$L" && echo PASSED || echo FAILED)" \
+      "the first glMatrixModview.Push() of OverlayRendererGLES.cpp taken out: exit $(rg_exit "$L"); $(grep -a -m1 '^UNBALANCED' "$L" | cut -c1-140)"
+  else rg_item matrix-balance-mutant FAILED "the mutant no longer applies: no glMatrixModview.Push(); in $f"; fi
+  rg_rm "$M"
+}
+
+stage_stereo() {
+  inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  check offsets aus depth
+  mutants offsets aus depth
+  mutants_clean
+}
+
+rg_main "$STAGES" "$@"

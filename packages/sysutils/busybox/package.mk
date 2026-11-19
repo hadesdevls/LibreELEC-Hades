@@ -125,6 +125,10 @@ makeinstall_target() {
     if [ ${TARGET_ARCH} = x86_64 ]; then
       cp ${PKG_DIR}/scripts/internal-disks ${INSTALL}/usr/lib/libreelec
       chmod 0755 ${INSTALL}/usr/lib/libreelec/internal-disks
+      # Hades: what the clock of the computer keeps, measured once the time comes from the internet, for
+      # the setting "Hardware clock" on Automatic: see hades_clock_mode in scripts/init
+      cp ${PKG_DIR}/scripts/clock-measure ${INSTALL}/usr/lib/libreelec
+      chmod 0755 ${INSTALL}/usr/lib/libreelec/clock-measure
     fi
     # Hades: which internal partitions are shown while the internal disks are shown, asked by
     # 95-udevil-mount.rules (udevil) before it mounts one, on every device: without it nothing internal
@@ -176,6 +180,9 @@ post_install() {
   enable_service show-version.service
   enable_service var.mount
   enable_service locale.service
+  if [ ${TARGET_ARCH} = x86_64 ]; then
+    enable_service hades-clock-measure.path
+  fi
 
   # cron support
   if [ "${CRON_SUPPORT}" = "yes" ]; then

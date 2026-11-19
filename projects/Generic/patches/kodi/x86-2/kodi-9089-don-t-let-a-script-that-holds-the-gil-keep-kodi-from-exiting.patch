@@ -1,0 +1,368 @@
+From b89af505dc3046f767fb5cfa393953af9170143a Mon Sep 17 00:00:00 2001
+From: Kel Modderman <kelvmod@gmail.com>
+Date: Sun, 1 Nov 2026 18:15:37 +1000
+Subject: [PATCH] Don't let a script that holds the GIL keep Kodi from exiting
+
+A script stuck in a C call that holds the GIL, such as a function called
+through ctypes.PyDLL or a C extension that never releases it, keeps Kodi
+from exiting. When Kodi stops, CPythonInvoker::stop() takes the GIL to
+tell each script to abort, including scripts that have nothing to do
+with the stuck one, and XBPython::Uninitialize() takes it to look for
+what is left. Python has no way to wait for the GIL with a time limit.
+
+Once Kodi is stopping, both now wait for the GIL on a helper thread for
+up to 5 seconds, under a thread state of the main interpreter, which no
+script can free. If the helper doesn't get it in time, Kodi gives up on
+Python: the script being stopped is marked failed, as a script that
+won't stop already is, later waits give up at once, stop() no longer
+waits 5 seconds for scripts that can't run, and Python isn't finalized.
+A helper that gets the GIL after it was given up on keeps it, so the
+script that held it can't run on while Kodi shuts down. Before Kodi
+stops nothing changes, except that stop() takes the GIL for the abort
+notification under a thread state of the main interpreter instead of
+the script's.
+
+The abort notification runs no Python, but taking the GIL there finds a
+stuck script before stop() waits 5 seconds for it. Using the main
+interpreter for it also means stop() no longer leaves a thread state in
+the script's interpreter while it waits, which ending that interpreter
+would free on Python 3.14.
+
+Raising SystemExit in a script still waits for the GIL as long as it
+takes. It needs a thread state of the script's interpreter, which can't
+wait on a helper, as ending the interpreter frees it, and can't be
+swapped to after the wait, as PyThreadState_Swap() releases the GIL. So
+a script that only starts holding the GIL after the abort notification
+of a stop(), its own or another's, can still block there, as before.
+
+XBPython::Uninitialize() no longer keeps the GIL on the main thread
+itself. When scripts or interpreters are left, the helper keeps it
+instead, and from then on the main thread must not take it. The only
+place that would is ~XBPython(), which skips Py_Finalize() then. The
+second Uninitialize() call now returns at once in both cases, as nothing
+can change the outcome after the first one.
+
+Assisted-by: Claude
+(cherry picked from commit 122881ea4f67137b12d8e3eae8e07dd0e138f05c)
+(cherry picked from commit 6b78fd548fd7db29373c82d8b6114b715857d07f)
+---
+ xbmc/interfaces/python/PythonInvoker.cpp |  37 +++---
+ xbmc/interfaces/python/XBPython.cpp      | 153 ++++++++++++++++++++---
+ xbmc/interfaces/python/XBPython.h        |  12 +-
+ 3 files changed, 168 insertions(+), 34 deletions(-)
+
+diff --git a/xbmc/interfaces/python/PythonInvoker.cpp b/xbmc/interfaces/python/PythonInvoker.cpp
+index 5a7f2df..aac5253 100644
+--- a/xbmc/interfaces/python/PythonInvoker.cpp
++++ b/xbmc/interfaces/python/PythonInvoker.cpp
+@@ -473,6 +473,7 @@ bool CPythonInvoker::stop(bool abort)
+ {
+   std::unique_lock lock(m_critical);
+   m_stop = true;
++  XBPython& python = CServiceBroker::GetXBPython();
+ 
+   if (!IsRunning() && !m_threadState)
+     return false;
+@@ -484,32 +485,32 @@ bool CPythonInvoker::stop(bool abort)
+       setState(InvokerStateStopping);
+       lock.unlock();
+ 
+-      PyThreadState* ts = PyThreadState_New(m_threadState->interp);
+-      if (ts == nullptr)
++      //tell xbmc.Monitor to call onAbortRequested(). That needs no Python, but taking the GIL
++      //here finds a script stuck holding it before the 5 s wait below.
++      const auto abortNotify = [this]
+       {
+-        CLog::LogF(LOGERROR, "({}, {}) PyThreadState_New failed", GetId(), m_sourceFile);
++        if (m_addon)
++        {
++          CLog::Log(LOGDEBUG, "CPythonInvoker({}, {}): trigger Monitor abort request", GetId(),
++                    m_sourceFile);
++          AbortNotification();
++        }
+         return false;
+-      }
+-
+-      PyEval_RestoreThread(ts);
+-
+-      //tell xbmc.Monitor to call onAbortRequested()
+-      if (m_addon)
++      };
++      if (!python.RunWithGil(abortNotify))
+       {
+-        CLog::Log(LOGDEBUG, "CPythonInvoker({}, {}): trigger Monitor abort request", GetId(),
+-                  m_sourceFile);
+-        AbortNotification();
++        // without the GIL the script can't stop
++        setState(InvokerStateFailed);
++        return false;
+       }
+-
+-      PyThreadState_Clear(ts);
+-      PyThreadState_DeleteCurrent();
+     }
+     else
+       //Release the lock while waiting for threads to finish
+       lock.unlock();
+ 
+     XbmcThreads::EndTime<> timeout(PYTHON_SCRIPT_TIMEOUT);
+-    while (!m_stoppedEvent.Wait(15ms))
++    // no script can stop without the GIL
++    while (!python.IsGilLost() && !m_stoppedEvent.Wait(15ms))
+     {
+       if (timeout.IsTimePast())
+       {
+@@ -534,13 +535,13 @@ bool CPythonInvoker::stop(bool abort)
+     setState(InvokerStateExecutionDone);
+ 
+     // Useful for add-on performance metrics
+-    if (!timeout.IsTimePast())
++    if (!timeout.IsTimePast() && !python.IsGilLost())
+       CLog::Log(LOGDEBUG, "CPythonInvoker({}, {}): script termination took {}ms", GetId(),
+                 m_sourceFile, (PYTHON_SCRIPT_TIMEOUT - timeout.GetTimeLeft()).count());
+ 
+     // Since we released the m_critical it's possible that the state is cleaned up
+     // so we need to recheck for m_threadState == NULL
+-    if (m_threadState != NULL)
++    if (m_threadState != NULL && !python.IsGilLost())
+     {
+       PyThreadState* ts = PyThreadState_New(m_threadState->interp);
+       if (ts == nullptr)
+diff --git a/xbmc/interfaces/python/XBPython.cpp b/xbmc/interfaces/python/XBPython.cpp
+index c3fa35f..568fec3 100644
+--- a/xbmc/interfaces/python/XBPython.cpp
++++ b/xbmc/interfaces/python/XBPython.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "ServiceBroker.h"
+ #include "Util.h"
++#include "application/Application.h"
+ #include "filesystem/SpecialProtocol.h"
+ #include "interfaces/AnnouncementManager.h"
+ #include "interfaces/legacy/AddonUtils.h"
+@@ -34,6 +35,35 @@
+ #endif
+ 
+ #include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <system_error>
++#include <thread>
++
++using namespace std::chrono_literals;
++
++namespace
++{
++// how long to wait for the GIL once Kodi is stopping
++constexpr auto GIL_WAIT = 5s;
++
++struct GilWait
++{
++  std::mutex mutex;
++  std::condition_variable cv;
++  bool started{false};
++  bool done{false};
++  std::optional<bool> keep; // fn's result
++  bool timedOut{false};
++
++  // the GIL is kept until the process exits
++  [[noreturn]] void Park(std::unique_lock<std::mutex>& lock)
++  {
++    while (true)
++      cv.wait(lock);
++  }
++};
++} // namespace
+ 
+ XBPython::XBPython()
+ {
+@@ -104,8 +134,8 @@ XBPython::~XBPython()
+ 
+   if (Py_IsInitialized())
+   {
+-    // Uninitialize() kept the GIL for scripts or interpreters that are left
+-    if (m_skipFinalize)
++    // Uninitialize() kept the GIL for scripts or interpreters that are left, or it's lost
++    if (m_skipFinalize || m_gilLost)
+       return;
+ 
+     // Switch to the main interpreter thread before finalizing
+@@ -503,30 +533,123 @@ void XBPython::Uninitialize()
+   // failed can leave its interpreter behind: then keep the GIL from now on, so no further
+   // Python code runs while Kodi exits, and don't finalize Python under them. Scripts not
+   // counted by now are refused in OnScriptInitialized().
+-  if (m_skipFinalize)
+-    return;
+   int scriptsRunning;
+   {
+     std::unique_lock counterLock(m_critSection);
++    if (m_scriptsClosed)
++      return;
+     m_scriptsClosed = true;
+     scriptsRunning = static_cast<int>(m_scriptsStarted.size());
+   }
+-  PyEval_RestoreThread(m_mainThreadState);
+-  bool interpreterLeft = false;
+-  for (PyInterpreterState* interp = PyInterpreterState_Head(); interp;
+-       interp = PyInterpreterState_Next(interp))
+-  {
+-    if (interp != PyInterpreterState_Main())
+-      interpreterLeft = true;
++  const auto keep = RunWithGil(
++      [scriptsRunning]
++      {
++        for (PyInterpreterState* interp = PyInterpreterState_Head(); interp;
++             interp = PyInterpreterState_Next(interp))
++        {
++          if (interp != PyInterpreterState_Main())
++            return true;
++        }
++        return scriptsRunning > 0;
++      });
++  if (!keep)
++  {
++    CLog::Log(LOGWARNING,
++              "XBPython: could not take the GIL, {} script(s) still running, not finalizing Python",
++              scriptsRunning);
++    m_skipFinalize = true;
++    return;
+   }
+   if (scriptsRunning > 0)
+     CLog::Log(LOGWARNING, "XBPython: {} script(s) still running, not finalizing Python",
+               scriptsRunning);
+-  else if (interpreterLeft)
++  else if (*keep)
+     CLog::Log(LOGWARNING, "XBPython: a script interpreter was not ended, not finalizing Python");
+-  m_skipFinalize = scriptsRunning > 0 || interpreterLeft;
+-  if (!m_skipFinalize)
+-    m_mainThreadState = PyEval_SaveThread();
++  m_skipFinalize = *keep;
++}
++
++std::optional<bool> XBPython::RunWithGil(const std::function<bool()>& fn)
++{
++  if (!g_application.IsStopping())
++  {
++    PyThreadState* ts = PyThreadState_New(PyInterpreterState_Main());
++    if (ts == nullptr)
++    {
++      CLog::LogF(LOGERROR, "PyThreadState_New failed");
++      return {};
++    }
++    PyEval_RestoreThread(ts);
++    if (fn())
++      return true;
++    PyThreadState_Clear(ts);
++    PyThreadState_DeleteCurrent();
++    return false;
++  }
++
++  if (m_gilLost)
++    return {};
++
++  // A C call can hold the GIL for good, and there's no timed way to take it, so wait on a
++  // helper thread. A helper that gets the GIL too late keeps it, so the script that held it
++  // doesn't run on while Kodi is torn down. Its thread state is in the main interpreter, which
++  // no script can free. fn only runs while the caller waits for it.
++  auto wait = std::make_shared<GilWait>();
++  try
++  {
++    std::thread(
++        [wait, fn]
++        {
++          PyThreadState* ts = PyThreadState_New(PyInterpreterState_Main());
++          if (ts != nullptr)
++            PyEval_RestoreThread(ts);
++          std::unique_lock lock(wait->mutex);
++          if (ts == nullptr)
++          {
++            wait->done = true;
++            wait->cv.notify_all();
++            return;
++          }
++          if (wait->timedOut)
++            wait->Park(lock);
++          wait->started = true;
++          wait->cv.notify_all();
++          lock.unlock();
++          const bool keep = fn();
++          if (!keep)
++          {
++            PyThreadState_Clear(ts);
++            PyThreadState_DeleteCurrent();
++          }
++          lock.lock();
++          wait->done = true;
++          wait->keep = keep;
++          wait->cv.notify_all();
++          if (keep)
++            wait->Park(lock);
++        })
++        .detach();
++  }
++  catch (const std::system_error& e)
++  {
++    CLog::LogF(LOGERROR, "no thread to take the GIL: {}", e.what());
++    return {};
++  }
++
++  std::unique_lock lock(wait->mutex);
++  if (!wait->cv.wait_for(lock, GIL_WAIT, [&wait] { return wait->started || wait->done; }))
++  {
++    wait->timedOut = true;
++    lock.unlock();
++    // a caller on another thread can still start a helper until this is set; it times out too
++    m_gilLost = true;
++    CLog::Log(LOGERROR, "XBPython: could not take the GIL within {} s, not running any more Python",
++              std::chrono::duration_cast<std::chrono::seconds>(GIL_WAIT).count());
++    return {};
++  }
++  wait->cv.wait(lock, [&wait] { return wait->done; });
++  if (!wait->keep)
++    CLog::LogF(LOGERROR, "PyThreadState_New failed");
++  return wait->keep;
+ }
+ 
+ void XBPython::Process()
+diff --git a/xbmc/interfaces/python/XBPython.h b/xbmc/interfaces/python/XBPython.h
+index 56e2c66..9883acb 100644
+--- a/xbmc/interfaces/python/XBPython.h
++++ b/xbmc/interfaces/python/XBPython.h
+@@ -15,7 +15,10 @@
+ #include "threads/Event.h"
+ #include "threads/Thread.h"
+ 
++#include <atomic>
++#include <functional>
+ #include <memory>
++#include <optional>
+ #include <set>
+ #include <vector>
+ 
+@@ -105,6 +108,12 @@ public:
+ 
+   PyThreadState* GetMainThreadState() const { return m_mainThreadState; }
+ 
++  // Runs fn with the GIL, under a new thread state of the main interpreter, and returns its
++  // result, or nothing if the GIL couldn't be had. fn returns true to keep the GIL for good.
++  // Once Kodi is stopping, gives up if a script holds the GIL too long.
++  std::optional<bool> RunWithGil(const std::function<bool()>& fn);
++  bool IsGilLost() const { return m_gilLost; }
++
+   // false means an inconsistent binding runtime: types would be created by a sub-interpreter
+   bool BindingModulesLoaded() const { return m_bindingModulesLoaded; }
+ 
+@@ -115,8 +124,9 @@ private:
+   PyThreadState* m_mainThreadState{nullptr};
+   bool m_bindingModulesLoaded{true};
+   std::set<const ILanguageInvoker*> m_scriptsStarted; // between OnScriptInitialized/Finalized
+-  bool m_skipFinalize{false}; // GIL kept since Uninitialize()
++  bool m_skipFinalize{false}; // Python left running at exit
+   bool m_scriptsClosed{false}; // no script starts once Uninitialize() counts them
++  std::atomic<bool> m_gilLost{false}; // a GIL wait timed out, no more Python runs
+ 
+   //Vector with list of threads used for running scripts
+   PyList m_vecPyList;
+-- 
+2.53.0
+

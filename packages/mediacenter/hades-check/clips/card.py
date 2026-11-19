@@ -18,7 +18,11 @@ Layout (a grid of 1920x1080; at 3840x2160 every coordinate is doubled). Region e
      those colours give in SDR with the reference white at 203 cd/m2 (ITU-R BT.2408): linear BT.709
      0.75^2.4 x 203 cd/m2 per lit component, to BT.2020, then the format's transfer;
   4. a dark strip (y 864-1008, x 120-936) of black, with four squares of 96 (y 888-984; x 168, 384,
-     600, 816) at 2, 4, 6 and 8 % of the code range above black;
+     600, 816): in SDR at 2, 4, 6 and 8 % of the code range above black; in HDR the same light on the
+     display as those squares give in SDR with the reference white at 203 cd/m2, as the colours (ITU-R
+     BT.2408; the gamma 2.4 of ITU-R BT.1886): 0.017, 0.090, 0.237 and 0.473 cd/m2. (At 2 to 8 % of the
+     signal of each format they were 0.009 to 0.18 cd/m2 in PQ, half of that light and less, and 0.022
+     to 0.62 in HLG: not the same squares in two formats of the same card);
   5. a light strip (y 864-1008, x 984-1800): in SDR white with four squares at 2, 4, 6 and 8 % of the
      range below it; in HDR the reference white (203 cd/m2) with four brighter squares, 400, 600, 800
      and 1000 cd/m2 (x 1032, 1248, 1464, 1680).
@@ -245,6 +249,14 @@ HIGHLIGHTS = (400.0, 600.0, 800.0, 1000.0)
 COLOURS = (("red", (1, 0, 0)), ("green", (0, 1, 0)), ("blue", (0, 0, 1)),
            ("cyan", (0, 1, 1)), ("magenta", (1, 0, 1)), ("yellow", (1, 1, 0)))
 MASTERING = {"primaries": "P3-D65", "max_nits": 1000.0, "min_nits": 0.005}
+DARK_PERCENT = (2, 4, 6, 8)  # the dark squares of SDR: per cent of the code range above black
+
+
+def dark_nits(pct):
+    """the light (cd/m2) of a dark square of the HDR cards: that of the square of SDR at pct % of the
+    code range, shown with the reference white at 203 cd/m2 through the gamma 2.4 of ITU-R BT.1886
+    (ITU-R BT.2408, as the colours)"""
+    return REF_WHITE * (pct / 100.0) ** 2.4
 
 FORMATS = (
     {"id": "sdr", "label": "SDR", "file": "hades-check-sdr.mkv", "width": 1920, "height": 1080,
@@ -332,17 +344,20 @@ def region_values(f):
             light = _hdr_colour_light(lit)
             rgbp = tuple(pq_oetf(c) for c in light) if sig == "pq" else hlg_from_display(light)
         out[name] = Value(limited_codes(ycbcr(rgbp, matrix), bits, name), light, rgbp)
-    for n, pct in enumerate((2, 4, 6, 8), 1):
-        ep = pct / 100.0
-        out["dark%d" % n] = _grey_signal(f, ep, grey_light(ep), "dark%d" % n)
+    def grey_nits(nits, what):
+        ep = pq_oetf(nits) if sig == "pq" else hlg_from_display((nits,) * 3)[0]
+        return _grey_signal(f, ep, (nits,) * 3, what)
+
+    for n, pct in enumerate(DARK_PERCENT, 1):
+        if sig == "sdr":
+            out["dark%d" % n] = _grey_signal(f, pct / 100.0, None, "dark%d" % n)
+        else:
+            out["dark%d" % n] = grey_nits(dark_nits(pct), "dark%d" % n)
     if sig == "sdr":
         out["light_strip"] = _grey_signal(f, 1.0, None, "light_strip")
         for n, pct in enumerate((2, 4, 6, 8), 1):
             out["light%d" % n] = _grey_signal(f, 1.0 - pct / 100.0, None, "light%d" % n)
     else:
-        def grey_nits(nits, what):
-            ep = pq_oetf(nits) if sig == "pq" else hlg_from_display((nits,) * 3)[0]
-            return _grey_signal(f, ep, (nits,) * 3, what)
         out["light_strip"] = grey_nits(REF_WHITE, "light_strip")
         for n, nits in enumerate(HIGHLIGHTS, 1):
             out["light%d" % n] = grey_nits(nits, "light%d" % n)

@@ -412,6 +412,86 @@ boot_time() {
   } > $S/boot-time.txt 2>&1
 }
 
+# Hades: the interrupts of the devices, into $S/interrupts.txt: each interrupt of /proc/interrupts that a device takes,
+# with its count summed over the processors (the file has a column for each), the controller and how it is triggered
+# (fasteoi or level: a line that stays active until the device is served, the legacy INTx of PCI; edge; MSI), who takes
+# it, and "shared" where more than one driver does (IRQF_SHARED); and of each, /proc/irq/N/spurious, which counts the
+# interrupts that came and that no driver took. Then each PCI device with a driver: its interrupt, and whether it
+# uses MSI or MSI-X (a device without them shares its line with whatever else the board puts on it). A sound card such
+# as a Xonar (snd_virtuoso, oxygen) takes a shared legacy interrupt; behind a PCIe-to-PCI bridge, what shares it and
+# whether it comes unhandled is what a start that hangs while the drivers load could come from (issue #14): this is
+# where a start that worked says it. Only read.
+interrupts() {
+  local d i m
+  awk '
+    NR == 1 { n = NF; next }
+    {
+      irq = $1; sub(/:$/, "", irq)
+      if (irq !~ /^[0-9]+$/ && irq != "ERR" && irq != "MIS" && irq != "SPU") next
+      total = 0; i = 2
+      while (i <= n + 1 && $i ~ /^[0-9]+$/) { total += $i; i++ }
+      rest = ""
+      for (; i <= NF; i++) rest = rest (rest == "" ? "" : " ") $i
+      if (irq ~ /^[0-9]+$/ && rest !~ /[^ ]+ +[^ ]+ +[^ ]/) next
+      shared = (gsub(/, /, ", ", rest) > 0) ? " (shared)" : ""
+      printf "%s: %d %s%s\n", irq, total, rest, shared
+    }' /proc/interrupts 2>/dev/null
+  echo "== interrupts that came and that no driver took (/proc/irq/N/spurious: count, unhandled, last unhandled)"
+  for i in /proc/irq/[0-9]*; do
+    [ -r $i/spurious ] && ls $i 2>/dev/null | grep -q -v -x -E 'spurious|smp_affinity|smp_affinity_list|affinity_hint|effective_affinity|effective_affinity_list|node' || continue
+    echo "${i##*/}: $(tr '\n' ' ' < $i/spurious)"
+  done
+  echo "== PCI devices with a driver: their interrupt, and MSI or MSI-X"
+  for d in /sys/bus/pci/devices/*; do
+    [ -e $d/driver ] || continue
+    m=$(ls $d/msi_irqs 2>/dev/null | wc -l)
+    echo "${d##*/} [$(cat $d/vendor 2>/dev/null | sed 's/^0x//'):$(cat $d/device 2>/dev/null | sed 's/^0x//')] class=$(cat $d/class 2>/dev/null) driver=$(basename "$(readlink $d/driver)") irq=$(cat $d/irq 2>/dev/null) $([ $m -gt 0 ] && echo "MSI or MSI-X: $m vectors" || echo "no MSI: a line (INTx)")"
+  done
+}
+# Hades: the clock of the computer (the RTC): the setting "Hardware clock" (Automatic, the default, or local time or UTC
+# set by hand, in /storage/.cache/adjtime), how this start reads the clock (the init, hades_clock_mode: /etc/adjtime,
+# and /run/hades/rtc-never-written where it reads it as UTC without writing it), the verdict kept by the measurements
+# with the time from the internet (/usr/lib/libreelec/clock-measure, /storage/.cache/clock-measured), a verdict that
+# changed in this start, and what a measurement gives now: local time, as Windows keeps it; UTC; or neither, its date
+# or time set wrong in the firmware. Nothing is written to the clock.
+clock_setting() {
+  local c=/storage/.cache/adjtime m=/storage/.cache/clock-measured how=auto now
+  if [ -e $c ] || [ -L $c ]; then
+    how=local
+    [ ! -L $c ] && [ -f $c ] && [ "$(dd if=$c bs=256 count=1 2>/dev/null | sed -n 3p)" = UTC ] && how=UTC
+  fi
+  case $how in
+    auto) echo "the setting Hardware clock: Automatic" ;;
+    UTC) echo "the setting Hardware clock: UTC, set by hand ($c)" ;;
+    *) echo "the setting Hardware clock: local time, set by hand ($c)" ;;
+  esac
+  if ! sed -n 3p /etc/adjtime 2>/dev/null | grep -q -x UTC; then
+    echo "this start reads the clock as local time, and never writes it"
+  elif [ -e /run/hades/rtc-never-written ]; then
+    echo "this start reads the clock as UTC, as it was measured to keep, and never writes it"
+  else
+    echo "this start reads the clock as UTC, and sets it to UTC from the internet, as LibreELEC does"
+  fi
+  if [ -f $m ] && [ ! -L $m ]; then
+    echo "the verdict kept ($m): $(dd if=$m bs=256 count=2 2>/dev/null | tr '\n' ' ')"
+  else
+    echo "the verdict kept ($m): none yet"
+  fi
+  [ -f /run/hades/clock-changed ] && echo "changed in this start: $(cat /run/hades/clock-changed)"
+  now=$(sh /usr/lib/libreelec/clock-measure show 2>&1)
+  echo "what the clock of the computer keeps, measured now: ${now#*: }"
+  case "$how:${now%%:*}" in
+    local:UTC) echo "the clock keeps UTC, and the setting Hardware clock says local time: Automatic, or UTC, reads it right from the start" ;;
+    UTC:local) echo "the clock keeps local time, and the setting Hardware clock says UTC: Automatic, or local time, reads it right from the start, and leaves the clock of Windows alone" ;;
+  esac
+}
+# Hades: what the kernel keeps time with (the clock source), and what it said when it changed it, or found one
+# unstable (the watchdog of the clock sources compares them every half second)
+clock_source() {
+  echo "clock source of the kernel: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>&1) (available: $(cat /sys/devices/system/clocksource/clocksource0/available_clocksource 2>&1))"
+  dmesg | grep -E 'clocksource: (Switched to|Marking|Watchdog|Clocksource|Long readout|timekeeping watchdog)|tsc: Marking|TSC found unstable|sched_clock: Marking unstable' | tail -16
+}
+
 snapshot() {
   S=$T/$1; rm -rf $S $S.filtered; mkdir -p $S/edid
   echo "$B" > $S/build.txt
@@ -421,13 +501,17 @@ snapshot() {
   for f in /storage/.kodi/temp/kodi*.log; do [ -f "$f" ] && last 8388608 "$f" | clean | gzip > $S/${f##*/}.gz; done
   {
   echo "== date (UTC) and uptime"; date -u; cat /proc/uptime
-  echo "== clock: system time vs hardware clock (RTC, read-only; Windows keeps it in local time)"
+  echo "== clock: system time vs hardware clock (RTC; never written but where the setting Hardware clock is UTC)"
   s=$(date +%s); r=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)
   echo "system UTC $(date -u '+%F %T'), local $(date '+%F %T %Z'); RTC $(cat /sys/class/rtc/rtc0/date /sys/class/rtc/rtc0/time 2>&1 | tr '\n' ' ')"
   echo "system_minus_rtc=$((s - ${r:-0})) s (a clock kept in local time: the time zone, once NTP has synchronized)"
+  clock_setting
+  echo "this start began at $(date -u -d @$((s - $(cut -d. -f1 /proc/uptime))) '+%F %T' 2>&1) UTC by the clock as it is now ($( { [ -e /run/connman/ntp-synchronized ] || [ -e /run/systemd/timesync/synchronized ]; } && echo 'set from the network' || echo 'not yet set from the network'); start.txt has it as the clock was then)"
   echo "adjtime: $(tr '\n' ' ' < /etc/adjtime 2>&1)| timezone: $(cat /storage/.cache/timezone 2>&1)"
   ls -la /run/connman/ntp-synchronized 2>&1
-  grep -h 'RTC runs in local time' /storage/.kodi/temp/kodi.log 2>/dev/null | tail -1 | clean
+  grep -h 'RTC .*: not writing it' /storage/.kodi/temp/kodi.log 2>/dev/null | tail -1 | clean
+  journalctl -b -t hades-clock -o short-iso --no-pager 2>/dev/null | tail -4
+  clock_source
   echo "== os-release"; cat /etc/os-release
   echo "== uname"; uname -a
   echo "== cmdline"; cat /proc/cmdline
@@ -581,10 +665,27 @@ snapshot() {
   echo "== kodi: VA-API"
   grep -hiE "vaapi|va-api|libva|nvidia_drv_video" /storage/.kodi/temp/kodi.log 2>/dev/null | head -40 | clean
   echo "== time sync (journal)"; lim journalctl -b --no-pager | grep -E 'RTC configured|ntp:|imeserver' | head -20 | clean
+  # Hades: the network at the start, in seconds since the kernel started: the link, connman's states, each step of its
+  # DHCP client (with the diagnostics on: hades_diag_dhcp in the init), and what ended the wait for the network
+  # (network-wait: the time from the internet, or the network alone where the clock is known to be right)
+  echo "== network at the start (journal, seconds since the kernel started)"
+  lim journalctl -b -o short-monotonic --no-pager -t kernel -t connmand -t hades-network-wait 2>/dev/null |
+    grep -E 'NIC Link is|Link is Up|state is|DHCP index|online check|ntp: adjust|hades-network-wait' | head -60 | clean
+  echo "clock for the wait: $(/usr/lib/libreelec/network-wait check 2>&1)"
   echo "== alsa"; aplay -l 2>&1; for e in /proc/asound/card*/eld#*; do [ -r "$e" ] && { echo "--- $e"; cat "$e"; }; done
+  # Hades: the digital (HDMI, DisplayPort) pins of each codec with their control, and the state of each playback
+  # stream: a pin whose output is off ("Pin-ctls" without OUT) while its stream runs plays nothing (linux-9893)
+  echo "== alsa: digital pins and playback streams"
+  for c in /proc/asound/card*/codec#*; do
+    [ -r "$c" ] || continue
+    echo "--- $c: $(sed -n 's/^Codec: //p' "$c" | head -n 1)"
+    awk '/^Node /{ node = $0; digital = ($0 ~ /Digital/) } digital && /Pin-ctls:/{ print node; print }' "$c"
+  done
+  for s in /proc/asound/card*/pcm*p/sub*/status; do [ -r "$s" ] && echo "--- $s: $(head -n 1 "$s")"; done
   echo "== journal warnings and errors"; lim journalctl -b -p warning --no-pager | tail -300 | clean
   } > $S/results.txt 2>&1
   [ -d /sys/class/bluetooth ] && bluetooth > $S/bluetooth.txt 2>&1
+  interrupts > $S/interrupts.txt 2>&1
   [ -r /sys/kernel/debug/gpio ] && lim cat /sys/kernel/debug/gpio > $S/gpio.txt
   if [ "$1" = 1-minute ] || [ "$1" = now ]; then
     # The firmware's description of the machine: its ACPI tables DSDT and SSDT, also the ones it loads while
@@ -627,22 +728,112 @@ snapshot() {
 # setting of LibreELEC; the machine ID is kept in the storage, so "-b -1" is that start, and journalctl does not
 # take --merge with -b): previous-boot/journal.txt.gz, the last 8 MiB of it, and journal-kernel.txt.gz, the
 # kernel's lines of it, through the filter for logs. It tells how a start that hung or lost its power ended,
-# which nothing else here can: that start saved nothing. Written once, before the first snapshot; nothing where
-# the journal has no start before this one.
+# which nothing else here can: that start saved nothing. Written once, before the first snapshot. Where the journal
+# has no start before this one, previous-boot/NONE.txt says why, as far as this system can tell it
+# (previous_boot_none), with the starts that the journal has (journalctl --list-boots: their numbers, identifiers
+# and times, through the filter): that a start left nothing is then told apart from a start before it that kept
+# nothing. Either way the folder of this start is there from now on, not only from the first snapshot. One line
+# in the kernel log says which of the two it was ("hades-diag: previous-boot: ...").
 previous_boot() {
-  local P=$T/previous-boot
-  [ -e /run/hades-diag-journal ] || [ -f /storage/.cache/journald.conf.d/00_settings.conf ] || return 0
-  lim journalctl --list-boots --no-pager 2>/dev/null | grep -q '^ *-1 ' || return 0
+  local P=$T/previous-boot why= list
   rm -rf $P $P.filtered; mkdir -p $P
   echo "$B" > $P/build.txt
-  lim journalctl -b -1 --no-pager > $T/previous.txt
-  last 8388608 $T/previous.txt | clean | gzip > $P/journal.txt.gz
-  lim journalctl -b -1 -k --no-pager > $T/previous.txt
-  last 8388608 $T/previous.txt | clean | gzip > $P/journal-kernel.txt.gz
-  rm -f $T/previous.txt
+  if [ -e /run/hades-diag-journal ] || [ -f /storage/.cache/journald.conf.d/00_settings.conf ]; then
+    if list=$(lim journalctl --list-boots --no-pager 2>&1) && echo "$list" | grep -q '^ *-1 '; then
+      lim journalctl -b -1 --no-pager > $T/previous.txt
+      last 8388608 $T/previous.txt | clean | gzip > $P/journal.txt.gz
+      lim journalctl -b -1 -k --no-pager > $T/previous.txt
+      last 8388608 $T/previous.txt | clean | gzip > $P/journal-kernel.txt.gz
+      rm -f $T/previous.txt
+    elif ! echo "$list" | grep -q '^ *0 '; then
+      why="journalctl could not list the starts of the journal (what it said is below)"
+    else
+      why=$(previous_boot_none kept "$(cat /run/hades-diag-journal 2>/dev/null)")
+    fi
+  else
+    list=$(lim journalctl --list-boots --no-pager 2>&1)
+    why=$(previous_boot_none "not kept")
+  fi
+  if [ -n "$why" ]; then
+    {
+      echo "No journal of the start before this one is saved here."
+      echo
+      echo "Why: $why"
+      echo
+      echo "The journal of a start that hung, or lost its power, is saved in the folder of the start after it (previous-boot"
+      echo "there), as long as the diagnostics were on in both. The starts that the journal has now (journalctl --list-boots;"
+      echo "0 is this one, -1 the one before it):"
+      echo "$list" | clean
+    } > $P/NONE.txt
+    echo "hades-diag: previous-boot: no journal of the start before this one: $why" > /dev/kmsg 2>/dev/null
+  else
+    echo "hades-diag: previous-boot: the journal of the start before this one is saved" > /dev/kmsg 2>/dev/null
+  fi
+  early_log $P
   to_flash previous-boot
   # (the report made on demand keeps it: report.sh takes it)
   [ -n "$REPORT" ] || rm -rf $P $P.filtered
+}
+# The kernel log of a start that ended before its journal was in the storage, as that start copied it there every second
+# (the init: hades_diag_early_log; early-log.sh): previous-boot/early-kernel-log.txt.gz, through the filter for logs (the
+# newest, where more than one start left one). Its head says which start it was (its boot ID, as journalctl --list-boots
+# in NONE.txt names the starts, both through the same filter) and where it was at its last copy; NONE.txt says it too,
+# or EARLY.txt where the journal of the start before was saved. A start that ended before its journal was in the
+# storage is not in the journal at all, so "-1" of the journal is then the start before that one: where the boot ID of
+# the copy is not among the starts of the journal, EARLY.txt says that the journal saved here is of an earlier start
+# (QEMU, 2026-11-18: a start held before the flush of its journal had the journal of the start before it saved here,
+# and nothing said that it was another start's). The copies of starts other than this one are deleted then, not by the
+# report made on demand. A start whose journal got to the storage deleted its own copy.
+early_log() {
+  local d=/storage/.cache/hades-diag/early-log me f n=0 newest= where note id
+  [ -d $d ] || return 0
+  me=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+  for f in $(ls -t $d/*.txt 2>/dev/null); do
+    [ "${f##*/}" = "$me.txt" ] && continue
+    n=$((n + 1))
+    [ -n "$newest" ] || newest=$f
+  done
+  if [ -n "$newest" ]; then
+    clean < $newest | gzip > $1/early-kernel-log.txt.gz
+    where=$(sed -n '3s/^copy [0-9]*, //p' $newest | clean)
+    note="The kernel log of a start that ended before its journal was in the storage is saved here (early-kernel-log.txt.gz): that start copied it to the storage every second, and its last copy was made $where."
+    [ $n -gt 1 ] && note="$note $n starts left such a copy; this is the newest."
+    id=$(sed -n '2s/^start: boot ID \([0-9a-f-]*\) .*/\1/p' $newest | tr -d -)
+    if [ -f $1/journal.txt.gz ] && [ -n "$id" ] && ! lim journalctl --list-boots --no-pager 2>/dev/null | grep -q "$id"; then
+      note="$note That start left no journal: journal.txt.gz and journal-kernel.txt.gz here are of the start before it, the last one whose journal got to the storage."
+    fi
+    if [ -f $1/NONE.txt ]; then
+      { echo; echo "$note"; } >> $1/NONE.txt
+    else
+      echo "$note" > $1/EARLY.txt
+    fi
+    echo "hades-diag: previous-boot: the kernel log of a start that ended before its journal was in the storage is saved (early-kernel-log.txt.gz): its last copy $where" > /dev/kmsg 2>/dev/null
+  fi
+  [ -n "$REPORT" ] && return 0
+  for f in $(ls -A $d 2>/dev/null); do
+    case "$f" in "$me.txt"|"$me.txt.new") ;; *) rm -f "$d/$f" ;; esac
+  done
+}
+# Why the journal has no start before this one, in a sentence. $1: "kept", this start keeps its journal in the storage,
+# and $2 is what the init wrote to /run/hades-diag-journal (whether the start before this one kept its own: kept, new,
+# new-storage; empty with the setting of LibreELEC, which keeps the journal of every start); "not kept", it does not.
+previous_boot_none() {
+  if [ "$1" = kept ]; then
+    case "$2" in
+      kept) echo "the start before this one kept its journal in the storage, as this one does, but the journal has no line of it: it ended before its journal was written to the storage (a hang or a loss of power in its first seconds, before systemd-journal-flush), or its lines were removed." ;;
+      new) echo "the start before this one kept no journal in the storage: the diagnostics were off then (while they are off, the journal of a start is not kept, and what they kept is deleted), or the init could not keep it." ;;
+      new-storage) echo "the diagnostics have not run on this storage before: this is the first start that keeps its journal after a new installation (its very first start only makes the storage as large as its partition, and keeps nothing) or after the storage was made anew." ;;
+      *) echo "the journal of the storage has no start before this one." ;;
+    esac
+  elif dmesg 2>/dev/null | grep -q 'hades-diag: the journal of this start could not be kept'; then
+    echo "this start does not keep its journal in the storage: the init could not keep it (its line \"hades-diag:\" in the kernel log)."
+  elif grep -qw installer /proc/cmdline 2>/dev/null; then
+    echo "this is a start of the installer, whose storage is in RAM: it keeps no journal in the storage."
+  elif switch_on; then
+    echo "the diagnostics were turned on during this start: the journal of a start is kept in the storage from the start after that on."
+  else
+    echo "the diagnostics are off: the journal of a start is kept in the storage only while they are on (or while the setting of LibreELEC that keeps the journal is on)."
+  fi
 }
 
 # Hades: the background jobs of this shell (the queries of the graphics cards of a snapshot), waited for at most $1

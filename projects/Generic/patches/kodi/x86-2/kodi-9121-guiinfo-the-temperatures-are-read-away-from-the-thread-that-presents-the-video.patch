@@ -1,0 +1,646 @@
+From 5e00cec88952b1c97ddb84429b120162e2874dd0 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 21:35:22 +0000
+Subject: [PATCH] guiinfo: the temperatures are read away from the thread that
+ presents the video
+
+Opening the player information over a video held the thread that draws
+the GUI, which also presents the frames of the video, for about 100 ms
+on an RTX 4080 SUPER, at every open: two or three frames that did not
+change (kodi.log: "DialogPlayerProcessInfo.xml opened over a video in
+97.5-112.0 ms ... 97.3-111.4 ms to open").
+
+The panel shows System.CPUTemperature, in a visible condition that is
+evaluated when the dialog opens (SetInitialVisibility()). For any of
+the heat labels CSystemGUIInfo read both temperatures, once a minute,
+there and then: the GPU's through the gputempcommand of LibreELEC's
+advancedsettings.xml, /usr/bin/gputemp, which on an NVIDIA card runs
+"nvidia-smi -q -x" and waits for it (popen()/pclose()). Measured in
+QEMU with the image of 3ea7eec: with LibreELEC's gputemp (4-7 ms there,
+it only reads hwmon) an open costs 5.2-6.1 ms "to open" where a reading
+is due and 0.5 ms within the minute after one; with a gputempcommand
+that takes 100 ms, 104.9-106.5 ms and 0.5 ms: the pattern of the
+RTX 4080 SUPER's log.
+
+Now:
+- only the temperature asked for is read: System.CPUTemperature no
+  longer runs the GPU's command, nor do the fan speed and the use of
+  the processors;
+- on the GUI's thread a reading never waits (CBackgroundReading): the
+  last one is given at once and, where it is a minute old or there is
+  none, a new one runs on the job manager, one at a time; before a
+  first one has ended the label is empty, not "Not available";
+- any other thread (an add-on, JSON-RPC) waits for a reading that is
+  due, as Kodi did, so that a script that reads the label once still
+  gets a value;
+- kodi.log says how long the first reading of each temperature took
+  and on which thread ("System information: the CPU temperature read
+  in ... ms").
+
+With this change the same opens cost 0.4-1.6 ms "to open", with either
+command, and with a cputempcommand that takes 100 ms the reading takes
+its 104 ms on a thread of the job manager while the open costs 0.5-0.8
+ms. A label read through JSON-RPC still gets its value.
+
+CBackgroundReading keeps its state in an object shared with the task,
+so a reading that ends after Kodi has begun to stop writes into nothing
+else. TestBackgroundReading covers: no wait without wait, one reading
+at a time, the last reading while the next runs, a waiting caller that
+reads there, a runner that cannot run, a task that outlives its owner
+and a later reading kept over an earlier one.
+---
+ xbmc/guilib/guiinfo/SystemGUIInfo.cpp     |  95 +++++++--
+ xbmc/guilib/guiinfo/SystemGUIInfo.h       |  14 +-
+ xbmc/utils/BackgroundReading.h            | 144 ++++++++++++++
+ xbmc/utils/CMakeLists.txt                 |   1 +
+ xbmc/utils/test/CMakeLists.txt            |   1 +
+ xbmc/utils/test/TestBackgroundReading.cpp | 232 ++++++++++++++++++++++
+ 6 files changed, 461 insertions(+), 26 deletions(-)
+ create mode 100644 xbmc/utils/BackgroundReading.h
+ create mode 100644 xbmc/utils/test/TestBackgroundReading.cpp
+
+diff --git a/xbmc/guilib/guiinfo/SystemGUIInfo.cpp b/xbmc/guilib/guiinfo/SystemGUIInfo.cpp
+index 1605d08..074aab1 100644
+--- a/xbmc/guilib/guiinfo/SystemGUIInfo.cpp
++++ b/xbmc/guilib/guiinfo/SystemGUIInfo.cpp
+@@ -23,6 +23,8 @@
+ #include "guilib/guiinfo/GUIInfo.h"
+ #include "guilib/guiinfo/GUIInfoHelper.h"
+ #include "guilib/guiinfo/GUIInfoLabels.h"
++#include "jobs/JobManager.h"
++#include "messaging/ApplicationMessenger.h"
+ #include "powermanagement/PowerManager.h"
+ #include "profiles/ProfileManager.h"
+ #include "rendering/RenderSystem.h"
+@@ -43,6 +45,7 @@
+ #include "utils/StringUtils.h"
+ #include "utils/SystemInfo.h"
+ #include "utils/TimeUtils.h"
++#include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ #include "windows/GUIMediaWindow.h"
+ 
+@@ -50,38 +53,94 @@
+ #include "platform/linux/HadesFirmwareBoot.h"
+ #endif
+ 
++#include <atomic>
++#include <chrono>
++#include <functional>
++#include <optional>
++
+ using namespace KODI::GUILIB;
+ using namespace KODI::GUILIB::GUIINFO;
+ 
+-CSystemGUIInfo::CSystemGUIInfo()
+-  : m_gpuInfo(CGPUInfo::GetGPUInfo()),
+-    m_lastSysHeatInfoTime(-SYSTEM_HEAT_UPDATE_INTERVAL)
++namespace
++{
++// Hades: a reading of a temperature runs on Kodi's job manager (CBackgroundReading)
++bool RunAside(std::function<void()> task)
+ {
++  const auto jobs = CServiceBroker::GetJobManager();
++  return jobs && jobs->AddJob(new CLambdaJob<std::function<void()>>(std::move(task)), nullptr,
++                              CJob::PRIORITY_LOW) != 0;
+ }
+ 
+-std::string CSystemGUIInfo::GetSystemHeatInfo(int info) const
++// Hades: each reading said in kodi.log, the first of each temperature at INFO: how long it took
++// and on which thread, so that a slow command shows (nvidia-smi through LibreELEC's gputemp)
++KODI::UTILS::CBackgroundReading<CTemperature>::Done SayReading(const char* which)
+ {
+-  if (CTimeUtils::GetFrameTime() - m_lastSysHeatInfoTime >= SYSTEM_HEAT_UPDATE_INTERVAL)
++  auto first = std::make_shared<std::atomic<bool>>(true);
++  return [which, first](const CTemperature& value, std::chrono::steady_clock::duration took,
++                        bool waited)
+   {
+-    m_lastSysHeatInfoTime = CTimeUtils::GetFrameTime();
+-    CServiceBroker::GetCPUInfo()->GetTemperature(m_cpuTemp);
+-    if (m_gpuInfo)
+-    {
+-      m_gpuInfo->GetTemperature(m_gpuTemp);
+-    }
+-  }
++    CLog::Log(first->exchange(false) ? LOGINFO : LOGDEBUG,
++              "System information: the {} temperature read in {:.1f} ms ({}), {}", which,
++              std::chrono::duration<double, std::milli>(took).count(),
++              value.IsValid() ? StringUtils::Format("{:.0f} C", value.ToCelsius())
++                              : std::string("none given"),
++              waited ? "for a caller that waits for it"
++                     : "away from the thread that draws the GUI and presents the video");
++  };
++}
++} // namespace
++
++CSystemGUIInfo::CSystemGUIInfo()
++  : m_cpuTemp(
++        []
++        {
++          CTemperature temperature;
++          if (const auto cpu = CServiceBroker::GetCPUInfo())
++            cpu->GetTemperature(temperature);
++          return temperature;
++        },
++        std::chrono::milliseconds(SYSTEM_HEAT_UPDATE_INTERVAL),
++        RunAside,
++        SayReading("CPU")),
++    m_gpuTemp(
++        [gpu = std::shared_ptr<CGPUInfo>(CGPUInfo::GetGPUInfo())]
++        {
++          CTemperature temperature;
++          // (the command is one of the advanced settings, which go when Kodi stops)
++          if (gpu && CServiceBroker::GetSettingsComponent())
++            gpu->GetTemperature(temperature);
++          return temperature;
++        },
++        std::chrono::milliseconds(SYSTEM_HEAT_UPDATE_INTERVAL),
++        RunAside,
++        SayReading("GPU"))
++{
++}
+ 
++std::string CSystemGUIInfo::GetSystemHeatInfo(int info) const
++{
+   std::string text;
+   switch (info)
+   {
+     case SYSTEM_CPU_TEMPERATURE:
+-      return m_cpuTemp.IsValid() ? g_langInfo.GetTemperatureAsString(m_cpuTemp)
+-                                 : CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(
+-                                       10005); // Not available
+     case SYSTEM_GPU_TEMPERATURE:
+-      return m_gpuTemp.IsValid()
+-                 ? g_langInfo.GetTemperatureAsString(m_gpuTemp)
+-                 : CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(10005);
++    {
++      // Hades: only the temperature asked for is read (Kodi read both for either, and for the fan
++      // and the use of the processors as well), and the thread that draws the GUI, which also
++      // presents the frames of a video, never waits for it: it is given the last reading, and
++      // nothing before a first one has ended (CBackgroundReading). Any other thread (an add-on,
++      // JSON-RPC) waits for a reading that is due, as before.
++      const auto messenger = CServiceBroker::GetAppMessenger();
++      const bool wait = messenger && !messenger->IsProcessThread();
++      auto& reading = info == SYSTEM_CPU_TEMPERATURE ? m_cpuTemp : m_gpuTemp;
++      const std::optional<CTemperature> temperature = reading.Get(wait);
++      if (!temperature)
++        return "";
++      return temperature->IsValid()
++                 ? g_langInfo.GetTemperatureAsString(*temperature)
++                 : CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(
++                       10005); // Not available
++    }
+     case SYSTEM_FAN_SPEED:
+       text = StringUtils::Format("{}%", m_fanSpeed * 2);
+       break;
+diff --git a/xbmc/guilib/guiinfo/SystemGUIInfo.h b/xbmc/guilib/guiinfo/SystemGUIInfo.h
+index 4a107f2..7ba5266 100644
+--- a/xbmc/guilib/guiinfo/SystemGUIInfo.h
++++ b/xbmc/guilib/guiinfo/SystemGUIInfo.h
+@@ -9,11 +9,9 @@
+ #pragma once
+ 
+ #include "guilib/guiinfo/GUIInfoProvider.h"
+-#include "utils/GpuInfo.h"
++#include "utils/BackgroundReading.h"
+ #include "utils/Temperature.h"
+ 
+-#include <memory>
+-
+ namespace KODI::GUILIB::GUIINFO
+ {
+ 
+@@ -47,13 +45,13 @@ public:
+ private:
+   std::string GetSystemHeatInfo(int info) const;
+ 
+-  std::unique_ptr<CGPUInfo> m_gpuInfo;
+-
+   static const int SYSTEM_HEAT_UPDATE_INTERVAL = 60000;
+ 
+-  mutable unsigned int m_lastSysHeatInfoTime;
+-  mutable CTemperature m_gpuTemp;
+-  mutable CTemperature m_cpuTemp;
++  //! Hades: each temperature read where a label asks for it, at most once in the interval, and
++  //! never on the thread that draws the GUI and presents the frames of a video
++  //! (CBackgroundReading: LibreELEC's gputemp runs nvidia-smi, which held that thread ~100 ms)
++  mutable KODI::UTILS::CBackgroundReading<CTemperature> m_cpuTemp;
++  mutable KODI::UTILS::CBackgroundReading<CTemperature> m_gpuTemp;
+   int m_fanSpeed = 0;
+   float m_fps = 0.0;
+   unsigned int m_frameCounter = 0;
+diff --git a/xbmc/utils/BackgroundReading.h b/xbmc/utils/BackgroundReading.h
+new file mode 100644
+index 0000000..14a3be3
+--- /dev/null
++++ b/xbmc/utils/BackgroundReading.h
+@@ -0,0 +1,144 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <chrono>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <utility>
++
++namespace KODI::UTILS
++{
++
++/*!
++ * \brief A value that can be slow to read (a command that is run, a sensor of a driver), kept as
++ *        its last reading, so that the thread that draws the GUI never waits for it.
++ *
++ * The thread that draws Kodi's GUI also presents the frames of a video. A label that runs a
++ * command each time it is read again holds that thread for as long as the command runs: the
++ * temperature that LibreELEC's gputemp gives runs nvidia-smi on an NVIDIA card, and the frames
++ * stood still for that time.
++ *
++ * Get() with \a wait false (the GUI's thread) never waits: it gives the last reading (none before
++ * the first one has ended) and, where there is none or the last one began \a interval ago or
++ * earlier, starts a new one on the runner (Kodi's job manager), one at a time; a later call has
++ * it once it has ended. Get() with \a wait true (an add-on, JSON-RPC: threads that waited before)
++ * reads where the last reading is that old, there and then, as Kodi did.
++ *
++ * The state is shared with the reading that runs: one that ends after its owner is gone writes
++ * only into that state. The function that reads must not refer to the owner either.
++ */
++template<typename T>
++class CBackgroundReading
++{
++public:
++  using Clock = std::chrono::steady_clock;
++  //! runs a task away from the caller; false where it cannot (the task is then not run)
++  using Runner = std::function<bool(std::function<void()>)>;
++  //! said after each reading: what it gave and how long it took, on the thread that read
++  using Done = std::function<void(const T& value, Clock::duration took, bool waited)>;
++
++  CBackgroundReading(std::function<T()> read,
++                     Clock::duration interval,
++                     Runner runner,
++                     Done done = nullptr)
++    : m_state(std::make_shared<State>()),
++      m_read(std::move(read)),
++      m_interval(interval),
++      m_runner(std::move(runner)),
++      m_done(std::move(done))
++  {
++  }
++
++  /*!
++   * \brief The last reading, or nothing before a first one has ended.
++   * \param wait false: never waits (a reading that is due runs on the runner); true: a reading
++   *        that is due is made here before this returns
++   * \param now the time of the call (a clock that only goes forward)
++   */
++  std::optional<T> Get(bool wait, Clock::time_point now = Clock::now())
++  {
++    std::unique_lock lock(m_state->mutex);
++    if (m_state->value && now - m_state->begun < m_interval)
++      return m_state->value;
++    if (wait)
++    {
++      // not under the lock: a reading in the background may end meanwhile
++      lock.unlock();
++      const auto start = Clock::now();
++      T value = m_read();
++      const auto took = Clock::now() - start;
++      if (m_done)
++        m_done(value, took, true);
++      lock.lock();
++      m_state->Store(std::move(value), now);
++      return m_state->value;
++    }
++    if (!m_state->running)
++    {
++      m_state->running = true;
++      lock.unlock();
++      // a copy of what the task needs: it may outlive this object
++      std::shared_ptr<State> state = m_state;
++      std::function<T()> read = m_read;
++      Done done = m_done;
++      const bool started = m_runner && m_runner(
++                                           [state, read, done, now]
++                                           {
++                                             const auto start = Clock::now();
++                                             T value = read();
++                                             const auto took = Clock::now() - start;
++                                             if (done)
++                                               done(value, took, false);
++                                             std::unique_lock taskLock(state->mutex);
++                                             state->Store(std::move(value), now);
++                                             state->running = false;
++                                           });
++      lock.lock();
++      if (!started)
++        m_state->running = false;
++    }
++    return m_state->value;
++  }
++
++  //! \brief Whether a reading runs in the background now.
++  bool Running() const
++  {
++    std::unique_lock lock(m_state->mutex);
++    return m_state->running;
++  }
++
++private:
++  struct State
++  {
++    std::mutex mutex;
++    std::optional<T> value; //!< the last reading
++    Clock::time_point begun; //!< when it began
++    bool running = false; //!< a reading runs in the background
++
++    //! a reading that began at \a when, unless one that began later is already in
++    void Store(T reading, Clock::time_point when)
++    {
++      if (value && when < begun)
++        return;
++      value = std::move(reading);
++      begun = when;
++    }
++  };
++
++  const std::shared_ptr<State> m_state;
++  const std::function<T()> m_read;
++  const Clock::duration m_interval;
++  const Runner m_runner;
++  const Done m_done;
++};
++
++} // namespace KODI::UTILS
+diff --git a/xbmc/utils/CMakeLists.txt b/xbmc/utils/CMakeLists.txt
+index 4281634..977e6fa 100644
+--- a/xbmc/utils/CMakeLists.txt
++++ b/xbmc/utils/CMakeLists.txt
+@@ -91,6 +91,7 @@ set(HEADERS ActorProtocol.h
+             Archive.h
+             ArtUtils.h
+             Artwork.h
++            BackgroundReading.h
+             Base64.h
+             BitstreamConverter.h
+             BitstreamReader.h
+diff --git a/xbmc/utils/test/CMakeLists.txt b/xbmc/utils/test/CMakeLists.txt
+index dd22016..f67971c 100644
+--- a/xbmc/utils/test/CMakeLists.txt
++++ b/xbmc/utils/test/CMakeLists.txt
+@@ -2,6 +2,7 @@ set(SOURCES TestAlarmClock.cpp
+             TestAliasShortcutUtils.cpp
+             TestArchive.cpp
+             TestArtUtils.cpp
++            TestBackgroundReading.cpp
+             TestBase64.cpp
+             TestBitstreamConverter.cpp
+             TestBitstreamStats.cpp
+diff --git a/xbmc/utils/test/TestBackgroundReading.cpp b/xbmc/utils/test/TestBackgroundReading.cpp
+new file mode 100644
+index 0000000..28174f6
+--- /dev/null
++++ b/xbmc/utils/test/TestBackgroundReading.cpp
+@@ -0,0 +1,232 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "utils/BackgroundReading.h"
++
++#include <atomic>
++#include <chrono>
++#include <functional>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#include <gtest/gtest.h>
++
++using namespace KODI::UTILS;
++using namespace std::chrono_literals;
++
++namespace
++{
++using Reading = CBackgroundReading<int>;
++using Clock = Reading::Clock;
++
++//! runs each task on a thread of its own, joined when it goes
++class CThreads
++{
++public:
++  ~CThreads()
++  {
++    for (auto& thread : m_threads)
++      thread.join();
++  }
++  Reading::Runner Runner()
++  {
++    return [this](std::function<void()> task)
++    {
++      m_threads.emplace_back(std::move(task));
++      return true;
++    };
++  }
++
++private:
++  std::vector<std::thread> m_threads;
++};
++
++//! keeps the tasks, run when the test says
++class CHeld
++{
++public:
++  Reading::Runner Runner()
++  {
++    return [this](std::function<void()> task)
++    {
++      m_tasks.push_back(std::move(task));
++      return true;
++    };
++  }
++  size_t Count() const { return m_tasks.size(); }
++  void RunAll()
++  {
++    auto tasks = std::move(m_tasks);
++    m_tasks.clear();
++    for (auto& task : tasks)
++      task();
++  }
++
++private:
++  std::vector<std::function<void()>> m_tasks;
++};
++
++bool WaitUntilDone(const Reading& reading)
++{
++  for (int i = 0; i < 400 && reading.Running(); ++i)
++    std::this_thread::sleep_for(5ms);
++  return !reading.Running();
++}
++} // namespace
++
++// The GUI's thread does not wait for a reading that takes long (a command such as nvidia-smi):
++// nothing before the first one has ended, then its value
++TEST(TestBackgroundReading, NeverWaitsWithoutWait)
++{
++  std::atomic<int> reads{0};
++  CThreads threads; // (joined before reads goes)
++  Reading reading(
++      [&reads]
++      {
++        std::this_thread::sleep_for(150ms);
++        return ++reads;
++      },
++      60s, threads.Runner());
++  const auto start = Clock::now();
++  const auto first = reading.Get(false);
++  const auto took = Clock::now() - start;
++  EXPECT_FALSE(first.has_value());
++  EXPECT_LT(took, 50ms) << "the caller waited for the reading";
++  ASSERT_TRUE(WaitUntilDone(reading));
++  const auto second = reading.Get(false);
++  ASSERT_TRUE(second.has_value());
++  EXPECT_EQ(1, *second);
++}
++
++// One reading at a time, however often it is asked for while it runs, and none while it is fresh
++TEST(TestBackgroundReading, OneReadingAtATime)
++{
++  std::atomic<int> reads{0};
++  CThreads threads; // (joined before reads goes)
++  Reading reading(
++      [&reads]
++      {
++        std::this_thread::sleep_for(60ms);
++        return ++reads;
++      },
++      60s, threads.Runner());
++  for (int i = 0; i < 100; ++i)
++    reading.Get(false);
++  ASSERT_TRUE(WaitUntilDone(reading));
++  for (int i = 0; i < 100; ++i)
++    EXPECT_EQ(1, reading.Get(false).value_or(-1));
++  EXPECT_FALSE(reading.Running());
++  EXPECT_EQ(1, reads.load());
++}
++
++// A reading that is due is started, and the last one is given until it has ended
++TEST(TestBackgroundReading, TheLastReadingWhileTheNextRuns)
++{
++  CHeld held;
++  int reads = 0;
++  Reading reading([&reads] { return ++reads; }, 60s, held.Runner());
++  const auto t0 = Clock::now();
++  EXPECT_FALSE(reading.Get(false, t0).has_value());
++  EXPECT_EQ(1u, held.Count());
++  held.RunAll();
++  EXPECT_EQ(1, reading.Get(false, t0 + 1s).value_or(-1));
++  EXPECT_EQ(1, reading.Get(false, t0 + 59s).value_or(-1));
++  EXPECT_EQ(0u, held.Count()) << "a fresh reading was read again";
++  // due: the old value, and a new reading started
++  EXPECT_EQ(1, reading.Get(false, t0 + 60s).value_or(-1));
++  EXPECT_EQ(1u, held.Count());
++  EXPECT_EQ(1, reading.Get(false, t0 + 61s).value_or(-1));
++  EXPECT_EQ(1u, held.Count()) << "a second reading was started while one runs";
++  held.RunAll();
++  EXPECT_EQ(2, reading.Get(false, t0 + 62s).value_or(-1));
++  // its interval runs from when it began (60 s)
++  EXPECT_EQ(2, reading.Get(false, t0 + 119s).value_or(-1));
++  EXPECT_EQ(0u, held.Count());
++  reading.Get(false, t0 + 120s);
++  EXPECT_EQ(1u, held.Count());
++}
++
++// A caller that may wait reads there and then where the reading is due, as Kodi did
++TEST(TestBackgroundReading, WaitReadsThere)
++{
++  CHeld held;
++  int reads = 0;
++  Reading reading([&reads] { return ++reads; }, 60s, held.Runner());
++  const auto t0 = Clock::now();
++  EXPECT_EQ(1, reading.Get(true, t0).value_or(-1));
++  EXPECT_EQ(1, reading.Get(true, t0 + 59s).value_or(-1));
++  EXPECT_EQ(2, reading.Get(true, t0 + 60s).value_or(-1));
++  EXPECT_EQ(0u, held.Count()) << "a caller that waits used the runner";
++  EXPECT_EQ(2, reads);
++}
++
++// A runner that cannot run the task: nothing runs, and the next call tries again
++TEST(TestBackgroundReading, RunnerThatCannotRun)
++{
++  int asked = 0;
++  Reading reading([] { return 7; }, 60s,
++                  [&asked](std::function<void()>)
++                  {
++                    ++asked;
++                    return false;
++                  });
++  EXPECT_FALSE(reading.Get(false).has_value());
++  EXPECT_FALSE(reading.Running());
++  EXPECT_FALSE(reading.Get(false).has_value());
++  EXPECT_EQ(2, asked);
++  Reading none([] { return 7; }, 60s, nullptr);
++  EXPECT_FALSE(none.Get(false).has_value());
++  EXPECT_FALSE(none.Running());
++}
++
++// A reading that ends after its owner is gone (Kodi stops while a command runs) writes nowhere
++// else (AddressSanitizer would see it)
++TEST(TestBackgroundReading, OutlivesItsOwner)
++{
++  CHeld held;
++  auto reading = std::make_unique<Reading>([] { return 3; }, 60s, held.Runner());
++  reading->Get(false);
++  reading.reset();
++  held.RunAll();
++  SUCCEED();
++}
++
++// A reading in the background that began before one that a waiting caller made does not replace it
++TEST(TestBackgroundReading, TheLaterReadingIsKept)
++{
++  CHeld held;
++  int reads = 0;
++  Reading reading([&reads] { return ++reads; }, 60s, held.Runner());
++  const auto t0 = Clock::now();
++  EXPECT_FALSE(reading.Get(false, t0).has_value()); // started, held
++  EXPECT_EQ(1, reading.Get(true, t0 + 1s).value_or(-1)); // read there: 1, begun at t0 + 1 s
++  held.RunAll(); // the held one reads 2, but it began at t0
++  EXPECT_EQ(1, reading.Get(false, t0 + 2s).value_or(-1));
++  EXPECT_FALSE(reading.Running());
++}
++
++// What each reading gave, how long it took and for whom
++TEST(TestBackgroundReading, Done)
++{
++  CHeld held;
++  std::vector<std::pair<int, bool>> said;
++  Reading reading([] { return 5; }, 60s, held.Runner(),
++                  [&said](const int& value, Clock::duration took, bool waited)
++                  {
++                    EXPECT_GE(took.count(), 0);
++                    said.emplace_back(value, waited);
++                  });
++  const auto t0 = Clock::now();
++  reading.Get(false, t0);
++  held.RunAll();
++  reading.Get(true, t0 + 60s);
++  ASSERT_EQ(2u, said.size());
++  EXPECT_EQ(std::make_pair(5, false), said[0]);
++  EXPECT_EQ(std::make_pair(5, true), said[1]);
++}
+-- 
+2.53.0
+
