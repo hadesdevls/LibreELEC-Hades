@@ -253,6 +253,7 @@ configure_target() {
               --disable-altivec \
               ${PKG_FFMPEG_FPU} \
               --disable-symver \
+              --disable-vulkan \
               ${PKG_FFMPEG_TESTING}
 }
 
