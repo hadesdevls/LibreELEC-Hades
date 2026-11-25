@@ -190,7 +190,7 @@ def limited_values(codes, bits):
 
 # ---------------------------------------------------------------------------------------------------
 # IPT-PQ-c2 (Dolby Vision profile 5): the matrices that the RPUs of profile 5 carry (as dovi_tool writes
-# them; Kodi of Hades, tools/dvbridge/dvbridge_ipt.h): YCCtoRGB (IPT -> L'M'S', 13 fractional bits), its
+# them; not those of the IPT tunnel of Kodi of Hades, tools/dvbridge/dvbridge_ipt.h): YCCtoRGB (IPT -> L'M'S', 13 fractional bits), its
 # offsets (28) and RGBtoLMS (the crosstalk undone, 14). The linear BT.2020 RGB of an LMS is
 # RGBtoLMS_2020^-1 LMS, RGBtoLMS_2020 being that of the RPUs of profiles 7 and 8.
 
@@ -392,9 +392,12 @@ FONT = {
     "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
     "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
     "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
     "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
     "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
     "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
     "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
     "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
     "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
@@ -403,6 +406,7 @@ FONT = {
     "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
     "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
     "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
     "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
     "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
 }
@@ -424,7 +428,10 @@ def label_dots(text):
 
 
 def layout(f):
-    """[(rect in pixels of the format, region name)], painted in order over the background"""
+    """[(rect in pixels of the format, region name)], painted in order over the background (a clip with
+    a layout of its own, the one of the A/B comparison of abclip.py, gives it as f["layout"])"""
+    if "layout" in f:
+        return f["layout"](f)
     s = f["width"] // GRID_W
     items = [(tuple(c * s for c in r), name) for name, r in regions()]
     items += [(tuple(c * s for c in r), "label") for r in label_dots(f["label"])]

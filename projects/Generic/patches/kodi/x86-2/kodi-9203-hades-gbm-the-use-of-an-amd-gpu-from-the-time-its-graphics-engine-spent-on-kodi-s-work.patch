@@ -1,0 +1,242 @@
+From 4e24c31b0b516ce0c956894b6e9e2a953b5d10b0 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:49:47 +0000
+Subject: [PATCH] [Hades][GBM] The use of an AMD GPU from the time its graphics
+ engine spent on Kodi's work
+
+The overview of the player information shows the use of the GPU. On amdgpu it
+was gpu_busy_percent, which each SMU computes its own way: the average
+graphics activity of a window of the firmware on Renoir and newer (swsmu),
+and the answer to PPSMC_MSG_GetGfxBusy on Raven and Picasso (powerplay). The
+two do not measure the same thing. With the same kind of videos, a Ryzen 5
+3400GE (Picasso, Vega 11) showed 100, with moments of 60 to 90, where a
+Ryzen 5 4650GE (Renoir, Vega 7) showed about 50 (LibreELEC forum, thread
+30682, posts 162 and 195), and the number could not be compared or used to
+find where the GPU time goes.
+
+The driver also gives, in the fdinfo of each DRM file, the time that each
+engine spent on the work of that client (drm-usage-stats.rst, amdgpu_fdinfo.c:
+drm-engine-gfx and drm-engine-compute, in ns). The sampler of the player
+information now reads it from the DRM files that Kodi has open on that GPU,
+each client once (a file shared by dup() shows the same drm-client-id), and
+the use is the difference over the time between two readings, as for i915
+and xe. That is the same measure on every amdgpu GPU; on a PC where Kodi is
+what draws, it is the use of the GPU. Where no file of the GPU gives the
+time of an engine, or the time went back because a file was closed, the
+reading falls back to gpu_busy_percent and the log line says why. The
+reading is done by the sampler's own thread, as before, never by the thread
+that draws.
+---
+ xbmc/windowing/gbm/GPUSensors.h | 165 ++++++++++++++++++++++++++++++--
+ 1 file changed, 155 insertions(+), 10 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/GPUSensors.h b/xbmc/windowing/gbm/GPUSensors.h
+index 32263df..3ef0948 100644
+--- a/xbmc/windowing/gbm/GPUSensors.h
++++ b/xbmc/windowing/gbm/GPUSensors.h
+@@ -50,9 +50,17 @@ namespace GBM
+  *
+  * Only what the driver of that GPU gives is read; what it does not give is not known, and nothing
+  * stands in for it:
+- * - amdgpu: the use from gpu_busy_percent (what the SMU firmware computes of the activity of its
+- *   cores) and the temperature of the channel labelled "edge" of its hwmon device (temp1; APUs have
+- *   no other).
++ * - amdgpu: the use from the time that the graphics engine of that GPU spent on Kodi's work, which
++ *   the driver gives in the fdinfo of each DRM file that Kodi has open on it (drm-usage-stats.rst:
++ *   "drm-engine-gfx" and "drm-engine-compute", in ns, each DRM client once), between two readings;
++ *   where no such file says it, the use from gpu_busy_percent (what the SMU firmware computes of the
++ *   activity of its cores). gpu_busy_percent means something else on each SMU: the average graphics
++ *   activity of a window of the firmware on Renoir and newer (swsmu), and the answer to
++ *   PPSMC_MSG_GetGfxBusy on Raven and Picasso (powerplay, smu10_hwmgr.c), which are not the same
++ *   measure (with the same kind of videos, a Ryzen 5 3400GE showed 100, with moments of 60 to 90,
++ *   where a Ryzen 5 4650GE showed about 50): the time of the engine is the same measure on all. On
++ *   a PC where Kodi is what draws, it is the use of the GPU. The temperature of the channel labelled
++ *   "edge" of its hwmon device (temp1; APUs have no other).
+  * - nvidia: NVML (libnvidia-ml.so.1 of the driver's user space, loaded when it is first needed):
+  *   nvmlDeviceGetUtilizationRates() (gpu: the part of the last sample period in which a kernel ran
+  *   on the GPU) and nvmlDeviceGetTemperatureV() of the sensor of the GPU die. The device is found
+@@ -197,6 +205,93 @@ inline std::optional<unsigned int> FormatShift(const std::string& text)
+   return static_cast<unsigned int>(*first);
+ }
+ 
++//! The time, in ns, that the graphics engine of a GPU spent on the work of this process: from the
++//! fdinfo of each DRM file of that GPU (drm-usage-stats.rst) that this process has open under
++//! <root>/proc/self/fdinfo, the sum of "drm-engine-gfx" and "drm-engine-compute" of each DRM client
++//! once (a file shared by dup() shows the same drm-client-id). Files of another driver or of another
++//! PCI device do not count. None where no file of the GPU gives the time of an engine.
++inline std::optional<uint64_t> EngineTimeOfThisProcess(const std::string& root,
++                                                       const std::string& driver,
++                                                       const std::string& pci)
++{
++  const std::string dir = root + "/proc/self/fdinfo";
++  DIR* d = opendir(dir.c_str());
++  if (!d)
++    return std::nullopt;
++  std::vector<std::pair<std::string, uint64_t>> clients;
++  bool found = false;
++  while (const dirent* entry = readdir(d))
++  {
++    if (entry->d_name[0] == '.')
++      continue;
++    const int fd = open((dir + "/" + entry->d_name).c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++      continue;
++    std::string text;
++    char buffer[4096];
++    ssize_t length;
++    while (text.size() < 65536)
++    {
++      length = ::read(fd, buffer, sizeof(buffer));
++      if (length < 0 && errno == EINTR)
++        continue;
++      if (length <= 0)
++        break;
++      text.append(buffer, static_cast<size_t>(length));
++    }
++    ::close(fd);
++    std::string fileDriver, filePci, client;
++    uint64_t time = 0;
++    bool timed = false;
++    size_t start = 0;
++    while (start < text.size())
++    {
++      size_t end = text.find('\n', start);
++      if (end == std::string::npos)
++        end = text.size();
++      const std::string line = text.substr(start, end - start);
++      start = end + 1;
++      const size_t colon = line.find(':');
++      if (colon == std::string::npos)
++        continue;
++      const std::string key = line.substr(0, colon);
++      size_t v = colon + 1;
++      while (v < line.size() && (line[v] == '\t' || line[v] == ' '))
++        ++v;
++      const std::string value = line.substr(v);
++      if (key == "drm-driver")
++        fileDriver = value;
++      else if (key == "drm-pdev")
++        filePci = value;
++      else if (key == "drm-client-id")
++        client = value;
++      else if (key == "drm-engine-gfx" || key == "drm-engine-compute")
++      {
++        const size_t unit = value.find(" ns");
++        const auto ns = ParseInteger(value.substr(0, unit));
++        if (unit != std::string::npos && ns && *ns >= 0)
++        {
++          time += static_cast<uint64_t>(*ns);
++          timed = true;
++        }
++      }
++    }
++    if (fileDriver != driver || filePci != pci || client.empty())
++      continue;
++    found = found || timed;
++    if (std::none_of(clients.begin(), clients.end(),
++                     [&client](const auto& c) { return c.first == client; }))
++      clients.emplace_back(client, time);
++  }
++  closedir(d);
++  if (!found)
++    return std::nullopt;
++  uint64_t total = 0;
++  for (const auto& c : clients)
++    total += c.second;
++  return total;
++}
++
+ //! dddd:bb:dd.f in hexadecimal (a domain may have more digits), as the kernel names a PCI function
+ inline bool IsPciAddress(const std::string& name)
+ {
+@@ -573,7 +668,14 @@ public:
+   dev_t Device() const { return m_number; }
+ 
+   //! Whether the use is a difference between two readings, and none has been taken yet
+-  bool NeedsEarlierReading() const { return m_counter && m_counter->Opened() && !m_counted; }
++  bool NeedsEarlierReading() const
++  {
++    return (m_counter && m_counter->Opened() && !m_counted) ||
++           (m_driver == "amdgpu" && !m_pci.empty() && !m_engineTried);
++  }
++
++  //! The clock of the readings of the time of the engine, in ns (a test sets its own)
++  void SetClock(std::function<int64_t()> clock) { m_clock = std::move(clock); }
+ 
+   Reading Read()
+   {
+@@ -585,15 +687,48 @@ public:
+       busyHow = temperatureHow = m_why;
+     else if (m_driver == "amdgpu")
+     {
+-      const auto text = DETAIL::ReadText(m_device + "/gpu_busy_percent");
+-      const auto value = text ? DETAIL::ParseInteger(*text) : std::nullopt;
+-      if (value && *value >= 0 && *value <= 100)
++      // the time of the graphics engine between this reading and the one before (the first one
++      // is the start of the next); where the fdinfo of the GPU does not give it, gpu_busy_percent
++      std::string engineWhy;
++      if (const auto engine = m_pci.empty()
++                                  ? std::nullopt
++                                  : DETAIL::EngineTimeOfThisProcess(m_root, m_driver, m_pci))
+       {
+-        reading.busy = static_cast<unsigned int>(*value);
+-        busyHow = "from gpu_busy_percent";
++        const int64_t now = m_clock();
++        if (m_engineWhen && now > *m_engineWhen && *engine >= m_engineTime)
++        {
++          const uint64_t span = static_cast<uint64_t>(now - *m_engineWhen);
++          reading.busy = static_cast<unsigned int>(
++              std::min<uint64_t>(100, ((*engine - m_engineTime) * 100 + span / 2) / span));
++          busyHow = "from the time of its graphics engine on Kodi's work (fdinfo drm-engine-gfx "
++                    "and drm-engine-compute) over " +
++                    std::to_string(span / 1000000) + " ms";
++        }
++        else if (m_engineWhen && *engine < m_engineTime)
++          engineWhy = "the time of its graphics engine went back (a DRM file of Kodi was closed): "
++                      "it is read again from here";
++        else
++          engineWhy = "the time of its graphics engine has no reading before this one";
++        m_engineTime = *engine;
++        m_engineWhen = now;
+       }
+       else
+-        busyHow = text ? "gpu_busy_percent gave \"" + *text + "\"" : "gpu_busy_percent could not be read";
++        engineWhy = "the fdinfo of Kodi's DRM files gives no time of its graphics engine";
++      m_engineTried = true;
++      if (!reading.busy)
++      {
++        const auto text = DETAIL::ReadText(m_device + "/gpu_busy_percent");
++        const auto value = text ? DETAIL::ParseInteger(*text) : std::nullopt;
++        if (value && *value >= 0 && *value <= 100)
++        {
++          reading.busy = static_cast<unsigned int>(*value);
++          busyHow = "from gpu_busy_percent";
++        }
++        else
++          busyHow = text ? "gpu_busy_percent gave \"" + *text + "\""
++                         : "gpu_busy_percent could not be read";
++        busyHow += " (" + engineWhy + ")";
++      }
+       reading.celsius = DETAIL::HwmonTemperature(m_device, {"edge"}, temperatureHow);
+     }
+     else if (m_driver == "nvidia")
+@@ -684,6 +819,16 @@ private:
+   std::unique_ptr<DETAIL::CBusyCounter> m_counter;
+   std::string m_counterHow;
+   bool m_counted{false};
++  // (amdgpu: the time of the graphics engine at the reading before, and when it was taken)
++  std::function<int64_t()> m_clock = []
++  {
++    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                    std::chrono::steady_clock::now().time_since_epoch())
++                                    .count());
++  };
++  uint64_t m_engineTime{0};
++  std::optional<int64_t> m_engineWhen;
++  bool m_engineTried{false};
+ };
+ 
+ /*!
+-- 
+2.53.0
+

@@ -256,8 +256,32 @@ static void Consistent(const Display& d, const Choice& c, int base, const std::s
   Check(std::fabs(got - own) < 0.01 || std::fabs(got - 2 * own) < 0.01, what + ": Kodi's rate or exactly twice it");
 }
 
+// Hades (issue #33): the vendor InfoFrame of anyone else that a mode of a 3D layout takes away
+static void HeldInfoFrame()
+{
+  Check(TakeAwayHeldInfoFrame(true, 5, 0), "held InfoFrame: another one goes with a 3D-layout mode");
+  Check(TakeAwayHeldInfoFrame(true, 5, 7), "held InfoFrame: not Kodi's own one goes");
+  Check(!TakeAwayHeldInfoFrame(true, 5, 5), "held InfoFrame: Kodi's own one is left to NextInfoFrameStep()");
+  Check(!TakeAwayHeldInfoFrame(true, 0, 7), "held InfoFrame: none held, nothing taken");
+  Check(!TakeAwayHeldInfoFrame(true, 0, 0), "held InfoFrame: none at all");
+  Check(!TakeAwayHeldInfoFrame(false, 5, 0), "held InfoFrame: a 2D mode keeps it");
+
+  // ... and the arrangement that the next layout is chosen for once frame packing is refused
+  Check(ArrangementToChoose(true, true, true) == Arrangement::SIDE_BY_SIDE,
+        "arrangement: a side-by-side source drawn for frame packing, refused: side by side");
+  Check(ArrangementToChoose(true, true, false) == Arrangement::TOP_AND_BOTTOM,
+        "arrangement: drawn for frame packing, not refused: top and bottom");
+  Check(ArrangementToChoose(true, false, true) == Arrangement::TOP_AND_BOTTOM,
+        "arrangement: a top-and-bottom source stays so after a refusal");
+  Check(ArrangementToChoose(false, false, true) == Arrangement::SIDE_BY_SIDE,
+        "arrangement: side by side stays so");
+  Check(ArrangementToChoose(false, true, true) == Arrangement::SIDE_BY_SIDE,
+        "arrangement: side by side whatever was asked before");
+}
+
 int main()
 {
+  HeldInfoFrame();
   // ---- the displays
   Display none{"2D only", Modes2D(), nullptr};
   Display mand{"HDMI 1.4 mandatory 3D only", Modes2D(), nullptr};

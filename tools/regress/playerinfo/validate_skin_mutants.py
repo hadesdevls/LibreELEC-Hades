@@ -59,13 +59,19 @@ mutants = [
     ('a Spanish string that writes vídeo for a Latin American one', lambda: edit('addons/skin.estuary/language/resource.language.es_mx/strings.po', 'msgstr "Altavoces"', 'msgstr "Altavoces del vídeo"')),
     ('English with a translation', lambda: edit('addons/skin.estuary/language/resource.language.en_gb/strings.po', 'msgid "Speakers"\nmsgstr ""', 'msgid "Speakers"\nmsgstr "x"')),
     ('a string that no file uses', lambda: edit(V, '$ADDON[skin.estuary 52811]', '$ADDON[skin.estuary 52810]')),
+    # (issue #25: native Dolby Vision Low-Latency shown as TV-led; each must fail for that reason)
+    ('the Output row without its line of Low-Latency', lambda: edit(V, '<value condition="String.IsEqual(Window(Home).Property(hades.dv.state),native) + String.IsEqual(Window(Home).Property(hades.dv.transport),lowlatency)">$ADDON[skin.estuary 52860]</value>', ''), 'Low-Latency $VAR[HadesOvDVOutVar] says'),
+    ('the Signal row without its line of Low-Latency', lambda: edit(V, '<value condition="String.IsEqual(Window(Home).Property(hades.out.signal),dv) + String.IsEqual(Window(Home).Property(hades.dv.transport),lowlatency)">$ADDON[skin.estuary 52861]</value>', ''), 'Low-Latency $VAR[HadesOvSignalVar] says'),
+    ('the Output row of Low-Latency given the text of Standard', lambda: edit(V, 'lowlatency)">$ADDON[skin.estuary 52860]</value>', 'lowlatency)">$ADDON[skin.estuary 52780]</value>'), 'Low-Latency $VAR[HadesOvDVOutVar] says'),
+    ('the Output row of Standard without TV-led', lambda: edit(V, '<value condition="String.IsEqual(Window(Home).Property(hades.dv.state),native)">$ADDON[skin.estuary 52780]</value>', '<value condition="String.IsEqual(Window(Home).Property(hades.dv.state),native)">$ADDON[skin.estuary 52781]</value>'), 'the check of Low-Latency sees nothing'),
 ]
-for name, fn in mutants:
+# (a mutant may name a text that its failure must have: it fails for that reason, not for another)
+for name, fn, *reason in mutants:
     fresh()
     fn()
     rc, out = run()
-    verdict = 'killed' if rc != 0 else 'SURVIVED'
-    if rc == 0:
+    verdict = 'killed' if rc != 0 and all(r in out for r in reason) else 'SURVIVED'
+    if verdict == 'SURVIVED':
         bad += 1
     print('mutant %-60s %s' % (name, verdict))
 shutil.rmtree(TMP)

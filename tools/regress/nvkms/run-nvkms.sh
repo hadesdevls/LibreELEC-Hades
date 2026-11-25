@@ -11,14 +11,22 @@
 #   frlkeep nvHadesFrlKeepDecide() and nvHadesFrlKeepWhyNot() (frl_keep_test.c, nvkms-hades.h): whether an HDMI head
 #           that runs over FRL stays on FRL for a mode that TMDS would carry (NV_HDMI_FRL_KEEP). The other way as for
 #           vrrrm: without the patch that adds nvHadesFrlKeepDecide(), found by its content, the test must not build.
+#   contenttype nvHadesAviContent(), nvHadesContentTypeOf() and nvHadesContentTypeOverride() (content_type_test.c,
+#           nvkms-hades.h): the content type of the AVI InfoFrame ("content type" of nvidia-drm), with the AVI
+#           InfoFrames built by the timing code of the tree for the CTA modes of an LG C5, in the open modules and
+#           in nvidia-legacy-open (its recipe and archive, the same way). The other way as for vrrrm: without the
+#           patch that adds nvHadesAviContent(), found by its content, the test must not build.
 # usage: run-nvkms.sh all | verdict [<log>] | <stage>...       (settings: lib/regress.sh)
-# Needs REGRESS_SOURCES (nvidia-open-kernel-modules/nvidia-open-kernel-modules-<version>.tar.gz). Writes only under
+# Needs REGRESS_SOURCES (nvidia-open-kernel-modules/nvidia-open-kernel-modules-<version>.tar.gz, and for contenttype
+# nvidia-legacy-open/nvidia-legacy-open-<version>.tar.gz). Writes only under
 # $REGRESS_WORK/nvkms.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
 rg_init nvkms
 P=packages/graphics/nvidia-open-kernel-modules
+# (the package of P, as its sources are named; contenttype sets both for nvidia-legacy-open)
+PKG=nvidia-open-kernel-modules
 NV=$RG_W/nv
 
 # nvtree <dest> <ERE of patch names left out, or ^$> [stop]: <dest>, the source of the recipe with its patches but
@@ -28,8 +36,8 @@ nvtree() {
   local D=$1 skip=$2 stop=${3:-} ver sha tb T p n=0 out="" cut=""
   ver=$(rg_pkgvar $P PKG_VERSION); sha=$(rg_pkgvar $P PKG_SHA256)
   [ -n "$ver" ] && [ -n "$sha" ] || { echo "NV: no version or hash of $P at $REGRESS_LE_REF"; return 1; }
-  tb=$(rg_source nvidia-open-kernel-modules "nvidia-open-kernel-modules-$ver.tar.gz") ||
-    { echo "NV: no nvidia-open-kernel-modules-$ver.tar.gz in REGRESS_SOURCES"; return 1; }
+  tb=$(rg_source $PKG "$PKG-$ver.tar.gz") ||
+    { echo "NV: no $PKG-$ver.tar.gz in REGRESS_SOURCES"; return 1; }
   [ "$(sha256sum < "$tb" | cut -c1-64)" = "$sha" ] || { echo "NV: sha256 of $tb is not PKG_SHA256 $sha"; return 1; }
   T=$D.le
   rg_le_tree "$T" $P/patches || { echo "NV: the patches of $REGRESS_LE_REF"; return 1; }
@@ -42,7 +50,7 @@ nvtree() {
     n=$((n + 1))
   done
   rg_rm "$T"
-  echo "NVTREE nvidia-open-kernel-modules $ver, $n patches of $REGRESS_LE_REF applied with -F0; left out:${out:- none}${cut}"
+  echo "NVTREE $PKG $ver, $n patches of $REGRESS_LE_REF applied with -F0; left out:${out:- none}${cut}"
 }
 # build_rm <tree> <binary> [<test source>]: vrr_rm_test.c (or another test of nvkms-hades.h) against a tree, as its
 # head says
@@ -127,4 +135,62 @@ stage_frlkeep() {
   rg_rm "$NV/all-frlkeep" "$NV/without-frlkeep"
 }
 
-rg_main "vrrrm frlkeep" "$@"
+# build_ct <tree> <binary>: content_type_test.c with the timing code of the tree (src/common/modeset/timing, NVIDIA's
+# code as it is: compiled without -Werror, the test with it)
+build_ct() {
+  local T=$1 O=$2.obj f
+  rg_fresh "$O"
+  for f in "$T"/src/common/modeset/timing/*.c; do
+    gcc -std=gnu11 -c -w -I "$T/src/common/inc" -I "$T/src/common/modeset/timing" -I "$T/src/common/sdk/nvidia/inc" \
+      -I "$T/src/common/shared/inc" "$f" -o "$O/$(basename "$f" .c).o" || return 1
+  done
+  gcc -std=gnu11 -Wall -Wextra -Werror -Wno-unused-function -I "$T/src/nvidia-modeset/include" \
+    -I "$T/src/common/sdk/nvidia/inc" -I "$T/src/common/inc" -I "$T/src/common/modeset/timing" \
+    -I "$T/kernel-open/common/inc" -I "$T/src/nvidia-modeset/interface" -I "$T/src/common/unix/common/inc" \
+    -o "$2" "$HERE/content_type_test.c" "$O"/*.o
+}
+# ct_one <package folder> <package> <item>: content_type_test.c on the source of that recipe with its patches, and
+# without the patch that adds nvHadesAviContent()
+ct_one() {
+  local P=$1 PKG=$2 it=$3 L v the
+  L=$RG_W/logs/tree-$it.log
+  if ! rg_log "$L" nvtree "$NV/all-$it" '^$'; then
+    rg_item $it FAILED "no source with the patches: $(rg_last "$L")"
+    rg_item $it.without FAILED "no source with the patches"
+    return 1
+  fi
+  echo "$(grep -a '^NVTREE' "$L")"
+  L=$RG_W/logs/$it.log
+  if rg_log "$RG_W/logs/$it.build.log" build_ct "$NV/all-$it" "$RG_W/$it"; then
+    rg_log "$L" "$RG_W/$it"
+    v=$(rg_pass "$L" '^PASSED$')
+    rg_item $it "$(rg_say "$v")" "$(rg_rest "$v"); $(grep -a -m1 -E '^[0-9]+ checks' "$L")"
+  else
+    rg_item $it FAILED "not built: $(grep -a -m1 'error' "$RG_W/logs/$it.build.log" | cut -c1-180)"
+  fi
+  # the other way: the patch that adds nvHadesAviContent(), found by its content, left out
+  rg_le_tree "$RG_W/le-list" $P/patches
+  the=$(grep -l -F 'nvHadesAviContent' "$RG_W/le-list/$P/patches"/*.patch | head -n 1)
+  rg_rm "$RG_W/le-list"
+  if [ -z "$the" ]; then rg_item $it.without FAILED "no patch of $P adds nvHadesAviContent()"; return 1; fi
+  the=$(basename "$the")
+  L=$RG_W/logs/tree-$it-without.log
+  if ! rg_log "$L" nvtree "$NV/without-$it" "^$(printf '%s' "$the" | sed 's/[.]/[.]/g')\$" stop; then
+    rg_item $it.without FAILED "no source without $the: $(rg_last "$L")"; return 1
+  fi
+  if build_ct "$NV/without-$it" "$RG_W/$it-without" > "$RG_W/logs/$it-without.build.log" 2>&1; then
+    rg_item $it.without FAILED "it builds without $the"
+  elif grep -a -q 'nvHadesAviContent\|NV_HADES_CONTENT_TYPE' "$RG_W/logs/$it-without.build.log"; then
+    rg_item $it.without PASSED "it does not build without $the, as it must: $(grep -a -m1 'error' "$RG_W/logs/$it-without.build.log" | sed 's/.*error: //' | cut -c1-120)"
+  else
+    rg_item $it.without FAILED "it does not build without $the, for another reason: $(grep -a -m1 'error' "$RG_W/logs/$it-without.build.log" | cut -c1-160)"
+  fi
+  rg_rm "$NV/all-$it" "$NV/without-$it" "$RG_W/$it.obj" "$RG_W/$it-without.obj"
+}
+
+stage_contenttype() {
+  ct_one packages/graphics/nvidia-open-kernel-modules nvidia-open-kernel-modules content_type
+  ct_one packages/graphics/nvidia-legacy-open nvidia-legacy-open content_type.legacy
+}
+
+rg_main "vrrrm frlkeep contenttype" "$@"

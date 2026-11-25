@@ -1,0 +1,1977 @@
+From 372537380683749f8d5f921983e9af460e0d639a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:09:05 +0000
+Subject: [PATCH] [Hades][Network] Projector control: the protocols of JVC,
+ Sony and Epson, and what to ask of a projector
+
+People with a home-cinema projector asked for Hades to set it by itself: the
+lens memory by the shape of the film (constant image height on a 2.35:1 or
+2.39:1 screen) and the picture mode by the kind of signal. This is the part
+of it that does not use Kodi, so that a host test can run it:
+
+- ProjectorLink: one talk with a projector over TCP, to the IP address the
+  user gives (a literal: nothing is looked up), never listening. JVC D-ILA
+  (TCP 20554: PJ_OK/PJREQ/PJACK, the network password plain or, for the
+  models of 2024 on, as SHA-256 of the password and "JVCKWPJ"; INML and
+  PMPM), Sony ADCP (TCP 53595: the SHA-256 challenge; pic_pos_sel and
+  picture_mode), Sony SDCP (TCP 53484: the community; items 0x0066 and
+  0x0002) and Epson ESC/VP.net (TCP 3629: the connect header with its
+  password header; POPLP and CMODE). Written from the public descriptions
+  of each protocol, read as data; no code is taken. Every step has a
+  timeout and ends at once when Kodi stops; every byte is said in the log
+  except the password and what is made of it.
+- ProjectorPolicy: the class of a shape by the user's thresholds, with a
+  band of 0.03 under each so that a picture at the edge does not move the
+  lens back and forth; a new class taken once it lasted 2 s at the start of
+  a video, then the user's hold (IMAX scenes, bars of a dark scene or of a
+  fade move nothing for less); the memory of narrower pictures when the
+  video ended 3 s ago (a playlist goes on in between); the kind of signal
+  (Dolby Vision sent as HDR10 to a projector without it stays Dolby Vision,
+  so that a mode without the projector's own tone mapping can be chosen for
+  it), taken once it lasted 3 s, once a change.
+- ProjectorFeed: what the renderer and the window system tell the control,
+  under a lock of its own. The shape is no new detector: it is the bar
+  under the picture that subtitles in the black bars already has (level 5
+  of Dolby Vision, or the pictures measured), on the frame as Kodi shows it.
+---
+ xbmc/network/CMakeLists.txt    |    5 +
+ xbmc/network/ProjectorFeed.cpp |  116 ++++
+ xbmc/network/ProjectorFeed.h   |   71 ++
+ xbmc/network/ProjectorLink.cpp | 1158 ++++++++++++++++++++++++++++++++
+ xbmc/network/ProjectorLink.h   |  230 +++++++
+ xbmc/network/ProjectorPolicy.h |  297 ++++++++
+ 6 files changed, 1877 insertions(+)
+ create mode 100644 xbmc/network/ProjectorFeed.cpp
+ create mode 100644 xbmc/network/ProjectorFeed.h
+ create mode 100644 xbmc/network/ProjectorLink.cpp
+ create mode 100644 xbmc/network/ProjectorLink.h
+ create mode 100644 xbmc/network/ProjectorPolicy.h
+
+diff --git a/xbmc/network/CMakeLists.txt b/xbmc/network/CMakeLists.txt
+index 6928547..f77e9ce 100644
+--- a/xbmc/network/CMakeLists.txt
++++ b/xbmc/network/CMakeLists.txt
+@@ -6,6 +6,8 @@ set(SOURCES DNSNameCache.cpp
+             Network.cpp
+             NetworkFileItemClassify.cpp
+             NetworkServices.cpp
++            ProjectorFeed.cpp
++            ProjectorLink.cpp
+             SocketOptions.cpp
+             Socket.cpp
+             TCPServer.cpp
+@@ -22,6 +24,9 @@ set(HEADERS DNSNameCache.h
+             Network.h
+             NetworkFileItemClassify.h
+             NetworkServices.h
++            ProjectorFeed.h
++            ProjectorLink.h
++            ProjectorPolicy.h
+             SocketOptions.h
+             Socket.h
+             TCPServer.h
+diff --git a/xbmc/network/ProjectorFeed.cpp b/xbmc/network/ProjectorFeed.cpp
+new file mode 100644
+index 0000000..7ef0658
+--- /dev/null
++++ b/xbmc/network/ProjectorFeed.cpp
+@@ -0,0 +1,116 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "ProjectorFeed.h"
++
++#include "cores/VideoPlayer/VideoRenderers/SubtitleBars.h"
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <mutex>
++
++namespace PROJECTOR
++{
++
++namespace
++{
++using Clock = std::chrono::steady_clock;
++
++std::atomic<bool> g_barsWanted{false};
++std::atomic<unsigned int> g_video{1};
++
++std::mutex g_lock;
++struct
++{
++  Shape shape;
++  std::string how;
++  HowKind howKind = HowKind::FRAME;
++  Clock::time_point pictureAt{};
++  bool pictureSeen = false;
++  Signal signal = Signal::NONE;
++  Clock::time_point signalAt{};
++  bool signalSeen = false;
++} g_fed;
++} // namespace
++
++void SetBarsWanted(bool wanted)
++{
++  g_barsWanted.store(wanted, std::memory_order_relaxed);
++}
++
++bool BarsWanted()
++{
++  return g_barsWanted.load(std::memory_order_relaxed);
++}
++
++void FeedNewVideo()
++{
++  g_video.fetch_add(1, std::memory_order_relaxed);
++}
++
++Shape ShapeOf(double frameRatio, int height, int barRows, bool barTaken)
++{
++  Shape shape;
++  if (!(frameRatio > 0.0) || !std::isfinite(frameRatio) || height <= 0)
++    return shape;
++  shape.valid = true;
++  shape.ratio = frameRatio;
++  const bool bar = barTaken && barRows > 0 && 2 * barRows < height;
++  if (bar)
++    shape.ratio = frameRatio * height / static_cast<double>(height - 2 * barRows);
++  shape.known = bar || std::abs(frameRatio - 16.0 / 9.0) > SIXTEEN_NINE_TOLERANCE;
++  return shape;
++}
++
++void FeedPicture(double frameRatio, int height, int barRows, const char* barHow, bool measured)
++{
++  Shape shape = ShapeOf(frameRatio, height, barRows, barHow != nullptr);
++  shape.video = g_video.load(std::memory_order_relaxed);
++  std::lock_guard lock(g_lock);
++  g_fed.shape = shape;
++  // (the texts are fixed ones of SubtitleBars.h: copied only when they change)
++  const char* how = barHow && barRows > 0 ? barHow
++                    : measured            ? "the shape of the frame (no bar seen)"
++                                          : "the shape of the frame (bars not measured here)";
++  if (g_fed.how != how)
++    g_fed.how = how;
++  g_fed.howKind = !(barHow && barRows > 0)                                  ? HowKind::FRAME
++                  : std::strcmp(barHow, KODI::SUBTITLES::BARS::HOW_L5) == 0 ? HowKind::LEVEL5
++                                                                            : HowKind::MEASURED;
++  g_fed.pictureAt = Clock::now();
++  g_fed.pictureSeen = true;
++}
++
++void FeedSignal(const std::string& source, const std::string& output, bool stereo)
++{
++  const Signal signal = SignalOf(source, output, stereo);
++  std::lock_guard lock(g_lock);
++  g_fed.signal = signal;
++  g_fed.signalAt = Clock::now();
++  g_fed.signalSeen = true;
++}
++
++Fed Read()
++{
++  const auto now = Clock::now();
++  std::lock_guard lock(g_lock);
++  Fed fed;
++  fed.shape = g_fed.shape;
++  fed.how = g_fed.how;
++  fed.howKind = g_fed.howKind;
++  fed.signal = g_fed.signal;
++  if (g_fed.pictureSeen)
++    fed.pictureAge = std::chrono::duration<double>(now - g_fed.pictureAt).count();
++  if (g_fed.signalSeen)
++    fed.signalAge = std::chrono::duration<double>(now - g_fed.signalAt).count();
++  return fed;
++}
++
++} // namespace PROJECTOR
+diff --git a/xbmc/network/ProjectorFeed.h b/xbmc/network/ProjectorFeed.h
+new file mode 100644
+index 0000000..fea5d94
+--- /dev/null
++++ b/xbmc/network/ProjectorFeed.h
+@@ -0,0 +1,71 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++/*!
++ * \file
++ * \brief Hades: network control of a home-cinema projector (ProjectorControl.h): what the player and
++ *        the window system tell it, read by its own thread. Cheap where it is called: a store under a
++ *        lock of its own. Nothing here uses Kodi.
++ */
++
++#include "ProjectorPolicy.h"
++
++#include <string>
++
++namespace PROJECTOR
++{
++
++//! The control wants the bars of the picture measured (subtitles in the black bars measures them
++//! too): set by the control, read by the renderer (any thread)
++void SetBarsWanted(bool wanted);
++bool BarsWanted();
++
++//! A stream starts (CRenderManager::Configure()): what comes next is of another video
++void FeedNewVideo();
++
++/*!
++ * \brief The picture presented (render thread, with BarsWanted()): the shape of its frame as Kodi
++ *        shows it, its height in rows, the bar under its active picture (SubtitleBars.h: 0 none
++ *        seen), how that bar was taken (nullptr: no bar), and whether the renderer measures bars at all
++ */
++void FeedPicture(double frameRatio, int height, int barRows, const char* barHow, bool measured);
++
++//! The signal (the window system, twice a second): hades.src.hdrtype, hades.out.hdrtype, 3D output
++void FeedSignal(const std::string& source, const std::string& output, bool stereo);
++
++//! where the shape comes from
++enum class HowKind
++{
++  FRAME, //!< the shape of the frame: no bar
++  LEVEL5, //!< a bar from the active area of Dolby Vision metadata
++  MEASURED, //!< a bar measured on the pictures
++};
++
++struct Fed
++{
++  Shape shape;
++  //! how the shape was found, for the log
++  std::string how;
++  HowKind howKind = HowKind::FRAME;
++  Signal signal = Signal::NONE;
++  //! seconds since the picture and the signal were last told (a large value: never)
++  double pictureAge = 1e9;
++  double signalAge = 1e9;
++};
++Fed Read();
++
++/*!
++ * \brief The shape of a picture: its frame's shape, and a bar of barRows under it taken as one of
++ *        the same height above it (a letterboxed picture is centred); known where a bar was taken,
++ *        or where the frame is not 16:9 (ProjectorPolicy.h)
++ */
++Shape ShapeOf(double frameRatio, int height, int barRows, bool barTaken);
++
++} // namespace PROJECTOR
+diff --git a/xbmc/network/ProjectorLink.cpp b/xbmc/network/ProjectorLink.cpp
+new file mode 100644
+index 0000000..b082a35
+--- /dev/null
++++ b/xbmc/network/ProjectorLink.cpp
+@@ -0,0 +1,1158 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "ProjectorLink.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <thread>
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++namespace PROJECTOR
++{
++
++namespace
++{
++int64_t NowMs()
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++std::string Hex2(int value)
++{
++  char text[8];
++  std::snprintf(text, sizeof(text), "%02X", value & 0xFF);
++  return text;
++}
++
++//! JVC: the start of every message to and from the projector after its two first letters
++const std::string JVC_UNIT("\x89\x01", 2);
++const std::string JVC_SALT = "JVCKWPJ";
++
++//! the picture modes of JVC's protocol (PMPM), of all its series of 2012 to 2025; a model takes the
++//! ones it has, and refuses the others
++const std::vector<ModeName> JVC_MODES = {
++    {0x00, "Film"},
++    {0x01, "Cinema"},
++    {0x02, "Animation"},
++    {0x03, "Natural"},
++    {0x04, "HDR10 (HDR on the models of 2017)"},
++    {0x06, "THX"},
++    {0x0B, "Frame Adapt HDR"},
++    {0x0C, "User 1 (SDR 1 on the NZ500 and NZ700)"},
++    {0x0D, "User 2 (SDR 2 on the NZ500 and NZ700)"},
++    {0x0E, "User 3 (HDR 1 on the NZ500 and NZ700)"},
++    {0x0F, "User 4 (HDR 2 on the NZ500 and NZ700)"},
++    {0x10, "User 5"},
++    {0x11, "User 6"},
++    {0x14, "HLG"},
++    {0x15, "HDR10+"},
++    {0x16, "Pana_PQ"},
++    {0x17, "Filmmaker Mode"},
++    {0x18, "Frame Adapt HDR2"},
++    {0x19, "Frame Adapt HDR3"},
++    {0x1B, "Vivid"},
++    {0x1C, "Natural (low latency)"},
++    {0x1D, "HDR10 (low latency)"},
++    {0x1E, "HLG (low latency)"},
++};
++
++//! Sony ADCP: the picture modes (picture_mode), the code Hades keeps for each and the projector's word
++struct AdcpMode
++{
++  int code;
++  const char* name;
++  const char* word;
++};
++const AdcpMode ADCP_MODES[] = {
++    {1, "Cinema Film 1", "cinema_film1"},
++    {2, "Cinema Film 2", "cinema_film2"},
++    {3, "Reference", "reference"},
++    {4, "TV", "tv"},
++    {5, "Photo", "photo"},
++    {6, "Game", "game"},
++    {7, "Bright Cinema", "brt_cinema"},
++    {8, "Bright TV", "brt_tv"},
++    {9, "User", "user"},
++    {10, "User 1", "user1"},
++    {11, "User 2", "user2"},
++    {12, "User 3", "user3"},
++};
++std::vector<ModeName> AdcpModes()
++{
++  std::vector<ModeName> modes;
++  for (const auto& mode : ADCP_MODES)
++    modes.push_back({mode.code, mode.name});
++  return modes;
++}
++//! Sony ADCP: the picture positions (pic_pos_sel), memory 1 to 7
++const char* const ADCP_POSITIONS[] = {"1.85_1",  "2.35_1",  "custom1", "custom2",
++                                      "custom3", "custom4", "custom5"};
++const char* const ADCP_POSITION_NAMES[] = {"1.85:1",   "2.35:1",   "Custom 1", "Custom 2",
++                                           "Custom 3", "Custom 4", "Custom 5"};
++
++//! Sony SDCP: the calibration presets of the 4K home cinema models (item 0x0002)
++const std::vector<ModeName> SDCP_MODES = {
++    {0x00, "Cinema Film 1"}, {0x01, "Cinema Film 2"}, {0x02, "Reference"},     {0x03, "TV"},
++    {0x04, "Photo"},         {0x05, "Game"},          {0x06, "Bright Cinema"}, {0x07, "Bright TV"},
++    {0x08, "User"},
++};
++const char* const SDCP_POSITION_NAMES[] = {"1.85:1", "2.35:1", "Custom 1", "Custom 2", "Custom 3"};
++constexpr uint16_t SDCP_POWER = 0x0102;
++constexpr uint16_t SDCP_POSITION = 0x0066;
++constexpr uint16_t SDCP_PRESET = 0x0002;
++
++//! Epson: the colour modes of ESC/VP21 (CMODE) of its home cinema models; a model takes the ones it
++//! has, and refuses the others
++const std::vector<ModeName> EPSON_MODES = {
++    {0x00, "Auto"},
++    {0x06, "Dynamic"},
++    {0x0C, "Bright Cinema"},
++    {0x07, "Natural"},
++    {0x15, "Cinema"},
++    {0x22, "Digital Cinema"},
++    {0x13, "THX"},
++    {0x05, "Theatre"},
++    {0x09, "Theatre Black 1"},
++    {0x0A, "Theatre Black 2"},
++    {0x0D, "Game"},
++    {0x16, "Stage"},
++    {0x0B, "x.v.Color"},
++    {0x20, "B&W Cinema"},
++    {0x21, "Adobe RGB"},
++    {0x17, "3D Cinema"},
++    {0x18, "3D Dynamic"},
++    {0x19, "3D THX"},
++};
++
++const std::string EPSON_NAME = "ESC/VP.net";
++} // namespace
++
++Brand BrandOf(int value)
++{
++  switch (value)
++  {
++    case 1:
++      return Brand::JVC;
++    case 2:
++      return Brand::SONY_ADCP;
++    case 3:
++      return Brand::SONY_SDCP;
++    case 4:
++      return Brand::EPSON;
++    default:
++      return Brand::NONE;
++  }
++}
++
++const char* BrandName(Brand brand)
++{
++  switch (brand)
++  {
++    case Brand::JVC:
++      return "JVC";
++    case Brand::SONY_ADCP:
++      return "Sony (ADCP)";
++    case Brand::SONY_SDCP:
++      return "Sony (SDCP)";
++    case Brand::EPSON:
++      return "Epson";
++    case Brand::NONE:
++      break;
++  }
++  return "none";
++}
++
++uint16_t DefaultPort(Brand brand)
++{
++  switch (brand)
++  {
++    case Brand::JVC:
++      return 20554;
++    case Brand::SONY_ADCP:
++      return 53595;
++    case Brand::SONY_SDCP:
++      return 53484;
++    case Brand::EPSON:
++      return 3629;
++    case Brand::NONE:
++      break;
++  }
++  return 0;
++}
++
++const char* PowerName(Power power)
++{
++  switch (power)
++  {
++    case Power::ON:
++      return "on";
++    case Power::STANDBY:
++      return "standby";
++    case Power::WARMING:
++      return "warming up";
++    case Power::COOLING:
++      return "cooling down";
++    case Power::ERROR:
++      return "error";
++    case Power::UNKNOWN:
++      break;
++  }
++  return "unknown";
++}
++
++const char* FailureName(Failure failure)
++{
++  switch (failure)
++  {
++    case Failure::NONE:
++      return "done";
++    case Failure::ADDRESS:
++      return "not an IP address";
++    case Failure::UNREACHABLE:
++      return "no connection";
++    case Failure::BUSY:
++      return "busy with another connection";
++    case Failure::PASSWORD_NEEDED:
++      return "a password is needed";
++    case Failure::PASSWORD_REFUSED:
++      return "the password was refused";
++    case Failure::NO_ANSWER:
++      return "no answer in time";
++    case Failure::REJECTED:
++      return "the command was refused";
++    case Failure::PROTOCOL:
++      return "an answer that is not of its protocol";
++    case Failure::NOT_AVAILABLE:
++      return "not available with this protocol";
++    case Failure::STOPPED:
++      return "stopped";
++  }
++  return "?";
++}
++
++const std::vector<ModeName>& ModesOf(Brand brand)
++{
++  static const std::vector<ModeName> none;
++  static const std::vector<ModeName> adcp = AdcpModes();
++  switch (brand)
++  {
++    case Brand::JVC:
++      return JVC_MODES;
++    case Brand::SONY_ADCP:
++      return adcp;
++    case Brand::SONY_SDCP:
++      return SDCP_MODES;
++    case Brand::EPSON:
++      return EPSON_MODES;
++    case Brand::NONE:
++      break;
++  }
++  return none;
++}
++
++const char* ModeNameOf(Brand brand, int code)
++{
++  for (const auto& mode : ModesOf(brand))
++    if (mode.code == code)
++      return mode.name;
++  return nullptr;
++}
++
++int MemoriesOf(Brand brand)
++{
++  switch (brand)
++  {
++    case Brand::JVC:
++    case Brand::EPSON:
++      return 10;
++    case Brand::SONY_ADCP:
++      return 7;
++    case Brand::SONY_SDCP:
++      return 5;
++    case Brand::NONE:
++      break;
++  }
++  return 0;
++}
++
++const char* MemoryOwnName(Brand brand, int memory)
++{
++  if (memory < 1 || memory > MemoriesOf(brand))
++    return "";
++  if (brand == Brand::SONY_ADCP)
++    return ADCP_POSITION_NAMES[memory - 1];
++  if (brand == Brand::SONY_SDCP)
++    return SDCP_POSITION_NAMES[memory - 1];
++  return "";
++}
++
++Address ReadAddress(const std::string& text)
++{
++  Address address;
++  if (text.empty() || text.size() > 64)
++    return address;
++  addrinfo hints{};
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_flags = AI_NUMERICHOST;
++  hints.ai_socktype = SOCK_STREAM;
++  addrinfo* found = nullptr;
++  if (getaddrinfo(text.c_str(), nullptr, &hints, &found) != 0 || !found)
++    return address;
++  address.valid = true;
++  const auto v4home = [](uint32_t a)
++  {
++    return (a >> 24) == 10 || (a >> 20) == ((172u << 4) | 1u) ||
++           (a >> 16) == ((192u << 8) | 168u) || (a >> 16) == ((169u << 8) | 254u);
++  };
++  if (found->ai_family == AF_INET)
++  {
++    const auto* in = reinterpret_cast<const sockaddr_in*>(found->ai_addr);
++    address.home = v4home(ntohl(in->sin_addr.s_addr));
++  }
++  else if (found->ai_family == AF_INET6)
++  {
++    const auto* in6 = reinterpret_cast<const sockaddr_in6*>(found->ai_addr);
++    const uint8_t* b = in6->sin6_addr.s6_addr;
++    // fc00::/7 (unique local), fe80::/10 (link-local), and an IPv4 address in IPv6 (::ffff:a.b.c.d)
++    if ((b[0] & 0xFE) == 0xFC || (b[0] == 0xFE && (b[1] & 0xC0) == 0x80))
++      address.home = true;
++    else if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr))
++      address.home = v4home((uint32_t(b[12]) << 24) | (uint32_t(b[13]) << 16) |
++                            (uint32_t(b[14]) << 8) | b[15]);
++  }
++  else
++    address.valid = false;
++  freeaddrinfo(found);
++  return address;
++}
++
++std::string Printable(const std::string& bytes)
++{
++  std::string text;
++  for (const unsigned char c : bytes)
++  {
++    if (c == '\\')
++      text += "\\\\";
++    else if (c >= 0x20 && c < 0x7F)
++      text += static_cast<char>(c);
++    else if (c == '\n')
++      text += "\\n";
++    else if (c == '\r')
++      text += "\\r";
++    else
++    {
++      char hex[8];
++      std::snprintf(hex, sizeof(hex), "\\x%02X", c);
++      text += hex;
++    }
++  }
++  return text;
++}
++
++// ------------------------------------------------------------------------------------ the session
++
++CSession::CSession(Brand brand,
++                   std::string address,
++                   uint16_t port,
++                   std::string password,
++                   Sha256Hex sha256,
++                   Log log,
++                   const std::atomic<bool>* stop,
++                   Timeouts timeouts)
++  : m_brand(brand),
++    m_address(std::move(address)),
++    m_port(port),
++    m_password(std::move(password)),
++    m_sha256(std::move(sha256)),
++    m_log(std::move(log)),
++    m_stop(stop),
++    m_timeouts(timeouts)
++{
++}
++
++CSession::~CSession()
++{
++  Disconnect();
++}
++
++void CSession::Say(const std::string& line) const
++{
++  if (m_log)
++    m_log(line);
++}
++
++Result CSession::Connect()
++{
++  Disconnect();
++  if (m_stop && *m_stop)
++    return {Failure::STOPPED, ""};
++  addrinfo hints{};
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
++  hints.ai_socktype = SOCK_STREAM;
++  addrinfo* found = nullptr;
++  const std::string port = std::to_string(m_port);
++  if (getaddrinfo(m_address.c_str(), port.c_str(), &hints, &found) != 0 || !found)
++    return {Failure::ADDRESS, m_address};
++  m_fd = socket(found->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
++  if (m_fd < 0)
++  {
++    freeaddrinfo(found);
++    return {Failure::UNREACHABLE, std::string("socket: ") + std::strerror(errno)};
++  }
++  int one = 1;
++  setsockopt(m_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++  const int r = connect(m_fd, found->ai_addr, found->ai_addrlen);
++  freeaddrinfo(found);
++  if (r != 0 && errno != EINPROGRESS)
++  {
++    const std::string why = std::strerror(errno);
++    Disconnect();
++    return {Failure::UNREACHABLE, why};
++  }
++  if (r != 0)
++  {
++    Result waited = Wait(POLLOUT, m_timeouts.connectMs);
++    if (!waited.Ok())
++    {
++      Disconnect();
++      if (waited.failure == Failure::NO_ANSWER)
++        waited = {Failure::UNREACHABLE,
++                  "no connection within " + std::to_string(m_timeouts.connectMs) + " ms"};
++      return waited;
++    }
++    int error = 0;
++    socklen_t length = sizeof(error);
++    if (getsockopt(m_fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0)
++    {
++      Disconnect();
++      return {Failure::UNREACHABLE, std::strerror(error ? error : errno)};
++    }
++  }
++  m_buffer.clear();
++  Say("connected to " + m_address + " port " + port);
++  return {};
++}
++
++void CSession::Disconnect()
++{
++  if (m_fd >= 0)
++  {
++    close(m_fd);
++    m_fd = -1;
++  }
++  m_buffer.clear();
++}
++
++Result CSession::Wait(short events, int timeoutMs)
++{
++  const int64_t end = NowMs() + timeoutMs;
++  while (true)
++  {
++    if (m_stop && *m_stop)
++      return {Failure::STOPPED, ""};
++    const int64_t left = end - NowMs();
++    if (left <= 0)
++      return {Failure::NO_ANSWER, ""};
++    pollfd p{m_fd, events, 0};
++    const int r = poll(&p, 1, static_cast<int>(std::min<int64_t>(left, 100)));
++    if (r < 0 && errno != EINTR)
++      return {Failure::UNREACHABLE, std::string("poll: ") + std::strerror(errno)};
++    if (r > 0)
++    {
++      if (p.revents & (events | POLLHUP | POLLERR))
++        return {};
++    }
++  }
++}
++
++Result CSession::Send(const std::string& bytes, const std::string& said)
++{
++  Say("sent: " + said);
++  size_t done = 0;
++  while (done < bytes.size())
++  {
++    Result waited = Wait(POLLOUT, m_timeouts.answerMs);
++    if (!waited.Ok())
++      return waited;
++    const ssize_t n = send(m_fd, bytes.data() + done, bytes.size() - done, MSG_NOSIGNAL);
++    if (n < 0)
++    {
++      if (errno == EAGAIN || errno == EINTR)
++        continue;
++      return {Failure::UNREACHABLE, std::string("send: ") + std::strerror(errno)};
++    }
++    done += static_cast<size_t>(n);
++  }
++  return {};
++}
++
++Result CSession::Fill(int64_t endMs)
++{
++  if (m_fd < 0)
++    return {Failure::UNREACHABLE, "not connected"};
++  while (true)
++  {
++    Result waited = Wait(POLLIN, static_cast<int>(std::max<int64_t>(0, endMs - NowMs())));
++    if (!waited.Ok())
++    {
++      if (waited.failure == Failure::NO_ANSWER && !m_buffer.empty())
++        waited.detail = "an answer cut short: " + Printable(m_buffer);
++      return waited;
++    }
++    char chunk[512];
++    const ssize_t r = recv(m_fd, chunk, sizeof(chunk), 0);
++    if (r == 0)
++      return {Failure::NO_ANSWER, "the projector closed the connection" +
++                                      (m_buffer.empty() ? "" : " after " + Printable(m_buffer))};
++    if (r < 0)
++    {
++      if (errno == EAGAIN || errno == EINTR)
++        continue;
++      return {Failure::UNREACHABLE, std::string("recv: ") + std::strerror(errno)};
++    }
++    m_buffer.append(chunk, static_cast<size_t>(r));
++    return {};
++  }
++}
++
++Result CSession::ReadExact(size_t n, int timeoutMs, std::string& out)
++{
++  const int64_t end = NowMs() + timeoutMs;
++  while (m_buffer.size() < n)
++  {
++    Result read = Fill(end);
++    if (!read.Ok())
++      return read;
++  }
++  out = m_buffer.substr(0, n);
++  m_buffer.erase(0, n);
++  return {};
++}
++
++Result CSession::ReadUntil(const std::string& until, size_t max, int timeoutMs, std::string& out)
++{
++  const int64_t end = NowMs() + timeoutMs;
++  while (true)
++  {
++    const size_t at = m_buffer.find_first_of(until);
++    if (at != std::string::npos && at < max)
++    {
++      out = m_buffer.substr(0, at + 1);
++      m_buffer.erase(0, at + 1);
++      return {};
++    }
++    if (m_buffer.size() >= max)
++      return {Failure::PROTOCOL, "an answer too long: " + Printable(m_buffer.substr(0, 64))};
++    Result read = Fill(end);
++    if (!read.Ok())
++      return read;
++  }
++}
++
++void CSession::Gap()
++{
++  while (NowMs() < m_nextSendMs)
++  {
++    if (m_stop && *m_stop)
++      return;
++    std::this_thread::sleep_for(
++        std::chrono::milliseconds(std::min<int64_t>(100, m_nextSendMs - NowMs())));
++  }
++}
++
++Result CSession::Open()
++{
++  m_open = false;
++  if (!ReadAddress(m_address).valid)
++    return {Failure::ADDRESS, m_address};
++  Result result;
++  switch (m_brand)
++  {
++    case Brand::JVC:
++      result = OpenJvc();
++      break;
++    case Brand::EPSON:
++      result = OpenEpson();
++      break;
++    case Brand::SONY_ADCP:
++    {
++      // (one command a connection: the connection and its password are tried with a reading)
++      std::string answer;
++      result = AdcpCommand("power_status ?", m_timeouts.answerMs, answer);
++      if (result.failure == Failure::REJECTED)
++        result = {};
++      break;
++    }
++    case Brand::SONY_SDCP:
++      result = Connect();
++      Disconnect();
++      break;
++    case Brand::NONE:
++      result = {Failure::NOT_AVAILABLE, "no projector chosen"};
++      break;
++  }
++  m_open = result.Ok();
++  return result;
++}
++
++void CSession::Close()
++{
++  if (m_fd >= 0)
++    Say("closed");
++  Disconnect();
++  m_open = false;
++}
++
++// ------------------------------------------------------------------------------------------- JVC
++
++Result CSession::OpenJvc()
++{
++  Result result = Connect();
++  if (!result.Ok())
++    return result;
++  std::string greeting;
++  result = ReadExact(5, m_timeouts.answerMs, greeting);
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(greeting));
++  if (greeting == "PJ_NG")
++    return {Failure::BUSY, "PJ_NG"};
++  if (greeting != "PJ_OK")
++    return {Failure::PROTOCOL, Printable(greeting)};
++  const auto plain = [this]
++  {
++    std::string padded = m_password;
++    if (padded.size() < 16)
++      padded.resize(16, '\0');
++    return padded;
++  };
++  const auto ask = [this](const std::string& bytes, const std::string& said, std::string& answer)
++  {
++    Result r = Send(bytes, said);
++    if (r.Ok())
++      r = ReadExact(5, m_timeouts.answerMs, answer);
++    if (r.Ok())
++      Say("received: " + Printable(answer));
++    return r;
++  };
++  std::string answer;
++  if (m_password.empty())
++  {
++    result = ask("PJREQ", "PJREQ", answer);
++    if (!result.Ok())
++      return result;
++    if (answer == "PJNAK")
++      return {Failure::PASSWORD_NEEDED, "PJNAK"};
++  }
++  else
++  {
++    // the form that was let in last first; after a PJNAK, the other one, once
++    const bool hashFirst = m_preferHashed && m_sha256;
++    const std::string first = hashFirst ? m_sha256(m_password + JVC_SALT) : plain();
++    result =
++        ask("PJREQ_" + first, hashFirst ? "PJREQ_(password, hashed)" : "PJREQ_(password)", answer);
++    if (!result.Ok())
++      return result;
++    m_hashed = hashFirst;
++    if (answer == "PJNAK" && (hashFirst || m_sha256))
++    {
++      const std::string second = hashFirst ? plain() : m_sha256(m_password + JVC_SALT);
++      result = ask("PJREQ_" + second, hashFirst ? "PJREQ_(password)" : "PJREQ_(password, hashed)",
++                   answer);
++      if (!result.Ok())
++        return result;
++      m_hashed = !hashFirst;
++    }
++    if (answer == "PJNAK")
++      return {Failure::PASSWORD_REFUSED, "PJNAK"};
++  }
++  if (answer != "PJACK")
++    return {Failure::PROTOCOL, Printable(answer)};
++  return {};
++}
++
++Result CSession::JvcOperation(const std::string& code, const std::string& value, int timeoutMs)
++{
++  if (!m_open || m_fd < 0)
++    return {Failure::UNREACHABLE, "not connected"};
++  Gap();
++  const std::string message = "!" + JVC_UNIT + code + value + "\n";
++  Result result = Send(message, Printable(message));
++  if (!result.Ok())
++    return result;
++  std::string ack;
++  result = ReadUntil("\n", 64, timeoutMs, ack);
++  m_nextSendMs = NowMs() + m_timeouts.gapMs;
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(ack));
++  if (ack != "\x06" + JVC_UNIT + code.substr(0, 2) + "\n")
++    return {Failure::PROTOCOL, Printable(ack)};
++  return {};
++}
++
++Result CSession::JvcReference(const std::string& code, std::string& value)
++{
++  if (!m_open || m_fd < 0)
++    return {Failure::UNREACHABLE, "not connected"};
++  Gap();
++  const std::string message = "?" + JVC_UNIT + code + "\n";
++  Result result = Send(message, Printable(message));
++  if (!result.Ok())
++    return result;
++  std::string ack;
++  result = ReadUntil("\n", 64, m_timeouts.answerMs, ack);
++  if (result.Ok())
++  {
++    Say("received: " + Printable(ack));
++    if (ack != "\x06" + JVC_UNIT + code.substr(0, 2) + "\n")
++      result = {Failure::PROTOCOL, Printable(ack)};
++  }
++  std::string answer;
++  if (result.Ok())
++    result = ReadUntil("\n", 128, m_timeouts.answerMs, answer);
++  m_nextSendMs = NowMs() + 100;
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(answer));
++  // (the answer: "@" 0x89 0x01, the two letters of the code, the value; some older models answer
++  // with the head of an acknowledgement and the value)
++  const std::string head = JVC_UNIT + code.substr(0, 2);
++  if (answer.size() < 1 + head.size() + 1 || (answer[0] != '@' && answer[0] != '\x06') ||
++      answer.compare(1, head.size(), head) != 0 || answer.size() == 1 + head.size() + 1)
++    return {Failure::PROTOCOL, Printable(answer)};
++  value = answer.substr(1 + head.size(), answer.size() - 2 - head.size());
++  return {};
++}
++
++// ------------------------------------------------------------------------------------- Sony ADCP
++
++Result CSession::AdcpCommand(const std::string& command, int timeoutMs, std::string& answer)
++{
++  Gap();
++  Result result = Connect();
++  if (!result.Ok())
++    return result;
++  std::string line;
++  result = ReadUntil("\n", 256, m_timeouts.answerMs, line);
++  if (!result.Ok())
++  {
++    Disconnect();
++    return result;
++  }
++  Say("received: " + Printable(line));
++  const auto trim = [](std::string s)
++  {
++    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
++      s.pop_back();
++    return s;
++  };
++  const std::string challenge = trim(line);
++  if (challenge != "NOKEY")
++  {
++    if (challenge.empty() || challenge.size() > 128)
++    {
++      Disconnect();
++      return {Failure::PROTOCOL, Printable(line)};
++    }
++    if (m_password.empty() || !m_sha256)
++    {
++      Disconnect();
++      return {Failure::PASSWORD_NEEDED, "the projector asks for its ADCP password"};
++    }
++    result = Send(m_sha256(challenge + m_password) + "\r\n", "(password, hashed)\\r\\n");
++    if (result.Ok())
++      result = ReadUntil("\n", 256, m_timeouts.answerMs, line);
++    if (!result.Ok())
++    {
++      Disconnect();
++      return result;
++    }
++    Say("received: " + Printable(line));
++    const std::string reply = trim(line);
++    if (reply == "err_auth")
++    {
++      Disconnect();
++      return {Failure::PASSWORD_REFUSED, reply};
++    }
++    if (reply != "ok" && reply != "OK")
++    {
++      Disconnect();
++      return {Failure::PROTOCOL, Printable(line)};
++    }
++  }
++  result = Send(command + "\r\n", Printable(command + "\r\n"));
++  if (result.Ok())
++    result = ReadUntil("\n", 1024, timeoutMs, line);
++  Disconnect();
++  Say("closed");
++  m_nextSendMs = NowMs() + m_timeouts.gapMs / 2;
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(line));
++  answer = trim(line);
++  if (answer.compare(0, 4, "err_") == 0)
++    return {Failure::REJECTED, answer};
++  return {};
++}
++
++// ------------------------------------------------------------------------------------- Sony SDCP
++
++Result CSession::SdcpRequest(
++    bool set, uint16_t item, uint16_t data, int timeoutMs, uint16_t& answer)
++{
++  Gap();
++  Result result = Connect();
++  if (!result.Ok())
++    return result;
++  std::string community = m_password.empty() ? "SONY" : m_password;
++  community.resize(4, '\0');
++  std::string request("\x02\x0A", 2);
++  request += community;
++  request += static_cast<char>(set ? 0x00 : 0x01);
++  request += static_cast<char>(item >> 8);
++  request += static_cast<char>(item & 0xFF);
++  if (set)
++  {
++    request += static_cast<char>(2);
++    request += static_cast<char>(data >> 8);
++    request += static_cast<char>(data & 0xFF);
++  }
++  else
++    request += static_cast<char>(0);
++  std::string said = Printable(request.substr(0, 2)) + "(community)" + Printable(request.substr(6));
++  result = Send(request, said);
++  std::string head;
++  if (result.Ok())
++    result = ReadExact(10, timeoutMs, head);
++  std::string body;
++  if (result.Ok())
++    result = ReadExact(static_cast<unsigned char>(head[9]), m_timeouts.answerMs, body);
++  Disconnect();
++  m_nextSendMs = NowMs() + m_timeouts.gapMs / 2;
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(head.substr(0, 2)) + "(community)" +
++      Printable(head.substr(6) + body));
++  if (head[0] != 0x02 || head[1] != 0x0A || static_cast<unsigned char>(head[7]) != (item >> 8) ||
++      static_cast<unsigned char>(head[8]) != (item & 0xFF))
++    return {Failure::PROTOCOL, Printable(head + body)};
++  if (body.size() >= 2)
++    answer = static_cast<uint16_t>((static_cast<unsigned char>(body[0]) << 8) |
++                                   static_cast<unsigned char>(body[1]));
++  if (head[6] != 0x01)
++  {
++    // (an error code of SDCP: 0x0101 a command it does not know, 0x0102 a data size it does not
++    // take, 0x0103 a selection it does not have, 0x0104 a value out of range, 0x0201 the community
++    // is not its own, ...)
++    char code[16];
++    std::snprintf(code, sizeof(code), "0x%04X", answer);
++    if (answer == 0x0201)
++      return {Failure::PASSWORD_REFUSED, std::string("SDCP error ") + code + " (community)"};
++    return {Failure::REJECTED, std::string("SDCP error ") + code};
++  }
++  return {};
++}
++
++// ----------------------------------------------------------------------------------------- Epson
++
++Result CSession::OpenEpson()
++{
++  Result result = Connect();
++  if (!result.Ok())
++    return result;
++  std::string hello = EPSON_NAME;
++  hello += static_cast<char>(0x10); // version 1.0
++  hello += static_cast<char>(0x03); // connect
++  hello += std::string(2, '\0'); // reserved
++  hello += static_cast<char>(0x00); // a request
++  std::string said = Printable(hello);
++  if (m_password.empty())
++    hello += static_cast<char>(0);
++  else
++  {
++    hello += static_cast<char>(1);
++    std::string password = m_password.substr(0, 16);
++    password.resize(16, '\0');
++    hello += static_cast<char>(0x01); // the password header
++    hello += static_cast<char>(0x01);
++    hello += password;
++    said += "\\x01 + header \\x01\\x01(password)";
++  }
++  if (m_password.empty())
++    said += "\\x00";
++  result = Send(hello, said);
++  std::string answer;
++  if (result.Ok())
++    result = ReadExact(16, m_timeouts.answerMs, answer);
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(answer));
++  if (answer.compare(0, EPSON_NAME.size(), EPSON_NAME) != 0 || answer[10] != 0x10 ||
++      answer[11] != 0x03)
++    return {Failure::PROTOCOL, Printable(answer)};
++  // (headers that come with the answer: read and left aside)
++  const unsigned int headers = static_cast<unsigned char>(answer[15]);
++  if (headers > 0)
++  {
++    std::string rest;
++    result = ReadExact(18 * headers, m_timeouts.answerMs, rest);
++    if (!result.Ok())
++      return result;
++  }
++  switch (static_cast<unsigned char>(answer[14]))
++  {
++    case 0x20:
++      return {};
++    case 0x41:
++      return {Failure::PASSWORD_NEEDED, "status 0x41"};
++    case 0x43:
++      return {Failure::PASSWORD_REFUSED, "status 0x43"};
++    case 0x53:
++      return {Failure::BUSY, "status 0x53"};
++    default:
++      return {Failure::PROTOCOL, "status 0x" + Hex2(answer[14])};
++  }
++}
++
++Result CSession::EpsonCommand(const std::string& command, int timeoutMs, std::string& answer)
++{
++  if (!m_open || m_fd < 0)
++    return {Failure::UNREACHABLE, "not connected"};
++  Gap();
++  Result result = Send(command + "\r", Printable(command + "\r"));
++  std::string line;
++  if (result.Ok())
++    result = ReadUntil(":", 1024, timeoutMs, line);
++  m_nextSendMs = NowMs() + m_timeouts.gapMs;
++  if (!result.Ok())
++    return result;
++  Say("received: " + Printable(line));
++  answer = line.substr(0, line.size() - 1);
++  while (!answer.empty() && (answer.back() == '\r' || answer.back() == '\n'))
++    answer.pop_back();
++  if (answer == "ERR")
++    return {Failure::REJECTED, "ERR"};
++  return {};
++}
++
++// -------------------------------------------------------------------------------------- commands
++
++Result CSession::GetPower(Power& power)
++{
++  power = Power::UNKNOWN;
++  switch (m_brand)
++  {
++    case Brand::JVC:
++    {
++      std::string value;
++      Result result = JvcReference("PW", value);
++      if (!result.Ok())
++        return result;
++      if (value == "0")
++        power = Power::STANDBY;
++      else if (value == "1")
++        power = Power::ON;
++      else if (value == "2")
++        power = Power::COOLING;
++      else if (value == "3")
++        power = Power::WARMING;
++      else if (value == "4")
++        power = Power::ERROR;
++      else
++        return {Failure::PROTOCOL, "power " + Printable(value)};
++      return {};
++    }
++    case Brand::SONY_ADCP:
++    {
++      std::string answer;
++      Result result = AdcpCommand("power_status ?", m_timeouts.answerMs, answer);
++      if (!result.Ok())
++        return result;
++      if (answer == "\"on\"")
++        power = Power::ON;
++      else if (answer == "\"standby\"")
++        power = Power::STANDBY;
++      else if (answer == "\"startup\"")
++        power = Power::WARMING;
++      else if (answer == "\"cooling1\"" || answer == "\"cooling2\"")
++        power = Power::COOLING;
++      else
++        return {Failure::PROTOCOL, "power " + Printable(answer)};
++      return {};
++    }
++    case Brand::SONY_SDCP:
++    {
++      uint16_t value = 0;
++      Result result = SdcpRequest(false, SDCP_POWER, 0, m_timeouts.answerMs, value);
++      if (!result.Ok())
++        return result;
++      if (value == 0 || value == 8)
++        power = Power::STANDBY;
++      else if (value == 1 || value == 2)
++        power = Power::WARMING;
++      else if (value == 3)
++        power = Power::ON;
++      else if (value >= 4 && value <= 7)
++        power = Power::COOLING;
++      else
++        return {Failure::PROTOCOL, "power " + std::to_string(value)};
++      return {};
++    }
++    case Brand::EPSON:
++    {
++      std::string answer;
++      Result result = EpsonCommand("PWR?", m_timeouts.answerMs, answer);
++      if (!result.Ok())
++        return result;
++      if (answer == "PWR=01")
++        power = Power::ON;
++      else if (answer == "PWR=00" || answer == "PWR=04")
++        power = Power::STANDBY;
++      else if (answer == "PWR=02")
++        power = Power::WARMING;
++      else if (answer == "PWR=03")
++        power = Power::COOLING;
++      else if (answer == "PWR=05")
++        power = Power::ERROR;
++      else
++        return {Failure::PROTOCOL, "power " + Printable(answer)};
++      return {};
++    }
++    case Brand::NONE:
++      break;
++  }
++  return {Failure::NOT_AVAILABLE, "no projector chosen"};
++}
++
++Result CSession::GetModel(std::string& model)
++{
++  model.clear();
++  if (m_brand == Brand::JVC)
++  {
++    std::string value;
++    Result result = JvcReference("MD", value);
++    if (!result.Ok())
++      return result;
++    // ("ILAFPJ -- B8A2": the code of the model after the name of the protocol)
++    size_t at = value.compare(0, 6, "ILAFPJ") == 0 ? 6 : 0;
++    while (at < value.size() && (value[at] == ' ' || value[at] == '-'))
++      at++;
++    model = value.substr(at);
++    return {};
++  }
++  if (m_brand == Brand::SONY_ADCP)
++  {
++    std::string answer;
++    Result result = AdcpCommand("modelname ?", m_timeouts.answerMs, answer);
++    if (!result.Ok())
++      return result;
++    if (answer.size() >= 2 && answer.front() == '"' && answer.back() == '"')
++      answer = answer.substr(1, answer.size() - 2);
++    model = answer;
++    return {};
++  }
++  return {Failure::NOT_AVAILABLE, "the protocol has no reading of the model"};
++}
++
++Result CSession::SetLensMemory(int memory)
++{
++  if (memory < 1 || memory > MemoriesOf(m_brand))
++    return {Failure::NOT_AVAILABLE,
++            "no lens memory " + std::to_string(memory) + " with " + BrandName(m_brand)};
++  switch (m_brand)
++  {
++    case Brand::JVC:
++      return JvcOperation("INML", std::to_string(memory - 1), m_timeouts.lensMs);
++    case Brand::SONY_ADCP:
++    {
++      std::string answer;
++      Result result = AdcpCommand(std::string("pic_pos_sel \"") + ADCP_POSITIONS[memory - 1] + "\"",
++                                  m_timeouts.lensMs, answer);
++      if (result.Ok() && answer != "ok")
++        return {Failure::PROTOCOL, Printable(answer)};
++      return result;
++    }
++    case Brand::SONY_SDCP:
++    {
++      uint16_t answer = 0;
++      return SdcpRequest(true, SDCP_POSITION, static_cast<uint16_t>(memory - 1), m_timeouts.lensMs,
++                         answer);
++    }
++    case Brand::EPSON:
++    {
++      std::string answer;
++      Result result = EpsonCommand("POPLP " + Hex2(memory), m_timeouts.lensMs, answer);
++      if (result.Ok() && !answer.empty())
++        return {Failure::PROTOCOL, Printable(answer)};
++      return result;
++    }
++    case Brand::NONE:
++      break;
++  }
++  return {Failure::NOT_AVAILABLE, "no projector chosen"};
++}
++
++Result CSession::SetPictureMode(int code)
++{
++  if (!ModeNameOf(m_brand, code))
++    return {Failure::NOT_AVAILABLE,
++            "no picture mode " + std::to_string(code) + " with " + BrandName(m_brand)};
++  switch (m_brand)
++  {
++    case Brand::JVC:
++      return JvcOperation("PMPM", Hex2(code), m_timeouts.modeMs);
++    case Brand::SONY_ADCP:
++    {
++      for (const auto& mode : ADCP_MODES)
++        if (mode.code == code)
++        {
++          std::string answer;
++          Result result = AdcpCommand(std::string("picture_mode \"") + mode.word + "\"",
++                                      m_timeouts.modeMs, answer);
++          if (result.Ok() && answer != "ok")
++            return {Failure::PROTOCOL, Printable(answer)};
++          return result;
++        }
++      break;
++    }
++    case Brand::SONY_SDCP:
++    {
++      uint16_t answer = 0;
++      return SdcpRequest(true, SDCP_PRESET, static_cast<uint16_t>(code), m_timeouts.modeMs, answer);
++    }
++    case Brand::EPSON:
++    {
++      std::string answer;
++      Result result = EpsonCommand("CMODE " + Hex2(code), m_timeouts.modeMs, answer);
++      if (result.Ok() && !answer.empty())
++        return {Failure::PROTOCOL, Printable(answer)};
++      return result;
++    }
++    case Brand::NONE:
++      break;
++  }
++  return {Failure::NOT_AVAILABLE, "no projector chosen"};
++}
++
++} // namespace PROJECTOR
+diff --git a/xbmc/network/ProjectorLink.h b/xbmc/network/ProjectorLink.h
+new file mode 100644
+index 0000000..1055782
+--- /dev/null
++++ b/xbmc/network/ProjectorLink.h
+@@ -0,0 +1,230 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++/*!
++ * \file
++ * \brief Hades: network control of a home-cinema projector (ProjectorControl.h): the protocols, over
++ *        one TCP connection that Hades opens to the address the user gave. Nothing here listens, and
++ *        nothing here uses Kodi: a host test runs it against a simulator of each projector
++ *        (tools/regress, kodi-host, stage projector).
++ *
++ * Written from the published descriptions of each protocol, read as data (no code taken):
++ *  - JVC D-ILA, TCP 20554. The projector greets with "PJ_OK" ("PJ_NG": busy with another
++ *    connection); Hades answers "PJREQ", or "PJREQ_" and the network password (padded with NUL to 16
++ *    bytes) where one is set; "PJACK" lets it in, "PJNAK" refuses. The models of 2024 on take the
++ *    password as the SHA-256, in hexadecimal, of the password followed by "JVCKWPJ": after a "PJNAK"
++ *    that form is sent once, on the same connection (as the pyjvcprojector library does, MIT,
++ *    jvcprojector/device.py). An operation is "!" 0x89 0x01, its code, its value and "\n", answered by
++ *    0x06 0x89 0x01, the first two letters of the code and "\n"; a reference is "?" in place of "!",
++ *    answered by that and then "@" 0x89 0x01, the two letters, the value and "\n". Codes used: PW
++ *    (power: 0 standby, 1 on, 2 cooling, 3 warming, 4 error), MD (model, "ILAFPJ -- B8A2"), INML
++ *    (installation mode, the lens memory: "0" for memory 1 to "9" for memory 10) and PMPM (picture
++ *    mode, two hexadecimal digits). An installation mode is answered once the lens has moved (up to a
++ *    minute), a picture mode within ten seconds.
++ *  - Sony, ADCP, TCP 53595 (VPL-XW and the VPL-VW models that have it). The projector sends a line:
++ *    "NOKEY" without a password, otherwise a random string; Hades answers the SHA-256, in hexadecimal,
++ *    of that string followed by the password, and "ok" lets it in ("err_auth" refuses). Commands are
++ *    lines that end in "\r\n": power_status ?, modelname ?, pic_pos_sel "2.35_1" (the picture
++ *    position, the lens memory), picture_mode "cinema_film1"; answered "ok", a value in quotes, or
++ *    err_cmd, err_val, err_option, err_inactive, err_internal1 or err_internal2. One command a
++ *    connection, as the integrations that use it do (ucr-integration-sonyADCP, GPL-3.0: protocol
++ *    facts only).
++ *  - Sony, SDCP, TCP 53484 (VPL-VW). A request is 0x02 0x0A, the community (four letters, "SONY"
++ *    unless the user changed it on the projector: it is the password field here), 0x01 to read or
++ *    0x00 to set, the item (two bytes), the length of the data and the data (two bytes); the answer
++ *    has the same header, 0x01 (done) or 0x00 (not done, and an error code as its data). Items:
++ *    0x0102 power status (0 standby, 1 and 2 starting, 3 on, 4 to 8 cooling or saving), 0x0066
++ *    picture position (0 to 4: 1.85:1, 2.35:1, custom 1 to 3), 0x0002 calibration preset (the
++ *    picture mode). From the protocol manual of the VPL-VW320 and VW520 as the pySDCP library (MIT)
++ *    and openHAB's binding (EPL-2.0) give it: protocol facts only.
++ *  - Epson, ESC/VP.net, TCP 3629. Hades sends a header of 16 bytes: "ESC/VP.net", 0x10 (version
++ *    1.0), 0x03 (connect), two reserved bytes, 0x00 (a request) and the count of the headers after
++ *    it: none, or one of 18 bytes with the password (0x01, 0x01 and the password padded with NUL to
++ *    16 bytes). The projector answers with the same header and a status: 0x20 done, 0x41 a password
++ *    is needed, 0x43 the password is wrong, 0x53 busy. Then ESC/VP21 commands end in "\r", and the
++ *    projector's answer ends in ":": "PWR?" (00 or 04 standby, 01 on, 02 warming, 03 cooling, 05
++ *    abnormal standby), "POPLP 01" (load lens memory 1, up to "0A"), "CMODE 15" (colour mode, two
++ *    hexadecimal digits); "ERR" is a command refused. From the epson-projector library (MIT): protocol
++ *    facts only.
++ *
++ * Every byte sent and received is said through the log callback, in printable form (bytes outside
++ * ASCII as \xNN), except a password and what is made of it, which are said as "(password)".
++ */
++
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace PROJECTOR
++{
++
++//! The protocol of the projector (the value of the setting videoscreen.hadesprojector)
++enum class Brand
++{
++  NONE = 0,
++  JVC = 1,
++  SONY_ADCP = 2,
++  SONY_SDCP = 3,
++  EPSON = 4,
++};
++Brand BrandOf(int value);
++const char* BrandName(Brand brand);
++uint16_t DefaultPort(Brand brand);
++
++enum class Power
++{
++  UNKNOWN,
++  ON,
++  STANDBY,
++  WARMING,
++  COOLING,
++  ERROR,
++};
++const char* PowerName(Power power);
++
++enum class Failure
++{
++  NONE,
++  ADDRESS, //!< not an IP address
++  UNREACHABLE, //!< no connection (refused, timed out, no route)
++  BUSY, //!< the projector serves another connection
++  PASSWORD_NEEDED, //!< it asks for a password and none is set
++  PASSWORD_REFUSED, //!< the password set is not its own
++  NO_ANSWER, //!< connected, and it did not answer in time
++  REJECTED, //!< it answered that it does not take the command
++  PROTOCOL, //!< it answered something that is not this protocol
++  NOT_AVAILABLE, //!< the protocol has no such command, or the projector no such memory or mode
++  STOPPED, //!< Kodi is stopping
++};
++const char* FailureName(Failure failure);
++
++struct Result
++{
++  Failure failure = Failure::NONE;
++  std::string detail;
++  bool Ok() const { return failure == Failure::NONE; }
++};
++
++//! A picture mode of a protocol: its code and the name the projector shows for it
++struct ModeName
++{
++  int code;
++  const char* name;
++};
++//! The picture modes Hades offers for a protocol (JVC: of all its series; a model takes those it has)
++const std::vector<ModeName>& ModesOf(Brand brand);
++const char* ModeNameOf(Brand brand, int code);
++//! How many lens memories the protocol can select (1 to that number)
++int MemoriesOf(Brand brand);
++//! The name the projector gives a lens memory where it has one of its own ("2.35:1"), or ""
++const char* MemoryOwnName(Brand brand, int memory);
++
++//! An address as the user wrote it: an IPv4 or IPv6 literal (no name: nothing is looked up), and
++//! whether it is of a home network (RFC 1918, link-local, IPv6 unique local or link-local)
++struct Address
++{
++  bool valid = false;
++  bool home = false;
++};
++Address ReadAddress(const std::string& text);
++
++using Log = std::function<void(const std::string& line)>;
++using Sha256Hex = std::function<std::string(const std::string& data)>;
++
++struct Timeouts
++{
++  int connectMs = 3000;
++  int answerMs = 5000;
++  int modeMs = 10000;
++  int lensMs = 60000;
++  //! the least time between two commands (a projector takes the next one only after the last)
++  int gapMs = 1000;
++};
++
++/*!
++ * \brief One talk with the projector: Open(), then commands, then Close() (or the destructor). Each
++ *        call blocks for at most its timeout, and returns at once when *stop becomes true. Not thread
++ *        safe.
++ */
++class CSession
++{
++public:
++  CSession(Brand brand,
++           std::string address,
++           uint16_t port,
++           std::string password,
++           Sha256Hex sha256,
++           Log log,
++           const std::atomic<bool>* stop,
++           Timeouts timeouts = {});
++  ~CSession();
++  CSession(const CSession&) = delete;
++  CSession& operator=(const CSession&) = delete;
++
++  //! connected and let in (for the protocols of one command a connection, that it lets in)
++  Result Open();
++  Result GetPower(Power& power);
++  //! the model, where the protocol says it (JVC, Sony ADCP); NOT_AVAILABLE elsewhere
++  Result GetModel(std::string& model);
++  //! the lens memory (1 to MemoriesOf())
++  Result SetLensMemory(int memory);
++  //! the picture mode (a code of ModesOf())
++  Result SetPictureMode(int code);
++  void Close();
++
++  //! JVC: the hashed form of the password was the one let in (known for the next session)
++  bool UsedHashedPassword() const { return m_hashed; }
++  void PreferHashedPassword(bool hashed) { m_preferHashed = hashed; }
++
++private:
++  // the connection
++  Result Connect();
++  void Disconnect();
++  Result Send(const std::string& bytes, const std::string& said);
++  //! what has come, added to the buffer (at least a byte), or the failure by endMs
++  Result Fill(int64_t endMs);
++  //! exactly n bytes, or up to and including one of the bytes of `until` (at most max bytes)
++  Result ReadExact(size_t n, int timeoutMs, std::string& out);
++  Result ReadUntil(const std::string& until, size_t max, int timeoutMs, std::string& out);
++  Result Wait(short events, int timeoutMs);
++  void Gap();
++  void Say(const std::string& line) const;
++
++  // the protocols
++  Result OpenJvc();
++  Result JvcOperation(const std::string& code, const std::string& value, int timeoutMs);
++  Result JvcReference(const std::string& code, std::string& value);
++  Result AdcpCommand(const std::string& command, int timeoutMs, std::string& answer);
++  Result SdcpRequest(bool set, uint16_t item, uint16_t data, int timeoutMs, uint16_t& answer);
++  Result OpenEpson();
++  Result EpsonCommand(const std::string& command, int timeoutMs, std::string& answer);
++
++  Brand m_brand;
++  std::string m_address;
++  uint16_t m_port;
++  std::string m_password;
++  Sha256Hex m_sha256;
++  Log m_log;
++  const std::atomic<bool>* m_stop;
++  Timeouts m_timeouts;
++  int m_fd = -1;
++  std::string m_buffer;
++  bool m_open = false;
++  bool m_hashed = false;
++  bool m_preferHashed = false;
++  int64_t m_nextSendMs = 0;
++};
++
++//! bytes as they are said in the log: printable ASCII as it is, the rest as \xNN
++std::string Printable(const std::string& bytes);
++
++} // namespace PROJECTOR
+diff --git a/xbmc/network/ProjectorPolicy.h b/xbmc/network/ProjectorPolicy.h
+new file mode 100644
+index 0000000..b60092b
+--- /dev/null
++++ b/xbmc/network/ProjectorPolicy.h
+@@ -0,0 +1,297 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++/*!
++ * \file
++ * \brief Hades: network control of a home-cinema projector (ProjectorControl.h): what to ask of it.
++ *        Nothing here uses Kodi: a host test runs it (tools/regress, kodi-host, stage projector).
++ *
++ * The lens memory by the shape of the picture (constant image height, CLensFollow). The shape is
++ * that of the active picture as Hades already knows it, with no detector of its own: the bar under
++ * the picture that subtitles in the black bars use (SubtitleBars.h: the active area of a Dolby Vision
++ * video, level 5, or else its pictures measured), taken as a bar of the same height above it, on the
++ * shape of the frame as Kodi shows it (its pixel ratio included). A shape is "known" where it comes
++ * from such a bar, or from a frame that is not 16:9 (a 2.39:1 encode without bars); a 16:9 frame
++ * with no bar seen yet is not (a film may open dark, with no edge of its picture to measure).
++ *  - Each shape falls in one of up to three classes, by the user's thresholds: narrower pictures,
++ *    wide pictures from wideFrom, the widest from widestFrom (where a third memory is set). A shape
++ *    must fall BAND under a threshold to leave the class above it: a picture measured at the edge of
++ *    a threshold does not move the lens back and forth.
++ *  - A class other than the current one is taken once every shape of it has lasted: a known shape
++ *    START_SECONDS until the first known shape of a video has been taken (so that the lens is ready as
++ *    the film starts), otherwise the user's holdSeconds (IMAX scenes and the bars of a dark scene do
++ *    not move the lens for less; nor does the frame of a remux whose bars are not measured yet, so that
++ *    the lens moves once at its start, not twice). A shape of the current class ends a wait.
++ *  - The end of a video is taken after STOP_SECONDS without one (the next of a playlist comes in
++ *    between); then, if the user wants it, the memory of narrower pictures (the interface is 16:9).
++ *
++ * The picture mode by the kind of signal (CSignalFollow): 3D where the output is 3D; Dolby Vision
++ * where the output is native Dolby Vision, or a Dolby Vision video sent as HDR10 (a projector without
++ * Dolby Vision: the user may want a mode without the projector's own tone mapping for the picture
++ * that Hades mapped to it); HDR10 (and HDR10+) and HLG by the output; SDR otherwise, the interface
++ * included. A kind is taken once it has lasted SIGNAL_SECONDS (the projector locks onto the new
++ * signal first, and its own choice of mode for it comes before Hades' one), and each kind once: a
++ * mode the user then chooses on the projector stays until the signal changes.
++ */
++
++#include <string>
++
++namespace PROJECTOR
++{
++
++//! The user's settings of the lens memory
++struct LensSettings
++{
++  int narrowMemory = 1;
++  double wideFrom = 2.10;
++  int wideMemory = 2;
++  //! 0: no third memory
++  int widestMemory = 0;
++  double widestFrom = 2.50;
++  double holdSeconds = 10.0;
++  bool backAtStop = true;
++};
++
++constexpr double BAND = 0.03;
++constexpr double START_SECONDS = 2.0;
++constexpr double STOP_SECONDS = 3.0;
++constexpr double SIGNAL_SECONDS = 3.0;
++//! a frame within this of 16:9 says nothing of the shape of its picture
++constexpr double SIXTEEN_NINE_TOLERANCE = 0.05;
++
++//! The class of a shape (0 narrower, 1 wide, 2 widest), current the class now (-1: none)
++inline int ClassOf(double ratio, const LensSettings& s, int current)
++{
++  const bool third = s.widestMemory > 0 && s.widestFrom > s.wideFrom;
++  const auto raw = [&](double r)
++  {
++    return third && r >= s.widestFrom ? 2 : r >= s.wideFrom ? 1 : 0;
++  };
++  int c = raw(ratio);
++  // (down from the current class only BAND under its threshold)
++  if (current >= 0 && c < current && raw(ratio + BAND) >= current)
++    c = current;
++  return c;
++}
++
++inline int MemoryOfClass(int c, const LensSettings& s)
++{
++  return c == 2 ? s.widestMemory : c == 1 ? s.wideMemory : s.narrowMemory;
++}
++
++//! The shape of the picture presented (ProjectorFeed.h)
++struct Shape
++{
++  bool valid = false;
++  //! width to a height of 1
++  double ratio = 0.0;
++  //! from a bar, or from a frame that is not 16:9 (see the top of this file)
++  bool known = false;
++  //! the video it is of (another video: another count)
++  unsigned int video = 0;
++};
++
++//! What the lens should be at
++struct LensWanted
++{
++  //! 0: nothing yet
++  int memory = 0;
++  int shapeClass = -1;
++  double ratio = 0.0;
++  //! why it was taken (a fixed text, for the log)
++  const char* why = nullptr;
++  //! it changed with this call
++  bool changed = false;
++};
++
++constexpr const char* WHY_START = "at the start of a video";
++constexpr const char* WHY_SHAPE = "the shape of the picture changed and lasted";
++constexpr const char* WHY_STOP = "the video ended";
++
++class CLensFollow
++{
++public:
++  LensWanted Update(double now, bool playing, const Shape& shape, const LensSettings& s)
++  {
++    m_now.changed = false;
++    if (!playing)
++    {
++      if (m_playing)
++      {
++        m_playing = false;
++        m_stopSince = now;
++        m_stopTaken = false;
++      }
++      if (!m_stopTaken && now - m_stopSince >= STOP_SECONDS)
++      {
++        m_stopTaken = true;
++        m_knownTaken = false;
++        m_candidate = -1;
++        if (s.backAtStop && (m_now.shapeClass != 0 || m_now.memory != s.narrowMemory))
++          Take(0, s.narrowMemory, 0.0, WHY_STOP);
++      }
++      return m_now;
++    }
++    if (!m_playing)
++    {
++      m_playing = true;
++      m_stopTaken = true;
++    }
++    if (!shape.valid || shape.ratio <= 0.0)
++      return m_now;
++    if (shape.video != m_video)
++    {
++      m_video = shape.video;
++      m_knownTaken = false;
++      m_candidate = -1;
++    }
++    const int c = ClassOf(shape.ratio, s, m_now.shapeClass);
++    if (c == m_now.shapeClass && MemoryOfClass(c, s) == m_now.memory)
++    {
++      m_candidate = -1;
++      if (shape.known)
++        m_knownTaken = true;
++      return m_now;
++    }
++    if (c != m_candidate)
++    {
++      m_candidate = c;
++      m_since = now;
++    }
++    // (a shape only of the frame waits the hold even at the start: the bars of a film that opens with
++    // a bright scene are measured within seconds, and the lens then moves once, not twice)
++    const double hold = shape.known && !m_knownTaken ? START_SECONDS : s.holdSeconds;
++    if (now - m_since >= hold)
++    {
++      Take(c, MemoryOfClass(c, s), shape.ratio, m_knownTaken ? WHY_SHAPE : WHY_START);
++      m_candidate = -1;
++      if (shape.known)
++        m_knownTaken = true;
++    }
++    return m_now;
++  }
++
++  const LensWanted& Now() const { return m_now; }
++  void Reset() { *this = CLensFollow(); }
++
++private:
++  void Take(int c, int memory, double ratio, const char* why)
++  {
++    m_now.shapeClass = c;
++    m_now.memory = memory;
++    m_now.ratio = ratio;
++    m_now.why = why;
++    m_now.changed = true;
++  }
++
++  LensWanted m_now;
++  bool m_playing = false;
++  double m_stopSince = 0.0;
++  bool m_stopTaken = true;
++  bool m_knownTaken = false;
++  unsigned int m_video = 0;
++  int m_candidate = -1;
++  double m_since = 0.0;
++};
++
++//! The kinds of signal that have a picture mode of their own
++enum class Signal
++{
++  NONE,
++  SDR,
++  HDR10,
++  HLG,
++  DOLBY_VISION,
++  THREE_D,
++};
++
++inline const char* SignalName(Signal s)
++{
++  switch (s)
++  {
++    case Signal::SDR:
++      return "SDR";
++    case Signal::HDR10:
++      return "HDR10";
++    case Signal::HLG:
++      return "HLG";
++    case Signal::DOLBY_VISION:
++      return "Dolby Vision";
++    case Signal::THREE_D:
++      return "3D";
++    case Signal::NONE:
++      break;
++  }
++  return "none";
++}
++
++/*!
++ * \brief The kind of a signal: source and output as the player information names them
++ *        (hades.src.hdrtype: dolbyvision, hdr10, hdr10plus, hlg, sdr; hades.out.hdrtype:
++ *        dolbyvision, hdr10, hdr10plus, hlg, sdr, or "" where the driver does not say), stereo the
++ *        output is 3D (not the 2D of a 3D video)
++ */
++inline Signal SignalOf(const std::string& source, const std::string& output, bool stereo)
++{
++  if (stereo)
++    return Signal::THREE_D;
++  if (output == "dolbyvision")
++    return Signal::DOLBY_VISION;
++  if (output == "hdr10" || output == "hdr10plus")
++    return source == "dolbyvision" ? Signal::DOLBY_VISION : Signal::HDR10;
++  if (output == "hlg")
++    return Signal::HLG;
++  if (output == "sdr")
++    return Signal::SDR;
++  return Signal::NONE;
++}
++
++class CSignalFollow
++{
++public:
++  //! the kind whose mode is to be sent now (once for each change), NONE otherwise
++  Signal Update(double now, Signal signal)
++  {
++    if (signal == Signal::NONE)
++      return Signal::NONE;
++    if (signal != m_seen)
++    {
++      m_seen = signal;
++      m_since = now;
++    }
++    if (m_seen != m_taken && now - m_since >= SIGNAL_SECONDS)
++    {
++      m_taken = m_seen;
++      return m_taken;
++    }
++    return Signal::NONE;
++  }
++  Signal Taken() const { return m_taken; }
++  void Reset() { *this = CSignalFollow(); }
++
++private:
++  Signal m_seen = Signal::NONE;
++  Signal m_taken = Signal::NONE;
++  double m_since = 0.0;
++};
++
++/*!
++ * \brief How long to wait before the next try where the projector did not answer, or was off: 5 s,
++ *        then twice as long each time, up to 5 minutes
++ */
++inline double RetryAfter(int failures)
++{
++  double wait = 5.0;
++  for (int i = 1; i < failures && wait < 300.0; i++)
++    wait *= 2.0;
++  return wait > 300.0 ? 300.0 : wait;
++}
++
++} // namespace PROJECTOR
+-- 
+2.53.0
+

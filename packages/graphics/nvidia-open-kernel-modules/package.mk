@@ -2,9 +2,9 @@
 # Copyright (C) 2026-present Hades
 
 PKG_NAME="nvidia-open-kernel-modules"
-PKG_VERSION="620.70.06"
-PKG_COMMIT="e6a2e01579fbbd1ca2ed43fef2ee2589e9bd8bd9"
-PKG_SHA256="b10b72830aa2c1367f0013d3d31fad3d0865330f37da2ed893f0a726125d4175"
+PKG_VERSION="620.73.04"
+PKG_COMMIT="a4b95f6a2db0bba10ccaccef79190a3c18dcf14a"
+PKG_SHA256="ffe12eaa1f5f316d9af8f0c3995ddc45d2ae598a250df920c9d1b37f116028c4"
 PKG_ARCH="x86_64"
 PKG_LICENSE="MIT OR GPL-2.0-only"
 PKG_SITE="https://github.com/NVIDIA/open-gpu-kernel-modules"

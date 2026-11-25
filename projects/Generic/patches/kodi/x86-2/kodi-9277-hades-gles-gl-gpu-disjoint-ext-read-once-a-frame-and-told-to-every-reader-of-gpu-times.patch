@@ -1,0 +1,347 @@
+From a93ac605daef46eeb1c4c0cb7f8a8b93b43c7b12 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:37:11 +0000
+Subject: [PATCH] [Hades][GLES] GL_GPU_DISJOINT_EXT read once a frame and told
+ to every reader of GPU times
+
+GL_GPU_DISJOINT_EXT says that the GPU lost the time since it was last
+read (a change of its clocks, a reset), so that the results of the
+timer queries in flight are not to be trusted, and reading it clears
+it. Five parts of the render thread time their pictures: Kodi's
+renderer (the step-down of its chroma), HDR10 adapted to the display,
+the passes of the conversion bridge, Dolby Vision rebuilt as HDR10 or
+SDR, and native Dolby Vision with its passes. Each read the state
+itself, so the first of them in a frame took a notice that the others
+never saw, and took the times of a lost period as true.
+
+CGpuDisjoint (GpuDisjoint.h) reads the state in one place of the window
+system, once a frame (the first reader after PresentRender() reads
+it), and counts the disjoint periods; each reader keeps the count it
+last saw and learns of every period since, whatever frame it asks in
+and in whatever order. A reader that has just made its timers takes no
+period of before. Kodi's renderer asks the window system, and reads the
+state itself only where the window system is not GBM's.
+---
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 23 +++++-
+ .../VideoRenderers/LinuxRendererGLES.h        |  3 +
+ xbmc/windowing/gbm/GpuDisjoint.h              | 80 +++++++++++++++++++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 50 ++++++++----
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  | 15 ++++
+ 5 files changed, 151 insertions(+), 20 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/GpuDisjoint.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index f6dedf9..90d998f 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -4133,6 +4133,11 @@ void CLinuxRendererGLES::ChromaTimerMark(bool begin)
+       q.gen(1, &timer.begin);
+       q.gen(1, &timer.end);
+     }
++#ifdef HAVE_DVBRIDGE
++    if (const auto* window = dynamic_cast<const KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++            CServiceBroker::GetWinSystem()))
++      window->GpuDisjointJoin(m_chromaDisjoint);
++#endif
+   }
+   auto& timer = m_chromaTimers[m_chromaTimerIndex];
+   if (!timer.begin || !timer.end)
+@@ -4158,9 +4163,21 @@ void CLinuxRendererGLES::ChromaTimerCollect()
+   const ChromaTimerQueries& q = ChromaQueries();
+   if (!q.Usable() || !m_chromaTimersMade)
+     return;
+-  // (reading the disjoint state clears it; a disjoint period makes the results in flight useless)
+-  GLint disjoint = 0;
+-  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++  // (a disjoint period makes the results in flight useless; the state is read once a frame by the window system for
++  // every reader of GPU times, CGpuDisjoint, so that none takes another's notice; here where the window system is not
++  // GBM's)
++  bool disjoint = false;
++#ifdef HAVE_DVBRIDGE
++  if (auto* window =
++          dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem()))
++    disjoint = window->GpuDisjointLost(m_chromaDisjoint);
++  else
++#endif
++  {
++    GLint state = 0;
++    glGetIntegerv(GL_GPU_DISJOINT_EXT, &state);
++    disjoint = state != 0;
++  }
+   const float fps = CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS();
+   const double periodMs = fps > 0 ? 1000.0 / static_cast<double>(fps) : 0;
+   for (size_t n = 0; n < m_chromaTimers.size(); ++n)
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 66d6384..74dd92b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -18,6 +18,7 @@
+ 
+ #include "BaseRenderer.h"
+ #include "ChromaStepDown.h"
++#include "windowing/gbm/GpuDisjoint.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "cores/VideoSettings.h"
+ #include "FrameBufferObject.h"
+@@ -382,6 +383,8 @@ protected:
+   unsigned int m_chromaTimerIndex{0};
+   bool m_chromaTimersMade{false};
+   unsigned int m_chromaTimed{0}; //!< pictures timed at this level, for the log
++  //! whether the GPU lost its time since these timers last asked (CGpuDisjoint, of the window system)
++  KODI::WINDOWING::GBM::CGpuDisjoint::Reader m_chromaDisjoint;
+   double m_chromaSumMs{0};
+   virtual void AfterRenderHook(int idx) {}
+ 
+diff --git a/xbmc/windowing/gbm/GpuDisjoint.h b/xbmc/windowing/gbm/GpuDisjoint.h
+new file mode 100644
+index 0000000..96e9ab9
+--- /dev/null
++++ b/xbmc/windowing/gbm/GpuDisjoint.h
+@@ -0,0 +1,80 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief Hades: GL_GPU_DISJOINT_EXT of GL_EXT_disjoint_timer_query, read once a frame and told to every reader of
++ *        GPU times
++ *
++ * The state says that the GPU lost the time since it was last read (a change of its clocks, a reset), so that the
++ * results of the timer queries in flight are not to be trusted; and reading it clears it. Several parts of the render
++ * thread time their pictures: Kodi's renderer (the step-down of its chroma, CLinuxRendererGLES), HDR10 adapted to the
++ * display, the passes of the conversion bridge, Dolby Vision rebuilt as HDR10 or SDR, native Dolby Vision. Each read
++ * the state itself, so that the first of them in a frame took a notice that the others then never saw, and took the
++ * results of a lost period as true (one sample in 48 does not lower a level, but a run of them can).
++ *
++ * Here the state is read by the first reader of a frame alone (read: the call that reads and clears it), and every
++ * disjoint period it finds is counted; each reader keeps the count it last saw, and learns of every period since then,
++ * whatever frame it reads in and in whatever order. Only the render thread calls it. Pure logic: a host test runs it
++ * (tools/regress of LibreELEC, kodi-host: gpu_disjoint_test.cpp).
++ */
++class CGpuDisjoint
++{
++public:
++  //! What a reader has seen
++  struct Reader
++  {
++    uint64_t seen = 0;
++  };
++
++  //! A new frame: the state is read again by the first reader in it (PresentRender())
++  void Frame() { ++m_frame; }
++
++  //! A reader that has just made its timers: nothing of it is in flight, so no period before now is its own
++  void Join(Reader& reader) const { reader.seen = m_periods; }
++
++  /*!
++   * \brief Whether the GPU lost its time since this reader last asked
++   * \param read the call that reads the state of the GL and clears it (true: disjoint); made at most once a frame
++   */
++  template<typename Read>
++  bool Lost(Reader& reader, Read&& read)
++  {
++    if (m_readFrame != m_frame)
++    {
++      m_readFrame = m_frame;
++      if (read())
++        ++m_periods;
++    }
++    const bool lost = reader.seen != m_periods;
++    reader.seen = m_periods;
++    return lost;
++  }
++
++  //! Disjoint periods found since the start (for the log and the tests)
++  uint64_t Periods() const { return m_periods; }
++
++private:
++  uint64_t m_frame = 1;
++  uint64_t m_readFrame = 0;
++  uint64_t m_periods = 0;
++};
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 923f24a..1b0a892 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -573,6 +573,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ {
+   if (!m_bRenderCreated)
+     return;
++  // Hades: GL_GPU_DISJOINT_EXT is read again by the first reader of GPU times after this (CGpuDisjoint)
++  m_gpuDisjoint.Frame();
+   // Hades: a frame whose GUI pass was left out (CDVGuiReuse) where the picture and the GUI over it
+   // were drawn into the window's buffer (the HDR10/HLG composite: EndGuiComposite()) is a whole
+   // frame, swapped as one whose GUI pass drew. Kodi's Render() says rendered of its GUI pass
+@@ -4192,6 +4194,7 @@ void CWinSystemGbmGLESContext::Hdr10AdaptTimerMark(bool begin)
+         m_glGenQueriesEXT(1, &timer.begin);
+         m_glGenQueriesEXT(1, &timer.end);
+       }
++    m_gpuDisjoint.Join(m_hdr10AdaptDisjoint);
+   }
+   auto& timer = m_hdr10AdaptTimers[m_hdr10AdaptTimerIndex];
+   if (!timer.begin || !timer.end)
+@@ -4216,12 +4219,10 @@ void CWinSystemGbmGLESContext::Hdr10AdaptTimerCollect(Hdr10AdaptStats& into)
+ {
+   if (!m_glGetQueryObjectuivEXT || !m_hdr10AdaptTimers[0].begin)
+     return;
+-  // (reading the disjoint state clears it; a disjoint period makes the results in flight useless)
+-  GLint disjoint = 0;
+-  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++  // (a disjoint period makes the results in flight useless: CGpuDisjoint, which every reader is told by)
++  const bool disjoint = GpuDisjointLost(m_hdr10AdaptDisjoint);
+   // Hades: ... and those of the passes of the bridge (libplacebo leaves this state to Kodi)
+-  if (disjoint && m_dvConvertBridge)
+-    m_dvConvertBridge->PassTimesLost();
++  ConversionTimesDisjoint();
+   for (size_t n = 0; n < m_hdr10AdaptTimers.size(); ++n)
+   {
+     auto& timer = m_hdr10AdaptTimers[(m_hdr10AdaptTimerIndex + n) % m_hdr10AdaptTimers.size()];
+@@ -5972,13 +5973,22 @@ void CWinSystemGbmGLESContext::ConversionTimesDisjoint()
+ {
+   if (!m_dvConvertBridge || !m_dvConvertBridge->PassSampleEvery())
+     return;
+-  // (reading it clears it)
+-  GLint disjoint = 0;
+-  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+-  if (disjoint)
++  // (a reader of its own: CGpuDisjoint)
++  if (GpuDisjointLost(m_convPassesDisjoint))
+     m_dvConvertBridge->PassTimesLost();
+ }
+ 
++bool CWinSystemGbmGLESContext::GpuDisjointLost(CGpuDisjoint::Reader& reader)
++{
++  return m_gpuDisjoint.Lost(reader,
++                            []
++                            {
++                              GLint disjoint = 0;
++                              glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++                              return disjoint != 0;
++                            });
++}
++
+ void CWinSystemGbmGLESContext::UpscaleStatsLog(bool end)
+ {
+   const auto now = std::chrono::steady_clock::now();
+@@ -10229,11 +10239,15 @@ void CWinSystemGbmGLESContext::DVGpuTimerMark(bool begin)
+     const bool available = m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
+                            m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT;
+     if (available)
++    {
+       for (auto& timer : m_dvGpuTimers)
+       {
+         m_glGenQueriesEXT(1, &timer.begin);
+         m_glGenQueriesEXT(1, &timer.end);
+       }
++      m_gpuDisjoint.Join(m_dvDisjoint);
++      m_gpuDisjoint.Join(m_dvPassesDisjoint);
++    }
+     if (!m_dvGpuTimerLogged)
+     {
+       m_dvGpuTimerLogged = true;
+@@ -10606,11 +10620,14 @@ void CWinSystemGbmGLESContext::ConvTimerMark(bool begin, const CDVConvertStep::F
+     }
+     if (m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
+         m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT)
++    {
+       for (auto& timer : m_convTimers)
+       {
+         m_glGenQueriesEXT(1, &timer.begin);
+         m_glGenQueriesEXT(1, &timer.end);
+       }
++      m_gpuDisjoint.Join(m_convDisjoint);
++    }
+     else
+       CLog::Log(LOGINFO,
+                 "DVBridge: the pictures of Dolby Vision rebuilt for output as HDR10 or SDR are not "
+@@ -10643,9 +10660,8 @@ void CWinSystemGbmGLESContext::ConvTimerCollect()
+ {
+   if (!m_glGetQueryObjectuivEXT || !m_convTimers[0].begin)
+     return;
+-  // (reading the disjoint state clears it; a disjoint period makes the results in flight useless)
+-  GLint disjoint = 0;
+-  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++  // (a disjoint period makes the results in flight useless: CGpuDisjoint)
++  const bool disjoint = GpuDisjointLost(m_convDisjoint);
+   const double periodMs = DVRefreshPeriodMs();
+   for (size_t n = 0; n < m_convTimers.size(); ++n)
+   {
+@@ -11045,11 +11061,11 @@ void CWinSystemGbmGLESContext::DVGpuTimerCollect()
+ {
+   if (!m_glGetQueryObjectuivEXT || !m_dvGpuTimers[0].begin)
+     return;
+-  // reading the disjoint state also clears it; a disjoint period invalidates pending results
+-  GLint disjoint = 0;
+-  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
+-  // Hades: ... and so are those of the passes (libplacebo leaves this state to Kodi: libplacebo-9944)
+-  if (disjoint && m_dvBridge)
++  // a disjoint period invalidates pending results (CGpuDisjoint: read once a frame, told to every reader)
++  const bool disjoint = GpuDisjointLost(m_dvDisjoint);
++  // Hades: ... and so are those of the passes (libplacebo leaves this state to Kodi: libplacebo-9944), whose reader is
++  // their own
++  if (GpuDisjointLost(m_dvPassesDisjoint) && m_dvBridge)
+     m_dvBridge->PassTimesLost();
+   // In the order of the frames: the timer that the next frame takes is that of the oldest one.
+   for (size_t n = 0; n < m_dvGpuTimers.size(); ++n)
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 73cc7ac..38a1553 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -47,6 +47,7 @@
+ #include "DVRepeatKeep.h"
+ #include "DVStartSignal.h"
+ #include "DVStepDown.h"
++#include "GpuDisjoint.h"
+ #include "DVVerify.h"
+ #include "HDR10Adapt.h"
+ #include "MeasuredLatency.h"
+@@ -385,6 +386,11 @@ public:
+    *        BT.709 for any other SDR)
+    */
+   const dvbridge_lut* LutFor(DISPLAY_LUT::Output output, DISPLAY_LUT::Gamut sdrOutput = DISPLAY_LUT::GAMUT_BT709);
++  //! Hades: whether the GPU lost its time (GL_GPU_DISJOINT_EXT) since this reader of GPU times last asked: the state
++  //! is read once a frame and told to every reader (CGpuDisjoint), Kodi's renderer among them; render thread
++  bool GpuDisjointLost(CGpuDisjoint::Reader& reader);
++  //! Hades: ... a reader that has just made its timers
++  void GpuDisjointJoin(CGpuDisjoint::Reader& reader) const { m_gpuDisjoint.Join(reader); }
+   //! Hades: ... after the picture is drawn (drawn: a picture went out): whether the renderer applied the LUT, and whether
+   //! it failed on this GPU; said in kodi.log, and on the screen where a LUT that is chosen cannot be applied (a file
+   //! that cannot be read, a LUT made for another kind of picture, a GPU that cannot draw it), once each
+@@ -1758,6 +1764,15 @@ private:
+   PFNGLGETQUERYOBJECTUI64VEXTPROC m_glGetQueryObjectui64vEXT = nullptr;
+   void DVGpuTimerMark(bool begin);
+   void DVGpuTimerCollect();
++  //! Hades: GL_GPU_DISJOINT_EXT, read once a frame (PresentRender()), and the readers of GPU times of the window
++  //! system: native Dolby Vision and its passes, Dolby Vision rebuilt, HDR10 adapted, the passes of the conversion
++  //! bridge
++  CGpuDisjoint m_gpuDisjoint;
++  CGpuDisjoint::Reader m_dvDisjoint;
++  CGpuDisjoint::Reader m_dvPassesDisjoint;
++  CGpuDisjoint::Reader m_convDisjoint;
++  CGpuDisjoint::Reader m_hdr10AdaptDisjoint;
++  CGpuDisjoint::Reader m_convPassesDisjoint;
+   void DVGpuTimerReset();
+   //! The last complete 10-s window of DVStats, for the player information.
+   struct DVWindow
+-- 
+2.53.0
+

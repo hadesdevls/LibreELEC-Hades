@@ -1,0 +1,657 @@
+From 26421c8c510cc9e0b96ffc4684f15a95fe895d2e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:01:42 +0000
+Subject: [PATCH] [Hades][VideoPlayer] 3D: the depth of the nearest thing
+ measured from two pictures, and of subtitles planned from it
+
+A 3D Blu-ray gives its subtitles a depth for each frame. MV-HEVC (Apple's
+spatial video, 3D films for the Vision Pro), side-by-side and
+top-and-bottom files, and MVC streams without plane offsets give none, so
+Kodi draws their subtitles at a fixed depth, the screen by default. A
+thing nearer than that depth, behind the subtitle, is then hidden by
+something that the eyes see behind it: a conflict of depth cues that
+strains the eyes.
+
+StereoDepth.h/.cpp, which know nothing of Kodi, measure and plan:
+
+- MeasureNearest(): blocks of 8 x 8 of the left eye's picture (a small
+  copy, 480 x 270) with texture are looked for along the same rows of
+  the right eye's, by the sum of absolute differences less the block
+  means (an eye brighter than the other does not move the match), to a
+  fraction of a pixel by a parabola through the costs, from 32 pixels in
+  front of the screen to 16 behind it. A block whose best match is not
+  clearly better than any other two or more away, or leaves too much
+  difference, is left out. The result is not the nearest block but the
+  one with 1 % of the matched blocks at or nearer than it, and never
+  fewer than 4: a block matched wrong, a bright pixel, noise do not move
+  it, a thing of a few blocks does.
+- SignatureOf()/IsCut(): a cut, by the mean light of 16 x 9 cells.
+- CPlanner: a subtitle appears in front of the nearest thing measured in
+  its area in the last second (two measures in a row agreeing), by a
+  margin of 0.25 % of the width, never nearer than 2 % (a comfort
+  limit) and never behind the screen. While it is shown it only comes
+  forward, at 4 % of the width a second at most, where two measures in
+  a row put something nearer: it never jumps and never goes back. The
+  next subtitle within half a second keeps the depth of the one before
+  unless its own is 0.15 % or more away. A cut keeps what was measured
+  before it until two measures of the new shot were made. The interface
+  over the video gets, as it opens, the depth in front of the nearest
+  thing of the whole picture, and keeps it while open, coming forward
+  only to stay in front of the subtitles.
+
+Measured on a Ryzen 9 7950X3D at -O2 for x86-64: 2.4 ms for one measure
+(the subtitles' area and the whole picture), on a thread of its own in
+the next commit.
+---
+ .../VideoPlayer/VideoRenderers/CMakeLists.txt |   6 +-
+ .../VideoRenderers/StereoDepth.cpp            | 358 ++++++++++++++++++
+ .../VideoPlayer/VideoRenderers/StereoDepth.h  | 208 ++++++++++
+ 3 files changed, 570 insertions(+), 2 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index 2f2337d..021edcb 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -6,7 +6,8 @@ set(SOURCES ActiveAreaZoom.cpp
+             RenderFactory.cpp
+             RenderFlags.cpp
+             RenderManager.cpp
+-            DebugRenderer.cpp)
++            DebugRenderer.cpp
++            StereoDepth.cpp)
+ 
+ set(HEADERS ActiveAreaZoom.h
+             BaseRenderer.h
+@@ -24,7 +25,8 @@ set(HEADERS ActiveAreaZoom.h
+             VsyncPhase.h
+             RenderInfo.h
+             RenderManager.h
+-            DebugRenderer.h)
++            DebugRenderer.h
++            StereoDepth.h)
+ 
+ if(CORE_SYSTEM_NAME STREQUAL windows OR CORE_SYSTEM_NAME STREQUAL windowsstore)
+   list(APPEND SOURCES WinRenderer.cpp
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp
+new file mode 100644
+index 0000000..613e35f
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp
+@@ -0,0 +1,358 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "StereoDepth.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <limits>
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++namespace
++{
++int ToPixel(float share, int size)
++{
++  const int pixel = static_cast<int>(std::lround(share * static_cast<float>(size)));
++  return std::clamp(pixel, 0, size);
++}
++} // namespace
++
++Measure MeasureNearest(const Plane& left,
++                       const Plane& right,
++                       const Area& area,
++                       const MatchParams& p)
++{
++  Measure result;
++  const int width = left.width;
++  const int height = left.height;
++  const int b = p.block;
++  if (!left.data || !right.data || right.width != width || right.height != height || b < 2 ||
++      p.step < 1 || width < b || height < b)
++    return result;
++
++  const int x0 = ToPixel(std::min(area.x1, area.x2), width);
++  const int x1 = ToPixel(std::max(area.x1, area.x2), width);
++  const int y0 = ToPixel(std::min(area.y1, area.y2), height);
++  const int y1 = ToPixel(std::max(area.y1, area.y2), height);
++  if (x1 - x0 < b || y1 - y0 < b)
++    return result;
++
++  // the sums of the rows of the right picture, to have the sum of any of its blocks in b additions
++  const int rows = y1 - y0;
++  std::vector<int> prefix(static_cast<size_t>(rows) * (width + 1));
++  for (int y = 0; y < rows; ++y)
++  {
++    const uint8_t* row = right.data + static_cast<size_t>(y0 + y) * right.stride;
++    int* sums = prefix.data() + static_cast<size_t>(y) * (width + 1);
++    sums[0] = 0;
++    for (int x = 0; x < width; ++x)
++      sums[x + 1] = sums[x] + row[x];
++  }
++
++  const int area2 = b * b;
++  // each difference below is scaled by the number of pixels of a block, so that the means
++  // taken off stay whole numbers
++  const int64_t residualMax = static_cast<int64_t>(p.residual) * area2 * area2;
++  const int textureMin = p.texture * b * (b - 1);
++
++  std::vector<int64_t> costs(static_cast<size_t>(p.nearest + p.farthest + 1));
++  std::vector<int> scaledLeft(static_cast<size_t>(area2));
++  std::vector<float> found;
++
++  for (int by = y0; by + b <= y1; by += p.step)
++  {
++    for (int bx = x0; bx + b <= x1; bx += p.step)
++    {
++      int texture = 0;
++      int sumLeft = 0;
++      for (int y = 0; y < b; ++y)
++      {
++        const uint8_t* row = left.data + static_cast<size_t>(by + y) * left.stride + bx;
++        for (int x = 0; x < b; ++x)
++        {
++          sumLeft += row[x];
++          if (x > 0)
++            texture += std::abs(row[x] - row[x - 1]);
++        }
++      }
++      if (texture < textureMin)
++        continue;
++      ++result.blocks;
++
++      for (int y = 0; y < b; ++y)
++      {
++        const uint8_t* row = left.data + static_cast<size_t>(by + y) * left.stride + bx;
++        for (int x = 0; x < b; ++x)
++          scaledLeft[static_cast<size_t>(y * b + x)] = row[x] * area2 - sumLeft;
++      }
++
++      // the right picture's block must stay in the picture
++      const int dMin = std::max(-p.nearest, -bx);
++      const int dMax = std::min(p.farthest, width - b - bx);
++      if (dMax - dMin < 2)
++        continue;
++
++      int bestD = dMin;
++      int64_t best = std::numeric_limits<int64_t>::max();
++      for (int d = dMin; d <= dMax; ++d)
++      {
++        int sumRight = 0;
++        for (int y = 0; y < b; ++y)
++        {
++          const int* sums = prefix.data() + static_cast<size_t>(by - y0 + y) * (width + 1);
++          sumRight += sums[bx + d + b] - sums[bx + d];
++        }
++        int64_t cost = 0;
++        for (int y = 0; y < b; ++y)
++        {
++          const uint8_t* row = right.data + static_cast<size_t>(by + y) * right.stride + bx + d;
++          const int* l = scaledLeft.data() + static_cast<size_t>(y * b);
++          for (int x = 0; x < b; ++x)
++            cost += std::abs(l[x] - (row[x] * area2 - sumRight));
++        }
++        costs[static_cast<size_t>(d + p.nearest)] = cost;
++        if (cost < best)
++        {
++          best = cost;
++          bestD = d;
++        }
++      }
++
++      int64_t second = std::numeric_limits<int64_t>::max();
++      for (int d = dMin; d <= dMax; ++d)
++        if (std::abs(d - bestD) >= 2)
++          second = std::min(second, costs[static_cast<size_t>(d + p.nearest)]);
++
++      // (strictly better: a texture that repeats matches as well, with no difference, a period
++      // further, and is no measure)
++      if (best > residualMax || second == std::numeric_limits<int64_t>::max() ||
++          !(static_cast<double>(best) < p.uniqueness * static_cast<double>(second)))
++        continue;
++
++      // a best match at the edge of the picture may be the edge of what could be looked at, not
++      // of the thing: left out. At the edge of the search it is a thing at least that near (or
++      // that far), which is kept as such.
++      if ((bestD == dMin && dMin != -p.nearest) || (bestD == dMax && dMax != p.farthest))
++        continue;
++
++      float d = static_cast<float>(bestD);
++      if (bestD > dMin && bestD < dMax)
++      {
++        const double before =
++            static_cast<double>(costs[static_cast<size_t>(bestD - 1 + p.nearest)]);
++        const double at = static_cast<double>(best);
++        const double after = static_cast<double>(costs[static_cast<size_t>(bestD + 1 + p.nearest)]);
++        const double curve = before - 2.0 * at + after;
++        if (curve > 0.0)
++          d += static_cast<float>(std::clamp((before - after) / (2.0 * curve), -0.5, 0.5));
++      }
++      found.push_back(d);
++    }
++  }
++
++  result.matched = static_cast<int>(found.size());
++  if (result.matched < p.support || result.matched == 0)
++    return result;
++
++  // nearest first: the most crossed disparity is the most negative
++  const int k =
++      std::min(result.matched,
++               std::max(p.support,
++                        static_cast<int>(std::ceil(p.share * static_cast<float>(result.matched)))));
++  std::nth_element(found.begin(), found.begin() + (k - 1), found.end());
++  result.nearest = -found[static_cast<size_t>(k - 1)] / static_cast<float>(width);
++  return result;
++}
++
++Signature SignatureOf(const Plane& picture)
++{
++  Signature s;
++  if (!picture.data || picture.width < 16 || picture.height < 9)
++    return s;
++  for (int cy = 0; cy < 9; ++cy)
++  {
++    const int ya = cy * picture.height / 9;
++    const int yb = (cy + 1) * picture.height / 9;
++    for (int cx = 0; cx < 16; ++cx)
++    {
++      const int xa = cx * picture.width / 16;
++      const int xb = (cx + 1) * picture.width / 16;
++      int64_t sum = 0;
++      for (int y = ya; y < yb; ++y)
++      {
++        const uint8_t* row = picture.data + static_cast<size_t>(y) * picture.stride;
++        for (int x = xa; x < xb; ++x)
++          sum += row[x];
++      }
++      const int64_t count = static_cast<int64_t>(yb - ya) * (xb - xa);
++      s.cells[cy * 16 + cx] = static_cast<uint8_t>(count ? sum / count : 0);
++    }
++  }
++  s.valid = true;
++  return s;
++}
++
++bool IsCut(const Signature& before, const Signature& now)
++{
++  if (!before.valid || !now.valid)
++    return false;
++  int sum = 0;
++  for (int i = 0; i < 16 * 9; ++i)
++    sum += std::abs(before.cells[i] - now.cells[i]);
++  return sum > 20 * 16 * 9;
++}
++
++void CPlanner::Reset()
++{
++  const PlannerParams params = m_params;
++  *this = CPlanner(params);
++}
++
++void CPlanner::AddMeasure(double t, std::optional<float> area, std::optional<float> whole, bool cut)
++{
++  m_entries.push_back({++m_seq, t, area, whole});
++  m_measured = true;
++
++  if (cut)
++  {
++    m_cutAt = t;
++    m_sinceCut = 1;
++  }
++  else if (m_cutAt)
++    ++m_sinceCut;
++
++  // the shot before a cut is forgotten once the new one was measured often enough
++  if (m_cutAt && m_sinceCut >= m_params.afterCut)
++  {
++    while (!m_entries.empty() && m_entries.front().t < *m_cutAt)
++      m_entries.pop_front();
++    m_cutAt.reset();
++  }
++
++  // what is older than the time remembered is not needed, but for the measures that confirm
++  while (m_entries.size() > static_cast<size_t>(std::max(m_params.confirm, 1)) &&
++         m_entries.front().t < t - m_params.hold - 1.0)
++    m_entries.pop_front();
++}
++
++std::optional<float> CPlanner::Recent(double t, bool whole) const
++{
++  const size_t confirm = static_cast<size_t>(std::max(m_params.confirm, 1));
++  std::optional<float> nearest;
++  for (size_t i = 0; i < m_entries.size(); ++i)
++  {
++    const Entry& e = m_entries[i];
++    if (e.t < t - m_params.hold || e.t > t)
++      continue;
++    if (i + 1 < confirm)
++      continue;
++    // the measure and those just before it, all of them: the least near of them
++    std::optional<float> agreed;
++    bool all = true;
++    for (size_t j = i + 1 - confirm; j <= i; ++j)
++    {
++      const std::optional<float>& v = whole ? m_entries[j].whole : m_entries[j].area;
++      if (!v)
++      {
++        all = false;
++        break;
++      }
++      agreed = agreed ? std::min(*agreed, *v) : *v;
++    }
++    if (all && agreed && (!nearest || *agreed > *nearest))
++      nearest = agreed;
++  }
++  return nearest;
++}
++
++std::optional<float> CPlanner::Latest() const
++{
++  const size_t confirm = static_cast<size_t>(std::max(m_params.confirm, 1));
++  if (m_entries.size() < confirm)
++    return std::nullopt;
++  std::optional<float> agreed;
++  for (size_t j = m_entries.size() - confirm; j < m_entries.size(); ++j)
++  {
++    if (!m_entries[j].area)
++      return std::nullopt;
++    agreed = agreed ? std::min(*agreed, *m_entries[j].area) : *m_entries[j].area;
++  }
++  return agreed;
++}
++
++float CPlanner::Clamp(float depth) const
++{
++  return std::min(std::max(depth, m_params.floor), m_params.comfort);
++}
++
++float CPlanner::Subtitles(double t, bool visible, uint64_t event)
++{
++  if (!visible)
++  {
++    if (m_inEvent)
++    {
++      m_inEvent = false;
++      m_endedAt = t;
++    }
++    return m_hasValue ? m_value : m_params.floor;
++  }
++
++  if (!m_inEvent || event != m_event)
++  {
++    // a new subtitle: it appears where it is to stay, so this is not a jump of it
++    const bool follows = m_inEvent || (m_endedAt && t - *m_endedAt <= m_params.bridge);
++    const std::optional<float> nearest = Recent(t, false);
++    float depth = Clamp(nearest ? *nearest + m_params.margin : m_params.floor);
++    if (follows && m_hasValue && std::abs(depth - m_value) <= m_params.hysteresis)
++      depth = m_value;
++    m_value = depth;
++    m_target = depth;
++    m_hasValue = true;
++    m_inEvent = true;
++    m_event = event;
++    m_lastT = t;
++    m_seenSeq = m_seq;
++    return m_value;
++  }
++
++  // the same subtitle: forward only, where measures in a row put something nearer, and smoothly
++  if (m_seq != m_seenSeq)
++  {
++    m_seenSeq = m_seq;
++    if (const std::optional<float> nearest = Latest(); nearest)
++      m_target = std::max(m_target, Clamp(*nearest + m_params.margin));
++  }
++  const double elapsed = std::max(0.0, t - m_lastT);
++  m_lastT = t;
++  if (m_value < m_target)
++    m_value = std::min(m_target, m_value + static_cast<float>(m_params.speed * elapsed));
++  return m_value;
++}
++
++float CPlanner::Gui(double t, bool shown, std::optional<float> subtitles)
++{
++  // closed: the depth it would open at now, which is the one of the frame it appears in (whether
++  // it is shown is known a frame late); open: kept, never behind the subtitles it is drawn over,
++  // and once forward, kept there
++  if (!shown)
++  {
++    const std::optional<float> nearest = Recent(t, true);
++    m_gui = Clamp(nearest ? *nearest + m_params.margin : m_params.floor);
++  }
++  if (subtitles)
++    m_gui = std::max(m_gui, Clamp(*subtitles));
++  return m_gui;
++}
++
++} // namespace STEREODEPTH
++} // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.h b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.h
+new file mode 100644
+index 0000000..ec85203
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepth.h
+@@ -0,0 +1,208 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++//! Hades: the depth of subtitles and of the interface over a 3D video that carries no depth of its
++//! own (MV-HEVC, side by side, top and bottom, an MVC stream without plane offsets), measured from
++//! the two pictures.
++//!
++//! What is measured is the disparity of the nearest thing in a part of the picture: where a point
++//! of the left eye's picture is found in the right eye's. A thing in front of the screen is seen
++//! further left by the right eye (crossed disparity). Every depth here is a crossed disparity as a
++//! share of the width of the picture: 0 is the plane of the screen, more is nearer the viewer, less
++//! is behind the screen. A subtitle shifted right by s pixels for the left eye and left by s for
++//! the right (CRenderer::SubtitleDepth()) has a depth of 2 * s / width.
++//!
++//! Nothing here knows of Kodi: the pictures come in as rows of 8-bit luma (a small copy of each
++//! eye, made by the graphics: CStereoDepthCapture), and the times in seconds.
++
++#include <cstdint>
++#include <deque>
++#include <optional>
++#include <vector>
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++//! 8-bit luma, its first row the top one
++struct Plane
++{
++  const uint8_t* data{nullptr};
++  int width{0};
++  int height{0};
++  int stride{0};
++};
++
++//! A part of a picture, as shares of its width and height
++struct Area
++{
++  float x1{0.0f};
++  float y1{0.0f};
++  float x2{1.0f};
++  float y2{1.0f};
++};
++
++//! How the two pictures are matched. Distances are in pixels of the pictures given.
++struct MatchParams
++{
++  int block{8}; //!< side of the square blocks matched
++  int step{8}; //!< distance between two blocks, across and down
++  int nearest{32}; //!< the most crossed disparity looked for (in front of the screen)
++  int farthest{16}; //!< the most uncrossed disparity looked for (behind it)
++  int texture{3}; //!< the mean step between neighbouring pixels a block needs, in levels
++  double uniqueness{0.85}; //!< best cost over the best one 2 or more away, at most
++  int residual{14}; //!< the mean difference left by the best match, in levels, at most
++  float share{0.01f}; //!< the share of the matched blocks found at or nearer than the result
++  int support{4}; //!< ... and their least number: fewer than this, and nothing is found
++};
++
++struct Measure
++{
++  int blocks{0}; //!< blocks of the area with texture enough to be matched
++  int matched{0}; //!< of them, those matched without doubt
++  //! the depth of the nearest thing found (see above), or nothing where fewer than
++  //! MatchParams::support blocks were matched (a flat area, a black bar)
++  std::optional<float> nearest;
++};
++
++/*!
++ * \brief The nearest thing in an area of a stereo pair.
++ *
++ * Blocks of the left picture with texture are looked for along the same rows of the right one,
++ * by the sum of absolute differences of the blocks less their means (so a brighter eye does not
++ * move the match), to a fraction of a pixel (a parabola through the costs around the best). A
++ * block whose best match is not clearly better than any other is left out. The result is not the
++ * nearest block but the one with MatchParams::share of the matched blocks at or before it, and
++ * never fewer than MatchParams::support blocks: a block matched wrong, a bright pixel, noise do
++ * not move it, while a thing of a few blocks does.
++ */
++Measure MeasureNearest(const Plane& left,
++                       const Plane& right,
++                       const Area& area,
++                       const MatchParams& params = {});
++
++//! What is kept of a picture to tell a cut: the mean light of 16 x 9 cells
++struct Signature
++{
++  bool valid{false};
++  uint8_t cells[16 * 9]{};
++};
++
++Signature SignatureOf(const Plane& picture);
++
++//! Whether two pictures are of two shots: the mean difference of their cells is over 20 levels
++bool IsCut(const Signature& before, const Signature& now);
++
++//! How depths are chosen from the measures
++struct PlannerParams
++{
++  float margin{0.0025f}; //!< in front of the nearest thing by so much
++  float comfort{0.02f}; //!< never nearer than this: a subtitle can be read without strain
++  float floor{0.0f}; //!< never farther than this: the plane of the screen
++  double speed{0.04}; //!< the fastest change within one subtitle, per second
++  double hold{1.0}; //!< seconds a nearest thing measured is remembered
++  double bridge{0.5}; //!< a subtitle that follows another within so many seconds...
++  float hysteresis{0.0015f}; //!< ... keeps its depth where the new one is not further off than this
++  int confirm{2}; //!< measures in a row that must agree before a subtitle is brought forward
++  int afterCut{2}; //!< measures after a cut before what was measured before it is forgotten
++};
++
++/*!
++ * \brief The depth of the subtitles and of the interface, frame by frame.
++ *
++ * Measures come in as they are made (a few a second, a little after their pictures); the depth of
++ * each frame is asked for as it is drawn.
++ *
++ * Subtitles: a subtitle (an event: a line, a set of bitmaps) gets, as it appears, the depth that
++ * puts it in front of the nearest thing measured in its area in the last PlannerParams::hold
++ * seconds, by PlannerParams::margin, between floor and comfort. While it is shown it only ever
++ * comes forward, never back, and smoothly (PlannerParams::speed), and only where
++ * PlannerParams::confirm measures in a row put something nearer than itself: it never jumps. One
++ * that follows another closely keeps the depth of the other unless the new depth is more than
++ * PlannerParams::hysteresis away. A cut keeps what was measured before it until
++ * PlannerParams::afterCut measures of the new shot were made.
++ *
++ * Interface: as it opens over the video, it gets the depth in front of the nearest thing of the
++ * whole picture in the last PlannerParams::hold seconds (never behind the subtitles), and keeps it
++ * while it is open; it comes forward only to stay in front of the subtitles.
++ */
++class CPlanner
++{
++public:
++  explicit CPlanner(const PlannerParams& params = {}) : m_params(params) {}
++
++  void Reset();
++
++  /*!
++   * \param t when the picture measured was shown, in seconds
++   * \param area the nearest thing in the subtitles' area (Measure::nearest)
++   * \param whole the nearest thing in the whole picture
++   * \param cut the picture is of another shot than the one measured before it
++   */
++  void AddMeasure(double t, std::optional<float> area, std::optional<float> whole, bool cut);
++
++  //! Whether anything was measured since the start or the last Reset()
++  bool HasMeasure() const { return m_measured; }
++
++  /*!
++   * \brief The depth of the subtitles in the frame shown at t.
++   * \param visible a subtitle is shown in it
++   * \param event what is shown: a new value is a new subtitle (OVERLAY::CRenderer::SubtitleEvent())
++   */
++  float Subtitles(double t, bool visible, uint64_t event);
++
++  /*!
++   * \brief The depth of the interface drawn over the video in the frame shown at t.
++   * \param shown the interface is drawn over the video
++   * \param subtitles the depth of the subtitles shown in the frame, or nothing
++   */
++  float Gui(double t, bool shown, std::optional<float> subtitles);
++
++  const PlannerParams& Params() const { return m_params; }
++
++private:
++  struct Entry
++  {
++    uint64_t seq;
++    double t;
++    std::optional<float> area;
++    std::optional<float> whole;
++  };
++
++  //! The nearest thing confirmed in the last PlannerParams::hold seconds before t
++  std::optional<float> Recent(double t, bool whole) const;
++  //! The nearest thing of the last PlannerParams::confirm measures, all of them agreeing
++  std::optional<float> Latest() const;
++  float Clamp(float depth) const;
++
++  PlannerParams m_params;
++  std::deque<Entry> m_entries;
++  uint64_t m_seq{0}; //!< the number of the last measure
++  bool m_measured{false};
++  //! a cut, and the measures made since it
++  std::optional<double> m_cutAt;
++  int m_sinceCut{0};
++
++  bool m_inEvent{false};
++  uint64_t m_event{0};
++  bool m_hasValue{false};
++  float m_value{0.0f}; //!< the depth drawn
++  float m_target{0.0f}; //!< where m_value goes within the event
++  double m_lastT{0.0};
++  std::optional<double> m_endedAt;
++  //! the last measure already looked at within the event
++  uint64_t m_seenSeq{0};
++
++  float m_gui{0.0f};
++};
++
++} // namespace STEREODEPTH
++} // namespace KODI
+-- 
+2.53.0
+

@@ -7,5 +7,7 @@ More detail than the [README](../README.md) gives, for those who want to know wh
 - [How it works](how-it-works.md): the path of a video to the TV told plainly, and then the technical record: when native Dolby Vision is used, how the output is given back after it, Dolby Vision shown as HDR10 or sent as Low-Latency, HDR10+, [HDR10 and HLG over the tunnel](how-it-works.md#hdr10-and-hlg-over-the-tunnel), a display without HDR, files and Blu-ray discs, [stereoscopic 3D](how-it-works.md#stereoscopic-3d), the backend of each graphics driver, and where each part is in the source.
 - [Diagnostics and logs](diagnostics.md): the diagnostic report made with one button, the diagnostic switch, the check of the Dolby Vision output, how to get the diagnostics and the log off the PC, what the filter takes out, and the lines of `kodi.log` that tell most.
 - [Bluetooth](bluetooth.md): why a Bluetooth device disconnected, a device used in Windows and in LibreELEC Hades on one PC, Intel controllers after a restart from Windows, and USB power saving.
+- [What has been tested](tested.md): where Hades has been seen working, on my PC and in the reports of other people, each with its source.
+- [Known limits](known-limits.md): what each kind of graphics, connection and display allows, and how to get the most from it.
 
-What has been tested, the known limits, the defaults that differ from LibreELEC, how to install, update and build, and the credits are in the [README](../README.md).
+The defaults that differ from LibreELEC, and how to install, update and build, are in the [README](../README.md); the credits, with the source of each, are in [CREDITS.md](../CREDITS.md).

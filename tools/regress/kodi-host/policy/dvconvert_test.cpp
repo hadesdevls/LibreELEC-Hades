@@ -62,7 +62,7 @@ int main()
       for (int compatible : {0, 1, 2, 4, 6})
         for (bool layer : {false, true})
           ok &= !ConversionEligible(Setting::NEEDED, profile, compatible, layer, false, false, false) ||
-                (profile == 10 && compatible == 0);
+                ((profile == 10 || profile == 20) && compatible == 0);
     Check("no other stream is, unless it is asked for: their base layer is played as before", ok);
     Check("asked for, profile 7 with its enhancement layer is; without one, and any other profile, is not",
           ConversionEligible(Setting::ALSO_ENHANCEMENT, 7, 6, true, false, false, false) &&
@@ -86,9 +86,23 @@ int main()
     for (int profile : {0, 4, 5, 7, 8, 9, 10, 20})
       for (int compatible : {0, 1, 2, 4, 6})
         ok &= DVBRIDGE::BaseLayerIsNoPicture(profile, compatible) ==
-              (profile == 5 || (profile == 10 && compatible == 0));
-    Check("the base layer is no picture by itself in profile 5, and in profile 10 when it is compatible with "
-          "nothing; in every other stream it is one", ok);
+              (profile == 5 || ((profile == 10 || profile == 20) && compatible == 0));
+    Check("the base layer is no picture by itself in profile 5, and in profiles 10 and 20 when it is compatible "
+          "with nothing (20.0 is IPT-PQ-c2 as Dolby's table of profiles defines it; it was shown as PQ before: "
+          "green and purple); in every other stream it is one", ok);
+    // Hades: profile 20, Dolby Vision in MV-HEVC: rebuilt and sent as HDR10 where its base layer is no
+    // picture (with either setting), never natively; its base view decoded by the processor goes to the bridge as
+    // profile 5 does; the subtitles of a 20.0 video are those of a PQ video
+    Check("profile 20.0 is reconstructed with either setting, as profile 5",
+          ConversionEligible(Setting::NEEDED, 20, 0, false, false, false, false) &&
+              ConversionEligible(Setting::NO_PICTURE_ONLY, 20, 0, false, false, false, false) &&
+              !ConversionEligible(Setting::NEEDED, 20, 4, false, false, false, false));
+    Check("profile 20 never goes out natively; every other profile may",
+          !DVBRIDGE::NativeProfile(20) && DVBRIDGE::NativeProfile(5) && DVBRIDGE::NativeProfile(7) &&
+              DVBRIDGE::NativeProfile(8) && DVBRIDGE::NativeProfile(10) && DVBRIDGE::NativeProfile(0));
+    Check("the pictures of profile 20 that the processor decodes go to the bridge, with their own RPU only",
+          DVBRIDGE::CpuPicturesEligible(20, false, true) && !DVBRIDGE::CpuPicturesEligible(20, false, false) &&
+              !DVBRIDGE::CpuPicturesEligible(7, true, true) && DVBRIDGE::CpuPicturesEligible(5, false, true));
     Check("only a picture of an HEVC stream can come with the metadata of an earlier one, when it has no RPU as "
           "coded; the metadata of an AV1 picture is its own (seventh review: every AV1 picture counted as one "
           "without its metadata)",

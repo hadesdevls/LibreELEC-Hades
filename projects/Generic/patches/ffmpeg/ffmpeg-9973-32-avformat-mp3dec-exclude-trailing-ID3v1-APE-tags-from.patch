@@ -1,0 +1,156 @@
+From 2b0654784b6c3e45fc0193e5a58abcc991d5a3df Mon Sep 17 00:00:00 2001
+From: grapemane <git@teets.us>
+Date: Tue, 3 Nov 2026 11:02:00 -0500
+Subject: [PATCH] avformat/mp3dec: exclude trailing ID3v1/APE tags from the
+ Xing size check
+
+mp3_parse_info_tag() compares the Xing/Info byte count with the file size
+from the first frame to EOF, and if the file is more than 1/16 larger it
+assumes a concatenated file, drops the frame count and estimates the
+duration from the bitrate. The file size includes any ID3v1 and APEv2 tag
+at the end, which the Info byte count never covers, so a file with large
+trailing tags (an APE tag holding cover art is common) gets a duration that
+is too long by the tag size over the bitrate, and loses gapless trimming.
+
+Seen on a 320 kbps file with a 1.2 MB APE tag: 155.29 s reported, 125.15 s
+decoded. Subtract the trailing tags before rejecting the Xing frame count.
+Only scan the tail when the unadjusted size would trigger the concatenation
+check, so ordinary HTTP input does not incur extra range requests. Save
+and restore the Info tag checksum across that scan. If a seek in the scan
+fails, report the error and parse the file as if it had no Xing/Info tag.
+A genuinely concatenated file still trips the check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Assisted-by: Fairy
+
+[Hades: backport to 9.1. The libavformat/Makefile line is the same; its context differs because master moved the ID3v2 writer to id3v2/writer.o (22519f6a2803, not taken).]
+
+(cherry picked from commit 2b0654784b6c3e45fc0193e5a58abcc991d5a3df)
+Upstream: https://github.com/FFmpeg/FFmpeg/commit/2b0654784b6c3e45fc0193e5a58abcc991d5a3df
+---
+ libavformat/Makefile |  2 +-
+ libavformat/mp3dec.c | 63 +++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 60 insertions(+), 5 deletions(-)
+
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index bfd625d..1a428d3 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -401,7 +401,7 @@ OBJS-$(CONFIG_MOV_MUXER)                 += movenc.o \
+                                             movenccenc.o movenc_ttml.o rawutils.o \
+                                             apv.o dovi_isom.o evc.o
+ OBJS-$(CONFIG_MP2_MUXER)                 += rawenc.o
+-OBJS-$(CONFIG_MP3_DEMUXER)               += mp3dec.o replaygain.o
++OBJS-$(CONFIG_MP3_DEMUXER)               += mp3dec.o apetag.o img2.o replaygain.o
+ OBJS-$(CONFIG_MP3_MUXER)                 += mp3enc.o rawenc.o id3v2enc.o
+ OBJS-$(CONFIG_MPC_DEMUXER)               += mpc.o apetag.o img2.o
+ OBJS-$(CONFIG_MPC8_DEMUXER)              += mpc8.o apetag.o img2.o
+diff --git a/libavformat/mp3dec.c b/libavformat/mp3dec.c
+index d326b99..cc6a7d4 100644
+--- a/libavformat/mp3dec.c
++++ b/libavformat/mp3dec.c
+@@ -29,6 +29,7 @@
+ #include "avformat.h"
+ #include "internal.h"
+ #include "avio_internal.h"
++#include "apetag.h"
+ #include "demux.h"
+ #include "id3v2.h"
+ #include "id3v1.h"
+@@ -161,8 +162,38 @@ static void read_xing_toc(AVFormatContext *s, int64_t filesize, int64_t duration
+         mp3->xing_toc = 1;
+ }
+ 
+-static void mp3_parse_info_tag(AVFormatContext *s, AVStream *st,
+-                               MPADecodeHeader2 *c, uint32_t spf)
++/**
++ * Size of the ID3v1 and APEv2 tags at the end of the file. They are not part
++ * of the MPEG stream, so the Xing/Info byte count does not include them.
++ * The read position is restored.
++ *
++ * @return the size in bytes, or a negative AVERROR code if seeking failed
++ */
++static int64_t mp3_trailing_tags_size(AVFormatContext *s, int64_t end)
++{
++    AVIOContext *pb = s->pb;
++    int64_t pos = avio_tell(pb), size = 0, ret = 0;
++    uint8_t buf[3];
++
++    if (end > ID3v1_TAG_SIZE) {
++        ret = avio_seek(pb, end - ID3v1_TAG_SIZE, SEEK_SET);
++        if (ret >= 0 && avio_read(pb, buf, 3) == 3 && !memcmp(buf, "TAG", 3))
++            size = ID3v1_TAG_SIZE;
++    }
++    if (ret >= 0) {
++        ret = ff_ape_tag_size(s, end - size);
++        if (ret > 0)
++            size += ret;
++    }
++
++    pos = avio_seek(pb, pos, SEEK_SET);
++    if (ret < 0)
++        return ret;
++    return pos < 0 ? pos : size;
++}
++
++static int mp3_parse_info_tag(AVFormatContext *s, AVStream *st,
++                              MPADecodeHeader2 *c, uint32_t spf)
+ {
+ #define LAST_BITS(k, n) ((k) & ((1 << (n)) - 1))
+ #define MIDDLE_BITS(k, m, n) LAST_BITS((k) >> (m), ((n) - (m) + 1))
+@@ -187,7 +218,7 @@ static void mp3_parse_info_tag(AVFormatContext *s, AVStream *st,
+     v = avio_rb32(s->pb);
+     mp3->is_cbr = v == MKBETAG('I', 'n', 'f', 'o');
+     if (v != MKBETAG('X', 'i', 'n', 'g') && !mp3->is_cbr)
+-        return;
++        return 0;
+ 
+     v = avio_rb32(s->pb);
+     if (v & XING_FLAG_FRAMES)
+@@ -196,6 +227,24 @@ static void mp3_parse_info_tag(AVFormatContext *s, AVStream *st,
+         mp3->header_filesize = avio_rb32(s->pb);
+     if (fsize && mp3->header_filesize) {
+         uint64_t min, delta;
++
++        /* Avoid seeking to the end unless trailing tags could make us
++         * incorrectly reject the frame count. Preserve the Info tag CRC
++         * across the seek. */
++        if (fsize > mp3->header_filesize &&
++            fsize - mp3->header_filesize > mp3->header_filesize >> 4 &&
++            (s->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
++            unsigned long checksum = ffio_get_checksum(s->pb);
++            int64_t trailing_tags_size = mp3_trailing_tags_size(s, mp3->filesize);
++
++            if (trailing_tags_size < 0) {
++                av_log(s, AV_LOG_ERROR, "Failed to read the trailing tags\n");
++                return trailing_tags_size;
++            }
++            ffio_init_checksum(s->pb, ff_crcA001_update, checksum);
++            fsize -= FFMIN(fsize, trailing_tags_size);
++        }
++
+         min = FFMIN(fsize, mp3->header_filesize);
+         delta = FFMAX(fsize, mp3->header_filesize) - min;
+         if (fsize > mp3->header_filesize && delta > min >> 4) {
+@@ -295,6 +344,7 @@ static void mp3_parse_info_tag(AVFormatContext *s, AVStream *st,
+         ff_replaygain_export_raw(st, r_gain, peak, a_gain, 0);
+         av_dict_set(&st->metadata, "encoder", version, 0);
+     }
++    return 0;
+ }
+ 
+ static void mp3_parse_vbri_tag(AVFormatContext *s, AVStream *st, int64_t base)
+@@ -411,7 +461,12 @@ static int mp3_parse_vbr_tags(AVFormatContext *s, AVStream *st, int64_t base)
+     mp3->header_filesize   = 0;
+     mp3->frame_duration = av_rescale_q(spf, (AVRational){1, c->sample_rate}, st->time_base);
+ 
+-    mp3_parse_info_tag(s, st, c, spf);
++    ret = mp3_parse_info_tag(s, st, c, spf);
++    if (ret < 0) {
++        mp3->frames = 0;
++        mp3->header_filesize = 0;
++        goto end;
++    }
+     mp3_parse_vbri_tag(s, st, base);
+     mp3_parse_itunes_smpb(s, st, c, spf);
+ 

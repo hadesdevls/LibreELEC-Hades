@@ -1,0 +1,505 @@
+From c67d3db69e2e432c11f1a56bdee689ffcd40e956 Mon Sep 17 00:00:00 2001
+From: "Gregory P. Smith" <68491+gpshead@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:46:32 -0700
+Subject: [PATCH] [3.14] gh-160310: Fix quadratic one-shot `decompress()` with
+ many members (GH-160311) (#161038)
+
+gzip.decompress(), bz2.decompress(), lzma.decompress() and
+compression.zstd.decompress() handed each new decompressor all of the
+remaining input and copied the rest back through unused_data, so input
+made of many concatenated members took quadratic time.  Each member is
+now fed in chunks that start at 1 KiB and double, and the loop steps
+back over unused_data by offset.  The first chunk is the whole input,
+so single-member data still takes one decompressor call.
+
+bz2, lzma and zstd share the loop through a private helper in
+compression._common._streams; gzip keeps its own because it parses the
+member header, trailer and padding itself.
+
+ANT-2026-9R8SO5S2
+
+(cherry picked from commit e80962a4bd68b162a54fc63cfb754237c2f81d8e)
+Upstream: https://github.com/python/cpython/commit/c67d3db69e2e432c11f1a56bdee689ffcd40e956
+---
+ Lib/bz2.py                                    | 22 ++-----
+ Lib/compression/_common/_streams.py           | 57 +++++++++++++++++++
+ Lib/compression/zstd/__init__.py              | 15 ++---
+ Lib/gzip.py                                   | 41 ++++++++++---
+ Lib/lzma.py                                   | 25 ++------
+ Lib/test/test_bz2.py                          | 47 +++++++++++++++
+ Lib/test/test_gzip.py                         | 44 ++++++++++++++
+ Lib/test/test_lzma.py                         | 51 +++++++++++++++++
+ Lib/test/test_zstd.py                         | 46 +++++++++++++++
+ ...-10-22-08-34-22.gh-issue-160310.q7Zm2K.rst |  4 ++
+ 10 files changed, 295 insertions(+), 57 deletions(-)
+ create mode 100644 Misc/NEWS.d/next/Library/2026-10-22-08-34-22.gh-issue-160310.q7Zm2K.rst
+
+diff --git a/Lib/bz2.py b/Lib/bz2.py
+index f4f3cda..7e41866 100644
+--- a/Lib/bz2.py
++++ b/Lib/bz2.py
+@@ -338,20 +338,8 @@ def decompress(data):
+ 
+     For incremental decompression, use a BZ2Decompressor object instead.
+     """
+-    results = []
+-    while data:
+-        decomp = BZ2Decompressor()
+-        try:
+-            res = decomp.decompress(data)
+-        except OSError:
+-            if not results:
+-                raise  # Error on the first iteration; bail out.
+-            if data.startswith(_STREAM_MAGIC):
+-                raise  # Leftover data is a damaged bzip2 stream; bail out.
+-            break  # Leftover data is not a valid bzip2 stream; ignore it.
+-        results.append(res)
+-        if not decomp.eof:
+-            raise ValueError("Compressed data ended before the "
+-                             "end-of-stream marker was reached")
+-        data = decomp.unused_data
+-    return b"".join(results)
++    if not data:
++        return b""
++    return _streams._decompress_all(data, BZ2Decompressor, OSError,
++                                    stream_magic=_STREAM_MAGIC,
++                                    truncated_error=ValueError)
+diff --git a/Lib/compression/_common/_streams.py b/Lib/compression/_common/_streams.py
+index 09c6550..0e3308c 100644
+--- a/Lib/compression/_common/_streams.py
++++ b/Lib/compression/_common/_streams.py
+@@ -169,3 +169,60 @@ class DecompressReader(io.RawIOBase):
+     def tell(self):
+         """Return the current file position."""
+         return self._pos
++
++
++def _decompress_all(data, decomp_factory, trailing_error=(), *,
++                    stream_magic=(), truncated_error, **decomp_args):
++    """Decompress all of the concatenated streams in *data*.
++
++    Each stream is decompressed by a new decompressor, made by calling
++    *decomp_factory* with *decomp_args*.  As in DecompressReader, an error
++    of class *trailing_error* in a stream after the first one ends the
++    data, unless that stream starts with *stream_magic*.  A stream without
++    an end-of-stream marker raises *truncated_error*.
++    """
++    results = []
++    # The views are released on exit, so that the caller can resize a
++    # bytearray argument again, also while handling an exception.
++    with memoryview(data) as view, view.cast("B") as data:
++        pos = 0
++        # There is usually a single stream: the first chunk is all of the
++        # data, to decompress it in one go.
++        chunk_size = len(data)
++        while True:
++            decomp = decomp_factory(**decomp_args)
++            start = pos
++            res = []
++            try:
++                # Feed the stream in chunks of increasing size, so that what
++                # is read past its end (and copied into unused_data) is
++                # bounded by the size of the stream, not by the size of all
++                # the streams that follow it.
++                while not decomp.eof and pos < len(data):
++                    with data[pos:pos + chunk_size] as chunk:
++                        res.append(decomp.decompress(chunk))
++                        pos += len(chunk)
++                    chunk_size *= 2
++            except trailing_error:
++                if not results:
++                    raise  # Error in the first stream; bail out.
++                if stream_magic:
++                    if isinstance(stream_magic, bytes):
++                        stream_magic = (stream_magic,)
++                    size = max(map(len, stream_magic))
++                    with data[start:start + size] as head:
++                        if head.tobytes().startswith(stream_magic):
++                            raise  # Damaged stream, not trailing data.
++                # Trailing data isn't a valid compressed stream; ignore it.
++                break
++            results.extend(res)
++            if not decomp.eof:
++                raise truncated_error("Compressed data ended before the "
++                                      "end-of-stream marker was reached")
++            pos -= len(decomp.unused_data)
++            if pos == len(data):
++                break
++            # Later streams start small: a larger first chunk reads further
++            # past the end of a short stream, a smaller one needs more calls.
++            chunk_size = 1024
++    return b"".join(results)
+diff --git a/Lib/compression/zstd/__init__.py b/Lib/compression/zstd/__init__.py
+index 5326cf9..b1b43ce 100644
+--- a/Lib/compression/zstd/__init__.py
++++ b/Lib/compression/zstd/__init__.py
+@@ -30,6 +30,7 @@ import _zstd
+ import enum
+ from _zstd import (ZstdCompressor, ZstdDecompressor, ZstdDict, ZstdError,
+                    get_frame_size, zstd_version)
++from compression._common import _streams
+ from compression.zstd._zstdfile import ZstdFile, open, _nbytes
+ 
+ # zstd_version_number is (MAJOR * 100 * 100 + MINOR * 100 + RELEASE)
+@@ -161,17 +162,9 @@ def decompress(data, zstd_dict=None, options=None):
+ 
+     For incremental decompression, use a ZstdDecompressor instead.
+     """
+-    results = []
+-    while True:
+-        decomp = ZstdDecompressor(options=options, zstd_dict=zstd_dict)
+-        results.append(decomp.decompress(data))
+-        if not decomp.eof:
+-            raise ZstdError('Compressed data ended before the '
+-                            'end-of-stream marker was reached')
+-        data = decomp.unused_data
+-        if not data:
+-            break
+-    return b''.join(results)
++    return _streams._decompress_all(data, ZstdDecompressor,
++                                    truncated_error=ZstdError,
++                                    options=options, zstd_dict=zstd_dict)
+ 
+ 
+ class CompressionParameter(enum.IntEnum):
+diff --git a/Lib/gzip.py b/Lib/gzip.py
+index 4dec70c..2c6051a 100644
+--- a/Lib/gzip.py
++++ b/Lib/gzip.py
+@@ -650,24 +650,47 @@ def decompress(data):
+     Return the decompressed string.
+     """
+     decompressed_members = []
++    fp = io.BytesIO(data)
++    # There is usually a single member: the first chunk is all of the data,
++    # to decompress it in one go.
++    chunk_size = len(data)
+     while True:
+-        fp = io.BytesIO(data)
+         if _read_gzip_header(fp) is None:
+             return b"".join(decompressed_members)
+         # Use a zlib raw deflate compressor
+         do = zlib.decompressobj(wbits=-zlib.MAX_WBITS)
+-        # Read all the data except the header
+-        decompressed = do.decompress(data[fp.tell():])
+-        if not do.eof or len(do.unused_data) < 8:
++        crc = zlib.crc32(b"")
++        length = 0
++        # Feed the member in chunks of increasing size, so that what is read
++        # past its end (and copied into unused_data) is bounded by the size
++        # of the member, not by the size of all the members that follow it.
++        while not do.eof and (chunk := fp.read(chunk_size)):
++            decompressed = do.decompress(chunk)
++            crc = zlib.crc32(decompressed, crc)
++            length += len(decompressed)
++            decompressed_members.append(decompressed)
++            chunk_size *= 2
++        # Later members start small: a larger first chunk reads further past
++        # the end of a short member, a smaller one needs more calls.
++        chunk_size = 1024
++        # Rewind to the end of the deflate stream and read the trailer
++        fp.seek(-len(do.unused_data), io.SEEK_CUR)
++        trailer = fp.read(8)
++        if not do.eof or len(trailer) < 8:
+             raise EOFError("Compressed file ended before the end-of-stream "
+                            "marker was reached")
+-        crc, length = struct.unpack("<II", do.unused_data[:8])
+-        if crc != zlib.crc32(decompressed):
++        crc32, isize = struct.unpack("<II", trailer)
++        if crc32 != crc:
+             raise BadGzipFile("CRC check failed")
+-        if length != (len(decompressed) & 0xffffffff):
++        if isize != (length & 0xffffffff):
+             raise BadGzipFile("Incorrect length of data produced")
+-        decompressed_members.append(decompressed)
+-        data = do.unused_data[8:].lstrip(b"\x00")
++        # Gzip files can be padded with zeroes and still have archives.
++        # Consume all zero bytes and set the file position to the first
++        # non-zero byte.
++        while chunk := fp.read(chunk_size):
++            if chunk := chunk.lstrip(b"\x00"):
++                fp.seek(-len(chunk), io.SEEK_CUR)
++                break
+ 
+ 
+ def main():
+diff --git a/Lib/lzma.py b/Lib/lzma.py
+index b023c87..42775a0 100644
+--- a/Lib/lzma.py
++++ b/Lib/lzma.py
+@@ -352,23 +352,8 @@ def decompress(data, format=FORMAT_AUTO, memlimit=None, filters=None):
+ 
+     For incremental decompression, use an LZMADecompressor instead.
+     """
+-    results = []
+-    magic = _stream_magic(format)
+-    while True:
+-        decomp = LZMADecompressor(format, memlimit, filters)
+-        try:
+-            res = decomp.decompress(data)
+-        except LZMAError:
+-            if not results:
+-                raise  # Error on the first iteration; bail out.
+-            if magic and data.startswith(magic):
+-                raise  # Leftover data is a damaged XZ stream; bail out.
+-            break  # Leftover data is not a valid LZMA/XZ stream; ignore it.
+-        results.append(res)
+-        if not decomp.eof:
+-            raise LZMAError("Compressed data ended before the "
+-                            "end-of-stream marker was reached")
+-        data = decomp.unused_data
+-        if not data:
+-            break
+-    return b"".join(results)
++    return _streams._decompress_all(data, LZMADecompressor, LZMAError,
++                                    stream_magic=_stream_magic(format),
++                                    truncated_error=LZMAError,
++                                    format=format, memlimit=memlimit,
++                                    filters=filters)
+diff --git a/Lib/test/test_bz2.py b/Lib/test/test_bz2.py
+index 5a6f7fe..abc06c1 100644
+--- a/Lib/test/test_bz2.py
++++ b/Lib/test/test_bz2.py
+@@ -1116,6 +1116,53 @@ class CompressDecompressTest(BaseTest):
+         text = bz2.decompress(self.DATA * 5 + self.BAD_DATA)
+         self.assertEqual(text, self.TEXT * 5)
+ 
++    def testDecompressMultiStreamBig(self):
++        big = random.randbytes(100_000)
++        streams = [self.TEXT, b'', big, self.TEXT, big]
++        expected = b''.join(streams)
++        data = b''.join(map(bz2.compress, streams))
++        self.assertEqual(bz2.decompress(data), expected)
++        self.assertEqual(bz2.decompress(bytearray(data)), expected)
++        self.assertEqual(bz2.decompress(memoryview(data)), expected)
++        self.assertEqual(bz2.decompress(data + self.BAD_DATA), expected)
++        self.assertRaises(ValueError, bz2.decompress, data[:-50_000])
++        # The damage is past the first chunk fed for the second stream.
++        damaged = bytearray(bz2.compress(big))
++        damaged[-3] ^= 1
++        self.assertRaises(OSError, bz2.decompress, self.DATA + damaged)
++
++    def testDecompressErrorReleasesBuffer(self):
++        # The argument can be resized while the exception is handled.
++        for data in self.DATA[:-10], self.BAD_DATA:
++            with self.subTest(data=data[:10]):
++                data = bytearray(data)
++                try:
++                    bz2.decompress(data)
++                except (ValueError, OSError):
++                    data += b'more'
++                else:
++                    self.fail('no exception')
++
++    def testDecompressManyStreams(self):
++        # The amount of data passed to the decompressors should grow
++        # linearly with the number of streams.
++        class Decompressor:
++            def __init__(self, *args, **kwargs):
++                self.decomp = BZ2Decompressor(*args, **kwargs)
++            def __getattr__(self, name):
++                return getattr(self.decomp, name)
++            def decompress(self, data):
++                nonlocal fed
++                fed += len(data)
++                return self.decomp.decompress(data)
++        with support.swap_attr(bz2, 'BZ2Decompressor', Decompressor):
++            fed = 0
++            self.assertEqual(bz2.decompress(self.EMPTY_DATA * 1000), b'')
++            fed1 = fed
++            fed = 0
++            self.assertEqual(bz2.decompress(self.EMPTY_DATA * 2000), b'')
++        self.assertLess(fed, fed1 * 3)
++
+     def testDecompressMultiStreamDamagedStream(self):
+         # A damaged bzip2 stream following a valid one is not trailing junk.
+         for pos in 4, 100, -3:
+diff --git a/Lib/test/test_gzip.py b/Lib/test/test_gzip.py
+index fc61edd..24922a5 100644
+--- a/Lib/test/test_gzip.py
++++ b/Lib/test/test_gzip.py
+@@ -817,6 +817,50 @@ class TestGzip(BaseTest):
+         compressed_data = gzip.compress(data1)
+         self.assertRaises(EOFError, gzip.decompress, compressed_data[:-8])
+ 
++    def test_decompress_multi_member(self):
++        big = os.urandom(100_000)
++        members = [data1, b'', big, data2, big]
++        expected = b''.join(members)
++        for padding in b'', b'\0', b'\0' * 5000:
++            with self.subTest(padding=len(padding)):
++                datac = b''.join(gzip.compress(data) + padding
++                                 for data in members)
++                self.assertEqual(gzip.decompress(datac), expected)
++        datac = b''.join(map(gzip.compress, members))
++        self.assertEqual(gzip.decompress(bytearray(datac)), expected)
++        self.assertEqual(gzip.decompress(memoryview(datac)), expected)
++        self.assertRaises(EOFError, gzip.decompress, datac[:-4])
++        self.assertRaises(EOFError, gzip.decompress, datac[:-50_000])
++        self.assertRaises(gzip.BadGzipFile, gzip.decompress, datac + b'junk')
++        # Damage the CRC in the trailer of the third member.
++        parts = [gzip.compress(data) for data in members]
++        corrupted = bytearray(b''.join(parts))
++        corrupted[len(b''.join(parts[:3])) - 8] ^= 1
++        with self.assertRaisesRegex(gzip.BadGzipFile, 'CRC check failed'):
++            gzip.decompress(corrupted)
++
++    def test_decompress_many_members(self):
++        # The amount of data passed to the decompressors should grow
++        # linearly with the number of members.
++        decompressobj = zlib.decompressobj
++        class Decompressor:
++            def __init__(self, *args, **kwargs):
++                self.decomp = decompressobj(*args, **kwargs)
++            def __getattr__(self, name):
++                return getattr(self.decomp, name)
++            def decompress(self, data):
++                nonlocal fed
++                fed += len(data)
++                return self.decomp.decompress(data)
++        datac = gzip.compress(b'')
++        with mock.patch.object(zlib, 'decompressobj', Decompressor):
++            fed = 0
++            self.assertEqual(gzip.decompress(datac * 1000), b'')
++            fed1 = fed
++            fed = 0
++            self.assertEqual(gzip.decompress(datac * 2000), b'')
++        self.assertLess(fed, fed1 * 3)
++
+     def test_read_truncated(self):
+         data = data1*50
+         # Drop the CRC (4 bytes) and file size (4 bytes).
+diff --git a/Lib/test/test_lzma.py b/Lib/test/test_lzma.py
+index 8927842..6c42155 100644
+--- a/Lib/test/test_lzma.py
++++ b/Lib/test/test_lzma.py
+@@ -508,11 +508,62 @@ class CompressDecompressFunctionTestCase(unittest.TestCase):
+         ddata = lzma.decompress(COMPRESSED_XZ + COMPRESSED_ALONE)
+         self.assertEqual(ddata, INPUT * 2)
+ 
++    def test_decompress_multistream_big(self):
++        big = random.randbytes(100_000)
++        streams = [INPUT, b"", big, INPUT, big]
++        expected = b"".join(streams)
++        cdata = b"".join(map(lzma.compress, streams))
++        self.assertEqual(lzma.decompress(cdata), expected)
++        self.assertEqual(lzma.decompress(bytearray(cdata)), expected)
++        self.assertEqual(lzma.decompress(memoryview(cdata)), expected)
++        self.assertEqual(lzma.decompress(cdata + COMPRESSED_BOGUS), expected)
++        self.assertRaises(LZMAError, lzma.decompress, cdata[:-50_000])
++        # The damage is past the first chunk fed for the second stream.
++        damaged = bytearray(lzma.compress(big))
++        damaged[-1] ^= 1
++        self.assertRaises(LZMAError, lzma.decompress, COMPRESSED_XZ + damaged)
++
++    def test_decompress_error_releases_buffer(self):
++        # The argument can be resized while the exception is handled.
++        for cdata in COMPRESSED_XZ[:-10], COMPRESSED_BOGUS:
++            with self.subTest(cdata=cdata[:10]):
++                cdata = bytearray(cdata)
++                try:
++                    lzma.decompress(cdata)
++                except LZMAError:
++                    cdata += b"more"
++                else:
++                    self.fail("no exception")
++
++    def test_decompress_many_streams(self):
++        # The amount of data passed to the decompressors should grow
++        # linearly with the number of streams.
++        class Decompressor:
++            def __init__(self, *args, **kwargs):
++                self.decomp = LZMADecompressor(*args, **kwargs)
++            def __getattr__(self, name):
++                return getattr(self.decomp, name)
++            def decompress(self, data):
++                nonlocal fed
++                fed += len(data)
++                return self.decomp.decompress(data)
++        cdata = lzma.compress(b"")
++        with support.swap_attr(lzma, "LZMADecompressor", Decompressor):
++            fed = 0
++            self.assertEqual(lzma.decompress(cdata * 1000), b"")
++            fed1 = fed
++            fed = 0
++            self.assertEqual(lzma.decompress(cdata * 2000), b"")
++        self.assertLess(fed, fed1 * 3)
++
+     # Test robust handling of non-LZMA data following the compressed stream(s).
+ 
+     def test_decompress_trailing_junk(self):
+         ddata = lzma.decompress(COMPRESSED_XZ + COMPRESSED_BOGUS)
+         self.assertEqual(ddata, INPUT)
++        ddata = lzma.decompress(COMPRESSED_ALONE + COMPRESSED_BOGUS,
++                                lzma.FORMAT_ALONE)
++        self.assertEqual(ddata, INPUT)
+ 
+     def test_decompress_multistream_trailing_junk(self):
+         ddata = lzma.decompress(COMPRESSED_XZ * 3 + COMPRESSED_BOGUS)
+diff --git a/Lib/test/test_zstd.py b/Lib/test/test_zstd.py
+index 569b96a..a20222f 100644
+--- a/Lib/test/test_zstd.py
++++ b/Lib/test/test_zstd.py
+@@ -192,6 +192,52 @@ class FunctionsTestCase(unittest.TestCase):
+         dat = decompress(DAT_130K_C + DAT_130K_C)
+         self.assertEqual(len(dat), 2 * _130_1K)
+ 
++    def test_decompress_multi_frames(self):
++        big = random.randbytes(100_000)
++        frames = [b"a" * 100, b"", big, b"b" * 100, big]
++        expected = b"".join(frames)
++        dat = b"".join(map(compress, frames))
++        self.assertEqual(decompress(dat), expected)
++        self.assertEqual(decompress(bytearray(dat)), expected)
++        self.assertEqual(decompress(memoryview(dat)), expected)
++        with self.assertRaisesRegex(ZstdError, "Compressed data ended before"):
++            decompress(dat[:-50_000])
++        with self.assertRaisesRegex(ZstdError, "Unknown frame descriptor"):
++            decompress(dat + b"junk")
++
++    def test_decompress_error_releases_buffer(self):
++        # The argument can be resized while the exception is handled.
++        for dat in COMPRESSED_100_PLUS_32KB[:-10], b"junk" * 10:
++            with self.subTest(dat=dat[:10]):
++                dat = bytearray(dat)
++                try:
++                    decompress(dat)
++                except ZstdError:
++                    dat += b"more"
++                else:
++                    self.fail("no exception")
++
++    def test_decompress_many_frames(self):
++        # The amount of data passed to the decompressors should grow
++        # linearly with the number of frames.
++        class Decompressor:
++            def __init__(self, *args, **kwargs):
++                self.decomp = ZstdDecompressor(*args, **kwargs)
++            def __getattr__(self, name):
++                return getattr(self.decomp, name)
++            def decompress(self, data):
++                nonlocal fed
++                fed += len(data)
++                return self.decomp.decompress(data)
++        dat = compress(b"")
++        with support.swap_attr(zstd, "ZstdDecompressor", Decompressor):
++            fed = 0
++            self.assertEqual(decompress(dat * 1000), b"")
++            fed1 = fed
++            fed = 0
++            self.assertEqual(decompress(dat * 2000), b"")
++        self.assertLess(fed, fed1 * 3)
++
+ 
+ class CompressorTestCase(unittest.TestCase):
+ 
+diff --git a/Misc/NEWS.d/next/Library/2026-10-22-08-34-22.gh-issue-160310.q7Zm2K.rst b/Misc/NEWS.d/next/Library/2026-10-22-08-34-22.gh-issue-160310.q7Zm2K.rst
+new file mode 100644
+index 0000000..82e62d7
+--- /dev/null
++++ b/Misc/NEWS.d/next/Library/2026-10-22-08-34-22.gh-issue-160310.q7Zm2K.rst
+@@ -0,0 +1,4 @@
++Fix quadratic time complexity of :func:`gzip.decompress`,
++:func:`bz2.decompress`, :func:`lzma.decompress` and
++:func:`compression.zstd.decompress` on data consisting of many concatenated
++members.

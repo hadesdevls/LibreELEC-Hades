@@ -1,0 +1,199 @@
+From 42df42783f600ee7f212d2a9c9009dfe6e6db031 Mon Sep 17 00:00:00 2001
+From: "Miss Islington (bot)"
+ <31488909+miss-islington@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:36:54 -0800
+Subject: [PATCH] [3.14] gh-162282: Fix remaining quadratic paths in
+ urllib.robotparser (GH-162442) (#162450)
+
+gh-162282: Fix remaining quadratic paths in urllib.robotparser (GH-162442)
+
+Merging many groups for the same user agent copied the accumulated rule
+lines on every merge, and _find_entry() checked a group once per user
+agent in it, so a single lookup for an unlisted agent was quadratic in
+the number of agents.
+
+Extend a merged entry in place when no other agent shares it, reuse one
+merged entry for all agents of a group that shared the same entry, and
+check each distinct entry only once in _find_entry().
+(cherry picked from commit 06eb74514678a3b1754f3667d0068587c968f0fe)
+
+Co-authored-by: Andrew Svetlov <andrew.svetlov@gmail.com>
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Upstream: https://github.com/python/cpython/commit/42df42783f600ee7f212d2a9c9009dfe6e6db031
+---
+ Lib/test/test_robotparser.py                  | 60 +++++++++++++++++++
+ Lib/urllib/robotparser.py                     | 56 +++++++++++++----
+ ...-11-22-15-56-36.gh-issue-162282.QjKIag.rst |  3 +
+ 3 files changed, 106 insertions(+), 13 deletions(-)
+ create mode 100644 Misc/NEWS.d/next/Library/2026-11-22-15-56-36.gh-issue-162282.QjKIag.rst
+
+diff --git a/Lib/test/test_robotparser.py b/Lib/test/test_robotparser.py
+index 2660820..408ddc4 100644
+--- a/Lib/test/test_robotparser.py
++++ b/Lib/test/test_robotparser.py
+@@ -858,6 +858,66 @@ class RepeatedUserAgentTest(unittest.TestCase):
+         self.assertEqual(len(entry.rulelines), 1)
+         self.assertFalse(parser.can_fetch("evil", "/"))
+ 
++    def test_many_groups_for_same_user_agent(self):
++        body = "User-agent: evil\nDisallow: /x\n\n" * 999
++        parser = urllib.robotparser.RobotFileParser()
++        parser.parse(body.splitlines())
++        entry = parser.groups["evil"]
++        self.assertEqual(len(entry.rulelines), 999)
++        # The merged entry is extended in place rather than copied.
++        parser.parse("User-agent: evil\nDisallow: /x\nCrawl-delay: 5".splitlines())
++        self.assertIs(parser.groups["evil"], entry)
++        self.assertEqual(len(entry.rulelines), 1000)
++        self.assertEqual(entry.delay, 5)
++        # The original entries are left intact.
++        self.assertEqual([len(e.rulelines) for e in parser.entries], [1] * 1000)
++        self.assertIsNone(parser.entries[-2].delay)
++
++    def test_merged_group_shared_by_user_agents(self):
++        parser = urllib.robotparser.RobotFileParser()
++        parser.parse("""\
++User-agent: a
++User-agent: b
++User-agent: c
++Disallow: /x
++
++User-agent: a
++User-agent: b
++Disallow: /y
++
++User-agent: a
++Disallow: /z
++""".splitlines())
++        groups = parser.groups
++        self.assertIs(groups["c"], parser.entries[0])
++        self.assertEqual(list(map(str, groups["a"].rulelines)),
++                         ["Disallow: /x", "Disallow: /y", "Disallow: /z"])
++        self.assertEqual(list(map(str, groups["b"].rulelines)),
++                         ["Disallow: /x", "Disallow: /y"])
++        self.assertEqual(list(map(str, groups["c"].rulelines)),
++                         ["Disallow: /x"])
++        self.assertFalse(parser.can_fetch("a", "/z"))
++        self.assertTrue(parser.can_fetch("b", "/z"))
++        self.assertTrue(parser.can_fetch("c", "/y"))
++
++    def test_many_user_agents_in_one_group(self):
++        body = "".join(f"User-agent: bot{i}\n" for i in range(1000))
++        body += "Disallow: /\n\nUser-agent: other\nDisallow: /x\n"
++        parser = urllib.robotparser.RobotFileParser()
++        parser.parse(body.splitlines())
++        self.assertIs(parser.groups["bot0"], parser.groups["bot999"])
++        calls = []
++        orig = urllib.robotparser.Entry.applies_to
++        def applies_to(entry, useragent):
++            calls.append(entry)
++            return orig(entry, useragent)
++        with support.swap_attr(urllib.robotparser.Entry, "applies_to",
++                               applies_to):
++            self.assertTrue(parser.can_fetch("unknown", "/"))
++            self.assertFalse(parser.can_fetch("xbot5x", "/"))
++        # Each distinct entry is checked at most once per lookup.
++        self.assertEqual(len(calls), 2 + 1)
++
+ 
+ if __name__=='__main__':
+     unittest.main()
+diff --git a/Lib/urllib/robotparser.py b/Lib/urllib/robotparser.py
+index 9cb97d5..8369e02 100644
+--- a/Lib/urllib/robotparser.py
++++ b/Lib/urllib/robotparser.py
+@@ -30,6 +30,8 @@ class RobotFileParser:
+     def __init__(self, url=''):
+         self.entries = []
+         self.groups = {}
++        # Merged entries in self.groups -> number of agents sharing them.
++        self._merged_refs = {}
+         self.sitemaps = []
+         self.default_entry = None
+         self.disallow_all = False
+@@ -83,16 +85,32 @@ class RobotFileParser:
+ 
+     def _add_entry(self, entry):
+         self.entries.append(entry)
+-        seen = set()
++        to_merge = {}
+         for agent in entry.useragents:
+             agent = agent.lower()
+-            if agent in seen:
+-                continue
+-            seen.add(agent)
+-            if agent not in self.groups:
++            old = self.groups.get(agent)
++            if old is None:
+                 self.groups[agent] = entry
+-            else:
+-                self.groups[agent] = merge_entries(self.groups[agent], entry)
++            elif old is not entry:
++                to_merge.setdefault(old, set()).add(agent)
++        if not to_merge:
++            return
++        refs = self._merged_refs
++        entry_agents = set(entry.useragents)
++        for old, agents in to_merge.items():
++            if refs.get(old) == len(agents):
++                # No other agent shares this merged entry, so it can be
++                # extended in place instead of being copied again.
++                _merge_into(old, entry, entry_agents)
++                continue
++            new = merge_entries(old, entry, entry_agents)
++            for agent in agents:
++                self.groups[agent] = new
++            refs[new] = len(agents)
++            if old in refs:
++                refs[old] -= len(agents)
++                if not refs[old]:
++                    del refs[old]
+ 
+     def parse(self, lines):
+         """Parse the input lines from a robots.txt file.
+@@ -171,7 +189,8 @@ class RobotFileParser:
+         entry = self.groups.get(useragent.lower())
+         if entry is not None:
+             return entry
+-        for entry in self.groups.values():
++        # Many agents can share the same entry; check each entry only once.
++        for entry in dict.fromkeys(self.groups.values()):
+             if entry.applies_to(useragent):
+                 return entry
+         return self.groups.get('*')
+@@ -358,10 +377,21 @@ def translate_pattern(path):
+     parts[-1] = f'.*{parts[-1]}'
+     return ''.join(parts)
+ 
+-def merge_entries(e1, e2):
++def merge_entries(e1, e2, e2_agents=None):
+     entry = Entry()
+-    entry.useragents = list(filter(set(e2.useragents).__contains__, e1.useragents))
+-    entry.rulelines = e1.rulelines + e2.rulelines
+-    entry.delay = e1.delay if e2.delay is None else e2.delay
+-    entry.req_rate = e1.req_rate if e2.req_rate is None else e2.req_rate
++    entry.useragents = e1.useragents
++    entry.rulelines = e1.rulelines.copy()
++    entry.delay = e1.delay
++    entry.req_rate = e1.req_rate
++    _merge_into(entry, e2, e2_agents)
+     return entry
++
++def _merge_into(e1, e2, e2_agents=None):
++    if e2_agents is None:
++        e2_agents = set(e2.useragents)
++    e1.useragents = list(filter(e2_agents.__contains__, e1.useragents))
++    e1.rulelines.extend(e2.rulelines)
++    if e2.delay is not None:
++        e1.delay = e2.delay
++    if e2.req_rate is not None:
++        e1.req_rate = e2.req_rate
+diff --git a/Misc/NEWS.d/next/Library/2026-11-22-15-56-36.gh-issue-162282.QjKIag.rst b/Misc/NEWS.d/next/Library/2026-11-22-15-56-36.gh-issue-162282.QjKIag.rst
+new file mode 100644
+index 0000000..70f534e
+--- /dev/null
++++ b/Misc/NEWS.d/next/Library/2026-11-22-15-56-36.gh-issue-162282.QjKIag.rst
+@@ -0,0 +1,3 @@
++Fix quadratic-time cost in :mod:`urllib.robotparser` when many groups share
++a ``User-agent:``, and when a group with many user agents is checked for
++a user agent that is not listed explicitly.

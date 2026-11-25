@@ -8,11 +8,15 @@
 #   pocheck     settings.xml parses; each strings.po is well formed, without a duplicate id; the ids of Hades in
 #               Estuary's files in order (po_check.py)
 #   picheck     make-playerinfo.py --check (system/hades is what it makes of Estuary's files); validate_skin.py (the
-#               strings in four languages, $VAR/$MAP/includes, the properties read and published, tabs and pages) with
+#               strings in four languages, $VAR/$MAP/includes, the properties read and published, tabs and pages, and
+#               no text of the pages that says TV-led in native Dolby Vision Low-Latency) with
 #               its broken copies (validate_skin_mutants.py); validate_hades_dialog.py (the generated pages)
 #   skinpasses  the row of the GPU time of the passes (hades.dv.passes) in the generated dialog and in Estuary's file,
 #               and every text of the panel fits its label as Kodi measures it, in en_gb, es_es, es_ar and es_mx
 #               (skin_check.py: FreeType through ctypes, the fonts of the tree)
+#   settings    the layout of the settings (settings_layout_check.py): every setting id of 1.1 still there (a value set
+#               in 1.1 is kept, and 1.1 reads it back), the groups and their order, levels, parents, the override files
+#               of the build, the strings of the layout in four languages; with its broken copies
 # usage: run-playerinfo.sh all | verdict [<log>] | <stage>...      (settings: lib/regress.sh)
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -244,4 +248,68 @@ PY
   else rg_item skin-passes FAILED "the row of the pass times: $r1 in the generated dialog, $i1 in Estuary's file; the copy without it: $r2"; fi
 }
 
-rg_main "pocheck picheck skinpasses" "$@"
+# --------------------------------------------------------------------------------------------------- settings
+# The override files of the build that name settings: LibreELEC's appliance files and Kodi's linux.xml
+st_overrides() {
+  local LE
+  LE=$(cd "$HERE/../../.." && pwd)
+  echo "$LE/packages/mediacenter/kodi/config/appliance.xml $LE/packages/mediacenter/kodi/config/appliance-gbm.xml" \
+    "$LE/packages/mediacenter/kodi/config/appliance-gbm-generic.xml $1/system/settings/linux.xml"
+}
+# st_mutant <name> <file of the tree> <python: t changed> <what> [<extra override file>]: a tree of links with that file
+# changed (the change must apply); settings_layout_check.py must fail it
+st_mutant() {
+  local M=$RG_W/st-$1 f=$2 L
+  rg_fresh "$M"
+  cp -as "$K/." "$M/" || { rg_item "settings-mutant-$1" FAILED "the tree of links"; return; }
+  rm -f "$M/$f"
+  if ! $RG_PY -c "import sys; t = open(sys.argv[1], encoding='utf-8').read(); t0 = t; $3; assert t != t0, 'the change does not apply'; open(sys.argv[2], 'w', encoding='utf-8').write(t)" "$K/$f" "$M/$f"; then
+    rg_item "settings-mutant-$1" FAILED "the mutant does not apply to $f: $4"; rg_rm "$M"; return
+  fi
+  L=$RG_W/logs/settings-mutant-$1.log
+  # shellcheck disable=SC2046
+  rg_log "$L" $RG_PY "$HERE/settings_layout_check.py" "$M" "$HERE/ref/settings-ids-1.1.txt" $(st_overrides "$M") ${5:-}
+  rg_item "settings-mutant-$1" "$([ "$(rg_exit "$L")" = 1 ] && grep -a -q '^SETTINGS-LAYOUT FAILED' "$L" && echo PASSED || echo FAILED)" \
+    "$4: exit $(rg_exit "$L"); $(grep -a -m1 '^FAIL' "$L" | cut -c1-120)"
+  rg_rm "$M"
+}
+stage_settings() {
+  setup
+  local L=$RG_W/logs/settings-layout.log v X=system/settings/settings.xml
+  # shellcheck disable=SC2046
+  rg_log "$L" $RG_PY "$HERE/settings_layout_check.py" "$K" "$HERE/ref/settings-ids-1.1.txt" $(st_overrides "$K")
+  v=$(rg_pass "$L" '^SETTINGS-LAYOUT ALL PASSED')
+  rg_item settings-layout "$(rg_say "$v")" "$(rg_rest "$v"); $(grep -a -c '^ok' "$L") checks ok"
+  # its other direction: a setting of 1.1 gone, the setting of Kodi back where it was, a child before its parent, an
+  # override file that names a setting where it no longer is, a translation missing
+  st_mutant gone $X "import re; t = re.sub(r'\n[ \t]*<setting id=\"videoscreen.hadesdvmenus\".*?</setting>', '', t, count=1, flags=re.S)" \
+    "a copy without the setting Dolby Vision for the menus (the value of 1.1 would be lost)"
+  st_mutant back $X "t = t.replace('label=\"13436\" help=\"62502\"', 'label=\"13436\" help=\"36299\"', 1)" \
+    "a copy where Adjust display HDR mode has Kodi's help again"
+  st_mutant parent $X "t = t.replace('<setting id=\"videoscreen.hadeshdrassdr\" parent=\"winsystem.ishdrdisplay\"', '<setting id=\"videoscreen.hadeshdrassdr\" parent=\"videoscreen.hadesdvnative\"', 1)" \
+    "a copy where Play HDR videos as SDR hangs from a setting of a later group"
+  st_mutant unmapped xbmc/settings/dialogs/GUIDialogSettingsBase.cpp "t = t.replace('if (labelId == 62082 || labelId == 62083)', 'if (labelId == -62082)', 1)" \
+    "a copy where the upscalers AiUpscale (film) and (animation) are not mapped to Estuary (English in Spanish)"
+  cat > "$RG_W/override-old-place.xml" <<'XML'
+<?xml version="1.0" encoding="utf-8" ?>
+<settings version="1">
+  <section id="system">
+    <category id="display">
+      <group id="8">
+        <setting id="videoscreen.hadeshdrassdr">
+          <visible>false</visible>
+        </setting>
+      </group>
+    </category>
+  </section>
+</settings>
+XML
+  st_mutant override addons/skin.estuary/language/resource.language.en_gb/strings.po "t = t + ' '" \
+    "an override file that names Play HDR videos as SDR in the group it was in up to 1.1" "$RG_W/override-old-place.xml"
+  st_mutant spanish addons/skin.estuary/language/resource.language.es_ar/strings.po \
+    "import re; t = re.sub(r'(msgctxt \"#54500\"\nmsgid \"[^\"]*\"\nmsgstr \")[^\"]*\"', r'\1\"', t, count=1)" \
+    "a copy of es_ar without the translation of the heading Other videos as Dolby Vision"
+  rm -f "$RG_W/override-old-place.xml"
+}
+
+rg_main "pocheck picheck skinpasses settings" "$@"

@@ -37,9 +37,13 @@ case "${LINUX}" in
     PKG_PATCH_DIRS="default rockchip"
     ;;
   *)
-    PKG_VERSION="7.3.5"
-    PKG_SHA256="8f293f83d54f0b7b9be56863ebc5e4ea79d73e530b4ae55c572be97ef39f0990"
-    PKG_URL="https://www.kernel.org/pub/linux/kernel/v${PKG_VERSION/.*/}.x/${PKG_NAME}-${PKG_VERSION}.tar.xz"
+    # Hades: Linux 7.4-rc4, the commit of Linus Torvalds' signed tag v7.4-rc4. kernel.org has no tarball of a
+    # release candidate and the snapshots of git.kernel.org came back empty; this archive of the GitHub mirror is,
+    # entry by entry, the tree of that signed tag (checked when it was taken).
+    PKG_VERSION="b6a9fa34ce4187cb69d3c588a4bbffc31ce5db8f" # 7.4-rc4
+    PKG_SHA256="3c9a5ee789133c1581fbc3db6b02a9b4db0ea210e34fe5efe76e309955071f30"
+    PKG_URL="https://github.com/torvalds/linux/archive/${PKG_VERSION}.tar.gz"
+    PKG_SOURCE_NAME="linux-${LINUX}-${PKG_VERSION}.tar.gz"
     PKG_PATCH_DIRS="default"
     case ${DEVICE} in
       RK3288|RK3328|RK3399)

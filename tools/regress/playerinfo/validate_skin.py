@@ -176,10 +176,10 @@ for tid in ('5556', '5551', '5557', '5555', '5558', '5559'):
     if tid not in pages:
         fail('no page for tab %s' % tid)
 for p in pages:
-    if p not in tabs and p not in ('5560', '5561', '5562'):
+    if p not in tabs and p not in ('5560', '5561', '5562', '5563'):
         fail('page %s has no tab' % p)
 for tid, c in tabs.items():
-    if tid in ('5560', '5561', '5562'):
+    if tid in ('5560', '5561', '5562', '5563'):
         continue
     if 'SetProperty(PlayerInfoDialogFocus,%s,Home)' % tid not in alltext(c):
         fail('tab %s does not set its page' % tid)
@@ -201,6 +201,10 @@ equivalent = {
     # in kHz
     'Player.Process(audiobitspersample)': 'hades.audio.srcbits',
     'Player.Process(audiosamplerate)': 'hades.audio.srcrate',
+    # ALLM, QMS and FreeSync of the TV, on one row since this version (those declared)
+    'hades.tv.allm': 'hades.tv.features',
+    'hades.tv.qms': 'hades.tv.features',
+    'hades.tv.freesync': 'hades.tv.features',
 }
 for old_label, new_text in equivalent.items():
     if old_label in old_labels and new_text in texts:
@@ -211,6 +215,112 @@ for l in gone:
 notes.append('labels of the reference: %d, of the panel: %d' % (len(old_labels), len(new_labels)))
 if WRITE:
     open(WRITE, 'w', encoding='utf-8').write(''.join(l + '\n' for l in sorted(new_labels)))
+
+# 7. what the panel says of the output in native Dolby Vision Low-Latency, which Hades maps to the display: no text of
+# the variables that its pages show says "TV-led" (issue #25: the Output row said "Native, TV-led"); and, the other
+# direction (the evaluation below sees the condition), in Standard the Output row says it. The conditions are evaluated
+# for the properties of the state below (String.IsEqual, String.IsEmpty, !, +, |, [ ]; anything else is false). The
+# display's own capability (hades.dv.display: "Dolby Vision Standard (TV-led)" where it takes Standard) is not a
+# property of the state: it says what the display takes, not what it is sent.
+EN = {n: v[0] for n, v in estuary.items()}
+TV_LED = 'TV-led'
+ATOM = r'[A-Za-z][A-Za-z0-9_.]*(?:\((?:[^()]|\([^()]*\))*\))?'
+
+
+def cond_true(cond, state):
+    toks = re.findall(r'[!+|\[\]]|' + ATOM, cond)
+    pos = [0]
+
+    def atom(t):
+        m = re.match(r'String\.IsEqual\((.*),([^,]*)\)$', t)
+        if m:
+            return state.get(m.group(1).strip(), '').lower() == m.group(2).strip().lower()
+        m = re.match(r'String\.IsEmpty\((.*)\)$', t)
+        if m:
+            return state.get(m.group(1).strip(), '') == ''
+        return False
+
+    def unary():
+        t = toks[pos[0]]
+        pos[0] += 1
+        if t == '!':
+            return not unary()
+        if t == '[':
+            v = disj()
+            pos[0] += 1  # the ']'
+            return v
+        return atom(t)
+
+    def conj():
+        v = unary()
+        while pos[0] < len(toks) and toks[pos[0]] == '+':
+            pos[0] += 1
+            v = unary() and v
+        return v
+
+    def disj():
+        v = conj()
+        while pos[0] < len(toks) and toks[pos[0]] == '|':
+            pos[0] += 1
+            v = conj() or v
+        return v
+
+    return disj()
+
+
+def var_text(defs, name, state, depth=0):
+    v = defs.get(name)
+    if v is None or depth > 8:
+        return ''
+    for value in v.findall('value'):
+        c = value.get('condition')
+        if c is None or cond_true(c, state):
+            t = value.text or ''
+            t = re.sub(r'\$ADDON\[skin\.estuary (\d+)\]', lambda m: EN.get(int(m.group(1)), ''), t)
+            t = re.sub(r'\$VAR\[([A-Za-z0-9_]+)\]', lambda m: var_text(defs, m.group(1), state, depth + 1), t)
+            return re.sub(r'\$INFO\[[^\]]*\]', '', t)
+    return ''
+
+
+def used_vars(defs, text):
+    seen, todo = set(), set(re.findall(r'\$(?:ESC)?VAR\[\s*([A-Za-z0-9_]+)', text))
+    while todo:
+        n = todo.pop()
+        if n in seen or n not in defs:
+            continue
+        seen.add(n)
+        todo |= set(re.findall(r'\$(?:ESC)?VAR\[\s*([A-Za-z0-9_]+)', alltext(defs[n])))
+    return seen
+
+
+def dv_state(transport):
+    p = 'Window(Home).Property(%s)'
+    return {p % 'hades.dv.state': 'native', p % 'hades.dv.transport': transport, p % 'hades.out.signal': 'dv',
+            'VideoPlayer.HdrType': 'dolbyvision'}
+
+
+def check_low_latency(where, defs, shown_text):
+    shown = used_vars(defs, shown_text)
+    ll = dv_state('lowlatency')
+    for n in sorted(n for n in shown if TV_LED in var_text(defs, n, ll)):
+        fail('%s: in native Dolby Vision Low-Latency $VAR[%s] says "%s"' % (where, n, var_text(defs, n, ll)))
+    std = var_text(defs, 'HadesOvDVOutVar', dv_state('source'))
+    if TV_LED not in std:
+        fail('%s: in native Dolby Vision Standard $VAR[HadesOvDVOutVar] does not say %s (%r): the check of '
+             'Low-Latency sees nothing' % (where, TV_LED, std))
+    return len(shown)
+
+
+n_ll = check_low_latency('Estuary', own_vars, texts)
+notes.append('Low-Latency: %d variables that the panel shows, none says %s' % (n_ll, TV_LED))
+# ... and the same of the pages made for every skin (system/hades), where the tree has them
+gen_inc, gen_dlg = ROOT + 'system/hades/HadesIncludes.xml', ROOT + 'system/hades/DialogHadesPlayerInfo.xml'
+if os.path.exists(gen_inc) and os.path.exists(gen_dlg):
+    g_inc, g_dlg = parse(gen_inc), parse(gen_dlg)
+    if g_inc is not None and g_dlg is not None:
+        g_defs = {v.get('name'): v for v in g_inc.iter('variable')}
+        n_ll = check_low_latency('system/hades', g_defs, alltext(g_dlg) + ' ' + alltext(g_inc))
+        notes.append('Low-Latency in system/hades: %d variables that its pages show, none says %s' % (n_ll, TV_LED))
 
 print('\n'.join('note: ' + n for n in notes))
 if fails:

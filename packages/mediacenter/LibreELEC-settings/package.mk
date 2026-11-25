@@ -14,6 +14,8 @@ PKG_DEPENDS_TARGET="toolchain Python3 connman dbussy"
 if [ "${TARGET_ARCH}" = "x86_64" ]; then
   PKG_DEPENDS_TARGET+=" hades-check"
 fi
+# Hades: the update channel of LibreELEC Hades, which the add-on reads (hades-update-channel)
+PKG_DEPENDS_TARGET+=" hades-update-channel"
 PKG_LONGDESC="LibreELEC-settings: is a settings dialog for LibreELEC"
 
 PKG_MAKE_OPTS_TARGET="ADDON_VERSION=${OS_VERSION} \

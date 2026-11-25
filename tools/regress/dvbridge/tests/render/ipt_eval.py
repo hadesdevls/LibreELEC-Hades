@@ -3,7 +3,7 @@
 # Copyright (C) 2026 LibreELEC Hades
 #
 """LibreELEC Hades, TEST ONLY: the TV-led tunnel in YCbCr (what Hades sends for profiles 7 and 8) and in
-IPT-PQ-c2 (what licensed players are reported to send), both against an ideal 12-bit IPT-PQ-c2 reference, in the way
+IPT-PQ-c2 (what licensed players send), both against an ideal 12-bit IPT-PQ-c2 reference, in the way
 the DMDreview comparison does it (12-bit I, P, T codes; luma-only and colour synthetic pictures; merged steps).
 
 Inputs are composer output pictures h (CCM 001 5.4.3.3: 12-bit YCbCr 4:2:0, chroma at the top left, the RPU's
@@ -13,8 +13,9 @@ the profile 7 FEL stream (ccmC_*, which Hades' composer gives sample for sample)
   YCbCr transport: Hades' packer, emulated exactly (Y = h; the chroma of even rows as it is, of odd rows Lanczos 6 at
       half phase in integers, as dvbridge_source.c does); checked against the bytes of the bridge (mode check).
   IPT transport: from the same h, chroma to 4:4:4 with the same Lanczos 6 (columns too), YCbCr -> R'G'B' (RPU) ->
-      linear (PQ) -> LMS (RPU rgb_to_lms) -> crosstalk undone (the RGBtoLMS of profile 5 RPUs) -> PQ -> IPT (the
-      inverse of the YCCtoRGB of profile 5 RPUs) + (0, 1/2, 1/2), 12-bit full range; P and T of each pair from its
+      linear (PQ) -> LMS (RPU rgb_to_lms) -> crosstalk undone (the RGBtoLMS of the tunnel) -> PQ -> IPT (the
+      inverse of the YCCtoRGB of the tunnel) + (0, 1/2, 1/2), 12-bit full range; the matrices of the tunnel are those
+      that a licensed core sends (Hades' dvbridge_ipt.h, read on an Amlogic player with Dolby's IDK 2.6); P and T of each pair from its
       even pixel; in float64, and in float32 as a GPU shader would compute it.
   Ideal: the same chain in float64 from h with the chroma interpolated in float64 (no rounding), rounded once.
   A TV decodes the YCbCr transport to IPT itself: emulated in float64 (its best case), with linear chroma between
@@ -32,8 +33,10 @@ C1, C2, C3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
 RPU_YCC = np.array([[9574, 0, 13802], [9574, -1540, -5348], [9574, 17610, 0]], float) / 8192
 RPU_OFF = np.array([16777216, 134217728, 134217728], float) / 268435456
 RPU_LMS = np.array([[7222, 8771, 390], [2654, 12430, 1300], [0, 422, 15962]], float) / 16384
-P5_YCC = np.array([[8192, 799, 1681], [8192, -933, 1091], [8192, 267, -5545]], float) / 8192
-P5_LMS = np.array([[17081, -349, -349], [-349, 17081, -349], [-349, -349, 17081]], float) / 16384
+# the matrices of the IPT tunnel: those that a licensed core sends (until 2026-11: those of the RPUs of profile 5,
+# 8192 and 17081/-349, which differ in the last code of four coefficients)
+P5_YCC = np.array([[8194, 799, 1681], [8194, -933, 1091], [8194, 267, -5545]], float) / 8192
+P5_LMS = np.array([[17080, -348, -348], [-348, 17080, -348], [-348, -348, 17080]], float) / 16384
 IPT_OFF = np.array([0.0, 0.5, 0.5])
 
 

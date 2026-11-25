@@ -18,7 +18,7 @@ export LC_ALL=C TZ=UTC
 HERE=$(cd "$(dirname "$0")" && pwd)
 : "${REGRESS_WORK:?set REGRESS_WORK to a work folder}"
 # the groups, the longest first (measured: see README.md)
-REGRESS_GROUPS=${REGRESS_GROUPS:-"dvbridge-render dvbridge-meta fel kodi-host ffmpeg boot playerinfo nvkms"}
+REGRESS_GROUPS=${REGRESS_GROUPS:-"dvbridge-render dvbridge-meta fel kodi-host ffmpeg boot playerinfo nvkms bdj patches"}
 LANES=${REGRESS_LANES:-3}
 MEM=${REGRESS_MEM:-5G}
 S=$REGRESS_WORK/summary.txt

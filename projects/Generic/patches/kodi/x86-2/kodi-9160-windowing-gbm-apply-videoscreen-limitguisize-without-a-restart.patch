@@ -1,0 +1,196 @@
+From c848fa652bde1d31723e0f7eb8a246310bf773b3 Mon Sep 17 00:00:00 2001
+From: Dom Cobley <popcornmix@gmail.com>
+Date: Sat, 10 Oct 2026 20:20:40 +0100
+Subject: [PATCH] windowing/gbm: apply videoscreen.limitguisize without a
+ restart
+
+The limit is read while the mode list is built, so changing it did nothing
+until Kodi was restarted. Rebuild the mode list and re-apply the current
+mode when the setting changes, which recreates the GUI surface at the new
+size.
+
+The work is posted to the main thread rather than done in the callback.
+The callback can run on another thread (e.g. JSON-RPC), and it runs with
+the settings lock held, while applying a mode needs that lock on the main
+thread to write back videoscreen.screenmode, so applying it directly
+deadlocks.
+
+The mode re-applied is the one in use, so a refresh rate chosen for
+playback is kept. Rebuilding the list makes the current mode the desktop
+mode, so the previous desktop mode is restored afterwards; otherwise a
+change during playback leaves the display at the video's refresh rate
+when playback stops.
+
+The callback is registered for the lifetime of the object because
+applying the mode cycles the window system.
+
+On a Pi 4 with a 2160p display, switching between the limits now takes
+effect immediately and the GUI swapchain follows: 3x33.2MB unlimited,
+3x8.3MB at 1080p, 3x3.7MB at 720p.
+
+(cherry picked from commit 87d0f9721626ca63e64fe30c4113489ffb8bdd7a)
+(cherry picked from commit 5d4e5afb2834d47b1849ebda7a0944e5aab80dad)
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp | 52 +++++++++++++++++++++++++++--
+ xbmc/windowing/gbm/WinSystemGbm.h   | 10 +++++-
+ xbmc/windowing/gbm/drm/DRMUtils.cpp |  1 -
+ xbmc/windowing/gbm/drm/DRMUtils.h   |  3 ++
+ 4 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index fd26465..da035f1 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -54,6 +54,7 @@
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "settings/lib/Setting.h"
++#include "settings/lib/SettingsManager.h"
+ #include "utils/DRMHelpers.h"
+ #include "utils/DisplayIdentity.h"
+ #include "utils/DisplayInfo.h"
+@@ -166,9 +167,18 @@ CWinSystemGbm::CWinSystemGbm()
+ {
+   m_dpms = std::make_shared<CGBMDPMSSupport>();
+   m_libinput->Start();
++
++  // registered for the lifetime of the object: applying the setting cycles the window system,
++  // which would otherwise unregister the callback that is doing the applying
++  CServiceBroker::GetSettingsComponent()->GetSettings()->GetSettingsManager()->RegisterCallback(
++      this, {SETTING_VIDEOSCREEN_LIMITGUISIZE});
+ }
+ 
+-CWinSystemGbm::~CWinSystemGbm() = default;
++CWinSystemGbm::~CWinSystemGbm()
++{
++  CServiceBroker::GetSettingsComponent()->GetSettings()->GetSettingsManager()->UnregisterCallback(
++      this);
++}
+ 
+ const std::string CWinSystemGbm::GetName()
+ {
+@@ -366,7 +376,7 @@ bool CWinSystemGbm::InitWindowSystem()
+   if (!settings)
+     return false;
+ 
+-  auto setting = settings->GetSetting("videoscreen.limitguisize");
++  auto setting = settings->GetSetting(SETTING_VIDEOSCREEN_LIMITGUISIZE);
+   if (setting)
+     setting->SetVisible(true);
+ 
+@@ -509,6 +519,44 @@ const char* CWinSystemGbm::StereoAdaptorReason() const
+   return DV_DUAL_MODE::WhyNoStereo(COutputHandover::DualModeVerdict(*connector), nvidia);
+ }
+ 
++void CWinSystemGbm::OnSettingChanged(const std::shared_ptr<const CSetting>& setting)
++{
++  if (!setting || setting->GetId() != SETTING_VIDEOSCREEN_LIMITGUISIZE)
++    return;
++
++  // post rather than call: this can run off the main thread (e.g. JSON-RPC), and it runs with the
++  // settings lock held, which applying the mode needs on the main thread to write back
++  // videoscreen.screenmode
++  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_CALLBACK, -1, -1, &m_limitGuiSizeCallback);
++}
++
++void CWinSystemGbm::ApplyLimitGuiSize(void* userptr)
++{
++  auto* winSystem = static_cast<CWinSystemGbm*>(userptr);
++
++  // the limit is applied as the mode list is built, so the list has to be rebuilt and the
++  // current mode re-applied for the GUI to be recreated at the new size
++  CDisplaySettings& displaySettings = CDisplaySettings::GetInstance();
++  const RESOLUTION_INFO desktop = displaySettings.GetResolutionInfo(RES_DESKTOP);
++  winSystem->UpdateResolutions();
++
++  // UpdateResolutions() makes the current mode the desktop mode, which during playback is the
++  // mode chosen for the video rather than the one to return to when it stops
++  for (size_t i = RES_CUSTOM; i < displaySettings.ResolutionInfoSize(); ++i)
++  {
++    const RESOLUTION_INFO& res = displaySettings.GetResolutionInfo(i);
++    if (res.iScreenWidth == desktop.iScreenWidth && res.iScreenHeight == desktop.iScreenHeight &&
++        res.fRefreshRate == desktop.fRefreshRate && res.dwFlags == desktop.dwFlags)
++    {
++      displaySettings.GetResolutionInfo(RES_DESKTOP) = res;
++      break;
++    }
++  }
++
++  CGraphicContext& gfx = winSystem->GetGfxContext();
++  gfx.SetVideoResolution(gfx.GetVideoResolution(), true);
++}
++
+ bool CWinSystemGbm::ResizeWindow(int newWidth, int newHeight, int newLeft, int newTop)
+ {
+   return true;
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index de9ac39..12f6d6a 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -28,6 +28,8 @@
+ #include "drm/DRMObject.h"
+ #include "drm/DRMUtils.h"
+ #include "drm/DRMWake.h"
++#include "messaging/ApplicationMessenger.h"
++#include "settings/lib/ISettingCallback.h"
+ #include "threads/CriticalSection.h"
+ #include "threads/SystemClock.h"
+ #include "utils/DisplayInfo.h"
+@@ -67,7 +69,7 @@ class COutputHandover;
+ class CDRMAtomic;
+ class CDRMDisplayWatch;
+ 
+-class CWinSystemGbm : public CWinSystemBase
++class CWinSystemGbm : public CWinSystemBase, public ISettingCallback
+ {
+ public:
+   CWinSystemGbm();
+@@ -267,6 +269,8 @@ public:
+   bool CanDoWindowed() override { return false; }
+   void UpdateResolutions() override;
+ 
++  void OnSettingChanged(const std::shared_ptr<const CSetting>& setting) override;
++
+   bool UseLimitedColor() override;
+ 
+   bool Hide() override;
+@@ -1178,6 +1182,10 @@ private:
+ 
+   //! The blob of the HDR metadata queued (SetHDR(): CHDRSignal), kept while its id may be
+   //! queued again
++  static void ApplyLimitGuiSize(void* userptr);
++
++  KODI::MESSAGING::ThreadMessageCallback m_limitGuiSizeCallback{ApplyLimitGuiSize, this};
++
+   CDRMPropertyBlob m_hdrBlob;
+   //! The values queued last for the Colorspace and HDR_OUTPUT_METADATA of the connector, if any
+   std::optional<uint64_t> m_queuedColorspace;
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index d79a5d4..6339bc6 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -36,7 +36,6 @@ using namespace KODI::WINDOWING::GBM;
+ 
+ namespace
+ {
+-const std::string SETTING_VIDEOSCREEN_LIMITGUISIZE = "videoscreen.limitguisize";
+ 
+ // Hades: the outputs that the user keeps on, read once, the first time they are asked for
+ const KEEP_OUTPUTS::CKeepOutputs& KeptOutputs()
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 845a52a..5c1e114 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -36,6 +36,9 @@ namespace WINDOWING
+ {
+ namespace GBM
+ {
++
++constexpr const char* SETTING_VIDEOSCREEN_LIMITGUISIZE = "videoscreen.limitguisize";
++
+ // https://github.com/torvalds/linux/blob/7d0a66e4bb9081d75c82ec4957c50034cb0ea449/drivers/
+ // gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c#L683-L692
+ //
+-- 
+2.53.0
+

@@ -50,7 +50,9 @@ WHAT IS WRITTEN HERE
       While the switch is on, the boot menu also starts the system with initcall_debug=1 (and a larger
       log for the kernel, log_buf_len=1M, so that its first lines stay): it writes a line in the journal
       when it starts each driver and one when the driver is ready, so that the journal of a start that
-      stopped while drivers started says which one never came back. Turned on in
+      stopped while drivers started says which one never came back: not-returned.txt lists the
+      drivers that the journal of that start shows starting and not back by its last line, each with
+      the last line it wrote (early-not-returned.txt, the same from early-kernel-log.txt.gz). Turned on in
       the settings, or by the installer for Windows, that holds from the next start; with the name of the
       file changed by hand, from the start after the next one. Turned off, the menu goes back to 0.
 

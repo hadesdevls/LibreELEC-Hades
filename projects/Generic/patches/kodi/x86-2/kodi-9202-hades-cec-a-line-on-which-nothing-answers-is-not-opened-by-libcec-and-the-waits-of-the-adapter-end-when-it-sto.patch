@@ -1,0 +1,265 @@
+From a6b00806dae05fedcffdf9d04beca2809f7a6384 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:50:00 +0000
+Subject: [PATCH] [Hades][CEC] A line on which nothing answers is not opened by
+ libCEC, and the waits of the adapter end when it stops
+
+Issue 24 (report of 2026-11-20 20:15:50): after the PC woke at 20:03:45, the
+CEC adapter of a DisplayPort output (DP-2) failed to open at 20:03:57, and
+Kodi wrote nothing more of it until it ended at 20:06:16. The kernel log
+says why: on that line every message "timed out" and every logical address
+was "polling ... failed with tx_status=0x00a0" (timeout after the retries),
+from Kodi's start on; libCEC claimed addresses, polled the TV and reported
+itself over and over, and its second open did not return in two minutes.
+Kodi did not try the adapter again meanwhile, and the end of Kodi waited
+11 s for the thread of the adapter (StopThread()), as sleep would.
+
+Before libCEC opens an adapter of the kernel, the line is asked once now:
+a poll from the unregistered address to the TV (0xf0, which the kernel
+sends on an adapter without a logical address), blocking. A result of the
+line, an acknowledgement or a negative one, says that it works, and libCEC
+opens it as before; a refused poll, or one aborted, says nothing, and so
+does an adapter that has logical addresses (in use): libCEC opens it as
+before. Two polls in a row with no result of the line (a timeout, an error,
+lost arbitration) give it up: libCEC is not asked to open it, kodi.log says
+so once, and it is asked again every 30 s, so that a line that comes alive
+(a TV switched on, another cable) is opened then (CEC_LINE). The waits of
+the thread of the adapter between attempts end when the thread is stopped,
+at sleep or at the end of Kodi, instead of sleeping out their 10 s.
+---
+ xbmc/peripherals/devices/CMakeLists.txt       |  1 +
+ .../devices/PeripheralCecAdapter.cpp          | 72 +++++++++++++++-
+ .../devices/PeripheralCecAdapter.h            |  6 ++
+ xbmc/peripherals/devices/PeripheralCecLine.h  | 84 +++++++++++++++++++
+ 4 files changed, 162 insertions(+), 1 deletion(-)
+ create mode 100644 xbmc/peripherals/devices/PeripheralCecLine.h
+
+diff --git a/xbmc/peripherals/devices/CMakeLists.txt b/xbmc/peripherals/devices/CMakeLists.txt
+index 5320fc0..984f31d 100644
+--- a/xbmc/peripherals/devices/CMakeLists.txt
++++ b/xbmc/peripherals/devices/CMakeLists.txt
+@@ -26,6 +26,7 @@ if(TARGET ${APP_NAME_LC}::CEC)
+   list(APPEND SOURCES PeripheralCecAdapter.cpp)
+   list(APPEND HEADERS PeripheralCecAdapter.h
+                       PeripheralCecKeys.h
++                      PeripheralCecLine.h
+                       PeripheralCecPicture.h)
+ endif()
+ 
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+index 699fa7c..6f9061f 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -383,9 +383,36 @@ bool CPeripheralCecAdapter::OpenConnection(void)
+       CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(36000), strMessage);
+ 
+   bool bConnectionFailedDisplayed(false);
++  // Hades: polls of the line in a row that got no result, and whether that was told
++  int deadInRow = 0;
++  bool deadTold = false;
+ 
+   while (!m_bStop && !bIsOpen)
+   {
++    // Hades: a line on which nothing answers is not opened by libCEC, whose open waits for minutes
++    // there; it is asked again later (CEC_LINE)
++    const CEC_LINE::Line line = AskLine();
++    deadInRow = line == CEC_LINE::Line::DEAD ? deadInRow + 1 : 0;
++    if (CEC_LINE::GivenUp(deadInRow))
++    {
++      if (!deadTold)
++        CLog::Log(LOGWARNING,
++                  "CEC: nothing answers on the line of the adapter {}: polls of the TV got no result "
++                  "of the line, only timeouts or errors ({} in a row), as every message would. "
++                  "libCEC does not open it (its open would wait for minutes); the line is asked "
++                  "again every {} s. A DisplayPort output whose converter passes no CEC does this",
++                  m_strComPort, deadInRow, CEC_LINE::AGAIN_SECONDS);
++      deadTold = true;
++      WaitUnlessStopped(std::chrono::seconds(CEC_LINE::AGAIN_SECONDS));
++      continue;
++    }
++    if (deadTold && line == CEC_LINE::Line::ALIVE)
++    {
++      CLog::Log(LOGINFO, "CEC: the line of the adapter {} answers now: libCEC opens it",
++                m_strComPort);
++      deadTold = false;
++    }
++
+     if ((bIsOpen = m_cecAdapter->Open(m_strComPort.c_str(), 10000)) == false)
+     {
+       // display warning: couldn't initialise libCEC
+@@ -397,7 +424,8 @@ bool CPeripheralCecAdapter::OpenConnection(void)
+             CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(36012));
+       bConnectionFailedDisplayed = true;
+ 
+-      CThread::Sleep(10000ms);
++      // (Hades: a wait that ends when the thread is stopped, at sleep or at the end of Kodi)
++      WaitUnlessStopped(10000ms);
+     }
+   }
+ 
+@@ -2064,6 +2092,48 @@ void CPeripheralCecAdapter::ProcessActivateSource(void)
+   }
+ }
+ 
++CEC_LINE::Line CPeripheralCecAdapter::AskLine()
++{
++#if defined(TARGET_LINUX)
++  if (!m_strComPort.starts_with("/dev/cec"))
++    return CEC_LINE::Line::UNKNOWN;
++  const int fd = open(m_strComPort.c_str(), O_RDWR | O_CLOEXEC);
++  if (fd < 0)
++    return CEC_LINE::Line::UNKNOWN;
++  // (an adapter that has logical addresses is in use, by libCEC or by another program: not asked)
++  struct cec_log_addrs addrs = {};
++  if (ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &addrs) != 0 || addrs.log_addr_mask != 0)
++  {
++    close(fd);
++    return CEC_LINE::Line::UNKNOWN;
++  }
++  // a poll from the unregistered address to the TV, blocking: the kernel returns once the line
++  // gave a result or its retries ended
++  struct cec_msg poll = {};
++  poll.len = 1;
++  poll.msg[0] = 0xf0;
++  const bool transmitted = ioctl(fd, CEC_TRANSMIT, &poll) == 0;
++  close(fd);
++  const CEC_LINE::Line line = CEC_LINE::Of(transmitted, poll.tx_status);
++  CLog::Log(LOGDEBUG, "CEC: a poll of the TV on the line of {}: {} (tx_status 0x{:02x})",
++            m_strComPort,
++            line == CEC_LINE::Line::ALIVE  ? "a result of the line"
++            : line == CEC_LINE::Line::DEAD ? "no result of the line"
++                                           : "nothing said",
++            poll.tx_status);
++  return line;
++#else
++  return CEC_LINE::Line::UNKNOWN;
++#endif
++}
++
++void CPeripheralCecAdapter::WaitUnlessStopped(std::chrono::milliseconds duration)
++{
++  const auto until = std::chrono::steady_clock::now() + duration;
++  while (!m_bStop && std::chrono::steady_clock::now() < until)
++    CThread::Sleep(100ms);
++}
++
+ CEC_PICTURE::Verdict CPeripheralCecAdapter::JudgePicture(void)
+ {
+   using namespace CEC_PICTURE;
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.h b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+index 00f748f..d4e13c8 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.h
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+@@ -41,6 +41,7 @@ public:
+ 
+ #else
+ 
++#include "PeripheralCecLine.h"
+ #include "PeripheralCecPicture.h"
+ #include "PeripheralHID.h"
+ #include "XBDateTime.h"
+@@ -164,6 +165,11 @@ private:
+   //! Hades: whether the adapter is on the output with Kodi's picture (CEC_PICTURE::Decide()), with
+   //! a line in the log when that changes
+   CEC_PICTURE::Verdict JudgePicture(void);
++  //! Hades: whether the line of an adapter of the kernel answers at all, asked with a poll of the
++  //! TV before libCEC opens it (CEC_LINE); UNKNOWN for another adapter
++  CEC_LINE::Line AskLine();
++  //! Hades: a wait of the thread of the adapter that ends when the thread is stopped
++  void WaitUnlessStopped(std::chrono::milliseconds duration);
+   //! Hades: the configuration made again when Kodi's picture moves to another output
+   void ProcessPictureChange(void);
+   //! Hades: libCEC told whether a route to Kodi takes the TV's input through this adapter
+diff --git a/xbmc/peripherals/devices/PeripheralCecLine.h b/xbmc/peripherals/devices/PeripheralCecLine.h
+new file mode 100644
+index 0000000..ed9d0b3
+--- /dev/null
++++ b/xbmc/peripherals/devices/PeripheralCecLine.h
+@@ -0,0 +1,84 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace PERIPHERALS
++{
++namespace CEC_LINE
++{
++
++/*!
++ * \brief Hades: whether the CEC line of an adapter of the kernel answers at all
++ *
++ * libCEC opens an adapter of the kernel (/dev/cecN) and, before its open returns, claims a logical
++ * address, asks the TV for its vendor and sends what a new device sends; each message that gets no
++ * result waits for the kernel's timeout, and is sent again. On a line where no message gets a
++ * result at all (issue 24: the CEC adapter of a DisplayPort output whose converter passes no CEC,
++ * every message "timed out" in the kernel log, every logical address "polling ... failed with
++ * tx_status=0x00a0"), the open did not return for minutes: Kodi did not try the adapter again,
++ * and the thread of the adapter, stopped at sleep or at the end of Kodi, held those up until it
++ * returned (11 s at the end of Kodi in that report).
++ *
++ * So before libCEC opens it, the line is asked once: a poll from the unregistered address to the
++ * TV (the message 0xf0, which the kernel sends on an adapter that has no logical address yet). A
++ * result of the line, an acknowledgement or a negative one (no TV), says that it works, and libCEC
++ * opens it as before. Neither, only a timeout, an error or lost arbitration after the retries of the
++ * kernel, says that nothing answers. Anything else (the kernel refuses the poll, the adapter goes
++ * away) says nothing, and libCEC opens it as before.
++ */
++enum class Line
++{
++  ALIVE, //!< the poll got a result of the line: an acknowledgement, or a negative one
++  DEAD, //!< it got no result of the line at all
++  UNKNOWN, //!< the poll could not be asked, or ended without saying (aborted)
++};
++
++//! The bits of tx_status of the kernel's struct cec_msg (linux/cec.h), here so that this is tested
++//! without it
++inline constexpr uint8_t TX_OK = 1u << 0;
++inline constexpr uint8_t TX_ARB_LOST = 1u << 1;
++inline constexpr uint8_t TX_NACK = 1u << 2;
++inline constexpr uint8_t TX_LOW_DRIVE = 1u << 3;
++inline constexpr uint8_t TX_ERROR = 1u << 4;
++inline constexpr uint8_t TX_MAX_RETRIES = 1u << 5;
++inline constexpr uint8_t TX_ABORTED = 1u << 6;
++inline constexpr uint8_t TX_TIMEOUT = 1u << 7;
++
++//! \param transmitted the kernel took the poll (CEC_TRANSMIT returned 0)
++//! \param status its tx_status
++constexpr Line Of(bool transmitted, uint8_t status)
++{
++  if (!transmitted)
++    return Line::UNKNOWN;
++  if (status & (TX_OK | TX_NACK))
++    return Line::ALIVE;
++  if (status & TX_ABORTED)
++    return Line::UNKNOWN;
++  if (status & (TX_TIMEOUT | TX_ERROR | TX_ARB_LOST | TX_LOW_DRIVE))
++    return Line::DEAD;
++  return Line::UNKNOWN;
++}
++
++//! A line is given up on (libCEC is not asked to open it) after this many polls in a row that got no
++//! result: one may be a line that is busy
++inline constexpr int DEAD_IN_ROW = 2;
++
++//! How long the thread of the adapter waits before it asks a line that answered nothing again, in
++//! seconds: a TV switched on, or a cable put in, is found then
++inline constexpr int AGAIN_SECONDS = 30;
++
++constexpr bool GivenUp(int deadInRow)
++{
++  return deadInRow >= DEAD_IN_ROW;
++}
++
++} // namespace CEC_LINE
++} // namespace PERIPHERALS
+-- 
+2.53.0
+

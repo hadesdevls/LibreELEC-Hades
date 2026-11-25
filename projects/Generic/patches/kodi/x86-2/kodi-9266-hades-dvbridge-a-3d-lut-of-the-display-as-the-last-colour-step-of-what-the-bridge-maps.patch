@@ -1,0 +1,1367 @@
+From e38228f033acb9fc3d96f3094c363d3d49f5e034 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 01:10:00 +0000
+Subject: [PATCH] [Hades][dvbridge] A 3D LUT of the display as the last colour
+ step of what the bridge maps
+
+A display calibrated with a 3D LUT (Calman, ColourSpace, DisplayCAL, madVR)
+had no way to use it here: Kodi's own colour management (CColorManager) is
+of its desktop OpenGL renderer only, and the pictures that Hades maps to a
+display are drawn by the bridge.
+
+dvbridge_lut.c reads a LUT exactly as its file says, or refuses it with the
+reason:
+- .cube: LUT_3D_SIZE (2 to 256), TITLE, a domain and an input range of
+  [0, 1]; a 1D LUT, another domain, or any other keyword is refused
+  (libplacebo's pl_lut_parse_cube() passes unknown keywords over, reads a
+  file with a 1D and a 3D size as one of them, scales the output by the
+  domain and takes a first data line indented by a space for a header);
+- .3dl (Lustre, Nuke): a uniform shaper, or Nuke's and Flame's (0, 64, ...,
+  960, 1023), whose shorter last interval is kept by a shaper of two slopes
+  in the shader; the output depth of Mesh, or the smallest that holds the
+  values;
+- madVR's .3dlut, as Kodi's CColorManager reads it (version 1, RGB, 16-bit
+  output, uncompressed), with the range, primaries and transfer of its
+  parameters (video levels where it says none, as madVR and Kodi take it).
+Numbers are read in the C locale whatever the process's.
+
+The table goes to libplacebo's pl_shader_custom_lut(): tetrahedral
+interpolation from a 3D texture that sh_lut() makes RGBA32F on OpenGL ES 3
+(the first float format that is not emulated), so the LUT gives the file's
+values at its grid points.
+
+dvbridge_render_set_lut(): the LUT is applied in the output hook, after the
+tone mapping, the trims, the lift of the display's black and the hold of its
+peak, and before a picture kept as 10-bit codes is quantized (once), in
+dvbridge_render_hdr10() and dvbridge_render_plain() (not into the tunnel),
+and in Low-Latency, whose bars stay at code 0 also where they are not
+written first. Never for native Dolby Vision that the TV maps, whatever is
+set. A render with it that fails is made again without it, and the
+renderer says so (dvbridge_render_lut_failed()); the reference renderer of
+the byte check takes it from the main one. Without a LUT the hooks and
+their signatures are those before: every picture the same bytes.
+
+Measured on Mesa's zink (tools/regress of LibreELEC Hades, stage lut3d of
+dvbridge-render): every picture of the battery as its references with no
+LUT; an identity LUT of 17, 33 or 65 points gives every 10-bit and 12-bit
+code of the picture without it (the floats within 6e-8), mapped to SDR, to
+a projector of 150 cd/m2 with and without its black, as it is, as 10-bit
+codes and in Low-Latency; a known LUT in each format within 2e-7 of the
+same LUT applied in float64 to the picture without it. On the software
+renderer at 3840x2160 a whole render of a mapped picture took 10 to 25 %
+longer with a LUT (46.1 against 52.4 ms mapped to SDR, 70.7 against 78.6 in
+Low-Latency, on the quietest run), all of it in the pass that writes the
+output: four reads of the table a pixel, no pass of its own. On a graphics
+chip kodi.log gives the time of that pass.
+---
+ tools/dvbridge/CMakeLists.txt    |   3 +-
+ tools/dvbridge/dvbridge_lut.c    | 749 +++++++++++++++++++++++++++++++
+ tools/dvbridge/dvbridge_lut.h    | 128 ++++++
+ tools/dvbridge/dvbridge_render.c | 179 +++++++-
+ tools/dvbridge/dvbridge_render.h |  14 +
+ 5 files changed, 1054 insertions(+), 19 deletions(-)
+ create mode 100644 tools/dvbridge/dvbridge_lut.c
+ create mode 100644 tools/dvbridge/dvbridge_lut.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index f35f328..62d22bd 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -19,7 +19,8 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_source.c dvbridge_probe.c dvbridge_hdr10plus.c
+                                 dvbridge_measure.c dvbridge_measured.c
+                                 dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c
+-                                dvbridge_upscale.c dvbridge_scene_map.c dvbridge_l5area.c)
++                                dvbridge_upscale.c dvbridge_scene_map.c dvbridge_l5area.c
++                                dvbridge_lut.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_lut.c b/tools/dvbridge/dvbridge_lut.c
+new file mode 100644
+index 0000000..397b60a
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_lut.c
+@@ -0,0 +1,749 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#include "dvbridge_lut.h"
++
++#include <libplacebo/shaders/custom.h>
++#include <math.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* ------------------------------------------------------------------------------------------------- the text */
++
++struct text {
++    const char *at, *end;
++};
++
++static void say(char *why, size_t why_size, const char *fmt, ...)
++{
++    if (!why || !why_size)
++        return;
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(why, why_size, fmt, ap);
++    va_end(ap);
++}
++
++static bool blank(char c)
++{
++    return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
++}
++
++/* the next line, without the spaces at either end; false at the end of the text */
++static bool next_line(struct text *t, struct text *line, int *number)
++{
++    if (t->at >= t->end)
++        return false;
++    const char *eol = memchr(t->at, '\n', (size_t)(t->end - t->at));
++    const char *stop = eol ? eol : t->end;
++    line->at = t->at;
++    line->end = stop;
++    t->at = eol ? eol + 1 : t->end;
++    while (line->at < line->end && blank(*line->at))
++        ++line->at;
++    while (line->end > line->at && blank(line->end[-1]))
++        --line->end;
++    ++*number;
++    return true;
++}
++
++static void skip_blanks(struct text *t)
++{
++    while (t->at < t->end && blank(*t->at))
++        ++t->at;
++}
++
++/* A number as the C locale writes it (sign, digits, a point, digits, an exponent), whatever the locale of the
++ * process: the digits taken as an integer and scaled by a power of ten, each step rounded once */
++static bool number(struct text *t, double *out)
++{
++    skip_blanks(t);
++    const char *p = t->at;
++    bool negative = false;
++    if (p < t->end && (*p == '-' || *p == '+'))
++        negative = *p++ == '-';
++    uint64_t mantissa = 0;
++    int scale = 0, digits = 0, kept = 0;
++    while (p < t->end && *p >= '0' && *p <= '9') {
++        if (kept < 18) {
++            mantissa = mantissa * 10 + (uint64_t)(*p - '0');
++            kept += mantissa != 0;
++        } else {
++            ++scale;
++        }
++        ++p;
++        ++digits;
++    }
++    if (p < t->end && *p == '.') {
++        ++p;
++        while (p < t->end && *p >= '0' && *p <= '9') {
++            if (kept < 18) {
++                mantissa = mantissa * 10 + (uint64_t)(*p - '0');
++                kept += mantissa != 0;
++                --scale;
++            }
++            ++p;
++            ++digits;
++        }
++    }
++    if (!digits)
++        return false;
++    if (p < t->end && (*p == 'e' || *p == 'E')) {
++        const char *q = p + 1;
++        bool down = false;
++        if (q < t->end && (*q == '-' || *q == '+'))
++            down = *q++ == '-';
++        int e = 0, ed = 0;
++        while (q < t->end && *q >= '0' && *q <= '9' && e < 1000) {
++            e = e * 10 + (*q++ - '0');
++            ++ed;
++        }
++        if (!ed)
++            return false;
++        scale += down ? -e : e;
++        p = q;
++    }
++    /* the end of the number: a space or the end of the line */
++    if (p < t->end && !blank(*p))
++        return false;
++    double v = (double)mantissa;
++    if (scale < 0) {
++        double d = 1.0;
++        for (int i = 0; i < -scale && i < 400; ++i)
++            d *= 10.0;
++        v /= d;
++    } else {
++        for (int i = 0; i < scale && i < 400; ++i)
++            v *= 10.0;
++    }
++    *out = negative ? -v : v;
++    t->at = p;
++    return isfinite(*out);
++}
++
++/* a whole number (no point, no exponent) */
++static bool integer(struct text *t, long *out)
++{
++    skip_blanks(t);
++    const char *p = t->at;
++    if (p >= t->end || *p < '0' || *p > '9')
++        return false;
++    long v = 0;
++    while (p < t->end && *p >= '0' && *p <= '9') {
++        if (v > 100000000L)
++            return false;
++        v = v * 10 + (*p++ - '0');
++    }
++    if (p < t->end && !blank(*p))
++        return false;
++    *out = v;
++    t->at = p;
++    return true;
++}
++
++static bool at_end(struct text *t)
++{
++    skip_blanks(t);
++    return t->at >= t->end;
++}
++
++/* the keyword at the start of a line (letters, digits and _), and the line after it */
++static bool keyword(const struct text *line, const char *name, struct text *rest)
++{
++    const size_t n = strlen(name);
++    if ((size_t)(line->end - line->at) < n || memcmp(line->at, name, n))
++        return false;
++    if (line->at + n < line->end && !blank(line->at[n]))
++        return false;
++    rest->at = line->at + n;
++    rest->end = line->end;
++    return true;
++}
++
++static bool starts_alpha(const struct text *line)
++{
++    const char c = *line->at;
++    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
++}
++
++static uint64_t fnv1a(const void *bytes, size_t size, uint64_t h)
++{
++    const uint8_t *p = bytes;
++    for (size_t i = 0; i < size; ++i) {
++        h ^= p[i];
++        h *= 0x100000001b3ULL;
++    }
++    return h;
++}
++
++/* ---------------------------------------------------------------------------------------------- the LUT */
++
++static struct dvbridge_lut *make(int size, enum dvbridge_lut_format format)
++{
++    struct dvbridge_lut *lut = calloc(1, sizeof(*lut));
++    const size_t n = (size_t)size * size * size * 3;
++    if (!lut || !(lut->data = malloc(n * sizeof(float)))) {
++        free(lut);
++        return NULL;
++    }
++    lut->size = size;
++    lut->format = format;
++    lut->pl.size[0] = lut->pl.size[1] = lut->pl.size[2] = size;
++    lut->pl.data = lut->data;
++    lut->in = lut->out = (struct dvbridge_lut_range){0.0f, 255.0f};
++    return lut;
++}
++
++void dvbridge_lut_free(struct dvbridge_lut **lut)
++{
++    if (!lut || !*lut)
++        return;
++    free((*lut)->data);
++    free(*lut);
++    *lut = NULL;
++}
++
++static void finish(struct dvbridge_lut *lut, const void *bytes, size_t size)
++{
++    /* the signature of the table (libplacebo makes it again when it changes): the file's bytes and its format */
++    uint64_t h = fnv1a(bytes, size, 0xcbf29ce484222325ULL);
++    h = fnv1a(&lut->format, sizeof(lut->format), h);
++    lut->pl.signature = h ? h : 1;
++}
++
++/* a value of the output: finite, and not far outside [0, 1] (a LUT gives a signal; a little outside it is held
++ * within it after the LUT) */
++static bool sane(double v)
++{
++    return isfinite(v) && v >= -1.0 && v <= 2.0;
++}
++
++/* ----------------------------------------------------------------------------------------------- .cube */
++
++static struct dvbridge_lut *parse_cube(const char *bytes, size_t size, struct dvbridge_lut_range range,
++                                       char *why, size_t ws)
++{
++    struct text t = {bytes, bytes + size}, line, rest;
++    int number_of_line = 0, n = 0;
++    size_t values = 0, want = 0;
++    struct dvbridge_lut *lut = NULL;
++    char title[128] = "";
++    bool data = false;
++    while (next_line(&t, &line, &number_of_line)) {
++        if (line.at == line.end || *line.at == '#')
++            continue;
++        if (starts_alpha(&line)) {
++            if (data) {
++                say(why, ws, "a keyword after the values (line %d)", number_of_line);
++                goto fail;
++            }
++            double a, b, c;
++            long l;
++            if (keyword(&line, "TITLE", &rest)) {
++                skip_blanks(&rest);
++                size_t len = (size_t)(rest.end - rest.at);
++                const char *s = rest.at;
++                if (len >= 2 && s[0] == '"' && s[len - 1] == '"') {
++                    ++s;
++                    len -= 2;
++                }
++                if (len >= sizeof(title))
++                    len = sizeof(title) - 1;
++                memcpy(title, s, len);
++                title[len] = '\0';
++            } else if (keyword(&line, "LUT_3D_SIZE", &rest)) {
++                if (n) {
++                    say(why, ws, "LUT_3D_SIZE given twice (line %d)", number_of_line);
++                    goto fail;
++                }
++                if (!integer(&rest, &l) || !at_end(&rest) || l < 2 || l > DVBRIDGE_LUT_MAX_SIZE) {
++                    say(why, ws, "LUT_3D_SIZE is not a size from 2 to %d (line %d)", DVBRIDGE_LUT_MAX_SIZE,
++                        number_of_line);
++                    goto fail;
++                }
++                n = (int)l;
++            } else if (keyword(&line, "LUT_1D_SIZE", &rest) || keyword(&line, "LUT_1D_INPUT_RANGE", &rest)) {
++                say(why, ws, "a 1D LUT (line %d): only 3D LUTs are applied", number_of_line);
++                goto fail;
++            } else if (keyword(&line, "DOMAIN_MIN", &rest)) {
++                if (!number(&rest, &a) || !number(&rest, &b) || !number(&rest, &c) || !at_end(&rest) || a != 0.0 ||
++                    b != 0.0 || c != 0.0) {
++                    say(why, ws, "DOMAIN_MIN is not 0 0 0 (line %d): only LUTs of the domain [0, 1] are read",
++                        number_of_line);
++                    goto fail;
++                }
++            } else if (keyword(&line, "DOMAIN_MAX", &rest)) {
++                if (!number(&rest, &a) || !number(&rest, &b) || !number(&rest, &c) || !at_end(&rest) || a != 1.0 ||
++                    b != 1.0 || c != 1.0) {
++                    say(why, ws, "DOMAIN_MAX is not 1 1 1 (line %d): only LUTs of the domain [0, 1] are read",
++                        number_of_line);
++                    goto fail;
++                }
++            } else if (keyword(&line, "LUT_3D_INPUT_RANGE", &rest)) {
++                if (!number(&rest, &a) || !number(&rest, &b) || !at_end(&rest) || a != 0.0 || b != 1.0) {
++                    say(why, ws, "LUT_3D_INPUT_RANGE is not 0 1 (line %d): only LUTs of the domain [0, 1] are read",
++                        number_of_line);
++                    goto fail;
++                }
++            } else {
++                const char *e = line.at;
++                while (e < line.end && !blank(*e))
++                    ++e;
++                say(why, ws, "the keyword %.*s is not one that is read (line %d)", (int)(e - line.at > 40 ? 40 : e - line.at),
++                    line.at, number_of_line);
++                goto fail;
++            }
++            continue;
++        }
++        /* a line of values */
++        if (!n) {
++            say(why, ws, "values before LUT_3D_SIZE (line %d)", number_of_line);
++            goto fail;
++        }
++        if (!lut) {
++            lut = make(n, DVBRIDGE_LUT_CUBE);
++            if (!lut) {
++                say(why, ws, "no memory for a LUT of %d points a side", n);
++                goto fail;
++            }
++            want = (size_t)n * n * n;
++            data = true;
++        }
++        if (values >= want) {
++            say(why, ws, "more lines of values than LUT_3D_SIZE %d says (line %d)", n, number_of_line);
++            goto fail;
++        }
++        double v[3];
++        if (!number(&line, &v[0]) || !number(&line, &v[1]) || !number(&line, &v[2]) || !at_end(&line)) {
++            say(why, ws, "line %d is not three numbers", number_of_line);
++            goto fail;
++        }
++        for (int c = 0; c < 3; ++c) {
++            if (!sane(v[c])) {
++                say(why, ws, "a value far outside [0, 1] (line %d)", number_of_line);
++                goto fail;
++            }
++            /* red fastest, as libplacebo's table */
++            lut->data[values * 3 + (size_t)c] = (float)v[c];
++        }
++        ++values;
++    }
++    if (!n) {
++        say(why, ws, "no LUT_3D_SIZE");
++        goto fail;
++    }
++    if (values != want) {
++        say(why, ws, "%zu lines of values where LUT_3D_SIZE %d says %zu", values, n, want);
++        goto fail;
++    }
++    lut->in = lut->out = range;
++    snprintf(lut->title, sizeof(lut->title), "%s", title);
++    finish(lut, bytes, size);
++    return lut;
++fail:
++    dvbridge_lut_free(&lut);
++    return NULL;
++}
++
++/* ------------------------------------------------------------------------------------------------ .3dl */
++
++static struct dvbridge_lut *parse_3dl(const char *bytes, size_t size, struct dvbridge_lut_range range,
++                                      char *why, size_t ws)
++{
++    struct text t = {bytes, bytes + size}, line, rest;
++    int number_of_line = 0, n = 0, mesh_in = 0, mesh_out = 0;
++    long shaper[DVBRIDGE_LUT_MAX_SIZE + 1];
++    uint32_t *raw = NULL;
++    size_t values = 0, want = 0;
++    struct dvbridge_lut *lut = NULL;
++    while (next_line(&t, &line, &number_of_line)) {
++        if (line.at == line.end || *line.at == '#')
++            continue;
++        /* (Lustre's header line, which starts with a digit) */
++        if (!n && keyword(&line, "3DMESH", &rest) && at_end(&rest))
++            continue;
++        if (starts_alpha(&line)) {
++            long a, b;
++            if (keyword(&line, "Mesh", &rest) && integer(&rest, &a) && integer(&rest, &b) && at_end(&rest) &&
++                a >= 1 && a <= 8 && b >= 8 && b <= 16 && !n) {
++                mesh_in = (int)a;
++                mesh_out = (int)b;
++                continue;
++            }
++            say(why, ws, "line %d is no line of a .3dl that is read", number_of_line);
++            goto fail;
++        }
++        if (!n) {
++            /* the shaper: the input codes of the grid */
++            int count = 0;
++            long v;
++            while (!at_end(&line)) {
++                if (count > DVBRIDGE_LUT_MAX_SIZE || !integer(&line, &v)) {
++                    say(why, ws, "the first line of values (line %d) is not the input codes of a grid of 2 to %d "
++                        "points", number_of_line, DVBRIDGE_LUT_MAX_SIZE);
++                    goto fail;
++                }
++                shaper[count++] = v;
++            }
++            if (count < 2 || count > DVBRIDGE_LUT_MAX_SIZE || shaper[0] != 0) {
++                say(why, ws, "the shaper line (line %d) is not a grid of 2 to %d points from 0", number_of_line,
++                    DVBRIDGE_LUT_MAX_SIZE);
++                goto fail;
++            }
++            if (mesh_in && count != (1 << mesh_in) + 1) {
++                say(why, ws, "the shaper line has %d points where Mesh %d says %d", count, mesh_in,
++                    (1 << mesh_in) + 1);
++                goto fail;
++            }
++            n = count;
++            const long top = shaper[n - 1];
++            bool uniform = top > 0;
++            for (int i = 0; i < n && uniform; ++i)
++                uniform = shaper[i] == lround((double)i * (double)top / (n - 1));
++            /* Nuke's and Flame's: codes i 2^bits / (N - 1), the last one the maximum (0, 64, ..., 960, 1023) */
++            bool two = false;
++            if (!uniform && n > 2 && ((top + 1) & top) == 0 && (top + 1) % (n - 1) == 0) {
++                const long step = (top + 1) / (n - 1);
++                two = true;
++                for (int i = 0; i < n - 1 && two; ++i)
++                    two = shaper[i] == (long)i * step;
++            }
++            if (!uniform && !two) {
++                say(why, ws, "the shaper line (line %d) is neither a uniform grid nor Nuke's (0, 64, ..., 1023): "
++                    "such a .3dl is not read", number_of_line);
++                goto fail;
++            }
++            lut = make(n, DVBRIDGE_LUT_3DL);
++            want = (size_t)n * n * n;
++            raw = malloc(want * 3 * sizeof(uint32_t));
++            if (!lut || !raw) {
++                say(why, ws, "no memory for a LUT of %d points a side", n);
++                goto fail;
++            }
++            if (two) {
++                lut->shaper_two = true;
++                lut->shaper_knee = (float)((double)shaper[n - 2] / (double)top);
++            }
++            continue;
++        }
++        if (values >= want) {
++            say(why, ws, "more lines of values than the shaper's %d points a side make (line %d)", n,
++                number_of_line);
++            goto fail;
++        }
++        long v[3];
++        if (!integer(&line, &v[0]) || !integer(&line, &v[1]) || !integer(&line, &v[2]) || !at_end(&line) ||
++            v[0] > 65535 || v[1] > 65535 || v[2] > 65535) {
++            say(why, ws, "line %d is not three whole numbers from 0 to 65535", number_of_line);
++            goto fail;
++        }
++        for (int c = 0; c < 3; ++c)
++            raw[values * 3 + (size_t)c] = (uint32_t)v[c];
++        ++values;
++    }
++    if (!n) {
++        say(why, ws, "no shaper line");
++        goto fail;
++    }
++    if (values != want) {
++        say(why, ws, "%zu lines of values where the shaper's %d points a side make %zu", values, n, want);
++        goto fail;
++    }
++    /* the depth of the output: Mesh's, else the smallest that holds the largest value */
++    uint32_t largest = 0;
++    for (size_t i = 0; i < want * 3; ++i)
++        largest = raw[i] > largest ? raw[i] : largest;
++    int bits = mesh_out;
++    if (!bits) {
++        static const int depths[4] = {10, 12, 14, 16};
++        for (int i = 0; i < 4 && !bits; ++i)
++            if (largest <= (1u << depths[i]) - 1)
++                bits = depths[i];
++    }
++    if (largest > (1u << bits) - 1) {
++        say(why, ws, "a value of %u above the %d bits of Mesh", largest, bits);
++        goto fail;
++    }
++    const double scale = (double)((1u << bits) - 1);
++    /* blue fastest in the file (red, green, blue nested), red fastest in the table */
++    for (int r = 0; r < n; ++r)
++        for (int g = 0; g < n; ++g)
++            for (int b = 0; b < n; ++b) {
++                const size_t from = ((size_t)r * n + g) * n + b, to = ((size_t)b * n + g) * n + r;
++                for (int c = 0; c < 3; ++c)
++                    lut->data[to * 3 + (size_t)c] = (float)(raw[from * 3 + (size_t)c] / scale);
++            }
++    free(raw);
++    lut->out_bits = bits;
++    lut->in = lut->out = range;
++    finish(lut, bytes, size);
++    return lut;
++fail:
++    free(raw);
++    dvbridge_lut_free(&lut);
++    return NULL;
++}
++
++/* ---------------------------------------------------------------------------------------------- madVR */
++
++#define MADVR_HEADER 96
++
++static uint32_t le32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static bool near_xy(const double a[8], const double b[8])
++{
++    for (int i = 0; i < 8; ++i)
++        if (fabs(a[i] - b[i]) > 0.002)
++            return false;
++    return true;
++}
++
++static bool has_word(const struct text *t, const char *word)
++{
++    const size_t n = strlen(word);
++    for (const char *p = t->at; p + n <= t->end; ++p) {
++        bool same = true;
++        for (size_t i = 0; i < n && same; ++i) {
++            char c = p[i];
++            if (c >= 'a' && c <= 'z')
++                c = (char)(c - 'a' + 'A');
++            same = c == word[i];
++        }
++        if (same)
++            return true;
++    }
++    return false;
++}
++
++static struct dvbridge_lut *parse_madvr(const uint8_t *bytes, size_t size, char *why, size_t ws)
++{
++    if (size < MADVR_HEADER || memcmp(bytes, "3DLT", 4)) {
++        say(why, ws, "not a madVR 3DLUT (no 3DLT header)");
++        return NULL;
++    }
++    const uint32_t version = le32(bytes + 4);
++    const uint32_t in_bits[3] = {le32(bytes + 48), le32(bytes + 52), le32(bytes + 56)};
++    const uint32_t in_encoding = le32(bytes + 60), out_bits = le32(bytes + 64), out_encoding = le32(bytes + 68);
++    const uint32_t params_at = le32(bytes + 72), params_size = le32(bytes + 76);
++    const uint32_t lut_at = le32(bytes + 80), compression = le32(bytes + 84);
++    const uint32_t stored = le32(bytes + 88), whole = le32(bytes + 92);
++    if (version != 1 || compression != 0 || in_encoding != 0 || out_encoding != 0 || out_bits != 16) {
++        say(why, ws, "a madVR 3DLUT of another kind (version %u, compression %u, input encoding %u, output "
++            "encoding %u, output %u bits): only version 1, uncompressed, RGB, 16-bit output is read",
++            version, compression, in_encoding, out_encoding, out_bits);
++        return NULL;
++    }
++    if (in_bits[0] != in_bits[1] || in_bits[0] != in_bits[2] || in_bits[0] < 1 || in_bits[0] > 8) {
++        say(why, ws, "a madVR 3DLUT whose input depths are %u, %u and %u: only one depth of 1 to 8 bits is read",
++            in_bits[0], in_bits[1], in_bits[2]);
++        return NULL;
++    }
++    const int n = 1 << in_bits[0];
++    const size_t want = (size_t)n * n * n * 3 * 2;
++    if (stored != want || whole != want || lut_at < MADVR_HEADER || lut_at > size || size - lut_at < want ||
++        (params_size && (params_at < MADVR_HEADER || params_at > size || size - params_at < params_size))) {
++        say(why, ws, "a madVR 3DLUT whose sizes do not hold (%u points a side, the table %u of %zu bytes at %u, "
++            "the parameters %u bytes at %u, the file %zu bytes)", n, stored, want, lut_at, params_size, params_at,
++            size);
++        return NULL;
++    }
++    struct dvbridge_lut *lut = make(n, DVBRIDGE_LUT_MADVR);
++    if (!lut) {
++        say(why, ws, "no memory for a LUT of %d points a side", n);
++        return NULL;
++    }
++    /* as Kodi's CColorManager::Load3dLut() reads it: red slowest and blue fastest, each sample blue, green, red;
++     * red fastest in the table */
++    const uint8_t *p = bytes + lut_at;
++    for (int r = 0; r < n; ++r)
++        for (int g = 0; g < n; ++g)
++            for (int b = 0; b < n; ++b, p += 6) {
++                float *to = lut->data + (((size_t)b * n + g) * n + r) * 3;
++                to[0] = (float)((p[4] | p[5] << 8) / 65535.0);
++                to[1] = (float)((p[2] | p[3] << 8) / 65535.0);
++                to[2] = (float)((p[0] | p[1] << 8) / 65535.0);
++            }
++    lut->out_bits = 16;
++    /* video levels, as madVR and Kodi take a madVR LUT, where its parameters say no other */
++    lut->in = lut->out = (struct dvbridge_lut_range){16.0f, 235.0f};
++    struct text params = {(const char *)bytes + params_at, (const char *)bytes + params_at + params_size}, line, rest;
++    int number_of_line = 0;
++    while (params_size && next_line(&params, &line, &number_of_line)) {
++        double a, b, xy[8];
++        if (keyword(&line, "Input_Range", &rest) && number(&rest, &a) && number(&rest, &b) && a >= 0 && b <= 255 &&
++            b > a) {
++            lut->in = (struct dvbridge_lut_range){(float)a, (float)b};
++            lut->range_declared = true;
++        } else if (keyword(&line, "Output_Range", &rest) && number(&rest, &a) && number(&rest, &b) && a >= 0 &&
++                   b <= 255 && b > a) {
++            lut->out = (struct dvbridge_lut_range){(float)a, (float)b};
++            lut->range_declared = true;
++        } else if (keyword(&line, "Input_Primaries", &rest)) {
++            int k = 0;
++            while (k < 8 && number(&rest, &xy[k]))
++                ++k;
++            static const double bt709[8] = {0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290};
++            static const double p3[8] = {0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290};
++            static const double bt2020[8] = {0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290};
++            if (k == 8)
++                lut->gamut = near_xy(xy, bt709) ? DVBRIDGE_LUT_GAMUT_BT709
++                             : near_xy(xy, p3)  ? DVBRIDGE_LUT_GAMUT_P3_D65
++                             : near_xy(xy, bt2020) ? DVBRIDGE_LUT_GAMUT_BT2020
++                                                   : DVBRIDGE_LUT_GAMUT_UNKNOWN;
++        } else if (keyword(&line, "Input_Transfer_Function", &rest)) {
++            lut->signal = has_word(&rest, "PQ") || has_word(&rest, "2084") ? DVBRIDGE_LUT_SIGNAL_PQ
++                          : has_word(&rest, "HLG")                         ? DVBRIDGE_LUT_SIGNAL_HLG
++                                                                           : DVBRIDGE_LUT_SIGNAL_SDR;
++        }
++    }
++    finish(lut, bytes, size);
++    return lut;
++}
++
++/* ---------------------------------------------------------------------------------------------- parse */
++
++static bool ends_with(const char *name, const char *ext)
++{
++    const size_t n = name ? strlen(name) : 0, e = strlen(ext);
++    if (n < e)
++        return false;
++    for (size_t i = 0; i < e; ++i) {
++        char c = name[n - e + i];
++        if (c >= 'A' && c <= 'Z')
++            c = (char)(c - 'A' + 'a');
++        if (c != ext[i])
++            return false;
++    }
++    return true;
++}
++
++struct dvbridge_lut *dvbridge_lut_parse(const void *bytes, size_t size, const char *name,
++                                        struct dvbridge_lut_range range, char *why, size_t why_size)
++{
++    say(why, why_size, "%s", "");
++    if (!bytes || !size) {
++        say(why, why_size, "the file is empty");
++        return NULL;
++    }
++    if (size > DVBRIDGE_LUT_MAX_BYTES) {
++        say(why, why_size, "the file is larger than %zu MB", DVBRIDGE_LUT_MAX_BYTES >> 20);
++        return NULL;
++    }
++    if (!(range.lo >= 0.0f && range.hi <= 255.0f && range.hi > range.lo)) {
++        say(why, why_size, "no range of the LUT's values");
++        return NULL;
++    }
++    if (size >= 4 && !memcmp(bytes, "3DLT", 4))
++        return parse_madvr(bytes, size, why, why_size);
++    if (ends_with(name, ".3dlut")) {
++        say(why, why_size, "a .3dlut without the header of madVR's format (3DLT)");
++        return NULL;
++    }
++    /* a text: no zero byte in it */
++    if (memchr(bytes, '\0', size)) {
++        say(why, why_size, "not a LUT of text (.cube, .3dl) nor of madVR's format");
++        return NULL;
++    }
++    if (ends_with(name, ".3dl"))
++        return parse_3dl(bytes, size, range, why, why_size);
++    if (ends_with(name, ".cube"))
++        return parse_cube(bytes, size, range, why, why_size);
++    say(why, why_size, "the name of the file ends in neither .cube, .3dl nor .3dlut");
++    return NULL;
++}
++
++const char *dvbridge_lut_format_name(enum dvbridge_lut_format format)
++{
++    switch (format) {
++    case DVBRIDGE_LUT_CUBE: return ".cube";
++    case DVBRIDGE_LUT_3DL: return ".3dl";
++    case DVBRIDGE_LUT_MADVR: return "madVR 3DLUT";
++    default: return "none";
++    }
++}
++
++const char *dvbridge_lut_signal_name(enum dvbridge_lut_signal signal)
++{
++    switch (signal) {
++    case DVBRIDGE_LUT_SIGNAL_SDR: return "SDR";
++    case DVBRIDGE_LUT_SIGNAL_PQ: return "PQ";
++    case DVBRIDGE_LUT_SIGNAL_HLG: return "HLG";
++    default: return "not said";
++    }
++}
++
++const char *dvbridge_lut_gamut_name(enum dvbridge_lut_gamut gamut)
++{
++    switch (gamut) {
++    case DVBRIDGE_LUT_GAMUT_BT709: return "BT.709";
++    case DVBRIDGE_LUT_GAMUT_P3_D65: return "DCI-P3 (D65)";
++    case DVBRIDGE_LUT_GAMUT_BT2020: return "BT.2020";
++    default: return "not said";
++    }
++}
++
++void dvbridge_lut_point(const struct dvbridge_lut *lut, int r, int g, int b, float rgb[3])
++{
++    const size_t at = (((size_t)b * lut->size + g) * lut->size + r) * 3;
++    rgb[0] = lut->data[at];
++    rgb[1] = lut->data[at + 1];
++    rgb[2] = lut->data[at + 2];
++}
++
++/* ---------------------------------------------------------------------------------------------- shader */
++
++static bool full(struct dvbridge_lut_range r)
++{
++    return r.lo == 0.0f && r.hi == 255.0f;
++}
++
++bool dvbridge_lut_shader(pl_shader sh, const struct dvbridge_lut *lut, pl_shader_obj *state)
++{
++    if (!sh || !lut || !state)
++        return false;
++    /* the input of the LUT: its range, then the grid coordinate of a .3dl of Nuke's shaper (the last interval
++     * shorter: codes 0 to knee in N - 2 steps, knee to the maximum in one), as the fraction of [0, 1] that
++     * libplacebo's table takes. Nothing where the range is full and the grid uniform: the LUT alone. */
++    char body[640];
++    int at = 0;
++    if (!full(lut->in))
++        at += snprintf(body + at, sizeof(body) - (size_t)at,
++                       "color.rgb = (vec3(%.9g) + vec3(%.9g) * color.rgb) * vec3(%.9g);\n", (double)lut->in.lo,
++                       (double)(lut->in.hi - lut->in.lo), 1.0 / 255.0);
++    if (lut->shaper_two) {
++        const double knee = lut->shaper_knee, steps = lut->size - 2, last = lut->size - 1;
++        at += snprintf(body + at, sizeof(body) - (size_t)at,
++                       "{\n"
++                       "    vec3 lut_u = clamp(color.rgb, 0.0, 1.0);\n"
++                       "    vec3 lut_g = mix(lut_u * vec3(%.9g), vec3(%.9g) + (lut_u - vec3(%.9g)) * vec3(%.9g),\n"
++                       "                     greaterThan(lut_u, vec3(%.9g)));\n"
++                       "    color.rgb = lut_g * vec3(%.9g);\n"
++                       "}\n",
++                       steps / knee, steps, knee, 1.0 / (1.0 - knee), knee, 1.0 / last);
++    }
++    if (at && !pl_shader_custom(sh, &(struct pl_custom_shader){
++                                        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++                                        .body = body, .description = "3D LUT: its input"}))
++        return false;
++    pl_shader_custom_lut(sh, &lut->pl, state);
++    if (pl_shader_is_failed(sh))
++        return false;
++    /* its output: back from its range, held within [0, 1] */
++    if (!full(lut->out))
++        snprintf(body, sizeof(body), "color.rgb = clamp((color.rgb * vec3(255.0) - vec3(%.9g)) * vec3(%.9g), 0.0, "
++                 "1.0);\n", (double)lut->out.lo, 1.0 / (double)(lut->out.hi - lut->out.lo));
++    else
++        snprintf(body, sizeof(body), "color.rgb = clamp(color.rgb, 0.0, 1.0);\n");
++    return pl_shader_custom(sh, &(struct pl_custom_shader){
++                                    .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++                                    .body = body, .description = "3D LUT: its output"});
++}
+diff --git a/tools/dvbridge/dvbridge_lut.h b/tools/dvbridge/dvbridge_lut.h
+new file mode 100644
+index 0000000..83c6140
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_lut.h
+@@ -0,0 +1,128 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_LUT_H
++#define DVBRIDGE_LUT_H
++
++/*
++ * Hades: a 3D LUT of the user's (a calibration of a display), read from a file, applied by the bridge as the last
++ * colour step of what it draws for a display that it maps to (dvbridge_render_set_lut()).
++ *
++ * The formats, each read here exactly as its file says or refused with the reason:
++ *   - .cube (Adobe / Resolve): LUT_3D_SIZE, TITLE, DOMAIN_MIN 0 0 0, DOMAIN_MAX 1 1 1, LUT_3D_INPUT_RANGE 0 1;
++ *     red fastest. A 1D LUT, another domain or input range, or any other keyword is refused: libplacebo's
++ *     pl_lut_parse_cube() passes unknown keywords over with a warning, reads a file with both a 1D and a 3D size
++ *     as one of them, scales the output values by the domain and takes a first data line that starts with a
++ *     space for a header line; the values of a LUT that it reads are the same as here.
++ *   - .3dl (Autodesk Lustre / Nuke): optional "3DMESH" and "Mesh <in bits> <out bits>", then the shaper line
++ *     (the input codes of the grid) and the integer outputs, blue fastest. The shaper of a uniform grid (code
++ *     i (max) / (N - 1), rounded) and the shaper of Nuke and Flame (codes i 2^bits / (N - 1), the last one the
++ *     maximum: 0, 64, ..., 960, 1023) are read exactly (the second as a shaper of two slopes in the shader);
++ *     any other is refused. The output depth is "Mesh"'s, else the smallest of 10, 12, 14 and 16 bits that holds
++ *     the largest value.
++ *   - .3dlut (madVR's format, as Kodi's CColorManager reads it: the "3DLT" header, version 1, RGB in and out,
++ *     16-bit output, no compression): its parameters say the range of its input and output (Input_Range and
++ *     Output_Range, on the scale of 0 to 255; video levels, 16 to 235, where it says none, as madVR and Kodi take
++ *     it), its primaries (Input_Primaries) and its transfer (Input_Transfer_Function: PQ, HLG or another).
++ *
++ * The values are kept as the file has them (scaled to [0, 1] where they are integers), on a uniform grid of N
++ * points per axis, red fastest: libplacebo's pl_custom_lut, which pl_shader_custom_lut() interpolates
++ * tetrahedrally from a 3D texture of 32-bit floats (on OpenGL ES 3, sh_lut() takes RGBA32F, the first float format
++ * that is not emulated): at its grid points it gives the values of the file, to the bit.
++ */
++
++#include <libplacebo/shaders.h>
++#include <libplacebo/shaders/lut.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* the formats */
++enum dvbridge_lut_format {
++    DVBRIDGE_LUT_NONE = 0,
++    DVBRIDGE_LUT_CUBE = 1,
++    DVBRIDGE_LUT_3DL = 2,
++    DVBRIDGE_LUT_MADVR = 3,
++};
++
++/* what a file says it was made for: its signal (UNKNOWN where it does not say: .cube and .3dl) */
++enum dvbridge_lut_signal {
++    DVBRIDGE_LUT_SIGNAL_UNKNOWN = 0,
++    DVBRIDGE_LUT_SIGNAL_SDR = 1, /* a gamma (BT.1886, a power, sRGB) */
++    DVBRIDGE_LUT_SIGNAL_PQ = 2,
++    DVBRIDGE_LUT_SIGNAL_HLG = 3,
++};
++
++/* ... and its gamut (UNKNOWN where it does not say, or where it is none of these) */
++enum dvbridge_lut_gamut {
++    DVBRIDGE_LUT_GAMUT_UNKNOWN = 0,
++    DVBRIDGE_LUT_GAMUT_BT709 = 1,
++    DVBRIDGE_LUT_GAMUT_P3_D65 = 2,
++    DVBRIDGE_LUT_GAMUT_BT2020 = 3,
++};
++
++/* the range of the values of the input or output of a LUT: full (0 to 1 of the signal), or the levels of video
++ * (lo to hi on the scale of 0 to 255: 16 to 235) */
++struct dvbridge_lut_range {
++    float lo, hi; /* 0 and 255: full */
++};
++
++/* the largest grid that is read (256: madVR's LUTs; 268 MB of 32-bit floats on the GPU) */
++#define DVBRIDGE_LUT_MAX_SIZE 256
++/* the largest file that is read */
++#define DVBRIDGE_LUT_MAX_BYTES ((size_t)256 << 20)
++
++struct dvbridge_lut {
++    /* the LUT as libplacebo takes it: size (N, N, N), data (N^3 RGB floats, red fastest), signature (of the
++     * file's bytes and how it is read) */
++    struct pl_custom_lut pl;
++    float *data;
++    enum dvbridge_lut_format format;
++    int size;
++    struct dvbridge_lut_range in, out;
++    /* the range was said by the file (madVR's parameters), not taken from the caller */
++    bool range_declared;
++    /* a .3dl of Nuke's shaper: the grid's last interval is shorter; the code where it starts (shaper_knee, of
++     * [0, 1] of the input) */
++    bool shaper_two;
++    float shaper_knee;
++    enum dvbridge_lut_signal signal;
++    enum dvbridge_lut_gamut gamut;
++    /* the depth of the integers of a .3dl's output, or of madVR's (16); 0: floats */
++    int out_bits;
++    char title[128]; /* TITLE of a .cube; empty where none */
++};
++
++/*
++ * Reads a LUT from the bytes of its file. name: the file's name (its extension says the format where its bytes
++ * do not: a madVR LUT by its header, a .cube by its keywords, a .3dl by its shaper line). range: the range of the
++ * input and output of a .cube or .3dl (which say none): full (0, 255) or video levels (16, 235).
++ * NULL where the file is not one of these formats or cannot be read exactly: why says why (a fixed text and what
++ * was found, at most why_size bytes).
++ */
++struct dvbridge_lut *dvbridge_lut_parse(const void *bytes, size_t size, const char *name,
++                                        struct dvbridge_lut_range range, char *why, size_t why_size);
++void dvbridge_lut_free(struct dvbridge_lut **lut);
++
++/* The name of a format and of a signal, for the log */
++const char *dvbridge_lut_format_name(enum dvbridge_lut_format format);
++const char *dvbridge_lut_signal_name(enum dvbridge_lut_signal signal);
++const char *dvbridge_lut_gamut_name(enum dvbridge_lut_gamut gamut);
++
++/*
++ * Appends the LUT to a shader whose colour is the signal in full range within [0, 1] (the output of the bridge's
++ * last pass): the input taken to the LUT's range and grid (its shaper), the LUT (pl_shader_custom_lut(), with
++ * state, the GPU object that holds its table: the caller's, destroyed with pl_shader_obj_destroy()), the output
++ * taken back from its range and held within [0, 1]. False where the shader could not take it (nothing then is
++ * to be drawn with this shader).
++ */
++bool dvbridge_lut_shader(pl_shader sh, const struct dvbridge_lut *lut, pl_shader_obj *state);
++
++/* The value of the LUT at grid point (r, g, b), as the file gives it (for the tests) */
++void dvbridge_lut_point(const struct dvbridge_lut *lut, int r, int g, int b, float rgb[3]);
++
++#endif
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 33c04a5..eb4900b 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -11,6 +11,7 @@
+ /* Reconstruct video at full precision, then pack the HDMI transport with frame-matched metadata. */
+ #include "dvbridge_render.h"
+ #include "dvbridge_gl_pack.h"
++#include "dvbridge_lut.h"
+ #include "dvbridge_placebo.h"
+ #include "dvbridge_source.h"
+ #include "dvbridge_upscale.h"
+@@ -255,6 +256,12 @@ struct dvbridge_renderer {
+     /* ... a render with it failed on this GPU (libplacebo turned one of its shaders off): the pictures are drawn
+      * without it until another one is set (upscale_retry()) */
+     bool upscale_tried, upscale_failed;
++    /* Hades: the 3D LUT of the display (dvbridge_render_set_lut(); NULL: none), the GPU object of its table, the
++     * render in hand applies it (lut_tried), the last picture drawn had it (lut_applied), and a render with it
++     * failed on this GPU: the pictures are drawn without it until another one is set (lut_failed; lut_retry()) */
++    const struct dvbridge_lut *lut;
++    pl_shader_obj lut_state;
++    bool lut_tried, lut_applied, lut_failed;
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -283,6 +290,11 @@ struct active_mask {
+     float peak;
+     uint32_t pattern;
+     float black;
++    /* Hades: Low-Latency: the 3D LUT of the display after that (NULL: none), the GPU object of its table, and
++     * whether it was put in the shader (dvbridge_render_set_lut()) */
++    const struct dvbridge_lut *lut;
++    pl_shader_obj *lut_state;
++    bool lut_called;
+ };
+ 
+ /*
+@@ -638,6 +650,20 @@ static struct pl_hook_res mask_low_latency(struct active_mask *mask, const struc
+         .description = "DV Low-Latency picture within the display's peak"};
+     mask->failed = mask->failed || p->stage != PL_HOOK_OUTPUT ||
+                    !bars_written_in_this_shader(mask, p) || !pl_shader_custom(p->sh, &shader);
++    /* Hades: the 3D LUT of the display (dvbridge_render_set_lut()), the last step of the colour, over the picture
++     * and the test pattern; the bars stay at code 0, as they stay where they are written at the start of the shader
++     * (skip_inactive_area()) and as the lift of the black leaves them: a LUT that maps black elsewhere does not light
++     * them. Without a LUT the shader is the one before. */
++    if (!mask->failed && mask->lut) {
++        static const struct pl_custom_shader bars = {
++            .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
++            .body = "if((gl_FragCoord.x < dvbridge_active.x || gl_FragCoord.x >= dvbridge_active.z || "
++                    "gl_FragCoord.y < dvbridge_active.y || gl_FragCoord.y >= dvbridge_active.w) && "
++                    "dvbridge_pattern == 0u) color.rgb = vec3(0.0);",
++            .description = "DV Low-Latency bars after the 3D LUT"};
++        mask->lut_called = dvbridge_lut_shader(p->sh, mask->lut, mask->lut_state) && pl_shader_custom(p->sh, &bars);
++        mask->failed = !mask->lut_called;
++    }
+     return (struct pl_hook_res){.failed = mask->failed, .output = PL_HOOK_SIG_NONE};
+ }
+ 
+@@ -688,6 +714,8 @@ static bool fine_gamut_table(const struct dvbridge_renderer *r, bool ll);
+ static bool gamut_table_retry(struct dvbridge_renderer *r, bool fine, bool ok);
+ static bool trim_retry(struct dvbridge_renderer *r, bool ok);
+ static void trim_kept(struct dvbridge_renderer *r, bool ok);
++static bool lut_retry(struct dvbridge_renderer *r, bool ok);
++static void lut_kept(struct dvbridge_renderer *r, bool ok);
+ static void gamut_table_kept(struct dvbridge_renderer *r, bool ok);
+ static double now_ms(void);
+ static bool gamut_ahead_start(struct dvbridge_renderer *r, const struct dvbridge_hdr10_mapping *m);
+@@ -866,6 +894,7 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     pl_tex_destroy(r->gpu, &r->hdr10[0]);
+     pl_tex_destroy(r->gpu, &r->hdr10[1]);
+     pl_tex_destroy(r->gpu, &r->rgb);
++    pl_shader_obj_destroy(&r->lut_state);
+     pl_renderer_destroy(&r->renderer);
+     for (int i = 0; i < PASS_TIMERS; ++i)
+         if (r->timers[i].made)
+@@ -1775,6 +1804,12 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         mask.pattern = r->ll_pattern;
+         trim_prepare(r, &r->ll_mapping, metadata, bytes, &trim);
+     }
++    /* Hades: the 3D LUT of the display (dvbridge_render_set_lut()): Low-Latency only, the picture that is mapped
++     * to the display; never the pictures that the display maps itself (the tunnel of Dolby Vision is bit-exact),
++     * and not after a render with it failed on this GPU (lut_retry()) */
++    r->lut_tried = mask.low_latency && r->lut && !r->lut_failed;
++    mask.lut = r->lut_tried ? r->lut : NULL;
++    mask.lut_state = &r->lut_state;
+     /* Only a picture that is not scaled is one shader from its planes to the target. */
+     mask.early_mask = early && !mask.pattern && dvbridge_geometry_whole(&geometry) &&
+                       geometry.source_width == 3840 && geometry.source_height == 2160 &&
+@@ -1800,6 +1835,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         .input = PL_HOOK_SIG_COLOR,
+         .priv = &mask, .hook = packed ? pack_active_area : mask_active_area,
+         .signature = packed            ? (mask.early_mask ? 0x4456425246555302ULL : 0x4456425246555301ULL)
++                     : mask.lut         ? (mask.early_mask ? 0x445642524c4c0012ULL : 0x445642524c4c0011ULL)
+                      : mask.low_latency ? (mask.early_mask ? 0x445642524c4c0002ULL : 0x445642524c4c0001ULL)
+                                        : (mask.early_mask ? 0x445642524c350002ULL : 0x445642524c350001ULL)};
+     /* Hades: a Low-Latency render's trim pass (dvbridge_trims.h) is a hook of its own before the
+@@ -1830,7 +1866,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     }
+     time_render(r, &params);
+     const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
+-    r->ready = rendered && mask.called && !mask.failed && (!trim.on || trim.called);
++    r->ready = rendered && mask.called && !mask.failed && (!trim.on || trim.called) && (!mask.lut || mask.lut_called);
+     /* An EL sampling failure can otherwise return a successfully rendered BL-only frame. A composer of
+      * ETSI GS CCM 001 that failed on this GPU is not one: libplacebo composed the picture by its own
+      * reshaping, as with it turned off, and said so in the log. */
+@@ -1844,6 +1880,7 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         r->not_drawn = WHY_PLACEBO_ERRORS;
+     r->ready = r->ready && clean;
+     r->ll_curve_drawn = r->ready && mask.low_latency && r->ll_curve_tried;
++    r->lut_applied = r->ready && mask.lut;
+     /* (Hades: a picture over HLG whose RPU declares PQ may be drawn by libplacebo's reshaping.) What
+      * the render composed, and why a base layer that is not in PQ was not composed, are of the render
+      * as its errors leave it, as render_hdr10() has them: a render that they fail composed nothing. */
+@@ -1907,6 +1944,7 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+     if (r) {
+         r->trim_tried = false;
+         r->ll_curve_tried = false;
++        r->lut_tried = false;
+     }
+     bool ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+     /* Hades: with the standard gamut table where the finer one could not be made */
+@@ -1924,6 +1962,11 @@ bool dvbridge_render_rgb(struct dvbridge_renderer *r, const struct pl_frame *sou
+         ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
+         ll_curve_kept(r, ok);
+     }
++    /* Hades: without the 3D LUT where it could not be drawn (Low-Latency; said: dvbridge_render_lut_failed()) */
++    if (r && lut_retry(r, ok)) {
++        ok = render_bars_first(r, source, metadata, bytes, pts, el_pts, geometry, NULL, false);
++        lut_kept(r, ok);
++    }
+     /* (a picture drawn without the curve it has, because this GPU does not draw it: noted once in a stream, also
+      * where that was found while the ways of drawing were made ready, whose notes are not kept) */
+     if (r && ok && r->ll_curve_held)
+@@ -2025,21 +2068,40 @@ struct picture_clamp {
+     bool called;
+     bool codes;   /* quantized to the codes of 10 bits */
+     float levels; /* 1023 */
++    /* Hades: the 3D LUT of the display (dvbridge_render_set_lut(); NULL: none) and the GPU object of its table */
++    const struct dvbridge_lut *lut;
++    pl_shader_obj *lut_state;
+ };
+ 
++/* Hades: the 3D LUT of the display after the shader of a hook that held the picture within its range (and the
++ * display's peak), and then the quantization to 10-bit codes where the picture is kept so: the LUT is the last step
++ * of the colour, on the signal before it is quantized once. The variable of the levels is that of the shader before
++ * it (one shader, its names declared once). */
++static bool lut_then_codes(const struct pl_hook_params *p, const struct dvbridge_lut *lut, pl_shader_obj *state,
++                           bool codes)
++{
++    static const struct pl_custom_shader quantize = {
++        .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR, .body = QUANTIZE_CODES,
++        .description = "the picture after the 3D LUT, as 10-bit codes"};
++    return dvbridge_lut_shader(p->sh, lut, state) && (!codes || pl_shader_custom(p->sh, &quantize));
++}
++
+ static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params *p)
+ {
+     struct picture_clamp *c = priv;
+     struct pl_shader_var var = {.var = pl_var_float("dvbridge_levels"), .data = &c->levels,
+                                 .dynamic = true};
++    /* Hades: with the 3D LUT, the codes are made after it (lut_then_codes()) */
++    const bool codes_here = c->codes && !c->lut;
+     const struct pl_custom_shader shader = {
+         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+-        .body = c->codes ? "color = clamp(color, 0.0, 1.0);\n" QUANTIZE_CODES
+-                         : "color = clamp(color, 0.0, 1.0);",
++        .body = codes_here ? "color = clamp(color, 0.0, 1.0);\n" QUANTIZE_CODES
++                           : "color = clamp(color, 0.0, 1.0);",
+         .variables = &var, .num_variables = c->codes ? 1 : 0,
+         .description = c->codes ? "DV picture within the range of an HDR10 output, as 10-bit codes"
+                                 : "DV picture within the range of an HDR10 output"};
+-    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader) &&
++                (!c->lut || lut_then_codes(p, c->lut, c->lut_state, c->codes));
+     return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
+ }
+ 
+@@ -2056,6 +2118,9 @@ struct display_clamp {
+     /* Hades: the display's black as a share of its peak in PQ (dvbridge_hdr10_mapping::black); 0: none, and the
+      * shader is the one before, its text and its variables */
+     float black;
++    /* Hades: the 3D LUT of the display after that (NULL: none; lut_then_codes()) */
++    const struct dvbridge_lut *lut;
++    pl_shader_obj *lut_state;
+ };
+ 
+ /* Hades: the black level lift of the EETF of ITU-R BT.2390 (5.4.1: E3 = E2 + b (1 - E2)^4, b the display's
+@@ -2082,16 +2147,18 @@ static struct pl_hook_res clamp_to_display(void *priv, const struct pl_hook_para
+     /* (Hades: with a black, its variable follows the levels where they are there, else the peak) */
+     if (black && !c->codes)
+         vars[1] = vars[2];
++    /* Hades: with the 3D LUT, the codes are made after it (lut_then_codes()) */
++    const bool codes_here = c->codes && !c->lut;
+     const struct pl_custom_shader shader = {
+         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+-        .body = black ? (c->codes ? "color = clamp(color, 0.0, 1.0);\n" DISPLAY_BLACK_LIFT
+-                                    "color.rgb = min(color.rgb, vec3(dvbridge_peak));\n" QUANTIZE_CODES
+-                                  : "color = clamp(color, 0.0, 1.0);\n" DISPLAY_BLACK_LIFT
+-                                    "color.rgb = min(color.rgb, vec3(dvbridge_peak));")
+-              : c->codes ? "color = clamp(color, 0.0, 1.0);\n"
+-                           "color.rgb = min(color.rgb, vec3(dvbridge_peak));\n" QUANTIZE_CODES
+-                         : "color = clamp(color, 0.0, 1.0);\n"
+-                           "color.rgb = min(color.rgb, vec3(dvbridge_peak));",
++        .body = black ? (codes_here ? "color = clamp(color, 0.0, 1.0);\n" DISPLAY_BLACK_LIFT
++                                      "color.rgb = min(color.rgb, vec3(dvbridge_peak));\n" QUANTIZE_CODES
++                                    : "color = clamp(color, 0.0, 1.0);\n" DISPLAY_BLACK_LIFT
++                                      "color.rgb = min(color.rgb, vec3(dvbridge_peak));")
++              : codes_here ? "color = clamp(color, 0.0, 1.0);\n"
++                             "color.rgb = min(color.rgb, vec3(dvbridge_peak));\n" QUANTIZE_CODES
++                           : "color = clamp(color, 0.0, 1.0);\n"
++                             "color.rgb = min(color.rgb, vec3(dvbridge_peak));",
+         .variables = vars, .num_variables = (c->codes ? 2 : 1) + (black ? 1 : 0),
+         .description = black ? (c->codes ? "DV picture within the peak of the display it is mapped to, its "
+                                            "black lifted to the display's, as 10-bit codes"
+@@ -2100,7 +2167,8 @@ static struct pl_hook_res clamp_to_display(void *priv, const struct pl_hook_para
+                      : c->codes ? "DV picture within the peak of the display it is mapped to, as "
+                                   "10-bit codes"
+                                 : "DV picture within the peak of the display it is mapped to"};
+-    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader);
++    c->called = p->stage == PL_HOOK_OUTPUT && pl_shader_custom(p->sh, &shader) &&
++                (!c->lut || lut_then_codes(p, c->lut, c->lut_state, c->codes));
+     return (struct pl_hook_res){.failed = !c->called, .output = PL_HOOK_SIG_NONE};
+ }
+ 
+@@ -2785,6 +2853,52 @@ static void trim_kept(struct dvbridge_renderer *r, bool ok)
+         r->trim_failed = false;
+ }
+ 
++/* Hades: the 3D LUT of the display (dvbridge_render_set_lut()). Only what the bridge maps to a display takes it: the
++ * pictures of dvbridge_render_hdr10() and dvbridge_render_plain() (not into the tunnel) and those of Low-Latency;
++ * the caller sets the LUT of the output's kind (SDR or HDR) or none. A new LUT, or none, is tried again where an
++ * earlier one failed. */
++void dvbridge_render_set_lut(struct dvbridge_renderer *r, const struct dvbridge_lut *lut)
++{
++    if (!r)
++        return;
++    if (lut != r->lut)
++        r->lut_failed = false;
++    r->lut = lut;
++    if (!lut)
++        r->lut_applied = false;
++}
++
++bool dvbridge_render_lut_applied(const struct dvbridge_renderer *r)
++{
++    return r && r->lut_applied;
++}
++
++bool dvbridge_render_lut_failed(const struct dvbridge_renderer *r)
++{
++    return r && r->lut && r->lut_failed;
++}
++
++/* Hades: after a render with the 3D LUT that failed: whether to make it again without it (it is noted as failed
++ * until another one is set, and the errors that libplacebo keeps reset), as the trim pass (trim_retry()). Where the
++ * render without it draws, the LUT was why: the picture goes on without it, and the caller says so
++ * (dvbridge_render_lut_failed()); where it does not either, the reason was another one and nothing is concluded. */
++static bool lut_retry(struct dvbridge_renderer *r, bool ok)
++{
++    if (ok || !r->lut_tried)
++        return false;
++    r->lut_failed = true;
++    r->lut_tried = false;
++    pl_renderer_reset_errors(r->renderer, NULL);
++    dvbridge_gl_drain_errors();
++    return true;
++}
++
++static void lut_kept(struct dvbridge_renderer *r, bool ok)
++{
++    if (!ok)
++        r->lut_failed = false;
++}
++
+ void dvbridge_render_set_gamut_table(struct dvbridge_renderer *r, int table)
+ {
+     if (!r)
+@@ -3038,11 +3152,18 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         params.dovi_ccm_bl_transfer = PL_COLOR_TRC_UNKNOWN;
+     if (sdr)
+         params.color_map_params = &sdr_map;
+-    struct picture_clamp clamped = {.codes = codes, .levels = 1023.0f};
++    /* Hades: the 3D LUT of the display (dvbridge_render_set_lut()), the last step of the colour of what is mapped to
++     * a display or drawn as it is (the caller sets it only for an output whose kind it was made for), never into
++     * the tunnel, and not after a render with it failed on this GPU (lut_retry()). Its hooks have signatures of
++     * their own; without it, the hooks are those before. */
++    r->lut_tried = !tunnel && r->lut && !r->lut_failed;
++    const struct dvbridge_lut *lut = r->lut_tried ? r->lut : NULL;
++    const uint64_t lut_sig = lut ? 0x0000000000004c00ULL : 0;
++    struct picture_clamp clamped = {.codes = codes, .levels = 1023.0f, .lut = lut, .lut_state = &r->lut_state};
+     const struct pl_hook hook = {
+         .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &clamped,
+         .hook = clamp_picture,
+-        .signature = codes ? 0x4456424844523132ULL : 0x4456424844523130ULL};
++        .signature = (codes ? 0x4456424844523132ULL : 0x4456424844523130ULL) ^ lut_sig};
+     const struct pl_hook *hooks[] = {&hook};
+     params.hooks = hooks;
+     params.num_hooks = 1;
+@@ -3055,7 +3176,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+      * and then held within its peak (in an SDR signal the peak is 1.0, which the clamp to [0, 1]
+      * holds it within) */
+     struct pl_color_map_params mapping;
+-    struct display_clamp to_display = {.codes = codes, .levels = 1023.0f};
++    struct display_clamp to_display = {.codes = codes, .levels = 1023.0f, .lut = lut, .lut_state = &r->lut_state};
+     /* Hades: with the display's black (an HDR10 target: dvbridge_hdr10_mapping::black), a shader of its own and
+      * signatures of their own; without it, the hook as before */
+     const bool lifted = r->hdr10_mapping.enabled && r->hdr10_mapping.target == DVBRIDGE_HDR10_TARGET_HDR10 &&
+@@ -3063,8 +3184,8 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     const struct pl_hook display_hook = {
+         .stages = PL_HOOK_OUTPUT, .input = PL_HOOK_SIG_COLOR, .priv = &to_display,
+         .hook = clamp_to_display,
+-        .signature = lifted ? (codes ? 0x4456424844523135ULL : 0x4456424844523134ULL)
+-                            : codes ? 0x4456424844523133ULL : 0x4456424844523131ULL};
++        .signature = (lifted ? (codes ? 0x4456424844523135ULL : 0x4456424844523134ULL)
++                             : codes ? 0x4456424844523133ULL : 0x4456424844523131ULL) ^ lut_sig};
+     const struct pl_hook *display_hooks[] = {&display_hook};
+     const bool peak_hook =
+         r->hdr10_mapping.enabled && r->hdr10_mapping.target != DVBRIDGE_HDR10_TARGET_SDR;
+@@ -3169,6 +3290,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     else if (!clean)
+         r->not_drawn = WHY_PLACEBO_ERRORS;
+     ok = ok && clean;
++    r->lut_applied = ok && lut;
+     r->base_refused = r->base_transfer && !plain && !ccm_composed && !ok ? r->base_transfer
+                                                                          : DVBRIDGE_BASE_PQ;
+     r->composed = !ok || plain   ? DVBRIDGE_COMPOSED_NONE
+@@ -3203,8 +3325,16 @@ bool dvbridge_render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *s
+     save_gl_state(&state);
+     const bool fine = fine_gamut_table(r, false);
+     r->trim_tried = false;
++    r->lut_tried = false;
++    r->lut_applied = false;
+     r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
+                                   NULL);
++    /* Hades: without the 3D LUT where a render with it failed */
++    if (lut_retry(r, r->hdr10_ready)) {
++        r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
++                                      NULL);
++        lut_kept(r, r->hdr10_ready);
++    }
+     /* Hades: with the standard gamut table where the finer one could not be made */
+     if (gamut_table_retry(r, fine, r->hdr10_ready)) {
+         r->hdr10_ready = render_hdr10(r, source, metadata, bytes, pts, el_pts, view, width, height,
+@@ -3239,7 +3369,15 @@ bool dvbridge_render_plain(struct dvbridge_renderer *r, const struct pl_frame *s
+     struct dvbridge_gl_state state;
+     save_gl_state(&state);
+     const bool fine = fine_gamut_table(r, false);
++    r->lut_tried = false;
++    r->lut_applied = false;
+     r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
++    /* Hades: without the 3D LUT where a render with it failed (first: a failure of the upscaler's shaders is then
++     * found by the render without the LUT, which fails too, and the LUT is kept) */
++    if (lut_retry(r, r->hdr10_ready)) {
++        r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
++        lut_kept(r, r->hdr10_ready);
++    }
+     /* Hades: without the upscaler's shaders where a render with them failed */
+     if (upscale_retry(r, r->hdr10_ready))
+         r->hdr10_ready = render_hdr10(r, source, NULL, 0, 0.0, NAN, view, width, height, plain);
+@@ -3493,6 +3631,11 @@ bool dvbridge_render_reference(struct dvbridge_renderer *ref, const struct dvbri
+      * this GPU does not draw it) */
+     ref->ll_hdr10plus = main->ll_hdr10plus;
+     ref->ll_curve_failed = main->ll_curve_failed;
++    /* (Hades: and the 3D LUT of the display, which changes its picture on purpose, unless main found that this GPU
++     * does not draw it; ref's table is a GPU object of its own) */
++    if (ref->lut != main->lut)
++        dvbridge_render_set_lut(ref, main->lut);
++    ref->lut_failed = main->lut_failed;
+     /* (and the gamut table of its mapping, which changes the picture on purpose) */
+     ref->gamut_asked = main->gamut_asked;
+     ref->gamut_fine_failed = main->gamut_fine_failed;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index cacb2e8..789c6f7 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -220,6 +220,20 @@ bool dvbridge_render_upscaled(const struct dvbridge_renderer *renderer);
+ /* Hades: a render with the upscaler's shaders failed on this GPU (libplacebo turned one of them off, or the render
+  * failed with them and drew without them): the pictures are drawn without them until another upscaler is set */
+ bool dvbridge_render_upscaler_failed(const struct dvbridge_renderer *renderer);
++/* Hades: the 3D LUT of the display (dvbridge_lut.h), the last step of the colour of the pictures that this renderer
++ * maps to a display or draws as they are: those of dvbridge_render_hdr10() and dvbridge_render_plain() (not into the
++ * tunnel) and those of Dolby Vision Low-Latency (dvbridge_render_set_low_latency()); never a frame of native Dolby
++ * Vision that the display maps itself (that tunnel is bit-exact), whatever is set. The caller sets the LUT made for
++ * the kind of the output (SDR or HDR), keeps it while it is set, and NULL (the default) draws every picture as
++ * before, bit for bit. A render with it that fails on this GPU is made again without it: the pictures go on without
++ * it until another one is set (dvbridge_render_lut_failed()), and the caller says so. */
++#define DVBRIDGE_RENDER_LUT 1
++struct dvbridge_lut;
++void dvbridge_render_set_lut(struct dvbridge_renderer *renderer, const struct dvbridge_lut *lut);
++/* ... the last picture drawn had it */
++bool dvbridge_render_lut_applied(const struct dvbridge_renderer *renderer);
++/* ... a render with it failed on this GPU: the pictures are drawn without it */
++bool dvbridge_render_lut_failed(const struct dvbridge_renderer *renderer);
+ bool dvbridge_render_plain(struct dvbridge_renderer *renderer, const struct pl_frame *source,
+                           const struct dvbridge_plain *plain, struct dvbridge_view view,
+                           int width, int height);
+-- 
+2.53.0
+

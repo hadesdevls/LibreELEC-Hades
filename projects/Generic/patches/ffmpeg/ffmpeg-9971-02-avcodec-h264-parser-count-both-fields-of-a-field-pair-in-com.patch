@@ -1,0 +1,234 @@
+From 785290b537be774a05ff7de1df7c16a9bd1908e8 Mon Sep 17 00:00:00 2001
+From: Baptiste Coudurier <baptiste.coudurier@gmail.com>
+Date: Fri, 16 Oct 2026 12:08:09 -0700
+Subject: [PATCH] avcodec/h264_parser: count both fields of a field pair in
+ complete frames
+
+With complete frames, the parser stopped at the first slice and
+reported a field picture as a single field even when the packet holds
+both fields of the frame, as in MXF. This halved the avg_frame_rate
+estimated by avformat_find_stream_info().
+
+Look for the opposite-parity field with the same frame number and
+account for both fields. Derive their display order from the field POCs
+using a copy of the parser state, leaving it unknown when the order
+cannot be established.
+
+Advance directly to the next NAL boundary for AVC, and retain start-code
+overlap after capped Annex B slice-header reads.
+
+Extend the existing MXF probe test to check the corrected average frame
+rate while excluding the sample's truncated final packet. Add a probe
+regression test ensuring progressive-source fields retain unknown stream
+field order rather than acquiring an interlaced label.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 785290b537be774a05ff7de1df7c16a9bd1908e8)
+---
+ libavcodec/h264_parser.c                   | 99 +++++++++++++++++++++-
+ tests/fate/h264.mak                        |  6 ++
+ tests/fate/mxf.mak                         |  3 +-
+ tests/ref/fate/h264-twofields-packet-probe |  4 +
+ tests/ref/fate/mxf-probe-h264-extradata    |  1 +
+ 5 files changed, 110 insertions(+), 3 deletions(-)
+ create mode 100644 tests/ref/fate/h264-twofields-packet-probe
+
+diff --git a/libavcodec/h264_parser.c b/libavcodec/h264_parser.c
+index 1bd0be38a53f..87228fb63aba 100644
+--- a/libavcodec/h264_parser.c
++++ b/libavcodec/h264_parser.c
+@@ -251,6 +251,54 @@ static int scan_mmco_reset(AVCodecParserContext *s, GetBitContext *gb,
+     return 0;
+ }
+ 
++/**
++ * Check whether a slice is the first slice of the field of opposite
++ * parity to the field picture already parsed, and derive its POC if possible.
++ */
++static int parse_second_field(const H264ParseContext *p, H2645NAL *nal,
++                              int *second_poc)
++{
++    GetBitContext *gb = &nal->gb;
++    H264POCContext poc = p->poc;
++    int field_poc[2] = { INT_MAX, INT_MAX };
++    int picture_structure, pic_poc;
++    const SPS *sps;
++    unsigned int pps_id;
++
++    if (get_ue_golomb_long(gb)) // first_mb_in_slice
++        return 0;
++    get_ue_golomb_31(gb);       // slice_type
++    pps_id = get_ue_golomb(gb);
++    if (pps_id >= MAX_PPS_COUNT || !p->ps.pps_list[pps_id])
++        return 0;
++    sps = p->ps.pps_list[pps_id]->sps;
++    if (sps->residual_color_transform_flag)
++        skip_bits(gb, 2);       // colour_plane_id
++    poc.frame_num = get_bits(gb, sps->log2_max_frame_num);
++    if (poc.frame_num != p->poc.prev_frame_num ||
++        sps->frame_mbs_only_flag || !get_bits1(gb)) // field_pic_flag
++        return 0;
++    picture_structure = PICT_TOP_FIELD + get_bits1(gb); // bottom_field_flag
++    if (picture_structure == p->picture_structure || get_bits_left(gb) < 0)
++        return 0;
++
++    /* Derive display order without changing the first field's parser state. */
++    if (nal->type == H264_NAL_IDR_SLICE) {
++        poc.prev_frame_num = poc.prev_frame_num_offset = 0;
++        poc.prev_poc_msb = poc.prev_poc_lsb = 0;
++        get_ue_golomb_long(gb); // idr_pic_id
++    }
++    if (sps->poc_type == 0)
++        poc.poc_lsb = get_bits(gb, sps->log2_max_poc_lsb);
++    if (sps->poc_type == 1 && !sps->delta_pic_order_always_zero_flag)
++        poc.delta_poc[0] = get_se_golomb(gb);
++    if (sps == p->ps.sps && get_bits_left(gb) >= 0 &&
++        ff_h264_init_poc(field_poc, &pic_poc, sps, &poc,
++                         picture_structure, nal->ref_idc) >= 0)
++        *second_poc = pic_poc;
++    return 1;
++}
++
+ /**
+  * Parse NAL units of found picture and decode some basic information.
+  *
+@@ -270,6 +318,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
+     unsigned int pps_id;
+     unsigned int slice_type;
+     int state = -1, got_reset = 0;
++    int first_field = 0;
+     int q264 = buf_size >=4 && !memcmp("Q264", buf, 4);
+     int field_poc[2];
+     int ret;
+@@ -332,7 +381,14 @@ static inline int parse_nal_units(AVCodecParserContext *s,
+         if (consumed < 0)
+             break;
+ 
+-        buf_index += consumed;
++        /* A capped slice-header read may end inside the next start code. */
++        if (consumed == src_length && src_length < next_avc - buf_index) {
++            if (p->is_avc)
++                buf_index = next_avc;
++            else
++                buf_index += consumed - 3;
++        } else
++            buf_index += consumed;
+ 
+         ret = init_get_bits8(&nal.gb, nal.data, nal.size);
+         if (ret < 0)
+@@ -341,6 +397,37 @@ static inline int parse_nal_units(AVCodecParserContext *s,
+         nal.ref_idc = get_bits(&nal.gb, 2);
+         nal.type    = get_bits(&nal.gb, 5);
+ 
++        if (first_field) {
++            int second_poc = INT_MAX;
++
++            /* The packet also holds the second field of the pair. */
++            if ((nal.type == H264_NAL_SLICE     ||
++                 nal.type == H264_NAL_IDR_SLICE ||
++                 nal.type == H264_NAL_DPA) &&
++                parse_second_field(p, &nal, &second_poc)) {
++                s->repeat_pict++;
++                s->field_order = AV_FIELD_UNKNOWN;
++                if (!got_reset && nal.ref_idc &&
++                    !(p->ps.sps->pic_struct_present_flag &&
++                      p->sei.picture_timing.present &&
++                      (p->sei.picture_timing.ct_type & 3) == 1) &&
++                    second_poc != INT_MAX &&
++                    second_poc != s->output_picture_number) {
++                    if (p->picture_structure == PICT_TOP_FIELD)
++                        s->field_order = s->output_picture_number < second_poc ?
++                                         AV_FIELD_TT : AV_FIELD_TB;
++                    else
++                        s->field_order = s->output_picture_number < second_poc ?
++                                         AV_FIELD_BB : AV_FIELD_BT;
++                }
++                s->picture_structure = AV_PICTURE_STRUCTURE_FRAME;
++                break;
++            }
++            /* Keep the parameter sets the second field may refer to. */
++            if (nal.type != H264_NAL_SPS && nal.type != H264_NAL_PPS)
++                continue;
++        }
++
+         switch (nal.type) {
+         case H264_NAL_SPS:
+             ff_h264_decode_seq_parameter_set(&nal.gb, avctx, &p->ps, 0);
+@@ -577,11 +664,19 @@ static inline int parse_nal_units(AVCodecParserContext *s,
+                           sps->num_units_in_tick * 2, den, 1 << 30);
+             }
+ 
++            /* A complete frame starting with a field picture may hold
++             * both fields of the pair, look for the second one. */
++            if ((s->flags & PARSER_FLAG_COMPLETE_FRAMES) &&
++                p->picture_structure != PICT_FRAME) {
++                first_field = 1;
++                break;
++            }
++
+             av_freep(&rbsp.rbsp_buffer);
+             return 0; /* no need to evaluate the rest */
+         }
+     }
+-    if (q264) {
++    if (first_field || q264) {
+         av_freep(&rbsp.rbsp_buffer);
+         return 0;
+     }
+diff --git a/tests/fate/h264.mak b/tests/fate/h264.mak
+index 1ee70f216df6..96c6292c2874 100644
+--- a/tests/fate/h264.mak
++++ b/tests/fate/h264.mak
+@@ -253,6 +253,7 @@ FATE_H264-$(call FRAMECRC, MPEGTS, H264, H264_PARSER MP3_DECODER SCALE_FILTER AR
+ FATE_H264_FFPROBE-$(call DEMDEC, MATROSKA, H264) += fate-h264-dts_5frames
+ FATE_H264_FFPROBE-$(call DEMDEC, MATROSKA, H264) += fate-h264-skip-pred-pts
+ FATE_H264_FFPROBE-$(call DEMDEC, MOV, H264) += fate-h264-late-sei
++FATE_H264_FFPROBE-$(call DEMDEC, MOV, H264, H264_PARSER) += fate-h264-twofields-packet-probe
+ FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-afd
+ FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-timecode-probe
+ FATE_H264_FFPROBE-$(call PARSERDEMDEC, H264, H264, H264) += fate-h264-skip-pred \
+@@ -523,3 +524,8 @@ fate-h264-bsf-redundant-pps-side-data2: CMD = transcode mov $(TARGET_SAMPLES)/h2
+ 
+ fate-h264-encparams: CMD = venc_data $(TARGET_SAMPLES)/h264-conformance/FRext/FRExt_MMCO4_Sony_B.264 0 1
+ FATE_SAMPLES_DUMP_DATA += fate-h264-encparams
++
++# Progressive-source fields must not acquire an interlaced stream label.
++fate-h264-twofields-packet-probe: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact -v 0 -select_streams v \
++                                          -show_entries stream=field_order,avg_frame_rate \
++                                          $(TARGET_SAMPLES)/h264/twofields_packet.mp4
+diff --git a/tests/fate/mxf.mak b/tests/fate/mxf.mak
+index 03bb156914b4..9b56bfa8c894 100644
+--- a/tests/fate/mxf.mak
++++ b/tests/fate/mxf.mak
+@@ -24,9 +24,10 @@ fate-mxf-probe-d10: SRC = $(TARGET_SAMPLES)/mxf/Sony-00001.mxf
+ fate-mxf-probe-d10: CMD = run $(PROBE_FORMAT_STREAMS_COMMAND) -i "$(SRC)"
+ 
+ # Long GOP AVC must retain its in-band parameter sets, not AVC-Intra defaults.
++# Count both fields per packet; discard the sample's truncated final packet.
+ FATE_MXF_PROBE-$(call DEMDEC, MXF, H264, H264_PARSER EXTRACT_EXTRADATA_BSF) += fate-mxf-probe-h264-extradata
+ fate-mxf-probe-h264-extradata: SRC = $(TARGET_SAMPLES)/h264/SonyXAVC_LongGOP_green_pixelation_early_Frames.MXF
+-fate-mxf-probe-h264-extradata: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact -v 0 -select_streams v -show_entries stream=extradata,extradata_size,extradata_hash -show_data_hash md5 -i "$(SRC)"
++fate-mxf-probe-h264-extradata: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -bitexact -v 0 -fflags +discardcorrupt -select_streams v -show_entries stream=avg_frame_rate,extradata,extradata_size,extradata_hash -show_data_hash md5 -i "$(SRC)"
+ 
+ # The companion paired-field parser fix changes the reference to 25/1.
+ # Keep the truncated final packet to exercise corrupt-packet FPS accounting.
+diff --git a/tests/ref/fate/h264-twofields-packet-probe b/tests/ref/fate/h264-twofields-packet-probe
+new file mode 100644
+index 000000000000..f215a7e0d1dd
+--- /dev/null
++++ b/tests/ref/fate/h264-twofields-packet-probe
+@@ -0,0 +1,4 @@
++[STREAM]
++field_order=unknown
++avg_frame_rate=30000/1001
++[/STREAM]
+diff --git a/tests/ref/fate/mxf-probe-h264-extradata b/tests/ref/fate/mxf-probe-h264-extradata
+index 482bca0ce5d1..5de7bb31e599 100644
+--- a/tests/ref/fate/mxf-probe-h264-extradata
++++ b/tests/ref/fate/mxf-probe-h264-extradata
+@@ -1,4 +1,5 @@
+ [STREAM]
++avg_frame_rate=25/1
+ extradata_size=254
+ extradata_hash=MD5:0a4fe18be973294d0433253d1e8548bc
+ [/STREAM]

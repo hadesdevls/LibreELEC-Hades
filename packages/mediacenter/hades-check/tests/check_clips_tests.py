@@ -3,7 +3,7 @@
 """Host tests of the picture clips of "Check this setup" (packages/mediacenter/hades-check/clips).
 
 usage: check_clips_tests.py --clips <clips dir> --x265 <x265> --ffmpeg <ffmpeg> --ffprobe <ffprobe>
-                            --dovi-compare <program> --kodi <Kodi tree> --work <dir>
+                            --dovi-compare <program> --dovi-blocks <program> --kodi <Kodi tree> --work <dir>
                             --gen1 <dir> --gen2 <dir> [--mutants] [--only <check,...>]
 gen1 and gen2 are two generations of the same clips, made apart (make_clips.sh --video-only, or with the
 sounds); the checks look at gen1 and compare the two. Every check prints PASS or FAIL with what it
@@ -47,7 +47,7 @@ def record(name, ok, detail=""):
 def import_clips(clips_dir, extra=()):
     """fresh modules of the generator (card, dovi, hevc, mkv and the extra ones), not shared with any
     earlier import, so that a mutant's changes stay in its own modules"""
-    names = ("card", "dovi", "hevc", "mkv") + tuple(extra)
+    names = ("card", "dovi", "hevc", "mkv", "abclip", "fpclip") + tuple(extra)
     for m in names + ("gen_video",):
         sys.modules.pop(m, None)
     sys.path.insert(0, clips_dir)
@@ -377,14 +377,19 @@ def check_pixels(gen, mods, prefix=""):
     return ok_all, report
 
 
-def ipt_header_matrices():
-    """the matrices of dvbridge_ipt.h, read from the Kodi tree (not from the generator)"""
-    text = open(os.path.join(A.kodi, "tools/dvbridge/dvbridge_ipt.h")).read()
+def p5_rpu_matrices():
+    """the matrices of an RPU of profile 5 as dovi_tool writes them (the constants of tests/dovi_compare.c, read
+    from dovi_tool's profile5.rs; not the generator's), and the RGBtoLMS of BT.2020 of Kodi's dvbridge_ipt.h.
+    (Not the matrices of the bridge's IPT tunnel of dvbridge_ipt.h: since 2026-11 those are a licensed core's,
+    for the expert choice of that tunnel only; dovi_compare checks them.)"""
+    test = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dovi_compare.c")).read()
+    header = open(os.path.join(A.kodi, "tools/dvbridge/dvbridge_ipt.h")).read()
 
-    def nums(name):
-        m = re.search(r"#define %s \{([^}]*)\}" % name, text)
+    def nums(text, pattern):
+        m = re.search(pattern, text)
         return [int(x.strip().rstrip("u")) for x in m.group(1).split(",")]
-    return nums("DVBRIDGE_IPT_YCC"), nums("DVBRIDGE_IPT_OFFSETS"), nums("DVBRIDGE_IPT_LMS"), nums("DVBRIDGE_LMS_2020")
+    return (nums(test, r"DOVI_TOOL_P5_YCC\[9\] = \{([^}]*)\}"), nums(test, r"DOVI_TOOL_P5_OFFSETS\[3\] = \{([^}]*)\}"),
+            nums(test, r"DOVI_TOOL_P5_LMS\[9\] = \{([^}]*)\}"), nums(header, r"#define DVBRIDGE_LMS_2020 \{([^}]*)\}"))
 
 
 PQ = dict(m1=2610 / 16384, m2=2523 / 4096 * 128, c1=3424 / 4096, c2=2413 / 4096 * 32, c3=2392 / 4096 * 32)
@@ -403,8 +408,8 @@ def pq_oetf(y):
 
 
 def check_p5_light(gen, mods, prefix=""):
-    """profile 5: what the base layer carries, against the light the card means. With the matrices of
-    Kodi's dvbridge_ipt.h (not the generator's), the exact I, P and T of each region's light (BT.2020 RGB
+    """profile 5: what the base layer carries, against the light the card means. With the matrices of an RPU
+    of profile 5 as dovi_tool writes them (p5_rpu_matrices(), not the generator's), the exact I, P and T of each region's light (BT.2020 RGB
     -> LMS -> the crosstalk of profile 5 undone -> PQ -> IPT, codes as code / 1023); the decoded codes
     must be those values rounded (within half a code), but for greys, whose P and T are 512 by the
     generator's rule (the zero of the DM header, code / 1024; the exact value is a hair below 511.5).
@@ -416,7 +421,7 @@ def check_p5_light(gen, mods, prefix=""):
     by = {e["format"]: e for e in clips_doc(gen)["clips"]}
     if "dv5" not in by:
         return record(prefix + "profile 5 light", False, "no dv5 clip"), []
-    ycc, off, lms, lms2020 = ipt_header_matrices()
+    ycc, off, lms, lms2020 = p5_rpu_matrices()
     m_ycc = np.array(ycc, float).reshape(3, 3) / 8192
     m_lms = np.array(lms, float).reshape(3, 3) / 16384
     m_2020 = np.array(lms2020, float).reshape(3, 3) / 16384
@@ -544,6 +549,135 @@ def check_hvcc_against_ffmpeg(gen, mods, prefix=""):
                          "CodecPrivate %s; colour %s, FFmpeg %s" % ("identical" if same_cp else "DIFFERENT",
                                                                    mine.get("colour"), theirs.get("colour")))
     return ok_all
+
+
+def check_ab(gen, mods, prefix=""):
+    """the clip of the A/B comparison of native Dolby Vision (abclip.py, clips.json "ab"): its entry; its RPU
+    as FFmpeg reads it (tests/dovi_blocks.c), picture by picture: level 1 of its picture, the three trims of
+    level 2 with the lift, level 5 of its bars, level 6 of the mastering display and of its light, nothing
+    else, the scene refreshed on the first picture only; and every code of every picture, decoded. What the
+    comparison needs is asserted on its own too: black bars inside the picture, a lift above 2048, squares
+    near black."""
+    ab, card, dv = mods["abclip"], mods["card"], mods["dovi"]
+    e = clips_doc(gen).get("ab")
+    if not e:
+        return record(prefix + "the A/B clip", False, "no entry \"ab\" in clips.json")
+    bad = []
+    f = dict(ab.fmt(), frames=e.get("frames"))
+    path = os.path.join(gen, e.get("file", ""))
+    if e.get("file") != ab.FILE or not os.path.isfile(path):
+        return record(prefix + "the A/B clip", False, "file %r" % e.get("file"))
+    if e.get("sha256") != sha256(path) or e.get("bytes") != os.path.getsize(path):
+        bad.append("digest or size in clips.json")
+    if e.get("format") != ab.FORMAT or e.get("width") != 3840 or e.get("height") != 2160:
+        bad.append("format or size %r" % ((e.get("format"), e.get("width"), e.get("height")),))
+    exact = f["frames"] * f["fps"][1] / f["fps"][0]
+    if not isinstance(e.get("duration"), (int, float)) or abs(e["duration"] - exact) > 0.0005:
+        bad.append("duration %r, %.4f s" % (e.get("duration"), exact))
+    # the references, from the reference modules
+    l1 = tuple(ab.level1(f)[1])
+    peak, mean = ab.light_stats(f)
+    s = f["height"] // card.GRID_H
+    want_l2 = [(dv.pq_code12(t), 2048, 2048 + ab.LIFT, 2048, 2048, 2048, 2048) for t in ab.TARGETS]
+    want_l5 = (0, 0, ab.BAR * s, ab.BAR * s)
+    want_l6 = (card.rnd(card.MASTERING["max_nits"], "max"), card.rnd(card.MASTERING["min_nits"] * 10000, "min"),
+               card.rnd(peak, "MaxCLL"), card.rnd(mean, "MaxFALL"))
+    if not ab.LIFT > 0 or not ab.BAR * s >= 200:
+        bad.append("the comparison needs a lift and bars: lift %r, bars of %r rows" % (ab.LIFT, ab.BAR * s))
+    p = subprocess.run([A.dovi_blocks, path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    lines = p.stdout.decode(errors="replace").splitlines()
+    frames = [l.split() for l in lines if l.startswith("frame ")]
+    if p.returncode or ("pictures %d" % f["frames"]) not in lines or len(frames) != f["frames"]:
+        bad.append("dovi_blocks: exit %d, %d pictures, %s" % (p.returncode, len(frames), lines[-1:] or "nothing"))
+    wrong = 0
+    for t in frames:
+        n = int(t[1])
+        got = {"L1": [], "L2": [], "L5": [], "L6": [], "other": []}
+        i = 6 if len(t) > 5 and t[2] == "refresh" else len(t)
+        while i < len(t):
+            k = t[i]
+            width = {"L1": 3, "L2": 7, "L5": 4, "L6": 4}.get(k)
+            if width is None:
+                got["other"].append(k)
+                i += 1
+                continue
+            got[k].append(tuple(int(x) for x in t[i + 1:i + 1 + width]))
+            i += 1 + width
+        refresh = len(t) > 3 and t[2] == "refresh" and t[3] == ("1" if n == 0 else "0")
+        if not (refresh and got["L1"] == [l1] and got["L2"] == want_l2 and got["L5"] == [want_l5] and
+                got["L6"] == [want_l6] and not got["other"]):
+            wrong += 1
+            if wrong <= 2:
+                bad.append("picture %d: %s; want L1 %s L2 %s L5 %s L6 %s" % (n, " ".join(t[2:]), l1, want_l2, want_l5, want_l6))
+    # every code, decoded; the bars and the near-black squares as the comparison needs them
+    analyze.card = card
+    values = ab.region_values()
+    exp = analyze.expected_planes(f, values)
+    n = good = 0
+    for planes in analyze.decoded_pictures(A.ffmpeg, path, f):
+        good += all((planes[c] == exp[c]).all() for c in range(3))
+        n += 1
+    if n != f["frames"] or good != n:
+        bad.append("%d of %d pictures exact" % (good, n))
+    bars = np.concatenate([exp[0][:ab.BAR * s], exp[0][-ab.BAR * s:]])
+    if not (bars == 64).all():
+        bad.append("the bars are not black (Y 64) across: %s" % sorted(set(bars.flatten().tolist()))[:6])
+    dark = [values["dark%d" % k].light[0] for k in range(1, len(ab.DARK) + 1)]
+    if not (0 < min(dark) and max(dark) <= 2.0 and values["dark0"].codes[0] == 64):
+        bad.append("the near-black squares: %s" % dark)
+    return record(prefix + "the A/B clip %s: clips.json, its RPU as FFmpeg reads it, its pictures" % ab.FILE, not bad,
+                  "%d pictures, every one with L1 %s, L2 %s, L5 %s, L6 %s; every code exact" % (n, l1, want_l2, want_l5, want_l6)
+                  if not bad else "; ".join(bad))
+
+
+def check_fp(gen, mods, prefix=""):
+    """the 3D clip of the frame packing card (fpclip.py, clips.json "fp"): its entry; 1920x1080 at 24000/1001, the
+    format whose frame packing every HDMI display with 3D takes; the 3D layout as FFmpeg gives it to Kodi (the
+    stream's stereo_mode "left_right", which Kodi draws split side by side, and its Stereo 3D side data); and every
+    code of every picture, decoded, with the two halves the same card but for the label of each eye"""
+    fp = mods["fpclip"]
+    e = clips_doc(gen).get("fp")
+    if not e:
+        return record(prefix + "the 3D clip", False, "no entry \"fp\" in clips.json")
+    path = os.path.join(gen, e.get("file", ""))
+    if e.get("file") != fp.FILE or not os.path.isfile(path):
+        return record(prefix + "the 3D clip", False, "file %r" % e.get("file"))
+    bad = []
+    if e.get("sha256") != sha256(path) or e.get("bytes") != os.path.getsize(path):
+        bad.append("digest or size in clips.json")
+    f = dict(fp.fmt(), frames=e.get("frames"))
+    got = (e.get("format"), e.get("width"), e.get("height"), e.get("fps"), e.get("bit_depth"), e.get("stereo_mode"))
+    if got != (fp.FORMAT, 1920, 1080, [24000, 1001], 8, "left_right"):
+        bad.append("entry %r" % (got,))
+    exact = f["frames"] * f["fps"][1] / f["fps"][0]
+    if not isinstance(e.get("duration"), (int, float)) or abs(e["duration"] - exact) > 0.0005:
+        bad.append("duration %r, %.4f s" % (e.get("duration"), exact))
+    st = ffprobe_json(path, "-show_streams")["streams"][0]
+    if (st.get("width"), st.get("height"), st.get("pix_fmt"), frac(st.get("r_frame_rate"))) != (1920, 1080, "yuv420p",
+                                                                                                24000 / 1001):
+        bad.append("FFmpeg reads %r" % ((st.get("width"), st.get("height"), st.get("pix_fmt"), st.get("r_frame_rate")),))
+    if (st.get("tags") or {}).get("stereo_mode") != "left_right":
+        bad.append("FFmpeg's stereo_mode %r" % (st.get("tags") or {}).get("stereo_mode"))
+    side = [d for d in st.get("side_data_list", []) if d.get("side_data_type") == "Stereo 3D"]
+    if not side or side[0].get("type") != "side by side" or side[0].get("inverted"):
+        bad.append("Stereo 3D side data %r" % side)
+    analyze.card = mods["card"]
+    exp = analyze.to_planes(b"".join(fp.planes()), f)
+    # the halves: the same card, but for the labels (their rows, card.LABEL_Y and seven dots)
+    card = mods["card"]
+    differ = np.nonzero((exp[0][:, :960] != exp[0][:, 960:]).any(axis=1))[0]
+    rows = (card.LABEL_Y, card.LABEL_Y + 7 * card.DOT)
+    if not len(differ) or differ.min() < rows[0] or differ.max() >= rows[1]:
+        bad.append("the eyes differ in rows %s, the labels are in %s" % (differ[:3].tolist() + differ[-3:].tolist(), rows))
+    n = good = 0
+    for planes in analyze.decoded_pictures(A.ffmpeg, path, f):
+        good += all((planes[c] == exp[c]).all() for c in range(3))
+        n += 1
+    if n != f["frames"] or good != n:
+        bad.append("%d of %d pictures exact" % (good, n))
+    return record(prefix + "the 3D clip %s: clips.json, its layout as FFmpeg reads it, its pictures" % fp.FILE, not bad,
+                  "%d pictures of 1920x1080 at 24000/1001, side by side with the left eye first, every code exact" % n
+                  if not bad else "; ".join(bad))
 
 
 def check_sizes(gen, mods, prefix="", limit=SIZE_LIMIT):
@@ -681,6 +815,30 @@ def run_mutants(gen, ref):
                check_dv81_base_layer(ctl, ref, "control: "), check_hvcc_against_ffmpeg(ctl, ref, "control: ")]
     if not all(control):
         say("the control fails: the mutants below would prove nothing")
+
+    # the clip of the A/B comparison: a control and three faults, two pictures each
+    actl = generate(w("ab-control"), "dv81-ab", 2)
+    say("--- control of the A/B clip (two pictures, no fault): the check below must pass")
+    if not check_ab(actl, ref, "control: "):
+        say("the control of the A/B clip fails: its mutants below would prove nothing")
+
+    def ab_no_l5(m):
+        m["abclip"].level5 = lambda f: {"left": 0, "right": 0, "top": 0, "bottom": 0}
+    mutant("the A/B clip without the level 5 of its bars", check_ab, generate(w("ab-nol5"), "dv81-ab", 2, ab_no_l5),
+           ref, "mutant: ")
+
+    def ab_neutral(m):
+        orig = m["abclip"].level2
+        m["abclip"].level2 = lambda: [dict(b, trim_offset=2048) for b in orig()]
+    mutant("the A/B clip with neutral trims (no lift)", check_ab, generate(w("ab-neutral"), "dv81-ab", 2, ab_neutral),
+           ref, "mutant: ")
+
+    def ab_grey_bars(m):
+        a = m["abclip"]
+        orig = a.region_values
+        a.region_values = lambda: dict(orig(), background=a._grey(0.1, "background"))
+    mutant("the A/B clip with grey bars", check_ab, generate(w("ab-grey"), "dv81-ab", 2, ab_grey_bars), ref,
+           "mutant: ")
 
     def pq_wrong_transfer(m):
         g = m["gen_video"]
@@ -838,11 +996,23 @@ def run_mutants(gen, ref):
     mutant("hvcC with another parallelismType", check_hvcc_against_ffmpeg,
            generate(w("hvcc"), "sdr", 2, hvcc_parallel), ref, "mutant: ")
 
+    # the 3D clip of the frame packing card: a control, then without its StereoMode, and with its eyes swapped
+    say("--- control of the 3D clip (two pictures, no fault): the check below must pass")
+    control.append(check_fp(generate(w("fp-control"), "sdr-3d-sbs", 2), ref, "control: "))
+    mutant("the 3D clip without its StereoMode", check_fp,
+           generate(w("fp-nostereo"), "sdr-3d-sbs", 2, lambda m: setattr(m["fpclip"], "STEREO_MODE", None)), ref,
+           "mutant: ")
+
+    def swap(m):
+        m["fpclip"].LABELS = tuple(reversed(m["fpclip"].LABELS))
+    mutant("the 3D clip with its eyes swapped", check_fp, generate(w("fp-swapped"), "sdr-3d-sbs", 2, swap), ref,
+           "mutant: ")
+
 
 def main():
     global A
     ap = argparse.ArgumentParser()
-    for k in ("clips", "x265", "ffmpeg", "ffprobe", "dovi-compare", "kodi", "work", "gen1", "gen2"):
+    for k in ("clips", "x265", "ffmpeg", "ffprobe", "dovi-compare", "dovi-blocks", "kodi", "work", "gen1", "gen2"):
         ap.add_argument("--" + k, required=k not in ("gen2",))
     ap.add_argument("--only", default="")
     ap.add_argument("--mutants", action="store_true")
@@ -879,6 +1049,10 @@ def main():
         check_dv81_base_layer(gen, ref)
     if want("hvcc"):
         check_hvcc_against_ffmpeg(gen, ref)
+    if want("ab"):
+        check_ab(gen, ref)
+    if want("fp"):
+        check_fp(gen, ref)
     if want("sizes"):
         check_sizes(gen, ref)
     if want("guard"):

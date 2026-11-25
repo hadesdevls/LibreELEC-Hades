@@ -1,0 +1,239 @@
+From a39023c4fe14c424909b8d631e58d27251810b20 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:09:26 +0000
+Subject: [PATCH] [Hades][DVBridge] The copy into an 8-bit window dithers, with
+ blue noise
+
+What the bridge maps or upscales (HDR10 or Dolby Vision mapped to SDR,
+HDR10 adapted to the display, a picture drawn with an upscaler) is drawn in
+floating point and copied into the window by the copier of
+dvbridge_gl_pack.c, which rounded each value to the nearest level. Into a
+window of 8 bits that leaves steps of a whole level in smooth gradients:
+skies, fades, dark walls.
+
+The copy into 255 levels now takes the level below each value or the one
+above it by a threshold of blue noise of 64 x 64 (void-and-cluster, made
+once here, deterministic; read with texelFetch), as libplacebo dithers by
+default. Measured against the same pictures in floating point, blurred 2 px
+(what the eye sees of banding from a distance), Delta E ITP (BT.2124):
+- gradients of 10 and 12 bits from PQ and SDR, to SDR and to PQ at 8 bits:
+  0.50 to 0.04 on average (-92 %), the 99th percentile 1.51 to 0.12;
+- six film frames to SDR: 0.133 to 0.073 (-45 %), the 99th percentile
+  0.66 to 0.28; to PQ at 8 bits: 0.167 to 0.129 (-23 %), 0.74 to 0.41;
+- the noise it adds: 0.41 of a level (rms of the high frequencies), in
+  place of 0.13 to 0.23 of rounding; PSNR without blur 3 dB lower;
+- the same as libplacebo's blue noise within 0.001; an ordered (Bayer)
+  dither is as good on film and a fifth worse on gradients, white noise
+  worse than both.
+Values on a level, black among them, stay on it; limited range is dithered
+after it is applied. 10 bits, floating point and wider windows get the
+rounding of before, exactly. Native Dolby Vision is untouched: its transport
+is packed elsewhere (dvbridge_gl_pack()), byte for byte as before.
+---
+ tools/dvbridge/dvbridge_gl_pack.c | 124 +++++++++++++++++++++++++++++-
+ tools/dvbridge/dvbridge_gl_pack.h |  13 ++++
+ 2 files changed, 134 insertions(+), 3 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_gl_pack.c b/tools/dvbridge/dvbridge_gl_pack.c
+index 365075b..6e97fa0 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.c
++++ b/tools/dvbridge/dvbridge_gl_pack.c
+@@ -234,8 +234,85 @@ bool dvbridge_gl_packer_gui(const struct dvbridge_gl_packer *p)
+ struct dvbridge_gl_copier {
+     GLuint program, vao, sampler;
+     GLint picture, flip_height, levels, limited;
++    /* Hades: the thresholds of the dither into 255 levels (dvbridge_gl_blue_noise()); 0: none, rounded */
++    GLuint noise;
++    GLint noise_unit, dither;
+ };
+ 
++void dvbridge_gl_blue_noise(float out[DVBRIDGE_GL_NOISE * DVBRIDGE_GL_NOISE])
++{
++    enum { S = DVBRIDGE_GL_NOISE, N = S * S };
++    static float kernel[N], energy[N];
++    static unsigned char on[N], first[N];
++    static int rank[N];
++    const float sigma = 1.9f;
++    for (int y = 0; y < S; ++y)
++        for (int x = 0; x < S; ++x) {
++            const int dx = x < S - x ? x : S - x, dy = y < S - y ? y : S - y;
++            kernel[y * S + x] = expf(-(float)(dx * dx + dy * dy) / (2.0f * sigma * sigma));
++        }
++    memset(energy, 0, sizeof(energy));
++    memset(on, 0, sizeof(on));
++#define NOISE_PUT(i, sign)                                                                         \
++    do {                                                                                           \
++        const int px_ = (i) % S, py_ = (i) / S;                                                    \
++        on[i] = (sign) > 0;                                                                        \
++        for (int q_ = 0; q_ < N; ++q_)                                                             \
++            energy[q_] += (sign) * kernel[(((q_ / S) - py_ + S) % S) * S + ((q_ % S) - px_ + S) % S]; \
++    } while (0)
++    /* a fixed start: a tenth of the texels, by a linear congruential generator */
++    unsigned lcg = 12345u;
++    int ones = 0;
++    while (ones < N / 10) {
++        lcg = lcg * 1664525u + 1013904223u;
++        const int i = (int)((lcg >> 8) % N);
++        if (!on[i]) {
++            NOISE_PUT(i, 1.0f);
++            ++ones;
++        }
++    }
++    /* the tightest cluster moved to the largest void until they are the same texel */
++    for (int guard = 0; guard < N; ++guard) {
++        int c = -1, v = -1;
++        for (int i = 0; i < N; ++i)
++            if (on[i] && (c < 0 || energy[i] > energy[c]))
++                c = i;
++        NOISE_PUT(c, -1.0f);
++        for (int i = 0; i < N; ++i)
++            if (!on[i] && (v < 0 || energy[i] < energy[v]))
++                v = i;
++        NOISE_PUT(v, 1.0f);
++        if (v == c)
++            break;
++    }
++    memcpy(first, on, sizeof(on));
++    float start[N];
++    memcpy(start, energy, sizeof(energy));
++    /* the ranks below: the tightest cluster taken out, one after the other */
++    for (int r = ones - 1; r >= 0; --r) {
++        int c = -1;
++        for (int i = 0; i < N; ++i)
++            if (on[i] && (c < 0 || energy[i] > energy[c]))
++                c = i;
++        NOISE_PUT(c, -1.0f);
++        rank[c] = r;
++    }
++    /* the ranks above: from the start, the largest void filled, one after the other */
++    memcpy(on, first, sizeof(on));
++    memcpy(energy, start, sizeof(energy));
++    for (int r = ones; r < N; ++r) {
++        int v = -1;
++        for (int i = 0; i < N; ++i)
++            if (!on[i] && (v < 0 || energy[i] < energy[v]))
++                v = i;
++        NOISE_PUT(v, 1.0f);
++        rank[v] = r;
++    }
++#undef NOISE_PUT
++    for (int i = 0; i < N; ++i)
++        out[i] = ((float)rank[i] + 0.5f) / (float)N;
++}
++
+ static const char COPY_VERTEX[] =
+     "#version 300 es\n"
+     "void main()\n"
+@@ -261,6 +338,8 @@ static const char COPY_FRAGMENT[] =
+     "uniform int flip_height;\n"
+     "uniform float levels;\n"
+     "uniform int limited;\n"
++    "uniform highp sampler2D noise;\n"
++    "uniform int dither;\n"
+     "out vec4 color;\n"
+     "void main()\n"
+     "{\n"
+@@ -273,8 +352,12 @@ static const char COPY_FRAGMENT[] =
+     "        c = (c * (219.0 * step8) + 16.0 * step8) / levels;\n"
+     "    else if (limited != 0)\n"
+     "        c = (c * 876.0 + 64.0) / 1023.0;\n"
+-    "    if (levels > 0.0)\n"
+-    "        c = (floor(c * levels + 0.5) + 0.00390625) / levels;\n"
++    "    if (levels > 0.0) {\n"
++    "        float threshold = 0.5;\n"
++    "        if (dither != 0)\n"
++    "            threshold = texelFetch(noise, ivec2(gl_FragCoord.xy) & 63, 0).r;\n"
++    "        c = (floor(c * levels + threshold) + 0.00390625) / levels;\n"
++    "    }\n"
+     "    color = vec4(c, 1.0);\n"
+     "}\n";
+ 
+@@ -300,11 +383,36 @@ struct dvbridge_gl_copier *dvbridge_gl_copier_create(void)
+     c->flip_height = glGetUniformLocation(c->program, "flip_height");
+     c->levels = glGetUniformLocation(c->program, "levels");
+     c->limited = glGetUniformLocation(c->program, "limited");
++    c->noise_unit = glGetUniformLocation(c->program, "noise");
++    c->dither = glGetUniformLocation(c->program, "dither");
+     if (!linked || c->picture < 0 || c->flip_height < 0 || c->levels < 0 || c->limited < 0 ||
+-        !make_objects(&c->vao, &c->sampler)) {
++        c->noise_unit < 0 || c->dither < 0 || !make_objects(&c->vao, &c->sampler)) {
+         dvbridge_gl_copier_destroy(c);
+         return NULL;
+     }
++    /* Hades: the thresholds of the dither, in a texture of their own (without it the copy rounds, as
++     * before) */
++    static float thresholds[DVBRIDGE_GL_NOISE * DVBRIDGE_GL_NOISE];
++    static bool made;
++    if (!made) {
++        dvbridge_gl_blue_noise(thresholds);
++        made = true;
++    }
++    struct dvbridge_gl_state state;
++    dvbridge_gl_state_save(&state);
++    dvbridge_gl_drain_errors();
++    glGenTextures(1, &c->noise);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, c->noise);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, DVBRIDGE_GL_NOISE, DVBRIDGE_GL_NOISE);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DVBRIDGE_GL_NOISE, DVBRIDGE_GL_NOISE, GL_RED, GL_FLOAT,
++                    thresholds);
++    if (glGetError() != GL_NO_ERROR) {
++        glDeleteTextures(1, &c->noise);
++        c->noise = 0;
++    }
++    dvbridge_gl_state_restore(&state);
+     return c;
+ }
+ 
+@@ -315,6 +423,8 @@ void dvbridge_gl_copier_destroy(struct dvbridge_gl_copier *c)
+     glDeleteVertexArrays(1, &c->vao);
+     glDeleteSamplers(1, &c->sampler);
+     glDeleteProgram(c->program);
++    if (c->noise)
++        glDeleteTextures(1, &c->noise);
+     free(c);
+ }
+ 
+@@ -513,6 +623,14 @@ bool dvbridge_gl_copy_area(struct dvbridge_gl_copier *c, unsigned texture, unsig
+         glUniform1i(c->flip_height, flip ? height : 0);
+         glUniform1f(c->levels, levels);
+         glUniform1i(c->limited, limited);
++        /* Hades: the dither into 255 levels, with the thresholds on unit 1 (read with texelFetch) */
++        const bool dither = held == 255 && c->noise;
++        glUniform1i(c->dither, dither);
++        glUniform1i(c->noise_unit, 1);
++        glActiveTexture(GL_TEXTURE1);
++        glBindSampler(1, 0);
++        glBindTexture(GL_TEXTURE_2D, dither ? c->noise : 0);
++        glActiveTexture(GL_TEXTURE0);
+         glDrawArrays(GL_TRIANGLES, 0, 3);
+     }
+     ok = glGetError() == GL_NO_ERROR;
+diff --git a/tools/dvbridge/dvbridge_gl_pack.h b/tools/dvbridge/dvbridge_gl_pack.h
+index 81a9833..463b69d 100644
+--- a/tools/dvbridge/dvbridge_gl_pack.h
++++ b/tools/dvbridge/dvbridge_gl_pack.h
+@@ -98,6 +98,19 @@ bool dvbridge_gl_copy(struct dvbridge_gl_copier *copier, unsigned texture, unsig
+  * bound is bound again. */
+ #define DVBRIDGE_GL_COPY_LEVELS 1
+ int dvbridge_gl_copy_levels(unsigned framebuffer);
++/* Hades: into a framebuffer of 255 levels (8 bits) the copy dithers: each value goes to the level below
++ * it or the one above, by a threshold of blue noise of 64 x 64 (dvbridge_gl_blue_noise()), so that a
++ * gradient keeps its slope instead of steps of a whole level. Measured on gradients of 10 and 12 bits
++ * mapped from PQ to SDR and on six film frames (against the same picture in floating point, blurred 2 px
++ * as the eye sees banding from a distance): Delta E ITP of what is left of the steps -90 % on gradients,
++ * -45 % on film in SDR and -23 % in PQ at 8 bits, for a noise of 0.4 of a level. Exact levels, black
++ * among them, stay as they are; 10 bits, floating point and more get the values as before, and so does
++ * everything that is not this copy (the transport of native Dolby Vision is packed elsewhere,
++ * dvbridge_gl_pack()). */
++#define DVBRIDGE_GL_NOISE 64
++/* the thresholds, (rank + 0.5) / 4096, a rank of void-and-cluster (R. Ulichney, 1993; Gaussian of sigma 1.9
++ * on the torus) for each texel; the same for every call */
++void dvbridge_gl_blue_noise(float out[DVBRIDGE_GL_NOISE * DVBRIDGE_GL_NOISE]);
+ struct dvbridge_gl_rect {
+     int x, y, width, height;
+ };
+-- 
+2.53.0
+

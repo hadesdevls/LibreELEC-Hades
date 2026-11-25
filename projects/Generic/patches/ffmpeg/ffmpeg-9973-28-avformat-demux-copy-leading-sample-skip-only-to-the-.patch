@@ -1,0 +1,361 @@
+From 1502da9c3dafe96c34013f2a34b267891452937a Mon Sep 17 00:00:00 2001
+From: Baptiste Coudurier <baptiste.coudurier@gmail.com>
+Date: Tue, 17 Nov 2026 16:44:36 -0800
+Subject: [PATCH] avformat/demux: copy leading sample skip only to the first
+ parser output
+
+Repeating it on every split output restarts the decoder's skip. Keep the next
+input's side data off a buffered output whose leading skip was removed.
+
+Signed-off-by: Baptiste Coudurier <baptiste.coudurier@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+[Hades: backport to 9.1 without libavformat/tests/.gitignore: FATE files of tests that master added after 9.1 (or, for libavformat/tests/.gitignore, a file the release tarball does not have).]
+
+(cherry picked from commit 1502da9c3dafe96c34013f2a34b267891452937a)
+Upstream: https://github.com/FFmpeg/FFmpeg/commit/1502da9c3dafe96c34013f2a34b267891452937a
+---
+ libavformat/Makefile                   |   1 +
+ libavformat/demux.c                    |  27 +++-
+ libavformat/internal.h                 |   2 +
+ libavformat/tests/parse_skip_samples.c | 190 +++++++++++++++++++++++++
+ tests/fate/libavformat.mak             |   8 +-
+ tests/ref/fate/parse-skip-samples      |  13 ++
+ 6 files changed, 235 insertions(+), 6 deletions(-)
+ create mode 100644 libavformat/tests/parse_skip_samples.c
+ create mode 100644 tests/ref/fate/parse-skip-samples
+
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index a0f4d71..bfd625d 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -794,6 +794,7 @@ TESTPROGS = demux_probe                                                 \
+             url                                                         \
+             seek_utils
+ TESTPROGS-$(CONFIG_RTPDEC)               += rtpdec
++TESTPROGS-$(and $(CONFIG_AC3_PARSER),$(CONFIG_AC3_DECODER)) += parse_skip_samples
+ #           async                                                       \
+ 
+ FIFO-MUXER-TESTPROGS-$(CONFIG_NETWORK)   += fifo_muxer
+diff --git a/libavformat/demux.c b/libavformat/demux.c
+index a7dcf41..e062aa8 100644
+--- a/libavformat/demux.c
++++ b/libavformat/demux.c
+@@ -1254,26 +1254,39 @@ static int parse_packet(AVFormatContext *s, AVPacket *pkt,
+ 
+         got_output = !!out_pkt->size;
+ 
+-        if (pkt->side_data && !out_pkt->side_data) {
+-            /* for the first iteration, side_data are simply moved to output.
+-             * in case of additional iterations, they are duplicated each time. */
++        if (pkt->side_data && !out_pkt->side_data && !sti->parse_skip_filtered) {
++            /* Move side data to the first output. Later outputs get a copy
++             * with any leading skip removed. */
+             if (!pkt_side_data_consumed) {
+                 pkt_side_data_consumed = 1;
+                 out_pkt->side_data       = pkt->side_data;
+                 out_pkt->side_data_elems = pkt->side_data_elems;
+             } else for (int i = 0; i < pkt->side_data_elems; i++) {
+                 const AVPacketSideData *const src_sd = &pkt->side_data[i];
+-                uint8_t *dst_data = av_packet_new_side_data(out_pkt, src_sd->type, src_sd->size);
++                uint8_t *dst_data;
++                int skip_samples = src_sd->type == AV_PKT_DATA_SKIP_SAMPLES &&
++                                   src_sd->size >= 10;
++
++                if (skip_samples && !AV_RL32(src_sd->data + 4)) {
++                    sti->parse_skip_filtered = !got_output;
++                    continue;
++                }
++                dst_data = av_packet_new_side_data(out_pkt, src_sd->type, src_sd->size);
+                 if (!dst_data) {
+                     ret = AVERROR(ENOMEM);
+                     goto fail;
+                 }
+                 memcpy(dst_data, src_sd->data, src_sd->size);
++                if (skip_samples) {
++                    AV_WL32(dst_data, 0);
++                    dst_data[8] = 0;
++                }
+             }
+         }
+ 
+         if (!out_pkt->size)
+             continue;
++        sti->parse_skip_filtered = 0;
+ 
+         if (pkt->buf && out_pkt->data == pkt->data) {
+             /* reference pkt->buf only when out_pkt->data is guaranteed to point
+@@ -1349,8 +1362,10 @@ fail:
+         pkt->side_data_elems    = 0;
+     }
+ 
+-    if (ret < 0)
++    if (ret < 0) {
++        sti->parse_skip_filtered = 0;
+         av_packet_unref(out_pkt);
++    }
+     av_packet_unref(pkt);
+     return ret;
+ }
+@@ -1504,6 +1519,7 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
+                    pkt->size, pkt->duration, pkt->flags);
+ 
+         if (sti->need_parsing && !sti->parser && !(s->flags & AVFMT_FLAG_NOPARSE)) {
++            sti->parse_skip_filtered = 0;
+             sti->parser = av_parser_init(st->codecpar->codec_id);
+             if (!sti->parser) {
+                 av_log(s, AV_LOG_VERBOSE, "parser not found for codec "
+@@ -2685,6 +2701,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
+         /* check if the caller has overridden the codec id */
+         // only for the split stuff
+         if (!sti->parser && !(ic->flags & AVFMT_FLAG_NOPARSE) && sti->request_probe <= 0) {
++            sti->parse_skip_filtered = 0;
+             sti->parser = av_parser_init(st->codecpar->codec_id);
+             if (sti->parser) {
+                 if (sti->need_parsing == AVSTREAM_PARSE_HEADERS) {
+diff --git a/libavformat/internal.h b/libavformat/internal.h
+index 53dc7b9..0af9842 100644
+--- a/libavformat/internal.h
++++ b/libavformat/internal.h
+@@ -324,6 +324,8 @@ typedef struct FFStream {
+ 
+     /* av_read_frame() support */
+     enum AVStreamParseType need_parsing;
++    /** The buffered parser output already had its leading-only skip removed. */
++    int parse_skip_filtered;
+     struct AVCodecParserContext *parser;
+ 
+     /**
+diff --git a/libavformat/tests/parse_skip_samples.c b/libavformat/tests/parse_skip_samples.c
+new file mode 100644
+index 0000000..e865e48
+--- /dev/null
++++ b/libavformat/tests/parse_skip_samples.c
+@@ -0,0 +1,190 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * Feed packets of several AC-3 frames, with skip samples side data on the
++ * first one or two, through the full parser and decode the split packets.
++ */
++
++#include <inttypes.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "libavutil/file.h"
++#include "libavutil/intreadwrite.h"
++#include "libavutil/log.h"
++#include "libavcodec/avcodec.h"
++#include "libavformat/avformat.h"
++#include "libavformat/demux.h"
++#include "libavformat/internal.h"
++
++#define FRAME_SIZE        1536 /* bytes per frame of the sample */
++#define FRAMES_PER_PACKET 4
++
++static uint8_t *file_buf;
++static size_t file_size, file_pos;
++static uint32_t skip_start, skip_end, next_skip_start;
++static uint8_t reason_start, reason_end;
++
++static int read_header(AVFormatContext *s)
++{
++    AVStream *st = avformat_new_stream(s, NULL);
++
++    if (!st)
++        return AVERROR(ENOMEM);
++    st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
++    st->codecpar->codec_id    = AV_CODEC_ID_AC3;
++    st->codecpar->sample_rate = 48000;
++    avpriv_set_pts_info(st, 64, 1, 48000);
++    ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
++    return 0;
++}
++
++static int read_packet(AVFormatContext *s, AVPacket *pkt)
++{
++    size_t size = FFMIN(file_size - file_pos, FRAME_SIZE * FRAMES_PER_PACKET);
++    int ret;
++
++    if (!size)
++        return AVERROR_EOF;
++    ret = av_new_packet(pkt, size);
++    if (ret < 0)
++        return ret;
++    memcpy(pkt->data, file_buf + file_pos, size);
++    if (!file_pos || (next_skip_start && file_pos == FRAME_SIZE * FRAMES_PER_PACKET)) {
++        uint8_t *sd = av_packet_new_side_data(pkt, AV_PKT_DATA_SKIP_SAMPLES, 10);
++        if (!sd)
++            return AVERROR(ENOMEM);
++        AV_WL32(sd,     file_pos ? next_skip_start : skip_start);
++        AV_WL32(sd + 4, skip_end);
++        sd[8] = reason_start;
++        sd[9] = reason_end;
++    }
++    file_pos += size;
++    return 0;
++}
++
++static const FFInputFormat test_demuxer = {
++    .p.name      = "test",
++    .p.flags     = AVFMT_NOFILE,
++    .read_header = read_header,
++    .read_packet = read_packet,
++};
++
++static int run(void)
++{
++    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_AC3);
++    AVFormatContext *s = NULL;
++    AVCodecContext *avctx = NULL;
++    AVPacket *pkt = av_packet_alloc();
++    AVFrame *frame = av_frame_alloc();
++    int64_t samples = 0;
++    int ret, n = 0;
++
++    file_pos = 0;
++    if (!pkt || !frame || !codec) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    ret = avformat_open_input(&s, NULL, &test_demuxer.p, NULL);
++    if (ret < 0)
++        goto end;
++    avctx = avcodec_alloc_context3(codec);
++    if (!avctx) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    ret = avcodec_open2(avctx, codec, NULL);
++    if (ret < 0)
++        goto end;
++
++    printf("skip %"PRIu32"/%"PRIu32" reason %d/%d\n",
++           skip_start, skip_end, reason_start, reason_end);
++    while ((ret = av_read_frame(s, pkt)) >= 0) {
++        size_t sd_size;
++        const uint8_t *sd = av_packet_get_side_data(pkt, AV_PKT_DATA_SKIP_SAMPLES,
++                                                    &sd_size);
++        /* Check trailing discard at the end of the group and leading skip everywhere. */
++        if (sd && sd_size >= 10 && (!skip_end || n == 0 || n >= FRAMES_PER_PACKET - 1 ||
++                                   AV_RL32(sd) || sd[8]))
++            printf("packet %d: pts %"PRId64" size %d skip %"PRIu32"/%"PRIu32
++                   " reason %d/%d\n", n, pkt->pts, pkt->size,
++                   AV_RL32(sd), AV_RL32(sd + 4), sd[8], sd[9]);
++        n++;
++        ret = avcodec_send_packet(avctx, pkt);
++        av_packet_unref(pkt);
++        if (ret < 0)
++            goto end;
++        while ((ret = avcodec_receive_frame(avctx, frame)) >= 0) {
++            samples += frame->nb_samples;
++            av_frame_unref(frame);
++        }
++        if (ret != AVERROR(EAGAIN))
++            goto end;
++    }
++    if (ret != AVERROR_EOF)
++        goto end;
++    ret = avcodec_send_packet(avctx, NULL);
++    while (ret >= 0 && (ret = avcodec_receive_frame(avctx, frame)) >= 0) {
++        samples += frame->nb_samples;
++        av_frame_unref(frame);
++    }
++    if (!skip_end)
++        printf("packets %d, decoded samples %"PRId64"\n", n, samples);
++    ret = ret == AVERROR_EOF ? 0 : ret;
++
++end:
++    avcodec_free_context(&avctx);
++    avformat_close_input(&s);
++    av_frame_free(&frame);
++    av_packet_free(&pkt);
++    return ret;
++}
++
++int main(int argc, char **argv)
++{
++    static const struct {
++        uint32_t start, end;
++        uint8_t  reason_start, reason_end;
++        uint32_t next_start;
++    } tests[] = {
++        { 2000,   0, 0, 0,    0 }, /* leading skip ending in the second frame */
++        { 3500,   0, 0, 0,    0 }, /* leading skip over three frames */
++        { 1000,   0, 0, 0, 1100 }, /* successive packets with distinct leading skips */
++        { 3500, 100, 1, 1,    0 }, /* leading skip and trailing discard */
++    };
++    int ret = 0;
++
++    if (argc < 2) {
++        fprintf(stderr, "Usage: %s <ac3 file>\n", argv[0]);
++        return 1;
++    }
++    av_log_set_level(AV_LOG_ERROR);
++    if (av_file_map(argv[1], &file_buf, &file_size, 0, NULL) < 0)
++        return 1;
++    for (int i = 0; i < FF_ARRAY_ELEMS(tests) && ret >= 0; i++) {
++        skip_start   = tests[i].start;
++        skip_end     = tests[i].end;
++        reason_start = tests[i].reason_start;
++        reason_end   = tests[i].reason_end;
++        next_skip_start = tests[i].next_start;
++        ret = run();
++    }
++    av_file_unmap(file_buf, file_size);
++    return ret < 0;
++}
+diff --git a/tests/fate/libavformat.mak b/tests/fate/libavformat.mak
+index 15548d9..6978900 100644
+--- a/tests/fate/libavformat.mak
++++ b/tests/fate/libavformat.mak
+@@ -131,6 +131,12 @@ FATE_LIBAVFORMAT += fate-seek_utils
+ fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
+ fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)
+ 
++FATE_LIBAVFORMAT_SAMPLES-$(call ALLYES, AVFORMAT AC3_PARSER AC3_DECODER) += fate-parse-skip-samples
++fate-parse-skip-samples: libavformat/tests/parse_skip_samples$(EXESUF)
++fate-parse-skip-samples: CMD = run libavformat/tests/parse_skip_samples$(EXESUF) $(TARGET_SAMPLES)/ac3/millers_crossing_4.0.ac3
++
++FATE_EXTERN += $(FATE_LIBAVFORMAT_SAMPLES-yes)
++
+ FATE_LIBAVFORMAT += $(FATE_LIBAVFORMAT-yes)
+ FATE-$(CONFIG_AVFORMAT) += $(FATE_LIBAVFORMAT)
+-fate-libavformat: $(FATE_LIBAVFORMAT)
++fate-libavformat: $(FATE_LIBAVFORMAT) $(if $(SAMPLES),$(FATE_LIBAVFORMAT_SAMPLES-yes))
+diff --git a/tests/ref/fate/parse-skip-samples b/tests/ref/fate/parse-skip-samples
+new file mode 100644
+index 0000000..adae782
+--- /dev/null
++++ b/tests/ref/fate/parse-skip-samples
+@@ -0,0 +1,13 @@
++skip 2000/0 reason 0/0
++packet 0: pts 0 size 1536 skip 2000/0 reason 0/0
++packets 62, decoded samples 93232
++skip 3500/0 reason 0/0
++packet 0: pts 0 size 1536 skip 3500/0 reason 0/0
++packets 62, decoded samples 91732
++skip 1000/0 reason 0/0
++packet 0: pts 0 size 1536 skip 1000/0 reason 0/0
++packet 4: pts 6144 size 1536 skip 1100/0 reason 0/0
++packets 62, decoded samples 93132
++skip 3500/100 reason 1/1
++packet 0: pts 0 size 1536 skip 3500/100 reason 1/1
++packet 3: pts 4608 size 1536 skip 0/100 reason 0/1

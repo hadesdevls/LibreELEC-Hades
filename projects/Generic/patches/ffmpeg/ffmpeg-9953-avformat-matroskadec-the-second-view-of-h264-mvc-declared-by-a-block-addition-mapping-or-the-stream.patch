@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:40:00 +0000
+Subject: [PATCH] avformat/matroskadec: the second view of H.264 MVC declared
+ by a block addition mapping or by the stream
+
+A Matroska file made of a 3D Blu-ray carries both views of the video in one
+H.264 track. A player finds the second view by the box 'mvcC' (an
+MVCDecoderConfigurationRecord of ISO/IEC 14496-15) that follows the
+AVCDecoderConfigurationRecord of the CodecPrivate: the form MakeMKV writes,
+and the legacy form of the Matroska codec specifications. Two other forms
+reach a player as plain 2D H.264:
+
+- The form that the Matroska codec specifications prefer: the CodecPrivate is
+  the record of the base view only, and a BlockAdditionMapping of type
+  'mvcC' (0x6D766343) carries the MVCDecoderConfigurationRecord in its
+  BlockAddIDExtraData. MakeMKV 1.15.2 wrote only that, and a remuxer that
+  keeps the mappings and rewrites the CodecPrivate leaves only that.
+  matroskadec ignored the mapping (an unknown type).
+- No declaration at all: a remuxer that rewrote the CodecPrivate and dropped
+  the mapping leaves the subset sequence parameter set of the second view
+  (NAL unit 15, Multiview High or Stereo High profile) in the stream only.
+
+Both are given to the player in the legacy form, a box 'mvcC' put behind
+the CodecPrivate, which is what a player that decodes MVC from Matroska
+looks for. The mapping's record is used as it is. For the stream, the first
+key frame of an H.264 track whose CodecPrivate is a record without such a
+box is looked at once, and the subset sequence parameter sets of those two
+profiles that it has become the record of a box (with no picture parameter
+set: those come in the stream before the slices that use them); the stream
+is marked for a context update, so that avformat_find_stream_info(), which
+reads that key frame, hands the new private data on. A CodecPrivate that has
+a box already (MakeMKV 1.15.3 and later write both forms) is not changed,
+and neither is any other track. The record of the base view, which is all a
+decoder of the base view reads, stays the same bytes; the stream metadata
+"mvc_configuration" says where the declaration was found ("codec private",
+"block addition mapping" or "stream").
+
+Tested on the host (tools/regress/ffmpeg, stage mvcmkv) with Matroska files
+made from the 1920x1080 two-view stream of the H.264 reference encoder in
+each form, read with and without this patch by ffprobe, and decided on by
+Kodi's MultiviewChoice.h of LibreELEC Hades: without it, the mapping forms
+(with the parameter sets of the second view in the stream or only in the
+mapping) and the stream form are plain H.264; with it, Kodi takes all five
+for two views, the mapping forms give the bytes of the legacy form, and the
+stream form opens the decoder of both views with the same
+AVCDecoderConfigurationRecord as the legacy form. The legacy form, the two
+forms together and a 2D file keep their bytes, and every packet of the six
+files is the same with and without it.
+---
+ libavformat/matroska.h    |   1 +
+ libavformat/matroskadec.c | 194 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 195 insertions(+)
+
+diff --git a/libavformat/matroska.h b/libavformat/matroska.h
+index 54fbf4c..c0cb511 100644
+--- a/libavformat/matroska.h
++++ b/libavformat/matroska.h
+@@ -369,6 +369,7 @@ typedef enum {
+   MATROSKA_BLOCK_ADD_ID_TYPE_DVCC                   = 0x64766343, // MKBETAG('d','v','c','C')
+   MATROSKA_BLOCK_ADD_ID_TYPE_DVVC                   = 0x64767643, // MKBETAG('d','v','v','C')
+   MATROSKA_BLOCK_ADD_ID_TYPE_HVCE                   = 0x68766345, // MKBETAG('h','v','c','E')
++  MATROSKA_BLOCK_ADD_ID_TYPE_MVCC                   = 0x6D766343, // MKBETAG('m','v','c','C')
+ } MatroskaBlockAddIDType;
+ 
+ #define MATROSKA_BLOCK_ADD_ID_OPAQUE 1
+diff --git a/libavformat/matroskadec.c b/libavformat/matroskadec.c
+index d996aa6..36a01d8 100644
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -293,6 +293,9 @@ typedef struct MatroskaTrack {
+     int needs_decoding;
+     uint64_t max_block_additional_id;
+     EbmlList block_addition_mappings;
++    /* H.264 whose CodecPrivate declares no second view: its first key frame is looked at for one
++     * (mkv_probe_mvc()) */
++    int mvc_probe;
+ 
+     uint32_t palette[AVPALETTE_COUNT];
+     int has_palette;
+@@ -2559,6 +2562,178 @@ static int mkv_parse_hvce(AVFormatContext *s, AVStream *st, EbmlBin *bin)
+     return 0;
+ }
+ 
++/*
++ * H.264 MVC: a Matroska file made of a 3D Blu-ray has both views of the video in one H.264 track.
++ * A player finds the second view by the box 'mvcC' (an MVCDecoderConfigurationRecord, ISO/IEC
++ * 14496-15) behind the AVCDecoderConfigurationRecord of the CodecPrivate: the form that MakeMKV
++ * writes, and the legacy form of the Matroska codec specifications. The form that those
++ * specifications prefer is a BlockAdditionMapping of type 'mvcC' whose BlockAddIDExtraData is that
++ * record, with the CodecPrivate left as the record of the base view (MakeMKV 1.15.2 wrote only
++ * that); and a file remuxed by a tool that rewrites the CodecPrivate may declare the second view
++ * nowhere but in its stream, by a subset sequence parameter set of the Multiview High or Stereo
++ * High profile. Both are given to the player as the legacy form: the box is put behind the
++ * CodecPrivate. The record of the base view stays as it is, and a decoder of the base view reads
++ * nothing behind it. Where the CodecPrivate has a box already, nothing is added.
++ */
++
++/* Where the parameter sets of an AVCDecoderConfigurationRecord end; 0 where it cannot be read */
++static size_t mkv_avcc_sets_end(const uint8_t *data, size_t size)
++{
++    size_t pos = 6;
++
++    if (!data || size < 7 || data[0] != 1)
++        return 0;
++    for (unsigned n = data[5] & 0x1f; n; n--) {
++        size_t len;
++        if (size - pos < 2)
++            return 0;
++        len  = AV_RB16(data + pos);
++        pos += 2;
++        if (size - pos < len)
++            return 0;
++        pos += len;
++    }
++    if (size - pos < 1)
++        return 0;
++    for (unsigned n = data[pos++]; n; n--) {
++        size_t len;
++        if (size - pos < 2)
++            return 0;
++        len  = AV_RB16(data + pos);
++        pos += 2;
++        if (size - pos < len)
++            return 0;
++        pos += len;
++    }
++    return pos;
++}
++
++/* Whether a box 'mvcC' that lies within the data follows the parameter sets of the record */
++static int mkv_avcc_has_mvcc(const uint8_t *data, size_t size)
++{
++    size_t pos = mkv_avcc_sets_end(data, size);
++
++    if (!pos)
++        return 0;
++    for (; size - pos >= 8; pos++) {
++        if (AV_RB32(data + pos + 4) == MKBETAG('m', 'v', 'c', 'C')) {
++            uint32_t box = AV_RB32(data + pos);
++            if (box >= 8 && box <= size - pos)
++                return 1;
++        }
++    }
++    return 0;
++}
++
++/* The box 'mvcC' of a record, put behind the CodecPrivate of the stream */
++static int mkv_append_mvcc(AVCodecParameters *par, const uint8_t *record, size_t size)
++{
++    uint8_t *data;
++    size_t total;
++
++    if (size > INT_MAX - 8 - AV_INPUT_BUFFER_PADDING_SIZE - (size_t)par->extradata_size)
++        return AVERROR_INVALIDDATA;
++    total = par->extradata_size + 8 + size;
++    data  = av_malloc(total + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!data)
++        return AVERROR(ENOMEM);
++    memcpy(data, par->extradata, par->extradata_size);
++    AV_WB32(data + par->extradata_size, 8 + size);
++    AV_WB32(data + par->extradata_size + 4, MKBETAG('m', 'v', 'c', 'C'));
++    memcpy(data + par->extradata_size + 8, record, size);
++    memset(data + total, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    av_free(par->extradata);
++    par->extradata      = data;
++    par->extradata_size = total;
++    return 0;
++}
++
++/* A BlockAdditionMapping of type 'mvcC' */
++static int mkv_parse_mvcc(AVFormatContext *s, AVStream *st, MatroskaTrack *track, const EbmlBin *bin)
++{
++    AVCodecParameters *par = st->codecpar;
++    int ret;
++
++    if (par->codec_id != AV_CODEC_ID_H264 || bin->size < 7 || bin->data[0] != 1 ||
++        !mkv_avcc_sets_end(par->extradata, par->extradata_size)) {
++        av_log(s, AV_LOG_WARNING, "Track %"PRIu64": a 'mvcC' Block Addition Mapping that cannot be "
++               "used (not an H.264 track with an AVCDecoderConfigurationRecord, or not a record)\n",
++               track->num);
++        return 0;
++    }
++    if (mkv_avcc_has_mvcc(par->extradata, par->extradata_size))
++        return 0;
++    if ((ret = mkv_append_mvcc(par, bin->data, bin->size)) < 0)
++        return ret;
++    av_dict_set(&st->metadata, "mvc_configuration", "block addition mapping", 0);
++    av_log(s, AV_LOG_VERBOSE, "Track %"PRIu64": H.264 MVC: the second view declared by a 'mvcC' "
++           "Block Addition Mapping (%d bytes)\n", track->num, bin->size);
++    return 0;
++}
++
++/* The first key frame of an H.264 track whose CodecPrivate declares no second view: its subset
++ * sequence parameter sets of the Multiview High (118) or Stereo High (128) profile, as a record */
++static int mkv_probe_mvc(MatroskaDemuxContext *matroska, MatroskaTrack *track, AVStream *st,
++                         const uint8_t *data, int size)
++{
++    AVCodecParameters *par = st->codecpar;
++    const uint8_t *sets[31];
++    int lens[31], nb = 0, ret;
++    const int nal_len = (par->extradata[4] & 3) + 1;
++    const uint8_t *p = data, *end = data + size;
++    uint8_t *record, *q;
++    size_t record_size = 7;
++
++    while (end - p >= nal_len) {
++        uint32_t len = 0;
++        for (int i = 0; i < nal_len; i++)
++            len = len << 8 | p[i];
++        p += nal_len;
++        if (len > (uint32_t)(end - p))
++            break;
++        if (len >= 4 && len <= 0xffff && (p[0] & 0x1f) == 15 && (p[1] == 118 || p[1] == 128)) {
++            int seen = 0;
++            for (int i = 0; i < nb; i++)
++                seen |= (uint32_t)lens[i] == len && !memcmp(sets[i], p, len);
++            if (!seen && nb < (int)FF_ARRAY_ELEMS(sets)) {
++                sets[nb]   = p;
++                lens[nb++] = len;
++                record_size += 2 + len;
++            }
++        }
++        p += len;
++    }
++    if (!nb)
++        return 0;
++
++    record = av_malloc(record_size);
++    if (!record)
++        return AVERROR(ENOMEM);
++    record[0] = 1;                          /* configurationVersion */
++    record[1] = sets[0][1];                 /* the profile, compatibility and level of the */
++    record[2] = sets[0][2];                 /* first subset sequence parameter set */
++    record[3] = sets[0][3];
++    record[4] = 0xfc | (nal_len - 1);       /* complete, explicit, reserved, lengthSizeMinusOne */
++    record[5] = nb;                         /* reserved bit 0, numOfSequenceParameterSets */
++    q = record + 6;
++    for (int i = 0; i < nb; i++) {
++        AV_WB16(q, lens[i]);
++        memcpy(q + 2, sets[i], lens[i]);
++        q += 2 + lens[i];
++    }
++    record[record_size - 1] = 0;            /* numOfPictureParameterSets: they come in the stream */
++
++    ret = mkv_append_mvcc(par, record, record_size);
++    av_free(record);
++    if (ret < 0)
++        return ret;
++    av_dict_set(&st->metadata, "mvc_configuration", "stream", 0);
++    ffstream(st)->need_context_update = 1;
++    av_log(matroska->ctx, AV_LOG_VERBOSE, "Track %"PRIu64": H.264 MVC: the second view declared "
++           "only by %d subset sequence parameter set(s) in the stream\n", track->num, nb);
++    return 0;
++}
++
+ static int mkv_parse_block_addition_mappings(AVFormatContext *s, AVStream *st, MatroskaTrack *track)
+ {
+     const EbmlList *mappings_list = &track->block_addition_mappings;
+@@ -2598,6 +2773,11 @@ static int mkv_parse_block_addition_mappings(AVFormatContext *s, AVStream *st, M
+             if ((ret = mkv_parse_hvce(s, st, &mapping->extradata)) < 0)
+                 return ret;
+ 
++            break;
++        case MATROSKA_BLOCK_ADD_ID_TYPE_MVCC:
++            if ((ret = mkv_parse_mvcc(s, st, track, &mapping->extradata)) < 0)
++                return ret;
++
+             break;
+         default:
+             av_log(s, AV_LOG_DEBUG,
+@@ -3372,6 +3552,14 @@ static int matroska_parse_tracks(AVFormatContext *s)
+         ret = mkv_parse_block_addition_mappings(s, st, track);
+         if (ret < 0)
+             return ret;
++
++        if (par->codec_id == AV_CODEC_ID_H264 &&
++            mkv_avcc_sets_end(par->extradata, par->extradata_size)) {
++            if (!mkv_avcc_has_mvcc(par->extradata, par->extradata_size))
++                track->mvc_probe = 1;
++            else if (!av_dict_get(st->metadata, "mvc_configuration", NULL, 0))
++                av_dict_set(&st->metadata, "mvc_configuration", "codec private", 0);
++        }
+     }
+ 
+     return 0;
+@@ -4321,6 +4509,12 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
+     if (!pkt_size && !nb_blockmore)
+         goto no_output;
+ 
++    if (track->mvc_probe && is_keyframe) {
++        track->mvc_probe = 0;
++        if ((res = mkv_probe_mvc(matroska, track, st, pkt_data, pkt_size)) < 0)
++            goto fail;
++    }
++
+     if (!matroska->is_webm && nb_blockmore && !track->max_block_additional_id) {
+         int strict = matroska->ctx->strict_std_compliance >= FF_COMPLIANCE_STRICT;
+         av_log(matroska->ctx, strict ? AV_LOG_ERROR : AV_LOG_WARNING,
+-- 
+2.53.0
+

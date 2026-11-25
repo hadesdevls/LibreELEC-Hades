@@ -15,7 +15,7 @@ INFO, TIMESTAMP_SCALE, DURATION, MUXING_APP, WRITING_APP = 0x1549A966, 0x2AD7B1,
 TRACKS, TRACK_ENTRY, TRACK_NUMBER, TRACK_UID, TRACK_TYPE = 0x1654AE6B, 0xAE, 0xD7, 0x73C5, 0x83
 FLAG_LACING, LANGUAGE, CODEC_ID, CODEC_PRIVATE, DEFAULT_DURATION = 0x9C, 0x22B59C, 0x86, 0x63A2, 0x23E383
 BLOCK_ADDITION_MAPPING, BLOCK_ADD_ID_NAME, BLOCK_ADD_ID_TYPE, BLOCK_ADD_ID_EXTRA = 0x41E4, 0x41A4, 0x41E7, 0x41ED
-VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT, FLAG_INTERLACED = 0xE0, 0xB0, 0xBA, 0x9A
+VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT, FLAG_INTERLACED, STEREO_MODE = 0xE0, 0xB0, 0xBA, 0x9A, 0x53B8
 COLOUR, MATRIX, RANGE, TRANSFER, PRIMARIES, MAX_CLL, MAX_FALL = 0x55B0, 0x55B1, 0x55B9, 0x55BA, 0x55BB, 0x55BC, 0x55BD
 MASTERING = 0x55D0
 MASTERING_IDS = (0x55D1, 0x55D2, 0x55D3, 0x55D4, 0x55D5, 0x55D6, 0x55D7, 0x55D8)  # R x y, G, B, white
@@ -68,11 +68,12 @@ def ms(frame, fps):
     return (2 * frame * 1000 * den + num) // (2 * num)
 
 
-def write(path, f, hvcc, aus, colour, mastering=None, max_cll=None, max_fall=None, dovi=None):
+def write(path, f, hvcc, aus, colour, mastering=None, max_cll=None, max_fall=None, dovi=None, stereo=None):
     """f: the format (width, height, fps); aus: the access units in decode order, which is presentation
     order (the stream has no reordering); colour: (matrix, range, transfer, primaries) as ITU-T H.273
     codes and Matroska's range (1 limited, 2 full), each written only where it says something (not 2,
-    "unspecified"), as FFmpeg's muxer does; dovi: (box type, record) of the Dolby Vision configuration"""
+    "unspecified"), as FFmpeg's muxer does; dovi: (box type, record) of the Dolby Vision configuration;
+    stereo: the StereoMode of a 3D video (RFC 9559: 1, side by side with the left eye first), or None"""
     fps = f["fps"]
     num, den = fps
     frames = len(aus)
@@ -96,7 +97,8 @@ def write(path, f, hvcc, aus, colour, mastering=None, max_cll=None, max_fall=Non
         col += master(MASTERING, *[flt(i, v) for i, v in zip(MASTERING_IDS, xy)],
                       flt(LUMINANCE_MAX, lmax), flt(LUMINANCE_MIN, lmin))
     video = master(VIDEO, uint(PIXEL_WIDTH, f["width"]), uint(PIXEL_HEIGHT, f["height"]),
-                   uint(FLAG_INTERLACED, 2), master(COLOUR, col))
+                   uint(FLAG_INTERLACED, 2), *([uint(STEREO_MODE, stereo)] if stereo is not None else []),
+                   master(COLOUR, col))
     entry = [uint(TRACK_NUMBER, 1), uint(TRACK_UID, 1), uint(TRACK_TYPE, 1), uint(FLAG_LACING, 0),
              text(LANGUAGE, "und"), text(CODEC_ID, "V_MPEGH/ISO/HEVC"), el(CODEC_PRIVATE, hvcc),
              uint(DEFAULT_DURATION, (2 * 1000000000 * den + num) // (2 * num))]

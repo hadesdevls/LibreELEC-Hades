@@ -16,7 +16,10 @@
  *    offsets 0); for profile 5 that RPU as dovi_tool makes profile 5
  *    of it (profile5_config(): the header of profile 8.1 with vdr_rpu_profile 0 and the base layer in
  *    full range, the same identity mapping, the IPT-PQ-c2 matrices and signal_color_space 2), the
- *    matrices taken from tools/dvbridge/dvbridge_ipt.h and checked against dovi_tool's.
+ *    matrices those of dovi_tool's profile 5, which the bridge passes on as they are by default;
+ *  - the matrices of the bridge's IPT tunnel (tools/dvbridge/dvbridge_ipt.h, only for the expert choice
+ *    "As licensed players send (IPT)"): those that a licensed core sent, which are not those of the
+ *    RPUs of profile 5.
  * FFmpeg exports the extension blocks of an RPU static ones first (dovi_rpudec.c, ff_dovi_get_metadata()),
  * so they are matched by level; each level once.
  *
@@ -68,6 +71,12 @@ static void log_cb(void *avcl, int level, const char *fmt, va_list vl)
 static const int DOVI_TOOL_P5_YCC[9] = {8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545};
 static const unsigned DOVI_TOOL_P5_OFFSETS[3] = {0, 134217728, 134217728};
 static const int DOVI_TOOL_P5_LMS[9] = {17081, -349, -349, -349, 17081, -349, -349, -349, 17081};
+/* what Dolby's own core (IDK 2.6) on an Amlogic player sent in TV-led output for films of profiles 5, 7
+ * and 8.1 alike (read on 2026-11-24; the bytes 2002 031f 0691 2002
+ * fc5b 0443 2002 010b ea57, 00000000 08000000 08000000, 42b8 fea4 fea4 fea4 42b8 fea4 fea4 fea4 42b8) */
+static const int LICENSED_CORE_YCC[9] = {8194, 799, 1681, 8194, -933, 1091, 8194, 267, -5545};
+static const unsigned LICENSED_CORE_OFFSETS[3] = {0, 134217728, 134217728};
+static const int LICENSED_CORE_LMS[9] = {17080, -348, -348, -348, 17080, -348, -348, -348, 17080};
 
 static const AVDOVIDmData *ext_of_level(const AVDOVIMetadata *m, int level, int *count)
 {
@@ -183,18 +192,26 @@ int main(int argc, char **argv)
     const long frames = atol(argv[12]);
     av_log_set_callback(log_cb);
 
-    /* the matrices of the bridge's IPT tunnel are those of dovi_tool's profile 5 */
+    /* the matrices of the bridge's IPT tunnel (the expert choice "As licensed players send (IPT)") are those
+     * that a licensed core sent, and not those of the RPUs of profile 5: the first column of YCCtoRGB and
+     * the crosstalk of RGBtoLMS differ by a code. (Until 2026-11 they were dovi_tool's profile 5; the
+     * profile 5 that the bridge passes on by default, its RPU's own matrices, is checked below against
+     * dovi_tool's.) */
     {
         static const int ycc[9] = DVBRIDGE_IPT_YCC, lms[9] = DVBRIDGE_IPT_LMS;
         static const unsigned off[3] = DVBRIDGE_IPT_OFFSETS;
         char w[96];
         for (int i = 0; i < 9; i++) {
-            snprintf(w, sizeof(w), "dvbridge_ipt.h YCC[%d] as dovi_tool's profile 5", i), EQ(w, ycc[i], DOVI_TOOL_P5_YCC[i]);
-            snprintf(w, sizeof(w), "dvbridge_ipt.h LMS[%d] as dovi_tool's profile 5", i), EQ(w, lms[i], DOVI_TOOL_P5_LMS[i]);
+            snprintf(w, sizeof(w), "dvbridge_ipt.h YCC[%d] as the licensed core's", i), EQ(w, ycc[i], LICENSED_CORE_YCC[i]);
+            snprintf(w, sizeof(w), "dvbridge_ipt.h LMS[%d] as the licensed core's", i), EQ(w, lms[i], LICENSED_CORE_LMS[i]);
         }
         for (int i = 0; i < 3; i++)
-            snprintf(w, sizeof(w), "dvbridge_ipt.h OFFSETS[%d] as dovi_tool's profile 5", i),
-                EQ(w, off[i], DOVI_TOOL_P5_OFFSETS[i]);
+            snprintf(w, sizeof(w), "dvbridge_ipt.h OFFSETS[%d] as the licensed core's", i),
+                EQ(w, off[i], LICENSED_CORE_OFFSETS[i]);
+        int differ = 0;
+        for (int i = 0; i < 9; i++)
+            differ += (ycc[i] != DOVI_TOOL_P5_YCC[i]) + (lms[i] != DOVI_TOOL_P5_LMS[i]);
+        EQ("coefficients of the tunnel that are not those of dovi_tool's profile 5", differ, 12);
     }
 
     AVFormatContext *fmt = NULL;
@@ -252,8 +269,8 @@ int main(int argc, char **argv)
              * with vdr_rpu_profile 0 and bl_video_full_range_flag 1), Profile81::rpu_data_mapping() (the
              * identity), Profile5::dm_data() (the IPT-PQ-c2 matrices, signal_color_space 2, the rest as
              * profile 8.1's VdrDmData::default_pq()) */
-            static const int ycc[9] = DVBRIDGE_IPT_YCC, lms[9] = DVBRIDGE_IPT_LMS;
-            static const unsigned off[3] = DVBRIDGE_IPT_OFFSETS;
+            const int *ycc = DOVI_TOOL_P5_YCC, *lms = DOVI_TOOL_P5_LMS;
+            const unsigned *off = DOVI_TOOL_P5_OFFSETS;
             AVDOVIRpuDataHeader *h = av_dovi_get_header(want[k]);
             AVDOVIColorMetadata *c = av_dovi_get_color(want[k]);
             h->vdr_rpu_profile = 0;

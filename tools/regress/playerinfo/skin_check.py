@@ -94,9 +94,16 @@ SAMPLES = {
     "hades.out.connector": ["HDMI-A-1", "DP-1", "eDP-1"],
     "hades.out.driver": ["nvidia-drm", "amdgpu", "i915", "xe"],
     "hades.out.mode": ["3840x2160 @ 119.880 Hz", "1920x1080i @ 59.940 Hz",  # "{}x{}{} @ {:.3f} Hz"
-                       "3840x2160 @ 119.880 Hz (VRR)"],  # (fixV) the rate of the flips with VRR: VrrModeText()
+                       "3840x2160 @ 119.880 Hz (VRR)",  # (fixV) the rate of the flips with VRR: VrrModeText()
+                       # (playA) a frame-packed 3D output in its raster (W FramePackedModeTextOf(): 1080p24 and
+                       # 720p50/60 only); behind it, on the overview, HadesOvStereoVar
+                       "1920x2205 @ 23.976 Hz", "1280x1470 @ 59.940 Hz"],
+    # (playA) the mode where there is a 3D output (W hades.out.mode3d; 3D never goes with VRR): frame packing in its
+    # raster, a half layout told of up to 1080p60 or 2160p30, and the eyes drawn split and not told in any mode
+    "hades.out.mode3d": ["1920x2205 @ 23.976 Hz", "1280x1470 @ 59.940 Hz", "3840x2160 @ 119.880 Hz",
+                         "1920x1080i @ 59.940 Hz"],
     # (fixV) the same without the mark of VRR, for the System page, whose VRR row says it
-    "hades.out.modeplain": ["3840x2160 @ 119.880 Hz", "1920x1080i @ 59.940 Hz"],
+    "hades.out.modeplain": ["3840x2160 @ 119.880 Hz", "1920x1080i @ 59.940 Hz", "1920x2205 @ 23.976 Hz"],
     # (fixV) W the VRR row, each picture more than once below the display's VRR minimum (Estuary #54307, {0} how many
     # times): at the widest, 16 (a video at 6 fps on a display whose VRR starts at 90 Hz)
     "hades.out.vrrtext": [("$ADDON[skin.estuary 54307]", "16")],
@@ -160,6 +167,11 @@ SAMPLES = {
     "hades.tv.frllanes": "4",
     "hades.tv.frlgbps": "12",
     "hades.tv.tmdsmhz": ["600", "1275"],
+    # (W DeclaresOf(), EdidHdmiPath.h: the HDMI address, four digits of the inputs of each device (8 is more than any TV
+    # or receiver has), and the sound formats of the EDID, all of them the longest)
+    "hades.tv.address": ["2.2.0.0", "8.8.8.8"],
+    "hades.tv.audio": ["TrueHD, DD+, DTS-HD, DTS, PCM 8 ch", "none"],
+    "hades.tv.features": ["ALLM, QMS, FreeSync", "none"],
     "hades.dv.composemaps": ["Y poly+MMR, Cb MMR, Cr poly+MMR, NLQ", "Y poly, Cb/Cr MMR, NLQ", "Y/Cb/Cr poly"],
     "hades.dv.shown": "600",  # the frames of the last 10 s: Dolby Vision goes out at the video's rate, 60 Hz at most
     "hades.dv.notshown": "600",
@@ -209,7 +221,31 @@ SAMPLES = {
     # a string whose {0}, {1} the code fills
     "hades.video.zoom": [("$ADDON[skin.estuary 54281]", "4096" + X + "1714 (2.39:1)", "2.50")] +
                         ["$ADDON[skin.estuary %d]" % n for n in range(54282, 54292)],
+    # W LutLine(): the 3D LUT of the display (DisplayLut.h Line()): the name of its file where it is applied (at most
+    # LINE_NAME, 32 characters: a longer one is cut in the middle; wide letters), or why not (Estuary #54814 to #54819)
+    "hades.video.lut": ["LG C5 #1 2026-...XYZLUT+MTX.cube", "JVC NZ8 HDR10 B...MTX 65P HGIG.CUBE"[:32]] +
+                       ["$ADDON[skin.estuary %d]" % n for n in range(54814, 54820)],
     "hades.video.api": ["VAAPI", "DRM PRIME", "VDPAU", "NVDEC"],  # H DecoderApi()
+    # xbmc/network/ProjectorControl.cpp PlayerInfoText(): the protocol, then its parts joined by ", " (a list of
+    # parts: Estuary #54781 the lens memory, its picture and where its shape comes from, #54782 to #54784; #54785 the
+    # picture mode by its name on the projector without what the settings add in brackets; #54786 to #54793 what
+    # stands in the way, alone)
+    "hades.video.projector": [
+        [("JVC: $ADDON[skin.estuary 54781]", "10", "2.39", "$ADDON[skin.estuary 54784]"),
+         ("$ADDON[skin.estuary 54785]", "User 4")],
+        [("Sony (ADCP): $ADDON[skin.estuary 54781]", "7", "2.39", "$ADDON[skin.estuary 54782]"),
+         ("$ADDON[skin.estuary 54785]", "Cinema Film 1")],
+        [("Sony (SDCP): $ADDON[skin.estuary 54794]", "5"), ("$ADDON[skin.estuary 54785]", "Bright Cinema")],
+        [("Epson: $ADDON[skin.estuary 54781]", "10", "2.76", "$ADDON[skin.estuary 54783]"),
+         ("$ADDON[skin.estuary 54785]", "Theatre Black 2")]] +
+        ["Sony (ADCP): $ADDON[skin.estuary %d]" % n for n in range(54786, 54794) if n != 54790] +
+        ["Sony (ADCP): $ADDON[skin.estuary 54790]"],
+    # PictureDefaults.h Line(): the settings that change the picture from the film, the words of the first three
+    # (Estuary #54420 to #54443) and how many more ("+N": at most 20 more, the 23 words less the three): every three
+    # of the eight widest words in the four languages, with " +20"; and how many words they are (hades.pic.count)
+    "hades.pic.changed": [D.join("$ADDON[skin.estuary %d]" % n for n in four) + " +20"
+                          for four in itertools.combinations((54430, 54431, 54435, 54432, 54424, 54429, 54441, 54439), 3)],
+    "hades.pic.count": ["1", "23"],
     # H ColourText(), in the words of the interface (W ColourWordsOf(): Estuary #51834, #52007-#52010)
     "hades.video.color": ["BT.601 (NTSC) ($ADDON[skin.estuary 52007])" + D + "BT.709/BT.1886" + D +
                           "$ADDON[skin.estuary 52009]",
@@ -294,16 +330,21 @@ def samples_of(info, lang):
         return [""]
     v = SAMPLES[key]
     out = []
-    for x in v if isinstance(v, list) else [v]:
+
+    def one(x):
         if isinstance(x, tuple):
-            # (a string of the interface whose {0}, {1}... the code fills: the string in the language, then the values)
+            # (a string of the interface whose {0}, {1}... the code fills: the string in the language, then the values,
+            # which may be strings of the interface too)
             text = localize(x[0], lang)
             for i, a in enumerate(x[1:]):
+                a = localize(a, lang)
                 text = text.replace("{%d}" % i, a)
                 text = text.replace("{}", a, 1)  # (fmt's automatic numbering)
-            out.append(text)
-        else:
-            out.append(localize(x, lang))
+            return text
+        return localize(x, lang)
+    for x in v if isinstance(v, list) else [v]:
+        # (a list in the list: a value made of parts that the code joins with ", ")
+        out.append(D.join(one(p) for p in x) if isinstance(x, list) else one(x))
     return out
 
 

@@ -5,7 +5,7 @@
 with every part of the recipe's patches (in the order LibreELEC's scripts/unpack applies them) that changes them, with
 patch -F0. A patch changes a file in its own sections only, so that those files come out as in the whole tree.
 
-usage: kernel_files.py <archive .tar.xz> <out folder> <patch>... -- <file of the tree>...
+usage: kernel_files.py <archive .tar.xz or .tar.gz> <out folder> <patch>... -- <file of the tree>...
 Prints one line per patch that changed one of the files, and KERNEL-FILES-DONE; status 1 when a section does not
 apply or a file is not there after all of them."""
 import os
@@ -19,7 +19,7 @@ cut = args.index('--')
 archive, out, patches, wanted = args[0], args[1], args[2:cut], set(args[cut + 1:])
 os.makedirs(out, exist_ok=True)
 found = 0
-with tarfile.open(archive, 'r:xz') as tar:
+with tarfile.open(archive, 'r:*') as tar:
     for member in tar:
         if not member.isfile():
             continue

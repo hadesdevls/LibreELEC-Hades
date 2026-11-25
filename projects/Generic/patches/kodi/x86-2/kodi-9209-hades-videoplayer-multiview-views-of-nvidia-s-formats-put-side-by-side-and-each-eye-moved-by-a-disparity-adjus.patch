@@ -1,0 +1,576 @@
+From c6114b0e8e20056a58491f2f42ec5f986d7eacea Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:18:08 +0000
+Subject: [PATCH] [Hades][VideoPlayer] Multiview: views of NVIDIA's formats put
+ side by side, and each eye moved by a disparity adjustment
+
+The picture of the two views of MVC and MV-HEVC (CMultiviewPacker) was
+made of views in the formats of the processor's decoder. Two things are
+added to it, for what follows:
+
+- Views in the formats that NVIDIA's decoder gives when they are copied
+  from the card: NV12 (8 bits), which Kodi's renderers on GBM take and
+  which goes side by side as it is, and P010 (10 bits, each sample in the
+  high bits of 16, U and V interleaved), which they do not take: its views
+  go into a picture of planar 10 bits (yuv420p10, what the processor's
+  decoder gives) in the same pass, sample for sample (PackedFormat(),
+  CopyP010(); the low 6 bits of P010 are zero). The loops have no test
+  inside, so that the compiler makes vector code of them.
+- A disparity adjustment (SetDisparityAdjustment(), KODI::MULTIVIEW::
+  LeftEyeShift()): Apple's spatial video carries one ('dadj' in 'cmfy' of
+  'eyes'), in ten-thousandths of the width of a view. Apple's
+  "QuickTime and ISO Base Media File Formats and Spatial and Immersive
+  Media" (1.9.8) applies half of it to each eye, positive denoting more
+  disparity from the parallel direction; its Compressor: "When horizontal
+  disparity is negative, content in the footage appears closer; when it's
+  positive, content seems farther away". So a positive value moves the
+  left eye's picture to the left and the right eye's to the right, by whole
+  chroma samples, as each is put in its half; the edge it leaves is black
+  (limited or full range) and without colour. 0, the default, moves
+  nothing.
+
+And for the NVIDIA decoder of both views (next commit), what decides it
+(KODI::MULTIVIEW::NvdecForTwoViews()): HEVC only, never against the
+player or the setting of hardware decoding, not after it failed for the
+stream, and only with a driver of the 610 series or later loaded, the first
+that NVIDIA's Video Codec SDK 13.1 asks for ("Driver version 610 and
+above"): an older one does not know the fields that say the layer of each
+picture of MV-HEVC.
+
+The log says once what the eyes of a stream are and what is made of them.
+
+Checked on the host (tools/regress/mvhevc): the conformance streams of
+ITU-T H.265.1 given to the packer as NV12 give each view as the reference
+decoder; made-up 10-bit views of 1080p and 2160p given as P010 come out as
+the yuv420p10 they were made from; the adjustment, both signs and none,
+limited and full range, in yuv420p10, P010 and NV12, sample by sample; six
+mutants of these rules caught.
+---
+ .../DVDCodecs/Video/MultiviewPacker.cpp       | 257 +++++++++++++++++-
+ .../DVDCodecs/Video/MultiviewPacker.h         |  21 +-
+ xbmc/cores/VideoPlayer/MultiviewChoice.h      | 128 +++++++++
+ 3 files changed, 393 insertions(+), 13 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
+index c60f21d..a0ec373 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
+@@ -10,6 +10,8 @@
+ 
+ #include "utils/log.h"
+ 
++#include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ extern "C"
+@@ -76,6 +78,158 @@ PictureEye EyeOf(const AVFrame* frame)
+          : stereo->view == AV_STEREO3D_VIEW_RIGHT ? PictureEye::RIGHT
+                                                   : PictureEye::UNSAID;
+ }
++
++/*!
++ * \brief The format of the picture of two views, for views of this format
++ *
++ * The same, but for P010, which NVIDIA's decoder gives for 10 bits (each sample in the high bits
++ * of 16, the two chroma planes in one) and which Kodi's renderers on GBM do not take: its views
++ * go into a picture of the planar 10-bit format that the processor's decoder gives, in the same
++ * pass, sample for sample (the low 6 bits of P010 are zero).
++ */
++AVPixelFormat PackedFormat(AVPixelFormat view)
++{
++  return view == AV_PIX_FMT_P010LE ? AV_PIX_FMT_YUV420P10LE : view;
++}
++
++//! The value of a picture with nothing in it (black, no colour, opaque) for one component, in
++//! its bits and at its place
++uint32_t Empty(const AVPixFmtDescriptor& desc, int component, bool fullRange)
++{
++  const AVComponentDescriptor& comp = desc.comp[component];
++  const int depth = comp.depth;
++  uint32_t value = 0;
++  if (desc.flags & AV_PIX_FMT_FLAG_RGB)
++    value = (desc.flags & AV_PIX_FMT_FLAG_ALPHA) && component == 3 ? (1u << depth) - 1 : 0;
++  else if (component == 0)
++    value = fullRange ? 0 : 16u << (depth - 8);
++  else if (component < 3)
++    value = 1u << (depth - 1);
++  else
++    value = (1u << depth) - 1;
++  return value << comp.shift;
++}
++
++/*!
++ * \brief One plane of one view into its half of the picture of two, moved sideways
++ * \param shift how far the view goes to the right, in positions of this plane (a position is
++ *        what a pixel of the plane takes: a sample, or a pair of chroma samples where two are
++ *        interleaved); where it leaves an edge without picture, the picture is empty there
++ */
++void CopyPlane(const AVPixFmtDescriptor& desc,
++               int plane,
++               bool fullRange,
++               uint8_t* dst,
++               int dstLinesize,
++               const uint8_t* src,
++               int srcLinesize,
++               int rowBytes,
++               int positions,
++               int rows,
++               int shift)
++{
++  if (shift == 0 || positions <= 0)
++  {
++    av_image_copy_plane(dst, dstLinesize, src, srcLinesize, rowBytes, rows);
++    return;
++  }
++  const int bytes = rowBytes / positions;
++  // the bytes of one empty position of this plane
++  uint8_t empty[16] = {};
++  if (bytes > static_cast<int>(sizeof(empty)))
++    return;
++  for (int c = 0; c < desc.nb_components; ++c)
++  {
++    const AVComponentDescriptor& comp = desc.comp[c];
++    if (comp.plane != plane)
++      continue;
++    const uint32_t value = Empty(desc, c, fullRange);
++    if (comp.step > 1 || comp.depth > 8)
++    {
++      // (16 bits, little-endian, at the byte of the component)
++      empty[comp.offset] = static_cast<uint8_t>(value & 0xff);
++      if (comp.offset + 1 < bytes)
++        empty[comp.offset + 1] = static_cast<uint8_t>(value >> 8);
++    }
++    else
++      empty[comp.offset] = static_cast<uint8_t>(value);
++  }
++  const int moved = std::min(std::abs(shift), positions);
++  const int kept = positions - moved;
++  for (int y = 0; y < rows; ++y)
++  {
++    uint8_t* row = dst + static_cast<ptrdiff_t>(y) * dstLinesize;
++    const uint8_t* from = src + static_cast<ptrdiff_t>(y) * srcLinesize;
++    // to the right: the edge on the left is empty; to the left: the one on the right
++    uint8_t* edge = shift > 0 ? row : row + static_cast<ptrdiff_t>(kept) * bytes;
++    for (int x = 0; x < moved; ++x)
++      std::memcpy(edge + static_cast<ptrdiff_t>(x) * bytes, empty, bytes);
++    if (shift > 0)
++      std::memcpy(row + static_cast<ptrdiff_t>(moved) * bytes, from,
++                  static_cast<size_t>(kept) * bytes);
++    else
++      std::memcpy(row, from + static_cast<ptrdiff_t>(moved) * bytes,
++                  static_cast<size_t>(kept) * bytes);
++  }
++}
++
++/*!
++ * \brief A view of P010 into its half of a planar 10-bit picture (PackedFormat()), moved sideways
++ *        as CopyPlane() moves one
++ * \param shift in pixels, even
++ */
++void CopyP010(uint8_t* const dst[3],
++              const int dstLinesize[3],
++              const AVFrame* src,
++              int width,
++              int height,
++              int shift,
++              bool fullRange)
++{
++  const uint16_t black = fullRange ? 0 : 16 << 2;
++  const uint16_t neutral = 512;
++  // the samples of a row that come from the view (from first to end), the others empty: loops
++  // without a test inside, which the compiler makes into vector code
++  const auto span = [](int size, int by, int& first, int& end)
++  {
++    first = std::clamp(by, 0, size);
++    end = std::clamp(size + by, 0, size);
++  };
++  int first = 0;
++  int end = 0;
++  span(width, shift, first, end);
++  for (int y = 0; y < height; ++y)
++  {
++    auto* out = reinterpret_cast<uint16_t*>(dst[0] + static_cast<ptrdiff_t>(y) * dstLinesize[0]);
++    const auto* in = reinterpret_cast<const uint16_t*>(src->data[0] + static_cast<ptrdiff_t>(y) *
++                                                                          src->linesize[0]);
++    for (int x = 0; x < first; ++x)
++      out[x] = black;
++    for (int x = first; x < end; ++x)
++      out[x] = static_cast<uint16_t>(in[x - shift] >> 6);
++    for (int x = end; x < width; ++x)
++      out[x] = black;
++  }
++  const int chromaWidth = width / 2;
++  const int chromaShift = shift / 2;
++  span(chromaWidth, chromaShift, first, end);
++  for (int y = 0; y < (height + 1) / 2; ++y)
++  {
++    auto* u = reinterpret_cast<uint16_t*>(dst[1] + static_cast<ptrdiff_t>(y) * dstLinesize[1]);
++    auto* v = reinterpret_cast<uint16_t*>(dst[2] + static_cast<ptrdiff_t>(y) * dstLinesize[2]);
++    const auto* in = reinterpret_cast<const uint16_t*>(src->data[1] + static_cast<ptrdiff_t>(y) *
++                                                                          src->linesize[1]);
++    for (int x = 0; x < first; ++x)
++      u[x] = v[x] = neutral;
++    for (int x = first; x < end; ++x)
++    {
++      u[x] = static_cast<uint16_t>(in[2 * (x - chromaShift)] >> 6);
++      v[x] = static_cast<uint16_t>(in[2 * (x - chromaShift) + 1] >> 6);
++    }
++    for (int x = end; x < chromaWidth; ++x)
++      u[x] = v[x] = neutral;
++  }
++}
+ } // namespace
+ 
+ CMultiviewPacker::CMultiviewPacker(BaseEye baseEye, bool eyeFromPictures)
+@@ -90,6 +244,49 @@ CMultiviewPacker::~CMultiviewPacker()
+ {
+   av_frame_free(&m_waiting);
+   av_frame_free(&m_packed);
++  // (a pool whose buffers a picture still holds is freed when the last one comes back)
++  for (AVBufferPool*& pool : m_pools)
++    av_buffer_pool_uninit(&pool);
++}
++
++bool CMultiviewPacker::GetBuffers()
++{
++  // Hades: the planes of the picture of two views come from pools that are kept while their size
++  // is: a picture of 2x3840x2160 takes 50 MB (10 bits), which a new allocation would map and
++  // fault in page by page at each picture (measured as the image builds Kodi, on a Ryzen 9
++  // 7950X3D: 28.6 ms a picture at 2160p per eye, against 3.8 ms from a pool)
++  const auto format = static_cast<AVPixelFormat>(m_packed->format);
++  int widths[4] = {};
++  if (av_image_fill_linesizes(widths, format, m_packed->width) < 0)
++    return false;
++  ptrdiff_t linesizes[4] = {};
++  for (int plane = 0; plane < 4; ++plane)
++    linesizes[plane] = (widths[plane] + 63) & ~63;
++  size_t sizes[4] = {};
++  if (av_image_fill_plane_sizes(sizes, format, m_packed->height, linesizes) < 0)
++    return false;
++  for (int plane = 0; plane < 4; ++plane)
++  {
++    if (!sizes[plane])
++      continue;
++    // (and what FFmpeg's own allocation adds at the end, for code that reads past a row)
++    const size_t size = sizes[plane] + 64;
++    if (!m_pools[plane] || m_poolSizes[plane] != size)
++    {
++      av_buffer_pool_uninit(&m_pools[plane]);
++      m_pools[plane] = av_buffer_pool_init(size, nullptr);
++      m_poolSizes[plane] = size;
++    }
++    if (!m_pools[plane])
++      return false;
++    m_packed->buf[plane] = av_buffer_pool_get(m_pools[plane]);
++    if (!m_packed->buf[plane])
++      return false;
++    m_packed->data[plane] = m_packed->buf[plane]->data;
++    m_packed->linesize[plane] = static_cast<int>(linesizes[plane]);
++  }
++  m_packed->extended_data = m_packed->data;
++  return true;
+ }
+ 
+ bool CMultiviewPacker::Pack(const AVFrame* base, const AVFrame* other)
+@@ -112,11 +309,12 @@ bool CMultiviewPacker::Pack(const AVFrame* base, const AVFrame* other)
+   if (!size)
+     return false;
+ 
+-  m_packed->format = base->format;
++  const AVPixelFormat packedFormat = PackedFormat(format);
++  m_packed->format = packedFormat;
+   m_packed->width = size->width;
+   m_packed->height = size->height;
+   // the times, the flags and the colours of the picture are those of its base view
+-  if (av_frame_get_buffer(m_packed, 0) < 0 || av_frame_copy_props(m_packed, base) < 0)
++  if (!GetBuffers() || av_frame_copy_props(m_packed, base) < 0)
+   {
+     av_frame_unref(m_packed);
+     return false;
+@@ -146,33 +344,68 @@ bool CMultiviewPacker::Pack(const AVFrame* base, const AVFrame* other)
+   // a base view that goes out alone is what both eyes see
+   const AVFrame* second = other ? other : base;
+   const AVFrame* halves[2] = {BaseOnLeft(eye) ? base : second, BaseOnLeft(eye) ? second : base};
++  // the disparity adjustment of the stream: the left eye one way, the right eye the other
++  // (KODI::MULTIVIEW::LeftEyeShift()), in whole chroma samples
++  const int leftShift = LeftEyeShift(m_disparity, base->width, 1 << desc->log2_chroma_w);
++  const bool fullRange = base->color_range == AVCOL_RANGE_JPEG;
+   for (int half = 0; half < 2; ++half)
+   {
+-    uint8_t* data[4] = {};
+-    int linesize[4] = {};
+-    const uint8_t* source[4] = {};
+-    int sourceLinesize[4] = {};
++    const AVFrame* view = halves[half];
++    const int shift = half == 0 ? leftShift : -leftShift;
++    if (packedFormat != format)
++    {
++      // P010 into planar 10 bits: the right half starts at the width of a view in each plane
++      uint8_t* data[3] = {};
++      int linesize[3] = {};
++      for (int plane = 0; plane < 3; ++plane)
++      {
++        const int bytes = av_image_get_linesize(packedFormat, base->width, plane);
++        if (bytes <= 0 || m_packed->linesize[plane] < 2 * bytes ||
++            !view->data[plane < 2 ? plane : 1])
++        {
++          av_frame_unref(m_packed);
++          return false;
++        }
++        data[plane] = m_packed->data[plane] + half * bytes;
++        linesize[plane] = m_packed->linesize[plane];
++      }
++      CopyP010(data, linesize, view, base->width, base->height, shift, fullRange);
++      continue;
++    }
+     for (int plane = 0; plane < 4; ++plane)
+     {
+       if (!m_packed->data[plane])
+         continue;
+       // what a row of one view takes in this plane, which is where the right half starts
+       const int bytes = av_image_get_linesize(format, base->width, plane);
+-      if (bytes <= 0 || !halves[half]->data[plane] || halves[half]->linesize[plane] < bytes ||
++      if (bytes <= 0 || !view->data[plane] || view->linesize[plane] < bytes ||
+           m_packed->linesize[plane] < 2 * bytes)
+       {
+         av_frame_unref(m_packed);
+         return false;
+       }
+-      data[plane] = m_packed->data[plane] + half * bytes;
+-      linesize[plane] = m_packed->linesize[plane];
+-      source[plane] = halves[half]->data[plane];
+-      sourceLinesize[plane] = halves[half]->linesize[plane];
++      // the positions of a row of this plane, and how far the view goes in them
++      const bool chroma = plane > 0 && plane < 3 && !(desc->flags & AV_PIX_FMT_FLAG_RGB);
++      const int positions = chroma ? AV_CEIL_RSHIFT(base->width, desc->log2_chroma_w) : base->width;
++      const int rows = chroma ? AV_CEIL_RSHIFT(base->height, desc->log2_chroma_h) : base->height;
++      CopyPlane(*desc, plane, fullRange, m_packed->data[plane] + half * bytes,
++                m_packed->linesize[plane], view->data[plane], view->linesize[plane], bytes,
++                positions, rows, chroma ? shift >> desc->log2_chroma_w : shift);
+     }
+-    av_image_copy(data, linesize, source, sourceLinesize, format, base->width, base->height);
+   }
+ 
+   m_packed->sample_aspect_ratio = AVRational{size->sarNum, size->sarDen};
++  // Hades: once a stream, what its eyes are and what is made of them: the output that the display
++  // takes for them then reduces each eye to it (frame packing at 1080p), or keeps more of it
++  if (!m_sizeTold)
++  {
++    m_sizeTold = true;
++    CLog::Log(LOGINFO,
++              "CMultiviewPacker: each eye is {}x{} ({}), side by side in a picture of {}x{} ({}); "
++              "each eye moved {} pixels for the disparity adjustment of the stream",
++              base->width, base->height, av_get_pix_fmt_name(format), size->width, size->height,
++              av_get_pix_fmt_name(packedFormat), std::abs(leftShift));
++  }
+   av_frame_remove_side_data(m_packed, AV_FRAME_DATA_VIEW_ID);
+   // (what the base view said of its own eye is no word on the picture of the two)
+   av_frame_remove_side_data(m_packed, AV_FRAME_DATA_STEREO3D);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
+index 230052a..0dcb4d3 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
+@@ -13,6 +13,7 @@
+ #include <cstdint>
+ #include <optional>
+ 
++struct AVBufferPool;
+ struct AVCodec;
+ struct AVFrame;
+ 
+@@ -34,7 +35,10 @@ const AVCodec* DecoderOfTwoViews(int codecId);
+  * The decoder of a stream that codes its two eyes as two views (H.264 MVC, MV-HEVC) gives each
+  * view as a picture of its own. Kodi shows a stereoscopic video from one picture that holds both eyes,
+  * so the two pictures of an access unit are put side by side here, at their full size, the left
+- * eye on the left, and that picture goes on as the picture of the decoder.
++ * eye on the left, and that picture goes on as the picture of the decoder. Views that NVIDIA's
++ * decoder gave in P010 (copied from the card) go into a picture of planar 10 bits, which Kodi's
++ * renderers take, in the same pass; and where the stream carries a disparity adjustment, each eye
++ * is moved sideways by half of it on the way.
+  *
+  * What is decided is in KODI::MULTIVIEW (MultiviewChoice.h): which pictures belong together,
+  * and that a base view without its second view goes out alone, in both halves, while a second
+@@ -80,6 +84,14 @@ public:
+   //! The pictures from before are not followed by those to come (a seek)
+   void Reset();
+ 
++  /*!
++   * \brief The disparity adjustment of the stream (Apple's spatial video), in ten-thousandths of
++   *        the width of a view: each eye is moved sideways by half of it as it is put in its half,
++   *        the edge it leaves empty (KODI::MULTIVIEW::LeftEyeShift()); 0, as at first, moves
++   *        nothing
++   */
++  void SetDisparityAdjustment(int adjustment) { m_disparity = adjustment; }
++
+   //! A packet went to the decoder, which took it or refused it
+   void Sent(bool refused);
+ 
+@@ -105,6 +117,8 @@ public:
+ 
+ private:
+   bool Pack(const AVFrame* base, const AVFrame* other);
++  //! The planes of m_packed, of its format and size, from m_pools
++  bool GetBuffers();
+   void Keep(AVFrame* frame, const KODI::MULTIVIEW::View& view);
+   void Forget();
+   Result Out(AVFrame* frame, bool packed, bool paired);
+@@ -114,11 +128,16 @@ private:
+   //! the eye that a picture said its base view is, once said in the log where the container says
+   //! the other one
+   bool m_eyeTold{false};
++  int m_disparity{0};
++  bool m_sizeTold{false}; //!< what the eyes are was said in the log
+   KODI::MULTIVIEW::Pace m_pace;
+   bool m_slow{false};
+   AVFrame* m_waiting{nullptr}; //!< the picture that waits for the other view of its access unit
+   std::optional<KODI::MULTIVIEW::View> m_waitingView; //!< ... and what it is, when one waits
+   AVFrame* m_packed{nullptr}; //!< where a picture of two views is made
++  //! ... in planes from these pools, while their size is that of the picture (GetBuffers())
++  AVBufferPool* m_pools[4]{};
++  size_t m_poolSizes[4]{};
+   std::optional<int> m_baseId; //!< the view that is the base view, once a picture named its view
+   uint64_t m_paired{0}; //!< pictures of two views gone out
+   uint64_t m_alone{0}; //!< base views gone out alone
+diff --git a/xbmc/cores/VideoPlayer/MultiviewChoice.h b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+index 227008f..9209fd9 100644
+--- a/xbmc/cores/VideoPlayer/MultiviewChoice.h
++++ b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+@@ -908,6 +908,134 @@ constexpr bool KeptToOneView(int dvProfile, int dvCompatibility)
+   return dvProfile == 20 && dvCompatibility == 0;
+ }
+ 
++/*!
++ * \name The graphics card of NVIDIA, decoding both views
++ *
++ * NVIDIA's video decoder (NVDEC) decodes the two layers of MV-HEVC where FFmpeg (9.1 on,
++ * nvdec_hevc.c) gives it the fields of the Video Codec SDK 13.1 that say the layer of each
++ * picture and its references in the other layer. The SDK asks for driver 610 or later (its
++ * Read Me: "Driver version 610 and above", Linux and Windows): an older driver does not know
++ * those fields and would decode the slices of the second view as pictures of the first. So
++ * NVDEC is asked for the two views only with such a driver (Hades: the 620 series for Turing
++ * and later; the 580 series of the older cards is not), and only through the copy back to
++ * memory that the processor's path ends in: the views are copied from the card, put side by
++ * side as the processor's are, and shown the same way. Where NVDEC cannot be had or fails, the
++ * processor decodes both views; where that does not keep up, the base view plays alone (2D).
++ * @{
++ */
++
++//! The first driver series whose NVDEC takes the two layers of MV-HEVC (Video Codec SDK 13.1)
++inline constexpr int NVDEC_TWO_VIEWS_DRIVER = 610;
++
++/*!
++ * \brief The series of the NVIDIA driver that is loaded, from what its module says of its
++ *        version (/sys/module/nvidia/version: "620.73.04"); nothing where it says nothing
++ */
++inline std::optional<int> NvidiaDriverSeries(std::string_view version)
++{
++  int series = 0;
++  size_t digits = 0;
++  for (; digits < version.size() && version[digits] >= '0' && version[digits] <= '9'; ++digits)
++  {
++    if (digits >= 6)
++      return std::nullopt;
++    series = series * 10 + (version[digits] - '0');
++  }
++  if (digits == 0 || (digits < version.size() && version[digits] != '.'))
++    return std::nullopt;
++  return series;
++}
++
++//! Whether NVDEC is asked for both views of a stream, and why not where it is not
++enum class Nvdec
++{
++  ASKED,
++  NOT_HEVC, //!< H.264 MVC: NVDEC has no MVC
++  SOFTWARE, //!< the player asked for decoding by the processor
++  NOT_ALLOWED, //!< hardware decoding is off (the setting of VAAPI, NVIDIA's other path to NVDEC)
++  FAILED_BEFORE, //!< it failed for this stream: the processor decodes both views from then on
++  NO_DRIVER, //!< no NVIDIA driver is loaded
++  OLD_DRIVER, //!< ... or one before NVDEC_TWO_VIEWS_DRIVER
++};
++
++constexpr Nvdec NvdecForTwoViews(bool hevc,
++                                 bool softwareAsked,
++                                 bool hardwareAllowed,
++                                 bool failedBefore,
++                                 std::optional<int> driverSeries)
++{
++  if (!hevc)
++    return Nvdec::NOT_HEVC;
++  if (softwareAsked)
++    return Nvdec::SOFTWARE;
++  if (!hardwareAllowed)
++    return Nvdec::NOT_ALLOWED;
++  if (failedBefore)
++    return Nvdec::FAILED_BEFORE;
++  if (!driverSeries)
++    return Nvdec::NO_DRIVER;
++  if (*driverSeries < NVDEC_TWO_VIEWS_DRIVER)
++    return Nvdec::OLD_DRIVER;
++  return Nvdec::ASKED;
++}
++
++//! ... in words for the log
++constexpr const char* NvdecWhyNot(Nvdec nvdec)
++{
++  switch (nvdec)
++  {
++    case Nvdec::ASKED:
++      return "asked";
++    case Nvdec::NOT_HEVC:
++      return "not HEVC";
++    case Nvdec::SOFTWARE:
++      return "the player asked for decoding by the processor";
++    case Nvdec::NOT_ALLOWED:
++      return "hardware decoding (VAAPI) is off";
++    case Nvdec::FAILED_BEFORE:
++      return "it failed for this stream before";
++    case Nvdec::NO_DRIVER:
++      return "no NVIDIA driver is loaded";
++    case Nvdec::OLD_DRIVER:
++      return "the NVIDIA driver is older than the 610 series, whose NVDEC takes the two views";
++  }
++  return "";
++}
++//! @}
++
++/*!
++ * \brief How far the left eye's picture is moved sideways for the disparity adjustment that a
++ *        spatial video of Apple carries, in pixels to the right (the right eye's goes as far the
++ *        other way)
++ * \param adjustment the adjustment in ten-thousandths of the width of a view, -10000 to 10000
++ *        (the box 'dadj' of 'cmfy' in 'eyes', which FFmpeg gives as
++ *        AVStereo3D::horizontal_disparity_adjustment over 10000); 0 where there is none
++ * \param width the width of a view
++ * \param step the pixels that a chroma sample spans across (2 for 4:2:0): the move is a whole
++ *        number of them, so that the chroma moves with the luma
++ *
++ * Apple's "QuickTime and ISO Base Media File Formats and Spatial and Immersive Media" (1.9.8,
++ * StereoComfortDisparityAdjustmentBox) maps the value over the width of a view's image and
++ * applies half of it to each eye, positive denoting more disparity from the parallel direction,
++ * negative toward the viewer; Apple's Compressor says it plainly: "When horizontal disparity is
++ * negative, content in the footage appears closer; when it's positive, content seems farther
++ * away". Content goes farther when the left eye's picture moves left and the right eye's right.
++ * The cameras of a spatial video look in parallel, which puts everything far away at the plane
++ * of the screen and everything else in front of it; the adjustment is where its maker put that
++ * plane instead, as the Vision Pro shows it.
++ */
++constexpr int LeftEyeShift(int adjustment, int width, int step)
++{
++  if (adjustment == 0 || adjustment < -10000 || adjustment > 10000 || width <= 0 || step <= 0)
++    return 0;
++  // half of adjustment / 10000 of the width, to the nearest whole step (and away from 0 at .5)
++  const int64_t numerator = static_cast<int64_t>(adjustment) * width;
++  const int64_t denominator = int64_t{20000} * step;
++  const int64_t steps = numerator >= 0 ? (numerator + denominator / 2) / denominator
++                                       : -((-numerator + denominator / 2) / denominator);
++  return static_cast<int>(-steps * step);
++}
++
+ //! What is known of a track when its stream is made
+ struct Track
+ {
+-- 
+2.53.0
+

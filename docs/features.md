@@ -1,6 +1,6 @@
 # Extras of Hades
 
-What LibreELEC Hades adds to LibreELEC, one by one, in plain words. Each entry says what it does, when you would want it and where to control it. What has been seen on which hardware is in the [README](../README.md#what-has-been-tested). For the exact behaviour of a setting, see the [settings guide](settings.md). For how a video travels to the TV, see [how it works](how-it-works.md).
+What LibreELEC Hades adds to LibreELEC, one by one, in plain words. Each entry says what it does, when you would want it and where to control it. What has been seen on which hardware is in [What has been tested](tested.md). For the exact behaviour of a setting, see the [settings guide](settings.md). For how a video travels to the TV, see [how it works](how-it-works.md).
 
 Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, most of this does nothing at all, and a video plays as it does in LibreELEC.
 
@@ -27,21 +27,21 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **Where.** *Settings > System > Display > Native Dolby Vision output*. In the player, *Dolby Vision output (this video)* chooses for one video.
 
-**Seen working** on NVIDIA, AMD and Intel graphics ([what has been tested](../README.md#what-has-been-tested)).
+**Seen working** on NVIDIA, AMD and Intel graphics ([what has been tested](tested.md)).
 
 **Safe by design.** Hades uses it only when the video, the TV, the HDMI link and the graphics driver all qualify. If anything is in doubt, or it fails during a video, the video goes on as HDR10 or SDR, and the player information says why.
 
 ### The player information page
 
-**What it does.** Opens a panel over the video. Its first line is a sentence: either that the video plays as intended, or what is wrong and what to do. Below it, the path of the signal: what the film carries, what Hades does with it, and what reaches your TV. More pages hold the details: the video, every level of the Dolby Vision metadata and which of them are used and sent, the sound with a plan of the speakers, and the system, with how the TV is connected (the link and its speed, the depth, whether variable refresh rate is on) and the versions of Hades, of the graphics driver and of the kernel. A bar at the bottom of every page gives the use and temperature of the processor and of the graphics, the memory, the pictures dropped and skipped, and the button *Output of this video*.
+**What it does.** Opens a panel over the video. Its first line is a sentence: either that the video plays as intended, or what is wrong and what to do. Lost frames count there only where the loss is steady, since a start, a seek or a pause loses a few by design, and the sentence names the cause where it can: the graphics busy, or a video that buffers. Below it, the path of the signal: what the film carries, what Hades does with it, and what reaches your TV. More pages hold the details: the video, every level of the Dolby Vision metadata and which of them are used and sent, the sound with a plan of the speakers, and the system, with how the TV is connected (the link and its speed, the depth, whether variable refresh rate is on) and the versions of Hades, of the graphics driver and of the kernel. A bar at the bottom of every page gives the use and temperature of the processor and of the graphics, the memory, the pictures dropped and skipped, and the button *Output of this video*.
 
 ![The overview of the player information: the film, Hades and your TV, with a bar at the bottom](images/player-information.png)
 
 **You would want it** to check that Dolby Vision is really on, or to see why it is not, and to change how a video goes out while it plays: O, then OK, opens the choice of output.
 
-**Where.** Press O on a keyboard, or the red key of a TV remote that sends keys over HDMI-CEC. There is also a button in the video's on-screen controls. Down from the tabs goes to the button, with a remote, a keyboard or Yatse.
+**Where.** Press O on a keyboard, or the red key of a TV remote that sends keys over HDMI-CEC. On a remote without colour keys (a Fire TV remote over Bluetooth, for one), hold Menu while the video plays; a short press of Menu still opens the on-screen controls. There is also a button in the video's on-screen controls. Down from the tabs goes to the button, with a remote, a keyboard or Yatse.
 
-**Status.** Seen working on an RTX 4080 SUPER with an LG C5 (author), and, with changing the output from the on-screen controls, on a Ryzen 7 5800H (user); see the [README](../README.md#what-has-been-tested).
+**Status.** Seen working on an RTX 4080 SUPER with an LG C5 (author), and, with changing the output from the on-screen controls, on a Ryzen 7 5800H (user); see [what has been tested](tested.md).
 
 ### Check this setup
 
@@ -49,13 +49,17 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **You would want it** after installing, after changing the TV or the receiver, or when a sound format plays silence. It switches on only the sound formats that you heard, and switches one off only if you say so; nothing of the picture settings changes. DTS cannot be checked this way.
 
+**Frame packing.** Where the display says it takes 3D, a 15-second 3D clip goes out in frame packing, and the card says whether the graphics driver took it, or what it went out as and why. It is skipped on a display without 3D.
+
+**A/B comparison.** *Dolby Vision: Hades or licensed players (A/B)* shows a test clip as Hades sends it and as licensed players send it, and asks which looks right on your TV; it can also copy the clip to a USB drive, to see it first with the TV's own player. Your answer goes into the diagnostic report with the name of your TV; nothing changes unless you say so.
+
 **Where.** *Settings > LibreELEC > System > Check this setup*. *Show the last result* shows what it found last time. A user ran it on an RX 550 with an LG G3 (issue #20), where it showed which of the paths broke on that card.
 
 ### A notice of the mode when a video starts
 
 **What it does.** A short line appears a moment after a video starts: for example "Dolby Vision, FEL, 3840x2160 at 23.976 Hz".
 
-**Where.** *Settings > System > Display > Show the playback mode when a video starts*. Off by default.
+**Where.** *Settings > Player > Videos > Show the playback mode when a video starts*. Off by default.
 
 ### Dolby Vision for the menus
 
@@ -99,6 +103,20 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **Where.** *Show Dolby Vision as HDR10 when the display cannot* (on by default), *Also with an enhancement layer*, and *Send it as HDR10+ where the display takes it*.
 
+### Your display
+
+**What it does.** Hades sets the picture for a display from what the display declares. *Your display* asks the two things no display declares: whether it is a projector, and how bright (then it sets the mapping for it, as the settings guide says, by whether the projector takes Dolby Vision, HDR10 or SDR only), and whether HDR videos should go out as HDR, HLG as SDR, or everything as SDR. It also says what Hades found by itself: the display and its connector, what it takes, whether a sound bar or receiver is in between, and where the TV remote reaches the PC over HDMI-CEC (the adapter on the output of the picture, on another output, a USB-CEC adapter, or none). Going on without an answer changes nothing, and another answer later puts back what an earlier one changed.
+
+**Where.** At the first start, a page of the wizard; later, *Settings > LibreELEC > System > Check this setup > Your display*.
+
+**Status.** Not tried on a projector.
+
+### Share my results
+
+**What it does.** Makes one line of LibreELEC Hades and its version, the processor, the graphics and their driver, each display (its name, its connector, what it takes, a sound bar or receiver in between) and the results of the last *Check this setup*, to paste in the forum or in an issue. It shows the line and copies it to a USB drive as `hades-results.txt`. It names no serial number, no address and no network, and no name of the PC. A diagnostic report has the same line.
+
+**Where.** *Settings > LibreELEC > System > Check this setup > Share my results*.
+
 ### Projectors and displays that map HDR poorly
 
 **What it does.** A projector is much dimmer than a TV, and many map HDR badly. Hades can do the mapping in the PC, to the peak brightness, the colours and the black that you set: for Dolby Vision shown as HDR10 (*Adapt Dolby Vision to my display*), for HDR10 and HDR10+ (*HDR10 and HDR10+ adapted to the display*, which follows the HDR10+ data of each scene), and for Low-Latency (its manual peak, colours and black). *Black of the display* lifts the darkest parts of the film above a projector's own black. *Dolby Vision: ignore the studio's fine-tuning (trims)* stops sending the trims to a display that shows washed-out blacks. *HDR10: limit the luminance told to the display* tells the display a lower peak. *Play HDR videos as SDR* sends HLG, or every HDR video, as SDR to a display whose SDR picture you prefer.
@@ -106,6 +124,16 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 **Where.** All at Expert level. The [settings guide](settings.md#for-projectors-and-displays-that-map-hdr-poorly) has a short section for projectors.
 
 **Trims.** Where Hades maps the picture to the display, *Dolby Vision: apply the trims when adjusting to your display* (Expert, off) applies the colourist's trims made for your display's peak, in the only way the standards publish. Measured against a studio's own version of a film for a 1000-nit display, that way made the shadows much darker than the studio did, so it is off. Native Dolby Vision is not affected: the TV applies the trims itself.
+
+### Projector control over the network
+
+**What it does.** For a home-cinema projector on your network, Hades selects its lens memory by the shape of the picture and its picture mode by the kind of signal. For a wide screen with constant image height, up to three lens memories (narrower pictures, wide pictures from 2.10:1, and the widest from a shape you set) are chosen by the shape of the picture without its black bars: from the Dolby Vision level 5 of the video where it has one, otherwise measured on the picture as *Subtitles in the black bars* does. At the start of a video the lens moves after 2 seconds; in the middle of a video only when a new shape lasts (10 seconds by default), so an IMAX scene moves it once and not back and forth; when the video ends it goes back to the memory of the menus. A picture mode can be set for SDR, HDR10 and HDR10+, HLG, Dolby Vision and 3D, sent once when that signal starts: a mode that you then choose with the projector's remote stays until the signal changes. In 3D the lens does not move.
+
+JVC D-ILA (NZ, NX, NP, N, X, RS and V series), Sony ADCP (VPL-XW, and the VPL-VW models that have it), Sony SDCP (VPL-VW) and Epson ESC/VP.net. Hades connects only to the IP address that you write, never listens, and sends nothing while the setting is Off; an address outside a home network needs your confirmation. The password is kept like the password of Kodi's web server and is never written to the log. A projector that is off or warming up gets nothing until it is on, and a problem gives one notice, not one per try.
+
+**Where.** *Settings > System > Display > Projector control over the network* (Advanced, off by default): the projector, its address and password, *Test the connection* (its model and whether it is on), the lens memories, and the picture modes. While it is on, the System page of the player information shows what was selected ("JVC: memory 2 for 2.39:1 (measured), mode Natural") or what stands in the way, and `kodi.log` has every command and every answer, without the password.
+
+**Status.** Tested against a simulator of each protocol, and end to end in a virtual machine against a JVC simulator; not tried on a projector yet.
 
 ### HDR10, HDR10+ and HLG sent as Dolby Vision
 
@@ -115,7 +143,7 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 ### HDR converted to SDR
 
-**What it does.** On a display without HDR, Dolby Vision and HDR videos are mapped to SDR with the reference method of ITU-R BT.2390: everything the display can show goes out as it was mastered, and only what is brighter is squeezed in. You can say what kind of display the SDR is made for: a reference display (white at 203 nits), a bright room (300 nits), a projector (100 nits), or Custom, with the white and the gamma of your own display. If you preferred the look of before 1.0, with darker middle tones and a little more detail in the brightest highlights, choose "BT.2390, libplacebo's knee" as the tone mapping method of the video.
+**What it does.** On a display without HDR, Dolby Vision and HDR videos are mapped to SDR with the reference method of ITU-R BT.2390: everything the display can show goes out as it was mastered, and only what is brighter is squeezed in. You can say what kind of display the SDR is made for: a reference display (white at 203 nits), a bright room (300 nits), a projector (100 nits), or Custom, with the white and the gamma of your own display. If you preferred the look of before 1.0, with darker middle tones and a little more detail in the brightest highlights, choose "BT.2390, libplacebo's knee" as the tone mapping method of the video. For a projector or a TV that takes SDR in a wider gamut, *HDR to SDR: gamut of the output* sends that SDR in BT.2020 or DCI-P3, the video mapped into it and the menus converted to match (Expert, BT.709 by default).
 
 **Where.** *HDR to SDR: the display it is made for*. Reference by default. It applies to HDR10, HDR10+ and HLG as well, with the knee of the ITU-R report or a Custom display. Measured with the software bridge. A profile that still has Kodi's tone mapping method "Off", which left HDR washed out on a display without HDR, is switched to "Reference (BT.2390)" once.
 
@@ -165,7 +193,7 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 ### Dolby Vision on more graphics and connections
 
-**What it does.** Native Dolby Vision on the newest Ryzen processors (display hardware DCN 4.2 and 4.2B), checked by reading the display pipe back each time it starts, and through a passive DisplayPort adaptor (DP++) that identifies itself as HDMI, on Intel and AMD graphics (NVIDIA already did). An adaptor that does not say HDMI gets no Dolby Vision, on NVIDIA too. The Radeon RX 400, RX 500 and Vega cards get Dolby Vision only with *Dolby Vision on this Radeon (experimental)*, and the older Intel HD and UHD 6xx graphics can send HDR over HDMI with *HDR over HDMI on this Intel graphics*: both expert settings, shown only on that graphics, kept in the boot menus. *Check the Dolby Vision output* (*Settings > LibreELEC > System > Submit Log*) measures whether an AMD or Intel graphics card sends the Dolby Vision picture unchanged, and says which colour of the output changes; where it finds a card not exact, Hades uses neither native Dolby Vision nor HDR in 4:2:2 at 12 bits on that output. The check was run by a user on an RX 550 (issue #20).
+**What it does.** Native Dolby Vision on the newest Ryzen processors (display hardware DCN 4.2 and 4.2B), checked by reading the display pipe back each time it starts, and through a passive DisplayPort adaptor (DP++) that identifies itself as HDMI, on Intel and AMD graphics (NVIDIA already did). An adaptor that does not say HDMI gets no Dolby Vision, on NVIDIA too. The Radeon RX 400, RX 500 and Vega cards get Dolby Vision only with *Dolby Vision on this Radeon (experimental)*, and the older Intel HD and UHD 6xx graphics can send HDR over HDMI with *HDR over HDMI on this Intel graphics*: both expert settings, shown only on that graphics, kept in the boot menus. *Check the Dolby Vision output* (*Settings > LibreELEC > System > Check this setup*) measures whether an AMD or Intel graphics card sends the Dolby Vision picture unchanged, and says which colour of the output changes; where it finds a card not exact, Hades uses neither native Dolby Vision nor HDR in 4:2:2 at 12 bits on that output. The check was run by a user on an RX 550 (issue #20).
 
 ### Dolby Vision through a DisplayPort-to-HDMI converter
 
@@ -181,9 +209,23 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 ### Upscalers
 
-**What it does.** When a video is smaller than your screen (1080p on a 4K TV, a DVD on a 1080p one), Kodi scales it up with a filter. An upscaler redraws it instead and rebuilds edges and fine lines: RAVU is the lightest, FSRCNNX 8 gives more detail, and FSRCNNX 16 the most and needs a strong graphics card. Measured against Kodi's Lanczos 3, they come closer to the original picture by 0.1 to 1.3 dB, 0.3 to 3.4 dB and 0.4 to 4.7 dB. They change the picture, so they are off unless you choose one; they are never used for Dolby Vision, and if the graphics cannot keep up, the upscaler turns itself off for that video and a message tells you.
+**What it does.** When a video is smaller than your screen (1080p on a 4K TV, a DVD on a 1080p one), Kodi scales it up with a filter. An upscaler redraws it instead and rebuilds edges and fine lines: RAVU is the lightest, FSRCNNX 8 gives more detail, and FSRCNNX 16 the most and needs a strong graphics card. Measured against Kodi's Lanczos 3, they come closer to the original picture by 0.1 to 1.3 dB, 0.3 to 3.4 dB and 0.4 to 4.7 dB. AiUpscale (film) and AiUpscale (animation) ask a little less of the graphics card than FSRCNNX 16 and come closer than it to the original on animation and on SDR film (+1.1 dB and +3.9 to +4.1 dB against Lanczos 3), a little less close on HDR10 (+3.3 to +3.4 dB); the animation one is made for drawn lines. They change the picture, so they are off unless you choose one; they are never used for Dolby Vision, and if the graphics cannot keep up, the upscaler turns itself off for that video and a message tells you.
 
 **Where.** *Settings > Player > Videos*, Expert: *Upscaler for videos of 1080p and above*, *Upscaler for videos below 1080p*, and *Upscaler for animation* for the videos whose genre says Animation or Anime. Or, while a video plays, the button of the Video page of the player information (O): it names the upscaler of the videos like the one that plays and changes it, for all of them (OK on the button, or on the Video tab).
+
+### Colour edges and smooth gradients
+
+**What it does.** Most videos keep their colour at half the resolution of their brightness. Where Kodi draws a video itself (SDR, HDR10 and HLG), Hades now puts the colour where the video places it and fills it in with a sharper filter: colour edges, red text on black for example, are cleaner and no longer slightly shifted. Measured against masters with full colour, the colour error goes down by 13 % on animation and 26 % on film. Where Hades maps or upscales a picture into 8 bits (an SDR screen, a laptop panel), it also adds a fine noise instead of rounding, so skies and fades show no steps.
+
+**Where.** Nothing to set: both are on. If the graphics cannot keep up, the colour filter steps down by itself for that video and `kodi.log` says so. Native Dolby Vision and 10-bit output are not touched.
+
+### A 3D LUT for each display
+
+**What it does.** A calibration program (Calman, ColourSpace, DisplayCAL, madVR) measures a display in one picture mode and writes a 3D LUT that corrects its colours. Hades applies it as the last step of the colour of the video, after the tone mapping and before the picture is turned into the codes that go out: a LUT for SDR on SDR videos, whether Kodi draws them or Hades does with an upscaler, and on HDR and Dolby Vision mapped to SDR (a projector, a display without HDR, *Play HDR videos as SDR*); a LUT for HDR on HDR10 and HDR10+ adapted to the display, Dolby Vision adapted to it, and Dolby Vision Low-Latency. Never on native Dolby Vision that the TV maps, nor on HDR that the display maps itself, whose own mapping comes after the LUT and changes with each film. Each display keeps its own LUTs, by the make and model in its EDID, so the LUT of a projector is never applied to the TV. A file made for another kind of picture (a LUT for PQ in the SDR place, for example) is refused with a notice. If the graphics cannot apply it, the picture goes out without it and Hades says so; it is never left out in silence.
+
+**Where.** *Settings > System > Display > 3D LUT (display calibration)*, Expert, off by default: the LUT for SDR and the LUT for HDR on this display (`.cube`, `.3dl` or madVR's `.3dlut`), the range of a `.cube` or `.3dl`, and the gamut that the SDR LUT was made for. The Video page of the player information names the LUT in use, or why it is not applied, and `kodi.log` says each file read and each decision. The menus and subtitles are not corrected, as in Kodi's own colour management. The videos of the DRM PRIME decoder (hidden and off in LibreELEC Hades) go out without a pass that could apply it: the player information says so, and Hades asks once whether to turn that decoder off. See [how-it-works.md](how-it-works.md#a-3d-lut-of-the-display).
+
+**Status.** Checked on the software renderer, in the bridge and in Kodi's own video shaders (an identity LUT leaves the picture as it was, but for a few pixels in Kodi's shaders rounded one code the other way; a known LUT gives what it says to a millionth); not tried on a calibrated display yet.
 
 ### Video at its own rate with VRR
 
@@ -192,6 +234,16 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 **You would want it** if your monitor has no mode of 24, 48 or 72 Hz, so a film goes out at 120 or 360 Hz with a picture held a refresh longer now and then (choose *Where the display has no mode at the video's rate*); or if the black at the start of every video bothers you and your display has VRR (choose *Always*; on an LG TV, turn on "VRR & G-Sync" for NVIDIA graphics or "AMD FreeSync Premium" for AMD graphics). With VRR on, the display's own information shows the rate it gets (47 Hz on the LG C5, 72 Hz on the monitor), and the player information says the same, measured.
 
 **Where.** *Settings > System > Display > Video at its own rate with VRR*, Expert: *Off* (the default), *Where the display has no mode at the video's rate*, or *Always*. On NVIDIA it leaves *HDMI variable refresh rate (VRR)* to the driver where it needs it. In the first second of each video Hades checks that the refresh really follows the video (on NVIDIA, as the driver says and by when each picture reached the output), and plays the video as with the setting off where it does not; the player information says which it was. `kodi.log` says how exact the timing was.
+
+### Filmmaker Mode by itself: films said to be films
+
+**What it does.** HDMI tells the TV what kind of picture it gets (the content type of the AVI InfoFrame). NVIDIA and AMD graphics said "computer graphics" for everything, films included, and Intel said nothing. Hades now says *Cinema* while a video plays and *Game* while a game of the game players (RetroPlayer) plays, each only where the TV declares in its EDID that it takes that kind; the menus go out as the graphics driver always said them. A TV that chooses its picture mode by it changes by itself: an LG TV with *Filmmaker Mode Auto Start* on shows a film in Filmmaker Mode and goes back for the menus. Dolby Vision that the TV processes itself says no content type, as licensed Dolby Vision players send it (the TV uses its Dolby Vision modes then); Dolby Vision Low-Latency is a video. Not a byte of the picture changes.
+
+It changes only together with a change of the display mode that happens anyway (a video at its own refresh rate, with *Adjust display refresh rate*), never with a black screen of its own. So a video that plays in the mode of the menus (the same refresh rate, *Adjust display refresh rate* off, or *Video at its own rate with VRR* at *Always*) keeps what the menus have, and `kodi.log` says so.
+
+**You would want it** if your TV has an automatic Filmmaker Mode, or switches its picture mode by what it is shown (on an LG TV: *Filmmaker Mode Auto Start* in its picture settings). Without such a setting on the TV, nothing changes on the screen.
+
+**Where.** *Settings > System > Display > Content type (Filmmaker Mode)*, Expert: *Automatic* (the default) or *As LibreELEC* (Hades does not set it, and the graphics driver says what it always said). The player information shows what the TV is told (Video page, Video output, *Content type*), and `kodi.log` each change. On NVIDIA graphics it needs Hades' own driver, which offers the content type (all the NVIDIA drivers of Hades do).
 
 ### Picture in step with its sound
 
@@ -203,7 +255,7 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 ### Integrated graphics
 
-**What it does.** Where the graphics need most of the time of a frame to prepare a Dolby Vision picture (typically integrated graphics with 4K Blu-ray video), the next frame is prepared while the last one waits, and the picture under menus and subtitles is redrawn only where they are. If even that is not enough, an automatic step-down rebuilds the picture slightly less precisely, only as far as the video needs to play smoothly. Graphics that keep up always show the exact picture.
+**What it does.** Where the graphics need most of the time of a frame to prepare a Dolby Vision picture (typically integrated graphics with 4K Blu-ray video), the next frame is prepared while the last one waits, and the picture under menus and subtitles is redrawn only where they are. If even that is not enough, an automatic step-down rebuilds the picture slightly less precisely, only as far as the video needs to play smoothly; so does Dolby Vision shown as HDR10 or SDR on a display without Dolby Vision, whose enhancement layer is still drawn. Graphics that keep up always show the exact picture.
 
 **Where.** *Present frames a frame ahead*, *Fidelity step-down* and the other settings of the Dolby Vision engine group, all Expert. Leave them at Automatic unless a row of the settings guide says otherwise.
 
@@ -235,7 +287,7 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **What it does.** On a laptop on its charger, the sound of TrueHD or DTS-HD could cut out every few seconds, because the graphics card changed speed. This setting holds the card at full speed while that sound plays.
 
-**Where.** *Keep the graphics card at full speed while HD audio plays through*. Off by default; shown only with an NVIDIA card. Not tried on hardware yet.
+**Where.** *Keep the graphics card at full speed while HD audio plays through*. Off by default; shown only with an NVIDIA card. Seen working on a laptop with an RTX 3070 Laptop GPU on its charger (user, [issue #8](https://github.com/hadesdevls/LibreELEC-Hades/issues/8)).
 
 ## Discs, 3D and files
 
@@ -247,7 +299,19 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **What it does.** Decodes both eyes of a 3D Blu-ray and switches a 3D display to 3D over HDMI. It needs a display that says it takes 3D. I have no 3D display; users have seen 3D Blu-ray video (MVC) and full side by side on a Ryzen 7 5800H, and frame packing on a Philips 3D TV from Intel graphics. In 1.0 the lines between the two eyes of frame packing are sent black, and the second view stays right after a picture that empties the decoder. Through an active DisplayPort or USB-C converter the graphics driver offers no 3D mode, and `kodi.log` says so.
 
-**Where.** *Decode both views of 3D Blu-ray video (MVC)* and *Switch the display to 3D (HDMI)*, both Expert.
+**Where.** *Decode both views of 3D video (Blu-ray MVC, MV-HEVC)*, *Switch the display to 3D (HDMI)* and *How 3D video goes out*, all Expert.
+
+### 3D in MV-HEVC
+
+**What it does.** Plays the 3D videos of an iPhone or a Vision Pro (spatial video) and 3D films made for the Vision Pro, in MP4, MOV or Matroska, in 3D, as a 3D Blu-ray plays. NVIDIA graphics with driver 620 (Turing and later) decode both views on the card; other graphics on the processor, and where the processor cannot keep up the video goes on in 2D and the player information says why. A spatial video keeps its intended depth, so far things sit behind the screen as on the Vision Pro. A Dolby Vision 3D film (profile 20) plays in 3D, with its colours right: each view rebuilt as HDR10 or mapped to SDR. *How 3D video goes out* (Expert) lets you choose HDR, SDR in BT.2020 or SDR in BT.709 for 3D video, to try what your 3D TV or projector takes.
+
+**Where.** The same settings as 3D Blu-ray. Checked with the ITU-T test streams; not seen on a 3D display yet.
+
+### Subtitles and menus over 3D
+
+**What it does.** A 3D Blu-ray tells the player how far in front of the screen to put each subtitle. Where a 3D video does not (MV-HEVC, side by side, top and bottom, a remux without it), Hades measures how near the picture comes where the subtitle goes and puts the subtitle just in front, gliding forward when it has to and never jumping while it is shown, within a comfortable limit. The menus and the player information open in front of the picture too.
+
+**Where.** *Player > Subtitles > Depth of subtitles and menus over 3D video*: Automatic, or Fixed, as in Kodi. Not seen on a 3D display yet.
 
 ### Blu-ray jumps and seeks
 
@@ -261,6 +325,12 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **What it does.** Dims picture-based subtitles (PGS, VobSub) that are too bright, makes their colours paler if they are too vivid, resizes them, and moves them to where the text subtitles go. *Bitmap subtitles made for* fixes subtitles made for SDR in an HDR film (they glare) or the other way round (they look grey). A subtitle now shows with its own frame, not one late. **Where:** *Player > Subtitles > Image based subtitles*.
 
+### Subtitles in the black bars
+
+**What it does.** Many films are wider than the TV, and most UHD remuxes keep their black bars inside the 16:9 picture. With this on, the subtitles of such a film go into the bar under the picture, so that they never cover it. Hades finds the bar from the Dolby Vision data where the video has them, and otherwise by measuring the picture: only a bright scene can widen it, so dark scenes do not move the subtitles, and a scene that opens up to the full screen brings them back at once. Two lines must fit at your subtitle size.
+
+**Where.** *Settings > Player > Subtitles*, off by default.
+
 ### DVD and telecined films
 
 **What it does.** A film on a DVD that is coded at 23.976 pictures per second with the flags to show it at 29.97 is shown at 23.976 Hz, each picture once, instead of in uneven steps. Hades tells it before the first picture, from the flags of the stream: in a file by what most of it is, and in a DVD image (ISO) or `VIDEO_TS` folder title by title. A disc in a drive is not read ahead, so it plays as before. Seeks in Matroska files start at the earliest key frame.
@@ -273,6 +343,14 @@ A film stored as interlaced video (3:2 pulldown on NTSC discs, a PAL film marked
 
 For streaming add-ons: a Blu-ray image plays as a disc even when the address of the add-on does not end in `.iso`; a server that allows one connection per file no longer stalls each seek (61 s before, under 2 s measured); an address whose token ran out is asked again of the add-on; disc images on the internet open faster; and a change of subtitle track shows at once, from what was read.
 
+### The settings of a film, by the film
+
+**What it does.** Kodi keeps what you choose for a video (its audio and subtitle tracks, the delays, the zoom, the picture settings) by its file. For a film or an episode that an add-on plays, Hades also keeps it by its IMDb, TMDb or TVDb id (with the season and number of an episode), so it comes back when the same film plays from another source. Each setting is taken where it still fits: the tracks are found again by what they are (the language and its variety, forced, for the hearing impaired, commentary, name, codec, channels), never by their number, and only where the new file has them; subtitles that you turned off stay off; the zoom for a picture of the same shape; the picture settings for a video of the same format; the volume for the same cut; and the audio and subtitle delays only for the same release, the same length to the second and the same video. The Dolby Vision output chosen for it is taken again too. Two films are never mixed: what was kept under ids that disagree with those of the film is left out. A short notification says what was restored, and `kodi.log` says what was taken and why (lines `Film settings:`).
+
+Files on this PC and on the local network, discs and the library keep their settings for their file, as in Kodi. The settings are kept in a table of their own in Kodi's video database, whose version does not change, so an older build opens the same database as before.
+
+**Where.** *Settings > Player > Videos > Remember the settings of films from add-ons*, on by default.
+
 ### The variety of a language
 
 **What it does.** Some videos have the same language twice: Spanish from Spain (Castilian) and from Latin America, Portuguese from Portugal and from Brazil, French from France and from Canada, Chinese in simplified and in traditional characters. This says which one plays first, for the audio and for the subtitles. Automatic follows the region of your language settings (Spanish (Mexico) prefers Latin American Spanish); a track that you choose in a video is remembered for it and still comes first.
@@ -284,6 +362,12 @@ For streaming add-ons: a Blu-ray image plays as a disc even when the address of 
 ### Safe defaults
 
 Hades is made for a PC that also holds your other disks and your Windows. The internal disks are hidden when it runs from USB, file sharing is off until you turn it on and then has a password, and the update server of LibreELEC is not used. Every one of these can be turned back on. The README lists them with the reason in [Defaults that differ from LibreELEC](../README.md#defaults-that-differ-from-libreelec).
+
+### Updates from Hades itself
+
+**What it does.** From 1.2, Hades looks on GitHub every six hours for a newer version of itself and tells you when there is one; *Available Versions* shows it, asks, downloads it and restarts to install it. Only a version signed by LibreELEC Hades, newer than yours and whole is taken, and looking sends nothing about your system. "Auto" downloads by itself and installs at the next start.
+
+**Where.** *Settings > LibreELEC > Updates*. How it is checked: [Updates from the system itself](how-it-works.md#updates-from-the-system-itself).
 
 ### The Windows installer
 

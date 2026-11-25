@@ -1,0 +1,1205 @@
+From 58ffeb00ec73ffd6d4b73663702672a853e74b22 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:01:44 +0000
+Subject: [PATCH] [Hades][VideoPlayer] 3D: each eye's video copied small by the
+ graphics and measured on a thread of its own
+
+The depth of a 3D video has to be measured from what is drawn, whatever
+decoded it (the processor, VA-API, NVDEC) and whatever the layout of the
+file, without slowing the playback down.
+
+CStereoDepthCapture copies, right after each eye's video was drawn into
+the framebuffer and before anything is drawn over it, the video's
+rectangle of that eye into a picture of 480 x 270, halving it in steps
+of two with framebuffer blits (each step averages 2 x 2 pixels, so a
+large picture is reduced without aliasing), the two eyes one above the
+other. Once both are in, the graphics read them into a pixel buffer
+behind a fence; frames later the render thread takes a read that is
+done and copies it (1 MB). It never waits for the graphics. It needs
+OpenGL (ES) 3; a framebuffer of floating point, a failed blit or read,
+end it for the video, and say why.
+
+CStereoDepthMeter, which the render manager will own: AfterVideo() for
+each eye's pass (only where the eye's viewport is the one
+SetStereoView() set, at most every 75 ms and once per picture);
+Frame() once a frame: the reads go to a thread of its own that makes
+the light of them and matches them (StereoDepth.cpp), and the planner
+gives the depths of the frame. It measures only where it can: an
+automatic setting, a split 3D output (side by side, top and bottom,
+frame packing), a video drawn in each eye's pass (not an HDR one,
+drawn once under the interface), full screen. kodi.log says once where
+the depth comes from: the disc's offsets, measured, or the setting, and
+why it is not measured.
+
+On Mesa's software OpenGL ES (llvmpipe), where the processor does the
+work of the graphics, the render thread spent 4 to 8 ms a frame; on
+graphics it is a few blits and a 1 MB copy (about 250 MB/s of reads of
+the graphics' memory at 1080p per eye).
+---
+ .../VideoPlayer/VideoRenderers/CMakeLists.txt |   8 +-
+ .../VideoRenderers/StereoDepthCapture.cpp     | 433 ++++++++++++++++++
+ .../VideoRenderers/StereoDepthCapture.h       | 120 +++++
+ .../VideoRenderers/StereoDepthMeter.cpp       | 385 ++++++++++++++++
+ .../VideoRenderers/StereoDepthMeter.h         | 165 +++++++
+ 5 files changed, 1109 insertions(+), 2 deletions(-)
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.h
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+index 021edcb..b3d691a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/CMakeLists.txt
+@@ -7,7 +7,9 @@ set(SOURCES ActiveAreaZoom.cpp
+             RenderFlags.cpp
+             RenderManager.cpp
+             DebugRenderer.cpp
+-            StereoDepth.cpp)
++            StereoDepth.cpp
++            StereoDepthCapture.cpp
++            StereoDepthMeter.cpp)
+ 
+ set(HEADERS ActiveAreaZoom.h
+             BaseRenderer.h
+@@ -26,7 +28,9 @@ set(HEADERS ActiveAreaZoom.h
+             RenderInfo.h
+             RenderManager.h
+             DebugRenderer.h
+-            StereoDepth.h)
++            StereoDepth.h
++            StereoDepthCapture.h
++            StereoDepthMeter.h)
+ 
+ if(CORE_SYSTEM_NAME STREQUAL windows OR CORE_SYSTEM_NAME STREQUAL windowsstore)
+   list(APPEND SOURCES WinRenderer.cpp
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp
+new file mode 100644
+index 0000000..f7c47a4
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp
+@@ -0,0 +1,433 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "StereoDepthCapture.h"
++
++#include <algorithm>
++#include <cstring>
++
++#include "system_gl.h"
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++#if defined(HAS_GL) || HAS_GLES == 3
++
++namespace
++{
++//! the GL state a copy or a read changes, put back as it was
++class CKeepState
++{
++public:
++  CKeepState()
++  {
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &m_read);
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &m_draw);
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &m_pack);
++    glGetIntegerv(GL_PACK_ALIGNMENT, &m_alignment);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &m_texture);
++    m_scissor = glIsEnabled(GL_SCISSOR_TEST);
++  }
++  ~CKeepState()
++  {
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(m_read));
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(m_draw));
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(m_pack));
++    glPixelStorei(GL_PACK_ALIGNMENT, m_alignment);
++    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(m_texture));
++    if (m_scissor)
++      glEnable(GL_SCISSOR_TEST);
++    else
++      glDisable(GL_SCISSOR_TEST);
++  }
++  GLint Draw() const { return m_draw; }
++
++private:
++  GLint m_read{0};
++  GLint m_draw{0};
++  GLint m_pack{0};
++  GLint m_alignment{4};
++  GLint m_texture{0};
++  GLboolean m_scissor{GL_FALSE};
++};
++
++void ClearErrors()
++{
++  while (glGetError() != GL_NO_ERROR)
++    ;
++}
++
++//! The levels a rectangle of \p width x \p height is halved through: the first copy is never
++//! more than 2:1 on either side
++int LevelsFor(int width, int height)
++{
++  int levels = 1;
++  while (levels < 4 && (CStereoDepthCapture::WIDTH << levels < width ||
++                        CStereoDepthCapture::HEIGHT << levels < height))
++    ++levels;
++  return levels;
++}
++} // namespace
++
++CStereoDepthCapture::~CStereoDepthCapture()
++{
++  Release();
++}
++
++bool CStereoDepthCapture::Supported(std::string& why)
++{
++  // the context's version is a fact of the running system: a winsystem may ask for an ES 2
++  // context where ES 3 headers were there to build with
++  GLint major = 0;
++  glGetIntegerv(GL_MAJOR_VERSION, &major);
++  if (glGetError() != GL_NO_ERROR || major < 3)
++  {
++    ClearErrors();
++    why = "the graphics context is older than OpenGL (ES) 3";
++    return false;
++  }
++  return true;
++}
++
++bool CStereoDepthCapture::Viewport(int& x, int& y, int& width, int& height)
++{
++  GLint viewport[4]{};
++  glGetIntegerv(GL_VIEWPORT, viewport);
++  x = viewport[0];
++  y = viewport[1];
++  width = viewport[2];
++  height = viewport[3];
++  return width > 0 && height > 0;
++}
++
++bool CStereoDepthCapture::EnsureLevels(int levels)
++{
++  if (static_cast<int>(m_levels.size()) == levels)
++    return true;
++  ReleaseLevels();
++
++  GLint texture = 0;
++  glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++  GLint draw = 0;
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++
++  bool ok = true;
++  for (int i = 0; i < levels && ok; ++i)
++  {
++    Level level;
++    level.width = WIDTH << i;
++    level.height = 2 * (HEIGHT << i);
++    glGenTextures(1, &level.texture);
++    glBindTexture(GL_TEXTURE_2D, level.texture);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, level.width, level.height, 0, GL_RGBA,
++                 GL_UNSIGNED_BYTE, nullptr);
++    glGenFramebuffers(1, &level.fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, level.fbo);
++    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, level.texture,
++                           0);
++    ok = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++    m_levels.push_back(level);
++  }
++
++  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(texture));
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  if (!ok)
++    ReleaseLevels();
++  return ok;
++}
++
++bool CStereoDepthCapture::CopyEye(int eye, int x, int y, int width, int height, std::string& why)
++{
++  if (eye < 0 || eye > 1 || width <= 0 || height <= 0)
++  {
++    why = "no rectangle of the video";
++    return false;
++  }
++  if (eye == 0)
++  {
++    m_eyes[0] = m_eyes[1] = false;
++    m_copiedLevel = -1;
++  }
++  else if (!m_eyes[0])
++  {
++    why = "the left eye was not copied";
++    return false;
++  }
++
++  const int levels = eye == 0 ? LevelsFor(width, height) : m_copiedLevel + 1;
++  if (!EnsureLevels(std::max(levels, static_cast<int>(m_levels.size()))) ||
++      static_cast<int>(m_levels.size()) < levels)
++  {
++    why = "the pictures of the copy could not be made";
++    return false;
++  }
++
++  CKeepState keep;
++
++  // the framebuffer the video was drawn into: its colours must be of fixed point to be blitted
++  // into 8 bits
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(keep.Draw()));
++  GLint type = GL_UNSIGNED_NORMALIZED;
++  glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER,
++                                        keep.Draw() ? GL_COLOR_ATTACHMENT0 : GL_BACK,
++                                        GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type);
++  ClearErrors();
++  if (type == GL_FLOAT)
++  {
++    why = "the picture is drawn in floating point";
++    return false;
++  }
++
++  const Level& level = m_levels[static_cast<size_t>(levels - 1)];
++  const int eyeHeight = level.height / 2;
++  // the left eye in the upper half (GL counts from the bottom), the right in the lower
++  const int top = eye == 0 ? eyeHeight : 0;
++
++  glDisable(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, level.fbo);
++  glBlitFramebuffer(x, y, x + width, y + height, 0, top, level.width, top + eyeHeight,
++                    GL_COLOR_BUFFER_BIT, GL_LINEAR);
++  if (glGetError() != GL_NO_ERROR)
++  {
++    ClearErrors();
++    why = "the framebuffer could not be blitted";
++    return false;
++  }
++
++  m_eyes[eye] = true;
++  m_copiedLevel = levels - 1;
++  return true;
++}
++
++bool CStereoDepthCapture::CanRead() const
++{
++  return std::any_of(std::begin(m_reads), std::end(m_reads), [](const Read& r) { return !r.busy; });
++}
++
++bool CStereoDepthCapture::StartRead(uint64_t tag, std::string& why)
++{
++  if (!m_eyes[0] || !m_eyes[1] || m_copiedLevel < 0)
++  {
++    why = "both eyes were not copied";
++    return false;
++  }
++  m_eyes[0] = m_eyes[1] = false;
++
++  Read* read = nullptr;
++  for (Read& r : m_reads)
++    if (!r.busy)
++    {
++      read = &r;
++      break;
++    }
++  if (!read)
++  {
++    why = "the reads before have not ended";
++    return false;
++  }
++
++  CKeepState keep;
++  ClearErrors();
++  glDisable(GL_SCISSOR_TEST);
++
++  // halved down to the smallest level, both eyes at once
++  for (int i = m_copiedLevel; i > 0; --i)
++  {
++    const Level& from = m_levels[static_cast<size_t>(i)];
++    const Level& to = m_levels[static_cast<size_t>(i - 1)];
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, from.fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, to.fbo);
++    glBlitFramebuffer(0, 0, from.width, from.height, 0, 0, to.width, to.height, GL_COLOR_BUFFER_BIT,
++                      GL_LINEAR);
++  }
++
++  const size_t size = static_cast<size_t>(WIDTH) * HEIGHT * 2 * 4;
++  if (!read->buffer)
++  {
++    glGenBuffers(1, &read->buffer);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, read->buffer);
++    glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(size), nullptr, GL_STREAM_READ);
++  }
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, read->buffer);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, m_levels[0].fbo);
++  glPixelStorei(GL_PACK_ALIGNMENT, 4);
++  glReadPixels(0, 0, WIDTH, 2 * HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++  GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++  if (glGetError() != GL_NO_ERROR || !fence)
++  {
++    if (fence)
++      glDeleteSync(fence);
++    ClearErrors();
++    why = "the copy could not be read back";
++    return false;
++  }
++  // the fence is put in the stream of commands now, so that it is signalled without a wait
++  glFlush();
++
++  read->fence = fence;
++  read->tag = tag;
++  read->order = ++m_order;
++  read->busy = true;
++  return true;
++}
++
++bool CStereoDepthCapture::Luma(const std::vector<uint8_t>& rgba, std::vector<uint8_t>& luma)
++{
++  if (rgba.size() != static_cast<size_t>(WIDTH) * HEIGHT * 2 * 4)
++    return false;
++  // the rows come from the bottom: the right eye's first, from its bottom row up, then the
++  // left eye's. Luma of BT.709 weights, in whole numbers.
++  luma.resize(static_cast<size_t>(WIDTH) * HEIGHT * 2);
++  for (int eye = 0; eye < 2; ++eye)
++  {
++    for (int row = 0; row < HEIGHT; ++row)
++    {
++      const int glRow = (eye == 0 ? HEIGHT : 0) + (HEIGHT - 1 - row);
++      const uint8_t* in = rgba.data() + static_cast<size_t>(glRow) * WIDTH * 4;
++      uint8_t* out = luma.data() + (static_cast<size_t>(eye) * HEIGHT + row) * WIDTH;
++      for (int x = 0; x < WIDTH; ++x)
++        out[x] =
++            static_cast<uint8_t>((54 * in[4 * x] + 183 * in[4 * x + 1] + 19 * in[4 * x + 2]) >> 8);
++    }
++  }
++  return true;
++}
++
++bool CStereoDepthCapture::Collect(std::vector<uint8_t>& rgba, uint64_t& tag)
++{
++  Read* oldest = nullptr;
++  for (Read& r : m_reads)
++    if (r.busy && (!oldest || r.order < oldest->order))
++      oldest = &r;
++  if (!oldest)
++    return false;
++
++  const GLenum state = glClientWaitSync(static_cast<GLsync>(oldest->fence), 0, 0);
++  if (state == GL_TIMEOUT_EXPIRED)
++    return false;
++  glDeleteSync(static_cast<GLsync>(oldest->fence));
++  oldest->fence = nullptr;
++  oldest->busy = false;
++  if (state == GL_WAIT_FAILED)
++  {
++    ClearErrors();
++    return false;
++  }
++
++  CKeepState keep;
++  const size_t size = static_cast<size_t>(WIDTH) * HEIGHT * 2 * 4;
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, oldest->buffer);
++  const auto* pixels = static_cast<const uint8_t*>(
++      glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(size), GL_MAP_READ_BIT));
++  if (!pixels)
++  {
++    ClearErrors();
++    return false;
++  }
++
++  rgba.assign(pixels, pixels + size);
++  glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++  tag = oldest->tag;
++  return true;
++}
++
++void CStereoDepthCapture::Drop()
++{
++  for (Read& r : m_reads)
++  {
++    if (r.fence)
++      glDeleteSync(static_cast<GLsync>(r.fence));
++    r.fence = nullptr;
++    r.busy = false;
++  }
++  m_eyes[0] = m_eyes[1] = false;
++}
++
++void CStereoDepthCapture::ReleaseLevels()
++{
++  for (Level& level : m_levels)
++  {
++    if (level.fbo)
++      glDeleteFramebuffers(1, &level.fbo);
++    if (level.texture)
++      glDeleteTextures(1, &level.texture);
++  }
++  m_levels.clear();
++  m_copiedLevel = -1;
++}
++
++void CStereoDepthCapture::Release()
++{
++  Drop();
++  for (Read& r : m_reads)
++  {
++    if (r.buffer)
++      glDeleteBuffers(1, &r.buffer);
++    r.buffer = 0;
++  }
++  ReleaseLevels();
++}
++
++#else
++
++CStereoDepthCapture::~CStereoDepthCapture() = default;
++bool CStereoDepthCapture::Supported(std::string& why)
++{
++  why = "the graphics are not OpenGL (ES) 3";
++  return false;
++}
++bool CStereoDepthCapture::Viewport(int&, int&, int&, int&)
++{
++  return false;
++}
++bool CStereoDepthCapture::CopyEye(int, int, int, int, int, std::string& why)
++{
++  why = "the graphics are not OpenGL (ES) 3";
++  return false;
++}
++bool CStereoDepthCapture::CanRead() const
++{
++  return false;
++}
++bool CStereoDepthCapture::StartRead(uint64_t, std::string& why)
++{
++  why = "the graphics are not OpenGL (ES) 3";
++  return false;
++}
++bool CStereoDepthCapture::Collect(std::vector<uint8_t>&, uint64_t&)
++{
++  return false;
++}
++bool CStereoDepthCapture::Luma(const std::vector<uint8_t>&, std::vector<uint8_t>&)
++{
++  return false;
++}
++void CStereoDepthCapture::Drop()
++{
++}
++void CStereoDepthCapture::Release()
++{
++}
++bool CStereoDepthCapture::EnsureLevels(int)
++{
++  return false;
++}
++void CStereoDepthCapture::ReleaseLevels()
++{
++}
++
++#endif
++
++} // namespace STEREODEPTH
++} // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.h b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.h
+new file mode 100644
+index 0000000..3b55b3b
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.h
+@@ -0,0 +1,120 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++/*!
++ * \brief Hades: a small copy of the video of each eye, made by the graphics, read back without
++ *        waiting for them.
++ *
++ * Render thread only, with the GL context current (OpenGL 3 or OpenGL ES 3: framebuffer blits,
++ * pixel buffers and fences). As each eye's video has been drawn, and before anything is drawn over
++ * it, CopyEye() copies its rectangle of the framebuffer bound for drawing into a picture of
++ * WIDTH x HEIGHT, halving it in steps of two (each step averages 2 x 2 pixels, so a large picture
++ * is reduced without aliasing). Once both eyes are in, StartRead() has the graphics read the two
++ * into a pixel buffer, behind a fence; Collect() takes, frames later, the oldest read that is
++ * done. The render thread never waits for the graphics.
++ *
++ * The copy is of the 8 bits of each channel: what is matched is the light of the picture, not
++ * its colour, and only within the picture, so the transfer the framebuffer holds (SDR, PQ) does
++ * not matter.
++ */
++class CStereoDepthCapture
++{
++public:
++  static constexpr int WIDTH = 480;
++  static constexpr int HEIGHT = 270;
++  //! reads in flight at most
++  static constexpr int READS = 3;
++
++  CStereoDepthCapture() = default;
++  ~CStereoDepthCapture();
++  CStereoDepthCapture(const CStereoDepthCapture&) = delete;
++  CStereoDepthCapture& operator=(const CStereoDepthCapture&) = delete;
++
++  //! Whether the context can do it (OpenGL 3 / OpenGL ES 3); why not in \p why
++  static bool Supported(std::string& why);
++
++  //! The viewport set now, in GL window coordinates (from the bottom)
++  static bool Viewport(int& x, int& y, int& width, int& height);
++
++  /*!
++   * \brief Copy one eye's video out of the framebuffer bound for drawing.
++   * \param eye 0 for the left eye, 1 for the right
++   * \param x, y, width, height its rectangle, in GL window coordinates (from the bottom)
++   * \return false where it could not be copied (\p why says why); nothing of this frame is read then
++   */
++  bool CopyEye(int eye, int x, int y, int width, int height, std::string& why);
++
++  //! Whether a slot is free for StartRead()
++  bool CanRead() const;
++
++  /*!
++   * \brief Read both eyes, copied this frame, back.
++   * \param tag given back with the read by Collect()
++   */
++  bool StartRead(uint64_t tag, std::string& why);
++
++  /*!
++   * \brief The oldest read that the graphics have done, as it was read (a copy of the pixel buffer:
++   *        the render thread does nothing more with it).
++   * \param rgba WIDTH x 2 HEIGHT pixels of 4 bytes, the bottom row first (Luma() makes the eyes of it)
++   */
++  bool Collect(std::vector<uint8_t>& rgba, uint64_t& tag);
++
++  /*!
++   * \brief The light of both eyes of a read (any thread).
++   * \param luma WIDTH x HEIGHT bytes of the left eye then as many of the right, top row first
++   * \return false where \p rgba is not a read
++   */
++  static bool Luma(const std::vector<uint8_t>& rgba, std::vector<uint8_t>& luma);
++
++  //! Drop the reads in flight (a seek, a stop): what they hold is of pictures no longer shown
++  void Drop();
++
++  //! Free the GL objects (render thread)
++  void Release();
++
++private:
++  struct Level
++  {
++    uint32_t fbo{0};
++    uint32_t texture{0};
++    int width{0};
++    int height{0}; //!< of both eyes, one above the other
++  };
++  struct Read
++  {
++    uint32_t buffer{0};
++    void* fence{nullptr};
++    uint64_t tag{0};
++    uint64_t order{0};
++    bool busy{false};
++  };
++
++  bool EnsureLevels(int levels);
++  void ReleaseLevels();
++
++  std::vector<Level> m_levels; //!< [0] is WIDTH x 2 HEIGHT; each one after it twice as large
++  Read m_reads[READS];
++  uint64_t m_order{0};
++  bool m_eyes[2]{false, false};
++  int m_copiedLevel{-1}; //!< the level the eyes of this frame were copied into
++};
++
++} // namespace STEREODEPTH
++} // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp
+new file mode 100644
+index 0000000..a6c5cc6
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp
+@@ -0,0 +1,385 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "StereoDepthMeter.h"
++
++#include "utils/log.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++namespace
++{
++double Now()
++{
++  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++//! a picture is measured at most this often (seconds): a few times a second is enough to follow
++//! a film, and the matching costs the processor nothing more
++constexpr double COPY_EVERY = 0.075;
++
++//! around the place of the subtitles, the area measured reaches so far (shares of the picture)
++constexpr float AREA_ACROSS = 0.08f;
++constexpr float AREA_DOWN = 0.04f;
++
++bool Split(RenderStereoMode mode)
++{
++  return mode == RenderStereoMode::SPLIT_HORIZONTAL || mode == RenderStereoMode::SPLIT_VERTICAL;
++}
++
++bool Anaglyph(RenderStereoMode mode)
++{
++  return mode == RenderStereoMode::ANAGLYPH_RED_CYAN ||
++         mode == RenderStereoMode::ANAGLYPH_GREEN_MAGENTA ||
++         mode == RenderStereoMode::ANAGLYPH_YELLOW_BLUE;
++}
++
++std::string Percent(float share)
++{
++  char text[32];
++  std::snprintf(text, sizeof(text), "%.2f %%", static_cast<double>(share) * 100.0);
++  return text;
++}
++} // namespace
++
++CStereoDepthMeter::CStereoDepthMeter() = default;
++
++CStereoDepthMeter::~CStereoDepthMeter()
++{
++  {
++    std::unique_lock lock(m_lock);
++    m_stop = true;
++  }
++  m_wake.notify_all();
++  if (m_thread.joinable())
++    m_thread.join();
++}
++
++bool CStereoDepthMeter::Measurable(const Facts& facts)
++{
++  if (!facts.automatic)
++    m_why = "the setting asks for a fixed depth";
++  else if (Anaglyph(facts.mode))
++    m_why = "an anaglyph output draws both eyes into one picture";
++  else if (!Split(facts.mode))
++    m_why = "this 3D output does not draw the eyes as two pictures";
++  else if (!facts.drawnInGuiPass)
++    m_why = "the video is drawn under the interface (HDR), once for both eyes";
++  else if (!facts.fullscreen)
++    m_why = "the video is not shown full screen";
++  else if (!m_broken.empty())
++    m_why = m_broken;
++  else
++  {
++    m_why.clear();
++    return true;
++  }
++  return false;
++}
++
++void CStereoDepthMeter::Tell(const Facts& facts)
++{
++  std::string text;
++  const std::string measured = "measured from the two pictures (in front of the nearest thing by " +
++                               Percent(m_planner.Params().margin) +
++                               " of the width, never nearer than " +
++                               Percent(m_planner.Params().comfort) + ")";
++  switch (m_source)
++  {
++    case DepthSource::NONE:
++      // told again at the next 3D video
++      m_told.clear();
++      return;
++    case DepthSource::DISC:
++      text = "subtitles by the plane offsets of the disc; the interface over the video " +
++             (m_why.empty() ? measured : "at the skin's depth (not measured: " + m_why + ")");
++      break;
++    case DepthSource::MEASURED:
++      text = "subtitles and the interface over the video " + measured;
++      if (facts.fixedPixels != 0)
++        text += ", the subtitles " + std::to_string(facts.fixedPixels) +
++                " pixels of each eye nearer as set";
++      break;
++    case DepthSource::FIXED:
++      text = "subtitles at the depth set (" + std::to_string(facts.fixedPixels) +
++             " pixels of each eye), the interface at the skin's depth; not measured: " + m_why;
++      break;
++  }
++  if (text != m_told)
++  {
++    m_told = text;
++    CLog::Log(LOGINFO, "3D depth: {}", text);
++  }
++}
++
++CStereoDepthMeter::Depths CStereoDepthMeter::Frame(const Facts& facts)
++{
++  if (m_flush.exchange(false))
++  {
++    m_capture.Drop();
++    m_planner.Reset();
++    m_pending.clear();
++    m_copying = false;
++    m_lastPicture = -1.0;
++    ++m_generation;
++  }
++
++  const bool threeD = facts.stereoVideo && facts.mode != RenderStereoMode::OFF &&
++                      facts.mode != RenderStereoMode::MONO;
++  const bool measurable = threeD && Measurable(facts);
++  if (!threeD)
++    m_source = DepthSource::NONE;
++  else if (facts.discDepth)
++    m_source = DepthSource::DISC;
++  else
++    m_source = measurable ? DepthSource::MEASURED : DepthSource::FIXED;
++  Tell(facts);
++
++  if (!measurable)
++  {
++    if (m_measure)
++    {
++      m_capture.Drop();
++      m_planner.Reset();
++      m_pending.clear();
++      m_copying = false;
++      ++m_generation;
++    }
++    m_measure = false;
++    return {};
++  }
++  m_measure = true;
++
++  // the copies the graphics have read back go to the thread that matches them
++  std::vector<uint8_t> rgba;
++  uint64_t tag = 0;
++  while (m_capture.Collect(rgba, tag))
++  {
++    while (!m_pending.empty() && m_pending.front().tag < tag)
++      m_pending.pop_front();
++    if (!m_pending.empty() && m_pending.front().tag == tag)
++    {
++      Submit({m_generation, m_pending.front().t, m_pending.front().area, std::move(rgba)});
++      m_pending.pop_front();
++    }
++    rgba = {};
++  }
++
++  std::deque<Result> results;
++  {
++    std::unique_lock lock(m_lock);
++    results.swap(m_results);
++  }
++  for (const Result& r : results)
++    if (r.generation == m_generation)
++      m_planner.AddMeasure(r.t, r.area, r.whole, r.cut);
++
++  if (facts.subtitleArea)
++    m_subtitleArea = facts.subtitleArea;
++
++  const double now = Now();
++  Depths depths;
++  std::optional<float> subtitles;
++  if (m_source == DepthSource::MEASURED && facts.destWidth > 0.0f)
++  {
++    const float measured = m_planner.Subtitles(now, facts.subtitleVisible, facts.subtitleEvent);
++    depths.subtitles = measured + 2.0f * static_cast<float>(facts.fixedPixels) / facts.destWidth;
++    if (facts.subtitleVisible)
++    {
++      subtitles = depths.subtitles;
++      if (facts.subtitleEvent != m_toldEvent)
++      {
++        m_toldEvent = facts.subtitleEvent;
++        CLog::Log(LOGDEBUG, "3D depth: subtitle {} at {} of the width{}", facts.subtitleEvent,
++                  Percent(*depths.subtitles),
++                  m_planner.HasMeasure() ? "" : " (nothing measured yet)");
++      }
++    }
++  }
++  else if (m_source == DepthSource::DISC && facts.subtitleVisible && facts.discOffset &&
++           facts.sourceWidth > 0.0f)
++    subtitles = 2.0f * static_cast<float>(*facts.discOffset) / facts.sourceWidth;
++
++  depths.guiPixels = m_planner.Gui(now, facts.guiShown, subtitles) * 0.5f * facts.destWidth;
++  return depths;
++}
++
++Area CStereoDepthMeter::SubtitleArea() const
++{
++  // before any subtitle was seen: the lower part of the picture, where they are put by default
++  Area area{0.1f, 0.6f, 0.9f, 1.0f};
++  const float width = m_copied.Width();
++  const float height = m_copied.Height();
++  if (!m_subtitleArea || width <= 0.0f || height <= 0.0f)
++    return area;
++  const CRect& s = *m_subtitleArea;
++  Area seen;
++  seen.x1 = std::clamp((s.x1 - m_copied.x1) / width - AREA_ACROSS, 0.0f, 1.0f);
++  seen.x2 = std::clamp((s.x2 - m_copied.x1) / width + AREA_ACROSS, 0.0f, 1.0f);
++  seen.y1 = std::clamp((s.y1 - m_copied.y1) / height - AREA_DOWN, 0.0f, 1.0f);
++  seen.y2 = std::clamp((s.y2 - m_copied.y1) / height + AREA_DOWN, 0.0f, 1.0f);
++  if (seen.x2 - seen.x1 < 0.05f || seen.y2 - seen.y1 < 0.05f)
++    return area;
++  return seen;
++}
++
++void CStereoDepthMeter::AfterVideo(
++    RenderStereoView view, const CRect& dest, int eyeWidth, int eyeHeight, double picture)
++{
++  if (!m_measure)
++    return;
++  if (view != RenderStereoView::RIGHT)
++    m_copying = view == RenderStereoView::LEFT ? false : m_copying;
++  if (view == RenderStereoView::OFF || (view == RenderStereoView::RIGHT && !m_copying))
++    return;
++
++  const double now = Now();
++  if (view == RenderStereoView::LEFT &&
++      (picture == m_lastPicture || now - m_lastCopy < COPY_EVERY || !m_capture.CanRead()))
++    return;
++
++  // the eye's screen is the viewport set for it (CGraphicContext::SetStereoView()): anything
++  // else, and this frame is not measured
++  int vx = 0;
++  int vy = 0;
++  int vw = 0;
++  int vh = 0;
++  if (!CStereoDepthCapture::Viewport(vx, vy, vw, vh) || vw != eyeWidth || vh != eyeHeight)
++  {
++    m_copying = false;
++    return;
++  }
++  CRect shown{dest};
++  shown.Intersect(CRect(0.0f, 0.0f, static_cast<float>(eyeWidth), static_cast<float>(eyeHeight)));
++  if (shown.Width() < 64.0f || shown.Height() < 36.0f)
++  {
++    m_copying = false;
++    return;
++  }
++  const int x1 = static_cast<int>(std::lround(shown.x1));
++  const int x2 = static_cast<int>(std::lround(shown.x2));
++  const int y1 = static_cast<int>(std::lround(shown.y1));
++  const int y2 = static_cast<int>(std::lround(shown.y2));
++
++  std::string why;
++  const int eye = view == RenderStereoView::LEFT ? 0 : 1;
++  if (!m_capture.CopyEye(eye, vx + x1, vy + (eyeHeight - y2), x2 - x1, y2 - y1, why))
++  {
++    m_copying = false;
++    m_broken = why;
++    return;
++  }
++
++  if (eye == 0)
++  {
++    m_copied = shown;
++    m_copying = true;
++    return;
++  }
++
++  m_copying = false;
++  if (!m_capture.CanRead())
++    return;
++  if (!m_capture.StartRead(++m_tag, why))
++  {
++    m_broken = why;
++    return;
++  }
++  m_pending.push_back({m_tag, now, SubtitleArea()});
++  m_lastPicture = picture;
++  m_lastCopy = now;
++}
++
++void CStereoDepthMeter::Submit(Job&& job)
++{
++  {
++    std::unique_lock lock(m_lock);
++    // the matching keeps up with a few pictures a second; were it ever late, the newest count
++    while (m_jobs.size() >= 2)
++      m_jobs.pop_front();
++    m_jobs.push_back(std::move(job));
++    if (!m_thread.joinable())
++      m_thread = std::thread([this] { Work(); });
++  }
++  m_wake.notify_one();
++}
++
++void CStereoDepthMeter::Work()
++{
++  constexpr int W = CStereoDepthCapture::WIDTH;
++  constexpr int H = CStereoDepthCapture::HEIGHT;
++  MatchParams whole;
++  whole.step = 16;
++  Signature before;
++  uint64_t generation = 0;
++
++  while (true)
++  {
++    Job job;
++    {
++      std::unique_lock lock(m_lock);
++      m_wake.wait(lock, [this] { return m_stop || !m_jobs.empty(); });
++      if (m_stop)
++        return;
++      job = std::move(m_jobs.front());
++      m_jobs.pop_front();
++    }
++    std::vector<uint8_t> luma;
++    if (!CStereoDepthCapture::Luma(job.rgba, luma))
++      continue;
++    if (job.generation != generation)
++    {
++      before = {};
++      generation = job.generation;
++    }
++
++    const Plane left{luma.data(), W, H, W};
++    const Plane right{luma.data() + static_cast<size_t>(W) * H, W, H, W};
++    Result result;
++    result.generation = job.generation;
++    result.t = job.t;
++    result.area = MeasureNearest(left, right, job.area).nearest;
++    result.whole = MeasureNearest(left, right, Area{0.02f, 0.02f, 0.98f, 0.98f}, whole).nearest;
++    // the whole picture is sampled more sparsely than the subtitles' area, which is a part of it: it
++    // is never taken as farther than that part (measured so on MV-HEVC conformance stream C)
++    if (result.area && (!result.whole || *result.whole < *result.area))
++      result.whole = result.area;
++    const Signature now = SignatureOf(left);
++    result.cut = IsCut(before, now);
++    before = now;
++
++    std::unique_lock lock(m_lock);
++    m_results.push_back(result);
++    while (m_results.size() > 16)
++      m_results.pop_front();
++  }
++}
++
++void CStereoDepthMeter::Release()
++{
++  m_capture.Release();
++  m_planner.Reset();
++  m_pending.clear();
++  m_copying = false;
++  m_measure = false;
++  m_lastPicture = -1.0;
++  m_subtitleArea.reset();
++  m_broken.clear();
++  ++m_generation;
++}
++
++} // namespace STEREODEPTH
++} // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.h b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.h
+new file mode 100644
+index 0000000..7973938
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.h
+@@ -0,0 +1,165 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "StereoDepth.h"
++#include "StereoDepthCapture.h"
++#include "rendering/RenderSystemTypes.h"
++#include "utils/Geometry.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace KODI
++{
++namespace STEREODEPTH
++{
++
++//! Where the depth of the subtitles over a 3D video comes from
++enum class DepthSource
++{
++  NONE, //!< no 3D output, or not a 3D video: nothing is placed in depth
++  DISC, //!< the plane offsets of a 3D Blu-ray
++  MEASURED, //!< measured from the two pictures
++  FIXED, //!< the setting subtitles.stereoscopicdepth
++};
++
++/*!
++ * \brief Hades: the depth of subtitles and of the interface over a 3D video, from the picture.
++ *
++ * Owned by the render manager, used on the render thread: AfterVideo() as each eye's video is
++ * drawn (it has the graphics copy it, CStereoDepthCapture), Frame() once a frame before drawing
++ * (it collects the copies read back, has them measured on a thread of its own, so that the render
++ * thread never does the matching, and gives the depths of the frame, CPlanner).
++ */
++class CStereoDepthMeter
++{
++public:
++  //! What a frame is
++  struct Facts
++  {
++    bool automatic{true}; //!< the setting asks for the depth to be measured
++    int fixedPixels{0}; //!< subtitles.stereoscopicdepth: a shift of each eye, in pixels
++    RenderStereoMode mode{};
++    bool stereoVideo{false}; //!< the video is a 3D video
++    bool drawnInGuiPass{true}; //!< its renderer draws it in the pass of the interface, per eye
++    bool fullscreen{false};
++    bool discDepth{false}; //!< its subtitles follow the plane offsets of a disc
++    std::optional<int> discOffset; //!< ... of this frame, in the video's pixels
++    float sourceWidth{0.0f}; //!< of one eye's picture, in the video's pixels
++    float destWidth{0.0f}; //!< of one eye's picture as drawn, in pixels of the screen
++    bool subtitleVisible{false};
++    uint64_t subtitleEvent{0};
++    std::optional<CRect> subtitleArea; //!< where they were drawn, in pixels of the screen
++    bool guiShown{false}; //!< the interface was drawn over the video in the frame before
++  };
++
++  struct Depths
++  {
++    //! the depth of the subtitles (a share of the width of the picture), where measured
++    std::optional<float> subtitles;
++    //! the shift of each eye's interface over the video, in pixels of the screen
++    float guiPixels{0.0f};
++  };
++
++  CStereoDepthMeter();
++  ~CStereoDepthMeter();
++  CStereoDepthMeter(const CStereoDepthMeter&) = delete;
++  CStereoDepthMeter& operator=(const CStereoDepthMeter&) = delete;
++
++  //! Once a frame, before it is drawn
++  Depths Frame(const Facts& facts);
++
++  /*!
++   * \brief After an eye's video was drawn, before anything is drawn over it.
++   * \param dest the video's rectangle, in pixels of the screen (of the eye)
++   * \param eyeWidth, eyeHeight the size of an eye's screen
++   * \param picture the picture drawn (its time): a picture is measured once
++   */
++  void AfterVideo(
++      RenderStereoView view, const CRect& dest, int eyeWidth, int eyeHeight, double picture);
++
++  //! A seek or a new stream: what was measured is of pictures no longer shown
++  void Flush() { m_flush = true; }
++
++  //! Free what the graphics hold (render thread)
++  void Release();
++
++  DepthSource Source() const { return m_source; }
++
++private:
++  struct Job
++  {
++    uint64_t generation{0};
++    double t{0.0};
++    Area area;
++    std::vector<uint8_t> rgba; //!< as CStereoDepthCapture::Collect() gives it
++  };
++  struct Result
++  {
++    uint64_t generation{0};
++    double t{0.0};
++    std::optional<float> area;
++    std::optional<float> whole;
++    bool cut{false};
++  };
++  struct Pending
++  {
++    uint64_t tag{0};
++    double t{0.0};
++    Area area;
++  };
++
++  void Work();
++  void Submit(Job&& job);
++  //! Whether it can be measured; why not in m_why
++  bool Measurable(const Facts& facts);
++  void Tell(const Facts& facts);
++  Area SubtitleArea() const;
++
++  CStereoDepthCapture m_capture;
++  CPlanner m_planner;
++  std::atomic<bool> m_flush{false};
++  uint64_t m_generation{1};
++
++  // what AfterVideo() needs of the frame, set by Frame()
++  bool m_measure{false};
++  bool m_copying{false};
++  double m_lastPicture{-1.0};
++  double m_lastCopy{-1.0};
++  uint64_t m_tag{0};
++  std::deque<Pending> m_pending;
++  CRect m_copied; //!< the part of the eye's screen copied, in its pixels
++  std::optional<CRect> m_subtitleArea; //!< the last place of the subtitles, in the same pixels
++  std::string m_broken; //!< why the copy failed for good, in this video
++
++  // the thread that matches
++  std::thread m_thread;
++  std::mutex m_lock;
++  std::condition_variable m_wake;
++  bool m_stop{false};
++  std::deque<Job> m_jobs;
++  std::deque<Result> m_results;
++
++  // what kodi.log was told
++  DepthSource m_source{DepthSource::NONE};
++  std::string m_why;
++  std::string m_told;
++  uint64_t m_toldEvent{0};
++};
++
++} // namespace STEREODEPTH
++} // namespace KODI
+-- 
+2.53.0
+

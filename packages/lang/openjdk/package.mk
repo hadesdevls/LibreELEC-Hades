@@ -25,8 +25,8 @@
 # libcups is loaded at run time if present, and the image has none (no printing).
 
 PKG_NAME="openjdk"
-PKG_VERSION="27.0.1.0.3"
-PKG_SHA256="d4f0d695767eee4842b1e6a22daf5af6a87bcaeea68f0597538a97bd8fb340a6"
+PKG_VERSION="27.0.1.1"
+PKG_SHA256="024dd1810fd02991a02e9ca1f5f74f69b3e9c5f1d35e926bddea033704397bb0"
 PKG_LICENSE="GPL-2.0-only WITH Classpath-exception-2.0"
 PKG_SITE="https://openjdk.org/"
 PKG_URL="https://github.com/openjdk/jdk${PKG_VERSION%%.*}u/archive/refs/tags/jdk-${PKG_VERSION}-ga.tar.gz"
@@ -44,10 +44,10 @@ PKG_LONGDESC="OpenJDK, a Java runtime private to the BD-J menus of Blu-ray discs
 PKG_TOOLCHAIN="manual"
 PKG_BUILD_FLAGS="-sysroot"
 
-# The commit of the tag (jdk-27.0.1.0.3-ga and jdk-27.0.1.0.3+1 name the same one: build 1). Checked
+# The commit of the tag (jdk-27.0.1.1-ga and jdk-27.0.1.1+4 name the same one: build 4). Checked
 # against the archive, and written as the source revision of the runtime (its "release" file).
-HADES_OPENJDK_COMMIT="53eadcb2b7896ba55b86bcf5378cb3fab612063c"
-HADES_OPENJDK_BUILD="1"
+HADES_OPENJDK_COMMIT="03d8fb0da157ce832839b05c99f2c9f78de25cb8"
+HADES_OPENJDK_BUILD="4"
 
 # The boot JDK: OpenJDK 26 of the build host (Ubuntu 26.04, universe, signed by its archive), at the
 # version that was reviewed for it (the supply-chain manifest); an update of the host stops the
@@ -86,8 +86,18 @@ pre_configure_target() {
   commit="$( (gzip -dc "${archive}" 2>/dev/null || :) | git get-tar-commit-id || :)"
   [ "${commit}" = "${HADES_OPENJDK_COMMIT}" ] ||
     die "openjdk: ${archive} is the tree of ${commit:-an unknown commit}, not of ${HADES_OPENJDK_COMMIT}"
-  [ "$(sed -n 's/^DEFAULT_VERSION_EXTRA1=//p' ${PKG_BUILD}/make/conf/version-numbers.conf)" = "${PKG_VERSION##*.}" ] ||
-    die "openjdk: make/conf/version-numbers.conf is not of ${PKG_VERSION}"
+  # (the version of the tree, as the JDK writes it: feature, interim, update, patch and the three extra
+  # numbers, without the zeros at the end: 27.0.1.0.3, 27.0.1.1)
+  local field tree_version=""
+  for field in FEATURE INTERIM UPDATE PATCH EXTRA1 EXTRA2 EXTRA3; do
+    tree_version+="$(sed -n "s/^DEFAULT_VERSION_${field}=//p" ${PKG_BUILD}/make/conf/version-numbers.conf)."
+  done
+  tree_version="${tree_version%.}"
+  while [ "${tree_version%.0}" != "${tree_version}" ]; do
+    tree_version="${tree_version%.0}"
+  done
+  [ "${tree_version}" = "${PKG_VERSION}" ] ||
+    die "openjdk: make/conf/version-numbers.conf is of ${tree_version}, not of ${PKG_VERSION}"
 
   # what make/SourceRevision.gmk takes when the tree is not a git checkout
   echo ".:git:${HADES_OPENJDK_COMMIT:0:12}" >${PKG_BUILD}/.src-rev

@@ -55,6 +55,9 @@ FFPREFIX="$WORK/ffmpeg$PREFIX"
 gcc -O1 -g -Wall -Wextra -Wno-unused-parameter -std=gnu11 -I"$KODI/tools/dvbridge" -I"$FFPREFIX/include" \
   -o "$WORK/dovi_compare" "$HERE/dovi_compare.c" "$KODI/tools/dvbridge/dvbridge_hdr10plus.c" \
   "$KODI/tools/dvbridge/dvbridge_probe.c" -L"$FFPREFIX/lib" -lavformat -lavcodec -lswresample -lavutil -lm -lpthread
+# (the blocks of the RPU of the A/B clip as FFmpeg reads them)
+gcc -O1 -g -Wall -Wextra -std=gnu11 -I"$FFPREFIX/include" -o "$WORK/dovi_blocks" "$HERE/dovi_blocks.c" \
+  -L"$FFPREFIX/lib" -lavformat -lavcodec -lswresample -lavutil -lm -lpthread
 
 for n in 1 2; do
   eval "g=\$GEN$n"
@@ -69,7 +72,8 @@ done
 
 rc=0
 "$PY" -I -B "$HERE/check_clips_tests.py" --clips "$CLIPS" --x265 "$TOOLS/x265" --ffmpeg "$TOOLS/ffmpeg" \
-  --ffprobe "$TOOLS/ffprobe" --dovi-compare "$WORK/dovi_compare" --kodi "$KODI" --work "$WORK/checks" \
+  --ffprobe "$TOOLS/ffprobe" --dovi-compare "$WORK/dovi_compare" --dovi-blocks "$WORK/dovi_blocks" --kodi "$KODI" \
+  --work "$WORK/checks" \
   --gen1 "$GEN1" --gen2 "$GEN2" --only "$ONLY" $MUTANTS || rc=1
 
 if [ -z "$VIDEO_ONLY" ]; then

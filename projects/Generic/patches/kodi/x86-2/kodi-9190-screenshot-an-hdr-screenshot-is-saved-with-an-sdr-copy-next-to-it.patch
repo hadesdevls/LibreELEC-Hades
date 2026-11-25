@@ -1,0 +1,526 @@
+From f0eae04ebea6c3d322aec9dd16a549c9af900f7a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:33:19 +0000
+Subject: [PATCH] [Screenshot] An HDR screenshot is saved with an SDR copy next
+ to it
+
+A screenshot taken while the output is HDR is the picture as the display
+gets it, PQ (or HLG) with BT.2020 primaries, tagged so in a cICP chunk.
+Only a viewer that reads that tag shows it right; every other one shows
+it dark and pale (issue #30), and a copy that loses the tag on the way
+looks so everywhere.
+
+Next to it, screenshotNNNNN-sdr.png (the name of the screenshot with
+"-sdr" before its extension) is now written as well: the same capture
+tone mapped to SDR by swscale (perceptual intent), with BT.709 primaries
+and the sRGB transfer, tagged sRGB (an sRGB chunk, no cICP), as Kodi's
+SDR screenshots are, so that any viewer shows it right. The HDR file is
+written first, by the same call with the same pixels and tags as
+before; the copy is not written where it fails. Both are written on the
+worker of the capture service, never on the thread that draws; a 4K
+copy takes about half a second of one core on the build host.
+
+The peak it is mapped from (CaptureSourcePeak()) is the MaxCLL of the
+content where it is given (100 cd/m2 or more) and lower than the peak of
+its mastering display, else that peak; where neither is known, 1000
+cd/m2, the most usual mastering peak, instead of the 10000 swscale takes,
+which darkens the whole picture. swscale reads only the mastering
+display, so that peak is given to it there. The bookmark thumbnails
+(CaptureToBGRA()) are mapped from the same peak.
+
+kodi.log says, at INFO, which copy was written and from which peak.
+
+Tests: TestCaptureConvert, the peak of a capture, the copy of a PQ ramp
+(black 0, 203 cd/m2 169, the peak 255), its sRGB coding against the
+BT.709 of the thumbnails, no metadata as 1000, MaxCLL taken, no copy of
+SDR, the copy of HLG.
+---
+ xbmc/rendering/capture/CaptureConvert.cpp     |  65 +++++-
+ xbmc/rendering/capture/CaptureConvert.h       |  16 ++
+ .../capture/test/TestCaptureConvert.cpp       | 203 ++++++++++++++++++
+ xbmc/utils/Screenshot.cpp                     |  88 ++++++--
+ 4 files changed, 355 insertions(+), 17 deletions(-)
+
+diff --git a/xbmc/rendering/capture/CaptureConvert.cpp b/xbmc/rendering/capture/CaptureConvert.cpp
+index d0a2ba8..28a2e10 100644
+--- a/xbmc/rendering/capture/CaptureConvert.cpp
++++ b/xbmc/rendering/capture/CaptureConvert.cpp
+@@ -13,6 +13,7 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstddef>
+ #include <cstring>
+ #include <vector>
+@@ -112,11 +113,14 @@ bool ExpandRange(const CaptureResult& result, const uint8_t* src0, std::vector<u
+ 
+ // Color-managed conversion honoring the capture's tags: PQ/HLG BT.2020 input
+ // tonemapped to 8-bit sRGB BT.709, matching what the thumbnail extractor does.
++// (Hades: dstTransfer, the transfer of the result: BT.709 for the thumbnails, the sRGB one for
++// the SDR copy of a screenshot)
+ bool ConvertColorManaged(const CaptureResult& result,
+                          const uint8_t* src0,
+                          unsigned int width,
+                          unsigned int height,
+-                         uint8_t* buffer)
++                         uint8_t* buffer,
++                         AVColorTransferCharacteristic dstTransfer = AVCOL_TRC_BT709)
+ {
+   std::vector<uint8_t> expanded;
+   const uint8_t* srcData = src0;
+@@ -148,8 +152,24 @@ bool ConvertColorManaged(const CaptureResult& result,
+       srcFrame->color_primaries = static_cast<AVColorPrimaries>(result.color.primaries);
+       srcFrame->color_trc = static_cast<AVColorTransferCharacteristic>(result.color.transfer);
+ 
+-      // the source peak: without it swscale assumes the full PQ range and crushes
+-      if (result.hasDisplayMetadata)
++      // the source peak: without it swscale assumes the full PQ range and crushes.
++      // (Hades: swscale reads the peak of the mastering display only, not MaxCLL: the peak of
++      // CaptureSourcePeak() is given to it there, 1000 where none is known)
++      if (result.color.transfer == AVCOL_TRC_SMPTE2084)
++      {
++        AVMasteringDisplayMetadata* mdm = av_mastering_display_metadata_create_side_data(srcFrame);
++        if (mdm)
++        {
++          if (result.hasDisplayMetadata)
++            *mdm = result.displayMetadata;
++          if (!mdm->has_luminance)
++            mdm->min_luminance = AVRational{0, 1};
++          mdm->max_luminance =
++              AVRational{static_cast<int>(std::lround(CaptureSourcePeak(result) * 10000.0)), 10000};
++          mdm->has_luminance = 1;
++        }
++      }
++      else if (result.hasDisplayMetadata)
+       {
+         AVMasteringDisplayMetadata* mdm = av_mastering_display_metadata_create_side_data(srcFrame);
+         if (mdm)
+@@ -170,7 +190,7 @@ bool ConvertColorManaged(const CaptureResult& result,
+       dstFrame->colorspace = AVCOL_SPC_RGB;
+       dstFrame->color_range = AVCOL_RANGE_JPEG;
+       dstFrame->color_primaries = AVCOL_PRI_BT709;
+-      dstFrame->color_trc = AVCOL_TRC_BT709;
++      dstFrame->color_trc = dstTransfer;
+ 
+       sws->flags = SWS_BILINEAR;
+       // stated explicitly: the default intent is relative colorimetric, which clips
+@@ -251,6 +271,43 @@ bool CaptureToBGRA(const CaptureResult& result,
+   return RawToBGRA8(result, src0, width, height, buffer);
+ }
+ 
++double CaptureSourcePeak(const CaptureResult& result, bool* assumed)
++{
++  if (assumed)
++    *assumed = false;
++  if (result.color.transfer != AVCOL_TRC_SMPTE2084)
++    return 0.0;
++  const double mastering =
++      result.hasDisplayMetadata && result.displayMetadata.has_luminance &&
++              result.displayMetadata.max_luminance.den > 0
++          ? av_q2d(result.displayMetadata.max_luminance)
++          : 0.0;
++  const double maxCll = result.hasLightMetadata && result.lightMetadata.MaxCLL >= 100
++                            ? static_cast<double>(result.lightMetadata.MaxCLL)
++                            : 0.0;
++  if (maxCll > 0.0 && (mastering <= 0.0 || maxCll < mastering))
++    return std::min(maxCll, 10000.0);
++  if (mastering > 0.0)
++    return std::min(mastering, 10000.0);
++  if (assumed)
++    *assumed = true;
++  return 1000.0;
++}
++
++bool CaptureToSdrCopy(const CaptureResult& result, uint8_t* buffer)
++{
++  if (!result.pixels || result.width == 0 || result.height == 0 ||
++      (result.color.transfer != AVCOL_TRC_SMPTE2084 &&
++       result.color.transfer != AVCOL_TRC_ARIB_STD_B67))
++    return false;
++
++  CScopedCapturePixels lock(*result.pixels);
++  if (!lock.data())
++    return false;
++  return ConvertColorManaged(result, CaptureSrcRow0(lock.data(), result.stride, result.height),
++                             result.width, result.height, buffer, AVCOL_TRC_IEC61966_2_1);
++}
++
+ } // namespace CAPTURE
+ } // namespace RENDERING
+ } // namespace KODI
+diff --git a/xbmc/rendering/capture/CaptureConvert.h b/xbmc/rendering/capture/CaptureConvert.h
+index 2ddbfc9..55d6382 100644
+--- a/xbmc/rendering/capture/CaptureConvert.h
++++ b/xbmc/rendering/capture/CaptureConvert.h
+@@ -38,6 +38,22 @@ bool CaptureToBGRA(const CaptureResult& result,
+                    unsigned int height,
+                    uint8_t* buffer);
+ 
++//! \brief Hades: the peak, in cd/m2, that a PQ capture is tone mapped from: the MaxCLL of its
++//! content where it is given and lower than the peak of its mastering display (a film mastered on
++//! a 4000 cd/m2 display whose brightest pixel is 1000), else that peak; where neither is given,
++//! 1000, the most usual mastering peak (swscale would take the whole range of PQ, 10000 cd/m2, and
++//! darken the whole picture). A MaxCLL under 100 is taken as not given. 0 for a capture that is
++//! not PQ.
++//! \param[out] assumed true where the peak is not given and 1000 is taken
++double CaptureSourcePeak(const CaptureResult& result, bool* assumed = nullptr);
++
++//! \brief Hades: the SDR copy of an HDR (PQ or HLG) capture: at its own size, 8-bit BGRA, tone
++//! mapped to SDR (perceptual intent, the source peak of CaptureSourcePeak()) with BT.709
++//! primaries and the sRGB transfer, the coding that picture viewers take for a picture without
++//! colour tags, as the SDR screenshots of Kodi are tagged. The buffer must hold
++//! width * height * 4 bytes. Runs on the consumer's thread, never the render thread.
++bool CaptureToSdrCopy(const CaptureResult& result, uint8_t* buffer);
++
+ } // namespace CAPTURE
+ } // namespace RENDERING
+ } // namespace KODI
+diff --git a/xbmc/rendering/capture/test/TestCaptureConvert.cpp b/xbmc/rendering/capture/test/TestCaptureConvert.cpp
+index 7282262..b5b6870 100644
+--- a/xbmc/rendering/capture/test/TestCaptureConvert.cpp
++++ b/xbmc/rendering/capture/test/TestCaptureConvert.cpp
+@@ -11,6 +11,7 @@
+ #include "rendering/capture/CaptureTypes.h"
+ 
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <memory>
+ #include <vector>
+@@ -186,3 +187,205 @@ TEST(TestCaptureConvert, PQRampHonorsMasteringPeak)
+   EXPECT_GE(ramp[height - 1], 200);
+   EXPECT_GT(ramp[7], ramp[4]);
+ }
++
++// Hades: the SDR copy of an HDR screenshot (CaptureToSdrCopy(), CaptureSourcePeak())
++namespace
++{
++// a grey PQ ramp, one row per luminance, RGBA64 tagged BT.2020 + PQ
++const std::vector<double> RAMP_NITS = {0.0, 1.0, 10.0, 50.0, 100.0, 203.0, 400.0, 1000.0, 10000.0};
++
++CaptureResult MakePQRamp()
++{
++  const unsigned int width = 4;
++  const unsigned int height = RAMP_NITS.size();
++  const unsigned int stride = width * 8;
++  std::vector<uint8_t> input(stride * height);
++  for (unsigned int y = 0; y < height; y++)
++  {
++    const uint16_t code = PQCode(RAMP_NITS[y]);
++    uint16_t* row = reinterpret_cast<uint16_t*>(input.data() + y * stride);
++    for (unsigned int x = 0; x < width; x++)
++    {
++      row[x * 4 + 0] = code;
++      row[x * 4 + 1] = code;
++      row[x * 4 + 2] = code;
++      row[x * 4 + 3] = 0xFFFF;
++    }
++  }
++  CaptureResult result = MakeResult(width, height, stride, AV_PIX_FMT_RGBA64LE, input);
++  result.color.primaries = AVCOL_PRI_BT2020;
++  result.color.transfer = AVCOL_TRC_SMPTE2084;
++  return result;
++}
++
++void SetMasteringPeak(CaptureResult& result, int nits)
++{
++  result.hasDisplayMetadata = true;
++  result.displayMetadata = {};
++  result.displayMetadata.has_luminance = 1;
++  result.displayMetadata.min_luminance = AVRational{50, 10000};
++  result.displayMetadata.max_luminance = AVRational{nits, 1};
++}
++
++// the grey of each row of a BGRA8 picture 4 pixels wide
++std::vector<int> Greys(const std::vector<uint8_t>& buffer, unsigned int height)
++{
++  std::vector<int> grey(height);
++  for (unsigned int y = 0; y < height; y++)
++  {
++    const uint8_t* px = buffer.data() + y * 4 * 4;
++    grey[y] = (px[0] + px[1] + px[2]) / 3;
++  }
++  return grey;
++}
++
++std::vector<int> SdrCopyGreys(const CaptureResult& result)
++{
++  std::vector<uint8_t> buffer(result.width * result.height * 4, 0);
++  EXPECT_TRUE(CaptureToSdrCopy(result, buffer.data()));
++  for (unsigned int y = 0; y < result.height; y++)
++  {
++    const uint8_t* px = buffer.data() + y * result.width * 4;
++    EXPECT_NEAR(px[0], px[1], 3) << "row " << y << ": grey stays grey";
++    EXPECT_NEAR(px[1], px[2], 3) << "row " << y << ": grey stays grey";
++  }
++  return Greys(buffer, result.height);
++}
++} // namespace
++
++TEST(TestCaptureConvert, SourcePeakOfAPQCapture)
++{
++  CaptureResult result = MakePQRamp();
++  bool assumed = false;
++  // nothing given: 1000, said to be assumed
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result, &assumed), 1000.0);
++  EXPECT_TRUE(assumed);
++  // the mastering display alone
++  SetMasteringPeak(result, 4000);
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result, &assumed), 4000.0);
++  EXPECT_FALSE(assumed);
++  // with a MaxCLL under it: the MaxCLL, the brightest pixel of the content
++  result.hasLightMetadata = true;
++  result.lightMetadata.MaxCLL = 1000;
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result), 1000.0);
++  // a MaxCLL over the mastering peak: that peak
++  result.lightMetadata.MaxCLL = 6000;
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result), 4000.0);
++  // a MaxCLL under 100 is no peak of an HDR picture: not taken
++  result.lightMetadata.MaxCLL = 40;
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result), 4000.0);
++  // the MaxCLL alone
++  result.hasDisplayMetadata = false;
++  result.lightMetadata.MaxCLL = 600;
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result, &assumed), 600.0);
++  EXPECT_FALSE(assumed);
++  // not PQ: none
++  result.color.transfer = AVCOL_TRC_ARIB_STD_B67;
++  EXPECT_DOUBLE_EQ(CaptureSourcePeak(result), 0.0);
++}
++
++TEST(TestCaptureConvert, SdrCopyOfPQ)
++{
++  // mastered at 1000 cd/m2: black stays black, the peak is white, the reference white of HDR
++  // (203 cd/m2, ITU-R BT.2408) is a bright grey under it, and the ramp rises
++  CaptureResult result = MakePQRamp();
++  SetMasteringPeak(result, 1000);
++  const std::vector<int> grey = SdrCopyGreys(result);
++  for (unsigned int y = 0; y < grey.size(); y++)
++    std::printf("SDR copy, mastered at 1000 cd/m2: %7.1f cd/m2 -> %d\n", RAMP_NITS[y], grey[y]);
++  EXPECT_LE(grey[0], 3);
++  EXPECT_GE(grey[7], 250);
++  EXPECT_GE(grey[5], 150);
++  EXPECT_LE(grey[5], 240);
++  for (unsigned int y = 1; y < grey.size(); y++)
++    EXPECT_GE(grey[y] + 1, grey[y - 1]) << "row " << y;
++  EXPECT_GT(grey[5], grey[3]);
++  EXPECT_GT(grey[7], grey[5]);
++}
++
++TEST(TestCaptureConvert, SdrCopyIsSrgbNotBT709)
++{
++  // the copy is coded with the sRGB transfer (the coding viewers take), the bookmark thumbnails
++  // with BT.709 (CaptureToBGRA()): the shadows of the same picture differ
++  CaptureResult result = MakePQRamp();
++  SetMasteringPeak(result, 1000);
++  const std::vector<int> srgb = SdrCopyGreys(result);
++  std::vector<uint8_t> buffer(result.width * result.height * 4, 0);
++  ASSERT_TRUE(CaptureToBGRA(result, result.width, result.height, buffer.data()));
++  const std::vector<int> bt709 = Greys(buffer, result.height);
++  std::printf("10 cd/m2: sRGB %d, BT.709 %d; 1 cd/m2: sRGB %d, BT.709 %d\n", srgb[2], bt709[2],
++              srgb[1], bt709[1]);
++  EXPECT_NE(srgb[1], bt709[1]);
++  EXPECT_NE(srgb[2], bt709[2]);
++}
++
++TEST(TestCaptureConvert, SdrCopyWithoutMetadataTakes1000)
++{
++  // nothing known of the picture: as if mastered at 1000 cd/m2, not over the whole PQ range
++  // (10000), which darkens all of it
++  CaptureResult none = MakePQRamp();
++  CaptureResult at1000 = MakePQRamp();
++  SetMasteringPeak(at1000, 1000);
++  CaptureResult at10000 = MakePQRamp();
++  SetMasteringPeak(at10000, 10000);
++  const std::vector<int> a = SdrCopyGreys(none);
++  const std::vector<int> b = SdrCopyGreys(at1000);
++  const std::vector<int> c = SdrCopyGreys(at10000);
++  std::printf("203 cd/m2: nothing known %d, at 1000 %d, at 10000 %d\n", a[5], b[5], c[5]);
++  EXPECT_EQ(a, b);
++  EXPECT_GT(a[5], c[5]);
++}
++
++TEST(TestCaptureConvert, SdrCopyTakesMaxCll)
++{
++  // mastered at 4000 cd/m2, its brightest pixel at 1000: mapped from 1000, as the picture is
++  CaptureResult cll = MakePQRamp();
++  SetMasteringPeak(cll, 4000);
++  cll.hasLightMetadata = true;
++  cll.lightMetadata.MaxCLL = 1000;
++  CaptureResult at1000 = MakePQRamp();
++  SetMasteringPeak(at1000, 1000);
++  CaptureResult at4000 = MakePQRamp();
++  SetMasteringPeak(at4000, 4000);
++  const std::vector<int> a = SdrCopyGreys(cll);
++  EXPECT_EQ(a[7], SdrCopyGreys(at1000)[7]);
++  EXPECT_GT(a[7], SdrCopyGreys(at4000)[7]);
++}
++
++TEST(TestCaptureConvert, SdrCopyOnlyOfHDR)
++{
++  // an SDR capture has no SDR copy
++  constexpr unsigned int width = 4;
++  constexpr unsigned int height = 2;
++  std::vector<uint8_t> input(width * height * 4, 0x80);
++  CaptureResult result = MakeResult(width, height, width * 4, AV_PIX_FMT_BGRA, input);
++  result.color.transfer = AVCOL_TRC_IEC61966_2_1;
++  std::vector<uint8_t> buffer(width * height * 4, 0);
++  EXPECT_FALSE(CaptureToSdrCopy(result, buffer.data()));
++}
++
++TEST(TestCaptureConvert, SdrCopyOfHLG)
++{
++  // HLG (relative to its display): black stays black, its peak is white, the ramp rises
++  constexpr unsigned int width = 4;
++  const std::vector<double> signal = {0.0, 0.25, 0.5, 0.75, 1.0};
++  const unsigned int height = signal.size();
++  std::vector<uint8_t> input(width * 8 * height);
++  for (unsigned int y = 0; y < height; y++)
++  {
++    uint16_t* row = reinterpret_cast<uint16_t*>(input.data() + y * width * 8);
++    for (unsigned int x = 0; x < width; x++)
++      for (int c = 0; c < 4; c++)
++        row[x * 4 + c] = c == 3 ? 0xFFFF : static_cast<uint16_t>(signal[y] * 65535.0 + 0.5);
++  }
++  CaptureResult result = MakeResult(width, height, width * 8, AV_PIX_FMT_RGBA64LE, input);
++  result.color.primaries = AVCOL_PRI_BT2020;
++  result.color.transfer = AVCOL_TRC_ARIB_STD_B67;
++  const std::vector<int> grey = SdrCopyGreys(result);
++  for (unsigned int y = 0; y < height; y++)
++    std::printf("SDR copy of HLG: signal %.2f -> %d\n", signal[y], grey[y]);
++  EXPECT_LE(grey[0], 3);
++  EXPECT_GE(grey[4], 245);
++  for (unsigned int y = 1; y < height; y++)
++    EXPECT_GT(grey[y], grey[y - 1]) << "row " << y;
++}
+diff --git a/xbmc/utils/Screenshot.cpp b/xbmc/utils/Screenshot.cpp
+index 623b38f..b45bed1 100644
+--- a/xbmc/utils/Screenshot.cpp
++++ b/xbmc/utils/Screenshot.cpp
+@@ -13,6 +13,7 @@
+ #include "Util.h"
+ #include "guilib/TextureFormats.h"
+ #include "pictures/Picture.h"
++#include "rendering/capture/CaptureConvert.h"
+ #include "rendering/capture/CaptureHandle.h"
+ #include "rendering/capture/CapturePixels.h"
+ #include "rendering/capture/CaptureService.h"
+@@ -23,10 +24,12 @@
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
+ #include "settings/windows/GUIControlSettings.h"
++#include "utils/StringUtils.h"
+ #include "utils/URIUtils.h"
+ #include "utils/log.h"
+ 
+ #include <memory>
++#include <vector>
+ 
+ std::vector<std::function<std::unique_ptr<IScreenshotSurface>()>> CScreenShot::m_screenShotSurfaces;
+ 
+@@ -62,6 +65,55 @@ unsigned int CaptureXbFormat(AVPixelFormat format)
+   }
+ }
+ 
++// Hades: the name of the SDR copy of a screenshot: its own with "-sdr" before its extension
++// (screenshot00001.png: screenshot00001-sdr.png)
++std::string SdrCopyName(const std::string& filename)
++{
++  if (StringUtils::EndsWithNoCase(filename, ".png"))
++    return filename.substr(0, filename.size() - 4) + "-sdr.png";
++  return filename + "-sdr.png";
++}
++
++// Hades: a screenshot taken while the output is HDR (PQ or HLG) is the picture as the display
++// gets it, tagged so (cICP): it looks right only in a viewer that reads that tag, and dark and
++// pale in the others. Next to it goes an SDR copy, tone mapped from it (CaptureToSdrCopy()) and
++// tagged sRGB, which every viewer shows right. On the capture service's worker, after the HDR one
++// is written: the thread that draws is not held up.
++void WriteSdrCopy(const KODI::RENDERING::CAPTURE::CaptureResult& result,
++                  const std::string& filename)
++{
++  using namespace KODI::RENDERING::CAPTURE;
++  const std::string copy = SdrCopyName(filename);
++  std::vector<uint8_t> pixels(static_cast<size_t>(result.width) * result.height * 4);
++  // (sRGB: an sRGB chunk in the PNG, and no cICP)
++  ImageColorMetadata srgb;
++  srgb.primaries = AVCOL_PRI_BT709;
++  srgb.transfer = AVCOL_TRC_IEC61966_2_1;
++  srgb.range = AVCOL_RANGE_JPEG;
++  if (!CaptureToSdrCopy(result, pixels.data()) ||
++      !CPicture::CreateThumbnailFromSurface(pixels.data(), result.width, result.height,
++                                            result.width * 4, copy,
++                                            XB_FMT_A8R8G8B8 | XB_FMT_OPAQUE, srgb))
++  {
++    CLog::Log(LOGERROR, "Screenshot: the SDR copy of {} could not be written",
++              CURL::GetRedacted(filename));
++    return;
++  }
++  const bool pq = result.color.transfer == AVCOL_TRC_SMPTE2084;
++  bool assumed = false;
++  const double peak = CaptureSourcePeak(result, &assumed);
++  CLog::Log(LOGINFO,
++            "Screenshot: {} is HDR as the display gets it ({}, {} primaries, tagged so with "
++            "cICP); its SDR copy, tone mapped {} and tagged sRGB, is {}",
++            CURL::GetRedacted(filename), pq ? "PQ" : "HLG",
++            result.color.primaries == AVCOL_PRI_BT2020 ? "BT.2020" : "BT.709",
++            !pq ? std::string("from HLG")
++                : StringUtils::Format("from a peak of {:.0f} cd/m2{}", peak,
++                                      assumed ? " (the picture's is not known: 1000 is taken)"
++                                              : ""),
++            CURL::GetRedacted(copy));
++}
++
+ // Encode a delivered capture to the destination file; runs on the capture
+ // service's callback worker.
+ void WriteCapture(const KODI::RENDERING::CAPTURE::CaptureResult& result,
+@@ -74,22 +126,32 @@ void WriteCapture(const KODI::RENDERING::CAPTURE::CaptureResult& result,
+     return;
+   }
+ 
+-  CScopedCapturePixels lock(*result.pixels);
+-  if (!lock.data())
+   {
+-    CLog::Log(LOGERROR, "Unable to write screenshot {}: pixel lock failed",
+-              CURL::GetRedacted(filename));
+-    return;
+-  }
++    CScopedCapturePixels lock(*result.pixels);
++    if (!lock.data())
++    {
++      CLog::Log(LOGERROR, "Unable to write screenshot {}: pixel lock failed",
++                CURL::GetRedacted(filename));
++      return;
++    }
+ 
+-  // OPAQUE: the encoder drops the framebuffer alpha through an X-variant source
+-  const unsigned int format = CaptureXbFormat(result.format) | XB_FMT_OPAQUE;
+-  const uint8_t* src0 = CaptureSrcRow0(lock.data(), result.stride, result.height);
++    // OPAQUE: the encoder drops the framebuffer alpha through an X-variant source
++    const unsigned int format = CaptureXbFormat(result.format) | XB_FMT_OPAQUE;
++    const uint8_t* src0 = CaptureSrcRow0(lock.data(), result.stride, result.height);
++
++    if (!CPicture::CreateThumbnailFromSurface(src0, result.width, result.height,
++                                              static_cast<unsigned int>(result.stride), filename,
++                                              format, result.color))
++    {
++      CLog::Log(LOGERROR, "Unable to write screenshot {}", CURL::GetRedacted(filename));
++      return;
++    }
++  }
+ 
+-  if (!CPicture::CreateThumbnailFromSurface(src0, result.width, result.height,
+-                                            static_cast<unsigned int>(result.stride), filename,
+-                                            format, result.color))
+-    CLog::Log(LOGERROR, "Unable to write screenshot {}", CURL::GetRedacted(filename));
++  // Hades: and its SDR copy, where it is HDR
++  if (result.color.transfer == AVCOL_TRC_SMPTE2084 ||
++      result.color.transfer == AVCOL_TRC_ARIB_STD_B67)
++    WriteSdrCopy(result, filename);
+ }
+ } // namespace
+ 
+-- 
+2.53.0
+

@@ -3,7 +3,7 @@
 # Copyright (C) 2026-present Hades
 #
 # Hades: the check of the output for Dolby Vision (hades-output-check), made once when the settings asked for it
-# (System > Submit Log, "Check the Dolby Vision output": the file request below, then Kodi started again).
+# (System > Check this setup, "Check the Dolby Vision output": the file request below, then Kodi started again).
 # hades-output-check.service runs this before Kodi starts, and Kodi waits for it; without the request the unit is
 # not started at all (its condition), so a start costs nothing. The request goes first, so that a check that
 # fails is not made again at the next start. The report goes to result.txt below and the file new tells the

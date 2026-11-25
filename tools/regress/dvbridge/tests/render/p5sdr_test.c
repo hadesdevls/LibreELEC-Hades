@@ -228,8 +228,10 @@ static long CopyCheck(struct gl* g, GLuint texture, int bits, int limited, long*
         const long code = bits == 10 ? (long)((((const uint32_t*)out)[i] >> (10 * c)) & 1023)
                                      : (long)((const uint8_t*)out)[i * 4 + c];
         const long nearest = lround(want);
-        // (a value half way between two codes may go either way)
-        if (code != nearest && fabs(fabs(want - floor(want)) - 0.5) > 1e-3)
+        // (a value half way between two codes may go either way; Hades: into 8 bits the copy dithers,
+        // dvbridge_gl_pack.c, to the code below the value or the one above it)
+        const bool dithered = bits == 8 && (code == (long)floor(want) || code == (long)ceil(want));
+        if (code != nearest && !dithered && fabs(fabs(want - floor(want)) - 0.5) > 1e-3)
         {
           ++wrong;
           if (labs(code - nearest) > *mostOff)

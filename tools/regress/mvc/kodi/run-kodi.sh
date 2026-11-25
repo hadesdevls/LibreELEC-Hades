@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 LibreELEC Hades
 # The host tests of Kodi's side (read only, from $MVC_KODI): stereo_rate_test.cpp (the 3D output at twice
-# the refresh rate, xbmc/windowing/gbm/drm/DRMStereo.h) and mvcc_count_test.cpp (finding 11 as Kodi reads
+# the refresh rate, and the vendor InfoFrame that a mode of a 3D layout takes away, issue #33,
+# xbmc/windowing/gbm/drm/DRMStereo.h), stereo_shown_test.cpp (what the player information
+# says of the 3D output, the same header) and mvcc_count_test.cpp (finding 11 as Kodi reads
 # 'mvcC', xbmc/cores/VideoPlayer/MultiviewChoice.h). Each against the header as it is (must pass) and against
 # copies of it with one rule changed (each must fail). MUTATE=1 also runs mutate_range.py on every mutation site
 # of the choice (lines 316-478 of DRMStereo.h) and of what it reads of the modes (147-263): survivors are listed
-# for the reader. Prints STEREO-RATE PASSED / MVCC PASSED, or FAILED.
+# for the reader. Prints STEREO-RATE PASSED / STEREO-SHOWN PASSED / MVCC PASSED, or FAILED.
 set -u
 . "$(dirname "$0")/../env.sh"
 K=$KODI
@@ -39,7 +41,25 @@ sem $T $H loose-rate 's/std::fabs(offer.refresh - rate) < 0.01; };/std::fabs(off
 sem $T $H whitelist-ignored-at-twice 's/^          otherSize(offer))$/          true)/'
 sem $T $H 1080-line-rule-off 's/    return offer.height >= (own.height < FILM_LINES ? own.height : FILM_LINES);/    return offer.height >= 0 * (own.height < FILM_LINES ? own.height : FILM_LINES);/'
 sem $T $H triple-not-double 's/2.0 \* own.refresh/3.0 * own.refresh/'
+sem $T $H held-infoframe-any-mode 's/  return layoutMode \&\& held != 0 \&\& held != own;/  return (layoutMode || held) \&\& held != 0 \&\& held != own;/'
+sem $T $H held-infoframe-none-held 's/  return layoutMode \&\& held != 0 \&\& held != own;/  return layoutMode \&\& held != own;/'
+sem $T $H arrangement-refusal-ignored 's/  if (topAndBottom \&\& !(forFramePacking \&\& framePackingRefused))/  if (topAndBottom \&\& !(forFramePacking \&\& framePackingRefused \&\& false))/'
+sem $T $H arrangement-source-ignored 's/  if (topAndBottom \&\& !(forFramePacking \&\& framePackingRefused))/  if (topAndBottom \&\& !((forFramePacking || true) \&\& framePackingRefused))/'
+sem $T $H held-infoframe-own-too 's/  return layoutMode \&\& held != 0 \&\& held != own;/  return layoutMode \&\& held != 0 \&\& held != 0 * own;/'
 [ $fails = 0 ] && echo "STEREO-RATE PASSED" || echo "STEREO-RATE FAILED ($fails)"
+# (playA) what the player information says of the 3D output: STEREO::ShownOf() and the raster of frame packing
+T=$TOOLS/kodi/stereo_shown_test.cpp
+fails=0
+build $K/xbmc/windowing/gbm/drm $T $D/s || { cat $D/s.log | head -20; fails=1; }
+$D/s > $D/sout.txt 2>&1 || fails=$((fails + 1))
+echo "stereo_shown_test: $(tail -n 1 $D/sout.txt)"
+sem $T $H shown-infoframe-before-mode 's/^  switch (output)$/  switch (infoFrame != Layout::NONE ? infoFrame : output)/'
+sem $T $H shown-infoframe-ignored 's/^  if (infoFrame == Layout::TOP_AND_BOTTOM)$/  if (false)/'
+sem $T $H shown-untold-as-2d 's/^  return topAndBottom ? Shown::OVER_UNDER_UNTOLD : Shown::SIDE_BY_SIDE_UNTOLD;$/  return topAndBottom ? Shown::NONE : Shown::NONE;/'
+sem $T $H shown-split-ignored 's/^  if (!split)$/  if (!split \&\& false)/'
+sem $T $H shown-arrangement-swapped 's/^  return topAndBottom ? Shown::OVER_UNDER_UNTOLD : Shown::SIDE_BY_SIDE_UNTOLD;$/  return topAndBottom ? Shown::SIDE_BY_SIDE_UNTOLD : Shown::OVER_UNDER_UNTOLD;/'
+sem $T $H shown-fp-raster-2d 's/  return LayoutOf(mode.flags) == Layout::FRAME_PACKING ? mode.vdisplay + mode.vtotal$/  return false ? mode.vdisplay + mode.vtotal/'
+[ $fails = 0 ] && echo "STEREO-SHOWN PASSED" || echo "STEREO-SHOWN FAILED ($fails)"
 T=$TOOLS/kodi/mvcc_count_test.cpp
 fails=0
 build $K/xbmc/cores/VideoPlayer $T $D/m || { cat $D/m.log | head -20; fails=1; }

@@ -6,7 +6,8 @@
 # shim-helpers-signed) go to the boot partition of the image (/secureboot, scripts/mkimage) and to the system
 # (/usr/share/hades-secureboot), where an update in place takes them from. hades-sb-sign signs GRUB and the kernel with
 # the key of the computer, which lives in the key slot of the storage (/storage/.hades-secureboot/key); the init of the
-# system that applies an update in place runs it from the new system (hades_sb_update in the init).
+# system that applies an update in place runs the one of the system that runs, never the update's, and only for an
+# update that the update channel of that system signed (hades_sb_proof and hades_sb_update in the init).
 
 PKG_NAME="hades-secureboot"
 PKG_VERSION="1"

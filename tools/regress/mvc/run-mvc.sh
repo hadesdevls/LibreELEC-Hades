@@ -152,6 +152,7 @@ PY2
     wantrev flushf1 "rev: runs 158, assertion aborts [1-9]" "F1 end to end"
   fi
   want kodi "STEREO-RATE PASSED" "the 3D output at twice the refresh rate (kodi/stereo_rate_test.cpp, its mutants)"
+  want kodi "STEREO-SHOWN PASSED" "what the player information says of the 3D output (kodi/stereo_shown_test.cpp, its mutants)"
   want kodi "MVCC PASSED" "F11 in Kodi: the count of 'mvcC' (kodi/mvcc_count_test.cpp, its mutants)"
   echo "VERDICT: $bad failure(s)"
   return $([ $bad = 0 ] && echo 0 || echo 1)

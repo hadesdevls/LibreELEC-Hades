@@ -8,10 +8,12 @@ FFmpeg's writer (libavcodec/dovi_rpuenc.c, ff_dovi_rpu_generate(), without metad
 dovi_tool (MIT); both were read as data, nothing of them runs here. What the RPU says is what Kodi of
 Hades makes for HDR10 sent as Dolby Vision (tools/dvbridge/dvbridge_hdr10plus.c,
 dvbridge_profile81_metadata()): the header of profile 8.1 as dovi_tool makes it, an identity mapping, the
-colour of BT.2020 PQ (or, for profile 5, the IPT-PQ-c2 matrices of dvbridge_ipt.h), the mastering
+colour of BT.2020 PQ (or, for profile 5, the IPT-PQ-c2 matrices of its RPUs, dovi_tool's), the mastering
 display as the source range, and display management of CM v2.9 with levels 1, 5 and 6 (in that order,
 as dovi_tool writes the blocks; level 5 is the whole picture, all four offsets 0, as the bridge writes it
-for metadata of its own since it sends no level 5 for an RPU without one).
+for metadata of its own since it sends no level 5 for an RPU without one). The clip of the A/B comparison
+(abclip.py) adds level 2 (the trims of its targets, after level 1, as dovi_tool orders them) and a level 5
+of its bars.
 """
 import card
 
@@ -79,8 +81,12 @@ YCC_2020 = (9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0)
 OFFSETS_2020 = (16777216, 134217728, 134217728)
 
 
-def metadata(profile, l1, mastering, max_cll, max_fall, scene_refresh):
-    """the fields of an RPU (a dict, the names of FFmpeg's AVDOVIMetadata)"""
+def metadata(profile, l1, mastering, max_cll, max_fall, scene_refresh, l2=(), l5=None):
+    """the fields of an RPU (a dict, the names of FFmpeg's AVDOVIMetadata); l2: blocks of level 2 (dicts
+    with "level": 2 and their fields), l5: the four offsets of level 5 (left, right, top, bottom; all 0
+    without it)"""
+    if l5 is None:
+        l5 = {"left": 0, "right": 0, "top": 0, "bottom": 0}
     min_nits, max_nits = mastering["min_nits"], mastering["max_nits"]
     ipt = profile == 5
     return {
@@ -112,8 +118,8 @@ def metadata(profile, l1, mastering, max_cll, max_fall, scene_refresh):
             "source_diagonal": 42,
         },
         "ext": [
-            {"level": 1, "min_pq": l1[0], "max_pq": l1[1], "avg_pq": l1[2]},
-            {"level": 5, "left": 0, "right": 0, "top": 0, "bottom": 0},
+            {"level": 1, "min_pq": l1[0], "max_pq": l1[1], "avg_pq": l1[2]}] + [dict(b) for b in l2] + [
+            dict(l5, level=5),
             {"level": 6, "max_luminance": card.rnd(max_nits, "L6 max"),
              "min_luminance": card.rnd(min_nits * 10000.0, "L6 min"),
              "max_cll": min(int(max_cll), 65535), "max_fall": min(int(max_fall), 65535)},
@@ -201,6 +207,15 @@ def rpu_payload(m):
             w.u(12, e["min_pq"])
             w.u(12, e["max_pq"])
             w.u(12, e["avg_pq"])
+        elif e["level"] == 2:
+            length = 11
+            w.ue(length)
+            w.u(8, 2)
+            start = len(w.bits)
+            for k in ("target_max_pq", "trim_slope", "trim_offset", "trim_power", "trim_chroma_weight",
+                      "trim_saturation_gain"):
+                w.u(12, e[k])
+            w.s(13, e["ms_weight"])
         elif e["level"] == 5:
             length = 7
             w.ue(length)

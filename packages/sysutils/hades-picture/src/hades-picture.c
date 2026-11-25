@@ -23,7 +23,8 @@
  *
  *   hades-picture serve                                       the service (hades-picture.service, through its socket)
  *   hades-picture show <fit|stretch> <boot|kodi> <picture> [<card>]   asks the service to show a picture
- *   hades-picture release                                     Kodi starts: the service lets go of the displays
+ *   hades-picture release                                     Kodi starts: the service lets go of the displays (once a
+ *                                                             picture that it is drawing is shown: BUSY_FLAG)
  *   hades-picture stop                                        the service gives the displays back to the console
  *   hades-picture fb <fit|stretch> <picture> [<card>]         draws into the console's frame buffer (fb0) and shows it
  *   hades-picture fb black                                    the same, black
@@ -72,6 +73,7 @@
 #define SOCK_PATH "/run/hades-picture.sock"
 #define HELD_FLAG "/run/hades-picture.held"
 #define KODI_FLAG "/run/hades-picture.kodi"
+#define BUSY_FLAG "/run/hades-picture.busy" /* a picture is being drawn: dispatch() */
 #define INIT_FILE "/run/hades-picture.init"
 #define INIT_WAIT_MS 120000
 #define MAX_CARDS 8
@@ -665,6 +667,8 @@ static void init_saved(const char *node, struct output *o, int n)
 	fclose(f);
 }
 
+static int let_go(void);
+
 static int show(enum picture_mode mode, int boot, const char *prefix, const char *card, const char *text)
 {
 	static struct found f[MAX_CARDS];
@@ -849,6 +853,21 @@ static int show(enum picture_mode mode, int boot, const char *prefix, const char
 	for (i = 0; i < ncards; i++)
 		if (fb0_on(cards[i].node) && !fb_draw(PICTURE_FIT, NULL, NULL, NULL, 1, 0, msg, sizeof(msg)))
 			logline("%s, under the pictures", msg);
+	/* The start of Kodi may have come while this picture of the start was being made, after the look at KODI_FLAG
+	 * above: its "release" (client()) writes KODI_FLAG and then asks this service only where HELD_FLAG or BUSY_FLAG is
+	 * there (HELD_FLAG: held_flag() above writes it once the pictures are shown; BUSY_FLAG: dispatch() writes it before
+	 * this picture is begun, so that such a "release" is answered only after it). Before BUSY_FLAG, that "release"
+	 * found nothing held and Kodi started while
+	 * this kept the DRM master, which Kodi needs: Kodi started on no display, behind the picture of the start (issue 14
+	 * of LibreELEC Hades, 2026-11-22: drmAuthMagic() refused, "failed to initialize Atomic DRM"). So KODI_FLAG is
+	 * looked at again here, after HELD_FLAG is written, as "release" writes KODI_FLAG before it looks for HELD_FLAG:
+	 * of the two, the one that looks last sees what the other wrote. Here, the displays are let go of as "release" does. */
+	if (boot && access(KODI_FLAG, F_OK) == 0) {
+		int n = let_go();
+
+		say("; Kodi was started meanwhile: let go of, %d picture(s) stay until Kodi shows its own in their place", n);
+		logline("Kodi was started while the picture of the start was being shown: %d picture(s) let go of", n);
+	}
 out:
 	for (i = 0; i < nf; i++)
 		if (f[i].mine)
@@ -860,17 +879,27 @@ out:
 
 /* ---------------------------------------------------------------- the service */
 
-static int release(void)
+/* lets go of the DRM master of every device that it holds: its pictures stay on the displays until something shows its
+ * own in their place (check_released()). How many pictures stay. */
+static int let_go(void)
 {
 	int i, n = held_count();
 
-	touch(KODI_FLAG);
 	for (i = 0; i < ncards; i++)
 		if (cards[i].master) {
 			drmDropMaster(cards[i].fd);
 			cards[i].master = 0;
 		}
 	released = n > 0;
+	return n;
+}
+
+static int release(void)
+{
+	int n;
+
+	touch(KODI_FLAG);
+	n = let_go();
 	say("ok released: %d picture(s) stay until Kodi shows its own in their place", n);
 	return 0;
 }
@@ -909,9 +938,24 @@ static int dispatch(char *line)
 	for (t = strtok_r(line, " \t\r\n", &save); t && n < 8; t = strtok_r(NULL, " \t\r\n", &save))
 		arg[n++] = t;
 	if (n >= 4 && n <= 5 && !strcmp(arg[0], "show") && (!strcmp(arg[1], "fit") || !strcmp(arg[1], "stretch")) &&
-	    (!strcmp(arg[2], "boot") || !strcmp(arg[2], "kodi")) && valid_path(arg[3]) && (n == 4 || valid_path(arg[4])))
-		return show(!strcmp(arg[1], "fit") ? PICTURE_FIT : PICTURE_STRETCH, !strcmp(arg[2], "boot"), arg[3],
-			    n == 5 ? arg[4] : NULL, n == 5 ? text_of(text) : NULL);
+	    (!strcmp(arg[2], "boot") || !strcmp(arg[2], "kodi")) && valid_path(arg[3]) && (n == 4 || valid_path(arg[4]))) {
+		int r;
+
+		/* While a picture is being drawn, this service holds the DRM master of the devices that it opened (from the
+		 * open, before the picture is even read, until it lets go of them), and Kodi needs it: Kodi gives up its
+		 * displays where it cannot get it ("Failed to authorize drm magic", and Kodi runs on no display). "release"
+		 * (client()) writes KODI_FLAG and then looks for this flag; show() looks at KODI_FLAG only after this flag is
+		 * written. Of the two, the one that looks last sees what the other wrote: either show() draws no picture of
+		 * the start, or "release" is put to this service, which answers it only after this picture, once it has let
+		 * go of the displays, so that Kodi starts with the DRM master free. Without it, "release" found nothing held
+		 * while a picture of the start was still being drawn, and Kodi could start inside that time (issue 14 of
+		 * LibreELEC Hades, 2026-11-22). */
+		touch(BUSY_FLAG);
+		r = show(!strcmp(arg[1], "fit") ? PICTURE_FIT : PICTURE_STRETCH, !strcmp(arg[2], "boot"), arg[3],
+			 n == 5 ? arg[4] : NULL, n == 5 ? text_of(text) : NULL);
+		unlink(BUSY_FLAG);
+		return r;
+	}
 	if (n == 1 && !strcmp(arg[0], "release"))
 		return release();
 	if (n == 1 && !strcmp(arg[0], "stop")) {
@@ -1069,9 +1113,10 @@ static int client(int argc, char **argv)
 	int i, s;
 
 	if (!strcmp(argv[1], "release")) {
-		/* (also where nothing is held: the picture of the start is not drawn once Kodi was started) */
+		/* (also where nothing is held: the picture of the start is not drawn once Kodi was started). Where the service
+		 * holds pictures, or is drawing one (BUSY_FLAG, dispatch()), it is asked, and answers once it has let go */
 		touch(KODI_FLAG);
-		if (access(HELD_FLAG, F_OK)) {
+		if (access(HELD_FLAG, F_OK) && access(BUSY_FLAG, F_OK)) {
 			puts("ok nothing is held: the displays are the console's");
 			return 0;
 		}

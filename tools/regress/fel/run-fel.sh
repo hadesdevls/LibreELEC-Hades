@@ -85,7 +85,7 @@ mutant_tree() {
   local n=$1 K f
   K=$(rg_kodi) || return 1
   rg_fresh "$M/$n/$DVL" "$M/$n/$DRH" "$M/$n/tools"
-  cp -a "$K/tools/dvbridge" "$M/$n/tools/" && cp -a "$K/$DVL/DVLayerMerge.cpp" "$K/$DVL/DVLayerMerge.h" "$M/$n/$DVL/" &&
+  cp -a "$K/tools/dvbridge" "$M/$n/tools/" && cp -a "$K/$DVL/DVLayerMerge.cpp" "$K/$DVL/DVLayerMerge.h" "$K/$DVL/StreamGroupStreams.h" "$M/$n/$DVL/" &&
     cp -a "$K/$DRH/DrainRestart.h" "$M/$n/$DRH/" || return 1
   f=$($RG_PY -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["FILE"])' "$HERE/mutants/$n.py") || return 1
   rg_edit "$M/$n/$f" "$HERE/mutants/$n.py"

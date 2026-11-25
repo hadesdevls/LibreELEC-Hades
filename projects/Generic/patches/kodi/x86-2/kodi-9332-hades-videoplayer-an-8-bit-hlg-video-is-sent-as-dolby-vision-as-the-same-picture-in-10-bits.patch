@@ -1,0 +1,646 @@
+From 24630aea0f35d1e657fe592a9b971c022727e222 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 14:31:21 +0000
+Subject: [PATCH] [Hades][VideoPlayer] An 8-bit HLG video is sent as Dolby
+ Vision, as the same picture in 10 bits
+
+"HLG as Dolby Vision" (videoscreen.hadeshlgasdv) took only 10-bit HLG: the
+conversion to ST 2084, the measurement of the metadata and the RPU of
+profile 8.1 (a base layer of 10 bits) are written for a 10-bit picture. An
+8-bit HLG video (from a camera, or a broadcast in 8 bits) stayed HLG: with
+"Automatic", where the output cannot send HLG, it lost its HDR and went
+out as SDR; with "On" it played as HLG.
+
+Now 8-bit 4:2:0 is eligible too (DVBRIDGE::HlgDolbyVisionEligible(),
+CDVHdr10Plus::HlgMeasurable()), and the bridge is given each 8-bit picture
+as the same picture in 10 bits: a pass on the GPU (dvbridge_gl_widen.c)
+writes each code v of the NV12 planes of a VAAPI surface as (v << 2) << 6
+in R16/RG16 textures, the planes of a P010 surface. Every step after it is
+the 10-bit one, byte for byte: drawn from the 8-bit planes as they are,
+libplacebo would normalise v / 255 with 8-bit range constants where the
+10-bit picture is v10 / 1023 with 10-bit ones, the same values in exact
+arithmetic but not the same floats, and the bridge refuses a base layer of
+another depth than its RPU gives anyway. The pass reads each code with
+texelFetch(), takes it back to the integer v and writes 256 v plus a
+quarter of a step, so that the conversion to 16 bits gives 256 v whether
+the GPU rounds or truncates; dithering is off for it, and the GL state of
+the caller is put back.
+
+Kodi's VAAPI renderer (with nvidia-vaapi-driver too) widens a picture once
+(CRendererVAAPIGLES::WidenForBridge()): for the measurement ahead of its
+drawing, the native output and the conversion, and anew for the next
+picture of a buffer. A picture whose widening fails is not drawn by the
+bridge, and kodi.log says so once. kodi.log says when a video's 8-bit
+pictures are widened, and the line of the demuxer gives the depth.
+10-bit HLG, HDR10, HDR10+ and Dolby Vision take no new step: the pass
+runs only for an NV12 picture of HLG sent as Dolby Vision. A picture the
+processor decodes is not measured at any depth (the measured route needs
+VAAPI surfaces, as before), and 4:2:2 or 12-bit HLG stays HLG with the
+reason in kodi.log.
+---
+ tools/dvbridge/CMakeLists.txt                 |   3 +-
+ tools/dvbridge/dvbridge_gl_widen.c            | 239 ++++++++++++++++++
+ tools/dvbridge/dvbridge_gl_widen.h            |  53 ++++
+ .../DVDCodecs/Video/DVPlaybackPolicy.h        |  14 +-
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            |  12 +-
+ .../VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp   |   8 +-
+ .../VideoPlayer/DVDDemuxers/DVHdr10Plus.h     |   2 +-
+ .../HwDecRender/RendererVAAPIGLES.cpp         |  67 ++++-
+ .../HwDecRender/RendererVAAPIGLES.h           |  14 +
+ 9 files changed, 395 insertions(+), 17 deletions(-)
+ create mode 100644 tools/dvbridge/dvbridge_gl_widen.c
+ create mode 100644 tools/dvbridge/dvbridge_gl_widen.h
+
+diff --git a/tools/dvbridge/CMakeLists.txt b/tools/dvbridge/CMakeLists.txt
+index 5330b71..82bf9f4 100644
+--- a/tools/dvbridge/CMakeLists.txt
++++ b/tools/dvbridge/CMakeLists.txt
+@@ -20,7 +20,8 @@ add_library(dvbridge_core STATIC dvbridge_core.c dvbridge_placebo.c dvbridge_ren
+                                 dvbridge_measure.c dvbridge_measured.c
+                                 dvbridge_dvplus.c dvbridge_dvplus_gl.c dvbridge_graphics.c
+                                 dvbridge_upscale.c dvbridge_scene_map.c dvbridge_l5area.c
+-                                dvbridge_lut.c dvbridge_lut_atlas.c dvbridge_gl_part.c)
++                                dvbridge_lut.c dvbridge_lut_atlas.c dvbridge_gl_part.c
++                                dvbridge_gl_widen.c)
+ set_target_properties(dvbridge_core PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+ target_include_directories(dvbridge_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ target_link_libraries(dvbridge_core PUBLIC PkgConfig::DVPlacebo PkgConfig::DVAvutil
+diff --git a/tools/dvbridge/dvbridge_gl_widen.c b/tools/dvbridge/dvbridge_gl_widen.c
+new file mode 100644
+index 0000000..a1661bb
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_gl_widen.c
+@@ -0,0 +1,239 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++/* Hades: an 8-bit 4:2:0 picture widened into the same picture in P010 (dvbridge_gl_widen.h). */
++#include "dvbridge_gl_widen.h"
++#include <GLES3/gl3.h>
++#include <string.h>
++
++/* GL_EXT_texture_norm16, as dvbridge_gl_frame_import() names them */
++#define WIDEN_R16 0x822A
++#define WIDEN_RG16 0x822C
++
++static const char WIDEN_VERTEX[] = "#version 300 es\n"
++                                   "void main() {\n"
++                                   "  vec2 p = vec2(float((gl_VertexID & 1) << 2) - 1.0,\n"
++                                   "                float((gl_VertexID & 2) << 1) - 1.0);\n"
++                                   "  gl_Position = vec4(p, 0.0, 1.0);\n"
++                                   "}\n";
++
++/* each code v of the plane (its sample, v / 255) as the 16-bit code 256 v = (v << 2) << 6, a quarter of a step above
++ * it so that the conversion to 16 bits gives that code whether it rounds or truncates */
++static const char WIDEN_FRAGMENT[] = "#version 300 es\n"
++                                     "precision highp float;\n"
++                                     "precision highp int;\n"
++                                     "uniform highp sampler2D plane;\n"
++                                     "out highp vec4 color;\n"
++                                     "void main() {\n"
++                                     "  vec2 v = round(texelFetch(plane, ivec2(gl_FragCoord.xy), 0).rg * 255.0);\n"
++                                     "  color = vec4((v * 256.0 + 0.25) / 65535.0, 0.0, 1.0);\n"
++                                     "}\n";
++
++static void drain_errors(void)
++{
++    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++        ;
++}
++
++static GLuint shader(GLenum type, const char *source)
++{
++    GLuint s = glCreateShader(type);
++    if (!s)
++        return 0;
++    glShaderSource(s, 1, &source, NULL);
++    glCompileShader(s);
++    GLint ok = GL_FALSE;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (ok != GL_TRUE) {
++        glDeleteShader(s);
++        return 0;
++    }
++    return s;
++}
++
++static bool make_program(struct dvbridge_gl_widen *w)
++{
++    if (w->program)
++        return true;
++    if (w->failed)
++        return false;
++    GLuint vs = shader(GL_VERTEX_SHADER, WIDEN_VERTEX);
++    GLuint fs = shader(GL_FRAGMENT_SHADER, WIDEN_FRAGMENT);
++    GLuint p = vs && fs ? glCreateProgram() : 0;
++    GLint ok = GL_FALSE;
++    if (p) {
++        glAttachShader(p, vs);
++        glAttachShader(p, fs);
++        glLinkProgram(p);
++        glGetProgramiv(p, GL_LINK_STATUS, &ok);
++    }
++    if (vs)
++        glDeleteShader(vs);
++    if (fs)
++        glDeleteShader(fs);
++    if (ok != GL_TRUE) {
++        if (p)
++            glDeleteProgram(p);
++        w->failed = true;
++        return false;
++    }
++    w->program = p;
++    w->sampler = glGetUniformLocation(p, "plane");
++    glGenVertexArrays(1, &w->vao);
++    glGenFramebuffers(1, &w->framebuffer);
++    if (w->sampler < 0 || !w->vao || !w->framebuffer || glGetError() != GL_NO_ERROR) {
++        dvbridge_gl_widen_free(w);
++        w->failed = true;
++        return false;
++    }
++    return true;
++}
++
++void dvbridge_gl_widened_free(struct dvbridge_gl_widened *t)
++{
++    if (!t)
++        return;
++    for (int i = 0; i < 2; ++i)
++        if (t->textures[i])
++            glDeleteTextures(1, &t->textures[i]);
++    memset(t, 0, sizeof(*t));
++}
++
++void dvbridge_gl_widen_free(struct dvbridge_gl_widen *w)
++{
++    if (!w)
++        return;
++    if (w->program)
++        glDeleteProgram(w->program);
++    if (w->vao)
++        glDeleteVertexArrays(1, &w->vao);
++    if (w->framebuffer)
++        glDeleteFramebuffers(1, &w->framebuffer);
++    memset(w, 0, sizeof(*w));
++}
++
++/* the GL state that the pass changes, as the caller had it */
++struct kept {
++    GLint draw_fb, read_fb, program, vao, active, texture, viewport[4];
++    GLboolean mask[4], blend, scissor, dither, depth, stencil, cull, discard;
++};
++
++static void keep(struct kept *k)
++{
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &k->draw_fb);
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &k->read_fb);
++    glGetIntegerv(GL_CURRENT_PROGRAM, &k->program);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &k->vao);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &k->active);
++    glActiveTexture(GL_TEXTURE0);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &k->texture);
++    glGetIntegerv(GL_VIEWPORT, k->viewport);
++    glGetBooleanv(GL_COLOR_WRITEMASK, k->mask);
++    k->blend = glIsEnabled(GL_BLEND);
++    k->scissor = glIsEnabled(GL_SCISSOR_TEST);
++    k->dither = glIsEnabled(GL_DITHER);
++    k->depth = glIsEnabled(GL_DEPTH_TEST);
++    k->stencil = glIsEnabled(GL_STENCIL_TEST);
++    k->cull = glIsEnabled(GL_CULL_FACE);
++    k->discard = glIsEnabled(GL_RASTERIZER_DISCARD);
++}
++
++static void set_enabled(GLenum cap, GLboolean on)
++{
++    if (on)
++        glEnable(cap);
++    else
++        glDisable(cap);
++}
++
++static void restore(const struct kept *k)
++{
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)k->draw_fb);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)k->read_fb);
++    glUseProgram((GLuint)k->program);
++    glBindVertexArray((GLuint)k->vao);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, (GLuint)k->texture);
++    glActiveTexture((GLenum)k->active);
++    glViewport(k->viewport[0], k->viewport[1], k->viewport[2], k->viewport[3]);
++    glColorMask(k->mask[0], k->mask[1], k->mask[2], k->mask[3]);
++    set_enabled(GL_BLEND, k->blend);
++    set_enabled(GL_SCISSOR_TEST, k->scissor);
++    set_enabled(GL_DITHER, k->dither);
++    set_enabled(GL_DEPTH_TEST, k->depth);
++    set_enabled(GL_STENCIL_TEST, k->stencil);
++    set_enabled(GL_CULL_FACE, k->cull);
++    set_enabled(GL_RASTERIZER_DISCARD, k->discard);
++}
++
++bool dvbridge_gl_widen_nv12(struct dvbridge_gl_widen *w, struct dvbridge_gl_widened *t, int width, int height,
++                            const struct dvbridge_gl_plane in[3], struct dvbridge_gl_plane out[3])
++{
++    if (!out)
++        return false;
++    memset(out, 0, 3 * sizeof(*out));
++    if (!w || !t || !in || width <= 0 || height <= 0)
++        return false;
++    const int widths[2] = {width, (width + 1) / 2}, heights[2] = {height, (height + 1) / 2};
++    for (int i = 0; i < 2; ++i)
++        if (!in[i].texture || in[i].width != widths[i] || in[i].height != heights[i])
++            return false;
++    drain_errors();
++    struct kept k;
++    keep(&k);
++    bool ok = make_program(w);
++    for (int i = 0; i < 2 && ok; ++i) {
++        const unsigned format = i ? WIDEN_RG16 : WIDEN_R16;
++        if (!t->textures[i] || t->widths[i] != widths[i] || t->heights[i] != heights[i]) {
++            if (t->textures[i])
++                glDeleteTextures(1, &t->textures[i]);
++            t->textures[i] = 0;
++            glGenTextures(1, &t->textures[i]);
++            glBindTexture(GL_TEXTURE_2D, t->textures[i]);
++            glTexStorage2D(GL_TEXTURE_2D, 1, format, widths[i], heights[i]);
++            /* as the planes of a surface are (libplacebo sets the sampling of each texture it reads itself) */
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            t->widths[i] = widths[i];
++            t->heights[i] = heights[i];
++            ok = glGetError() == GL_NO_ERROR;
++            if (!ok)
++                break;
++        }
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, w->framebuffer);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->textures[i], 0);
++        if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++            ok = false;
++            break;
++        }
++        glUseProgram(w->program);
++        glBindVertexArray(w->vao);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, in[i].texture);
++        glUniform1i(w->sampler, 0);
++        glViewport(0, 0, widths[i], heights[i]);
++        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++        glDisable(GL_BLEND);
++        glDisable(GL_SCISSOR_TEST);
++        glDisable(GL_DITHER);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_STENCIL_TEST);
++        glDisable(GL_CULL_FACE);
++        glDisable(GL_RASTERIZER_DISCARD);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++        ok = glGetError() == GL_NO_ERROR;
++    }
++    restore(&k);
++    if (!ok)
++        return false;
++    for (int i = 0; i < 2; ++i)
++        out[i] = (struct dvbridge_gl_plane){t->textures[i], widths[i], heights[i]};
++    return true;
++}
+diff --git a/tools/dvbridge/dvbridge_gl_widen.h b/tools/dvbridge/dvbridge_gl_widen.h
+new file mode 100644
+index 0000000..f9bed0a
+--- /dev/null
++++ b/tools/dvbridge/dvbridge_gl_widen.h
+@@ -0,0 +1,53 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++#ifndef DVBRIDGE_GL_WIDEN_H
++#define DVBRIDGE_GL_WIDEN_H
++/* Hades: an 8-bit 4:2:0 picture (NV12: an R8 luma plane and an RG8 chroma plane) given to the bridge as the same
++ * picture in 10 bits (P010: R16 and RG16, the 10 bits at the top), each code v written as (v << 2) << 6, for HLG sent
++ * as Dolby Vision (DVBRIDGE_BASE_HLG_TO_PQ of dvbridge_render.h) from an 8-bit HLG video.
++ *
++ * The conversion to ST 2084, the measurement of its metadata and the RPU of profile 8.1 are written for a 10-bit
++ * picture: its RPU says a base layer of 10 bits, and the bridge draws a base layer only at the depth its RPU gives.
++ * Drawn from the 8-bit planes, libplacebo would normalise each sample as v / 255 and take the limited range in 8-bit
++ * constants, where the same picture in 10 bits is v10 / 1023 in 10-bit ones: the same values in exact arithmetic,
++ * other operations in floats, and not the same bytes in the transport. Widened, the 8-bit picture is the 10-bit
++ * picture of the codes v << 2, sample for sample: every pass after this one (the conversion, the measurement, the
++ * metadata) is the one of 10-bit HLG, and its output the same bytes as for that picture given in 10 bits.
++ *
++ * The pass reads each code with texelFetch(), takes it back to the integer v (round(s * 255)) and writes 256 v plus a
++ * quarter of a step: a value within a small fraction of a step of the code 256 v, so that the conversion of the
++ * output to 16 bits gives that code whether it rounds to nearest or truncates; dithering is off for the pass. The
++ * GL state of the caller is kept. Current GL context required (OpenGL ES 3 with GL_EXT_texture_norm16, as the import
++ * of P010 surfaces needs). */
++#include "dvbridge_gl_frame.h"
++#include <stdbool.h>
++
++/* the program of the pass (one for any number of pictures); zero it before the first use */
++struct dvbridge_gl_widen {
++    unsigned program, vao, framebuffer;
++    int sampler;
++    bool failed;
++};
++
++/* the two textures of one widened picture, made again where its size changes; zero it before the first use */
++struct dvbridge_gl_widened {
++    unsigned textures[2];
++    int widths[2], heights[2];
++};
++
++/* The NV12 picture of width x height in in[0] (R8, width x height) and in[1] (RG8, half size rounded up), widened
++ * into *widened, whose textures are given in out[] as dvbridge_gl_frame_import() takes them for DVBRIDGE_P010.
++ * False, and nothing in out[], where the planes are not of those sizes, or the pass cannot be made or fails. */
++bool dvbridge_gl_widen_nv12(struct dvbridge_gl_widen *widen, struct dvbridge_gl_widened *widened, int width,
++                            int height, const struct dvbridge_gl_plane in[3], struct dvbridge_gl_plane out[3]);
++
++/* The textures of *widened deleted, and it zeroed (current GL context required). */
++void dvbridge_gl_widened_free(struct dvbridge_gl_widened *widened);
++/* The program of the pass deleted, and *widen zeroed (current GL context required). */
++void dvbridge_gl_widen_free(struct dvbridge_gl_widen *widen);
++#endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+index b1dba38..c7effd4 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h
+@@ -680,8 +680,10 @@ constexpr int HlgTransferOf(int vuiTransfer, int alternativeTransfer)
+ /*!
+  * \brief Hades: whether the stream is one that can be sent as Dolby Vision from its HLG: coded as
+  *        BT.2100 HLG says (the ARIB STD-B67 transfer, BT.2020 primaries and the BT.2020 matrix for
+- *        non-constant luminance), in 10 bits and 4:2:0, in limited range, a single layer that is
+- *        not interlaced (the measurement and the conversion are written for exactly that)
++ *        non-constant luminance), in 10 bits or in 8 bits and 4:2:0, in limited range, a single
++ *        layer that is not interlaced (the measurement and the conversion are written for a 10-bit
++ *        picture of exactly that; an 8-bit one is given to them as the same picture in 10 bits,
++ *        each code v as v << 2: dvbridge_gl_widen.h)
+  * \param aribB67 the transfer characteristic of the stream is ARIB STD-B67 (18), as the decoder
+  *        gives it (HlgTransferOf(): the VUI's, or the SEI's that says HLG for a VUI of BT.2020
+  *        10-bit).
+@@ -696,8 +698,8 @@ constexpr bool HlgDolbyVisionEligible(bool aribB67,
+                                       bool fullRange,
+                                       bool progressive)
+ {
+-  return aribB67 && bt2020Primaries && bt2020Ncl && bitDepth == 10 && chroma420 && !fullRange &&
+-         progressive;
++  return aribB67 && bt2020Primaries && bt2020Ncl && (bitDepth == 10 || bitDepth == 8) &&
++         chroma420 && !fullRange && progressive;
+ }
+ 
+ /*!
+@@ -712,8 +714,8 @@ constexpr const char* HlgDolbyVisionIneligibility(
+ {
+   if (bitDepth == 0)
+     return nullptr;
+-  if (bitDepth != 10)
+-    return bitDepth == 8 ? "it is coded in 8 bits" : "its samples are not of 10 bits";
++  if (bitDepth != 10 && bitDepth != 8)
++    return "its samples are neither of 8 nor of 10 bits";
+   if (chromaW != 1 || chromaH != 1)
+     return chromaW == 1 && chromaH == 0   ? "its chroma is 4:2:2"
+            : chromaW == 0 && chromaH == 0 ? "its chroma is 4:4:4"
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index f9fc857..a9db9eb 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1971,15 +1971,21 @@ void CDVDDemuxFFmpeg::ProbeHlg(CDemuxStream* stream,
+       av_guess_frame_rate(m_pFormatContext, const_cast<AVStream*>(avStream), nullptr);
+   if (!CDVHdr10Plus::HlgRecord(avStream->codecpar, rate, record))
+     return;
++  const AVPixFmtDescriptor* desc =
++      av_pix_fmt_desc_get(static_cast<AVPixelFormat>(avStream->codecpar->format));
++  const bool eightBits = desc && desc->comp[0].depth == 8;
+   CLog::Log(
+       LOGINFO,
+-      "CDVDDemuxFFmpeg: stream {} is HLG (BT.2020, 10 bits, limited range; as its decoder takes "
++      "CDVDDemuxFFmpeg: stream {} is HLG (BT.2020, {} bits, limited range; as its decoder takes "
+       "it, also where only an SEI says HLG): it is Dolby Vision profile 8.1 from here on (HLG "
+       "as Dolby Vision, videoscreen.hadeshlgasdv, and the display takes Dolby Vision): its "
+       "picture is converted to PQ as the reference display of "
+       "BT.2100 shows HLG (1000 cd/m2, system gamma 1.2) and its metadata are measured from that "
+-      "picture. This changes the picture on purpose",
+-      streamIdx);
++      "picture{}. This changes the picture on purpose",
++      streamIdx, eightBits ? 8 : 10,
++      eightBits ? " (its 8-bit picture given to the conversion as the same picture in 10 bits, "
++                  "each code v as v << 2)"
++                : "");
+   m_dvPromoted[streamIdx] = record;
+   m_dvMeasured[streamIdx] = true;
+   m_dvMeasuredHlg[streamIdx] = true;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp
+index 5d11e33..0a181c5 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp
+@@ -158,14 +158,14 @@ bool CDVHdr10Plus::HlgMeasurable(const AccessUnit& unit, const AVCodecParameters
+     return false;
+   const AVPixFmtDescriptor* desc =
+       av_pix_fmt_desc_get(static_cast<AVPixelFormat>(parameters->format));
+-  const bool tenBits420 = desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB) &&
+-                          desc->nb_components == 3 && desc->comp[0].depth == 10 &&
+-                          desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1;
++  // (Hades: 10 or 8 bits, 4:2:0: an 8-bit picture goes to the bridge as the same picture in 10 bits)
++  const bool yuv = desc && !(desc->flags & AV_PIX_FMT_FLAG_RGB) && desc->nb_components == 3;
++  const bool chroma420 = yuv && desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1;
+   return DVBRIDGE::HlgDolbyVisionEligible(
+       DVBRIDGE::HlgTransferOf(parameters->color_trc, unit.alternativeTransfer) ==
+           AVCOL_TRC_ARIB_STD_B67,
+       parameters->color_primaries == AVCOL_PRI_BT2020,
+-      parameters->color_space == AVCOL_SPC_BT2020_NCL, tenBits420 ? 10 : 0, tenBits420,
++      parameters->color_space == AVCOL_SPC_BT2020_NCL, yuv ? desc->comp[0].depth : 0, chroma420,
+       parameters->color_range == AVCOL_RANGE_JPEG,
+       parameters->field_order == AV_FIELD_PROGRESSIVE ||
+           parameters->field_order == AV_FIELD_UNKNOWN);
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.h
+index 2e8b3e0..c0c3051 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.h
+@@ -96,7 +96,7 @@ public:
+ 
+   //! Hades: HLG sent as Dolby Vision (videoscreen.hadeshlgasdv): an access unit with a picture and
+   //! nothing of Dolby Vision or HDR10+, of a stream that DVBRIDGE::HlgDolbyVisionEligible() takes
+-  //! (HLG as BT.2100 says, BT.2020 NCL, 10 bits 4:2:0, limited range, progressive). The probe goes
++  //! (HLG as BT.2100 says, BT.2020 NCL, 10 or 8 bits 4:2:0, limited range, progressive). The probe goes
+   //! on
+   //! over the next packets: one that has Dolby Vision gives the stream back as it was.
+   static bool HlgMeasurable(const AccessUnit& unit, const AVCodecParameters* parameters);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+index 6b23acd..778a62b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp
+@@ -88,6 +88,10 @@ CRendererVAAPIGLES::~CRendererVAAPIGLES()
+   {
+     DeleteTexture(i);
+   }
++#ifdef HAVE_DVBRIDGE
++  // (Hades: the program of the widening, WidenForBridge())
++  dvbridge_gl_widen_free(&m_dvWiden);
++#endif
+   // renderer destruction runs on the render thread with the GL context current
+   m_texturePool.ReleaseAll();
+ }
+@@ -422,6 +426,9 @@ int CRendererVAAPIGLES::RenderDVConversion(int idx)
+     return -1;
+   layer.baseTransfer = buffer.doviBaseTransfer;
+   layer.video = buffer.doviVideo;
++  // (Hades: an 8-bit picture of HLG sent as Dolby Vision, as the same picture in 10 bits)
++  if (!WidenForBridge(idx, layer))
++    return -1;
+   // (Hades: a picture of a 3D video, drawn a view at a time)
+   layer.stereo = StereoPacking();
+   // A picture without a time has no enhancement picture either (they are paired by it)
+@@ -471,8 +478,11 @@ void CRendererVAAPIGLES::MeasureAhead(int idx)
+     AfterRenderHook(idx);
+     return;
+   }
++  // (Hades: or an 8-bit picture of HLG sent as Dolby Vision, measured widened: WidenForBridge())
++  const bool hlg8 =
++      m_vaapiFourcc == VA_FOURCC_NV12 && buffer.doviBaseTransfer == DVBRIDGE::BASE_LAYER_HLG_TO_PQ;
+   if (!buffer.doviMeasured || buffer.doviMeasureQueued || !buffer.videoBuffer || !m_isVAAPIBuffer ||
+-      m_vaapiFourcc != VA_FOURCC_P010 || m_textureTarget != GL_TEXTURE_2D ||
++      (m_vaapiFourcc != VA_FOURCC_P010 && !hlg8) || m_textureTarget != GL_TEXTURE_2D ||
+       buffer.doviPts == DVD_NOPTS_VALUE)
+     return;
+   buffer.doviMeasureQueued = true;
+@@ -481,7 +491,7 @@ void CRendererVAAPIGLES::MeasureAhead(int idx)
+   if (!window || !UploadTexture(idx))
+     return;
+   CDVBridgeGLES::Layer layer{};
+-  layer.layout = DVBRIDGE_P010;
++  layer.layout = hlg8 ? DVBRIDGE_NV12 : DVBRIDGE_P010;
+   layer.width = m_sourceWidth;
+   layer.height = m_sourceHeight;
+   layer.chroma = buffer.doviChroma;
+@@ -493,6 +503,8 @@ void CRendererVAAPIGLES::MeasureAhead(int idx)
+     layer.planes[p] = {plane.id, static_cast<int>(plane.texwidth),
+                       static_cast<int>(plane.texheight)};
+   }
++  if (!WidenForBridge(idx, layer))
++    return;
+   window->DVMeasurePicture(layer);
+   // Hades: the GPU reads its planes for the measurement after this, whether or not the picture
+   // is drawn: one let go without being drawn (late) keeps its buffer, and so its surface, until
+@@ -535,6 +547,9 @@ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
+     layer.planes[p] = {plane.id, static_cast<int>(plane.texwidth),
+                       static_cast<int>(plane.texheight)};
+   }
++  // Hades: an 8-bit picture of HLG sent as Dolby Vision, as the same picture in 10 bits
++  if (!WidenForBridge(idx, layer))
++    return DVFrameRejected("hlg-8-bit-widening");
+   // Hades: the picture's own HDR10+ metadata, where its Dolby Vision is made from them (Low-Latency)
+   DVHdr10Plus(idx, layer.hdr10plus);
+   dvbridge_geometry geometry{};
+@@ -550,6 +565,46 @@ bool CRendererVAAPIGLES::RenderDVBridge(int idx)
+ }
+ #endif
+ 
++#ifdef HAVE_DVBRIDGE
++// Hades: an 8-bit picture of HLG sent as Dolby Vision given to the bridge as the same picture in 10
++// bits (dvbridge_gl_widen.h), once a picture: by the measurement ahead of its drawing, or by its drawing
++bool CRendererVAAPIGLES::WidenForBridge(int idx, CDVBridgeGLES::Layer& layer)
++{
++  if (layer.layout != DVBRIDGE_NV12 ||
++      m_buffers[idx].doviBaseTransfer != DVBRIDGE::BASE_LAYER_HLG_TO_PQ)
++    return true;
++  dvbridge_gl_plane widened[3]{};
++  auto& kept = m_dvWidened[idx];
++  if (m_dvWidenedNow[idx])
++  {
++    // (the picture of this buffer was widened already: by the measurement, ahead of its drawing)
++    for (int p = 0; p < 2; ++p)
++      widened[p] = {kept.textures[p], kept.widths[p], kept.heights[p]};
++  }
++  else if (!dvbridge_gl_widen_nv12(&m_dvWiden, &kept, layer.width, layer.height, layer.planes,
++                                   widened))
++  {
++    if (!m_dvWidenTold)
++      CLog::Log(LOGWARNING,
++                "DVBridge: an 8-bit HLG picture could not be given to the bridge as the "
++                "same picture in 10 bits (the pass that widens it failed): it is not "
++                "drawn as Dolby Vision");
++    m_dvWidenTold = true;
++    return false;
++  }
++  if (!m_dvWidenTold)
++    CLog::Log(LOGINFO, "DVBridge: the 8-bit pictures of this HLG video are given to the bridge as "
++                       "the same pictures in 10 bits (each code v as v << 2): the conversion to PQ "
++                       "and the measurement are those of 10-bit HLG");
++  m_dvWidenTold = true;
++  m_dvWidenedNow[idx] = true;
++  layer.layout = DVBRIDGE_P010;
++  for (int p = 0; p < 3; ++p)
++    layer.planes[p] = widened[p];
++  return true;
++}
++#endif
++
+ bool CRendererVAAPIGLES::CreateTexture(int index)
+ {
+   if (!m_isVAAPIBuffer)
+@@ -612,6 +667,10 @@ void CRendererVAAPIGLES::DeleteTexture(int index)
+   buf.fields[FIELD_FULL][0].id = 0;
+   buf.fields[FIELD_FULL][1].id = 0;
+   buf.fields[FIELD_FULL][2].id = 0;
++#ifdef HAVE_DVBRIDGE
++  // (Hades: its widened planes, WidenForBridge())
++  dvbridge_gl_widened_free(&m_dvWidened[index]);
++#endif
+ }
+ 
+ bool CRendererVAAPIGLES::UploadTexture(int index)
+@@ -730,6 +789,10 @@ void CRendererVAAPIGLES::ReleaseBuffer(int index)
+ 
+   if (m_isVAAPIBuffer)
+     m_vaapiTextures[index] = nullptr;
++#ifdef HAVE_DVBRIDGE
++  // (Hades: the next picture of this buffer is widened anew, WidenForBridge())
++  m_dvWidenedNow[index] = false;
++#endif
+ 
+   CLinuxRendererGLES::ReleaseBuffer(index);
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+index 4250a21..ee5cccb 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.h
+@@ -11,7 +11,12 @@
+ #include "VaapiEGL.h"
+ #include "cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h"
+ #ifdef HAVE_DVBRIDGE
++#include "cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h"
+ #include "utils/DVBridgeDiagnosticState.h"
++extern "C"
++{
++#include "dvbridge_gl_widen.h"
++}
+ #endif
+ 
+ #include <array>
+@@ -87,6 +92,15 @@ protected:
+ #ifdef HAVE_DVBRIDGE
+   bool DVFrameRejected(const char* stage);
+   DVBRIDGE::DiagnosticFailures m_dvRejected;
++  //! Hades: an 8-bit picture (NV12) of HLG sent as Dolby Vision given to the bridge as the same
++  //! picture in P010, each code v as (v << 2) << 6 (dvbridge_gl_widen.h); \a layer, built from the
++  //! picture's planes, is changed to the widened ones. True where nothing is to be widened, or it
++  //! was; false where the pass failed (the picture is then not drawn by the bridge)
++  bool WidenForBridge(int idx, CDVBridgeGLES::Layer& layer);
++  dvbridge_gl_widen m_dvWiden{};
++  dvbridge_gl_widened m_dvWidened[NUM_BUFFERS]{};
++  bool m_dvWidenedNow[NUM_BUFFERS]{};
++  bool m_dvWidenTold = false;
+ #endif
+   VAAPI::CVaapiTexturePool m_texturePool;
+   VAAPI::CVaapiTexture* m_vaapiTextures[NUM_BUFFERS]{};
+-- 
+2.53.0
+

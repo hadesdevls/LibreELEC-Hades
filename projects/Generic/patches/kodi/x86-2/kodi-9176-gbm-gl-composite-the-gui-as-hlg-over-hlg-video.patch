@@ -1,0 +1,239 @@
+From 361d3fde71b6bf1d6fac2c4fed216be6fff000ec Mon Sep 17 00:00:00 2001
+From: Chris <meischris39@hotmail.com>
+Date: Thu, 12 Nov 2026 16:29:16 +0000
+Subject: [PATCH] [GBM][GL] Composite the GUI as HLG over HLG video
+
+The GL GUI compositor always encoded the GUI as PQ, so over HLG video
+the GUI showed at the wrong level. Take the HLG path from the GLES
+compositor, picked from the video's transfer function as GLES does.
+A change of transfer marks the GUI dirty, as a skipped GUI walk would
+otherwise keep showing it composited for the old one.
+
+[Hades: the GL context gets here without upstream b4fd1ce (the colour
+range setting, which Hades has not taken: it has a Broadcast RGB design
+of its own), which added m_guiColorTransfer and the includes for the
+window manager: both are added with this commit. Hades builds the GLES
+context; this one is not compiled in the image.]
+(cherry picked from commit d80dcca7b8ae47b9775095b9f995781a92ac807f)
+---
+ system/shaders/GL/1.5/gl_gui_composite.frag  | 44 ++++++++++++++++----
+ xbmc/rendering/gl/GuiCompositeShaderGL.cpp   | 27 ++++++++++++
+ xbmc/rendering/gl/GuiCompositeShaderGL.h     |  3 ++
+ xbmc/windowing/gbm/WinSystemGbmGLContext.cpp | 21 ++++++++--
+ xbmc/windowing/gbm/WinSystemGbmGLContext.h   |  1 +
+ 5 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/system/shaders/GL/1.5/gl_gui_composite.frag b/system/shaders/GL/1.5/gl_gui_composite.frag
+index 9dd40b8..9da395f 100644
+--- a/system/shaders/GL/1.5/gl_gui_composite.frag
++++ b/system/shaders/GL/1.5/gl_gui_composite.frag
+@@ -12,6 +12,8 @@ in vec2 v_tex;
+ out vec4 fragColor;
+ uniform sampler2D u_samp;
+ uniform float u_sdrPeak; // SDR peak in normalized PQ (e.g. 100/10000 = 0.01)
++uniform float u_ootfGamma; // HLG: OOTF gamma (1.2 for BT.2100 1000-nit ref)
++                           // PQ: 0.0
+ 
+ // ST2084 (PQ) constants
+ const float ST2084_m1 = 0.1593017578125;   // 2610/16384
+@@ -51,19 +53,47 @@ void main()
+   // BT.709 -> BT.2020 gamut mapping
+   linear = bt709_to_bt2020 * linear;
+ 
+-  // scale to PQ luminance range: SDR content at u_sdrPeak of 10000 nits
+-  linear *= u_sdrPeak;
++  vec3 result;
+ 
+-  // linear -> PQ
+-  vec3 pq = forwardPQ(linear);
++  if (u_ootfGamma > 0.0)
++  {
++    // HLG path: direct computation following libplacebo pl_color_delinearize.
++    // BT.2100 reference display: 1000 nits. GUI white (linear 1.0) = 203 nits
++    // (BT.2408 reference white) should map to 75% HLG signal.
++    //
++    // Step 1: normalize to display-peak-relative units
++    // Step 2: inverse OOTF with 12x prescale for OETF input domain
++    // Step 3: HLG OETF (ARIB STD-B67) piecewise: sqrt for <=1, log for >1
++    const float csp_max = 1000.0 / 203.0; // display peak in ref-white units
++    const float HLG_A = 0.17883277;
++    const float HLG_B = 0.28466892;
++    const float HLG_C = 0.55991073;
++
++    vec3 scene = linear / csp_max;
++    float Y = dot(scene, vec3(0.2627, 0.6780, 0.0593));
++    scene *= 12.0 * pow(max(1e-6, Y), (1.0 - u_ootfGamma) / u_ootfGamma);
++
++    // HLG OETF piecewise (threshold at scene-light 1.0)
++    vec3 lo = vec3(0.5) * sqrt(max(scene, vec3(0.0)));
++    vec3 hi = vec3(HLG_A) * log(max(scene - vec3(HLG_B), vec3(1e-6))) + vec3(HLG_C);
++    result = mix(lo, hi, step(vec3(1.0), scene));
++  }
++  else
++  {
++    // scale to PQ luminance range: SDR content at u_sdrPeak of 10000 nits
++    linear *= u_sdrPeak;
++
++    // linear -> PQ
++    result = forwardPQ(linear);
++  }
+ 
+   // Limited-range encoding at the BO write boundary. Canonical normalized
+   // ratios (bit-depth-agnostic in float space; BO write quantizes to the
+   // active surface bit depth).
+ #ifdef KODI_LIMITED_RANGE
+-  pq = pq * ((235.0 - 16.0) / 255.0) + (16.0 / 255.0);
++  result = result * ((235.0 - 16.0) / 255.0) + (16.0 / 255.0);
+ #endif
+ 
+-  // The FBO holds coverage; squaring it compensates for PQ blending and keeps opaque GUI opaque.
+-  fragColor = vec4(pq, gui.a * gui.a);
++  // The FBO holds coverage; squaring compensates for PQ/HLG blending and keeps opaque GUI opaque.
++  fragColor = vec4(result, gui.a * gui.a);
+ }
+diff --git a/xbmc/rendering/gl/GuiCompositeShaderGL.cpp b/xbmc/rendering/gl/GuiCompositeShaderGL.cpp
+index 0efa6df..6daf0ae 100644
+--- a/xbmc/rendering/gl/GuiCompositeShaderGL.cpp
++++ b/xbmc/rendering/gl/GuiCompositeShaderGL.cpp
+@@ -10,6 +10,11 @@
+ 
+ #include "utils/log.h"
+ 
++extern "C"
++{
++#include <libavutil/pixfmt.h>
++}
++
+ CGuiCompositeShaderGL::CGuiCompositeShaderGL(const std::string& prefix)
+ {
+   VertexShader()->LoadSource("gl_gui_composite.vert", prefix);
+@@ -23,6 +28,7 @@ void CGuiCompositeShaderGL::OnCompiledAndLinked()
+   m_hSamp = glGetUniformLocation(ProgramHandle(), "u_samp");
+   m_hProj = glGetUniformLocation(ProgramHandle(), "u_proj");
+   m_hSdrPeak = glGetUniformLocation(ProgramHandle(), "u_sdrPeak");
++  m_hOotfGamma = glGetUniformLocation(ProgramHandle(), "u_ootfGamma");
+ 
+   glUseProgram(ProgramHandle());
+   glUniform1i(m_hSamp, 0);
+@@ -35,5 +41,26 @@ bool CGuiCompositeShaderGL::OnEnabled()
+     glUniformMatrix4fv(m_hProj, 1, GL_FALSE, m_proj);
+ 
+   glUniform1f(m_hSdrPeak, m_sdrPeak);
++  glUniform1f(m_hOotfGamma, m_ootfGamma);
+   return true;
+ }
++
++bool CGuiCompositeShaderGL::SetColorTransfer(int colorTransfer)
++{
++  if (colorTransfer == AVCOL_TRC_SMPTE2084)
++  {
++    m_ootfGamma = 0.0f;
++    return true;
++  }
++
++  if (colorTransfer == AVCOL_TRC_ARIB_STD_B67)
++  {
++    // BT.2100: gamma = 1.2 + 0.42 * log10(Lw/1000). For 1000-nit ref: 1.2.
++    m_ootfGamma = 1.2f;
++    return true;
++  }
++
++  CLog::Log(LOGERROR, "CGuiCompositeShaderGL::SetColorTransfer - unsupported transfer function {}",
++            colorTransfer);
++  return false;
++}
+diff --git a/xbmc/rendering/gl/GuiCompositeShaderGL.h b/xbmc/rendering/gl/GuiCompositeShaderGL.h
+index 0f707ce..b006076 100644
+--- a/xbmc/rendering/gl/GuiCompositeShaderGL.h
++++ b/xbmc/rendering/gl/GuiCompositeShaderGL.h
+@@ -19,6 +19,7 @@ public:
+ 
+   void SetProjection(const GLfloat* proj) { m_proj = proj; }
+   void SetSdrPeak(float peak) { m_sdrPeak = peak; }
++  bool SetColorTransfer(int colorTransfer);
+ 
+   GLint GetPosLoc() { return m_hPos; }
+   GLint GetTexLoc() { return m_hTex; }
+@@ -30,10 +31,12 @@ protected:
+ private:
+   const GLfloat* m_proj{nullptr};
+   float m_sdrPeak{203.0f / 10000.0f};
++  float m_ootfGamma{0.0f};
+ 
+   GLint m_hPos{-1};
+   GLint m_hTex{-1};
+   GLint m_hSamp{-1};
+   GLint m_hProj{-1};
+   GLint m_hSdrPeak{-1};
++  GLint m_hOotfGamma{-1};
+ };
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
+index f0b67d7..506332c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLContext.cpp
+@@ -9,6 +9,7 @@
+ #include "WinSystemGbmGLContext.h"
+ 
+ #include "OptionalsReg.h"
++#include "ServiceBroker.h"
+ #include "cores/RetroPlayer/process/gbm/RPProcessInfoGbm.h"
+ #include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererDMAOpenGL.h"
+ #include "cores/RetroPlayer/rendering/VideoRenderers/RPRendererFBO.h"
+@@ -17,6 +18,8 @@
+ #include "cores/VideoPlayer/Process/gbm/ProcessInfoGBM.h"
+ #include "cores/VideoPlayer/VideoRenderers/LinuxRendererGL.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
++#include "guilib/GUIComponent.h"
++#include "guilib/GUIWindowManager.h"
+ #include "rendering/gl/GuiCompositeShaderGL.h"
+ #include "rendering/gl/ScreenshotSurfaceGL.h"
+ #include "utils/BufferObjectFactory.h"
+@@ -208,9 +211,13 @@ bool CWinSystemGbmGLContext::CreateContext()
+ 
+ bool CWinSystemGbmGLContext::SetGuiCompositing(int colorTransfer)
+ {
+-  // TODO: add CreateLUTs(colorTransfer) support to GL composite shader to match
+-  // GLES (WinSystemGbmGLESContext). Currently GL only handles PQ via pow shader;
+-  // HLG and LUT-based PQ are not yet implemented.
++  // A skipped GUI walk shows the GUI as composited for the old transfer
++  if (colorTransfer != m_guiColorTransfer)
++  {
++    if (CGUIComponent* gui = CServiceBroker::GetGUI())
++      gui->GetWindowManager().MarkDirty();
++  }
++  m_guiColorTransfer = colorTransfer;
+   m_guiCompositing = (colorTransfer != 0);
+ 
+   if (m_guiCompositing)
+@@ -226,8 +233,16 @@ bool CWinSystemGbmGLContext::SetGuiCompositing(int colorTransfer)
+         CLog::Log(LOGERROR, "CWinSystemGbmGLContext: failed to compile GUI composite shader");
+         m_compositeShader.reset();
+         m_guiCompositing = false;
++        return false;
+       }
+     }
++
++    if (!m_compositeShader->SetColorTransfer(colorTransfer))
++    {
++      m_compositeShader.reset();
++      m_guiCompositing = false;
++      return false;
++    }
+   }
+   else
+   {
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLContext.h b/xbmc/windowing/gbm/WinSystemGbmGLContext.h
+index 1c68c58..a5ac95b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLContext.h
+@@ -55,6 +55,7 @@ protected:
+ 
+ private:
+   bool m_guiCompositing{false};
++  int m_guiColorTransfer{0};
+   CFrameBufferObject m_guiFbo;
+   int m_guiFboWidth{0};
+   int m_guiFboHeight{0};
+-- 
+2.53.0
+

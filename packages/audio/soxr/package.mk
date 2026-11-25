@@ -3,8 +3,8 @@
 # Copyright (C) 2016-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="soxr"
-PKG_VERSION="96a8a450f46ea8d0f2b3812080873ac31b7d501a"
-PKG_SHA256="b3c66ff8df0541ecbb857fb94479cd497455b3b032417af06300444e526c6e69"
+PKG_VERSION="a246900b0b8e7b1c1d30a581802e0a2fd4b8de8a"
+PKG_SHA256="84cd2c2152554aa95c0bf32b8dddfbe8c71ab39d3108da0f98cadfa081359903"
 PKG_LICENSE="LGPL-2.1-or-later"
 PKG_SITE="https://github.com/dofuuz/soxr"
 PKG_URL="${PKG_SITE}/archive/${PKG_VERSION}.tar.gz"

@@ -1,0 +1,728 @@
+From 9eb973ce8afae6563395f5b9dc0c2657fe99fcb3 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 03:13:56 +0000
+Subject: [PATCH] [Hades][VideoShaders][GLES] The 3D LUT of the display in
+ Kodi's own video shaders
+
+The shader that writes a picture to the window may now apply the 3D LUT of
+the display as the last step of its colour, as Kodi's desktop OpenGL
+renderer does with CColorManager: the YUV shader where the picture is
+drawn in one pass (YUV2RGBProgressiveShader, YUV2RGBBobShader, and
+YUV2RGBFilterShader of GLES 3.1), the scaler of the second pass where it
+is drawn in two (ConvolutionFilterShader; the first pass is left as it
+is). A shader is given the LUT by its renderer (CLut3dGLES, which holds
+its table on the GPU) and only then takes gles_lut3d.frag before main()
+and the call of gles_lut3d_body.frag before the dither, after the clamp of
+the output: given none, every shader is the one before, to the byte.
+
+gles_lut3d.frag reads the table of dvbridge_lut_atlas.h (an RGB32F
+texture on unit 5, read at the centres of its texels) and interpolates it
+over the six tetrahedra of a cube, as libplacebo's pl_shader_custom_lut()
+does for the bridge, in highp whatever the precision of the shader (a GPU
+without highp in a fragment shader does not make it, and the renderer goes
+on without the LUT). It takes the signal to full range within [0, 1] (an
+output of limited range: 64 to 940 of 1023, as CConvertMatrix makes it),
+to the LUT's input range and grid, and its output back; what an output of
+limited range carries below its black and above its white goes on beside
+the LUT, so that an identity LUT gives that output's codes too. A uniform
+tells it not to apply the LUT for a picture drawn elsewhere than into the
+window (a capture), as the bridges draw none there.
+
+Measured on Mesa's zink (tools/regress of LibreELEC Hades, stage lutsdr of
+dvbridge-render): a picture of an SDR clip drawn the ways Kodi draws one,
+with a known LUT in each format, is within 3.1e-7 of the LUT applied to the
+picture without it in float64; an identity LUT gives floats within 1.2e-7
+of it, and its bytes and 10-bit codes but where those floats are on either
+side of a rounding boundary of the GPU (none in four of the seven ways; at
+most 23 pixels of 2.1 million in 8 bits and 116 in 10 bits, by one code); a
+shader told not to apply it draws the picture without it, to the bit.
+---
+ system/shaders/GLES/2.0/gles_lut3d.frag       |  98 +++++++++++++++
+ system/shaders/GLES/2.0/gles_lut3d_body.frag  |   2 +
+ .../VideoShaders/CMakeLists.txt               |   6 +-
+ .../VideoRenderers/VideoShaders/Lut3dGLES.cpp | 117 ++++++++++++++++++
+ .../VideoRenderers/VideoShaders/Lut3dGLES.h   |  95 ++++++++++++++
+ .../VideoShaders/VideoFilterShaderGLES.cpp    |  17 ++-
+ .../VideoShaders/VideoFilterShaderGLES.h      |  13 +-
+ .../VideoShaders/YUV2RGBShaderGLES.cpp        |  40 ++++--
+ .../VideoShaders/YUV2RGBShaderGLES.h          |  23 +++-
+ 9 files changed, 396 insertions(+), 15 deletions(-)
+ create mode 100644 system/shaders/GLES/2.0/gles_lut3d.frag
+ create mode 100644 system/shaders/GLES/2.0/gles_lut3d_body.frag
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.h
+
+diff --git a/system/shaders/GLES/2.0/gles_lut3d.frag b/system/shaders/GLES/2.0/gles_lut3d.frag
+new file mode 100644
+index 0000000..f012e7a
+--- /dev/null
++++ b/system/shaders/GLES/2.0/gles_lut3d.frag
+@@ -0,0 +1,98 @@
++// Hades: the 3D LUT of the display (videoscreen.hadeslut3d*, windowing/gbm/DisplayLut.h), the last step of the colour
++// of a picture that Kodi's renderer draws itself, as the bridge applies it to those it maps (dvbridge_lut_shader()).
++// Put into a shader only where a LUT is applied (VideoShaders/Lut3dGLES.h): without one, every shader is the one before,
++// to the byte. GLSL ES 1.00 has no 3D texture: the table is a 2D texture of 32-bit floats that holds the N slices of
++// blue side by side (tools/dvbridge/dvbridge_lut_atlas.h), read at the centres of its texels and interpolated over the
++// six tetrahedra of a cube, as libplacebo's pl_shader_custom_lut(); in highp, whatever the precision of the shader.
++#if __VERSION__ >= 300
++#define KODI_LUT3D_TEXTURE texture
++#elif defined(GL_FRAGMENT_PRECISION_HIGH)
++#define KODI_LUT3D_TEXTURE texture2D
++#else
++#error "the 3D LUT is read and interpolated in highp, which this GPU does not have in a fragment shader"
++#endif
++
++uniform highp sampler2D m_lut3d;
++// N - 1 (N: points a side), slices a row of the texture, 1 / its width, 1 / its height
++uniform highp vec4 m_lut3dGrid;
++// the signal in full range to the input range of the LUT: scale, offset
++uniform highp vec2 m_lut3dIn;
++// a .3dl of Nuke's shaper: knee, (N - 2) / knee, N - 2, 1 / (1 - knee); a knee of 0: a uniform grid
++uniform highp vec4 m_lut3dShaper;
++// the output range of the LUT back to full: scale, offset
++uniform highp vec2 m_lut3dOut;
++// the range of the picture's signal (full: 1, 0; limited: 876 / 1023, 64 / 1023), and whether the LUT is applied
++// (0: a picture drawn elsewhere than into the window)
++uniform highp vec3 m_lut3dSignal;
++
++// the value of the LUT at grid point i (integers)
++highp vec3 KodiLut3dAt(highp vec3 i)
++{
++  highp float n = m_lut3dGrid.x + 1.0;
++  highp float row = floor((i.b + 0.5) / m_lut3dGrid.y);
++  highp float col = i.b - row * m_lut3dGrid.y;
++  highp vec2 at = vec2(col * n + i.r + 0.5, row * n + i.g + 0.5) * m_lut3dGrid.zw;
++  return KODI_LUT3D_TEXTURE(m_lut3d, at).rgb;
++}
++
++highp vec3 KodiLut3d(highp vec3 signal)
++{
++  if (m_lut3dSignal.z < 0.5)
++    return signal;
++  // the signal in full range within [0, 1], to the input range of the LUT; an output of limited range carries what is
++  // below its black and above its white (to 0 and 1023 of 1023), which goes on beside the LUT, as far from its black and
++  // white as it was (an output of full range holds it at 0 and 1 itself)
++  highp vec3 full = (signal - vec3(m_lut3dSignal.y)) / m_lut3dSignal.x;
++  highp vec3 c = clamp(full, 0.0, 1.0);
++  highp vec3 beyond = m_lut3dSignal.x < 1.0 ? full - c : vec3(0.0);
++  c = c * m_lut3dIn.x + m_lut3dIn.y;
++  // ... to the grid: uniform, or Nuke's shaper (N - 2 steps up to the knee, one after it)
++  highp vec3 p;
++  if (m_lut3dShaper.x > 0.0)
++  {
++    highp vec3 u = clamp(c, 0.0, 1.0);
++    highp vec3 below = u * m_lut3dShaper.y;
++    highp vec3 above = vec3(m_lut3dShaper.z) + (u - vec3(m_lut3dShaper.x)) * m_lut3dShaper.w;
++    p.r = u.r > m_lut3dShaper.x ? above.r : below.r;
++    p.g = u.g > m_lut3dShaper.x ? above.g : below.g;
++    p.b = u.b > m_lut3dShaper.x ? above.b : below.b;
++    p = clamp(p, 0.0, m_lut3dGrid.x);
++  }
++  else
++    p = clamp(c, 0.0, 1.0) * m_lut3dGrid.x;
++  // the cube of p and where p is in it, and the tetrahedron: the steps along the axes in the order of the fractions,
++  // the largest first
++  highp vec3 base = min(floor(p), vec3(m_lut3dGrid.x - 1.0));
++  highp vec3 f = p - base;
++  highp vec3 c0 = KodiLut3dAt(base);
++  highp vec3 c3 = KodiLut3dAt(base + vec3(1.0));
++  highp vec3 v;
++  if (f.r >= f.g)
++  {
++    if (f.g >= f.b)
++      v = (1.0 - f.r) * c0 + (f.r - f.g) * KodiLut3dAt(base + vec3(1.0, 0.0, 0.0)) +
++          (f.g - f.b) * KodiLut3dAt(base + vec3(1.0, 1.0, 0.0)) + f.b * c3;
++    else if (f.r >= f.b)
++      v = (1.0 - f.r) * c0 + (f.r - f.b) * KodiLut3dAt(base + vec3(1.0, 0.0, 0.0)) +
++          (f.b - f.g) * KodiLut3dAt(base + vec3(1.0, 0.0, 1.0)) + f.g * c3;
++    else
++      v = (1.0 - f.b) * c0 + (f.b - f.r) * KodiLut3dAt(base + vec3(0.0, 0.0, 1.0)) +
++          (f.r - f.g) * KodiLut3dAt(base + vec3(1.0, 0.0, 1.0)) + f.g * c3;
++  }
++  else
++  {
++    if (f.b >= f.g)
++      v = (1.0 - f.b) * c0 + (f.b - f.g) * KodiLut3dAt(base + vec3(0.0, 0.0, 1.0)) +
++          (f.g - f.r) * KodiLut3dAt(base + vec3(0.0, 1.0, 1.0)) + f.r * c3;
++    else if (f.b >= f.r)
++      v = (1.0 - f.g) * c0 + (f.g - f.b) * KodiLut3dAt(base + vec3(0.0, 1.0, 0.0)) +
++          (f.b - f.r) * KodiLut3dAt(base + vec3(0.0, 1.0, 1.0)) + f.r * c3;
++    else
++      v = (1.0 - f.g) * c0 + (f.g - f.r) * KodiLut3dAt(base + vec3(0.0, 1.0, 0.0)) +
++          (f.r - f.b) * KodiLut3dAt(base + vec3(1.0, 1.0, 0.0)) + f.b * c3;
++  }
++  // the output of the LUT back to full range within [0, 1], and to the range of the picture's signal
++  v = clamp(v * m_lut3dOut.x + m_lut3dOut.y, 0.0, 1.0);
++  return (v + beyond) * m_lut3dSignal.x + vec3(m_lut3dSignal.y);
++}
++
+diff --git a/system/shaders/GLES/2.0/gles_lut3d_body.frag b/system/shaders/GLES/2.0/gles_lut3d_body.frag
+new file mode 100644
+index 0000000..abf44b6
+--- /dev/null
++++ b/system/shaders/GLES/2.0/gles_lut3d_body.frag
+@@ -0,0 +1,2 @@
++  // Hades: the 3D LUT of the display, the last step of the colour, before the dither (gles_lut3d.frag)
++  rgb.rgb = KodiLut3d(rgb.rgb);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
+index 4cf1269..2416b92 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/CMakeLists.txt
+@@ -36,9 +36,11 @@ if(TARGET ${APP_NAME_LC}::OpenGLES AND ("android" IN_LIST CORE_PLATFORM_NAME_LC
+                             "gbm" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "x11" IN_LIST CORE_PLATFORM_NAME_LC OR
+                             "wayland" IN_LIST CORE_PLATFORM_NAME_LC))
+-  list(APPEND SOURCES VideoFilterShaderGLES.cpp
++  list(APPEND SOURCES Lut3dGLES.cpp
++                      VideoFilterShaderGLES.cpp
+                       YUV2RGBShaderGLES.cpp)
+-  list(APPEND HEADERS VideoFilterShaderGLES.h
++  list(APPEND HEADERS Lut3dGLES.h
++                      VideoFilterShaderGLES.h
+                       YUV2RGBShaderGLES.h)
+ endif()
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.cpp
+new file mode 100644
+index 0000000..6a98593
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.cpp
+@@ -0,0 +1,117 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "Lut3dGLES.h"
++
++#include "guilib/Shader.h"
++#include "utils/StringUtils.h"
++
++using namespace Shaders::GLES;
++
++bool CLut3dGLES::Upload(const float* rgb, int width, int height, std::string& why)
++{
++  why.clear();
++  Release();
++  if (!rgb || width < 1 || height < 1)
++  {
++    why = "no table";
++    return false;
++  }
++#if defined(GL_ES_VERSION_3_0)
++  // (errors of before are not this upload's; a lost context may keep giving one)
++  for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i)
++    ;
++  // the unpacking as the table is laid out (the planes of the video may leave a row length or an alignment set)
++  GLint alignment = 4, rowLength = 0;
++  glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++  glGetIntegerv(GL_UNPACK_ROW_LENGTH, &rowLength);
++  glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++  glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++  glGenTextures(1, &m_texture);
++  glActiveTexture(GL_TEXTURE0 + UNIT);
++  glBindTexture(GL_TEXTURE_2D, m_texture);
++  // (read at the centres of its texels: a float texture needs no filtering, which OpenGL ES 3 does not give one of
++  // 32-bit floats)
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, width, height, 0, GL_RGB, GL_FLOAT, rgb);
++  const GLenum error = glGetError();
++  glBindTexture(GL_TEXTURE_2D, 0);
++  glActiveTexture(GL_TEXTURE0);
++  glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++  glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
++  if (error != GL_NO_ERROR)
++  {
++    why = StringUtils::Format("the GPU did not take its table as a texture of {}x{} 32-bit floats ({} MB): GL error "
++                              "{:#x}",
++                              width, height,
++                              (static_cast<size_t>(width) * static_cast<size_t>(height) * 12) >> 20, error);
++    Release();
++    return false;
++  }
++  m_bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 3 * sizeof(float);
++  return true;
++#else
++  why = "its table is a texture of 32-bit floats, which needs OpenGL ES 3";
++  return false;
++#endif
++}
++
++void CLut3dGLES::Release()
++{
++  if (m_texture)
++    glDeleteTextures(1, &m_texture);
++  m_texture = 0;
++  m_bytes = 0;
++}
++
++void CLut3dGLES::SetSignal(bool limited, bool apply)
++{
++  m_limited = limited;
++  m_apply = apply;
++}
++
++bool CLut3dGLES::Insert(CShader& pixel, const std::string& marker)
++{
++  return pixel.InsertSource("gles_lut3d.frag", "void main()") &&
++         pixel.InsertSource("gles_lut3d_body.frag", marker);
++}
++
++void CLut3dGLES::Locate(GLuint program, Handles& handles)
++{
++  handles.texture = glGetUniformLocation(program, "m_lut3d");
++  handles.grid = glGetUniformLocation(program, "m_lut3dGrid");
++  handles.in = glGetUniformLocation(program, "m_lut3dIn");
++  handles.shaper = glGetUniformLocation(program, "m_lut3dShaper");
++  handles.out = glGetUniformLocation(program, "m_lut3dOut");
++  handles.signal = glGetUniformLocation(program, "m_lut3dSignal");
++}
++
++void CLut3dGLES::Bind(const Handles& handles) const
++{
++  glActiveTexture(GL_TEXTURE0 + UNIT);
++  glBindTexture(GL_TEXTURE_2D, m_texture);
++  glActiveTexture(GL_TEXTURE0);
++  glUniform1i(handles.texture, UNIT);
++  glUniform4fv(handles.grid, 1, m_grid);
++  glUniform2fv(handles.in, 1, m_in);
++  glUniform4fv(handles.shaper, 1, m_shaper);
++  glUniform2fv(handles.out, 1, m_out);
++  // (the limited range of the output as CConvertMatrix::GetYuvMat() makes it: 64 to 940 of 1023)
++  glUniform3f(handles.signal, m_limited ? (940.0f - 64.0f) / 1023.0f : 1.0f, m_limited ? 64.0f / 1023.0f : 0.0f,
++              m_apply && m_texture ? 1.0f : 0.0f);
++}
++
++void CLut3dGLES::Unbind()
++{
++  glActiveTexture(GL_TEXTURE0 + UNIT);
++  glBindTexture(GL_TEXTURE_2D, 0);
++  glActiveTexture(GL_TEXTURE0);
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.h
+new file mode 100644
+index 0000000..9db590c
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.h
+@@ -0,0 +1,95 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "system_gl.h"
++
++#include <cstddef>
++#include <string>
++
++namespace Shaders
++{
++class CShader;
++
++namespace GLES
++{
++
++/*!
++ * \brief Hades: the 3D LUT of the display (videoscreen.hadeslut3d*, windowing/gbm/DisplayLut.h) in the video shaders of
++ *        Kodi's own renderer, as the last step of the colour of the pictures that it draws itself into the window.
++ *
++ * The renderer holds one, made from the LUT that the window system decides on (its table as a 2D texture of 32-bit
++ * floats: tools/dvbridge/dvbridge_lut_atlas.h), and gives it to the shader that writes the picture to the window (the
++ * YUV shader where it draws in one pass, the scaler of the second pass where it draws in two); that shader takes
++ * gles_lut3d.frag before main() and gles_lut3d_body.frag before the dither, and reads the table and its values here
++ * (Locate(), Bind()). A shader given none is the one before, to the byte.
++ */
++class CLut3dGLES
++{
++public:
++  //! The texture unit of the table (0 to 2: the planes; 3: the scaling kernel or the dither; 4: the dither)
++  static constexpr int UNIT = 5;
++
++  CLut3dGLES() = default;
++  ~CLut3dGLES() { Release(); }
++  CLut3dGLES(const CLut3dGLES&) = delete;
++  CLut3dGLES& operator=(const CLut3dGLES&) = delete;
++
++  /*!
++   * \brief The table on the GPU (the render thread, with its context): width x height texels of 3 floats, the first
++   *        row of glTexImage2D first; false and why where the GPU does not take it (no texture is then kept)
++   */
++  bool Upload(const float* rgb, int width, int height, std::string& why);
++  void Release();
++  bool Valid() const { return m_texture != 0; }
++  //! The bytes of the table on the GPU
++  size_t Bytes() const { return m_bytes; }
++
++  //! The values of gles_lut3d.frag (dvbridge_lut_atlas: grid, input, shaper, output)
++  float m_grid[4]{1.0f, 1.0f, 1.0f, 1.0f};
++  float m_in[2]{1.0f, 0.0f};
++  float m_shaper[4]{0.0f, 0.0f, 0.0f, 0.0f};
++  float m_out[2]{1.0f, 0.0f};
++
++  /*!
++   * \brief The range of the picture's signal (limited: 64 to 940 of 1023, as CConvertMatrix makes it) and whether the
++   *        LUT is applied to the pictures drawn from now on (not to one drawn elsewhere than into the window)
++   */
++  void SetSignal(bool limited, bool apply);
++  bool Applied() const { return m_apply; }
++
++  //! Puts the shader files of the LUT into a pixel shader: its functions before main(), its call before marker (the
++  //! place where the dither goes, which is put in after it)
++  static bool Insert(CShader& pixel, const std::string& marker);
++
++  struct Handles
++  {
++    GLint texture{-1};
++    GLint grid{-1};
++    GLint in{-1};
++    GLint shaper{-1};
++    GLint out{-1};
++    GLint signal{-1};
++  };
++  //! The uniforms of the LUT in a linked program
++  static void Locate(GLuint program, Handles& handles);
++  //! The table on its unit and the values of the uniforms (the program in use); the active unit is left at 0
++  void Bind(const Handles& handles) const;
++  //! The unit of the table emptied; the active unit is left at 0
++  static void Unbind();
++
++private:
++  GLuint m_texture{0};
++  size_t m_bytes{0};
++  bool m_limited{false};
++  bool m_apply{true};
++};
++
++} // namespace GLES
++} // namespace Shaders
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.cpp
+index e5d20b1..ab73376 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.cpp
+@@ -69,10 +69,13 @@ bool BaseVideoFilterShader::OnEnabled()
+   return true;
+ }
+ 
+-ConvolutionFilterShader::ConvolutionFilterShader(ESCALINGMETHOD method, bool dither)
++ConvolutionFilterShader::ConvolutionFilterShader(ESCALINGMETHOD method,
++                                                 bool dither,
++                                                 const CLut3dGLES* lut3d)
+ {
+   m_method = method;
+   m_dither = dither;
++  m_lut3d = lut3d;
+ 
+   std::string shadername;
+   std::string defines = OutputDefines();
+@@ -122,6 +125,10 @@ ConvolutionFilterShader::ConvolutionFilterShader(ESCALINGMETHOD method, bool dit
+ 
+   PixelShader()->LoadSource(shadername, defines);
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
++  // Hades: the 3D LUT of the display, where it is given one (Lut3dGLES.h): this pass writes the picture to the
++  // window; before the dither (a shader whose files could not be put together has none: HasLut3d())
++  if (m_lut3d && !CLut3dGLES::Insert(*PixelShader(), "gl_FragColor"))
++    m_lut3d = nullptr;
+   PixelShader()->InsertSource("gles_dither_body.frag", "gl_FragColor");
+ }
+ 
+@@ -146,6 +153,9 @@ void ConvolutionFilterShader::OnCompiledAndLinked()
+     m_hDitherQuant = glGetUniformLocation(ProgramHandle(), "m_ditherquant");
+     m_hDitherSize = glGetUniformLocation(ProgramHandle(), "m_dithersize");
+   }
++  // Hades: the 3D LUT of the display, where this shader applies it
++  if (m_lut3d)
++    CLut3dGLES::Locate(ProgramHandle(), m_lut3dHandles);
+ 
+   CConvolutionKernel kernel(m_method, 256);
+ 
+@@ -230,6 +240,9 @@ bool ConvolutionFilterShader::OnEnabled()
+     glUniform2f(m_hDitherSize, static_cast<float>(m_ditherSize), static_cast<float>(m_ditherSize));
+     VerifyGLState();
+   }
++  // Hades: the 3D LUT of the display: its table and its values
++  if (m_lut3d)
++    m_lut3d->Bind(m_lut3dHandles);
+ 
+   return true;
+ }
+@@ -242,6 +255,8 @@ void ConvolutionFilterShader::OnDisabled()
+     glBindTexture(GL_TEXTURE_2D, 0);
+     glActiveTexture(GL_TEXTURE0);
+   }
++  if (m_lut3d)
++    CLut3dGLES::Unbind();
+ }
+ 
+ void ConvolutionFilterShader::Free()
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.h
+index a912550..2ac5c0c 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/VideoFilterShaderGLES.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "Lut3dGLES.h"
+ #include "cores/VideoSettings.h"
+ #include "guilib/Shader.h"
+ 
+@@ -43,6 +44,9 @@ public:
+     m_model = m;
+   }
+   virtual void SetAlpha(GLfloat alpha) { m_alpha = alpha; }
++  //! Hades: this shader applies the 3D LUT of the display it was made with (Lut3dGLES.h): the second pass, which
++  //! writes the picture to the window
++  virtual bool HasLut3d() const { return false; }
+ 
+ protected:
+   int m_width;
+@@ -69,7 +73,9 @@ protected:
+   class ConvolutionFilterShader : public BaseVideoFilterShader
+   {
+   public:
+-    ConvolutionFilterShader(ESCALINGMETHOD method, bool dither = false);
++    ConvolutionFilterShader(ESCALINGMETHOD method,
++                            bool dither = false,
++                            const CLut3dGLES* lut3d = nullptr);
+     ~ConvolutionFilterShader() override;
+     void OnCompiledAndLinked() override;
+     bool OnEnabled() override;
+@@ -77,6 +83,7 @@ protected:
+     void Free();
+ 
+     bool GetTextureFilter(GLint& filter) override { filter = GL_NEAREST; return true; }
++    bool HasLut3d() const override { return m_lut3d != nullptr; }
+ 
+     void SetDitherUniforms(bool enabled,
+                            GLuint ditherTex,
+@@ -104,6 +111,10 @@ protected:
+     GLuint m_ditherTex = 0;
+     unsigned int m_ditherDepth = 0;
+     int m_ditherSize = 0;
++
++    //! Hades: the 3D LUT of the display (the renderer's, kept while this shader is), nullptr: none
++    const CLut3dGLES* m_lut3d = nullptr;
++    CLut3dGLES::Handles m_lut3dHandles;
+   };
+ 
+   class DefaultFilterShader : public BaseVideoFilterShader
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+index f6a4625..d351bba 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+@@ -32,13 +32,15 @@ BaseYUV2RGBGLSLShader::BaseYUV2RGBGLSLShader(EShaderFormat format,
+                                              AVColorPrimaries srcPrimaries,
+                                              bool toneMap,
+                                              ETONEMAPMETHOD toneMapMethod,
+-                                             bool dither)
++                                             bool dither,
++                                             const CLut3dGLES* lut3d)
+ {
+   m_width = 1;
+   m_height = 1;
+   m_field = 0;
+   m_format = format;
+   m_dither = dither;
++  m_lut3d = lut3d;
+ 
+   m_black = 0.0f;
+   m_contrast = 1.0f;
+@@ -157,6 +159,9 @@ void BaseYUV2RGBGLSLShader::OnCompiledAndLinked()
+     m_hDitherQuant = glGetUniformLocation(ProgramHandle(), "m_ditherquant");
+     m_hDitherSize = glGetUniformLocation(ProgramHandle(), "m_dithersize");
+   }
++  // Hades: the 3D LUT of the display, where this shader applies it
++  if (m_lut3d)
++    CLut3dGLES::Locate(ProgramHandle(), m_lut3dHandles);
+ 
+   VerifyGLState();
+ }
+@@ -261,6 +266,9 @@ bool BaseYUV2RGBGLSLShader::OnEnabled()
+     glUniform1f(m_hDitherQuant, (1 << m_ditherDepth) - 1.0f);
+     glUniform2f(m_hDitherSize, static_cast<float>(m_ditherSize), static_cast<float>(m_ditherSize));
+   }
++  // Hades: the 3D LUT of the display: its table and its values
++  if (m_lut3d)
++    m_lut3d->Bind(m_lut3dHandles);
+ 
+   VerifyGLState();
+ 
+@@ -286,12 +294,21 @@ void BaseYUV2RGBGLSLShader::OnDisabled()
+     glBindTexture(GL_TEXTURE_2D, 0);
+     glActiveTexture(GL_TEXTURE0);
+   }
++  if (m_lut3d)
++    CLut3dGLES::Unbind();
+ }
+ 
+ void BaseYUV2RGBGLSLShader::Free()
+ {
+ }
+ 
++void BaseYUV2RGBGLSLShader::InsertLut3d(const std::string& marker)
++{
++  // (a shader whose files could not be put together has no LUT: HasLut3d() says so, and the renderer)
++  if (m_lut3d && !CLut3dGLES::Insert(*PixelShader(), marker))
++    m_lut3d = nullptr;
++}
++
+ bool BaseYUV2RGBGLSLShader::AddChromaDefines(KODI::CHROMA::Filter filter)
+ {
+   using KODI::CHROMA::Filter;
+@@ -350,8 +367,9 @@ YUV2RGBProgressiveShader::YUV2RGBProgressiveShader(EShaderFormat format,
+                                                    bool toneMap,
+                                                    ETONEMAPMETHOD toneMapMethod,
+                                                    bool dither,
+-                                                   KODI::CHROMA::Filter chroma)
+-  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither)
++                                                   KODI::CHROMA::Filter chroma,
++                                                   const CLut3dGLES* lut3d)
++  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither, lut3d)
+ {
+   // Hades: the chroma of a 4:2:0 picture (gles_yuv2rgb_chroma.frag; it has none of the places the
+   // inserts below look for)
+@@ -361,6 +379,8 @@ YUV2RGBProgressiveShader::YUV2RGBProgressiveShader(EShaderFormat format,
+     PixelShader()->InsertSource("gles_yuv2rgb_chroma.frag", "void main()");
+   PixelShader()->InsertSource("gles_tonemap.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
++  // Hades: the 3D LUT of the display, where it is given one (Lut3dGLES.h), before the dither
++  InsertLut3d("gl_FragColor");
+   PixelShader()->InsertSource("gles_dither_body.frag", "gl_FragColor");
+ }
+ 
+@@ -374,12 +394,15 @@ YUV2RGBBobShader::YUV2RGBBobShader(EShaderFormat format,
+                                    AVColorPrimaries srcPrimaries,
+                                    bool toneMap,
+                                    ETONEMAPMETHOD toneMapMethod,
+-                                   bool dither)
+-  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither)
++                                   bool dither,
++                                   const CLut3dGLES* lut3d)
++  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither, lut3d)
+ {
+   PixelShader()->LoadSource("gles_yuv2rgb_bob.frag", m_defines);
+   PixelShader()->InsertSource("gles_tonemap.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
++  // Hades: the 3D LUT of the display, where it is given one (Lut3dGLES.h), before the dither
++  InsertLut3d("gl_FragColor");
+   PixelShader()->InsertSource("gles_dither_body.frag", "gl_FragColor");
+ }
+ 
+@@ -415,8 +438,9 @@ YUV2RGBFilterShader::YUV2RGBFilterShader(EShaderFormat format,
+                                          ETONEMAPMETHOD toneMapMethod,
+                                          ESCALINGMETHOD method,
+                                          bool dither,
+-                                         KODI::CHROMA::Filter chroma)
+-  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither)
++                                         KODI::CHROMA::Filter chroma,
++                                         const CLut3dGLES* lut3d)
++  : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither, lut3d)
+ {
+   m_scaling = method;
+   // Hades: the chroma of a 4:2:0 picture, as YUV2RGBProgressiveShader takes it
+@@ -427,6 +451,8 @@ YUV2RGBFilterShader::YUV2RGBFilterShader(EShaderFormat format,
+     PixelShader()->InsertSource("gles_yuv2rgb_chroma.frag", "void main()");
+   PixelShader()->InsertSource("gles_tonemap.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
++  // Hades: the 3D LUT of the display, where it is given one (Lut3dGLES.h), before the dither
++  InsertLut3d("fragColor = rgb");
+   PixelShader()->InsertSource("gles_dither_body.frag", "fragColor = rgb");
+ }
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
+index 33ad258..f7eb50a 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
+@@ -10,6 +10,7 @@
+ 
+ #include "../ChromaStepDown.h"
+ #include "ConversionMatrix.h"
++#include "Lut3dGLES.h"
+ #include "ShaderFormats.h"
+ #include "cores/VideoSettings.h"
+ #include "guilib/Shader.h"
+@@ -32,7 +33,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                           AVColorPrimaries src,
+                           bool toneMap,
+                           ETONEMAPMETHOD toneMapMethod,
+-                          bool dither = false);
++                          bool dither = false,
++                          const CLut3dGLES* lut3d = nullptr);
+     ~BaseYUV2RGBGLSLShader() override;
+     void SetField(int field) { m_field = field; }
+     void SetWidth(int w) { m_width = w; }
+@@ -62,6 +64,9 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+     //! Hades: how this shader takes the chroma (KODI: Kodi's own way, for any format other than
+     //! the 4:2:0 ones, or where it was asked for)
+     KODI::CHROMA::Filter ChromaFilter() const { return m_chromaFilter; }
++    //! Hades: this shader applies the 3D LUT of the display it was made with (Lut3dGLES.h): the shader that
++    //! writes the picture to the window
++    bool HasLut3d() const { return m_lut3d != nullptr; }
+ 
+     GLint GetVertexLoc() { return m_hVertex; }
+     GLint GetYcoordLoc() { return m_hYcoord; }
+@@ -79,6 +84,9 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+     //! Hades: the defines of a chroma filter for a 4:2:0 format (none for any other, or for KODI);
+     //! true where the shader then takes gles_yuv2rgb_chroma.frag, before main()
+     bool AddChromaDefines(KODI::CHROMA::Filter filter);
++    //! Hades: the files of the 3D LUT put into the pixel shader (before main(), and its call before marker),
++    //! where the shader is made with one; before the dither is put in, so that the dither comes after it
++    void InsertLut3d(const std::string& marker);
+ 
+     EShaderFormat m_format;
+     int m_width;
+@@ -107,6 +115,10 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+     GLint m_hChromaSize{-1};
+     GLint m_hChromaShift{-1};
+ 
++    //! Hades: the 3D LUT of the display (the renderer's, kept while this shader is), nullptr: none
++    const CLut3dGLES* m_lut3d{nullptr};
++    CLut3dGLES::Handles m_lut3dHandles;
++
+     float m_black;
+     float m_contrast;
+ 
+@@ -162,7 +174,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                              bool toneMap,
+                              ETONEMAPMETHOD toneMapMethod,
+                              bool dither = false,
+-                             KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI);
++                             KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI,
++                             const CLut3dGLES* lut3d = nullptr);
+   };
+ 
+   class YUV2RGBBobShader : public BaseYUV2RGBGLSLShader
+@@ -173,7 +186,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                      AVColorPrimaries srcPrimaries,
+                      bool toneMap,
+                      ETONEMAPMETHOD toneMapMethod,
+-                     bool dither = false);
++                     bool dither = false,
++                     const CLut3dGLES* lut3d = nullptr);
+     void OnCompiledAndLinked() override;
+     bool OnEnabled() override;
+ 
+@@ -192,7 +206,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                         ETONEMAPMETHOD toneMapMethod,
+                         ESCALINGMETHOD method,
+                         bool dither = false,
+-                        KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI);
++                        KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI,
++                        const CLut3dGLES* lut3d = nullptr);
+     ~YUV2RGBFilterShader() override;
+ 
+   protected:
+-- 
+2.53.0
+

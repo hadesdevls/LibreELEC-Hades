@@ -66,9 +66,9 @@ def main():
         if os.path.exists(dest):
             sys.exit('%s exists' % dest)
         os.makedirs(dest)
-        # (what the tests read: the sources, and the strings of the core and of Estuary)
-        for top in ('xbmc', 'tools/dvbridge', 'addons/resource.language.en_gb', 'addons/skin.estuary/language',
-                    'addons/skin.estuary/xml', 'addons/skin.estuary/fonts'):
+        # (what the tests read: the sources, the shaders, the keymaps, and the strings of the core and of Estuary)
+        for top in ('xbmc', 'tools/dvbridge', 'system/shaders', 'system/keymaps', 'addons/resource.language.en_gb',
+                    'addons/skin.estuary/language', 'addons/skin.estuary/xml', 'addons/skin.estuary/fonts'):
             if os.path.isdir(os.path.join(tree, top)):
                 link_tree(tree, dest, top)
         path = os.path.join(dest, m['file'])

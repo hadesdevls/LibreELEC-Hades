@@ -1,0 +1,1701 @@
+From dab423f60e390ac1a1b54d89baefb89a412ed2f5 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:51:21 +0000
+Subject: [PATCH] [Hades][VideoPlayer] Settings of a film kept by what it is:
+ identity, tracks and releases
+
+Kodi keeps the settings of a video (its audio and subtitle tracks, their
+delays, the zoom, the picture settings) for its file, by its path. An
+add-on that plays from an online service gives another link at each
+playback, often of another release of the same film, so those settings
+were lost every time.
+
+FilmMemory.h is the logic, with no state, to keep them for the film or
+episode itself, named by the ids its add-on gives it (IMDb, TMDb, TVDb;
+season and number for an episode), one record per release that played
+(its length and the format of its video):
+- two identities are the same video only with an id in common and no id
+  of the same type that differs, the same kind, season and number;
+- tracks are found again by what they are (language and its variety,
+  forced, commentary, audio description, then name, codec, channels,
+  hearing impaired, place among those of their language), never by their
+  number, and only where the release that plays has such a track;
+- each setting comes from the most recent record where it applies: the
+  tracks from any release, the zoom from a picture of the same shape, the
+  picture settings from a video of the same format, the volume from the
+  same cut (lengths within 0.5 %, 5 to 30 s), the audio and subtitle
+  delays and the video stream only from the same release (the same length
+  to the second and the same video), as another release or another cut is
+  timed otherwise;
+- a record is a versioned "key=value" text: a later version's keys are
+  left out and values not valid here keep the default.
+
+TestFilmMemory covers the identities, the text, the tracks and what each
+release takes.
+---
+ xbmc/cores/VideoPlayer/CMakeLists.txt         |   2 +
+ xbmc/cores/VideoPlayer/FilmMemory.cpp         | 918 ++++++++++++++++++
+ xbmc/cores/VideoPlayer/FilmMemory.h           | 224 +++++
+ xbmc/cores/VideoPlayer/test/CMakeLists.txt    |   1 +
+ .../cores/VideoPlayer/test/TestFilmMemory.cpp | 462 +++++++++
+ 5 files changed, 1607 insertions(+)
+ create mode 100644 xbmc/cores/VideoPlayer/FilmMemory.cpp
+ create mode 100644 xbmc/cores/VideoPlayer/FilmMemory.h
+ create mode 100644 xbmc/cores/VideoPlayer/test/TestFilmMemory.cpp
+
+diff --git a/xbmc/cores/VideoPlayer/CMakeLists.txt b/xbmc/cores/VideoPlayer/CMakeLists.txt
+index 8fa5554..e4677e7 100644
+--- a/xbmc/cores/VideoPlayer/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/CMakeLists.txt
+@@ -14,6 +14,7 @@ set(SOURCES AudioSinkAE.cpp
+             Edl/EdlParsers/MultipleEpisodeEdlParser.cpp
+             Edl/EdlParsers/PvrEdlParser.cpp
+             Edl/EdlParsers/VideoReDoParser.cpp
++            FilmMemory.cpp
+             MatroskaEditionChoice.cpp
+             MultiviewDisc.cpp
+             PTSTracker.cpp
+@@ -54,6 +55,7 @@ set(HEADERS AudioSinkAE.h
+             MultiviewChoice.h
+             MultiviewDisc.h
+             FieldCadence.h
++            FilmMemory.h
+             FilmTimer.h
+             OverlayFrameMatch.h
+             PTSTracker.h
+diff --git a/xbmc/cores/VideoPlayer/FilmMemory.cpp b/xbmc/cores/VideoPlayer/FilmMemory.cpp
+new file mode 100644
+index 0000000..af1d436
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/FilmMemory.cpp
+@@ -0,0 +1,918 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "FilmMemory.h"
++
++#include "cores/VideoPlayer/Interface/StreamInfo.h"
++
++#include <algorithm>
++#include <charconv>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <functional>
++#include <system_error>
++
++namespace KODI::FILMMEMORY
++{
++namespace
++{
++constexpr int VERSION = 1;
++
++std::string Trimmed(std::string_view text)
++{
++  const auto first = text.find_first_not_of(" \t\r\n");
++  if (first == std::string_view::npos)
++    return {};
++  const auto last = text.find_last_not_of(" \t\r\n");
++  return std::string(text.substr(first, last - first + 1));
++}
++
++std::string Lower(std::string_view text)
++{
++  std::string lower(text);
++  for (char& c : lower)
++  {
++    if (c >= 'A' && c <= 'Z')
++      c = static_cast<char>(c - 'A' + 'a');
++  }
++  return lower;
++}
++
++bool AllDigits(std::string_view text)
++{
++  return !text.empty() &&
++         std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
++}
++
++//! "tt" and 7 to 10 digits
++std::string ImdbId(std::string_view text)
++{
++  const std::string id = Lower(Trimmed(text));
++  if (id.size() < 9 || id.size() > 12 || id.compare(0, 2, "tt") != 0 ||
++      !AllDigits(std::string_view(id).substr(2)))
++    return {};
++  return id;
++}
++
++//! 1 to 10 digits, not all of them 0 (a number without its leading zeros)
++std::string NumericId(std::string_view text)
++{
++  std::string id = Trimmed(text);
++  if (!AllDigits(id) || id.size() > 10)
++    return {};
++  const auto first = id.find_first_not_of('0');
++  if (first == std::string::npos)
++    return {};
++  return id.substr(first);
++}
++
++std::string Duration(int64_t ms)
++{
++  if (ms <= 0)
++    return "length not known";
++  const int64_t s = (ms + 500) / 1000;
++  char text[32];
++  std::snprintf(text, sizeof(text), "%lld:%02lld:%02lld", static_cast<long long>(s / 3600),
++                static_cast<long long>(s / 60 % 60), static_cast<long long>(s % 60));
++  return text;
++}
++
++const char* HdrName(int hdr)
++{
++  switch (static_cast<StreamHdrType>(hdr))
++  {
++    case StreamHdrType::HDR_TYPE_NONE:
++      return "SDR";
++    case StreamHdrType::HDR_TYPE_HDR10:
++      return "HDR10";
++    case StreamHdrType::HDR_TYPE_DOLBYVISION:
++      return "Dolby Vision";
++    case StreamHdrType::HDR_TYPE_HLG:
++      return "HLG";
++    case StreamHdrType::HDR_TYPE_HDR10PLUS:
++      return "HDR10+";
++    default:
++      return "HDR";
++  }
++}
++
++// ---- the text of a record
++
++std::string Escaped(std::string_view value)
++{
++  std::string text;
++  for (const char c : value)
++  {
++    if (c == '\\')
++      text += "\\\\";
++    else if (c == '\n')
++      text += "\\n";
++    else if (c == '\r')
++      text += "\\r";
++    else
++      text += c;
++  }
++  return text;
++}
++
++std::string Unescaped(std::string_view value)
++{
++  std::string text;
++  for (size_t i = 0; i < value.size(); ++i)
++  {
++    if (value[i] == '\\' && i + 1 < value.size())
++    {
++      ++i;
++      text += value[i] == 'n' ? '\n' : value[i] == 'r' ? '\r' : value[i];
++    }
++    else
++      text += value[i];
++  }
++  return text;
++}
++
++std::string Number(float value)
++{
++  char text[64];
++  const auto result = std::to_chars(text, text + sizeof(text), value);
++  return std::string(text, result.ptr);
++}
++
++std::optional<float> FloatOf(std::string_view text)
++{
++  float value = 0.0f;
++  const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
++  if (result.ec != std::errc() || result.ptr != text.data() + text.size() || !std::isfinite(value))
++    return std::nullopt;
++  return value;
++}
++
++std::optional<int64_t> IntOf(std::string_view text)
++{
++  int64_t value = 0;
++  const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
++  if (result.ec != std::errc() || result.ptr != text.data() + text.size())
++    return std::nullopt;
++  return value;
++}
++
++void Line(std::string& text, std::string_view key, std::string_view value)
++{
++  text += key;
++  text += '=';
++  text += Escaped(value);
++  text += '\n';
++}
++
++void Line(std::string& text, std::string_view key, int64_t value)
++{
++  Line(text, key, std::to_string(value));
++}
++
++void Line(std::string& text, std::string_view key, float value)
++{
++  Line(text, key, Number(value));
++}
++
++void TrackLines(std::string& text, std::string_view prefix, const Track& track)
++{
++  const std::string p(prefix);
++  Line(text, p, int64_t{1});
++  Line(text, p + ".lang", track.language);
++  Line(text, p + ".variety", int64_t{track.variety});
++  Line(text, p + ".name", track.name);
++  Line(text, p + ".codec", track.codec);
++  Line(text, p + ".channels", int64_t{track.channels});
++  Line(text, p + ".flags", int64_t{track.flags});
++  Line(text, p + ".external", int64_t{track.external ? 1 : 0});
++  Line(text, p + ".index", int64_t{track.index});
++  Line(text, p + ".ordinal", int64_t{track.ordinal});
++}
++
++// A value of the text in its place, where it is valid (anything else keeps what is there)
++struct Reader
++{
++  std::string_view value;
++
++  bool Int(int& to, int64_t low, int64_t high) const
++  {
++    const auto v = IntOf(value);
++    if (!v || *v < low || *v > high)
++      return false;
++    to = static_cast<int>(*v);
++    return true;
++  }
++  bool Int64(int64_t& to, int64_t low, int64_t high) const
++  {
++    const auto v = IntOf(value);
++    if (!v || *v < low || *v > high)
++      return false;
++    to = *v;
++    return true;
++  }
++  bool Bool(bool& to) const
++  {
++    int v = 0;
++    if (!Int(v, 0, 1))
++      return false;
++    to = v != 0;
++    return true;
++  }
++  bool Float(float& to) const
++  {
++    const auto v = FloatOf(value);
++    if (!v)
++      return false;
++    to = *v;
++    return true;
++  }
++  template<typename E>
++  bool Enum(E& to, int high) const
++  {
++    int v = 0;
++    if (!Int(v, 0, high - 1))
++      return false;
++    to = static_cast<E>(v);
++    return true;
++  }
++};
++
++bool TrackValue(Track& track, std::string_view key, const Reader& r)
++{
++  if (key == "lang")
++    track.language = Lower(Unescaped(r.value));
++  else if (key == "variety")
++    r.Int(track.variety, 0, 255);
++  else if (key == "name")
++    track.name = Unescaped(r.value);
++  else if (key == "codec")
++    track.codec = Unescaped(r.value);
++  else if (key == "channels")
++    r.Int(track.channels, 0, 64);
++  else if (key == "flags")
++    r.Int(track.flags, 0, 0x7fffffff);
++  else if (key == "external")
++    r.Bool(track.external);
++  else if (key == "index")
++    r.Int(track.index, -1, 100000);
++  else if (key == "ordinal")
++    r.Int(track.ordinal, -1, 100000);
++  else
++    return false;
++  return true;
++}
++
++// ---- tracks
++
++//! What kind of track it is, by its flags and by the words of its title
++struct TrackKinds
++{
++  bool forced{false};
++  bool hearingImpaired{false};
++  bool commentary{false};
++  bool description{false};
++};
++
++bool NameHas(const std::string& lowerName, std::initializer_list<const char*> words)
++{
++  return std::any_of(words.begin(), words.end(), [&lowerName](const char* word)
++                     { return lowerName.find(word) != std::string::npos; });
++}
++
++TrackKinds KindsOf(const Track& track)
++{
++  const std::string name = Lower(track.name);
++  TrackKinds kinds;
++  kinds.forced = (track.flags & FLAG_FORCED) || NameHas(name, {"forced", "forzad", "forcé"});
++  kinds.hearingImpaired = (track.flags & FLAG_HEARING_IMPAIRED) ||
++                          NameHas(name, {"sdh", "hearing impaired", "hard of hearing"});
++  kinds.commentary = (track.flags & FLAG_COMMENT) || NameHas(name, {"comment", "comentario"});
++  kinds.description = (track.flags & FLAG_VISUAL_IMPAIRED) ||
++                      NameHas(name, {"audio description", "descriptive", "audiodescrip"});
++  return kinds;
++}
++
++//! A subtitle drawn from text (as opposed to pictures)
++bool TextSubtitle(const std::string& codec)
++{
++  const std::string c = Lower(codec);
++  return !(c.find("pgs") != std::string::npos || c.find("dvd_sub") != std::string::npos ||
++           c.find("dvb_sub") != std::string::npos || c.find("vobsub") != std::string::npos ||
++           c.find("xsub") != std::string::npos);
++}
++
++std::string Join(const std::vector<std::string>& parts, const char* separator)
++{
++  std::string text;
++  for (const auto& part : parts)
++  {
++    if (!text.empty())
++      text += separator;
++    text += part;
++  }
++  return text;
++}
++
++const Record* First(const std::vector<Record>& records, const std::function<bool(const Record&)>& f)
++{
++  for (const auto& record : records)
++  {
++    if (f(record))
++      return &record;
++  }
++  return nullptr;
++}
++
++std::string Seconds(float value)
++{
++  char text[32];
++  std::snprintf(text, sizeof(text), "%+.3f s", static_cast<double>(value));
++  return text;
++}
++} // namespace
++
++std::string Identity::Describe() const
++{
++  std::vector<std::string> ids;
++  if (!imdb.empty())
++    ids.push_back("imdb " + imdb);
++  if (!tmdb.empty())
++    ids.push_back("tmdb " + tmdb);
++  if (!tvdb.empty())
++    ids.push_back("tvdb " + tvdb);
++  if (kind == Kind::EPISODE)
++  {
++    char se[48];
++    std::snprintf(se, sizeof(se), "episode S%02dE%02d of ", season, episode);
++    return se + Join(ids, " ");
++  }
++  return "film " + Join(ids, " ");
++}
++
++std::optional<Identity> IdentityOf(std::string_view mediaType,
++                                   std::string_view imdb,
++                                   std::string_view tmdb,
++                                   std::string_view tvdb,
++                                   int season,
++                                   int episode)
++{
++  Identity identity;
++  const std::string type = Lower(Trimmed(mediaType));
++  if (type == "movie")
++    identity.kind = Kind::MOVIE;
++  else if (type == "episode")
++  {
++    if (season < 0 || episode < 0)
++      return std::nullopt;
++    identity.kind = Kind::EPISODE;
++    identity.season = season;
++    identity.episode = episode;
++  }
++  else
++    return std::nullopt;
++  identity.imdb = ImdbId(imdb);
++  identity.tmdb = NumericId(tmdb);
++  identity.tvdb = NumericId(tvdb);
++  if (identity.imdb.empty() && identity.tmdb.empty() && identity.tvdb.empty())
++    return std::nullopt;
++  return identity;
++}
++
++bool SameVideo(const Identity& a, const Identity& b)
++{
++  if (a.kind != b.kind || a.season != b.season || a.episode != b.episode)
++    return false;
++  int common = 0;
++  for (const auto& [x, y] : {std::pair{&a.imdb, &b.imdb}, std::pair{&a.tmdb, &b.tmdb},
++                             std::pair{&a.tvdb, &b.tvdb}})
++  {
++    if (x->empty() || y->empty())
++      continue;
++    if (*x != *y)
++      return false;
++    ++common;
++  }
++  return common > 0;
++}
++
++std::string Track::Describe() const
++{
++  std::vector<std::string> parts;
++  parts.push_back(language.empty() ? std::string("no language") : language);
++  if (!name.empty())
++    parts.push_back("\"" + name + "\"");
++  if (!codec.empty())
++    parts.push_back(codec);
++  if (channels > 0)
++    parts.push_back(std::to_string(channels) + " channels");
++  const TrackKinds kinds = KindsOf(*this);
++  if (kinds.forced)
++    parts.push_back("forced");
++  if (kinds.hearingImpaired)
++    parts.push_back("hearing impaired");
++  if (kinds.commentary)
++    parts.push_back("commentary");
++  if (kinds.description)
++    parts.push_back("audio description");
++  if (external)
++    parts.push_back("a file beside the video");
++  return Join(parts, ", ");
++}
++
++std::string Release::Describe() const
++{
++  std::string text = Duration(durationMs);
++  if (picture.width > 0 && picture.height > 0)
++    text += ", " + std::to_string(picture.width) + "x" + std::to_string(picture.height) + " " +
++            HdrName(picture.hdr);
++  if (!picture.stereo.empty())
++    text += " 3D " + picture.stereo;
++  return text;
++}
++
++int64_t SameCutToleranceMs(int64_t durationMs)
++{
++  return std::clamp<int64_t>(durationMs / 200, 5000, 30000);
++}
++
++bool SameFormat(const Picture& a, const Picture& b)
++{
++  return a.width > 0 && a.height > 0 && a.width == b.width && a.height == b.height &&
++         a.hdr == b.hdr && a.stereo == b.stereo;
++}
++
++bool SameShape(const Picture& a, const Picture& b)
++{
++  if (!(a.aspect > 0.0f) || !(b.aspect > 0.0f))
++    return false;
++  return std::fabs(a.aspect - b.aspect) <= 0.01f * b.aspect;
++}
++
++bool SameRelease(const Release& a, const Release& b)
++{
++  return a.durationMs > 0 && b.durationMs > 0 &&
++         std::llabs(a.durationMs - b.durationMs) <= SAME_RELEASE_MS &&
++         SameFormat(a.picture, b.picture) && a.videoStreams == b.videoStreams;
++}
++
++bool SameCut(const Release& a, const Release& b)
++{
++  return a.durationMs > 0 && b.durationMs > 0 &&
++         std::llabs(a.durationMs - b.durationMs) <=
++             SameCutToleranceMs(std::max(a.durationMs, b.durationMs));
++}
++
++std::string Serialize(const Record& record)
++{
++  std::string text;
++  const CVideoSettings& s = record.settings;
++  Line(text, "v", int64_t{VERSION});
++  Line(text, "duration", record.release.durationMs);
++  Line(text, "width", int64_t{record.release.picture.width});
++  Line(text, "height", int64_t{record.release.picture.height});
++  Line(text, "aspect", record.release.picture.aspect);
++  Line(text, "hdr", int64_t{record.release.picture.hdr});
++  Line(text, "stereo", record.release.picture.stereo);
++  Line(text, "videostreams", int64_t{record.release.videoStreams});
++  Line(text, "deinterlace", int64_t{s.m_InterlaceMethod});
++  Line(text, "scaling", int64_t{s.m_ScalingMethod});
++  Line(text, "viewmode", int64_t{s.m_ViewMode});
++  Line(text, "zoom", s.m_CustomZoomAmount);
++  Line(text, "pixelratio", s.m_CustomPixelRatio);
++  Line(text, "verticalshift", s.m_CustomVerticalShift);
++  Line(text, "nonlinstretch", int64_t{s.m_CustomNonLinStretch ? 1 : 0});
++  Line(text, "volumeamplification", s.m_VolumeAmplification);
++  Line(text, "subtitledelay", s.m_SubtitleDelay);
++  Line(text, "subtitleson", int64_t{s.m_SubtitleOn ? 1 : 0});
++  Line(text, "brightness", s.m_Brightness);
++  Line(text, "contrast", s.m_Contrast);
++  Line(text, "gamma", s.m_Gamma);
++  Line(text, "noisereduction", s.m_NoiseReduction);
++  Line(text, "postprocess", int64_t{s.m_PostProcess ? 1 : 0});
++  Line(text, "sharpness", s.m_Sharpness);
++  Line(text, "audiodelay", s.m_AudioDelay);
++  Line(text, "stereomode", int64_t{s.m_StereoMode});
++  Line(text, "stereoinvert", int64_t{s.m_StereoInvert ? 1 : 0});
++  Line(text, "videostream", int64_t{s.m_VideoStream});
++  Line(text, "tonemapmethod", int64_t{s.m_ToneMapMethod});
++  Line(text, "tonemapparam", s.m_ToneMapParam);
++  Line(text, "orientation", int64_t{s.m_Orientation});
++  Line(text, "centermixlevel", int64_t{s.m_CenterMixLevel});
++  if (record.audio)
++    TrackLines(text, "audio", *record.audio);
++  if (record.subtitle)
++    TrackLines(text, "sub", *record.subtitle);
++  Line(text, "subchosen", int64_t{record.subtitleChosen ? 1 : 0});
++  return text;
++}
++
++bool Parse(std::string_view text, const CVideoSettings& defaults, Record& record)
++{
++  record = Record{};
++  record.settings = defaults;
++  record.settings.m_AudioStream = -1;
++  record.settings.m_SubtitleStream = -1;
++  bool versioned = false;
++  Track audio;
++  Track subtitle;
++  bool hasAudio = false;
++  bool hasSubtitle = false;
++  CVideoSettings& s = record.settings;
++  size_t start = 0;
++  while (start < text.size())
++  {
++    size_t end = text.find('\n', start);
++    if (end == std::string_view::npos)
++      end = text.size();
++    const std::string_view line = text.substr(start, end - start);
++    start = end + 1;
++    const size_t eq = line.find('=');
++    if (eq == std::string_view::npos)
++      continue;
++    const std::string_view key = line.substr(0, eq);
++    const Reader r{line.substr(eq + 1)};
++    if (key == "v")
++    {
++      int version = 0;
++      if (!r.Int(version, 1, 1000000))
++        return false;
++      versioned = true;
++    }
++    else if (key == "duration")
++      r.Int64(record.release.durationMs, 0, int64_t{1000} * 3600 * 1000);
++    else if (key == "width")
++      r.Int(record.release.picture.width, 0, 65535);
++    else if (key == "height")
++      r.Int(record.release.picture.height, 0, 65535);
++    else if (key == "aspect")
++    {
++      float aspect = 0.0f;
++      if (r.Float(aspect) && aspect >= 0.0f && aspect < 100.0f)
++        record.release.picture.aspect = aspect;
++    }
++    else if (key == "hdr")
++      r.Int(record.release.picture.hdr, 0, 255);
++    else if (key == "stereo")
++      record.release.picture.stereo = Unescaped(r.value);
++    else if (key == "videostreams")
++      r.Int(record.release.videoStreams, 0, 1000);
++    else if (key == "deinterlace")
++      r.Enum(s.m_InterlaceMethod, VS_INTERLACEMETHOD_MAX);
++    else if (key == "scaling")
++      r.Enum(s.m_ScalingMethod, VS_SCALINGMETHOD_MAX);
++    else if (key == "viewmode")
++      r.Int(s.m_ViewMode, ViewModeNormal, ViewModeZoom110Width);
++    else if (key == "zoom")
++      r.Float(s.m_CustomZoomAmount);
++    else if (key == "pixelratio")
++      r.Float(s.m_CustomPixelRatio);
++    else if (key == "verticalshift")
++      r.Float(s.m_CustomVerticalShift);
++    else if (key == "nonlinstretch")
++      r.Bool(s.m_CustomNonLinStretch);
++    else if (key == "volumeamplification")
++      r.Float(s.m_VolumeAmplification);
++    else if (key == "subtitledelay")
++      r.Float(s.m_SubtitleDelay);
++    else if (key == "subtitleson")
++      r.Bool(s.m_SubtitleOn);
++    else if (key == "brightness")
++      r.Float(s.m_Brightness);
++    else if (key == "contrast")
++      r.Float(s.m_Contrast);
++    else if (key == "gamma")
++      r.Float(s.m_Gamma);
++    else if (key == "noisereduction")
++      r.Float(s.m_NoiseReduction);
++    else if (key == "postprocess")
++      r.Bool(s.m_PostProcess);
++    else if (key == "sharpness")
++      r.Float(s.m_Sharpness);
++    else if (key == "audiodelay")
++      r.Float(s.m_AudioDelay);
++    else if (key == "stereomode")
++      r.Int(s.m_StereoMode, 0, 1000);
++    else if (key == "stereoinvert")
++      r.Bool(s.m_StereoInvert);
++    else if (key == "videostream")
++      r.Int(s.m_VideoStream, -1, 1000);
++    else if (key == "tonemapmethod")
++      r.Enum(s.m_ToneMapMethod, VS_TONEMAPMETHOD_MAX);
++    else if (key == "tonemapparam")
++      r.Float(s.m_ToneMapParam);
++    else if (key == "orientation")
++    {
++      int orientation = 0;
++      if (r.Int(orientation, 0, 359) && orientation % 90 == 0)
++        s.m_Orientation = orientation;
++    }
++    else if (key == "centermixlevel")
++      r.Int(s.m_CenterMixLevel, -1000, 1000);
++    else if (key == "audio")
++      hasAudio = true;
++    else if (key == "sub")
++      hasSubtitle = true;
++    else if (key.substr(0, 6) == "audio.")
++      TrackValue(audio, key.substr(6), r);
++    else if (key.substr(0, 4) == "sub.")
++      TrackValue(subtitle, key.substr(4), r);
++    else if (key == "subchosen")
++      r.Bool(record.subtitleChosen);
++    // (a key of a later version is left out)
++  }
++  if (!versioned)
++    return false;
++  if (hasAudio)
++    record.audio = audio;
++  if (hasSubtitle)
++    record.subtitle = subtitle;
++  return true;
++}
++
++TrackMatch FindTrack(const Track& kept, const std::vector<Track>& streams, bool subtitle)
++{
++  TrackMatch match;
++  if (kept.external)
++  {
++    match.why = "it was a subtitle file beside the video, not a track of it";
++    return match;
++  }
++  const TrackKinds want = KindsOf(kept);
++  int best = -1;
++  int bestScore = -1;
++  std::vector<std::string> bestNotes;
++  size_t sameLanguage = 0;
++  std::vector<Track> placed = streams;
++  AssignPlaces(placed);
++  for (size_t i = 0; i < placed.size(); ++i)
++  {
++    const Track& t = placed[i];
++    if (t.language != kept.language)
++      continue;
++    ++sameLanguage;
++    if (kept.variety != 0 && t.variety != 0 && kept.variety != t.variety)
++      continue;
++    const TrackKinds kinds = KindsOf(t);
++    if (kinds.commentary != want.commentary)
++      continue;
++    if (subtitle ? kinds.forced != want.forced : kinds.description != want.description)
++      continue;
++    int score = 0;
++    std::vector<std::string> notes;
++    if (!kept.name.empty() && Lower(Trimmed(kept.name)) == Lower(Trimmed(t.name)))
++    {
++      score += 16;
++      notes.emplace_back("the same name");
++    }
++    if (kept.variety != 0 && kept.variety == t.variety)
++    {
++      score += 8;
++      notes.emplace_back("the same variety");
++    }
++    if (!kept.codec.empty() && Lower(kept.codec) == Lower(t.codec))
++    {
++      score += 8;
++      notes.emplace_back("the same codec");
++    }
++    if (!subtitle && kept.channels > 0 && kept.channels == t.channels)
++    {
++      score += 4;
++      notes.emplace_back("the same channels");
++    }
++    if (subtitle && kinds.hearingImpaired == want.hearingImpaired)
++    {
++      score += 4;
++      if (want.hearingImpaired)
++        notes.emplace_back("for the hearing impaired");
++    }
++    if (subtitle && TextSubtitle(kept.codec) == TextSubtitle(t.codec))
++      score += 2;
++    if (kept.ordinal >= 0 && kept.ordinal == t.ordinal)
++    {
++      score += 2;
++      notes.emplace_back("the same place among the tracks of its language");
++    }
++    if ((kept.flags & FLAG_ORIGINAL) == (t.flags & FLAG_ORIGINAL))
++      score += 1;
++    if ((kept.flags & FLAG_DUB) == (t.flags & FLAG_DUB))
++      score += 1;
++    if (score > bestScore)
++    {
++      bestScore = score;
++      best = static_cast<int>(i);
++      bestNotes = std::move(notes);
++    }
++  }
++  if (best < 0)
++  {
++    match.why = sameLanguage == 0
++                    ? std::string("this source has no track in that language")
++                    : "this source has " + std::to_string(sameLanguage) +
++                          " in that language, none of the same kind or variety";
++    return match;
++  }
++  match.position = best;
++  match.index = placed[static_cast<size_t>(best)].index;
++  match.why = "the same language" + std::string(bestNotes.empty() ? "" : ", ") +
++              Join(bestNotes, ", ");
++  return match;
++}
++
++void AssignPlaces(std::vector<Track>& tracks)
++{
++  for (size_t i = 0; i < tracks.size(); ++i)
++  {
++    if (tracks[i].index < 0)
++      tracks[i].index = static_cast<int>(i);
++    int ordinal = 0;
++    for (size_t j = 0; j < i; ++j)
++    {
++      if (tracks[j].language == tracks[i].language)
++        ++ordinal;
++    }
++    tracks[i].ordinal = ordinal;
++  }
++}
++
++std::optional<Restoration> Restore(const std::vector<Record>& records,
++                                   const Release& now,
++                                   const CVideoSettings& current,
++                                   const std::vector<Track>& audio,
++                                   const std::vector<Track>& subtitles)
++{
++  if (records.empty())
++    return std::nullopt;
++  Restoration r;
++  r.settings = current;
++  CVideoSettings& s = r.settings;
++  auto& log = r.log;
++  const auto from = [](const Record& record)
++  { return "kept from its playback of " + record.release.Describe(); };
++
++  // the audio track: the last one chosen, by what it is
++  if (const Record* rec = First(records, [](const Record& x) { return x.audio.has_value(); }))
++  {
++    const TrackMatch m = FindTrack(*rec->audio, audio, false);
++    if (m.index >= 0)
++    {
++      s.m_AudioStream = m.index;
++      r.groups |= GROUP_AUDIO;
++      log.push_back("audio: track " + std::to_string(m.index) + " (" +
++                    audio[static_cast<size_t>(m.position)].Describe() + ") for " +
++                    rec->audio->Describe() + " " + from(*rec) + ": " + m.why);
++    }
++    else
++      log.push_back("audio: " + rec->audio->Describe() + " " + from(*rec) +
++                    " is not taken: " + m.why + "; the track is chosen as the settings say");
++  }
++
++  // the subtitles: the last choice of them
++  if (const Record* rec = First(records, [](const Record& x) { return x.subtitleChosen; }))
++  {
++    TrackMatch m;
++    if (rec->subtitle)
++      m = FindTrack(*rec->subtitle, subtitles, true);
++    const bool off = !rec->settings.m_SubtitleOn;
++    if (off || m.index >= 0)
++    {
++      if (m.index >= 0)
++        s.m_SubtitleStream = m.index;
++      s.m_SubtitleOn = !off;
++      s.m_isDefaultVideoSettings = false;
++      r.subtitleChosen = true;
++      r.groups |= GROUP_SUBTITLES;
++      std::string text = off ? "subtitles: off" : "subtitles: on";
++      if (rec->subtitle)
++        text += m.index >= 0 ? ", track " + std::to_string(m.index) + " (" +
++                                   subtitles[static_cast<size_t>(m.position)].Describe() +
++                                   ") for " + rec->subtitle->Describe() + " (" + m.why + ")"
++                             : ", " + rec->subtitle->Describe() + " not in this source (" +
++                                   m.why + ")";
++      log.push_back(text + ", " + from(*rec));
++    }
++    else if (rec->subtitle)
++      log.push_back("subtitles: " + rec->subtitle->Describe() + " " + from(*rec) +
++                    " are not taken: " + m.why + "; they are chosen as the settings say");
++    else
++      log.push_back("subtitles: shown " + from(*rec) +
++                    " with no track to show: they are chosen as the settings say");
++  }
++
++  // the zoom and the view mode: from a picture of the same shape
++  if (const Record* rec =
++          First(records, [&now](const Record& x)
++                { return SameShape(x.release.picture, now.picture); }))
++  {
++    const CVideoSettings& k = rec->settings;
++    if (s.m_ViewMode != k.m_ViewMode || s.m_CustomZoomAmount != k.m_CustomZoomAmount ||
++        s.m_CustomPixelRatio != k.m_CustomPixelRatio ||
++        s.m_CustomVerticalShift != k.m_CustomVerticalShift ||
++        s.m_CustomNonLinStretch != k.m_CustomNonLinStretch)
++    {
++      s.m_ViewMode = k.m_ViewMode;
++      s.m_CustomZoomAmount = k.m_CustomZoomAmount;
++      s.m_CustomPixelRatio = k.m_CustomPixelRatio;
++      s.m_CustomVerticalShift = k.m_CustomVerticalShift;
++      s.m_CustomNonLinStretch = k.m_CustomNonLinStretch;
++      r.groups |= GROUP_VIEW;
++      log.push_back("view mode " + std::to_string(k.m_ViewMode) + ", zoom " +
++                    Number(k.m_CustomZoomAmount) + ", pixel ratio " +
++                    Number(k.m_CustomPixelRatio) + ", vertical shift " +
++                    Number(k.m_CustomVerticalShift) + ", " + from(*rec) +
++                    " (a picture of the same shape)");
++    }
++  }
++  else
++    log.push_back("view mode and zoom: none kept for a picture of this shape");
++
++  // the picture settings: from a video of the same format
++  if (const Record* rec =
++          First(records, [&now](const Record& x)
++                { return SameFormat(x.release.picture, now.picture); }))
++  {
++    const CVideoSettings& k = rec->settings;
++    const CVideoSettings before = s;
++    s.m_InterlaceMethod = k.m_InterlaceMethod;
++    s.m_ScalingMethod = k.m_ScalingMethod;
++    s.m_Brightness = k.m_Brightness;
++    s.m_Contrast = k.m_Contrast;
++    s.m_Gamma = k.m_Gamma;
++    s.m_Sharpness = k.m_Sharpness;
++    s.m_NoiseReduction = k.m_NoiseReduction;
++    s.m_PostProcess = k.m_PostProcess;
++    s.m_ToneMapMethod = k.m_ToneMapMethod;
++    s.m_ToneMapParam = k.m_ToneMapParam;
++    s.m_Orientation = k.m_Orientation;
++    s.m_StereoMode = k.m_StereoMode;
++    s.m_StereoInvert = k.m_StereoInvert;
++    if (before != s)
++    {
++      r.groups |= GROUP_PICTURE;
++      log.push_back("picture settings (upscaler " + std::to_string(k.m_ScalingMethod) +
++                    ", deinterlacing " + std::to_string(k.m_InterlaceMethod) + ", tone mapping " +
++                    std::to_string(k.m_ToneMapMethod) + ", brightness " + Number(k.m_Brightness) +
++                    ", contrast " + Number(k.m_Contrast) + "...), " + from(*rec) +
++                    " (a video of the same format)");
++    }
++  }
++  else
++    log.push_back("picture settings: none kept for a video of this format");
++
++  // the volume amplification and the level of the centre: from the same cut
++  if (const Record* rec =
++          First(records, [&now](const Record& x) { return SameCut(x.release, now); }))
++  {
++    const CVideoSettings& k = rec->settings;
++    if (s.m_VolumeAmplification != k.m_VolumeAmplification ||
++        s.m_CenterMixLevel != k.m_CenterMixLevel)
++    {
++      s.m_VolumeAmplification = k.m_VolumeAmplification;
++      s.m_CenterMixLevel = k.m_CenterMixLevel;
++      r.groups |= GROUP_AUDIO_LEVEL;
++      log.push_back("volume amplification " + Number(k.m_VolumeAmplification) +
++                    " dB, centre level " + std::to_string(k.m_CenterMixLevel) + ", " + from(*rec) +
++                    " (the same cut)");
++    }
++  }
++  else
++    log.push_back("volume amplification and centre level: none kept for this cut (a length "
++                  "within " +
++                  std::to_string(SameCutToleranceMs(now.durationMs) / 1000) + " s)");
++
++  // the delays and the video stream: only from the same release
++  if (const Record* rec =
++          First(records, [&now](const Record& x) { return SameRelease(x.release, now); }))
++  {
++    const CVideoSettings& k = rec->settings;
++    const bool delays =
++        s.m_AudioDelay != k.m_AudioDelay || s.m_SubtitleDelay != k.m_SubtitleDelay;
++    s.m_AudioDelay = k.m_AudioDelay;
++    s.m_SubtitleDelay = k.m_SubtitleDelay;
++    if (delays)
++    {
++      r.groups |= GROUP_DELAYS;
++      log.push_back("audio delay " + Seconds(k.m_AudioDelay) + ", subtitle delay " +
++                    Seconds(k.m_SubtitleDelay) + ", " + from(*rec) + " (the same release)");
++    }
++    if (k.m_VideoStream >= 0 && k.m_VideoStream < now.videoStreams &&
++        s.m_VideoStream != k.m_VideoStream)
++    {
++      s.m_VideoStream = k.m_VideoStream;
++      log.push_back("video stream " + std::to_string(k.m_VideoStream) + ", " + from(*rec) +
++                    " (the same release)");
++    }
++  }
++  else
++    log.push_back("audio and subtitle delays: kept only for the same release (the same length "
++                  "to the second and the same video), and none was kept for this one");
++
++  return r;
++}
++
++} // namespace KODI::FILMMEMORY
+diff --git a/xbmc/cores/VideoPlayer/FilmMemory.h b/xbmc/cores/VideoPlayer/FilmMemory.h
+new file mode 100644
+index 0000000..7c13597
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/FilmMemory.h
+@@ -0,0 +1,224 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "cores/VideoSettings.h"
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++/*!
++ * \brief Hades: the settings of a film or an episode that an add-on plays, kept by what it is and
++ *        not by its path ("Remember the settings of films from add-ons", videoplayer.hadesfilmmemory)
++ *
++ * Kodi keeps the settings of a video (its audio and subtitle tracks, their delays, the zoom, the
++ * picture settings) for its file, by its path. An add-on can play the same film from another source
++ * each time, often another release of it, and those settings were lost every time. Here they are
++ * kept for the film or episode itself, named by
++ * the ids its add-on gives it (IMDb, TMDb, TVDb; season and episode for an episode), one record
++ * for each release of it that played (its length and the format of its video), and each setting is
++ * taken from the most recent record where it applies to the release that plays now:
++ *  - the audio and subtitle tracks: from any release, matched by what they are (language and its
++ *    variety, the kind of track, name, codec, channels), never by their number, and only where the
++ *    release that plays has such a track (FindTrack());
++ *  - the zoom and the rest of the view mode: from a release whose picture has the same shape;
++ *  - the picture settings (upscaler, deinterlacing, brightness, contrast, gamma, sharpness, noise
++ *    reduction, tone mapping, orientation, stereoscopic mode): from one whose video has the same
++ *    format (size, HDR type, stereoscopic layout);
++ *  - the volume amplification and the level of the centre: from the same cut (a length within
++ *    SameCutToleranceMs());
++ *  - the audio and subtitle delays and the video stream chosen: only from the same release (the same
++ *    length to the second and the same video): another release, or another cut of the film, is
++ *    timed otherwise.
++ * Only pure logic here, no state: the player (FilmMemoryItem.h) gives the facts of what plays, the
++ * application keeps the records in the video database (CVideoDatabase::GetFilmSettings()).
++ */
++namespace KODI::FILMMEMORY
++{
++
++enum class Kind
++{
++  MOVIE,
++  EPISODE,
++};
++
++//! What a video is, by the ids its add-on gave it
++struct Identity
++{
++  Kind kind{Kind::MOVIE};
++  std::string imdb; //!< "tt" and 7 to 10 digits, lower case; empty when not given
++  std::string tmdb; //!< 1 to 10 digits, not 0; empty when not given
++  std::string tvdb; //!< 1 to 10 digits, not 0; empty when not given
++  int season{-1}; //!< of an episode (0 for its specials)
++  int episode{-1}; //!< of an episode
++
++  //! For the log: "film imdb tt0111161 tmdb 278", "episode S01E02 of tvdb 81189"
++  std::string Describe() const;
++  //! The text of its kind in the database ("movie", "episode")
++  const char* KindText() const { return kind == Kind::EPISODE ? "episode" : "movie"; }
++};
++
++/*!
++ * \brief The identity of a video from what its add-on said of it: its media type ("movie" or
++ *        "episode"; nothing else is named here), its unique ids, and, for an episode, its season and
++ *        number. Ids that are not of their form are left out ("None", "0", an empty text...).
++ * \return nothing when no id is left, or for an episode without a season and a number
++ */
++std::optional<Identity> IdentityOf(std::string_view mediaType,
++                                   std::string_view imdb,
++                                   std::string_view tmdb,
++                                   std::string_view tvdb,
++                                   int season,
++                                   int episode);
++
++/*!
++ * \brief Whether two identities are the same film or episode: the same kind (and season and
++ *        number), at least one id in common, and no id of the same type that differs (an add-on that
++ *        gives another IMDb id for the same TMDb id is not trusted with either).
++ */
++bool SameVideo(const Identity& a, const Identity& b);
++
++//! An audio or subtitle track, by what it is
++struct Track
++{
++  std::string language; //!< ISO 639-2/B, lower case; empty when none or undetermined
++  int variety{0}; //!< KODI::UTILS::LanguageVariety (castellano or latino...); 0 when not known
++  std::string name; //!< its title in the file
++  std::string codec;
++  int channels{0};
++  int flags{0}; //!< StreamFlags
++  bool external{false}; //!< a subtitle file beside the video, not a stream of it
++  int index{-1}; //!< its number among the tracks of its type (for the log)
++  int ordinal{-1}; //!< its place among the tracks of its type in its language (0 the first)
++
++  //! For the log: "spa (es), \"Castellano\", truehd, 8 channels, forced"
++  std::string Describe() const;
++};
++
++//! The video of a release
++struct Picture
++{
++  int width{0};
++  int height{0};
++  float aspect{0.0f}; //!< display aspect ratio; 0 when not known
++  int hdr{0}; //!< StreamHdrType
++  std::string stereo; //!< stereoscopic layout; empty for 2D
++};
++
++//! A release of a film or an episode: what tells one from another
++struct Release
++{
++  int64_t durationMs{0}; //!< 0 when not known
++  Picture picture;
++  int videoStreams{0};
++
++  //! For the log: "2:01:13, 3840x1600 HDR10"
++  std::string Describe() const;
++};
++
++constexpr int64_t SAME_RELEASE_MS = 1000;
++/*!
++ * \brief How far apart the lengths of two releases of the same cut can be: 0.5 % of the length,
++ *        5 s at least and 30 s at most. Releases of one cut differ by the logos of a distributor or
++ *        a studio (seconds); another cut (extended, director's, unrated) adds or takes minutes, and
++ *        the closest ones seen, such as the final cut of Blade Runner, 44 s.
++ */
++int64_t SameCutToleranceMs(int64_t durationMs);
++bool SameRelease(const Release& a, const Release& b);
++bool SameCut(const Release& a, const Release& b);
++bool SameFormat(const Picture& a, const Picture& b);
++bool SameShape(const Picture& a, const Picture& b);
++
++//! What is kept of one playback of a release
++struct Record
++{
++  Release release;
++  CVideoSettings settings; //!< as the video was left (its track numbers are not used)
++  std::optional<Track> audio; //!< the audio track the user chose
++  std::optional<Track> subtitle; //!< the subtitle track chosen or shown
++  bool subtitleChosen{false}; //!< the user chose the subtitles (a track, or on or off)
++};
++
++//! A record as the video database keeps it (CVideoDatabase::GetFilmSettings())
++struct StoredRecord
++{
++  int id{-1};
++  Identity identity; //!< the ids it was kept with
++  std::string text; //!< Serialize()
++};
++
++//! The text of a record in the database: "key=value" lines, a version first
++std::string Serialize(const Record& record);
++/*!
++ * \brief A record from its text; what it does not say, or says with a value that is not valid
++ *        here (a later version's), is taken from \p defaults; keys not known are left out
++ * \return false where the text is not a record
++ */
++bool Parse(std::string_view text, const CVideoSettings& defaults, Record& record);
++
++struct TrackMatch
++{
++  int index{-1}; //!< the number (Track::index) of the track that is the one kept; -1 when none is
++  int position{-1}; //!< its place in the list given
++  std::string why; //!< for the log
++};
++
++//! Numbers the tracks of a list by their place where they have none, and gives each its place
++//! among those of its language (Track::ordinal)
++void AssignPlaces(std::vector<Track>& tracks);
++
++/*!
++ * \brief The track that is the one kept, among the tracks of the release that plays: the same
++ *        language (and variety, where both are known), the same kind (forced or not, commentary or
++ *        not, audio description or not), then the closest by name, codec, channels, hearing impaired,
++ *        and the same place among the tracks of that language. A subtitle file beside the video
++ *        that was kept is not looked for: the release that plays has its own.
++ */
++TrackMatch FindTrack(const Track& kept, const std::vector<Track>& streams, bool subtitle);
++
++//! The settings restored
++enum Group : unsigned
++{
++  GROUP_AUDIO = 1u << 0,
++  GROUP_SUBTITLES = 1u << 1,
++  GROUP_VIEW = 1u << 2,
++  GROUP_PICTURE = 1u << 3,
++  GROUP_AUDIO_LEVEL = 1u << 4,
++  GROUP_DELAYS = 1u << 5,
++};
++
++struct Restoration
++{
++  CVideoSettings settings; //!< what the video starts with
++  unsigned groups{0}; //!< Group: what was restored (and changed something)
++  bool subtitleChosen{false}; //!< a choice of subtitles was taken again
++  std::vector<std::string> log; //!< what was taken, from which playback, and what was not and why
++};
++
++/*!
++ * \brief What a video starts with, from the records kept for it (the most recently played first)
++ * \param current what it starts with otherwise (Kodi's default, or what was kept for its path)
++ * \param audio, subtitles the tracks of the release that plays, in their order
++ * \return nothing where no record is given
++ */
++std::optional<Restoration> Restore(const std::vector<Record>& records,
++                                   const Release& now,
++                                   const CVideoSettings& current,
++                                   const std::vector<Track>& audio,
++                                   const std::vector<Track>& subtitles);
++
++//! At most this many records for a film or an episode (the least recently played go first) ...
++constexpr int RECORDS_PER_VIDEO = 8;
++//! ... and this many in all
++constexpr int RECORDS_IN_ALL = 4000;
++
++} // namespace KODI::FILMMEMORY
+diff --git a/xbmc/cores/VideoPlayer/test/CMakeLists.txt b/xbmc/cores/VideoPlayer/test/CMakeLists.txt
+index 3914a87..d559b1b 100644
+--- a/xbmc/cores/VideoPlayer/test/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/test/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ set(SOURCES TestActiveAreaZoom.cpp
+             TestDVDSubtitlesLibass.cpp
++            TestFilmMemory.cpp
+             TestOverlayRendererUtil.cpp
+             TestStereoEyeSize.cpp
+             TestVideoCodecPictureFormat.cpp
+diff --git a/xbmc/cores/VideoPlayer/test/TestFilmMemory.cpp b/xbmc/cores/VideoPlayer/test/TestFilmMemory.cpp
+new file mode 100644
+index 0000000..cbb103f
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/test/TestFilmMemory.cpp
+@@ -0,0 +1,462 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "cores/VideoPlayer/FilmMemory.h"
++#include "cores/VideoPlayer/Interface/StreamInfo.h"
++
++#include <gtest/gtest.h>
++
++using namespace KODI::FILMMEMORY;
++
++namespace
++{
++// (as KODI::UTILS::LanguageVariety numbers them)
++constexpr int SPAIN = 1;
++constexpr int LATIN_AMERICA = 2;
++
++Track T(std::string language, std::string name, std::string codec, int channels, int flags = 0)
++{
++  Track t;
++  t.language = std::move(language);
++  t.name = std::move(name);
++  t.codec = std::move(codec);
++  t.channels = channels;
++  t.flags = flags;
++  return t;
++}
++
++std::vector<Track> Placed(std::vector<Track> tracks)
++{
++  AssignPlaces(tracks);
++  return tracks;
++}
++
++Release R(int64_t ms, int w = 3840, int h = 1600, float aspect = 2.4f, int hdr = 1)
++{
++  Release r;
++  r.durationMs = ms;
++  r.picture.width = w;
++  r.picture.height = h;
++  r.picture.aspect = aspect;
++  r.picture.hdr = hdr;
++  r.videoStreams = 1;
++  return r;
++}
++
++constexpr int64_t FILM = 2 * 3600 * 1000 + 13 * 60 * 1000; // 2:13:00
++} // namespace
++
++// ---- what a video is
++
++TEST(TestFilmMemory, IdentityOfAFilm)
++{
++  const auto id = IdentityOf("movie", "tt0111161", "278", "", -1, -1);
++  ASSERT_TRUE(id.has_value());
++  EXPECT_EQ(Kind::MOVIE, id->kind);
++  EXPECT_EQ("tt0111161", id->imdb);
++  EXPECT_EQ("278", id->tmdb);
++  EXPECT_TRUE(id->tvdb.empty());
++  // (as an add-on writes ids it does not have: Python's str(None), a 0)
++  const auto partial = IdentityOf("Movie", " TT0111161 ", "None", "0", -1, -1);
++  ASSERT_TRUE(partial.has_value());
++  EXPECT_EQ("tt0111161", partial->imdb);
++  EXPECT_TRUE(partial->tmdb.empty());
++  EXPECT_TRUE(partial->tvdb.empty());
++}
++
++TEST(TestFilmMemory, NoIdentityWithoutIdsOrOfOtherVideos)
++{
++  EXPECT_FALSE(IdentityOf("movie", "", "None", "0", -1, -1).has_value());
++  EXPECT_FALSE(IdentityOf("movie", "tt12", "abc", "", -1, -1).has_value());
++  // (a generic video, a show, a music video: no film nor episode is named)
++  EXPECT_FALSE(IdentityOf("video", "tt0111161", "278", "", -1, -1).has_value());
++  EXPECT_FALSE(IdentityOf("tvshow", "tt0944947", "1399", "121361", -1, -1).has_value());
++  EXPECT_FALSE(IdentityOf("", "tt0111161", "", "", -1, -1).has_value());
++  // an episode needs its season and its number
++  EXPECT_FALSE(IdentityOf("episode", "tt0944947", "1399", "121361", -1, 3).has_value());
++  EXPECT_FALSE(IdentityOf("episode", "tt0944947", "1399", "121361", 1, -1).has_value());
++}
++
++TEST(TestFilmMemory, AnEpisodeIsNamedByItsShowSeasonAndNumber)
++{
++  // (add-ons give the ids of the show with the season and the number of the episode)
++  const auto e = IdentityOf("episode", "tt0944947", "1399", "121361", 1, 2);
++  ASSERT_TRUE(e.has_value());
++  EXPECT_EQ(Kind::EPISODE, e->kind);
++  const auto same = IdentityOf("episode", "tt0944947", "", "", 1, 2);
++  const auto next = IdentityOf("episode", "tt0944947", "1399", "121361", 1, 3);
++  const auto otherSeason = IdentityOf("episode", "tt0944947", "1399", "121361", 2, 2);
++  ASSERT_TRUE(same && next && otherSeason);
++  EXPECT_TRUE(SameVideo(*e, *same));
++  EXPECT_FALSE(SameVideo(*e, *next));
++  EXPECT_FALSE(SameVideo(*e, *otherSeason));
++}
++
++TEST(TestFilmMemory, TwoFilmsAreNeverMixed)
++{
++  const auto a = IdentityOf("movie", "tt0111161", "278", "", -1, -1);
++  const auto byTmdb = IdentityOf("movie", "", "278", "", -1, -1);
++  const auto other = IdentityOf("movie", "tt0068646", "238", "", -1, -1);
++  // the same TMDb id with another IMDb id: one of the two is wrong, neither is trusted
++  const auto conflict = IdentityOf("movie", "tt0068646", "278", "", -1, -1);
++  // no id of the same type in common
++  const auto unrelated = IdentityOf("movie", "", "", "81189", -1, -1);
++  // an episode with the ids of a film
++  const auto episode = IdentityOf("episode", "tt0111161", "278", "", 1, 1);
++  ASSERT_TRUE(a && byTmdb && other && conflict && unrelated && episode);
++  EXPECT_TRUE(SameVideo(*a, *byTmdb));
++  EXPECT_FALSE(SameVideo(*a, *other));
++  EXPECT_FALSE(SameVideo(*a, *conflict));
++  EXPECT_FALSE(SameVideo(*a, *unrelated));
++  EXPECT_FALSE(SameVideo(*a, *episode));
++}
++
++// ---- the text of a record
++
++TEST(TestFilmMemory, ARecordReadsAsItWasWritten)
++{
++  Record r;
++  r.release = R(FILM);
++  r.release.picture.stereo = "left_right";
++  r.release.videoStreams = 2;
++  r.settings.m_InterlaceMethod = VS_INTERLACEMETHOD_RENDER_BOB;
++  r.settings.m_ScalingMethod = VS_SCALINGMETHOD_LANCZOS3;
++  r.settings.m_ViewMode = ViewModeCustom;
++  r.settings.m_CustomZoomAmount = 1.3333334f;
++  r.settings.m_CustomPixelRatio = 0.97f;
++  r.settings.m_CustomVerticalShift = -0.125f;
++  r.settings.m_CustomNonLinStretch = true;
++  r.settings.m_VolumeAmplification = 6.5f;
++  r.settings.m_SubtitleDelay = -1.25f;
++  r.settings.m_SubtitleOn = false;
++  r.settings.m_Brightness = 52.0f;
++  r.settings.m_Contrast = 48.5f;
++  r.settings.m_Gamma = 21.0f;
++  r.settings.m_NoiseReduction = 0.1f;
++  r.settings.m_PostProcess = true;
++  r.settings.m_Sharpness = 0.25f;
++  r.settings.m_AudioDelay = 0.075f;
++  r.settings.m_StereoMode = 3;
++  r.settings.m_StereoInvert = true;
++  r.settings.m_VideoStream = 1;
++  r.settings.m_ToneMapMethod = VS_TONEMAPMETHOD_BT2390;
++  r.settings.m_ToneMapParam = 1.5f;
++  r.settings.m_Orientation = 180;
++  r.settings.m_CenterMixLevel = 3;
++  r.audio = T("spa", "Castellano \\ \"DTS-HD\"\nline", "truehd", 8, FLAG_DEFAULT);
++  r.audio->variety = SPAIN;
++  r.audio->index = 3;
++  r.audio->ordinal = 1;
++  r.subtitle = T("eng", "Forced", "subrip", 0, FLAG_FORCED);
++  r.subtitle->external = true;
++  r.subtitleChosen = true;
++
++  Record back;
++  ASSERT_TRUE(Parse(Serialize(r), CVideoSettings(), back));
++  EXPECT_FALSE(back.settings != r.settings) << Serialize(back);
++  EXPECT_EQ(r.release.durationMs, back.release.durationMs);
++  EXPECT_EQ(3840, back.release.picture.width);
++  EXPECT_EQ(1600, back.release.picture.height);
++  EXPECT_FLOAT_EQ(2.4f, back.release.picture.aspect);
++  EXPECT_EQ(1, back.release.picture.hdr);
++  EXPECT_EQ("left_right", back.release.picture.stereo);
++  EXPECT_EQ(2, back.release.videoStreams);
++  ASSERT_TRUE(back.audio.has_value());
++  EXPECT_EQ(r.audio->name, back.audio->name);
++  EXPECT_EQ("spa", back.audio->language);
++  EXPECT_EQ(SPAIN, back.audio->variety);
++  EXPECT_EQ("truehd", back.audio->codec);
++  EXPECT_EQ(8, back.audio->channels);
++  EXPECT_EQ(FLAG_DEFAULT, back.audio->flags);
++  EXPECT_EQ(3, back.audio->index);
++  EXPECT_EQ(1, back.audio->ordinal);
++  ASSERT_TRUE(back.subtitle.has_value());
++  EXPECT_TRUE(back.subtitle->external);
++  EXPECT_EQ(FLAG_FORCED, back.subtitle->flags);
++  EXPECT_TRUE(back.subtitleChosen);
++}
++
++TEST(TestFilmMemory, ATextOfAnotherVersionKeepsWhatIsValidHere)
++{
++  CVideoSettings defaults;
++  defaults.m_ViewMode = ViewModeZoom;
++  Record r;
++  // (no "v": not a record)
++  EXPECT_FALSE(Parse("duration=5\n", defaults, r));
++  EXPECT_FALSE(Parse("", defaults, r));
++  // a later version: its new keys and values not valid here are left out
++  ASSERT_TRUE(Parse("v=7\nduration=7980000\nviewmode=99\nzoom=nan\nscaling=1000\n"
++                    "tonemapmethod=-1\norientation=45\nnewsetting=3\nbrightness=55\n"
++                    "audiodelay=0.5x\nsubtitledelay=-0.25\n",
++                    defaults, r));
++  EXPECT_EQ(7980000, r.release.durationMs);
++  EXPECT_EQ(ViewModeZoom, r.settings.m_ViewMode);
++  EXPECT_EQ(1.0f, r.settings.m_CustomZoomAmount);
++  EXPECT_EQ(defaults.m_ScalingMethod, r.settings.m_ScalingMethod);
++  EXPECT_EQ(defaults.m_ToneMapMethod, r.settings.m_ToneMapMethod);
++  EXPECT_EQ(0, r.settings.m_Orientation);
++  EXPECT_EQ(55.0f, r.settings.m_Brightness);
++  EXPECT_EQ(0.0f, r.settings.m_AudioDelay);
++  EXPECT_EQ(-0.25f, r.settings.m_SubtitleDelay);
++  EXPECT_FALSE(r.audio.has_value());
++  EXPECT_FALSE(r.subtitle.has_value());
++  // (a track number of the text is never a choice: the stream numbers are not taken from it)
++  EXPECT_EQ(-1, r.settings.m_AudioStream);
++  EXPECT_EQ(-1, r.settings.m_SubtitleStream);
++}
++
++// ---- tracks by what they are
++
++TEST(TestFilmMemory, AnAudioTrackIsFoundByWhatItIsNotByItsNumber)
++{
++  Track kept = T("spa", "Castellano", "truehd", 8);
++  kept.index = 3;
++  kept.ordinal = 1;
++  // another release: other order, the Spanish of Spain in another codec
++  const auto streams = Placed({T("spa", "Latino", "ac3", 6), T("spa", "Castellano", "ac3", 6),
++                               T("eng", "", "truehd", 8)});
++  const TrackMatch m = FindTrack(kept, streams, false);
++  EXPECT_EQ(1, m.index) << m.why;
++  EXPECT_EQ(1, m.position);
++}
++
++TEST(TestFilmMemory, TheNumberOfATrackInAnotherReleaseIsNotTaken)
++{
++  // the Spanish track was the first of the release kept; this one has the English one first
++  Track kept = T("spa", "Castellano", "ac3", 6);
++  kept.index = 0;
++  kept.ordinal = 0;
++  const auto streams = Placed({T("eng", "", "ac3", 6), T("spa", "Castellano", "ac3", 6)});
++  EXPECT_EQ(1, FindTrack(kept, streams, false).index);
++  // the forced subtitles were the second track; here the second is the full one
++  Track forced = T("eng", "", "subrip", 0, FLAG_FORCED);
++  forced.index = 1;
++  const auto subtitles = Placed({T("eng", "", "subrip", 0, FLAG_FORCED), T("eng", "", "subrip", 0)});
++  EXPECT_EQ(0, FindTrack(forced, subtitles, true).index);
++  // and where the language is not there at all, no other track is taken by its number
++  EXPECT_EQ(-1, FindTrack(kept, Placed({T("eng", "", "ac3", 6), T("fre", "", "ac3", 6)}), false).index);
++}
++
++TEST(TestFilmMemory, AnotherVarietyIsNotTheTrackKept)
++{
++  Track kept = T("spa", "", "eac3", 6);
++  kept.variety = SPAIN;
++  auto latino = T("spa", "", "eac3", 6);
++  latino.variety = LATIN_AMERICA;
++  EXPECT_EQ(-1, FindTrack(kept, Placed({latino}), false).index);
++  // where the variety of one of them is not known, the language decides
++  EXPECT_EQ(0, FindTrack(kept, Placed({T("spa", "", "ac3", 2)}), false).index);
++}
++
++TEST(TestFilmMemory, ACommentaryIsNeverTakenForTheFilm)
++{
++  const Track kept = T("eng", "", "truehd", 8);
++  const auto streams = Placed({T("eng", "Director's commentary", "ac3", 2),
++                               T("eng", "", "ac3", 2, FLAG_COMMENT)});
++  const TrackMatch m = FindTrack(kept, streams, false);
++  EXPECT_EQ(-1, m.index);
++  EXPECT_FALSE(m.why.empty());
++  // nor an audio description
++  EXPECT_EQ(-1, FindTrack(kept, Placed({T("eng", "", "eac3", 6, FLAG_VISUAL_IMPAIRED)}), false).index);
++  // and the other way round
++  EXPECT_EQ(-1, FindTrack(T("eng", "Commentary", "ac3", 2), Placed({kept}), false).index);
++}
++
++TEST(TestFilmMemory, AForcedSubtitleIsNotTheFullOne)
++{
++  const Track forced = T("eng", "", "hdmv_pgs_subtitle", 0, FLAG_FORCED);
++  // (one release flags it, another only names it)
++  const auto streams = Placed({T("eng", "English", "subrip", 0), T("eng", "English Forced", "subrip", 0),
++                               T("eng", "SDH", "subrip", 0, FLAG_HEARING_IMPAIRED)});
++  EXPECT_EQ(1, FindTrack(forced, streams, true).index);
++  // the full ones: the one for the hearing impaired where that was kept
++  EXPECT_EQ(2, FindTrack(T("eng", "", "subrip", 0, FLAG_HEARING_IMPAIRED), streams, true).index);
++  EXPECT_EQ(0, FindTrack(T("eng", "", "subrip", 0), streams, true).index);
++  // a release with only the full ones has no forced subtitles
++  EXPECT_EQ(-1, FindTrack(forced, Placed({T("eng", "", "subrip", 0)}), true).index);
++}
++
++TEST(TestFilmMemory, NoTrackOfAnotherLanguageOrBesideTheVideo)
++{
++  const TrackMatch m = FindTrack(T("fre", "", "ac3", 6), Placed({T("eng", "", "ac3", 6)}), false);
++  EXPECT_EQ(-1, m.index);
++  EXPECT_NE(std::string::npos, m.why.find("no track in that language"));
++  Track external = T("spa", "", "subrip", 0);
++  external.external = true;
++  EXPECT_EQ(-1, FindTrack(external, Placed({T("spa", "", "subrip", 0)}), true).index);
++  EXPECT_EQ(-1, FindTrack(T("eng", "", "ac3", 6), {}, false).index);
++}
++
++TEST(TestFilmMemory, TheSamePlaceAmongTheTracksOfItsLanguage)
++{
++  // two English tracks that tell nothing apart: the second one kept is the second one
++  Track kept = T("eng", "", "ac3", 6);
++  kept.ordinal = 1;
++  const auto streams = Placed({T("ger", "", "ac3", 6), T("eng", "", "ac3", 6), T("eng", "", "ac3", 6)});
++  EXPECT_EQ(2, FindTrack(kept, streams, false).index);
++}
++
++// ---- what a release takes from the records of its film
++
++namespace
++{
++Record Kept(Release release)
++{
++  Record r;
++  r.release = release;
++  r.settings.m_AudioDelay = 0.2f;
++  r.settings.m_SubtitleDelay = -1.5f;
++  r.settings.m_ViewMode = ViewModeCustom;
++  r.settings.m_CustomZoomAmount = 1.33f;
++  r.settings.m_ScalingMethod = VS_SCALINGMETHOD_SPLINE36;
++  r.settings.m_Sharpness = 0.3f;
++  r.settings.m_VolumeAmplification = 4.0f;
++  r.audio = T("spa", "Castellano", "truehd", 8);
++  r.subtitle = T("spa", "Forzados", "hdmv_pgs_subtitle", 0, FLAG_FORCED);
++  r.subtitleChosen = true;
++  return r;
++}
++
++const std::vector<Track> AUDIO = Placed({T("eng", "", "eac3", 6), T("spa", "Castellano", "eac3", 6)});
++const std::vector<Track> SUBTITLES =
++    Placed({T("eng", "", "subrip", 0), T("spa", "", "subrip", 0), T("spa", "Forced", "subrip", 0)});
++} // namespace
++
++TEST(TestFilmMemory, TheSameReleaseTakesEverything)
++{
++  const auto r = Restore({Kept(R(FILM))}, R(FILM + 400), CVideoSettings(), AUDIO, SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(0.2f, r->settings.m_AudioDelay);
++  EXPECT_EQ(-1.5f, r->settings.m_SubtitleDelay);
++  EXPECT_EQ(1, r->settings.m_AudioStream);
++  EXPECT_EQ(2, r->settings.m_SubtitleStream);
++  EXPECT_TRUE(r->settings.m_SubtitleOn);
++  EXPECT_EQ(std::optional<bool>(false), r->settings.m_isDefaultVideoSettings);
++  EXPECT_EQ(ViewModeCustom, r->settings.m_ViewMode);
++  EXPECT_EQ(VS_SCALINGMETHOD_SPLINE36, r->settings.m_ScalingMethod);
++  EXPECT_EQ(4.0f, r->settings.m_VolumeAmplification);
++  EXPECT_EQ(GROUP_AUDIO | GROUP_SUBTITLES | GROUP_VIEW | GROUP_PICTURE | GROUP_AUDIO_LEVEL |
++                GROUP_DELAYS,
++            r->groups);
++}
++
++TEST(TestFilmMemory, AnotherReleaseOfTheSameCutIsTimedOtherwise)
++{
++  // 12 s longer (another distributor's logos): not its delays
++  const auto r = Restore({Kept(R(FILM))}, R(FILM + 12000), CVideoSettings(), AUDIO, SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(0.0f, r->settings.m_AudioDelay);
++  EXPECT_EQ(0.0f, r->settings.m_SubtitleDelay);
++  EXPECT_EQ(0u, r->groups & GROUP_DELAYS);
++  EXPECT_EQ(4.0f, r->settings.m_VolumeAmplification);
++  EXPECT_EQ(1, r->settings.m_AudioStream);
++  EXPECT_EQ(2, r->settings.m_SubtitleStream);
++}
++
++TEST(TestFilmMemory, AnotherCutTakesTheTracksButNotItsTiming)
++{
++  // the extended cut, 20 minutes longer, in the same format
++  const auto r =
++      Restore({Kept(R(FILM))}, R(FILM + 20 * 60 * 1000), CVideoSettings(), AUDIO, SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(0.0f, r->settings.m_AudioDelay);
++  EXPECT_EQ(0.0f, r->settings.m_SubtitleDelay);
++  EXPECT_EQ(0.0f, r->settings.m_VolumeAmplification);
++  EXPECT_EQ(1, r->settings.m_AudioStream);
++  EXPECT_EQ(2, r->settings.m_SubtitleStream);
++  // the zoom is of the shape of the picture, the picture settings of its format
++  EXPECT_EQ(ViewModeCustom, r->settings.m_ViewMode);
++  EXPECT_EQ(VS_SCALINGMETHOD_SPLINE36, r->settings.m_ScalingMethod);
++  // a cut within 30 s is the same cut; 44 s apart (the final cut of Blade Runner) is not
++  EXPECT_TRUE(SameCut(R(FILM), R(FILM + 30000)));
++  EXPECT_FALSE(SameCut(R(FILM), R(FILM + 44000)));
++  // (an episode of 22 minutes: 6.6 s)
++  EXPECT_TRUE(SameCut(R(22 * 60 * 1000), R(22 * 60 * 1000 + 6000)));
++  EXPECT_FALSE(SameCut(R(22 * 60 * 1000), R(22 * 60 * 1000 + 8000)));
++  // a length not known is no release and no cut
++  EXPECT_FALSE(SameCut(R(0), R(0)));
++  EXPECT_FALSE(SameRelease(R(0), R(0)));
++}
++
++TEST(TestFilmMemory, TheZoomOnlyForAPictureOfTheSameShape)
++{
++  // the IMAX release, 1.90:1, of the same length
++  const auto r = Restore({Kept(R(FILM))}, R(FILM, 3840, 2020, 1.9f), CVideoSettings(), AUDIO,
++                         SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(ViewModeNormal, r->settings.m_ViewMode);
++  EXPECT_EQ(1.0f, r->settings.m_CustomZoomAmount);
++  EXPECT_EQ(0u, r->groups & GROUP_VIEW);
++  // (and its size is another format: not its picture settings, nor its delays)
++  EXPECT_EQ(VS_SCALINGMETHOD_LINEAR, r->settings.m_ScalingMethod);
++  EXPECT_EQ(0.0f, r->settings.m_AudioDelay);
++}
++
++TEST(TestFilmMemory, ThePictureSettingsOnlyForAVideoOfTheSameFormat)
++{
++  // a 1080p SDR release of the same shape and length
++  const auto r = Restore({Kept(R(FILM))}, R(FILM, 1920, 800, 2.4f, 0), CVideoSettings(), AUDIO,
++                         SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(VS_SCALINGMETHOD_LINEAR, r->settings.m_ScalingMethod);
++  EXPECT_EQ(0.0f, r->settings.m_Sharpness);
++  EXPECT_EQ(0u, r->groups & GROUP_PICTURE);
++  EXPECT_EQ(ViewModeCustom, r->settings.m_ViewMode);
++  EXPECT_EQ(0.0f, r->settings.m_SubtitleDelay);
++}
++
++TEST(TestFilmMemory, SubtitlesNotInThisSourceAreLeftToTheSettings)
++{
++  CVideoSettings current;
++  current.m_isDefaultVideoSettings = true;
++  const auto noSpanish = Placed({T("eng", "", "subrip", 0), T("fre", "", "subrip", 0)});
++  const auto r = Restore({Kept(R(FILM))}, R(FILM), current, AUDIO, noSpanish);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(-1, r->settings.m_SubtitleStream);
++  EXPECT_TRUE(r->settings.m_SubtitleOn);
++  EXPECT_EQ(std::optional<bool>(true), r->settings.m_isDefaultVideoSettings);
++  EXPECT_FALSE(r->subtitleChosen);
++  EXPECT_EQ(0u, r->groups & GROUP_SUBTITLES);
++  // but subtitles turned off stay off, in any source
++  Record off = Kept(R(FILM));
++  off.settings.m_SubtitleOn = false;
++  const auto o = Restore({off}, R(FILM), current, AUDIO, noSpanish);
++  ASSERT_TRUE(o.has_value());
++  EXPECT_FALSE(o->settings.m_SubtitleOn);
++  EXPECT_EQ(-1, o->settings.m_SubtitleStream);
++  EXPECT_EQ(std::optional<bool>(false), o->settings.m_isDefaultVideoSettings);
++  EXPECT_NE(0u, o->groups & GROUP_SUBTITLES);
++}
++
++TEST(TestFilmMemory, EachSettingFromTheLastPlaybackItAppliesTo)
++{
++  // the last playback, of another cut in 1080p, chose English; the one before, of this release,
++  // Spanish and its delays
++  Record last = Kept(R(FILM + 20 * 60 * 1000, 1920, 800, 2.4f, 0));
++  last.audio = T("eng", "", "ac3", 6);
++  last.settings.m_AudioDelay = 0.9f;
++  last.settings.m_ScalingMethod = VS_SCALINGMETHOD_LANCZOS3;
++  const auto r = Restore({last, Kept(R(FILM))}, R(FILM), CVideoSettings(), AUDIO, SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(0, r->settings.m_AudioStream);
++  EXPECT_EQ(0.2f, r->settings.m_AudioDelay);
++  EXPECT_EQ(VS_SCALINGMETHOD_SPLINE36, r->settings.m_ScalingMethod);
++  EXPECT_FALSE(r->log.empty());
++}
++
++TEST(TestFilmMemory, NothingKeptNothingRestored)
++{
++  EXPECT_FALSE(Restore({}, R(FILM), CVideoSettings(), AUDIO, SUBTITLES).has_value());
++  // a record with Kodi's defaults and no choice changes nothing
++  Record plain;
++  plain.release = R(FILM);
++  const auto r = Restore({plain}, R(FILM), CVideoSettings(), AUDIO, SUBTITLES);
++  ASSERT_TRUE(r.has_value());
++  EXPECT_EQ(0u, r->groups);
++  EXPECT_FALSE(r->settings != CVideoSettings());
++}
+-- 
+2.53.0
+

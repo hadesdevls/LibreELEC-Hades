@@ -1,0 +1,132 @@
+# What has been tested
+
+This page says where LibreELEC Hades has been seen working, and what still waits for hardware I do not have. It is not a list of recommended hardware: a device missing here has not been reported yet.
+
+I test on an AMD Ryzen 9 7950X3D with an NVIDIA GeForce RTX 4080 SUPER, using both the card and the processor's integrated graphics, with an LG C5 TV, a Samsung Odyssey OLED G6 monitor (LS27DG600SLXPE), a TCL Q85H Pro sound bar (on the TV's eARC, or between the PC and the TV) and a HIKSEMI HS-USB-SYNC C PRO 128 GB USB SSD; and on a laptop with an Intel Core i5-12450H.
+
+- **"Author"** marks what I saw myself.
+- **"User"** marks what people reported on their own hardware, in the issues of this repository and on the LibreELEC and Kodi forums: only what each person said they saw, with their hardware as they named it.
+- **Seen working** means correct colours and a clean return to the menus. The TV's Dolby Vision logo alone does not count.
+- **"Measured"** means that logs, a diagnostic report or an instrument back the result.
+
+If you try Hades, please say what you see in the [forum](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/) or the [issues](https://github.com/hadesdevls/LibreELEC-Hades/issues): reports from more hardware help the most.
+
+## On my PC (author)
+
+With the GeForce RTX 4080 SUPER connected by HDMI to the LG C5, the TCL Q85H Pro sound bar on the TV's eARC, and the Samsung Odyssey OLED G6 monitor:
+
+- **Dolby Vision:** native output of profile 7 with its full enhancement layer, profile 8.1 and profile 5, including films that once dropped to HDR10; HDR10 sent as Dolby Vision, also when chosen for one video from its output.
+- **Sound passed through to the sound bar:** Dolby TrueHD with Atmos (with Dolby Vision profiles 7 and 8.1), Dolby Digital Plus with Atmos (with profile 5) and DTS-HD Master Audio (with HDR10).
+- **HDR10+ on the Odyssey,** which takes HDR10+ and not Dolby Vision: HDR10+ videos, Dolby Vision videos that carry HDR10+ of their own, and Dolby Vision profile 7 with its enhancement layer sent as HDR10+.
+- **"As SDR (without HDR)"** for one video.
+- **The player information:** it opens with O at once, and its button for the output of the video is reached with Down, or with O, then OK.
+- **A change of subtitle track** shows the new track at once.
+- **Displays:** moving from the LG C5 to the Odyssey and back from the settings, with the display that is not in use turned off; back to 3840x2160 at 120 Hz after a video, many times in a row.
+- **The start with several displays:** the picture of the eclipse with no line of text, and the notice that Hades shows on one display, at its own size on each of them.
+- **The restarts:** *Restart LibreELEC Hades*, *Restart the interface* and *Restart into Windows* in the power menu, and *Restart into LibreELEC Hades* from the installer.
+- **The time** of the PC's hardware clock, which keeps local time for Windows.
+
+## Graphics
+
+| Maker | Graphics | Tried on |
+| --- | --- | --- |
+| **NVIDIA** | GeForce RTX 50 series | RTX 5060 (author); RTX 5080 and RTX 5090 (users) |
+| | GeForce RTX 40 series | **RTX 4080 SUPER (author)**; RTX 4080 Laptop GPU (user) |
+| | GeForce RTX 30 series | RTX 3050, RTX 3070, RTX 3070 Laptop GPU and RTX 3090 (users) |
+| | GeForce GTX 16 and RTX 20 series, and the Quadro RTX of that generation | GTX 1650 (user, [issue #22](https://github.com/hadesdevls/LibreELEC-Hades/issues/22)); Quadro RTX 4000 in a laptop (user, [issue #4](https://github.com/hadesdevls/LibreELEC-Hades/issues/4)) |
+| | GeForce GTX 900 and GTX 10 series, TITAN V (driver 580) | GTX 1060 (user, [issue #17](https://github.com/hadesdevls/LibreELEC-Hades/issues/17)) |
+| **AMD** | Radeon RX 7000 series | RX 7600 (user) |
+| | Radeon RX 5000, RX 6000 and RX 9000 series | No reports yet |
+| | Radeon RX 400 and 500 series, RX Vega M, RX Vega 56 and 64, Radeon VII | Dolby Vision not seen working yet ([Known limits](known-limits.md#graphics)) |
+| | Ryzen integrated graphics | **Ryzen 9 7950X3D (author)**; Ryzen 7 5800H, Ryzen 5 5600U, Ryzen 5 PRO 4650GE, Ryzen 5 PRO 3400GE and Ryzen 3200G (users) |
+| | Radeon R5 to R7 graphics of the A-series processors | PRO A10-8730B, SDR and 3D through passive DisplayPort adaptors (user, issues [#26](https://github.com/hadesdevls/LibreELEC-Hades/issues/26) and [#31](https://github.com/hadesdevls/LibreELEC-Hades/issues/31)) |
+| **Intel** | Integrated graphics (display version 11 and later) | **Core i5-12450H (author)**; Core i7-1355U, Core i3-1005G1, Core 5 255H, Core Ultra 5 235T, Core Ultra 7 255H, Core i3-N305 and N100 (users) |
+| | HD and UHD 6xx graphics | HD Graphics 610 with a Pentium G4560, HD Graphics 620 with a Core i5-7200U (in a virtual machine) and the UHD Graphics of a Core i5-10310U (users) |
+| | Graphics that use the `xe` driver (Arc B-series, Core Ultra 200V and newer) | Arc B570 (user) |
+
+TVs, projectors and monitors: an LG C5 TV and a Samsung Odyssey OLED G6 monitor (author); LG G5, LG C2, a Panasonic TV, a Sony X900H, a Sony A80K and a Sony Bravia 8 II with native Dolby Vision (its HDMI input set to "Enhanced format"), a Samsung S90H, a Samsung S95B, a JVC DLA-NZ9 and a JVC NZ800 projector with HDR10+, an LG C3 with Dolby Atmos passed through, an LG OLED G6 with HDR10, an LG C1 through a Denon receiver and an LG G2 through an Onkyo receiver and through an Anthem AVM 90 with native Dolby Vision, a Titan Noir Max projector with native Dolby Vision, with Low-Latency, and with Dolby Vision shown as HDR10 and HDR10+ through a Denon X4800H, a Hisense L9H projector with native Dolby Vision, an LG CX through a Yamaha RX-V6A receiver, an LG OLED B7 that gets its picture back after it is switched off and on, a Philips 3D TV with 3D in frame packing, an LG 4K passive 3D TV with 3D, and a Sony TV that offers Dolby Vision only as low-latency (users).
+
+## Features
+
+| What | Seen working on |
+| --- | --- |
+| Dolby Vision profile 7 with FEL | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author); RTX 4080 Laptop GPU, RTX 5080, RTX 5090, GTX 1650, RX 7600, Ryzen 7 5800H, Core i7-1355U, Core 5 255H, Arc B570, HD Graphics 620 and HD Graphics 610 (users; on the HD Graphics 620, measured: the enhancement layer rebuilt in single- and dual-track files and a whole film, in a virtual machine; on the HD Graphics 610, measured: the enhancement layer in every frame, at the last level of the fidelity step-down, with no menus over the picture, issue #12) |
+| Dolby Vision profile 7 with MEL | Ryzen 9 7950X3D (author); RX 7600 and Arc B570 (users) |
+| Dolby Vision profiles 8.1 and 5 | RTX 4080 SUPER and Ryzen 9 7950X3D (author); RX 7600 (user); profile 8.1 on an RTX 5090 (user, issue #16) |
+| Films that once dropped to HDR10, now in Dolby Vision | Profile 7 with FEL and Dolby TrueHD Atmos, on the RTX 4080 SUPER (author, issue #1); samples of two such films on a Ryzen 7 5800H (user) |
+| Dolby Vision in two video tracks | `.m2ts` on the RTX 4080 SUPER (author); MKV on an RTX 3070, MP4 on a laptop with RTX graphics, and dual-track clips on HD Graphics 620 (users) |
+| Dolby Vision at 60 Hz, through the HDMI port of a laptop that the graphics drive as DisplayPort | Quadro RTX 4000 in an HP ZBook 17 G6 (user, issue #4) |
+| Menus and subtitles over Dolby Vision at full frame rate | Profiles 7 FEL and 8.1 on the RTX 4080 SUPER and the Ryzen 9 7950X3D (author); profile 7 FEL on an RX 7600 (user, measured with the menus over the picture: 240 of 240 frames, the largest gap 42.0 ms, issue #3) |
+| Dolby Vision Low-Latency | Ryzen 9 7950X3D, through an HDMI sync box that offers only low-latency Dolby Vision (author); RTX 5090 with a Titan Noir Max projector (user, [issue #25](https://github.com/hadesdevls/LibreELEC-Hades/issues/25)) |
+| Dolby Vision through a sound bar or an AV receiver | RTX 4080 SUPER through the TCL Q85H Pro sound bar to the LG C5 (author); Ryzen 5 5600U through a Denon AVC-X3900H to an LG C1 (user, issue #15); HD Graphics 610 through an Onkyo receiver to an LG G2 (user, issue #12); Core i7-1355U through an Anthem AVM 90 to an LG G2 (user, issue #28); RTX 5090 through a Denon X4800H to a Titan Noir Max projector (users, issues #16 and #25); GTX 1060 with driver 580 through a Denon receiver, at every refresh rate (user); Arc B570 through a Denon AVR-X2800H to a Sony A80K, and HD Graphics 620 through a Samsung HW-Q800T to a Sony X900H (users) |
+| Dolby Vision shown as HDR10 | Profile 5 on the RTX 4080 SUPER (author); profiles 5 and 7 FEL on a Core i3-1005G1 (user); an RTX 5090 with a Titan Noir Max projector (user, issue #16); profile 7 FEL on a Ryzen 5 PRO 3400GE with a JVC NZ800 and a Titan Noir Max through an Anthem MRX 1140 (user) |
+| Dolby Vision shown as HDR10+ | Profile 7 FEL on the RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); profile 7 FEL on an RX 7600 with a JVC DLA-NZ9, shown as HDR10+ with its FEL at full resolution, and measured: the JVC reports HDR10+ throughout, and DistributionY99, read from the output, follows the peak that the Dolby Vision metadata give each scene (user, issue #10); a Core i3-1005G1 with a Samsung S90H (user, issue #2); an RTX 5090 with a Titan Noir Max projector (user, issue #16) |
+| HDR mapped by Hades for a projector | HDR mapped to 150 nits on a Ryzen 5 PRO 4650GE and a Ryzen 5 PRO 3400GE, with a JVC NZ800 and a Titan Noir Max (user) |
+| Changing the output of a video while it plays (Dolby Vision, HDR10, HDR10+, SDR) | RTX 4080 SUPER (author); Ryzen 7 5800H, from the on-screen controls (user) |
+| HDR10+ | RTX 4080 SUPER with a Samsung Odyssey OLED G6 (author); Core i3-1005G1 with a Samsung S90H, Ryzen 3200G with a Samsung S95B, Ryzen 7 5800H, RX 7600 with a JVC DLA-NZ9, and Ryzen 5 PRO 4650GE and 3400GE with a JVC NZ800 (users; on the RX 7600, measured: the HDR10+ packets of four HDR10+ films byte for byte those of a licensed player in 10 of 10 samples, issue #10) |
+| HDR10+ as Dolby Vision | RTX 4080 SUPER (author); Ryzen 7 5800H (user) |
+| HDR10 with more than 8 bits on NVIDIA | RTX 4080 SUPER (author); GTX 1650 in YCbCr 4:2:2 at 12 bits, through a Yamaha RX-V6A to an LG CX (user, issue #22); Quadro RTX 4000 in YCbCr 4:2:2 at 12 bits (user, issue #4); GTX 1060 with driver 580, in YCbCr 4:2:2 at 10 bits, with an LG OLED65C8, straight and through a Denon receiver (user, issue #17) |
+| A TV switched off and on gets its picture back | RTX 3050 to an LG OLED B7 at 3840x2160 at 50 Hz (user, issue #11), and through an AV receiver with 1.1 (user, issue #24) |
+| A 24 fps video at exactly 24 Hz on NVIDIA | RTX 4080 SUPER (author) |
+| Dolby TrueHD with Atmos, passed through | RTX 4080 SUPER, Ryzen 9 7950X3D and Core i5-12450H (author); RTX 3090, HD Graphics 620, and an RTX 3070 Laptop GPU on its charger with *Keep the graphics card at full speed while HD audio plays through* (users; the last one without cuts, [issue #8](https://github.com/hadesdevls/LibreELEC-Hades/issues/8)) |
+| Dolby Digital Plus with Atmos, DTS-HD Master Audio and DTS:X, passed through | RTX 4080 SUPER (author); DTS-HD Master Audio from an RTX 3050 to a Pioneer receiver on an output of its own (user, issue #24); DTS:X from HD Graphics 620 (user) |
+| Sound on a display that takes PCM of 16 or 20 bits only | Core i5-10310U with a Philips 3D TV (user, [issue #23](https://github.com/hadesdevls/LibreELEC-Hades/issues/23)) |
+| 3D: both views decoded, the display switched to 3D | Ryzen 7 5800H, 3D Blu-ray video (MVC) and full side by side (user); the UHD Graphics of a Core i5-10310U with a Philips 3D TV, in frame packing (user, issue #23); the Radeon R5 graphics of a PRO A10-8730B through passive DisplayPort adaptors: a 3D Blu-ray in frame packing at 1080p 23.976 Hz with the Philips 3D TV (from the report: 1920x2205 with the 3D InfoFrame, and both views in each of the 320 pictures it played, issue #31), and 3D and 1080p at 60 Hz with an LG 4K passive 3D TV (user, issue #26) |
+| 3D on NVIDIA graphics | Both views of 3D Blu-ray discs (MVC) decoded on an RTX 5090, with a Titan Noir Max projector through a Denon X4800H; frame packing not yet: NVIDIA's driver refused its mode, so the two views went out one above the other at 2160p without a 3D signal, and the projector was set to 3D by hand (user, [issue #33](https://github.com/hadesdevls/LibreELEC-Hades/issues/33)) |
+| The use and temperature of the graphics in the player information | A laptop with RTX graphics (user) |
+| Check this setup, and Check the Dolby Vision output | RX 550 with an LG G3 (user, [issue #20](https://github.com/hadesdevls/LibreELEC-Hades/issues/20)) |
+| The diagnostic report made with one button | Intel and NVIDIA graphics (users, issues #22 and #23) |
+| Kodi on the TV in a PC with two graphics chips | RTX 4080 SUPER and Ryzen 9 7950X3D, with the TV on the NVIDIA card (author) |
+| Started from USB with the internal disks hidden, and with DMA translation | Ryzen 9 7950X3D (author) |
+| Films on an NTFS disk | Core Ultra 5 235T (user, [issue #21](https://github.com/hadesdevls/LibreELEC-Hades/issues/21)) |
+| Hades in a Proxmox virtual machine, with the graphics passed through | HD Graphics 620 with its HD audio, and the integrated graphics of another PC (users) |
+| An NVIDIA Shield TV remote over Bluetooth stays connected | An ASRock B660 ITX PC (user) |
+| Windows installer | "Update" of a USB SSD, and *Restart into LibreELEC Hades* (author); the other operations on a virtual disk |
+
+Every change is tested before a release on the host, with the code that the image runs, and on my PC where it has the hardware. Reports with the diagnostic switch on ([diagnostics](diagnostics.md)) help confirm the rest.
+
+## Reports from users since 1.0
+
+Each row is what one person said they saw, with the post or the comment where they said it.
+
+| Who | Version | Hardware, as they named it | What they saw | Source |
+| --- | --- | --- | --- | --- |
+| theged | 1.1 | Core i5-7200U with HD Graphics 620, Hades in a Proxmox virtual machine with the graphics and the HD audio passed through; Sony X900H, sound to a Samsung HW-Q800T over eARC and through its HDMI passthrough | Native Dolby Vision profile 7 FEL in single- and dual-track clips and a whole film, 3840x2160 at 23.976 Hz, HDR10, TrueHD Atmos, DTS:X and multichannel PCM; measured in his logs | [Forum, post 205](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209884#post209884) |
+| Khazar321 | 1.1 | RTX 5090, Ryzen 7 9800X3D, Denon X4800H, Xgimi Titan Noir Max | Low-Latency with "also where the TV takes Standard", native Dolby Vision with the projector, and Dolby Vision shown as HDR10 | [Issue #25](https://github.com/hadesdevls/LibreELEC-Hades/issues/25#issuecomment-7046055282) |
+| Khazar321 | 1.1 | Same | 3D Blu-ray disc images: both views decoded, sent one above the other at 2160p without a 3D signal, the projector set to 3D by hand | [Issue #33](https://github.com/hadesdevls/LibreELEC-Hades/issues/33), [forum, post 164](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209621#post209621) |
+| JonnyVee | 1.1 | Lenovo M75q, Ryzen 5 PRO 4650GE; JVC NZ800 and Xgimi Titan Noir Max through an Anthem MRX 1140 | "Works quite well"; the graphics at 46 to 50 %; HDR10+ to the NZ800 with *Send it as HDR10+*; HDR mapped to 150 nits "worked really well" | [Forum, post 162](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209603#post209603), [post 175](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209652#post209652) |
+| JonnyVee | 1.1 | Lenovo M75q Gen 1, Ryzen 5 PRO 3400GE; same projectors and receiver | Dolby Vision as HDR10 with FEL, HDR10+ as HDR10+, HDR10 as SDR, Dolby Vision as HDR10 mapped to 150 nits | [Forum, post 195](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209789#post209789) |
+| lvasan | 1.1 | Intel Arc B570, Denon AVR-X2800H, Sony A80K | Native Dolby Vision profile 7 FEL and MEL, both layers decoded | [Forum, post 154](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209589#post209589) |
+| NTM-3D | 1.1 | PRO A10-8730B (Radeon R5) through a passive DisplayPort-to-HDMI adaptor; LG 4K passive 3D TV | 1080p at 60 Hz and 3D | [Issue #26](https://github.com/hadesdevls/LibreELEC-Hades/issues/26#issuecomment-7030725573) |
+| NTM-3D | 1.1 | Same laptop; Philips 3D TV | With two of three adaptors: 1080p at 60 Hz, sound and 3D in frame packing (1920x2205, both views in 320 pictures); measured in his report | [Issue #31](https://github.com/hadesdevls/LibreELEC-Hades/issues/31#issuecomment-7034020214) |
+| NTM-3D | 1.1 | Core i5-10310U (UHD Graphics); Philips 3D TV | 3D, and now sound | [Issue #23](https://github.com/hadesdevls/LibreELEC-Hades/issues/23#issuecomment-7030989618) |
+| SeaMonkey82 | 1.0 and 1.1 | GTX 1650, Yamaha RX-V6A, LG CX | 1.0: no playback issues in a Core i3-3220 PC; 1.1: profile 7 FEL from beginning to end in an AMD FX-8350 PC | [Issue #22](https://github.com/hadesdevls/LibreELEC-Hades/issues/22#issuecomment-7026126508) |
+| sat4all1-dev | 1.0 | GTX 1060, Denon AVR-X3200W, LG OLED65C8 | "Everything is working great" | [Issue #17](https://github.com/hadesdevls/LibreELEC-Hades/issues/17#issuecomment-6869981717) |
+| corgeone | 1.0 and 1.1 | Topton GM1, Core i7-1355U, Anthem AVM 90, LG G2 | 1.0: native Dolby Vision FEL "works great"; 1.1: with `i915.hdmi_empty_vsif=0` the receiver reports 4K at 60 Hz; measured | [Issue #28](https://github.com/hadesdevls/LibreELEC-Hades/issues/28#issuecomment-7025260208) |
+| wright96d | 1.0 | HP ZBook with Quadro RTX 4000 | Dolby Vision at 60 Hz and YCbCr 4:2:2 at 12 bits | [Issue #4](https://github.com/hadesdevls/LibreELEC-Hades/issues/4#issuecomment-6887844654) |
+| Levi741i | 1.0 | Laptop with RTX 3070 Laptop GPU and Intel UHD graphics, LG G5, on its charger | TrueHD passed through without cuts with *Keep the graphics card at full speed while HD audio plays through* | [Issue #8](https://github.com/hadesdevls/LibreELEC-Hades/issues/8#issuecomment-7065918483) |
+| RaphS8 | 1.0 | Core Ultra 5 235T, Pioneer VSX-534D, LG G5 | Films from an NTFS disk play "perfectly" | [Issue #21](https://github.com/hadesdevls/LibreELEC-Hades/issues/21#issuecomment-7050770051) |
+| harment | 1.0 and 1.1 | RTX 3050, Core i5-8600K, LG B7, an AV receiver | The picture stays with *Keep the display of the audio output on*, and comes back after the TV wakes | [Issue #24](https://github.com/hadesdevls/LibreELEC-Hades/issues/24#issuecomment-7046376694) |
+| MrPhenix007 | 1.1 | ASUS NUC 15 Pro AI, Core Ultra 7 255H, LG OLED G6 | HDR10 at 3840x2160 and 23.976 Hz in RGB at 10 bits | [Issue #30](https://github.com/hadesdevls/LibreELEC-Hades/issues/30) |
+| Felix Oghină | His build with pull request 29 | Chromebook with an Intel N-series processor, passive USB-C hubs | Dolby Vision and multichannel sound through the hubs | [Pull request #29](https://github.com/hadesdevls/LibreELEC-Hades/pull/29) |
+| ht2tweak | 1.0 | Ryzen 7 5800H | Dolby Vision, HDR and HDR10+ samples, the output switched while they played, minutes of FEL films, an MVC file and full side by side | [Forum, post 138](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209198#post209198) |
+| astrotrain | 1.0 | Ryzen 5 5600U | "Excellent results": no flicker, a cooler processor, DVDs at their own rate | [Forum, post 142](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209218#post209218) |
+| louyeh | 1.0 | Beelink EQ12 Pro, Core i3-N305, Hisense L9H projector, Samsung HW-Q990C | Default settings, no faults; Dolby Vision at 4K and 24 Hz with the graphics at 50 to 60 % | [Forum, post 143](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209219#post209219) |
+| MrMagic | 1.0 and 1.1 | Proxmox VE with the integrated graphics passed through, Denon X2800H | The stutter of a disc image with picture subtitles gone in 1.0; "everything plays fine" | [Forum, post 136](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209192#post209192), [post 189](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209714#post209714) |
+| Alaric | 1.1 | GMKtec NucBox K12, an LG TV, a Denon Atmos receiver | His test files play | [Forum, post 153](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=209586#post209586) |
+| siriusbox | 1.1 | ASRock B660 ITX/ac PC, Sony HT-A9, a Hisense projector, an NVIDIA Shield TV remote | The Bluetooth drops of the Shield remote are gone | [Forum thread of the remote, post 9](https://forum.libreelec.tv/thread/30674-x86-64-nvidia-shield-tv-remote-2019-constantly-connects-disconnects/?postID=209660#post209660) |
+
+## Not tried on hardware yet
+
+These need hardware, a display or a connection that I do not have. Each was checked on the host, with the code that the image runs, or in a virtual machine. If you have one of them, please say what you see in the [forum](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/) or the [issues](https://github.com/hadesdevls/LibreELEC-Hades/issues).
+
+- **New in this version:** projector control over the network (JVC D-ILA, Sony ADCP and SDCP, Epson ESC/VP.net: tested against a simulator of each protocol, and end to end in a virtual machine against a JVC simulator), and *Your display* on a projector; the 3D LUT of a calibrated display; on a 3D display, an HDR video in a 3D output, subtitles and menus placed by measured depth, the frame packing card of *Check this setup* and the player information on frame packing; Dolby Vision rebuilt as HDR10 or SDR on graphics too small for it at full fidelity; updates found and installed by Hades itself (from one version to the next in a virtual machine, with test keys; the first real update through the channel is the one after 1.2).
+- **AMD graphics:** Dolby Vision on the newest Ryzen processors (DCN 4.2 and 4.2B); the Dolby Vision path of the Radeon RX 400, RX 500 and Vega cards, and the check of the output that says where such a card changes the bytes.
+- **Intel graphics:** HDR over HDMI on HD and UHD 6xx graphics; AV receivers that switch inputs (issue #28); reading the EDID on Panther Lake and Wildcat Lake.
+- **NVIDIA graphics:** a card held to a low power limit, which now presents frames ahead; a card with 2 GB of memory; *Video at its own rate with VRR* with Media VRR on the RTX 50 series, and with HDR10+ there; a change of mode with several displays, and a sleep, on driver 580 (GTX 900 and 10 series).
+- **Connections:** passive DisplayPort adaptors (DP++), for Dolby Vision and HDR, for 3D on NVIDIA graphics, and an adaptor that says DVI on NVIDIA (on AMD graphics, SDR and 3D through such adaptors have been seen working, issues #26 and #31); USB-C hubs and adapters, for Dolby Vision and surround sound; the DisplayPort-to-HDMI converter of a mini PC or NUC board.
+- **Displays:** projectors and LCD TVs with Dolby Vision Low-Latency (their black level, a peak or colours that cannot be used; Low-Latency has been seen working on a laser projector whose colours reach past BT.2020, issue #25); a TV whose EDID counts extra blocks with an HDMI Forum EEODB (issue #7); 3D displays (side by side at 1080p, the lines between the eyes of frame packing, the second view after a picture that empties the decoder; MV-HEVC 3D, checked only with the ITU-T conformance streams and test streams made for it; the disparity adjustment of a real spatial video); Dolby Vision profile 20 (no file to try it with).
+- **Sound and HDMI-CEC:** an AV receiver on an output of its own kept on with `hades-keep-outputs`; a receiver with a back centre speaker, for 6.1 and 6.0 tracks; a CEC adapter on an output without the picture, CEC over a DisplayPort connector, adapters plugged in later, and SECO boards (UDOO x86).
+- **PCs:** Chromebooks; laptops with Secure Boot; a PC without a temperature sensor for its processor; a PC whose HPET timer stops (issue #22); the firmware of more MediaTek and Qualcomm Wi-Fi and Bluetooth adapters; infrared remotes that use the decoders compiled from source; the fast side of an external USB hub that may sleep.
+
+SDR, HDR10, HLG, audio passthrough, menus and refresh-rate switching use Kodi's own code and behave as in LibreELEC, apart from the additions of Hades.

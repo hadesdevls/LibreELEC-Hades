@@ -4,7 +4,9 @@
 // LibreELEC Hades, TEST ONLY: the GPU time of each pass (dvbridge_render_time_passes()) in a bridge
 // test. DV_PASSTIMES=1 makes libplacebo with its timers on OpenGL ES (gles_timer_queries, a patch of the libplacebo
 // recipe) and turns
-// the timing on in the renderer; without it nothing of it is to be made, and the test checks that. Every render is
+// the timing on in the renderer; without it nothing of it is to be made, and the test checks that. DV_PASSTIMES=<n>
+// times one render in n, as Kodi does (dvbridge_render_sample_passes(), libplacebo-9947: the others begin no query):
+// the bridge's packing then has the times of those renders alone. Every render is
 // timed on the host, with glFinish() after it (on Mesa's software GL the GPU's work is the CPU's), for what the
 // timing costs. Included by a test after its Check(); the bridge's functions are weak, so that the test also builds
 // with a bridge that has none of it (it then says so and fails).
@@ -22,8 +24,11 @@ __attribute__((weak)) bool dvbridge_render_passes_timed(const struct dvbridge_re
                                                         bool* own);
 __attribute__((weak)) unsigned dvbridge_render_take_pass_times(struct dvbridge_renderer* renderer,
                                                                struct dvbridge_pass_time* out, unsigned max);
+__attribute__((weak)) void dvbridge_render_sample_passes(struct dvbridge_renderer* renderer, bool now);
 
 static int g_passOn = -1;
+static int g_passEvery = 1; // one render in so many timed (DV_PASSTIMES=<n>)
+static long g_passRenders, g_passSampled;
 static double g_renderMs, g_renderCpuMs;
 static long g_renders;
 static long g_packs __attribute__((unused));
@@ -33,7 +38,9 @@ static int PassTimesOn(void)
   if (g_passOn < 0)
   {
     const char* e = getenv("DV_PASSTIMES");
-    g_passOn = e && !strcmp(e, "1");
+    const int n = e ? atoi(e) : 0;
+    g_passOn = n >= 1;
+    g_passEvery = n > 1 ? n : 1;
   }
   return g_passOn;
 }
@@ -62,6 +69,17 @@ static void PassTimesStart(struct dvbridge_renderer* r)
 {
   if (PassTimesOn() && dvbridge_render_time_passes)
     dvbridge_render_time_passes(r, true);
+}
+
+// before each render: whether it is timed, one in g_passEvery (as Kodi's CDVBridgeGLES::SamplePasses())
+static void PassSample(struct dvbridge_renderer* r)
+{
+  if (!PassTimesOn() || g_passEvery <= 1)
+    return;
+  const bool now = g_passRenders++ % g_passEvery == 0;
+  g_passSampled += now;
+  if (dvbridge_render_sample_passes)
+    dvbridge_render_sample_passes(r, now);
 }
 
 // own: how many times the bridge's own passes ran (0: this test draws none of them); placeboDraws: libplacebo draws
@@ -98,7 +116,8 @@ static void PassTimesSummary(pl_gpu gpu, struct dvbridge_renderer* r, long own, 
         placeboTimes += t[i].count;
     }
     printf("pass times: %u passes, %ld times of libplacebo's, %ld of the bridge's own (%ld of the packing, of %ld "
-           "packings)\n", n, placeboTimes, ownTimes, ownPack, own);
+           "packings); one render in %d timed (%ld of %ld)\n", n, placeboTimes, ownTimes, ownPack, own, g_passEvery,
+           g_passEvery > 1 ? g_passSampled : g_renders, g_passEvery > 1 ? g_passRenders : g_renders);
     Check(timed && placebo && mine,
           "the passes are timed: libplacebo's (its GPU makes timers on OpenGL ES with gles_timer_queries) and the "
           "bridge's own (GL_EXT_disjoint_timer_query)");
@@ -107,9 +126,17 @@ static void PassTimesSummary(pl_gpu gpu, struct dvbridge_renderer* r, long own, 
     else
       Check(placeboTimes == 0, "libplacebo draws none of these pictures (the source transport takes the decoder's "
                                "planes where the composer's mapping is the identity): none of its passes has a time");
-    // each packing's time comes back on a later frame: all of them but those still in flight (at most 8)
-    if (own)
+    // each packing's time comes back on a later frame: all of them but those still in flight (at most 8); timed one
+    // render in n, those of the renders timed, and none of the others
+    if (own && g_passEvery <= 1)
       Check(ownPack <= own && ownPack >= own - 8, "the bridge's packing has the time of every packing but the last few");
+    else if (own)
+    {
+      const long timed = (own + g_passEvery - 1) / g_passEvery;
+      Check(dvbridge_render_sample_passes != NULL, "the bridge samples the frames it times (dvbridge_render_sample_passes())");
+      Check(ownPack <= timed && ownPack >= timed - 8 && ownPack > 0,
+            "timed one render in n: the bridge's packing has the time of the renders timed alone");
+    }
     Check(dvbridge_render_take_pass_times(r, t, 32) == 0, "a window taken starts again: nothing in the next one");
   }
   else

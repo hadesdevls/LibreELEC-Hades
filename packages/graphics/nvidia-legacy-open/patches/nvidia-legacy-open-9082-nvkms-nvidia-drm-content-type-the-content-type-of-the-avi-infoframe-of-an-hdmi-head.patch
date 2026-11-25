@@ -1,0 +1,548 @@
+From b702b4234ff6a6baa5911d1ded94996dbf7836a7 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 00:42:14 +0000
+Subject: [PATCH] nvkms, nvidia-drm: content type, the content type of the AVI
+ InfoFrame of an HDMI head
+
+NVKMS tells every HDMI display that what it shows is "IT content, graphics":
+NvTiming_ConstructVideoInfoframeCtrl() sets ITC 1 and CN Graphics for every
+mode of the EDID (nvt_edidext_861.c), and SendVideoInfoFrame() sends that AVI
+InfoFrame with each mode set, a film included. nvidia-drm had no way to say
+otherwise: it did not offer DRM's standard "content type" property, which i915,
+xe and amdgpu have. A TV that chooses its picture mode by the content type
+(Filmmaker Mode Auto Start of LG on Cinema, a game mode on Game, Sony's scene
+select) could not be told that a film is a film.
+
+nvidia-drm now attaches "content type" to HDMI connectors, and to the
+dual-mode DisplayPort connectors that are offered as HDMI. Its value goes to
+the KAPI as hadesContentType with the head's configuration, and from there to
+NVKMS in a field of three bits of the overrides of the mode validation of the
+head's mode set (NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE: no structure of the
+API changes), which the mode set keeps with the head's InfoFrame state.
+SendVideoInfoFrame() then writes it into every AVI InfoFrame of the head, also
+those that a flip of the HDR or vendor InfoFrame writes again
+(nvHadesAviContent() of nvkms-hades.h, which a host test runs):
+
+- Graphics, Photo, Cinema, Game: ITC 1 and that CN1 CN0, as DRM's
+  drm_hdmi_avi_infoframe_content_type() makes them for i915 and amdgpu;
+- "No Data", the default: NVKMS's own AVI InfoFrame (ITC 1, Graphics), so that
+  a client that never sets the property sends what it always sent; but with
+  Dolby Vision on the head (the Dolby vendor InfoFrame, Standard or
+  Low-Latency, or the HDMI 1.4b signalling of Dolby Vision), ITC 0 and CN 0,
+  "no data". That is what the AVI InfoFrame of the Dolby Vision tunnel of i915
+  and amdgpu in Hades says with "No Data" (DRM's helper), and what a licensed
+  Dolby Vision set-top box sends (an Amlogic one read on 2026-11-24: ITC off,
+  CN 0). In the tunnel's AVI InfoFrame only the ITC bit changes (and with it
+  the checksum).
+
+A change of it is a mode set of the head, in KAPI (bRequiredModeset) and in
+DRM (mode_changed), compared with the head's inherited configuration, as
+"Broadcast RGB" is: a commit without DRM_MODE_ATOMIC_ALLOW_MODESET that
+changes it is refused, as i915 refuses it, rather than taken without reaching
+the display. The Kodi of LibreELEC Hades changes it only in a commit that
+changes the mode of the head anyway, or that starts or ends Dolby Vision (a
+mode set already), so that it never costs a mode set of its own. The console
+after a client goes back to "No Data", as it drops NV_HDMI_VRR_OFF. The
+kernel's log says the content type of each head whose value changed.
+---
+ kernel-open/common/inc/nvkms-kapi.h           | 11 +++
+ kernel-open/nvidia-drm/nvidia-drm-connector.c | 71 +++++++++++++-
+ kernel-open/nvidia-drm/nvidia-drm-connector.h |  8 ++
+ kernel-open/nvidia-drm/nvidia-drm-modeset.c   | 40 ++++++++
+ src/nvidia-modeset/include/nvkms-hades.h      | 93 +++++++++++++++++++
+ src/nvidia-modeset/include/nvkms-types.h      |  5 +
+ src/nvidia-modeset/interface/nvkms-api.h      | 12 +++
+ .../kapi/interface/nvkms-kapi.h               | 11 +++
+ src/nvidia-modeset/kapi/src/nvkms-kapi.c      | 13 ++-
+ src/nvidia-modeset/src/nvkms-hdmi.c           | 27 ++++++
+ src/nvidia-modeset/src/nvkms-modeset.c        |  5 +
+ 11 files changed, 290 insertions(+), 6 deletions(-)
+
+diff --git a/kernel-open/common/inc/nvkms-kapi.h b/kernel-open/common/inc/nvkms-kapi.h
+index 53603af..30773aa 100644
+--- a/kernel-open/common/inc/nvkms-kapi.h
++++ b/kernel-open/common/inc/nvkms-kapi.h
+@@ -472,6 +472,16 @@ struct NvKmsKapiHeadModeSetConfig {
+      */
+     NvBool hadesColorRangeLimited;
+ 
++    /*
++     * Hades: the content type that the AVI InfoFrame of this head says:
++     * DRM_MODE_CONTENT_TYPE_* (0 "No Data": NVKMS's own, none with Dolby
++     * Vision; 1 Graphics, 2 Photo, 3 Cinema, 4 Game), through
++     * NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE. nvidia-drm sets it from the
++     * connector's "content type". A change of it is a mode set
++     * (ApplyModeSetConfig()).
++     */
++    NvU8 hadesContentType;
++
+     /*
+      * Hades: the HDR10+ VSIF of the frame (IEEE OUI 90-84-8B first, 27
+      * bytes; payloadSize 0 for none). Passed by a mode set, and by the flip of
+@@ -496,6 +506,7 @@ struct NvKmsKapiHeadRequestedConfig {
+         NvBool ditheringChanged       : 1;
+         NvBool colorBpcChanged        : 1;
+         NvBool hadesColorRangeChanged : 1; /* Hades: hadesColorRangeLimited */
++        NvBool hadesContentTypeChanged : 1; /* Hades: hadesContentType */
+         NvBool hdr10PlusVsifChanged   : 1;
+     } flags;
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.c b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+index bbad902..8fb5c95 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.c
+@@ -487,8 +487,8 @@ static int nv_drm_connector_atomic_get_property(
+  * Linux). When Kodi dies in a Dolby Vision video, that state still has the
+  * Dolby VSIF of the tunnel in NV_HDMI_VSIF_METADATA: the console would go out
+  * next to it, as a tunnel the display cannot read. It is dropped from the
+- * state of the client's commit; dithering and "max bpc", which only make the
+- * console exact, stay.
++ * state of the client's commit, and "content type" goes back to "No Data";
++ * dithering and "max bpc", which only make the console exact, stay.
+  */
+ static void nv_drm_connector_atomic_client_restore(
+     struct drm_connector *connector,
+@@ -500,21 +500,25 @@ static void nv_drm_connector_atomic_client_restore(
+     if ((nv_connector_state->hdmi_vsif_metadata != NULL) ||
+         (nv_connector_state->hdr10plus_vsif != NULL) ||
+         nv_connector_state->hdmi_dv_low_latency ||
+-        nv_connector_state->hdmi_dv_hdmi14b) {
++        nv_connector_state->hdmi_dv_hdmi14b ||
++        (state->content_type != DRM_MODE_CONTENT_TYPE_NO_DATA)) {
+         NV_DRM_DEV_LOG_INFO(to_nv_device(connector->dev),
+                             "[CONNECTOR:%d:%s] the console takes the display: "
+                             "NV_HDMI_VSIF_METADATA %s, HDR10PLUS_VSIF %s, "
+-                            "NV_HDMI_DV_LOW_LATENCY %d, NV_HDMI_DV_HDMI14B %d dropped",
++                            "NV_HDMI_DV_LOW_LATENCY %d, NV_HDMI_DV_HDMI14B %d, content type %u dropped",
+                             connector->base.id, connector->name,
+                             nv_connector_state->hdmi_vsif_metadata != NULL ? "set" : "none",
+                             nv_connector_state->hdr10plus_vsif != NULL ? "set" : "none",
+                             nv_connector_state->hdmi_dv_low_latency,
+-                            nv_connector_state->hdmi_dv_hdmi14b);
++                            nv_connector_state->hdmi_dv_hdmi14b,
++                            state->content_type);
+     }
+     drm_property_replace_blob(&nv_connector_state->hdmi_vsif_metadata, NULL);
+     drm_property_replace_blob(&nv_connector_state->hdr10plus_vsif, NULL);
+     nv_connector_state->hdmi_dv_low_latency = false;
+     nv_connector_state->hdmi_dv_hdmi14b = false;
++    /* Hades: "content type", which a client sets for what it shows */
++    state->content_type = DRM_MODE_CONTENT_TYPE_NO_DATA;
+ }
+ #endif
+ 
+@@ -1044,6 +1048,40 @@ static void nv_drm_connector_hades_color_range(
+ }
+ #endif
+ 
++#if NV_DRM_HADES_CONTENT_TYPE
++/*
++ * Hades: "content type" (DRM's standard property, as i915 and amdgpu have it):
++ * the content type that the AVI InfoFrame of the head says (KAPI
++ * hadesContentType, nvHadesAviContent() of NVKMS): Graphics, Photo, Cinema or
++ * Game with ITC 1; "No Data", the default, leaves NVKMS's own AVI InfoFrame
++ * (ITC 1, Graphics) as before, but says no data (ITC 0) while Dolby Vision goes
++ * out, as the tunnel of i915 and amdgpu says it. Compared with the head's
++ * inherited configuration, as "Broadcast RGB" is. A change of it is a mode set,
++ * in KAPI and in DRM (mode_changed): a commit without
++ * DRM_MODE_ATOMIC_ALLOW_MODESET that changes it is refused
++ * (drm_atomic_check_only()), as i915 refuses it, rather than taken without
++ * reaching the display. Kodi of LibreELEC Hades changes it only in a commit
++ * that changes the mode of the head anyway, or starts or ends Dolby Vision.
++ */
++static void nv_drm_connector_hades_content_type(
++    const struct drm_connector *connector,
++    const struct drm_connector_state *new_connector_state,
++    struct drm_crtc_state *crtc_state,
++    struct NvKmsKapiHeadRequestedConfig *req_config)
++{
++    const NvU8 type =
++        ((connector->dev->mode_config.content_type_property != NULL) &&
++         (new_connector_state->content_type <= DRM_MODE_CONTENT_TYPE_GAME)) ?
++        (NvU8)new_connector_state->content_type : DRM_MODE_CONTENT_TYPE_NO_DATA;
++
++    if (req_config->modeSetConfig.hadesContentType != type) {
++        req_config->modeSetConfig.hadesContentType = type;
++        req_config->flags.hadesContentTypeChanged = NV_TRUE;
++        crtc_state->mode_changed = true;
++    }
++}
++#endif
++
+ static int
+ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+                                 nv_drm_atomic_state_base_t *state)
+@@ -1114,6 +1152,11 @@ __nv_drm_connector_atomic_check(struct drm_connector *connector,
+     nv_drm_connector_hades_color_range(connector, new_connector_state, crtc_state,
+                                        req_config);
+ #endif
++#if NV_DRM_HADES_CONTENT_TYPE
++    /* Hades: "content type" (nv_drm_connector_hades_content_type()) */
++    nv_drm_connector_hades_content_type(connector, new_connector_state, crtc_state,
++                                        req_config);
++#endif
+ 
+     /*
+      * Hades: HDR10PLUS_VSIF, the HDR10+ vendor InfoFrame of the frame of this
+@@ -1406,6 +1449,15 @@ nv_drm_connector_new(struct drm_device *dev,
+                 "Failed to attach Broadcast RGB to connector created from physical index %u",
+                 nv_connector->physicalIndex);
+         }
++#endif
++#if NV_DRM_HADES_CONTENT_TYPE
++        /* Hades: "content type" (KAPI hadesContentType) */
++        if (drm_connector_attach_content_type_property(&nv_connector->base) != 0) {
++            NV_DRM_DEV_LOG_ERR(
++                nv_dev,
++                "Failed to attach content type to connector created from physical index %u",
++                nv_connector->physicalIndex);
++        }
+ #endif
+     } else if (nv_connector->type == NVKMS_CONNECTOR_TYPE_DP) {
+ #if defined(NV_DRM_MODE_CREATE_DP_COLORSPACE_PROPERTY_HAS_SUPPORTED_COLORSPACES_ARG)
+@@ -1624,6 +1676,15 @@ void nv_drm_connector_add_dual_mode_tmds(struct nv_drm_connector *nv_connector)
+             nv_connector->physicalIndex);
+     }
+ #endif
++#if NV_DRM_HADES_CONTENT_TYPE
++    /* Hades: "content type", as on HDMI connectors (a DP connector has none before) */
++    if (drm_connector_attach_content_type_property(&nv_connector->base) != 0) {
++        NV_DRM_DEV_LOG_ERR(
++            nv_dev,
++            "Failed to attach content type to connector at physical index %u",
++            nv_connector->physicalIndex);
++    }
++#endif
+ 
+     drm_object_attach_property(&nv_connector->base.base,
+                                nv_dev->nv_connector_dual_mode_tmds_property,
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-connector.h b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+index 39e6b34..19ad4f6 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-connector.h
++++ b/kernel-open/nvidia-drm/nvidia-drm-connector.h
+@@ -42,6 +42,14 @@
+ #define NV_DRM_HADES_BROADCAST_RGB \
+     (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
+ 
++/*
++ * Hades: DRM's standard "content type" connector property
++ * (drm_connector_attach_content_type_property(), drm_connector_state.
++ * content_type): the content type of the AVI InfoFrame (Linux 5.0 and later)
++ */
++#define NV_DRM_HADES_CONTENT_TYPE \
++    (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0))
++
+ #include "nvtypes.h"
+ #include "nvkms-api-types.h"
+ 
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-modeset.c b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+index bbc6e6b..d2dc4a9 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-modeset.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-modeset.c
+@@ -607,6 +607,46 @@ nv_drm_atomic_apply_modeset_config(struct drm_device *dev,
+     }
+ #endif
+ 
++#if NV_DRM_HADES_CONTENT_TYPE
++    /*
++     * Hades: the content type that "content type" gave the AVI InfoFrame of a
++     * head whose value changed in this commit, in the kernel's log
++     * (nvHadesAviContent() of NVKMS)
++     */
++    if (commit) {
++        static const char *const names[] = {
++            "No Data", "Graphics", "Photo", "Cinema", "Game"
++        };
++        struct drm_connector *connector;
++        struct drm_connector_state *connector_state;
++        int j;
++
++        for_each_new_connector_in_state(state, connector, connector_state, j) {
++            struct drm_crtc *head_crtc = connector_state->crtc;
++            const struct NvKmsKapiHeadRequestedConfig *head_config;
++            NvU8 type;
++
++            if ((head_crtc == NULL) || (head_crtc->state == NULL) ||
++                !head_crtc->state->active) {
++                continue;
++            }
++            head_config = &to_nv_crtc_state(head_crtc->state)->req_config;
++            if (!head_config->flags.hadesContentTypeChanged) {
++                continue;
++            }
++            type = head_config->modeSetConfig.hadesContentType;
++            NV_DRM_DEV_LOG_INFO(
++                nv_dev,
++                "Hades: head %u (%s): content type \"%s\": the AVI InfoFrame says %s",
++                to_nv_crtc(head_crtc)->head, connector->name,
++                names[type <= DRM_MODE_CONTENT_TYPE_GAME ? type : 0],
++                type == DRM_MODE_CONTENT_TYPE_NO_DATA ?
++                    "what NVKMS says (IT content, graphics), and no data (ITC 0) while Dolby Vision goes out" :
++                    "IT content (ITC 1) with this content type in CN1 CN0");
++        }
++    }
++#endif
++
+     if (commit && nv_dev->supportsSyncpts) {
+         /* commit is true so we check old state */
+         for_each_old_crtc_in_state(state, crtc, old_crtc_state, i) {
+diff --git a/src/nvidia-modeset/include/nvkms-hades.h b/src/nvidia-modeset/include/nvkms-hades.h
+index b796bb0..cb279b7 100644
+--- a/src/nvidia-modeset/include/nvkms-hades.h
++++ b/src/nvidia-modeset/include/nvkms-hades.h
+@@ -862,4 +862,97 @@ static inline NvU32 nvHadesEdidKeptSize(const NvU8 *edid, NvU32 length, NvU32 pa
+     return (eeodbSize > parsedSize) ? eeodbSize : parsedSize;
+ }
+ 
++/*
++ * Hades: the content type of an HDMI head, as a client asked for it in the
++ * mode set (NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE of the overrides of its
++ * mode validation, from DRM's standard "content type" of nvidia-drm): what the
++ * AVI InfoFrame says in ITC (byte 3, bit 7) and CN1CN0 (byte 5, bits 5:4) of
++ * CTA-861.
++ *
++ * NVKMS on its own says ITC 1 with CN Graphics for every HDMI mode of an EDID
++ * (NvTiming_ConstructVideoInfoframeCtrl()): "computer graphics", the menus and
++ * a film alike. With a content type asked for, ITC is 1 and CN that type, as
++ * DRM's drm_hdmi_avi_infoframe_content_type() makes them for i915 and amdgpu:
++ * a TV that switches by it (Filmmaker Mode Auto Start of LG on Cinema, a game
++ * mode on Game) does so.
++ *
++ * "No Data" (0) leaves NVKMS's own AVI InfoFrame, so that a client that never
++ * sets the property sends what it always sent, but with Dolby Vision on the
++ * head (a Dolby vendor InfoFrame, Standard or Low-Latency, or the HDMI 1.4b
++ * signalling of Dolby Vision): then ITC is 0 and CN 0, "no data". That is what
++ * the AVI InfoFrame of the Dolby Vision tunnel of i915 and amdgpu in Hades says
++ * with "No Data" (DRM's helper), and what a licensed Dolby Vision set-top box
++ * sends (an Amlogic one, 2026-11-24: "itc: disable", "content_type: graphics").
++ *
++ * Returns whether the AVI InfoFrame is to say *pItc and *pCn (FALSE: NVKMS's
++ * own values stay); *pItc is 0 or 1, *pCn the CN1CN0 of CTA-861 (0 Graphics
++ * with ITC 1, no data with ITC 0; 1 Photo; 2 Cinema; 3 Game).
++ */
++#define NV_HADES_CONTENT_TYPE_NONE     0
++#define NV_HADES_CONTENT_TYPE_GRAPHICS 1
++#define NV_HADES_CONTENT_TYPE_PHOTO    2
++#define NV_HADES_CONTENT_TYPE_CINEMA   3
++#define NV_HADES_CONTENT_TYPE_GAME     4
++
++/* the content type of the overrides of a mode validation (0 for a value out of range) */
++static inline NvU8 nvHadesContentTypeOf(NvU32 overrides, NvU32 mask, NvU32 shift)
++{
++    const NvU32 type = (overrides & mask) >> shift;
++
++    return (type <= NV_HADES_CONTENT_TYPE_GAME) ? (NvU8)type : NV_HADES_CONTENT_TYPE_NONE;
++}
++
++/* ... and the overrides that ask for a content type (0 for one out of range) */
++static inline NvU32 nvHadesContentTypeOverride(NvU32 type, NvU32 mask, NvU32 shift)
++{
++    return (type <= NV_HADES_CONTENT_TYPE_GAME) ? ((type << shift) & mask) : 0;
++}
++
++static inline NvBool nvHadesAviContent(NvU8 type, NvBool dolbyVision,
++                                       NvU8 *pItc, NvU8 *pCn)
++{
++    switch (type) {
++        case NV_HADES_CONTENT_TYPE_GRAPHICS:
++            *pItc = 1;
++            *pCn = 0;
++            return NV_TRUE;
++        case NV_HADES_CONTENT_TYPE_PHOTO:
++            *pItc = 1;
++            *pCn = 1;
++            return NV_TRUE;
++        case NV_HADES_CONTENT_TYPE_CINEMA:
++            *pItc = 1;
++            *pCn = 2;
++            return NV_TRUE;
++        case NV_HADES_CONTENT_TYPE_GAME:
++            *pItc = 1;
++            *pCn = 3;
++            return NV_TRUE;
++        default:
++            if (dolbyVision) {
++                *pItc = 0;
++                *pCn = 0;
++                return NV_TRUE;
++            }
++            return NV_FALSE;
++    }
++}
++
++/* The name of a content type, for the kernel's log */
++static inline const char *nvHadesContentTypeName(NvU8 type)
++{
++    switch (type) {
++        case NV_HADES_CONTENT_TYPE_GRAPHICS:
++            return "Graphics";
++        case NV_HADES_CONTENT_TYPE_PHOTO:
++            return "Photo";
++        case NV_HADES_CONTENT_TYPE_CINEMA:
++            return "Cinema";
++        case NV_HADES_CONTENT_TYPE_GAME:
++            return "Game";
++        default:
++            return "No Data";
++    }
++}
++
+ #endif /* __NVKMS_HADES_H__ */
+diff --git a/src/nvidia-modeset/include/nvkms-types.h b/src/nvidia-modeset/include/nvkms-types.h
+index 4f70a3a..2d1e803 100644
+--- a/src/nvidia-modeset/include/nvkms-types.h
++++ b/src/nvidia-modeset/include/nvkms-types.h
+@@ -1893,6 +1893,11 @@ typedef struct _NVDispHeadInfoFrameStateEvoRec {
+     struct NvKmsHdmiVsifMetadata hdmiVsifMetadata;
+     /* Hades: the client's HDR10+ VSIF (nvkms-hades.h); payloadSize 0 for none */
+     struct NvKmsHdmiVsifMetadata hdr10PlusVsif;
++    /*
++     * Hades: the content type that the client asked for in the mode set of
++     * the head (NV_HADES_CONTENT_TYPE_*, nvHadesAviContent()); 0 none
++     */
++    NvU8 hadesContentType;
+ } NVDispHeadInfoFrameStateEvoRec;
+ 
+ typedef enum _NVEvoMergeMode {
+diff --git a/src/nvidia-modeset/interface/nvkms-api.h b/src/nvidia-modeset/interface/nvkms-api.h
+index 4dc84e2..be97129 100644
+--- a/src/nvidia-modeset/interface/nvkms-api.h
++++ b/src/nvidia-modeset/interface/nvkms-api.h
+@@ -363,8 +363,20 @@ enum NvKmsModeValidationOverrides {
+     NVKMS_MODE_VALIDATION_NO_INTERLACED_MODES                = (1 << 18),
+     NVKMS_MODE_VALIDATION_MAX_ONE_HARDWARE_HEAD              = (1 << 19),
+     NVKMS_MODE_VALIDATION_PREFER_HDMI_FRL_MODE               = (1 << 20),
++    /*
++     * Hades: the content type that the AVI InfoFrame of an HDMI head says
++     * (ITC and CN1CN0 of CTA-861), a field of three bits, not a flag: 0 leaves
++     * it to NVKMS ("No Data" of DRM's "content type"), 1 Graphics, 2 Photo,
++     * 3 Cinema, 4 Game (DRM_MODE_CONTENT_TYPE_*). Asked for by the KAPI from
++     * "content type" of nvidia-drm; nvHadesAviContent() of nvkms-hades.h
++     * makes the AVI InfoFrame of it. It changes nothing but that InfoFrame.
++     */
++    NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE                 = (7 << 27),
+ };
+ 
++/* Hades: the shift of NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE */
++#define NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE_SHIFT 27
++
+ /*!
+  * Frequency information used during mode validation (for HorizSync
+  * and VertRefresh) can come from several possible sources.  NVKMS
+diff --git a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+index 53603af..30773aa 100644
+--- a/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
++++ b/src/nvidia-modeset/kapi/interface/nvkms-kapi.h
+@@ -472,6 +472,16 @@ struct NvKmsKapiHeadModeSetConfig {
+      */
+     NvBool hadesColorRangeLimited;
+ 
++    /*
++     * Hades: the content type that the AVI InfoFrame of this head says:
++     * DRM_MODE_CONTENT_TYPE_* (0 "No Data": NVKMS's own, none with Dolby
++     * Vision; 1 Graphics, 2 Photo, 3 Cinema, 4 Game), through
++     * NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE. nvidia-drm sets it from the
++     * connector's "content type". A change of it is a mode set
++     * (ApplyModeSetConfig()).
++     */
++    NvU8 hadesContentType;
++
+     /*
+      * Hades: the HDR10+ VSIF of the frame (IEEE OUI 90-84-8B first, 27
+      * bytes; payloadSize 0 for none). Passed by a mode set, and by the flip of
+@@ -496,6 +506,7 @@ struct NvKmsKapiHeadRequestedConfig {
+         NvBool ditheringChanged       : 1;
+         NvBool colorBpcChanged        : 1;
+         NvBool hadesColorRangeChanged : 1; /* Hades: hadesColorRangeLimited */
++        NvBool hadesContentTypeChanged : 1; /* Hades: hadesContentType */
+         NvBool hdr10PlusVsifChanged   : 1;
+     } flags;
+ 
+diff --git a/src/nvidia-modeset/kapi/src/nvkms-kapi.c b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+index 3374a67..009c092 100644
+--- a/src/nvidia-modeset/kapi/src/nvkms-kapi.c
++++ b/src/nvidia-modeset/kapi/src/nvkms-kapi.c
+@@ -3532,6 +3532,16 @@ static NvBool NvKmsKapiRequestedModeSetConfigToKms(
+         InitNvKmsModeValidationParams(device,
+                                       &paramsHead->modeValidationParams);
+ 
++        /*
++         * Hades: "content type" of nvidia-drm, in the AVI InfoFrame of the
++         * head (nvHadesAviContent() of NVKMS)
++         */
++        paramsHead->modeValidationParams.overrides |=
++            ((headModeSetConfig->hadesContentType <= 4) ?
++             (((NvU32)headModeSetConfig->hadesContentType <<
++               NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE_SHIFT) &
++              NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE) : 0);
++
+         for (i = 0; i < headModeSetConfig->numDisplays; i++) {
+             paramsHead->dpyIdList = nvAddDpyIdToDpyIdList(
+                     nvNvU32ToDpyId(headModeSetConfig->displays[i]),
+@@ -4179,7 +4189,8 @@ static NvBool ApplyModeSetConfig(
+             headRequestedConfig->flags.hdmiVsifMetadataChanged ||
+             headRequestedConfig->flags.ditheringChanged    ||
+             headRequestedConfig->flags.colorBpcChanged ||
+-            headRequestedConfig->flags.hadesColorRangeChanged;
++            headRequestedConfig->flags.hadesColorRangeChanged ||
++            headRequestedConfig->flags.hadesContentTypeChanged;
+ 
+         /*
+          * NVKMS flip ioctl could not validate flip configuration for an
+diff --git a/src/nvidia-modeset/src/nvkms-hdmi.c b/src/nvidia-modeset/src/nvkms-hdmi.c
+index 530d92d..dd9985e 100644
+--- a/src/nvidia-modeset/src/nvkms-hdmi.c
++++ b/src/nvidia-modeset/src/nvkms-hdmi.c
+@@ -513,6 +513,33 @@ static void SendVideoInfoFrame(const NVDispEvoRec *pDispEvo,
+         }
+     }
+ 
++    /*
++     * Hades: the content type that the client asked for in the mode set, or
++     * no data with Dolby Vision where it asked for none (nvHadesAviContent()).
++     * In every AVI InfoFrame of the head, as a flip that changes the HDR or
++     * vendor InfoFrame writes it again too.
++     */
++    {
++        const struct NvKmsHdmiVsifMetadata *pVsif =
++            &pInfoFrameState->hdmiVsifMetadata;
++        NvU8 itc;
++        NvU8 cn;
++
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE3_ITC_NO_DATA == 0);
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE3_ITC_IT_CONTENT == 1);
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE5_CN1CN0_GRAPHICS == 0);
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE5_CN1CN0_PHOTO == 1);
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE5_CN1CN0_CINEMA == 2);
++        ct_assert(NVT_VIDEO_INFOFRAME_BYTE5_CN1CN0_GAME == 3);
++
++        if (nvHadesAviContent(pInfoFrameState->hadesContentType,
++                              nvHadesVsifIsDolbyVision(pVsif),
++                              &itc, &cn)) {
++            videoCtrl.it_content = itc;
++            videoCtrl.it_content_type = cn;
++        }
++    }
++
+     status = NvTiming_ConstructVideoInfoframe(pEdidInfo,
+                                               &videoCtrl,
+                                               NULL, &VideoInfoFrame);
+diff --git a/src/nvidia-modeset/src/nvkms-modeset.c b/src/nvidia-modeset/src/nvkms-modeset.c
+index 515f3de..619e99f 100644
+--- a/src/nvidia-modeset/src/nvkms-modeset.c
++++ b/src/nvidia-modeset/src/nvkms-modeset.c
+@@ -1256,6 +1256,11 @@ AssignProposedModeSetHwState(NVDevEvoRec *pDevEvo,
+ 
+             pProposedApiHead->modeValidationParams =
+                 pRequestHead->modeValidationParams;
++            /* Hades: the content type of the AVI InfoFrame (nvHadesAviContent()) */
++            pProposedApiHead->infoFrame.hadesContentType =
++                nvHadesContentTypeOf(pRequestHead->modeValidationParams.overrides,
++                                     NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE,
++                                     NVKMS_MODE_VALIDATION_HADES_CONTENT_TYPE_SHIFT);
+ 
+             pProposedApiHead->attributes.digitalSignal =
+                 nvGetDefaultDpyAttributeDigitalSignalValue(pDpyEvo->pConnectorEvo);
+-- 
+2.53.0
+

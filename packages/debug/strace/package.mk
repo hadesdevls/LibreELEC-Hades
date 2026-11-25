@@ -15,7 +15,10 @@ PKG_BUILD_FLAGS="-cfg-libs"
 # Hades: stack tracing (strace -k) with libunwind, declared: configure finds libdw, libunwind or
 # libiberty by itself, depending on what other packages have installed when strace is configured, so
 # builds of the same tree differed.
-PKG_CONFIGURE_OPTS_TARGET="--enable-stacktrace=yes --with-libunwind --without-libdw --without-libiberty"
+# Build against the kernel headers that strace bundles, not the newer ones of the toolchain: Linux 7.4
+# renames a field that strace 7.3 parses (io_uring_rsrc_update2.resv is now flags) and strace has not
+# caught up yet (upstream keeps that header back until its parser is updated).
+PKG_CONFIGURE_OPTS_TARGET="--enable-stacktrace=yes --with-libunwind --without-libdw --without-libiberty --enable-bundled=yes"
 
 if [ "${TARGET_ARCH}" = x86_64 -o "${TARGET_ARCH}" = "aarch64" ]; then
   PKG_CONFIGURE_OPTS_TARGET+=" --enable-mpers=no"

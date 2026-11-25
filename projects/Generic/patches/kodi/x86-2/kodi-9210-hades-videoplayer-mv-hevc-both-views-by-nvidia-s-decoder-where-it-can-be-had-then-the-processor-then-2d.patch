@@ -1,0 +1,346 @@
+From 2567e30d79a6676092aebc735c819b533c413ee3 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:18:11 +0000
+Subject: [PATCH] [Hades][VideoPlayer] MV-HEVC: both views by NVIDIA's decoder
+ where it can be had, then the processor, then 2D
+
+Kodi decodes on NVIDIA through VA-API (nvidia-vaapi-driver), which has no
+MV-HEVC profile, so both views of MV-HEVC were decoded by the processor on
+every card. NVIDIA's decoder takes MV-HEVC from its Video Codec SDK 13.1,
+and FFmpeg 9.1 uses it through CUDA (nvdec_hevc.c): FFmpeg's own HEVC
+decoder, given a CUDA device, offers AV_PIX_FMT_CUDA for a stream of two
+layers too.
+
+For a stream of two views, where KODI::MULTIVIEW::NvdecForTwoViews() says
+so (HEVC, hardware decoding of HEVC on in the settings of VA-API, which on
+NVIDIA is NVDEC too, NVIDIA's driver of the 610 series or later loaded,
+not failed before for the stream), the decoder is opened with a CUDA
+device of its own (av_hwdevice_ctx_create()) and one frame thread: each
+thread would hold decode surfaces of its own, and NVDEC has 32 at most
+(FFmpeg refuses a stream that needs more, rather than decoding it short).
+GetFormat() takes AV_PIX_FMT_CUDA while FFmpeg offers it. Each view is
+copied from the card with all that the decoder said of it
+(av_hwframe_transfer_data(), av_frame_copy_props(): its view, its eye, its
+Dolby Vision metadata) and goes to the packer as the processor's views do,
+P010 into planar 10 bits. The picture that is shown is the one of the
+processor's path; its format, not the decoder's, says what the renderer
+is given.
+
+Where the CUDA device cannot be opened, the processor decodes both views.
+Where FFmpeg no longer offers the format (its NVDEC could not start: the
+driver refused the stream, or more surfaces than the card has were
+needed), a view cannot be copied, or the views stop coming, the stream is
+opened again with both views decoded by the processor (LeaveNvdec(),
+VC_REOPEN, the packets since the last key frame sent again); where that
+does not keep up, the base view plays alone, in 2D, as before. Where NVDEC
+itself does not keep up, the processor would not either: the base view
+plays alone. kodi.log says each step, and why NVDEC is not asked where it
+is not; the player information names the decoder ff-hevc-nvdec, as
+hardware.
+
+Compiled with the commands of the image's build. NVDEC has not run: there
+is no NVIDIA card in the build machine. The copy and the packing are
+checked on the host with the conformance streams given to the packer in
+NVDEC's formats.
+---
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 158 +++++++++++++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |  11 ++
+ 2 files changed, 162 insertions(+), 7 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index 1043bcc..af4067a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -33,6 +33,7 @@
+ #include "utils/log.h"
+ 
+ #include <chrono>
++#include <fstream>
+ #include <iterator>
+ #include <memory>
+ #include <mutex>
+@@ -55,6 +56,7 @@ extern "C" {
+ #include <libavfilter/avfilter.h>
+ #include <libavfilter/buffersink.h>
+ #include <libavfilter/buffersrc.h>
++#include <libavutil/hwcontext.h>
+ #include <libavutil/mastering_display_metadata.h>
+ #include <libavutil/opt.h>
+ #include <libavutil/pixdesc.h>
+@@ -110,6 +112,30 @@ namespace
+ // (DemuxPacket::decodeOnly) gives its opaque, which the decoder hands on to the picture
+ // (AV_CODEC_FLAG_COPY_OPAQUE): the top bit, beside the count of doviSourceEpoch
+ constexpr uintptr_t DECODE_ONLY_MARK = uintptr_t{1} << (sizeof(uintptr_t) * 8 - 1);
++
++// Hades: the series of the NVIDIA driver that is loaded, as its module says it
++// (KODI::MULTIVIEW::NvidiaDriverSeries()); nothing where none is
++std::optional<int> LoadedNvidiaDriverSeries()
++{
++  std::ifstream file("/sys/module/nvidia/version");
++  std::string version;
++  if (!file || !std::getline(file, version))
++    return std::nullopt;
++  return KODI::MULTIVIEW::NvidiaDriverSeries(version);
++}
++
++// Hades: whether hardware decoding of HEVC is on: the settings of VAAPI, which on an NVIDIA card is
++// NVDEC too (nvidia-vaapi-driver)
++bool HevcHardwareAllowed()
++{
++  const auto settings = CServiceBroker::GetSettingsComponent()->GetSettings();
++  for (const char* name : {"videoplayer.usevaapi", "videoplayer.usevaapihevc"})
++  {
++    if (!settings->GetSetting(name) || !settings->GetBool(name))
++      return false;
++  }
++  return true;
++}
+ } // namespace
+ 
+ enum DecoderState
+@@ -323,6 +349,25 @@ enum AVPixelFormat CDVDVideoCodecFFmpeg::GetFormat(struct AVCodecContext * avctx
+ 
+   ctx->m_processInfo.SetVideoDimensions(avctx->coded_width, avctx->coded_height);
+ 
++  // Hades: both views of MV-HEVC by NVIDIA's decoder (m_multiviewNvdec): its format, as long as
++  // FFmpeg offers it. Where it no longer does, it could not start NVDEC for this stream (its
++  // driver refused it, or more surfaces than the card has were needed): the stream is opened
++  // again, both views decoded by the processor (GetPicture(), LeaveNvdec()).
++  if (ctx->m_multiviewNvdec)
++  {
++    for (const AVPixelFormat* cur = fmt; *cur != AV_PIX_FMT_NONE; ++cur)
++    {
++      if (*cur == AV_PIX_FMT_CUDA)
++      {
++        const char* swName = av_get_pix_fmt_name(avctx->sw_pix_fmt);
++        ctx->m_processInfo.SetVideoPixelFormat(swName ? swName : "");
++        return AV_PIX_FMT_CUDA;
++      }
++    }
++    ctx->m_multiviewNvdecLost = true;
++    return avcodec_default_get_format(avctx, fmt);
++  }
++
+   // if frame threading is enabled hw accel is not allowed
+   // 2nd condition:
+   // fix an ffmpeg issue here, it calls us with an invalid profile
+@@ -635,12 +680,43 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+ #endif
+ 
+   // setup threading model
++  m_multiviewNvdec = false;
++  m_multiviewNvdecLost = false;
+   if (multiview)
+   {
+-    // no hardware decoder gives the second view: both are decoded by the processor, with threads
++    // Hades: both views of MV-HEVC by NVIDIA's decoder, where it can be had
++    // (KODI::MULTIVIEW::NvdecForTwoViews()): FFmpeg's HEVC decoder with a CUDA device, the views
++    // copied from the card and put side by side as the processor's are (ReceiveMultiviewFrame()).
++    // One frame thread: NVDEC decodes, and each thread would take decode surfaces of its own.
++    const KODI::MULTIVIEW::Nvdec nvdec = KODI::MULTIVIEW::NvdecForTwoViews(
++        hints.codec == AV_CODEC_ID_HEVC, (hints.codecOptions & CODEC_FORCE_SOFTWARE) != 0,
++        HevcHardwareAllowed(), m_multiviewNvdecFailed, LoadedNvidiaDriverSeries());
++    if (nvdec == KODI::MULTIVIEW::Nvdec::ASKED)
++    {
++      AVBufferRef* device = nullptr;
++      const int err = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
++      if (err >= 0)
++      {
++        m_pCodecContext->hw_device_ctx = device;
++        m_multiviewNvdec = true;
++      }
++      else
++        CLog::Log(LOGINFO,
++                  "CDVDVideoCodecFFmpeg::Open() NVDEC is not used for both views: the CUDA device "
++                  "could not be opened ({}); the processor decodes them",
++                  err);
++    }
++    else if (hints.codec == AV_CODEC_ID_HEVC)
++      CLog::Log(LOGINFO,
++                "CDVDVideoCodecFFmpeg::Open() NVDEC is not asked for both views ({}); the "
++                "processor decodes them",
++                KODI::MULTIVIEW::NvdecWhyNot(nvdec));
++
++    // otherwise no hardware decoder gives the second view: both are decoded by the processor,
++    // with threads
+     int num_threads = CServiceBroker::GetCPUInfo()->GetCPUCount() * 3 / 2;
+     num_threads = std::max(1, std::min(num_threads, 16));
+-    m_pCodecContext->thread_count = num_threads;
++    m_pCodecContext->thread_count = m_multiviewNvdec ? 1 : num_threads;
+     m_decoderState = STATE_SW_MULTI;
+   }
+   else if (!(hints.codecOptions & CODEC_FORCE_SOFTWARE))
+@@ -740,9 +816,12 @@ bool CDVDVideoCodecFFmpeg::Open(CDVDStreamInfo &hints, CDVDCodecOptions &options
+   }
+   if (multiview)
+     CLog::Log(LOGINFO,
+-              "CDVDVideoCodecFFmpeg::Open() both views of this stream are decoded ({}, by the "
+-              "processor) and go on as one picture, side by side; the base view is the {} eye",
+-              MultiviewDecoderName(), hints.multiviewBaseRight ? "right" : "left");
++              "CDVDVideoCodecFFmpeg::Open() both views of this stream are decoded ({}, by {}) "
++              "and go on as one picture, side by side; the base view is the {} eye",
++              MultiviewDecoderName(),
++              m_multiviewNvdec ? "NVIDIA's decoder, NVDEC, the views copied from the card"
++                               : "the processor",
++              hints.multiviewBaseRight ? "right" : "left");
+ 
+   m_pFrame = av_frame_alloc();
+   if (!m_pFrame)
+@@ -839,6 +918,14 @@ int CDVDVideoCodecFFmpeg::ReceiveMultiviewFrame(int result)
+   for (;;)
+   {
+     CMultiviewPacker::Result made = CMultiviewPacker::Result::NONE;
++    // Hades: a view that NVDEC decoded is on the card: it is copied to memory first, with all
++    // that the decoder said of it (DownloadView())
++    if (result == 0 && m_pDecodedFrame->format == AV_PIX_FMT_CUDA && !DownloadView())
++    {
++      av_frame_unref(m_pDecodedFrame);
++      m_multiview->Fail("a view could not be copied from the graphics card");
++      return AVERROR(EAGAIN);
++    }
+     if (result == 0)
+       made = m_multiview->Add(m_pDecodedFrame);
+     else if (result == AVERROR_EOF)
+@@ -865,6 +952,41 @@ int CDVDVideoCodecFFmpeg::ReceiveMultiviewFrame(int result)
+   }
+ }
+ 
++bool CDVDVideoCodecFFmpeg::DownloadView()
++{
++  if (!m_viewDownload)
++    m_viewDownload = av_frame_alloc();
++  if (!m_viewDownload)
++    return false;
++  av_frame_unref(m_viewDownload);
++  // (into memory of the format of the card's frames: P010 for 10 bits, NV12 for 8; the packer
++  // takes either, CMultiviewPacker::Pack())
++  if (av_hwframe_transfer_data(m_viewDownload, m_pDecodedFrame, 0) < 0 ||
++      av_frame_copy_props(m_viewDownload, m_pDecodedFrame) < 0)
++  {
++    av_frame_unref(m_viewDownload);
++    return false;
++  }
++  av_frame_unref(m_pDecodedFrame);
++  av_frame_move_ref(m_pDecodedFrame, m_viewDownload);
++  return true;
++}
++
++CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::LeaveNvdec(const char* reason)
++{
++  CLog::Log(LOGINFO,
++            "CDVDVideoCodecFFmpeg: NVDEC is given up for both views of this stream ({}): the "
++            "processor decodes them from here on",
++            reason);
++  av_frame_unref(m_pDecodedFrame);
++  m_multiviewNvdecFailed = true;
++  // The stream is opened again as at first, both views decoded by the processor
++  // (KODI::MULTIVIEW::Nvdec::FAILED_BEFORE); where that does not keep up, the base view plays
++  // alone as LeaveMultiview() has it. The player sends the packets since the last key frame again.
++  m_decoderState = STATE_NONE;
++  return VC_REOPEN;
++}
++
+ const char* CDVDVideoCodecFFmpeg::MultiviewDecoderName() const
+ {
+   return m_hints.codec == AV_CODEC_ID_HEVC ? KODI::MULTIVIEW::HEVC_DECODER_NAME
+@@ -873,6 +995,10 @@ const char* CDVDVideoCodecFFmpeg::MultiviewDecoderName() const
+ 
+ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::LeaveMultiview()
+ {
++  // Hades: where NVDEC gave the views and they could not be had (not for slowness: the processor
++  // would be slower), the processor tries them before the base view plays alone
++  if (m_multiviewNvdec && !m_multiview->Slow())
++    return LeaveNvdec(m_multiview->Reason());
+   CLog::Log(LOGINFO,
+             "CDVDVideoCodecFFmpeg: the decoder of both views is given up for this stream ({}): "
+             "its base view plays, as before",
+@@ -1026,6 +1152,9 @@ void CDVDVideoCodecFFmpeg::Dispose()
+   av_frame_free(&m_pFrame);
+   av_frame_free(&m_pDecodedFrame);
+   av_frame_free(&m_pFilterFrame);
++  av_frame_free(&m_viewDownload); // Hades
++  m_multiviewNvdec = false; // Hades (m_multiviewNvdecFailed outlives it)
++  m_multiviewNvdecLost = false;
+   avcodec_free_context(&m_pCodecContext);
+ 
+   if (m_pHardware)
+@@ -1112,8 +1241,11 @@ void CDVDVideoCodecFFmpeg::UpdateName()
+ 
+   if(m_pHardware)
+     m_name += "-" + m_pHardware->Name();
++  // Hades: both views of MV-HEVC by NVDEC (the player information says hardware)
++  if (m_multiviewNvdec)
++    m_name += "-nvdec";
+ 
+-  m_processInfo.SetVideoDecoderName(m_name, m_pHardware ? true : false);
++  m_processInfo.SetVideoDecoderName(m_name, m_pHardware || m_multiviewNvdec);
+ 
+   CLog::Log(LOGDEBUG, "CDVDVideoCodecFFmpeg - Updated codec: {}", m_name);
+ }
+@@ -2094,6 +2226,9 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetBasePicture(VideoPicture* pVid
+   if (m_multiview)
+   {
+     ret = ReceiveMultiviewFrame(ret);
++    if (m_multiviewNvdecLost)
++      return LeaveNvdec("FFmpeg could not start it for this stream: its driver refused it, or it "
++                        "needs more decode surfaces than the card has");
+     if (ret != AVERROR_EOF && m_multiview->GivenUp())
+       return LeaveMultiview();
+   }
+@@ -2251,7 +2386,12 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetBasePicture(VideoPicture* pVid
+   {
+     SetFilters();
+ 
+-    bool need_scale = std::ranges::find(m_formats, m_pCodecContext->pix_fmt) == m_formats.end();
++    // (Hades: the picture of two views is of the format the packer made it in, which for views
++    // copied from NVDEC is not the decoder's)
++    const AVPixelFormat pictureFormat = m_multiview
++                                            ? static_cast<AVPixelFormat>(m_pDecodedFrame->format)
++                                            : m_pCodecContext->pix_fmt;
++    bool need_scale = std::ranges::find(m_formats, pictureFormat) == m_formats.end();
+ 
+     // Hades: a filter graph is set up from what the decoder context says, and the picture of
+     // two views is twice as wide as that. A stream whose pictures need one (deinterlacing,
+@@ -2568,6 +2708,10 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+   // place libavcodec assigns it. Fall back to the frame, which is the picture actually handed to
+   // the renderer, but never to a hardware surface, which describes no layout.
+   pVideoPicture->pixelFormat = m_pCodecContext->sw_pix_fmt;
++  // Hades: the picture of two views is in the format that the packer made (P010 from NVDEC goes
++  // into planar 10 bits)
++  if (m_multiview)
++    pVideoPicture->pixelFormat = AV_PIX_FMT_NONE;
+   if (pVideoPicture->pixelFormat == AV_PIX_FMT_NONE)
+   {
+     const auto frameFormat = static_cast<AVPixelFormat>(m_pFrame->format);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 02ede40..56d0354 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -205,6 +205,10 @@ protected:
+                             const char* reason);
+   int ReceiveMultiviewFrame(int result);
+   CDVDVideoCodec::VCReturn LeaveMultiview();
++  //! Hades: a view that NVDEC decoded copied from the card into memory (m_pDecodedFrame)
++  bool DownloadView();
++  //! Hades: NVDEC given up for both views: they are decoded by the processor from then on
++  CDVDVideoCodec::VCReturn LeaveNvdec(const char* reason);
+   //! Hades: the name of the decoder of both views of the stream, for the log
+   const char* MultiviewDecoderName() const;
+   static enum AVPixelFormat GetFormat(struct AVCodecContext * avctx, const AVPixelFormat * fmt);
+@@ -285,6 +289,13 @@ protected:
+   //! ... and that this decoder could not be had for the stream, or was given up: its base view
+   //! is decoded as any other stream. It outlives Dispose(), as the state of the decoder does.
+   bool m_multiviewFailed = false;
++  //! Hades: both views of MV-HEVC are decoded by NVIDIA's decoder (KODI::MULTIVIEW::Nvdec), the
++  //! views copied from the card (DownloadView(), m_viewDownload); FFmpeg no longer offered it
++  //! (GetFormat()); it failed for this stream, which outlives Dispose() as m_multiviewFailed does
++  bool m_multiviewNvdec = false;
++  bool m_multiviewNvdecLost = false;
++  bool m_multiviewNvdecFailed = false;
++  AVFrame* m_viewDownload = nullptr;
+ 
+   struct CDropControl
+   {
+-- 
+2.53.0
+

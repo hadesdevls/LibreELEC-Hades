@@ -6,12 +6,16 @@
 # OpenGL ES (zink on lavapipe), with the libplacebo and the FFmpeg of the LibreELEC recipes: the fidelity bench in
 # its configurations against the reference sums, the measured test with the CCM 001 reader, the render test with
 # its checks and the mutations it must catch, the step-down of a scaled picture, the gamut table, the GUI step, the
-# geometry of a view, the composed planes in 16 bits, the composer with a base layer in BT.1886. Host test only.
+# geometry of a view, the composed planes in 16 bits, the composer with a base layer in BT.1886, HDR mapped to SDR in
+# BT.2020 and DCI-P3, the step-down levels of Dolby Vision rebuilt as HDR10 and SDR, the 3D LUT of a display (in the
+# bridge, and in the video shaders of Kodi's own renderer: stage lutsdr), a 3D picture drawn a view at a time (stage
+# stereo3d), an 8-bit HLG picture sent as Dolby Vision the same bytes as the same picture in 10 bits (stage hlg8).
+# Host test only.
 #
 # usage: run-dvbridge-render.sh all | verdict [<log>] | <stage>...
 # Inputs (inputs-dvbridge-render.tsv, by SHA256): the FEL stream the pictures are taken from, an HDR10 stream, the
-# profile 5 and PQ/HLG charts. The pictures of the fidelity bench are decoded again from the stream by ref_dump
-# (src/ref_dump.c) and checked against ref/render/fidelity-data.sha256 before anything draws them.
+# profile 5 and PQ/HLG charts, an SDR clip of H.264. The pictures of the fidelity bench are decoded again from the
+# stream by ref_dump (src/ref_dump.c) and checked against ref/render/fidelity-data.sha256 before anything draws them.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -27,7 +31,7 @@ DATA=$RG_W/data
 export LP_NUM_THREADS=${LP_NUM_THREADS:-4}
 # the pictures of the stream that the fidelity bench draws
 PICS="3 27 51 240 480 720 960 1200 1440 1680 1920 2160 2400 2640"
-STAGES="build data fid measured rt r56 rscale gamut gui geom r8 p82 fidx mmr hdr10area startsignal padding wextra p84 hostpol ipt p5gui p84gpu"
+STAGES="build data fid measured rt r56 rscale gamut sdrgamut convstep gui geom r8 p82 fidx mmr hdr10area startsignal padding wextra p84 hostpol ipt p5gui p84gpu lut3d lutsdr stereo3d hlg8"
 
 # --------------------------------------------------------------------------------------------------- helpers
 lp() { rg_lp_shared; }
@@ -394,6 +398,117 @@ PY
   else
     rg_item gamut-ident FAILED "$(grep -E '^(B|rt|the same|DIFFERS|no ref|nothing|MUTANT)' "$O/gamut-ident.log" | cut -c1-90 | tr '\n' ';')"
   fi
+}
+
+# HDR mapped to SDR in a wide container (videoscreen.hadessdrhdrgamut: BT.2020 or DCI-P3 (D65), as well as BT.709):
+# sdrgamut_test.c on the PQ chart (its mastering display DCI-P3) and the HLG one (BT.2020), and two mutants: mapped into
+# BT.709 and put in the container (as a "BT.709 in BT.2020" output), and the signal written in BT.709 whatever the
+# container. What BT.709 draws is that of gamut-ident (stage gamut), unchanged.
+stage_sdrgamut() {
+  local K L F O v t want got n=0 ok=0
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  rg_inputs "$LIST" "$IN" > /dev/null || rg_fail "inputs"
+  O=$RG_W/sdrgamut; rg_fresh "$O"
+  # sg <tree> <tag>: the test of that tree on both charts, into $O/<tag>-pq.log and $O/<tag>-hlg.log
+  sg() {
+    rg_bridge "$1" "$L" "$F" "$TS/sdrgamut_test.c" "$O/t-$2" || { echo "$2: BUILD FAILED"; return 1; }
+    rg_log "$O/$2-pq.log" gpu nice -n 19 timeout 1800 "$O/t-$2" "$IN/chart-pq.yuv" 1 pq 4000 0.005 4000 400 p3
+    rg_log "$O/$2-hlg.log" gpu nice -n 19 timeout 1800 "$O/t-$2" "$IN/chart-hlg.yuv" 1 hlg 0 0 0 0 none
+    rg_rm "$O/t-$2"
+  }
+  sg "$K" tree
+  for t in pq hlg; do
+    v=$(rg_pass "$O/tree-$t.log" '^PASSED: 0 failed$')
+    rg_item "sdr-gamut-$t" "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -m1 '^inside BT.709, saturation below 0.20' "$O/tree-$t.log" | cut -c1-230); $(grep -a -m1 '^pixels outside' "$O/tree-$t.log" | cut -c1-170)"
+  done
+  # the mutants, each with the checks it must fail on the PQ chart and on the HLG one (measured when written)
+  for t in "into-bt709 mut-sdr-into-bt709.py 2 3" "bt709-signal mut-sdr-bt709-signal.py 2 1"; do
+    set -- $t
+    n=$((n + 1))
+    if mutant "sdrgamut-$1" "$TS/$2" dvbridge_render.c && sg "$RG_W/mut/sdrgamut-$1" "m-$1" > "$O/m-$1.build" 2>&1; then
+      got="$(grep -a -c '^FAIL:' "$O/m-$1-pq.log") $(grep -a -c '^FAIL:' "$O/m-$1-hlg.log")"
+      if [ "$got" = "$3 $4" ]; then ok=$((ok + 1)); else echo "mutant $1: failed $got checks, $3 $4 expected"; fi
+    else echo "mutant $1: no longer applies or does not build"; fi
+    rg_rm "$RG_W/mut/sdrgamut-$1"
+  done
+  rg_item sdr-gamut-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed the checks expected (mapped into BT.709 and put in the container: 2 on the PQ chart, 3 on the HLG one; the signal in BT.709 whatever the container: 2 and 1)"
+}
+
+# A 3D picture drawn by the bridge a view at a time (KODI::UTILS::STEREO3D in Kodi): two pictures side by side (as Kodi
+# puts the two views of MV-HEVC) or one above the other, each view copied out of the textures of Kodi's renderer
+# (dvbridge_gl_part_copy()) and drawn into its eye: value for value the same picture in 2D at that place, rebuilt from
+# profile 5 as HDR10 (side by side (half) at 2160p, frame packing at 1080p, a cropped picture), mapped to SDR in
+# BT.2020, and HDR10 mapped to SDR in BT.709; each eye its own view; and the rule before (a crop of the picture of two),
+# which draws the other view's samples at the seam. A mutant of the copy: every part from the corner of the picture (the
+# right eyes show the left view).
+stage_stereo3d() {
+  local K L F O v t got n=0 ok=0
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  rg_inputs "$LIST" "$IN" > /dev/null || rg_fail "inputs"
+  O=$RG_W/stereo3d; rg_fresh "$O"
+  s3() { # <tree> <tag>
+    rg_bridge "$1" "$L" "$F" "$TS/stereo3d_test.c" "$O/t-$2" || { echo "$2: BUILD FAILED"; tail -n 5 "$O/t-$2.build.log"; return 1; }
+    rg_log "$O/$2.log" gpu nice -n 19 timeout 2400 "$O/t-$2" "$IN/p5-51.meta" "$IN/p5-51-bl.yuv" "$IN/p5-96-bl.yuv"       "$IN/chart-pq.yuv" "$IN/hdr10bl-96.yuv"
+    rg_rm "$O/t-$2"
+  }
+  s3 "$K" tree
+  v=$(rg_pass "$O/tree.log" '^PASSED: 0 failed$')
+  rg_item stereo3d "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.log") checks; $(grep -a -m1 'the rule before' "$O/tree.log" | cut -c7-190)"
+  for t in "at-origin mut-part-at-origin.py 5"; do
+    set -- $t
+    n=$((n + 1))
+    if mutant "stereo3d-$1" "$TS/$2" dvbridge_gl_part.c && s3 "$RG_W/mut/stereo3d-$1" "m-$1" > "$O/m-$1.build" 2>&1; then
+      got=$(grep -a -c '^FAIL:' "$O/m-$1.log")
+      if [ "$got" = "$3" ]; then ok=$((ok + 1)); else echo "mutant $1: failed $got checks, $3 expected"; fi
+    else echo "mutant $1: no longer applies or does not build"; fi
+    rg_rm "$RG_W/mut/stereo3d-$1"
+  done
+  rg_item stereo3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed the checks expected (every part copied from the corner of the picture: 5, the right eyes)"
+}
+
+# The fidelity step-down levels of Dolby Vision rebuilt for output as HDR10 and as SDR (CDVConvertStep in Kodi): the
+# fidelity bench with fidbench-mapping.py and fidbench-convtime.py on the two pictures of the FEL stream with the most
+# of its layer (51) and a late one (1440), at each level: the enhancement layer is drawn at every level, every level
+# below 0 changes the picture, level 0 is the picture of gamut-ident (as before), and the GPU time of each level on the
+# software renderer (informative: what a level saves on a graphics chip is measured there, by Kodi).
+stage_convstep() {
+  local K L F O m lvl tag e same0 res diff n=0 bad=0 detail=""
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  [ -f "$DATA/p51/meta.bin" ] && [ -f "$DATA/p1440/meta.bin" ] || { rg_item conv-step FAILED "no pictures (stage data)"; return 1; }
+  O=$RG_W/convstep; rg_fresh "$O"
+  cp "$SRC/fidbench.c" "$O/fb.c"
+  if ! rg_edit "$O/fb.c" "$TS/fidbench-mapping.py" > "$O/edit.log" 2>&1 || ! rg_edit "$O/fb.c" "$TS/fidbench-convtime.py" >> "$O/edit.log" 2>&1; then
+    rg_item conv-step FAILED "the edits no longer apply to src/fidbench.c: $(tail -n 1 "$O/edit.log")"; return 1
+  fi
+  rg_bridge "$K" "$L" "$F" "$O/fb.c" "$O/fb" "$SRC" || { rg_item conv-step FAILED "did not build: $(tail -n 3 "$O/fb.build.log" | tr '\n' ' ')"; return 1; }
+  for m in hdr10 sdr; do
+    e="FB_HDR10=1"; [ $m = sdr ] && e="FB_HDR10=1 FB_SDR=1"
+    for lvl in 0 1 2 3; do
+      tag=$m-$lvl
+      mkdir -p "$O/$tag"
+      # shellcheck disable=SC2086
+      rg_log "$O/$tag.log" gpu $e FB_STEP=$lvl FB_TIMES=5 nice -n 19 timeout 2400 "$O/fb" "$DATA" "$O/$tag" "$tag" 51 1440
+      ( cd "$O/$tag" && sha256sum *.f32 ) | sed "s/$tag/L/g" > "$O/$tag.sums"
+    done
+  done
+  for m in hdr10 sdr; do
+    # the reference of level 0: gamut-ident's pictures of picture 1440 as they are and to SDR
+    res=$(grep -c 'residual drawn 1' "$O"/$m-*.log | awk -F: '{s += $2} END {print s}')
+    diff=0
+    for lvl in 1 2 3; do cmp -s "$O/$m-0.sums" "$O/$m-$lvl.sums" || diff=$((diff + 1)); done
+    same0=no
+    case $m in hdr10) e=asis ;; sdr) e=sdr ;; esac
+    if grep -q " ./fb-$e/$e-p1440-hdr10.f32\$" "$REF/gamut-ident-B.sha256" &&
+       [ "$(grep " ./fb-$e/$e-p1440-hdr10.f32\$" "$REF/gamut-ident-B.sha256" | cut -c1-64)" = "$(grep 'L-p1440-hdr10.f32' "$O/$m-0.sums" | cut -c1-64)" ]; then
+      same0=yes
+    fi
+    detail="$detail $m: residual drawn in $res of 8 pictures, levels 1-3 other pictures than level 0 in $diff of 3, level 0 of picture 1440 as gamut-ident: $same0; times $(for lvl in 0 1 2 3; do grep -a -h 'picture 51 tag' "$O/$m-$lvl.log" | grep -o 'median [0-9.]* ms' | sed "s/median/$lvl:/"; done | tr '\n' ' ');"
+    [ "$res" = 8 ] && [ $diff = 3 ] && [ $same0 = yes ] || bad=$((bad + 1))
+    n=$((n + 1))
+  done
+  echo "$detail"
+  rg_item conv-step "$([ $bad = 0 ] && echo PASSED || echo FAILED)" "the step-down levels of the conversion, pictures 51 and 1440 of the FEL stream:$detail"
+  rg_rm "$O"
 }
 
 # CDVGuiStep (xbmc/windowing/gbm/DVGuiStep.h): the fidelity step-down of frames with GUI elements, and its mutants
@@ -916,9 +1031,13 @@ stage_hostpol() {
 
 # the IPT tunnel (dvbridge_ipt.h, the IPT pass of dvbridge_source.c): the 14 pictures against an IPT conversion in
 # float64 and float32 of the exact composed planes (src/ccm_ref.c; ipt_check.py, ipt_eval.py); the direct and the
-# composed way the same bytes; the GUI over it; a profile 5 picture the same with the setting on and off; two
-# mutants that the oracle must see
-IPT_F64="I 0.036% off max 1 | P 0.034% max 1 | T 0.041% max 1"
+# composed way the same bytes; the GUI over it; a profile 5 picture taken from the matrices of its RPU to those of
+# the tunnel (a licensed core's), the direct and the composed way the same bytes, and decoded as the picture as
+# composed is; two mutants that the oracle must see
+# (with the matrices of the licensed core in the tunnel, 2026-11; with those of the RPUs of profile 5 before it was
+# "I 0.036% off max 1 | P 0.034% max 1 | T 0.041% max 1": the shares move with the rounding of other matrices, the
+# maximum of one code is the target)
+IPT_F64="I 0.043% off max 1 | P 0.029% max 1 | T 0.036% max 1"
 stage_ipt() {
   local K L F O p v n m d5 bad
   K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
@@ -947,7 +1066,7 @@ stage_ipt() {
   rg_log "$O/check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" bridge "$DATA" "$O/ipt" ipt $PICS
   n=$(sed -n 's/^ALL vs float64 oracle: //p' "$O/check.log")
   if [ "$v" = 42 ] && grep -a -q '^FIDBENCH-OK: 14 of 14' "$O/ipt.log" && grep -a -q '^BRIDGE-IPT PASSED$' "$O/check.log" && [ "$n" = "$IPT_F64" ]; then
-    rg_item ipt-oracle PASSED "14 pictures, the header of profile 5; against the float64 oracle: $n; float32: $(sed -n 's/^ALL vs float32 oracle: //p' "$O/check.log"); ideal (reported): $(sed -n 's/^ALL vs ideal: //p' "$O/check.log"); the composed planes of ccm_ref.c as ref/render/ccm-ref.sha256 (42 files)"
+    rg_item ipt-oracle PASSED "14 pictures, the header of the licensed core's IPT; against the float64 oracle: $n; float32: $(sed -n 's/^ALL vs float32 oracle: //p' "$O/check.log"); ideal (reported): $(sed -n 's/^ALL vs ideal: //p' "$O/check.log"); the composed planes of ccm_ref.c as ref/render/ccm-ref.sha256 (42 files)"
   else
     rg_item ipt-oracle FAILED "ccm_ref planes $v of 42 as the reference; $(grep -a -E '^(FIDBENCH|BRIDGE-IPT)' "$O/ipt.log" "$O/check.log" | cut -d: -f2- | tr '\n' ' '); float64: ${n:-none} (want $IPT_F64); $(rg_last "$O/check.log")"
   fi
@@ -972,7 +1091,9 @@ PY
   v=$(rg_pass "$O/gui-check.log" '^GUI PASSED$')
   rg_item ipt-gui "$(rg_say "$v")" "the pixels the GUI does not reach as the direct way, pictures 51 960 2640: $(rg_rest "$v")"
   rg_rm "$O/gui"
-  # --- ipt-p5: a profile 5 picture (its base layer is IPT-PQ-c2 already) the same bytes with the tunnel asked or not
+  # --- ipt-p5: a profile 5 picture (its base layer is IPT-PQ-c2 in the matrices of its RPU): with the tunnel asked,
+  # in the matrices of the tunnel, the direct and the composed way the same bytes, and decoded from its header as the
+  # picture as composed is decoded from its own
   d5=$O/data5/p1; mkdir -p "$d5"
   $RG_PY - "$IN/p5-chart-bl.yuv" "$d5" <<'PY'
 import sys
@@ -992,10 +1113,22 @@ PY
     rg_fresh "$O/p5-$m"
     rg_log "$O/p5-$m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=$m nice -n 19 timeout 1800 "$O/fb" "$O/data5" "$O/p5-$m" p5 1
   done
-  n=0; for p in direct.rgba composed.rgba; do cmp -s "$O/p5-0/p5-p1-$p" "$O/p5-1/p5-p1-$p" && [ -s "$O/p5-0/p5-p1-$p" ] && n=$((n + 1)); done
-  [ "$n" = 2 ] && grep -a -q '^FIDBENCH-OK' "$O/p5-1.log" && rg_item ipt-p5 PASSED "the profile 5 chart: the direct and the composed transport the same bytes with the IPT tunnel asked or not" \
-    || rg_item ipt-p5 FAILED "$n of 2 outputs the same; $(rg_last "$O/p5-1.log")"
-  rg_rm "$O/p5-0" "$O/p5-1" "$O/data5"
+  n=0; for m in 0 1; do cmp -s "$O/p5-$m/p5-p1-direct.rgba" "$O/p5-$m/p5-p1-composed.rgba" && [ -s "$O/p5-$m/p5-p1-direct.rgba" ] && n=$((n + 1)); done
+  rg_log "$O/p5-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" p5 "$O/p5-0" p5 "$O/p5-1" p5 1
+  [ "$n" = 2 ] && grep -a -q '^FIDBENCH-OK' "$O/p5-1.log" && grep -a -q '^P5-IPT PASSED$' "$O/p5-check.log" &&
+    rg_item ipt-p5 PASSED "the profile 5 chart: the direct and the composed way the same bytes, asked or not; $(grep -a -m1 '^p1 ' "$O/p5-check.log" | sed 's/^p1 *//')" \
+    || rg_item ipt-p5 FAILED "$n of 2 ways the same; $(grep -a -m1 -E '^(p1 |P5-IPT|Traceback)' "$O/p5-check.log"); $(rg_last "$O/p5-1.log")"
+  # ... and the conversion of profile 5 through the RGBtoLMS of BT.2020 in place of its RPU's (a mutant): caught
+  if mutant ipt-p5lms "$TS/mut-ipt-p5lms.py" dvbridge_source.c &&
+     rg_bridge "$RG_W/mut/ipt-p5lms" "$L" "$F" "$O/fidbench-ipt.c" "$O/fb-p5lms" "$SRC"; then
+    rg_fresh "$O/p5-m"
+    rg_log "$O/p5-m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=1 nice -n 19 timeout 1800 "$O/fb-p5lms" "$O/data5" "$O/p5-m" p5 1
+    rg_log "$O/p5-m-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" p5 "$O/p5-0" p5 "$O/p5-m" p5 1
+    grep -a -q '^P5-IPT FAILED$' "$O/p5-m-check.log" &&
+      rg_item ipt-p5-mutant PASSED "profile 5 converted through the RGBtoLMS of BT.2020: caught, $(grep -a -m1 '^p1 ' "$O/p5-m-check.log" | sed 's/^p1 *//' | cut -c1-150)" ||
+      rg_item ipt-p5-mutant FAILED "profile 5 converted through the RGBtoLMS of BT.2020: not caught; $(grep -a -m1 -E '^(p1 |P5-IPT|Traceback)' "$O/p5-m-check.log")"
+  else rg_item ipt-p5-mutant FAILED "the mutant no longer applies or does not build"; fi
+  rg_rm "$O/p5-0" "$O/p5-1" "$O/p5-m" "$O/data5" "$O/fb-p5lms" "$RG_W/mut/ipt-p5lms"
   # --- ipt-mutants: a coefficient of the matrix, Cb and Cr swapped; caught where the checker fails, or where pictures
   # 51 and 960 are not as far from the float64 oracle as the bridge as it is puts them (the lines of check.log)
   v=""; n=0
@@ -1174,6 +1307,156 @@ stage_mmr() {
     fi
   else rg_item mmr-table-mutant FAILED "the mutant lp-mut-mmr-table.py no longer applies or does not build"; fi
   rg_rm "$O/fb" "$O/fb-mut" "$RG_W/lp-mmrmut"
+}
+
+# The 3D LUT of a display (dvbridge_lut.h, dvbridge_render_set_lut()): lut3d_test.c on the PQ chart (mapped to SDR, to
+# a projector with and without its black, as it is, kept as 10-bit codes) and on picture 3 of the FEL stream (native and
+# Low-Latency, with the bars written first and not), with the LUT files of lut3d_check.py (.cube, .3dl, madVR's), whose
+# check applies each LUT to the picture drawn without it with arithmetic of its own; and the mutants it must catch, each
+# with the lines "FAIL..." of the test and of the check that it makes (measured when written): a .3dl in the order of its
+# file, the video levels of a LUT's input left out, the bars of Low-Latency left to the LUT, 10-bit codes made before
+# the LUT, the LUT applied to HDR over the tunnel, a LUT that fails not drawn again without it.
+stage_lut3d() {
+  local K L F O v m got n=0 ok=0
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  rg_inputs "$LIST" "$IN" > /dev/null || rg_fail "inputs"
+  [ -f "$DATA/p3/meta.bin" ] || { rg_item lut3d FAILED "no pictures (stage data)"; return 1; }
+  O=$RG_W/lut3d; rg_fresh "$O" "$O/luts"
+  $RG_PY "$TS/lut3d_check.py" make "$O/luts" > "$O/make.log" 2>&1 || { rg_item lut3d FAILED "the LUT files: $(tail -n 1 "$O/make.log")"; return 1; }
+  # lt <tree> <tag>: the test of that tree into $O/<tag>.log, checked into $O/<tag>.check
+  lt() {
+    rg_bridge "$1" "$L" "$F" "$TS/lut3d_test.c" "$O/t-$2" "$SRC" || { echo "$2: BUILD FAILED"; tail -n 5 "$O/t-$2.build.log"; return 1; }
+    rg_fresh "$O/out-$2"
+    rg_log "$O/$2.log" gpu nice -n 19 timeout 2400 "$O/t-$2" "$IN/chart-pq.yuv" 1 "$O/luts" "$O/out-$2" "$DATA/p3"
+    rg_log "$O/$2.check" $RG_PY "$TS/lut3d_check.py" check "$O/luts" "$O/out-$2" "$O/$2.log"
+    rg_rm "$O/t-$2" "$O/out-$2"
+  }
+  lt "$K" tree
+  v=$(rg_pass "$O/tree.log" '^PASSED: 0 failed$')
+  rg_item lut3d-render "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.log") checks; $(grep -a -m1 '^identity sdr ' "$O/tree.log" | cut -c1-120); $(grep -a -m1 '^identity ll ' "$O/tree.log" | cut -c1-120); $(grep -a -m1 '^time sdr' "$O/tree.log" | cut -c1-120); $(grep -a -m1 '^time ll' "$O/tree.log" | cut -c1-90)"
+  v=$(rg_pass "$O/tree.check" '^LUT3D-CHECK PASSED: 0 failed$')
+  rg_item lut3d-reference "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.check") checks against the LUT applied in Python; sdr $(grep -a -m1 'sdr (tint)' "$O/tree.check" | grep -o 'at most [^ ]* apart'); ll $(grep -a -m1 '^ok:   ll (tint)' "$O/tree.check" | grep -o 'at most [^ ]* apart')"
+  # the mutants: <name> <edit file> <file under tools/dvbridge> <FAIL lines of the test> <of the check>
+  for m in "3dl-order mut-lut-3dl-order.py dvbridge_lut.c 0 3" "range mut-lut-range.py dvbridge_lut.c 0 2"            "bars mut-lut-bars.py dvbridge_render.c 2 0" "codes mut-lut-codes.py dvbridge_render.c 0 1"            "tunnel mut-lut-tunnel.py dvbridge_render.c 2 0" "retry mut-lut-retry.py dvbridge_render.c 3 0"; do
+    set -- $m
+    n=$((n + 1))
+    if mutant "lut3d-$1" "$TS/$2" "$3"; then
+      lt "$RG_W/mut/lut3d-$1" "m-$1" > "$O/m-$1.build" 2>&1
+      rg_rm "$RG_W/mut/lut3d-$1"
+    else echo "mutant $1: no longer applies"; continue; fi
+    got="$(grep -a -c '^FAIL' "$O/m-$1.log") $(grep -a -c '^FAIL' "$O/m-$1.check")"
+    if [ "$got" = "$4 $5" ]; then ok=$((ok + 1)); else echo "mutant $1: $got lines FAIL (test, check), $4 $5 expected"; fi
+  done
+  rg_item lut3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: a .3dl in its file's order 0 and 3, video levels left out 0 and 2, the bars of Low-Latency 2 and 0, codes before the LUT 0 and 1, HDR over the tunnel 2 and 0, no retry without a LUT that fails 3 and 0)"
+}
+
+# The 3D LUT of a display in the video shaders of Kodi's own renderer, the way SDR videos that Kodi draws itself take it
+# (system/shaders/GLES/2.0/gles_lut3d.frag and gles_lut3d_body.frag, put in by VideoShaders/Lut3dGLES.h; the table laid
+# out by tools/dvbridge/dvbridge_lut_atlas.c): lutsdr_test.c draws a picture of an SDR clip (bd1080.264, its base view)
+# the ways Kodi draws one (the YUV shader of GLES 2.0 in one pass, of a software and of a VAAPI picture, to an output
+# of full and of limited range; the filter shader of GLES 3.1; a field; HDR tone mapped by Kodi; two passes with Kodi's
+# scalers), without a LUT, with identity LUTs (every byte and 10-bit code of the picture without it) and with the LUT
+# files of lut3d_check.py (.cube, .3dl, madVR's), which lutsdr_check.py checks against the LUT applied in Python to the
+# picture drawn without it; and the mutants it must catch, each with the lines "FAIL..." of the test and of the check
+# that it makes (measured when written).
+# lutsdr_copy <dest>: a copy of the tree under test's tools/dvbridge and system/shaders/GLES (for a mutant)
+lutsdr_copy() {
+  local K
+  K=$(rg_kodi) || return 1
+  rg_fresh "$1/tools" "$1/system/shaders"
+  cp -a "$K/tools/dvbridge" "$1/tools/" && cp -a "$K/system/shaders/GLES" "$1/system/shaders/"
+}
+stage_lutsdr() {
+  local K L F O v m got n=0 ok=0
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  rg_inputs "$LIST" "$IN" > /dev/null || rg_fail "inputs"
+  O=$RG_W/lutsdr; rg_fresh "$O" "$O/luts"
+  $RG_PY "$TS/lut3d_check.py" make "$O/luts" > "$O/make.log" 2>&1 || { rg_item lutsdr FAILED "the LUT files: $(tail -n 1 "$O/make.log")"; return 1; }
+  # lt <tree> <tag>: the test of that tree into $O/<tag>.log, checked into $O/<tag>.check
+  lt() {
+    rg_bridge "$1" "$L" "$F" "$TS/lutsdr_test.c" "$O/t-$2" "$SRC" || { echo "$2: BUILD FAILED"; tail -n 5 "$O/t-$2.build.log"; return 1; }
+    rg_fresh "$O/out-$2"
+    rg_log "$O/$2.log" gpu nice -n 19 timeout 1800 "$O/t-$2" "$1" "$IN/bd1080.264" "$O/luts" "$O/out-$2"
+    rg_log "$O/$2.check" $RG_PY "$TS/lutsdr_check.py" "$O/luts" "$O/out-$2" "$O/$2.log"
+    rg_rm "$O/t-$2" "$O/out-$2"
+  }
+  lt "$K" tree
+  v=$(rg_pass "$O/tree.log" '^PASSED: 0 failed$')
+  rg_item lutsdr-render "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.log") checks; $(grep -a -m1 '^identity basic-yv12 id65' "$O/tree.log" | cut -c1-140); $(grep -a -m1 '^identity conv4 ' "$O/tree.log" | cut -c1-140); $(grep -a -m1 '^time ' "$O/tree.log" | cut -c1-140)"
+  v=$(rg_pass "$O/tree.check" '^LUTSDR-CHECK PASSED: 0 failed$')
+  rg_item lutsdr-reference "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.check") checks against the LUT applied in Python; $(grep -a -o 'at most [^ ]* apart' "$O/tree.check" | sort -k3 -g | tail -n 1) at worst"
+  # the mutants: <name> <edit file> <file under the tree> <FAIL lines of the test> <of the check>
+  for m in "range mut-lutsdr-range.py system/shaders/GLES/2.0/gles_lut3d.frag 0 2" \
+           "tetra mut-lutsdr-tetra.py system/shaders/GLES/2.0/gles_lut3d.frag 10 11" \
+           "atlas mut-lutsdr-atlas.py tools/dvbridge/dvbridge_lut_atlas.c 11 11" \
+           "shaper mut-lutsdr-shaper.py system/shaders/GLES/2.0/gles_lut3d.frag 0 1" \
+           "apply mut-lutsdr-apply.py system/shaders/GLES/2.0/gles_lut3d.frag 8 0" \
+           "beyond mut-lutsdr-beyond.py system/shaders/GLES/2.0/gles_lut3d.frag 3 2"; do
+    set -- $m
+    n=$((n + 1))
+    if lutsdr_copy "$RG_W/mut/lutsdr-$1" && rg_edit "$RG_W/mut/lutsdr-$1/$3" "$TS/$2" > "$RG_W/mut/lutsdr-$1.edit.log" 2>&1; then
+      lt "$RG_W/mut/lutsdr-$1" "m-$1" > "$O/m-$1.build" 2>&1
+      rg_rm "$RG_W/mut/lutsdr-$1"
+    else echo "mutant $1: no longer applies"; continue; fi
+    got="$(grep -a -c '^FAIL' "$O/m-$1.log") $(grep -a -c '^FAIL' "$O/m-$1.check")"
+    echo "mutant $1: $got lines FAIL (test, check), $4 $5 expected"
+    if [ "$got" = "$4 $5" ]; then ok=$((ok + 1)); fi
+  done
+  rg_item lutsdr-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: the input range of a LUT left out 0 and 2, a tetrahedron of other corners 10 and 11, the slices of the table out of place 11 and 11, Nuke's shaper left out 0 and 1, a shader told not to apply the LUT applying it 8 and 0, what is beyond black and white of a limited output lost 3 and 2)"
+}
+
+# An 8-bit HLG picture sent as Dolby Vision (dvbridge_gl_widen.c; Kodi's VAAPI renderer, WidenForBridge()): the HLG
+# chart brought to 8 bits and a picture with every code in each plane, given as NV12 planes and widened, against the
+# same pictures given as P010 planes of (v << 2) << 6: every widened sample, the picture drawn (floats), the transport
+# packed with its metadata (bytes) and the measurement, the same; the GL state kept; the planes given as they are
+# refused (hlg8_test.c). Three mutants of the pass (the 10 bits at the bottom of 16, the chroma not widened, the GL
+# state not put back), and in the source the rule, the probe and the three ways of the renderer (hlg8_src_check.py),
+# with a copy of the renderer without the widening on the native output, which it must find.
+stage_hlg8() {
+  local K L F O v t got n=0 ok=0 C
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  rg_inputs "$LIST" "$IN" > /dev/null || rg_fail "inputs"
+  O=$RG_W/hlg8; rg_fresh "$O"
+  h8() { # <tree> <tag>
+    rg_bridge "$1" "$L" "$F" "$TS/hlg8_test.c" "$O/t-$2" || { echo "$2: BUILD FAILED"; tail -n 5 "$O/t-$2.build.log"; return 1; }
+    rg_log "$O/$2.log" gpu nice -n 19 timeout 2400 "$O/t-$2" "$IN/chart-hlg.yuv"
+    rg_rm "$O/t-$2"
+  }
+  h8 "$K" tree
+  v=$(rg_pass "$O/tree.log" '^PASSED: 0 failed$')
+  rg_item hlg8 "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.log") checks; $(grep -a -m1 'converted to ST 2084 differ' "$O/tree.log" | cut -c7-200)"
+  for t in "p010-shift mut-widen-p010-shift.py 8" "luma-only mut-widen-luma-only.py 8" "state mut-widen-state.py 2"; do
+    set -- $t
+    n=$((n + 1))
+    if mutant "hlg8-$1" "$TS/$2" dvbridge_gl_widen.c && h8 "$RG_W/mut/hlg8-$1" "m-$1" > "$O/m-$1.build" 2>&1; then
+      got=$(grep -a -c '^FAIL:' "$O/m-$1.log")
+      if [ "$got" = "$3" ]; then ok=$((ok + 1)); else echo "mutant $1: failed $got checks, $3 expected"; fi
+    else echo "mutant $1: no longer applies or does not build"; fi
+    rg_rm "$RG_W/mut/hlg8-$1"
+  done
+  rg_item hlg8-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed the checks expected (the 10 bits at the bottom: 8; the chroma not widened: 8; the GL state not put back: 2)"
+  rg_log "$O/src.log" $RG_PY "$TS/hlg8_src_check.py" "$K"
+  v=$(rg_pass "$O/src.log" '^PASSED: 0 failed$')
+  rg_item hlg8-src "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/src.log") checks"
+  C=$O/src-without; rg_fresh "$C"
+  for t in xbmc/cores/VideoPlayer/DVDCodecs/Video/DVPlaybackPolicy.h xbmc/cores/VideoPlayer/DVDDemuxers/DVHdr10Plus.cpp \
+           xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp; do
+    mkdir -p "$C/$(dirname "$t")" && cp "$K/$t" "$C/$t"
+  done
+  $RG_PY - "$C/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererVAAPIGLES.cpp" << 'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+old = '  if (!WidenForBridge(idx, layer))\n    return DVFrameRejected("hlg-8-bit-widening");\n'
+if t.count(old) != 1:
+    sys.exit(3)
+open(p, 'w').write(t.replace(old, ''))
+PY
+  rg_log "$O/src-without.log" $RG_PY "$TS/hlg8_src_check.py" "$C"
+  got=$(grep -a -c '^FAIL:' "$O/src-without.log")
+  [ "$got" = 1 ] && rg_item hlg8-src.without PASSED "the renderer without the widening on the native output: 1 check fails, as it must" ||
+    rg_item hlg8-src.without FAILED "the renderer without the widening on the native output: $got checks fail, not 1"
+  rg_rm "$C"
 }
 
 rg_main "$STAGES" "$@"

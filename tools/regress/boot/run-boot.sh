@@ -35,10 +35,24 @@
 #                and what clock-measure keeps for it (clock-trusted), with the busybox of the image and fakes of
 #                wait-time-sync, connmand-wait-online and logger (network_wait_test.sh); each of its 7 mutations (a
 #                rule of either script taken out) must fail a check
+#   notreturned  the drivers that the journal of a start, or the copy of its kernel log, shows starting under
+#                initcall_debug and not returned by its last line: not-returned.awk and not_returned() of collect.sh
+#                (packages/sysutils/hades-diag/scripts), with the busybox of the image (not_returned_test.sh); an awk
+#                that does not count the returns, and one that counts the PCI fixups, must fail 5 and 9 checks
+#   afternvidia  after-nvidia (packages/graphics/nvidia/scripts), which kmod runs in place of loading snd_virtuoso:
+#                the module is loaded once nvidia has started, at once where there is nothing to wait for, and within
+#                its limits, with the busybox of the image, a /sys of files and a fake modprobe (after_nvidia_test.sh);
+#                each of its 7 mutations must fail a check
+#   nvidiasleep  NVIDIA's power management interface for the 580 driver (packages/graphics/nvidia/scripts): the sleep hook
+#                writes suspend, hibernate and resume to /proc/driver/nvidia/suspend as systemd-sleep runs it, and nothing
+#                with the 620 driver; stack-links writes the option that keeps the video memory for the legacy driver only
+#                (nvidia_sleep_test.sh, with the busybox of the image); each of its 6 mutations must fail a check
+# Not a stage (it needs an image and KVM): picture_race_qemu.sh, Kodi's "hades-picture release" that comes while a
+# picture of the start is being drawn, in QEMU (its head says what it checks).
 # Host test only: it writes under $REGRESS_WORK/boot and reads the tree at $REGRESS_LE_REF and the busybox of the build
 # folder ($REGRESS_LE_BUILD/install_pkg/busybox-*).
 # usage: run-boot.sh all | verdict [<log>] | <stage>...       stages: menus today olderlook oldertext notice themeupdate installer picture
-#                                                              scripts netwait
+#                                                              scripts netwait notreturned afternvidia nvidiasleep
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -269,4 +283,64 @@ stage_netwait() {
   done
 }
 
-rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait" "$@"
+stage_notreturned() {
+  local bb L v T=$RG_W/le-notreturned S=packages/sysutils/hades-diag/scripts
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $S/not-returned.awk $S/collect.sh
+  if [ -z "$bb" ] || [ ! -f "$T/$S/not-returned.awk" ] || [ ! -f "$T/$S/collect.sh" ]; then
+    rg_item not-returned FAILED "no busybox of the image, or no not-returned.awk or collect.sh at $REGRESS_LE_REF"
+    rg_item not-returned.returns FAILED "the same"; rg_item not-returned.fixups FAILED "the same"; return 1
+  fi
+  L=$RG_W/logs/not-returned.log
+  rg_log "$L" bash "$HERE/not_returned_test.sh" "$bb" "$T/$S/not-returned.awk" "$T/$S/collect.sh"
+  v=$(rg_pass "$L" '^not-returned: [0-9]+ checks passed, 0 failed$' '^FAIL ')
+  rg_item not-returned "$(rg_say "$v")" "$(rg_rest "$v")"
+  # (the mutants: the returns not counted; the PCI fixups of initcall_debug counted as starts of drivers)
+  sed 's/^\t\tpend\[k\]--$/\t\tpend[k] += 0/' "$T/$S/not-returned.awk" > "$RG_W/nr-returns.awk"
+  sed 's/index(\$0, "kernel: " s)/index($0, s)/' "$T/$S/not-returned.awk" > "$RG_W/nr-fixups.awk"
+  for x in returns:5 fixups:9; do
+    if cmp -s "$T/$S/not-returned.awk" "$RG_W/nr-${x%%:*}.awk"; then
+      rg_item "not-returned.${x%%:*}" FAILED "the mutant is not made"; continue
+    fi
+    L=$RG_W/logs/not-returned-${x%%:*}.log
+    rg_log "$L" bash "$HERE/not_returned_test.sh" "$bb" "$RG_W/nr-${x%%:*}.awk" "$T/$S/collect.sh"
+    v=$(rg_fails "$L" "${x#*:}" '^FAIL ')
+    rg_item "not-returned.${x%%:*}" "$(rg_say "$v")" "$(rg_rest "$v")"
+  done
+}
+
+stage_afternvidia() {
+  local bb L v m T=$RG_W/le-afternvidia AN=packages/graphics/nvidia/scripts/after-nvidia
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $AN
+  if [ -z "$bb" ] || [ ! -f "$T/$AN" ]; then
+    rg_item after-nvidia FAILED "no busybox of the image, or no after-nvidia at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/after-nvidia.log
+  rg_log "$L" bash "$HERE/after_nvidia_test.sh" "$bb" "$T/$AN"
+  v=$(rg_pass "$L" '^AFTER-NVIDIA PASSED$' '^  FAIL ')
+  rg_item after-nvidia "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5 M6 M7; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item after-nvidia.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item after-nvidia.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+stage_nvidiasleep() {
+  local bb L v m T=$RG_W/le-nvidiasleep SL=packages/graphics/nvidia/scripts/sleep LK=packages/graphics/nvidia/scripts/stack-links
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $SL $LK
+  if [ -z "$bb" ] || [ ! -f "$T/$SL" ] || [ ! -f "$T/$LK" ]; then
+    rg_item nvidia-sleep FAILED "no busybox of the image, or no sleep hook or stack-links at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/nvidia-sleep.log
+  rg_log "$L" bash "$HERE/nvidia_sleep_test.sh" "$bb" "$T/$SL" "$T/$LK"
+  v=$(rg_pass "$L" '^NVIDIA-SLEEP PASSED$' '^  FAIL ')
+  rg_item nvidia-sleep "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5 M6; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item nvidia-sleep.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item nvidia-sleep.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep" "$@"

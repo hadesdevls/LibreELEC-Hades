@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:35:04 +0000
+Subject: [PATCH] drm/i915: the port kept off a moment before a sink's link is
+ set up again after a drop of its HPD
+
+Issue #28 (corgeone), after linux-9881: an Anthem AVM 90 between an Intel
+i7-1355U and an LG G2 drops HPD for ~1.0 s and resets its SCDC when it
+switches to another input and back. With 1.1 the repair modeset of
+intel_hdmi_reset_link() came 1.04 s after HPD was back, as 9881 meant, and
+the AVM showed a picture in 2 of 11 input switches (0 of 3 with
+scdc_settle_ms=2000). The output turned off for 0.3 s and on again from user
+space (Kodi's ToggleDPMS twice), 0.5 s after HPD came back, gave a picture
+every time, ~3.3 s after the switch. The same when the AVM comes out of
+standby with the PC already on its input: HPD back after a long low, a mode
+set, and "No Signal" until that toggle.
+
+The repair is a full modeset (connectors_changed): intel_ddi_post_disable_hdmi()
+turns the DDI buffer and the clocks off and intel_ddi_enable_hdmi() turns them
+on again in the same commit, a few ms apart. What the AVM needs, by the
+measurement, is the TMDS clock stopped for a moment, which waiting longer
+before that modeset does not give.
+
+So after a drop of HPD that no modeset of the output explains (the rule of
+9881, intel_hdmi_hpd_drop_answers(): a drop that begins more than 3 s after
+the last set up of the output), intel_hdmi_detect() marks the output, and its
+next set up, in intel_ddi_enable_hdmi() before the scrambling setup of the
+sink and the DDI buffer, waits until the port has been off
+i915.hdmi_relink_off_ms (xe.hdmi_relink_off_ms; 300 by default; 0: as
+before; at most 2000) and HPD has been back as long. Whoever makes that set
+up, the repair of the kernel or a mode set of user space after a hotplug, it
+is the same, once per return of HPD, and only within 15 s of it. The kernel
+log says each time how long the port stayed off and why
+("... the port was kept off N ms more ... (hdmi_relink_off_ms)").
+
+A drop that is the sink's answer to a modeset of the output (an LG G5 drops
+HPD ~0.4 s after a Dolby Vision or refresh rate change) waits for nothing, as
+before. Cost where it applies: up to 0.3 s more of a black screen that was
+there anyway, in a commit that waits as long.
+
+KUnit (drm_hdmi_scdc_settle): the wait after the repair modeset of an input
+switch, in the standby case, with the port off or HPD back long enough
+already, with the parameter off and at its longest, and none for an LG G5's
+answer.
+
+Not tried on hardware: corgeone can, with his relink service stopped, by
+switching the AVM's input and by waking it from standby.
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c      | 58 +++++++++++++++++++
+ .../drm/i915/display/intel_display_types.h    |  9 +++
+ drivers/gpu/drm/i915/display/intel_hdmi.c     | 16 +++++
+ .../drm/i915/display/intel_hdmi_scdc_settle.h | 43 ++++++++++++++
+ .../gpu/drm/tests/drm_hdmi_scdc_settle_test.c | 34 +++++++++++
+ 5 files changed, 160 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index c2a57fc..e0f2a4f 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3231,6 +3231,14 @@ static void intel_ddi_post_disable_hdmi(struct intel_atomic_state *state,
+ 	intel_ddi_disable_clock(encoder);
+ 
+ 	intel_dp_dual_mode_set_tmds_output(intel_hdmi, false);
++
++	/* Hades: when the port went off, for i915.hdmi_relink_off_ms (intel_hdmi_scdc_settle.h) */
++	if (old_conn_state->connector) {
++		struct intel_connector *connector = to_intel_connector(old_conn_state->connector);
++
++		WRITE_ONCE(connector->output_off_at, jiffies);
++		WRITE_ONCE(connector->output_off, true);
++	}
+ }
+ 
+ static void intel_ddi_post_disable_hdmi_or_sst(struct intel_atomic_state *state,
+@@ -3416,6 +3424,53 @@ gen9_chicken_trans_reg_by_port(struct intel_display *display, enum port port)
+ 	return CHICKEN_TRANS(display, trans[port]);
+ }
+ 
++/*
++ * Hades: after a drop of a sink's HPD that no modeset of the output explains, the first set up of
++ * the output keeps its port off until it has been off this long and HPD back this long
++ * (intel_hdmi_scdc_settle.h); 0 turns it off
++ */
++static unsigned int hdmi_relink_off_ms = 300;
++module_param(hdmi_relink_off_ms, uint, 0644);
++MODULE_PARM_DESC(hdmi_relink_off_ms,
++	"HDMI: ms that the port stays off before its link is set up again, after a drop of the sink's "
++	"HPD that no modeset of the output explains, such as an AV receiver switching inputs or "
++	"leaving standby (default 300, 0: as before; at most 2000)");
++
++/* Hades: i915.hdmi_relink_off_ms, before intel_ddi_enable_hdmi() sets the link up */
++static void intel_hdmi_relink_off(struct intel_connector *connector)
++{
++	struct intel_display *display = to_intel_display(connector);
++	const unsigned int off = min_t(unsigned int, READ_ONCE(hdmi_relink_off_ms),
++				       INTEL_HDMI_RELINK_OFF_MAX_MS);
++	const unsigned long back_at = connector->hpd_back_at;
++	const unsigned long off_at = READ_ONCE(connector->output_off_at);
++	unsigned int since_back, since_off = UINT_MAX, wait;
++
++	if (!READ_ONCE(connector->relink_off_due))
++		return;
++	WRITE_ONCE(connector->relink_off_due, false);
++	/* (a set up long after HPD came back is not the one of that hotplug) */
++	if (!off || time_after(jiffies, back_at + msecs_to_jiffies(INTEL_HDMI_HPD_BACK_MS)))
++		return;
++	since_back = jiffies_to_msecs(jiffies - back_at);
++	if (READ_ONCE(connector->output_off) &&
++	    !time_after(jiffies, off_at + msecs_to_jiffies(INTEL_HDMI_HPD_BACK_MS)))
++		since_off = jiffies_to_msecs(jiffies - off_at);
++
++	wait = intel_hdmi_relink_off_wait_ms(off, true, since_back, since_off);
++	if (wait)
++		msleep(wait);
++	if (since_off == UINT_MAX)
++		drm_info(display->drm,
++			 "[CONNECTOR:%d:%s] HPD came back %u ms ago from a drop that no modeset of this output explains: the link is set up %u ms later, %u ms or more after HPD came back (hdmi_relink_off_ms)\n",
++			 connector->base.base.id, connector->base.name, since_back, wait, off);
++	else
++		drm_info(display->drm,
++			 "[CONNECTOR:%d:%s] HPD came back %u ms ago from a drop that no modeset of this output explains: the port was kept off %u ms more (off %u ms in all, %u ms or more after HPD came back) before its link is set up again (hdmi_relink_off_ms)\n",
++			 connector->base.base.id, connector->base.name, since_back, wait,
++			 since_off + wait, off);
++}
++
+ static void intel_ddi_enable_hdmi(struct intel_atomic_state *state,
+ 				  struct intel_encoder *encoder,
+ 				  const struct intel_crtc_state *crtc_state,
+@@ -3427,6 +3482,9 @@ static void intel_ddi_enable_hdmi(struct intel_atomic_state *state,
+ 	enum port port = encoder->port;
+ 	u32 buf_ctl = 0;
+ 
++	/* Hades: the port kept off a moment first, after a drop of HPD (i915.hdmi_relink_off_ms) */
++	intel_hdmi_relink_off(to_intel_connector(connector));
++
+ 	if (!intel_hdmi_handle_sink_scrambling(encoder, connector,
+ 					       crtc_state->hdmi_high_tmds_clock_ratio,
+ 					       crtc_state->hdmi_scrambling))
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 0a34408..ad26b8c 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -642,6 +642,15 @@ struct intel_connector {
+ 	unsigned long hpd_down_at;
+ 	unsigned long hpd_back_at;
+ 	unsigned long output_set_up_at;
++	/*
++	 * Hades: i915.hdmi_relink_off_ms (intel_hdmi_scdc_settle.h): HPD came back from a drop that
++	 * no modeset of this output explains, and the output has not been set up since
++	 * (relink_off_due, intel_hdmi_detect()); when the port was last turned off
++	 * (intel_ddi_post_disable_hdmi(), output_off_at)
++	 */
++	bool relink_off_due;
++	bool output_off;
++	unsigned long output_off_at;
+ 
+ 	/* since POLL and HPD connectors may use the same HPD line keep the native
+ 	   state of connector->polled in case hotplug storm detection changes it */
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi.c b/drivers/gpu/drm/i915/display/intel_hdmi.c
+index d586f26..180dbd5 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/display/intel_hdmi.c
+@@ -68,6 +68,7 @@
+ #include "intel_hdcp_regs.h"
+ #include "intel_hdcp_shim.h"
+ #include "intel_hdmi.h"
++#include "intel_hdmi_scdc_settle.h"
+ #include "intel_hdr10plus.h"
+ #include "intel_hdmi_gmp_hdr.h"
+ #include "intel_hdmi_vsif.h"
+@@ -3832,6 +3833,21 @@ static void intel_hdmi_hpd_high(struct intel_connector *connector)
+ 	connector->hpd_back_at = jiffies;
+ 	connector->hpd_back = true;
+ 	connector->hpd_back_said = false;
++	/*
++	 * Hades: i915.hdmi_relink_off_ms: the next set up of the output keeps its port off a moment
++	 * first, where no modeset of the output explains the drop (an AV receiver that switched
++	 * inputs or left standby), not where the drop is the sink's answer to one
++	 */
++	{
++		const unsigned long set_up_at = READ_ONCE(connector->output_set_up_at);
++		long set_up_to_drop = -1;
++
++		if (READ_ONCE(connector->output_set_up) &&
++		    time_after_eq(connector->hpd_down_at, set_up_at))
++			set_up_to_drop = jiffies_to_msecs(connector->hpd_down_at - set_up_at);
++		WRITE_ONCE(connector->relink_off_due,
++			   !intel_hdmi_hpd_drop_answers(set_up_to_drop));
++	}
+ }
+ 
+ static enum drm_connector_status
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+index f5bab19..ffc9c3a 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
++++ b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+@@ -58,4 +58,47 @@ static inline bool intel_hdmi_scdc_settle_waits(unsigned int settle_ms, bool bac
+ 	return since_back_ms < settle_ms;
+ }
+ 
++/*
++ * i915.hdmi_relink_off_ms (xe.hdmi_relink_off_ms), issue #28 again: a link set up again at the right
++ * moment is not enough for the AVM 90. The modeset of intel_hdmi_reset_link(), 1.04 s after HPD came
++ * back, gave a picture in 2 of 11 input switches (0 of 3 with scdc_settle_ms=2000), while the output
++ * turned off for 0.3 s and on again from user space (DPMS), 0.5 s after HPD came back, gave one every
++ * time, ~3.3 s after the switch. The modeset turns the port off and on in the same commit, a few ms
++ * apart: the sink wants the TMDS clock stopped for a moment before the link comes back. The same
++ * when the AVM comes out of standby with the PC already on its input: HPD back after a long low, a
++ * mode set, and "No Signal" until that DPMS toggle.
++ *
++ * So after a drop of HPD that no modeset of the output explains (!intel_hdmi_hpd_drop_answers()),
++ * the first time the output is set up (intel_ddi_enable_hdmi(), before the scrambling setup of the
++ * sink and the DDI buffer) waits until the port has been off @off_ms and HPD back @off_ms. A drop
++ * that is the sink's answer to a modeset (an LG G5 changing picture mode) waits for nothing, as
++ * before. 0 turns it off.
++ */
++#define INTEL_HDMI_RELINK_OFF_MAX_MS	2000
++
++/*
++ * How long the output waits before its link is set up again, in ms (0: not at all):
++ * @off_ms: i915.hdmi_relink_off_ms (0: never; above INTEL_HDMI_RELINK_OFF_MAX_MS, that)
++ * @due: HPD came back from a drop that no modeset of the output explains, and the output has not
++ *       been set up since
++ * @since_back_ms: since HPD came back
++ * @since_off_ms: since the port was last turned off (UINT_MAX: never on, or long ago)
++ */
++static inline unsigned int intel_hdmi_relink_off_wait_ms(unsigned int off_ms, bool due,
++							 unsigned int since_back_ms,
++							 unsigned int since_off_ms)
++{
++	unsigned int wait = 0;
++
++	if (!off_ms || !due)
++		return 0;
++	if (off_ms > INTEL_HDMI_RELINK_OFF_MAX_MS)
++		off_ms = INTEL_HDMI_RELINK_OFF_MAX_MS;
++	if (since_off_ms < off_ms)
++		wait = off_ms - since_off_ms;
++	if (since_back_ms < off_ms && off_ms - since_back_ms > wait)
++		wait = off_ms - since_back_ms;
++	return wait;
++}
++
+ #endif /* __INTEL_HDMI_SCDC_SETTLE_H__ */
+diff --git a/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+index b35b836..ae83ff8 100644
+--- a/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
++++ b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+@@ -6,6 +6,7 @@
+  * come after an AV receiver's input switch and after an LG G5's answer to a Dolby Vision start.
+  */
+ #include <kunit/test.h>
++#include <linux/limits.h>
+ 
+ #include "../i915/display/intel_hdmi_scdc_settle.h"
+ 
+@@ -72,10 +73,43 @@ static void drm_test_scdc_settle_looks(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, settle_modeset_at(4000000000u, 180000), 10060);
+ }
+ 
++/* i915.hdmi_relink_off_ms: how long the port stays off before the link is set up again */
++static void drm_test_scdc_relink_off(struct kunit *test)
++{
++	/* nothing due, or the parameter off: no wait */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, false, 0, 0), 0);
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(0, true, 0, 0), 0);
++	/*
++	 * issue #28, an input switch: the repair modeset 1040 ms after HPD came back turns the port off
++	 * and sets it up again at once; it stays off 300 ms
++	 */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 1040, 0), 300);
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 1040, 5), 295);
++	/* ... off long enough already, and HPD back long enough: none */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 1040, 300), 0);
++	/* the standby case: the output set up 60 ms after HPD came back, the port off for long */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 60, UINT_MAX), 240);
++	/* ... or turned off just then: the longer of the two */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 260, 10), 290);
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(300, true, 10, 260), 290);
++	/* no longer than the longest */
++	KUNIT_EXPECT_EQ(test, intel_hdmi_relink_off_wait_ms(4000000000u, true, 0, 0),
++			INTEL_HDMI_RELINK_OFF_MAX_MS);
++	/* an LG G5's drop 0.4 s after a Dolby Vision start is its answer: nothing is due */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, !intel_hdmi_hpd_drop_answers(400), 60, 0),
++			0);
++	/* the AVM's input switch, the last modeset of the output minutes before: due */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, !intel_hdmi_hpd_drop_answers(180000), 1040, 0),
++			300);
++}
++
+ static struct kunit_case drm_hdmi_scdc_settle_tests[] = {
+ 	KUNIT_CASE(drm_test_scdc_settle_answers),
+ 	KUNIT_CASE(drm_test_scdc_settle_waits),
+ 	KUNIT_CASE(drm_test_scdc_settle_looks),
++	KUNIT_CASE(drm_test_scdc_relink_off),
+ 	{ }
+ };
+ 
+-- 
+2.53.0
+

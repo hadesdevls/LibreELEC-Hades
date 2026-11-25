@@ -9,7 +9,14 @@
   same <dirA> <tagA> <dirB> <tagB> <kind> <pic>...   two outputs of the same kind byte for byte (and how many differ)
   gui <out dir> <tag> <pic>...    composed.rgba with the GUI against direct.rgba: pixels not drawn over the same
   scaled <dirY> <tagY> <dirI> <tagI> <pic>...  a scaled picture: the IPT tunnel decoded against the YCbCr one decoded
-Exit status 1 when a target is not met (bridge: the header not IPT with the matrices of profile 5; against the
+  p5 <dir0> <tag0> <dir1> <tag1> <pic>...  a profile 5 picture as composed (its RPU's matrices) and in the IPT tunnel:
+      the second's header the licensed core's, and its codes those of the first converted in float64 (decoded with
+      the RPU's matrices, encoded with the tunnel's, rounded once) within 1 code, on at most 1 % of the samples; and
+      what the conversion costs, the two decoded as a display decodes them from their own headers to the PQ of LMS,
+      reported (its 99th percentile within 2 codes of 4095: a code of I, P or T is up to 1 + 0.1 + 0.2 of L', M', S';
+      no maximum, as a channel whose crosstalk brings it to 0 has the steepest part of PQ there: 80 codes of S from
+      one code of T in a colour out of gamut, the same with the conversion in float64)
+Exit status 1 when a target is not met (bridge: the header not IPT with the matrices of a licensed core; against the
 float64 oracle a sample off by more than 1 code; against the float32 oracle a sample off by more than 1 code, or more
 than 5 % of the samples of a component off; the totals over all the pictures are printed for the caller to hold to
 its reference: the shares of codes off depend on the pictures). The ideal (the chain with the chroma
@@ -49,6 +56,13 @@ def header(y, c):
     return ycc, off, lms, p[60], p[61]
 
 
+def licensed(ycc, off, lms):
+    """the matrices of the IPT tunnel that a licensed core sends (2002 031f 0691 2002 fc5b 0443 2002 010b ea57,
+    0 / 0.5 / 0.5, 42b8 fea4 fea4 fea4 42b8 ...: the user's Amlogic player, five films)"""
+    return ycc == [8194, 799, 1681, 8194, -933, 1091, 8194, 267, -5545] and off == [0, 134217728, 134217728] \
+        and lms == [17080, -348, -348, -348, 17080, -348, -348, -348, 17080]
+
+
 def planes(data, n):
     h = []
     for name, shape in (('y', (H, W)), ('cb', (H // 2, W // 2)), ('cr', (H // 2, W // 2))):
@@ -68,8 +82,7 @@ def bridge(data, out, tag, pics):
     for n in pics:
         y, c = tunnel(os.path.join(out, '%s-p%d-direct.rgba' % (tag, n)))
         ycc, off, lms, depth, space = header(y, c)
-        hdr_ok = ycc == [8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545] and off == [0, 134217728, 134217728] \
-            and lms == [17081, -349, -349, -349, 17081, -349, -349, -349, 17081] and depth == 12 and space == 2
+        hdr_ok = licensed(ycc, off, lms) and depth == 12 and space == 2
         bad |= not hdr_ok
         h = planes(data, n)
         rows = active(y)
@@ -79,7 +92,8 @@ def bridge(data, out, tag, pics):
             res[name] = (i, p, t)
         ref = E.ideal(h)
         res['ideal'] = (ref[..., 0], ref[:, 0::2, 1], ref[:, 0::2, 2])
-        line = 'p%-5d header %s (space %d, depth %d)' % (n, 'IPT, profile 5 matrices' if hdr_ok else 'WRONG', space, depth)
+        line = 'p%-5d header %s (space %d, depth %d)' % (n, 'IPT, the licensed core\'s matrices' if hdr_ok else 'WRONG',
+                                                         space, depth)
         cos = np.zeros((H, W // 2), bool)
         cos[0::2] = True
         cos &= rows[:, None]
@@ -174,6 +188,49 @@ def scaled(dy, ty, di, ti, pics):
     return 1 if bad else 0
 
 
+def decode_pq_lms(y, c, ycc, off, lms):
+    """the even pixels of a tunnel decoded as a display decodes them from its header: LMS = RGBtoLMS EOTF(YCCtoRGB
+    (codes - offsets)), given in PQ (x 4095)"""
+    v = np.stack([y[:, 0::2] / 4096.0 - off[0] / 268435456.0, c[:, 0::2] / 4096.0 - off[1] / 268435456.0,
+                  c[:, 1::2] / 4096.0 - off[2] / 268435456.0], -1)
+    m = np.array(ycc, float).reshape(3, 3) / 8192
+    x = np.array(lms, float).reshape(3, 3) / 16384
+    return E.oetf(E.mm(x, E.eotf(E.mm(m, v)))) * 4095
+
+
+def p5(d0, t0, d1, t1, pics):
+    bad = False
+    for n in pics:
+        y0, c0 = tunnel(os.path.join(d0, '%s-p%d-direct.rgba' % (t0, n)))
+        y1, c1 = tunnel(os.path.join(d1, '%s-p%d-direct.rgba' % (t1, n)))
+        h0, h1 = header(y0, c0), header(y1, c1)
+        lic = licensed(*h1[:3]) and h1[3] == 12 and h1[4] == 2
+        rows = active(y0) & active(y1)
+        # the oracle: the codes of the picture as composed, decoded with the header of its RPU and encoded with the
+        # tunnel's, in float64, rounded once (the even pixel of each pair, where the composer's chroma is)
+        v = np.stack([y0[:, 0::2] / 4096.0 - h0[1][0] / 268435456.0, c0[:, 0::2] / 4096.0 - h0[1][1] / 268435456.0,
+                      c0[:, 1::2] / 4096.0 - h0[1][2] / 268435456.0], -1)
+        m0, x0 = np.array(h0[0], float).reshape(3, 3) / 8192, np.array(h0[2], float).reshape(3, 3) / 16384
+        m1, x1 = np.array(h1[0], float).reshape(3, 3) / 8192, np.array(h1[2], float).reshape(3, 3) / 16384
+        t = E.mm(np.linalg.inv(x1) @ x0, E.eotf(E.mm(m0, v)))
+        ipt = E.mm(np.linalg.inv(m1), E.oetf(t)) + np.array(h1[1], float) / 268435456.0
+        want = np.clip(np.floor(ipt * 4096 + 0.5), 0, 4095)
+        got = np.stack([y1[:, 0::2], c1[:, 0::2], c1[:, 1::2]], -1)
+        dd = np.abs(want - got)[rows]
+        # ... and what it costs: the two decoded as a display decodes them from their own headers, in PQ of LMS
+        a = decode_pq_lms(y0, c0, *h0[:3])[rows]
+        b = decode_pq_lms(y1, c1, *h1[:3])[rows]
+        d = np.abs(a - b).max(axis=-1)
+        print('p%-5d profile 5 in the tunnel (header %s): against the float64 conversion of its codes, I/P/T off '
+              '%.3f/%.3f/%.3f%%, max %d %d %d; decoded against the picture as composed (PQ of LMS, codes of 4095): '
+              'mean %.3f, p99 %.3f' % (n, 'the licensed core\'s' if lic else 'WRONG', 100 * (dd[..., 0] > 0).mean(),
+                                        100 * (dd[..., 1] > 0).mean(), 100 * (dd[..., 2] > 0).mean(), dd[..., 0].max(),
+                                        dd[..., 1].max(), dd[..., 2].max(), d.mean(), np.percentile(d, 99)))
+        bad |= not lic or dd.max() > 1 or (dd > 0).mean() > 0.01 or np.percentile(d, 99) > 2.0
+    print('P5-IPT %s' % ('FAILED' if bad else 'PASSED'))
+    return 1 if bad else 0
+
+
 if __name__ == '__main__':
     m, a = sys.argv[1], sys.argv[2:]
     if m == 'bridge':
@@ -182,5 +239,7 @@ if __name__ == '__main__':
         sys.exit(same(a[0], a[1], a[2], a[3], a[4], [int(x) for x in a[5:]]))
     if m == 'gui':
         sys.exit(gui(a[0], a[1], [int(x) for x in a[2:]]))
+    if m == 'p5':
+        sys.exit(p5(a[0], a[1], a[2], a[3], [int(x) for x in a[4:]]))
     if m == 'scaled':
         sys.exit(scaled(a[0], a[1], a[2], a[3], [int(x) for x in a[4:]]))

@@ -13,9 +13,18 @@
 #             HdmiVrrOff.h), vrr_video_test.cpp ("Video at its own rate with VRR": VrrVideo.h, with the rule of 1.1
 #             for which flips are paced, which must fail, and its mutants) and
 #             display_modes_test.cpp (the mode of the menus of each display: DisplayModeMemory.h),
+#             display_lut_test.cpp (the 3D LUT of each display: which outputs take one, a LUT made for another kind
+#             of picture refused, one display's LUT never another's: DisplayLut.h), display_lut_loader_test.cpp (its
+#             files read off the render thread, one at a time, the table of before let go first, a read no longer
+#             asked for never given: DisplayLutLoader.h, with address and undefined, and with thread sanitizers), and
+#             in the source what no host test runs (lut_src_check.py: no file read on the render thread, the bridges
+#             let go first, Kodi's renderer putting the table on the GPU a part a frame with no copy, "loading"),
 #             exact_rate_test.cpp (a mode at the video's rate at another size of the display, without a whitelist
 #             of the user: ExactRateElsewhere.h), video_size_test.cpp ("Adjust display resolution": the mode of the
-#             video's size at the refresh rate Kodi chose, VideoSizeMode.h), picture_timing_test.cpp (HEVC with frame_field_info_present_flag
+#             video's size at the refresh rate Kodi chose, VideoSizeMode.h), content_type_test.cpp (the content
+#             type of the AVI InfoFrame and the Filmmaker Mode it brings: ContentType.h, and its place in the transport
+#             of native Dolby Vision, TransportSpecs.h; with the rule before, Kodi never setting it, which must fail),
+#             picture_timing_test.cpp (HEVC with frame_field_info_present_flag
 #             progressive by the picture timing of its first access units: ProgressiveVideo.cpp, with the FFmpeg
 #             headers of the build folder),
 #             vrr_pacer_bench.cpp (how exact Kodi's own timing of flips is on this host: a measure, its numbers
@@ -34,16 +43,93 @@
 #   linkdepth the depth of the link (LinkDepth.h) and what in the sources writes "max bpc" (src_check.py)
 #   fix       a render that libplacebo failed (dvbridge_render.c on the software GPU, a real profile 7 stream as
 #             input), the reads of the connector (DRMConnector.cpp), what a replacement retires (RetiredKept.h),
-#             the callers of both, the list of the audio outputs (ActiveAESink.cpp)
+#             the callers of both, the list of the audio outputs (ActiveAESink.cpp), and in the source what kodi.log
+#             says of a power action and of where it came from (power_src_check.py: a Standby of CEC with its setting,
+#             the builtins, JSON-RPC, the idle timer, the shutdown function, the action carried out or refused by PVR),
+#             and a drain of the video decoder that keeps the picture the renderer had no room for
+#             (decoderdrain_test.cpp: DecoderDrain.h, and in the source that VideoPlayerVideo drains only through it),
+#             and why an HLG video stays HLG where HLG as Dolby Vision cannot take it (hlgreason_test.cpp:
+#             HlgDolbyVisionIneligibility() against HlgDolbyVisionEligible(), DVPlaybackPolicy.h)
 #   own       the trace of a seek (SeekTrace.h, SeekPending.h, ModeChangeTime.h), the module xbmcaddon through the
 #             build's swig, pwr() of hades-diag's watch-dv.sh with the image's busybox, and the plane of the speakers
 #             of the player information through Kodi's data cache and the audio engine's clear of it (speakers_test.cpp:
-#             HadesPlayerInfo.h with DataCacheCore.cpp and AEChannelInfo.cpp)
+#             HadesPlayerInfo.h with DataCacheCore.cpp and AEChannelInfo.cpp), and the use of an amdgpu GPU from the
+#             time of its graphics engine in the fdinfo of Kodi's DRM files (gpusensors_test.cpp: GPUSensors.h)
 #   ux        the depth of a scrolling label, Kodi's TestActiveAEFollowDisplay with googletest, the Bluetooth logic
-#             of the LibreELEC settings add-on
+#             of the LibreELEC settings add-on, its A/B comparison of native Dolby Vision and its frame packing card
+#             (LibreELEC-settings-9073, 9074, with stand-ins for Kodi), how often the player information is processed
+#             (PlayerInfoRefresh.h; and in the source, info_refresh_src.py: every frame while a control of it animates,
+#             in both dialogs), the keys that open it while a video plays (keymap_check.py: a long press of Menu, and
+#             the short press of each key as before, in Kodi's default keymaps), the sentence of its overview and the
+#             frames that Kodi loses (verdict_test.cpp: CLostFrames of HadesPlayerInfo.h, only sustained loss in
+#             steady playback is said, with its cause; lost_frames_src.py: what the window system samples and when it
+#             starts again; check_verdict_test.py: the sentence as Check this setup says it, LibreELEC-settings-9087,
+#             and the same with 9087 reversed, which must fail), the settings that change the picture
+#             from the film (PictureDefaults.h),
+#             subtitles in the black bars (SubtitleBars.h; its measurement, SubtitleBarsGLES.cpp, on the host's Mesa
+#             llvmpipe through EGL surfaceless, with the GLES headers of the build folder)
 #   overlay   the GL matrix stacks: no function of Kodi pops a level that it did not push (overlay/matrix_balance.py)
+#   chroma    the chroma of the 4:2:0 pictures that Kodi's GLES renderer draws itself: the siting and the
+#             step-down of its filter (chroma_step_test.cpp: ChromaStepDown.h), and Kodi's YUV shaders of the tree
+#             on the software GPU against a model of each way of taking the chroma, in the four layouts of the
+#             renderer, with the basic and the filter shader (chroma_shader_test.c); and the dither of the bridge's
+#             copy into an 8-bit window (copy_dither_test.c: tools/dvbridge/dvbridge_gl_pack.c on the software GPU);
+#             the step-down by missed refreshes where the GPU has no usable timer, the flips of the commits that tell
+#             them (chroma_step_test.cpp: CFlipChain), and in the source the bits of the GPU's timestamps, the choice
+#             of the measure, the pictures told and what kodi.log says (chroma_src_check.py); and GL_GPU_DISJOINT_EXT
+#             read once a frame and told to every reader of GPU times (gpu_disjoint_test.cpp: GpuDisjoint.h), read in
+#             one place of the source with a reader of its own for each (disjoint_src_check.py)
 #   stereo    Blu-ray 3D: the plane offsets (Kodi's TestBlurayOffsetMetadata with googletest; on the access units
-#             of a real MVC stream, an input) and the depth of a subtitle
+#             of a real MVC stream, an input) and the depth of a subtitle; the depth measured from a 3D
+#             video's two pictures (StereoDepth.cpp: pictures of known depth, the planner, five seconds of a film
+#             through SubtitleDepth(), and the rule before, which must fail), and the same through the graphics
+#             (StereoDepthCapture.cpp and StereoDepthMeter.cpp on Mesa's software OpenGL ES 3, EGL without a window:
+#             the host's libEGL.so.1 and libGLESv2.so.2, the build folder's GLES and EGL headers); an HDR video in a
+#             3D output through the graphics (hdr3d_gl_test.cpp: StereoViews.h, WholeBuffer.h and StereoGap.h on the
+#             same OpenGL ES 3, frames of Kodi in frame packing, side by side, top and bottom, 2D of a 3D video and
+#             anaglyph: each eye its own half of the picture under the GUI composited over the whole frame; the rule
+#             before, which must fail; an SDR video in 3D and an HDR video in 2D the same bytes as before; the callers);
+#             and the depth measured from a 3D video in HDR10 and HLG (hdrdepth_gl_test.cpp: the pictures of known depth
+#             in PQ and HLG, at full light and a quarter of it, in a framebuffer of 10 bits, against their SDR copies;
+#             the caller in RenderManager.cpp); a 3D video and the Dolby Vision bridge (stereo3d_test.cpp: Stereo3DVideo.h,
+#             how a 3D video goes out, which 3D pictures the bridge draws and that the default draws none it did not
+#             before, the views cut at the seam and placed in the eye, their timing, SDR in a wide gamut in 3D,
+#             profile 20 in 3D, and the callers; the rules before, which must fail)
+#   capture   the SDR copy of an HDR screenshot and the peak it is mapped from (Kodi's TestCaptureConvert with
+#             googletest: CaptureConvert.cpp with libswscale and libavutil of the FFmpeg of the recipe, built for the
+#             host as the bridge's is, rg_ff_bridge), and when the keys of the TV's remote and the commands of the TV
+#             are taken (TestPeripheralCecKeys and TestPeripheralCecPicture: PeripheralCecKeys.h with the libcec
+#             headers of the build folder's sysroot)
+#   setup     the display and its connection: whether an EDID comes through a sound bar or AV receiver, and its sound
+#             (edidpath_test.cpp: EdidHdmiPath.h, on an LG C5 read both ways, AV receivers and TVs; edid_path_diag_test.sh:
+#             hades-diag's edid-path.awk with the image's busybox); the defaults of the file cache from the RAM and from
+#             the <cache> of advancedsettings.xml (cachedefaults_test.cpp: FileCacheDefaults.h, and the rule of 1.1, which
+#             must fail); after an update, Dolby Vision starting from what the last build found with the same GPU
+#             (dvpathprior_test.cpp: DVPathChoice.h, and the rule of 1.1, which must fail); "Your display" and "Share my
+#             results" of the LibreELEC settings add-on (check_display_test.py, LibreELEC-settings-9085 with stand-ins for
+#             Kodi, and the same with 9085 reversed, which must fail); and LibreELEC-settings-9086 (a setting that the
+#             A/B comparison or the frame packing card could not put back, the second journal of "Your display"): the
+#             tests of 9085, 9073 and 9074 with 9086 reversed, each of which must fail
+#   projector the network control of a home-cinema projector (xbmc/network): what it asks of the projector, the
+#             shape of a picture and the addresses of a home network (projector_policy_test.cpp: ProjectorPolicy.h,
+#             ProjectorFeed.cpp, ProjectorLink.cpp), and the protocols of JVC D-ILA, Sony ADCP and SDCP and Epson
+#             ESC/VP.net against a simulator of each on 127.0.0.1 (projector_link_test.py driving projector_cli.cpp
+#             built with ProjectorLink.cpp), and in its source that its notices are made of translated strings
+#             (projector_src_check.py: ProjectorControl.cpp)
+#   cefix     the fixes taken from CoreELEC's forks (CREDITS.md names them): Kodi's TestAEPackIEC61937,
+#             TestAEStreamParser and TestAEChannelLayout with googletest, built as a release build is (NDEBUG) with
+#             the sanitizers (the IEC 61937 packers, a DTS header without a channel arrangement, the top-back channels
+#             of a decoded layout), TestStereoEyeSize (one eye of a full frame of 3D), the 3D patterns of file names
+#             (cefix/stereo_names.py), the family names of font collections with a face that does not load or has no
+#             name, with FreeType (cefix/font_gen.py, font_test.cpp), and in the source what no host test can run
+#             (cefix/src_check.py: curl, the player's thread, SMB while the system sleeps, a thread's end)
+#   permemory the settings of films and episodes from add-ons kept by their ids, not by their links (FilmMemory.h): Kodi's
+#             TestFilmMemory with googletest and the sanitizers (identities that never mix two films, tracks found by
+#             what they are and never by their number, what each release takes: the delays only from the same release,
+#             the zoom from a picture of the same shape, the picture settings from a video of the same format, a text of
+#             another version), and in the source what no host test runs (permemory/src_check.py: where the player takes
+#             the settings and keeps them, which items keep them by their ids, the table of the video database, the
+#             setting and its strings)
 # usage: run-kodi-host.sh all | verdict [<log>] | <stage>...      (settings: lib/regress.sh)
 # Needs REGRESS_KODI_GIT, REGRESS_LE_BUILD (googletest, swig, libdrm and GLES headers, busybox), REGRESS_SOURCES
 # (libplacebo, FFmpeg, LibreELEC-settings) and REGRESS_INPUTS (inputs-kodi-host.tsv).
@@ -60,7 +146,7 @@ MUT="$RG_PY $H/mutate.py"
 CXX="g++ -std=c++20 -O1 -g -Wall -Wextra"
 SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
 export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} UBSAN_OPTIONS=${UBSAN_OPTIONS:-print_stacktrace=1}
-STAGES="existing policy window modes output linkdepth fix own ux overlay stereo"
+STAGES="existing policy window modes output linkdepth fix own ux overlay stereo capture chroma cefix setup projector permemory"
 SWIG_HADES_LINES=66 # the lines of the generated xbmcaddon module with the text of Hades' typemap
 IN=$RG_W/in
 VP=xbmc/cores/VideoPlayer/DVDCodecs/Video
@@ -75,6 +161,15 @@ drminc() {
   mkdir -p "$d" && ln -sfn "$s/xf86drm.h" "$d/xf86drm.h" && ln -sfn "$s/xf86drmMode.h" "$d/xf86drmMode.h" && ln -sfn "$s/libdrm" "$d/libdrm"
   echo "$d"
 }
+# the GLES 3 and EGL headers of the build folder's sysroot, in a folder of their own (made once)
+glesinc() {
+  local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/glesinc x
+  [ -f "$s/GLES3/gl3.h" ] && [ -f "$s/EGL/egl.h" ] && [ -d "$s/KHR" ] || { echo "no GLES 3 or EGL headers in $s" >&2; return 1; }
+  mkdir -p "$d" && for x in GLES2 GLES3 EGL KHR; do
+    [ "$(readlink "$d/$x")" = "$s/$x" ] || ln -sfn "$s/$x" "$d/$x" || return 1
+  done
+  echo "$d"
+}
 # the headers of FFmpeg of the build folder's sysroot (libavcodec, libavutil), in a folder of their own
 ffinc() {
   local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/ffinc
@@ -85,6 +180,12 @@ ffinc() {
     [ "$(readlink "$d/$x")" = "$s/$x" ] || ln -sfn "$s/$x" "$d/$x" || return 1
   done
   echo "$d"
+}
+# the libcec headers of the build folder's sysroot, in a folder of their own
+cecinc() {
+  local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/cecinc
+  [ -f "$s/libcec/cectypes.h" ] || { echo "no libcec headers in $s" >&2; return 1; }
+  mkdir -p "$d" && { [ "$(readlink "$d/libcec")" = "$s/libcec" ] || ln -sfn "$s/libcec" "$d/libcec"; } && echo "$d"
 }
 # googletest of the build folder (libfmt's copy), built once
 gtest() {
@@ -128,6 +229,12 @@ build() {
       dualmode|dualmode-table) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB -I $K/$GB/drm $S/output/dualmode_test.cpp -o $D/t ;;
       dvframetest|drmwake) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB/drm $S/output/${t}_test.cpp -o $D/t ;;
       dvframetest-old-rule|presentlag-old-rule) $CXX $SAN -DOLD_RULE $S/output/${t%-old-rule}_test.cpp -o $D/t ;;
+      # (Hades: a 3D video and the bridge, Stereo3DVideo.h; -DOLD_RULE the rules before, which must fail)
+      stereo3d|stereo3d-old-rule) ff=$(ffinc) && $CXX $([ $t = stereo3d ] && echo "${WERR:-}" || echo -DOLD_RULE) -Wshadow \
+                         $SAN -DKODI_TREE="\"$K\"" -I $X -isystem $ff $S/stereo/stereo3d_test.cpp -o $D/t ;;
+      sdrcontainer_gl) gles=$(glesinc) && ff=$(ffinc) && $CXX ${WERR:-} -Wshadow $SAN -DKODI_TREE="\"$K\"" -I $X \
+                         -isystem $gles -isystem $ff $S/output/sdrcontainer_gl_test.cpp \
+                         /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
       *_test) $CXX ${WERR:-} -Wshadow $SAN -I $X -I $K/$GB -I $S/output/presfix $S/output/presfix/$t.cpp -o $D/t ;;
       linkdepth) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/linkdepth/linkdepth_test.cpp -o $D/t ;;
       src_check) cp $S/linkdepth/src_check.py $D/t ;;
@@ -138,6 +245,12 @@ build() {
                         -isystem $DRM -isystem $DRM/libdrm $K/$GB/drm/DRMConnector.cpp $K/$GB/drm/DRMObject.cpp \
                         $S/fix/drmconnector_test.cpp -o $D/conn ;;
       retiredkept) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -I $X $S/fix/retiredkept_test.cpp -o $D/t ;;
+      eofpresentation) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -I $X/cores/VideoPlayer $S/fix/eofpresentation_test.cpp -o $D/t ;;
+      hlgreason) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -I $X $S/fix/hlgreason_test.cpp -o $D/t ;;
+      decoderdrain) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -DKODI_TREE="\"$K\"" -I $X/cores/VideoPlayer \
+                      $S/fix/decoderdrain_test.cpp -o $D/t ;;
+      cecline) $CXX ${WERR:-} -Wshadow $SAN -fno-sanitize-recover=all -I $X/peripherals/devices $S/fix/cecline_test.cpp -o $D/t ;;
+      power_src) cp $S/fix/power_src_check.py $D/t ;;
       pieces) $RG_PY $S/fix/pieces_gen.py $K $D/gen && $CXX $SAN -fno-sanitize-recover=all -I $D/gen -I $S/fix/stubs \
                 -I $K/$GB/drm -I $X -isystem $DRM -isystem $DRM/libdrm $K/$GB/drm/DRMConnector.cpp $K/$GB/drm/DRMObject.cpp \
                 $S/fix/pieces_test.cpp -o $D/t ;;
@@ -154,6 +267,7 @@ build() {
                   $X/platform/posix/threads/RecursiveMutex.cpp $X/cores/AudioEngine/Utils/AEChannelInfo.cpp \
                   $S/own/speakers_test.cpp -o $D/t ;;
       swig) cp $S/own/swig_check.py $D/t ;;
+      gpusensors) $CXX ${WERR:-} -Wshadow $SAN -pthread -I $X/windowing/gbm $S/own/gpusensors_test.cpp -o $D/t ;;
       fadelabel) mkdir -p $D/src $D/stub/guilib/guiinfo $D/stub/utils $D/stub/windowing &&
                    cp $X/guilib/GUIFadeLabelControl.cpp $X/guilib/GUIFadeLabelControl.h $S/ux/fadelabel_depth_test.cpp $D/src/ &&
                    cp $S/ux/fadelabel_stubs.h $D/stub/stubs.h &&
@@ -165,20 +279,93 @@ build() {
       offsets) $CXX $SAN -pthread -I $S/stereo/stub -I $X -I $X/cores/VideoPlayer/DVDDemuxers -I $GT \
                  $X/cores/VideoPlayer/DVDDemuxers/test/TestBlurayOffsetMetadata.cpp $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp \
                  $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      # (Kodi's own files and tests as they are: not with -Werror)
+      capture-convert) $CXX $SAN -pthread -I $S/capture/stub -I $X -isystem $FFB/include -I $GT \
+                         $X/rendering/capture/test/TestCaptureConvert.cpp $X/rendering/capture/CaptureConvert.cpp \
+                         $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o $FFB/lib/libswscale.a $FFB/lib/libavutil.a \
+                         -lm -o $D/t ;;
+      cec-keys) $CXX $SAN -pthread -I $X -isystem $CEC -I $GT $X/peripherals/test/TestPeripheralCecKeys.cpp \
+                  $X/peripherals/test/TestPeripheralCecPicture.cpp $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o \
+                  -o $D/t ;;
       aus) $CXX $SAN -I $S/stereo/stub -I $X/cores/VideoPlayer/DVDDemuxers $S/stereo/aus_test.cpp \
              $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp -o $D/t ;;
       depth) $RG_PY $S/stereo/depth_gen.py $K $D/gen && $CXX $SAN -I $S/stereo/stub -I $X/cores/VideoPlayer/DVDDemuxers \
                $D/gen/depth_test.cpp $X/cores/VideoPlayer/DVDDemuxers/BlurayOffsetMetadata.cpp -o $D/t ;;
+      autodepth|autodepth-old-rule)
+        $RG_PY $S/stereo/depth_gen.py $K $D/gen && $CXX $([ $t = autodepth ] && echo "${WERR:-}" || echo -DOLD_RULE) $SAN \
+          -I $D/gen -I $X/cores/VideoPlayer/VideoRenderers $S/stereo/autodepth_test.cpp \
+          $X/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp -o $D/t ;;
+      autodepth_gl) gles=$(glesinc) && $CXX ${WERR:-} $SAN -pthread -DHAS_GLES=3 -I $S/stereo/glstub -I $X \
+                      -I $X/cores/VideoPlayer/VideoRenderers -isystem $gles $S/stereo/autodepth_gl_test.cpp \
+                      $X/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp $X/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp \
+                      $X/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
+                      /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      hdrdepth_gl) gles=$(glesinc) && $CXX ${WERR:-} $SAN -pthread -DHAS_GLES=3 -DKODI_TREE="\"$K\"" \
+                     -I $S/stereo/glstub -I $X -I $X/cores/VideoPlayer/VideoRenderers -isystem $gles \
+                     $S/stereo/hdrdepth_gl_test.cpp $X/cores/VideoPlayer/VideoRenderers/StereoDepth.cpp \
+                     $X/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp \
+                     $X/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
+                     /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      hdr3d_gl|hdr3d_gl-old-rule)
+        gles=$(glesinc) && $CXX $([ $t = hdr3d_gl ] && echo "${WERR:-}" || echo -DOLD_RULE) $SAN -pthread -DHAS_GLES=3 \
+          -DKODI_TREE="\"$K\"" -I $S/stereo/glstub -I $X -isystem $gles $S/stereo/hdr3d_gl_test.cpp \
+          /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
       settings_resize) $CXX -pthread $SAN -I $X $H/settings_resize_test.cpp -o $D/t ;;
       settings_resize-D*) $CXX -pthread $SAN -D${t#settings_resize-D} -I $X $H/settings_resize_test.cpp -o $D/t ;;
       settings_resize-tsan) $CXX -pthread -fsanitize=thread -I $X $H/settings_resize_test.cpp -o $D/t ;;
       vrr) $CXX -Wno-mismatched-new-delete $SAN -pthread -I $X $H/vrr_test.cpp -o $D/t ;;
-      vrr_gui|vrr_video|display_modes|exact_rate|video_size) $CXX ${WERR:-} -Wshadow $SAN -I $X $H/${t}_test.cpp -o $D/t ;;
+      vrr_gui|vrr_video|display_modes|display_lut|exact_rate|video_size|content_type) $CXX ${WERR:-} -Wshadow $SAN -I $X $H/${t}_test.cpp -o $D/t ;;
+      display_lut_loader) $CXX ${WERR:-} -Wshadow $SAN -pthread -I $X $H/display_lut_loader_test.cpp -o $D/t ;;
+      display_lut_loader-tsan) $CXX ${WERR:-} -Wshadow -fsanitize=thread -pthread -I $X $H/display_lut_loader_test.cpp -o $D/t ;;
+      lut_src) cp $H/lut_src_check.py $D/t ;;
+      content_type-old-rule) $CXX $SAN -DOLD_RULE -I $X $H/content_type_test.cpp -o $D/t ;;
+      picture_defaults|subtitle_bars|info_refresh|verdict) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/ux/${t}_test.cpp -o $D/t ;;
+      lost_frames_src) cp $S/ux/lost_frames_src.py $D/t ;;
+      info_refresh_src) cp $S/ux/info_refresh_src.py $D/t ;;
+      keymap_check) cp $S/ux/keymap_check.py $D/t ;;
+      # (Kodi's file with stubs of its system_gl.h and utils/log.h, and the GLES headers of the build folder)
+      subtitle_bars_gl) $CXX ${WERR:-} -Wshadow $SAN -I $S/ux/stub -I "$GLINC" -I $X \
+                          $X/cores/VideoPlayer/VideoRenderers/SubtitleBarsGLES.cpp $S/ux/subtitle_bars_gl_test.cpp -o $D/t \
+                          /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 ;;
       # (Kodi's own file as it is: not with -Werror)
       picture_timing) $CXX $SAN -I $X -isystem "$(ffinc)" $H/picture_timing_test.cpp $X/utils/ProgressiveVideo.cpp -o $D/t ;;
       vrr_video-old-rule) $CXX $SAN -DOLD_RULE -I $X $H/vrr_video_test.cpp -o $D/t ;;
+      # (Kodi's own files and tests as they are, as a release build compiles them: NDEBUG)
+      cefix-ae) A=$X/cores/AudioEngine/Utils
+                $CXX -DNDEBUG $SAN -pthread -DTARGET_POSIX -DTARGET_LINUX -I $S/fix/stubs -I $X -I $X/platform/posix \
+                  -isystem $FF/include -I $GT $A/test/TestAEPackIEC61937.cpp $A/test/TestAEStreamParser.cpp \
+                  $A/test/TestAEChannelLayout.cpp $A/AEPackIEC61937.cpp $A/AEStreamInfo.cpp $A/AEUtil.cpp $A/AEChannelInfo.cpp \
+                  $S/cefix/ae_clock.cpp \
+                  $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o $FF/lib/libavutil.a -lm -o $D/t ;;
+      # (Kodi's own VideoSettings.cpp as it is: not with -Werror; fmt's headers of the build folder, header only)
+      permemory) $CXX $SAN -pthread -DTARGET_POSIX -DTARGET_LINUX -DFMT_HEADER_ONLY -isystem $FMT -I $X -I $X/platform/posix                    -I $GT $X/cores/VideoPlayer/test/TestFilmMemory.cpp $X/cores/VideoPlayer/FilmMemory.cpp                    $X/cores/VideoSettings.cpp $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      permemory-src) cp $S/permemory/src_check.py $D/t ;;
+      stereo-eye) $CXX $SAN -pthread -I $X -I $GT $X/cores/VideoPlayer/test/TestStereoEyeSize.cpp \
+                    $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      stereo-names) cp $S/cefix/stereo_names.py $D/t ;;
+      font) $RG_PY $S/cefix/font_gen.py $K $D/gen && $CXX $SAN -I $S/cefix -isystem $FTINC $D/gen/font_pieces.cpp \
+              $S/cefix/font_test.cpp $FTLIB -o $D/t ;;
+      cefix-src) cp $S/cefix/src_check.py $D/t ;;
+      edidpath) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/setup/edidpath_test.cpp -o $D/t ;;
+      cachedefaults|cachedefaults-old-rule)
+        $CXX $([ $t = cachedefaults ] && echo "${WERR:-}" || echo -DOLD_RULE) -Wshadow $SAN -I $X \
+          $S/setup/cachedefaults_test.cpp -o $D/t ;;
+      dvpathprior|dvpathprior-old-rule)
+        $CXX $([ $t = dvpathprior ] && echo "${WERR:-}" || echo -DOLD_RULE) -Wshadow $SAN -I $K/$GB \
+          $S/setup/dvpathprior_test.cpp -o $D/t ;;
       # (a measure of time: no sanitizer, optimised as the image is)
       vrr_pacer) $CXX ${WERR:-} -O2 -I $X $H/vrr_pacer_bench.cpp -o $D/t ;;
+      chroma_step) $CXX ${WERR:-} -Wshadow $SAN -I $X/cores/VideoPlayer/VideoRenderers $S/chroma/chroma_step_test.cpp -o $D/t ;;
+      chroma_src) cp $S/chroma/chroma_src_check.py $D/t ;;
+      gpu_disjoint) $CXX ${WERR:-} -Wshadow $SAN -I $K/$GB $S/chroma/gpu_disjoint_test.cpp -o $D/t ;;
+      disjoint_src) cp $S/chroma/disjoint_src_check.py $D/t ;;
+      chroma_shader) gcc -std=gnu11 -O1 -g -Wall -Wextra ${WERR:-} -I "$GLINC" $S/chroma/chroma_shader_test.c -o $D/t                        /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -lm ;;
+      copy_dither) gcc -std=gnu11 -O1 -g -Wall -Wextra ${WERR:-} -I "$GLINC" -I $K/tools/dvbridge $S/chroma/copy_dither_test.c                      $K/tools/dvbridge/dvbridge_gl_pack.c -o $D/t                      /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -lm ;;
+      projector_policy) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/projector/projector_policy_test.cpp \
+                          $X/network/ProjectorFeed.cpp $X/network/ProjectorLink.cpp -o $D/t ;;
+      projector_link) $CXX ${WERR:-} -Wshadow $SAN -I $X/network $S/projector/projector_cli.cpp \
+                        $X/network/ProjectorLink.cpp -o $D/cli && cp $S/projector/projector_link_test.py $D/t ;;
+      projector_src) cp $S/projector/projector_src_check.py $D/t ;;
       *) echo "no test $t"; false ;;
     esac
   } > "$D/build.log" 2>&1 < /dev/null
@@ -224,6 +411,19 @@ run() {
     settings_resize-tsan) TSAN_OPTIONS=halt_on_error=1 timeout 180 $D/t ;;
     settings_resize*) timeout 120 $D/t ;;
     vrr_pacer) timeout 60 $D/t 10 ;;
+    chroma_shader) env $RG_GPU_ENV timeout 600 $D/t $K ;;
+    copy_dither) env $RG_GPU_ENV timeout 600 $D/t ;;
+    stereo-names|cefix-src|permemory-src) $RG_PY $D/t $K ;;
+    edidpath) $D/t $IN/edid/lg-c5-direct.bin $IN/edid/lg-c5-sound-bar.bin $IN/edid/receiver-denon.bin \
+                $IN/edid/receiver-onkyo.bin $IN/edid/receiver-pioneer.bin -- $IN/edid/tv-lg-1.bin $IN/edid/tv-lg-2.bin \
+                $IN/edid/tv-lg-3.bin ;;
+    cachedefaults*) $D/t $K ;;
+    projector_link) timeout 600 $RG_PY $D/t $D/cli ;;
+    projector_src) $RG_PY $D/t $K ;;
+    lut_src|info_refresh_src|keymap_check|lost_frames_src) $RG_PY $D/t $K ;;
+    display_lut_loader-tsan) TSAN_OPTIONS=halt_on_error=1 timeout 120 $D/t ;;
+    chroma_src|disjoint_src|power_src) $RG_PY $D/t $K ;;
+    font) $D/t $K/addons/skin.estuary/fonts/NotoSans-Regular.ttf $K/addons/skin.estuary/fonts/NotoMono-Regular.ttf ;;
     *) $D/t ;;
   esac
 }
@@ -252,26 +452,49 @@ pass_re() {
     aesink-race) echo '^race \(address\): 0 ThreadSanitizer reports, 0 AddressSanitizer errors' ;;
     seek) echo '^PASSED: [0-9]+ passed, 0 failed' ;;
     speakers) echo '^SPEAKERS-TEST PASSED$' ;;
+    edidpath) echo '^EDIDPATH-TEST PASSED$' ;;
+    cachedefaults*) echo '^CACHEDEFAULTS-TEST PASSED$' ;;
+    dvpathprior*) echo '^DVPATHPRIOR-TEST PASSED$' ;;
     swig) echo "^lines with Hades text: $SWIG_HADES_LINES\$" ;;
     fadelabel) echo '^PASSED: 0 of [0-9]+ passes' ;;
-    audio-follow|offsets) echo '^\[  PASSED  \] [0-9]+ tests' ;;
-    aus|depth) echo '^0 failed$' ;;
+    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory) echo '^\[  PASSED  \] [0-9]+ tests' ;;
+    stereo-names) echo '^STEREO-NAMES PASSED$' ;;
+    font) echo '^FONT-TEST PASSED$' ;;
+    cefix-src) echo '^CEFIX-SRC PASSED$' ;;
+    permemory-src) echo '^PERMEMORY-SRC PASSED$' ;;
+    aus|depth|autodepth*|hdr3d_gl*|hdrdepth_gl|sdrcontainer_gl|stereo3d*) echo '^0 failed$' ;;
     settings_resize*) echo '^[0-9]+ checks, 0 failed' ;;
-    vrr|vrr_gui|vrr_video|display_modes|exact_rate|video_size|picture_timing) echo '^PASSED$' ;;
+    vrr|vrr_gui|vrr_video|display_modes|display_lut|exact_rate|video_size|picture_timing|content_type) echo '^PASSED$' ;;
+    display_lut_loader|display_lut_loader-tsan) echo '^PASSED$' ;;
+    lut_src) echo '^LUT-SRC PASSED$' ;;
+    info_refresh_src) echo '^INFO-REFRESH-SRC PASSED$' ;;
+    keymap_check) echo '^KEYMAP-CHECK PASSED$' ;;
+    lost_frames_src) echo '^LOST-FRAMES-SRC PASSED$' ;;
+    power_src) echo '^POWER-SRC PASSED$' ;;
+    picture_defaults|subtitle_bars|subtitle_bars_gl|info_refresh|verdict) echo '^PASSED$' ;;
     vrr_pacer) echo '^interval against the one asked for: ' ;;
+    chroma_step) echo '^CHROMA-STEP PASSED$' ;;
+    chroma_src) echo '^CHROMA-SRC PASSED$' ;;
+    gpu_disjoint) echo '^GPU-DISJOINT PASSED$' ;;
+    disjoint_src) echo '^DISJOINT-SRC PASSED$' ;;
+    chroma_shader) echo '^CHROMA-SHADER PASSED$' ;;
+    copy_dither) echo '^COPY-DITHER PASSED$' ;;
+    projector_policy) echo '^PROJECTOR-POLICY PASSED$' ;;
+    projector_link) echo '^PROJECTOR-LINK PASSED$' ;;
+    projector_src) echo '^PROJECTOR-SRC PASSED$' ;;
     *) echo '^ALL PASSED' ;;
   esac
 }
 fail_re() {
   case $1 in
-    audio-follow|offsets) echo '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' ;;
+    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory) echo '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' ;;
     widths) echo 'OVER' ;;
     reachable*) echo '^WRONG' ;;
     *) echo '^FAIL' ;;
   esac
 }
 # the tests that run with the GPU or a minute's wait, one at a time
-heavy() { case $1 in eos|render_refused|drmconnector-bounded|pieces|aesink-race|reslist-*) return 0 ;; *) return 1 ;; esac; }
+heavy() { case $1 in eos|render_refused|chroma_shader|drmconnector-bounded|pieces|aesink-race|reslist-*) return 0 ;; *) return 1 ;; esac; }
 
 # check <test>...: each test against the tree as it is: built (WERR=-Werror where its flags take it), run, judged
 check() {
@@ -349,13 +572,17 @@ KT=$(kodi) || exit 1
 echo "Kodi tree: $KT ($(rg_kodi_commit 2> /dev/null | cut -c1-12))"
 
 stage_existing() {
-  check settings_resize vrr settings_resize-tsan vrr_gui vrr_video vrr_pacer display_modes exact_rate video_size     picture_timing
+  check settings_resize vrr settings_resize-tsan vrr_gui vrr_video vrr_pacer display_modes display_lut exact_rate video_size     picture_timing \
+    content_type display_lut_loader display_lut_loader-tsan lut_src
   must_fail settings_resize-DOLD_RULE 11
   must_fail settings_resize-DIS_PLAYING_RULE 3
   must_fail settings_resize-DNO_SIGNAL 11
   must_fail settings_resize-DNO_VIDEO_PLAYS 1
   must_fail vrr_video-old-rule 4
-  mutants settings_resize vrr vrr_gui vrr_video display_modes exact_rate video_size picture_timing
+  # (the rule before: Kodi never set the content type; 9 checks and the verdict line)
+  must_fail content_type-old-rule 10
+  mutants settings_resize vrr vrr_gui vrr_video display_modes display_lut exact_rate video_size picture_timing content_type \
+    display_lut_loader lut_src
   mutants_clean
 }
 stage_policy() {
@@ -395,12 +622,14 @@ for line in open(sys.argv[1], encoding="utf-8"):
   done
   check dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
     finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
-    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test
+    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test sdrsignal_test dvform_test \
+    sdrcontainer_gl convstep_test
   must_fail dvframetest-old-rule 4
   must_fail presentlag-old-rule 5
   mutants dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
     finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
-    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test
+    dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test sdrsignal_test dvform_test \
+    sdrcontainer_gl convstep_test
   mutants_clean
 }
 stage_linkdepth() {
@@ -415,16 +644,16 @@ stage_fix() {
   # ("bounded" waits a minute: it runs beside the others)
   check drmconnector-bounded &
   check render_refused drmconnector-connected drmconnector-never drmconnector-kept drmconnector-failed retiredkept \
-    pieces aesink-same aesink-race
+    pieces aesink-same aesink-race eofpresentation decoderdrain hlgreason cecline power_src
   wait
   mutants render_refused drmconnector-never drmconnector-kept drmconnector-failed drmconnector-bounded retiredkept \
-    pieces aesink-same aesink-race
+    pieces aesink-same aesink-race eofpresentation decoderdrain hlgreason cecline power_src
   mutants_clean
 }
 stage_own() {
   local bb L
-  check seek swig speakers
-  mutants seek swig speakers
+  check seek swig speakers gpusensors
+  mutants seek swig speakers gpusensors
   mutants_clean
   # pwr() of watch-dv.sh (hades-diag, the LibreELEC tree of REGRESS_LE_REF) with the image's busybox; its six
   # mutations are made by the test itself, on the function it takes out of the script
@@ -444,8 +673,11 @@ stage_own() {
 }
 stage_ux() {
   GT=$(gtest) || rg_fail "googletest of the build folder"
-  check fadelabel audio-follow
-  mutants fadelabel audio-follow
+  GLINC=$(rg_glinc) || rg_fail "no GLES headers in the build folder"
+  check fadelabel audio-follow picture_defaults subtitle_bars subtitle_bars_gl info_refresh info_refresh_src keymap_check \
+    verdict lost_frames_src
+  mutants fadelabel audio-follow picture_defaults subtitle_bars subtitle_bars_gl info_refresh info_refresh_src keymap_check \
+    verdict lost_frames_src
   mutants_clean
   # the Bluetooth logic of the LibreELEC settings add-on: bluetooth.py of its recipe (archive checked against
   # PKG_SHA256, every patch with -F0), and the same with the part of LibreELEC-settings-9019 that changes it reversed
@@ -479,6 +711,68 @@ PY
     [ "$(rg_exit $L)" != 0 ] && rg_item bt-addon.without-9019 PASSED "it fails without 9019: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
       rg_item bt-addon.without-9019 FAILED "it passes without 9019"
   else rg_item bt-addon.without-9019 FAILED "the part of 9019 that changes bluetooth.py does not reverse"; fi
+  # the patches of the add-on numbered after $1, the last first
+  settings_after() {
+    local p n
+    for p in $(ls $S/le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
+      n=$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')
+      [ "$n" -gt "$1" ] && echo "$p"
+    done
+  }
+  # Hades: the A/B comparison of native Dolby Vision of Check this setup (hades_check.py and hades_check_ui.py of
+  # LibreELEC-settings-9073, with stand-ins for Kodi), and the same with 9073 reversed, which must fail
+  L=$RG_W/logs/check-ab.log
+  rg_log "$L" $RG_PY $H/ux/check_ab_test.py $S/src/resources/lib
+  rg_item check-ab "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  rg_fresh $S/without-9073 && cp -a $S/src/. $S/without-9073/
+  L=$RG_W/logs/check-ab.without-9073.log
+  # (every patch of the add-on numbered after 9073 reversed first, the last first: they change the same files)
+  local later
+  for later in $(settings_after 9073); do
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9073 < "$later" || rg_item check-ab.without-9073 FAILED "$(basename $later) does not reverse"
+  done
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9073 < "$(ls $S/le/$P/patches/LibreELEC-settings-9073-*.patch)"; then
+    rg_log "$L" $RG_PY $H/ux/check_ab_test.py $S/without-9073/resources/lib
+    [ "$(rg_exit $L)" != 0 ] && rg_item check-ab.without-9073 PASSED "it fails without 9073: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item check-ab.without-9073 FAILED "it passes without 9073"
+  else rg_item check-ab.without-9073 FAILED "9073 does not reverse"; fi
+  rg_rm $S/without-9073
+  # Hades: the frame packing card of Check this setup (hades_check.py and hades_check_ui.py of
+  # LibreELEC-settings-9074, with stand-ins for Kodi), and the same with 9074 reversed, which must fail
+  L=$RG_W/logs/check-fp.log
+  rg_log "$L" $RG_PY $H/ux/check_fp_test.py $S/src/resources/lib
+  rg_item check-fp "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  rg_fresh $S/without-9074 && cp -a $S/src/. $S/without-9074/
+  L=$RG_W/logs/check-fp.without-9074.log
+  # (every patch of the add-on numbered after 9074 reversed first, the last first: they change the same files)
+  for later in $(settings_after 9074); do
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9074 < "$later" || rg_item check-fp.without-9074 FAILED "$(basename $later) does not reverse"
+  done
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9074 < "$(ls $S/le/$P/patches/LibreELEC-settings-9074-*.patch)"; then
+    rg_log "$L" $RG_PY $H/ux/check_fp_test.py $S/without-9074/resources/lib
+    [ "$(rg_exit $L)" != 0 ] && rg_item check-fp.without-9074 PASSED "it fails without 9074: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item check-fp.without-9074 FAILED "it passes without 9074"
+  else rg_item check-fp.without-9074 FAILED "9074 does not reverse"; fi
+  rg_rm $S/without-9074
+  # Hades: the sentence of the player information as Check this setup says it, with the frames that Kodi lost in
+  # steady playback (hades_check.py of LibreELEC-settings-9087 and Estuary's Variables.xml of the Kodi tree, with
+  # stand-ins for Kodi), and the same with 9087 reversed, which must fail
+  local K
+  K=$(kodi)
+  L=$RG_W/logs/check-verdict.log
+  rg_log "$L" $RG_PY $H/ux/check_verdict_test.py $S/src/resources/lib "$K"
+  rg_item check-verdict "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  rg_fresh $S/without-9087 && cp -a $S/src/. $S/without-9087/
+  L=$RG_W/logs/check-verdict.without-9087.log
+  for later in $(settings_after 9087); do
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9087 < "$later" || rg_item check-verdict.without-9087 FAILED "$(basename $later) does not reverse"
+  done
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9087 < "$(ls $S/le/$P/patches/LibreELEC-settings-9087-*.patch)"; then
+    rg_log "$L" $RG_PY $H/ux/check_verdict_test.py $S/without-9087/resources/lib "$K"
+    [ "$(rg_exit $L)" != 0 ] && rg_item check-verdict.without-9087 PASSED "it fails without 9087: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item check-verdict.without-9087 FAILED "it passes without 9087"
+  else rg_item check-verdict.without-9087 FAILED "9087 does not reverse"; fi
+  rg_rm $S/without-9087
 }
 # the GL matrix stacks (CMatrixGLStack): every C++ source of the tree, no function pops a level that it did not push
 # (a Pop() on a level pushed by a caller restores the caller's matrix in the middle of its drawing); and a copy of the
@@ -506,8 +800,126 @@ stage_overlay() {
 stage_stereo() {
   inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
   GT=$(gtest) || rg_fail "googletest of the build folder"
-  check offsets aus depth
-  mutants offsets aus depth
+  check offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d
+  must_fail autodepth-old-rule 3
+  must_fail hdr3d_gl-old-rule 19
+  must_fail stereo3d-old-rule 5
+  mutants offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d
+  mutants_clean
+}
+stage_chroma() {
+  GLINC=$(rg_glinc) || rg_fail "no GLES headers in the build folder"
+  check chroma_step chroma_src chroma_shader copy_dither gpu_disjoint disjoint_src
+  mutants chroma_step chroma_src chroma_shader copy_dither gpu_disjoint disjoint_src
+  mutants_clean
+}
+
+stage_capture() {
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  FFB=$(rg_ff_bridge) || rg_fail "the FFmpeg of the bridge"
+  CEC=$(cecinc) || rg_fail "the libcec headers of the build folder"
+  check capture-convert cec-keys
+  mutants capture-convert cec-keys
+  mutants_clean
+}
+
+stage_cefix() {
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  FF=$(rg_ff_bridge) || rg_fail "FFmpeg not built"
+  # FreeType: the headers of its source in the build folder, the library of the host
+  FTINC=$(ls -d "$REGRESS_LE_BUILD"/build/freetype-*/include 2> /dev/null | sort | tail -n 1)
+  FTLIB=$(ls /usr/lib/x86_64-linux-gnu/libfreetype.so.6 2> /dev/null | head -n 1)
+  local t="cefix-ae stereo-eye stereo-names font cefix-src"
+  if [ -z "$FTINC" ] || [ -z "$FTLIB" ]; then
+    rg_item font FAILED "no FreeType: headers '${FTINC:-none}', library '${FTLIB:-none}'"; t=${t/ font/}
+  fi
+  # shellcheck disable=SC2086
+  check $t
+  # shellcheck disable=SC2086
+  mutants $t
+  mutants_clean
+}
+
+stage_setup() {
+  local P=packages/mediacenter/LibreELEC-settings ver sha tb S=$RG_W/setup L p bb
+  inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
+  check edidpath cachedefaults dvpathprior
+  must_fail cachedefaults-old-rule 24
+  must_fail dvpathprior-old-rule 3
+  mutants edidpath cachedefaults dvpathprior
+  mutants_clean
+  # hades-diag's edid-path.awk with the image's busybox, on the tree of REGRESS_LE_REF
+  bb=$(ls "$REGRESS_LE_BUILD"/install_pkg/busybox-*/usr/bin/busybox 2> /dev/null | head -n 1)
+  rg_le_tree $RG_W/le packages/sysutils/hades-diag
+  L=$RG_W/logs/edid-path-diag.log
+  if [ -z "$bb" ]; then rg_item edid-path-diag FAILED "no busybox in $REGRESS_LE_BUILD/install_pkg"
+  else
+    rg_log "$L" bash $H/setup/edid_path_diag_test.sh "$bb" $RG_W/le/packages/sysutils/hades-diag $IN/edid/lg-c5-direct.bin \
+      $IN/edid/lg-c5-sound-bar.bin $IN/edid/receiver-onkyo.bin $IN/edid/tv-lg-1.bin
+    rg_item edid-path-diag "$(rg_say "$(rg_pass "$L" '^EDID-PATH-DIAG PASSED$' '^FAIL')")" \
+      "$(rg_rest "$(rg_pass "$L" '^EDID-PATH-DIAG PASSED$' '^FAIL')")"
+  fi
+  # "Your display" and "Share my results" (LibreELEC-settings-9085) on the add-on of the recipe with every patch, and
+  # the same with 9085 reversed, which must fail
+  ver=$(rg_pkgvar $P PKG_VERSION); sha=$(rg_pkgvar $P PKG_SHA256)
+  tb=$(rg_source LibreELEC-settings "LibreELEC-settings-$ver.tar.gz")
+  rg_fresh $S/src $S/without-9085
+  rg_le_tree $S/le $P/patches
+  if [ -z "$tb" ] || [ "$(sha256sum < "$tb" | cut -c1-64)" != "$sha" ]; then
+    rg_item check-display FAILED "no LibreELEC-settings-$ver.tar.gz with PKG_SHA256 in REGRESS_SOURCES"; return 0
+  fi
+  tar -xzf "$tb" --strip-components=1 -C $S/src
+  for p in $(ls $S/le/$P/patches/*.patch | sort); do
+    patch -d $S/src -p1 -F0 -s --no-backup-if-mismatch < "$p" || { rg_item check-display FAILED "patch $(basename $p) does not apply"; return 0; }
+  done
+  L=$RG_W/logs/check-display.log
+  rg_log "$L" $RG_PY $H/setup/check_display_test.py $S/src/resources/lib $IN/edid/lg-c5-direct.bin $IN/edid/lg-c5-sound-bar.bin
+  rg_item check-display "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  cp -a $S/src/. $S/without-9085/
+  L=$RG_W/logs/check-display.without-9085.log
+  # (every patch of the add-on numbered after 9085 reversed first, the last first: they change the same files)
+  for p in $(ls $S/le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
+    [ "$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')" -gt 9085 ] || continue
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9085 < "$p" ||
+      rg_item check-display.without-9085 FAILED "$(basename $p) does not reverse"
+  done
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9085 < "$(ls $S/le/$P/patches/LibreELEC-settings-9085-*.patch)"; then
+    rg_log "$L" $RG_PY $H/setup/check_display_test.py $S/without-9085/resources/lib $IN/edid/lg-c5-direct.bin \
+      $IN/edid/lg-c5-sound-bar.bin
+    [ "$(rg_exit $L)" != 0 ] && rg_item check-display.without-9085 PASSED "it fails without 9085: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item check-display.without-9085 FAILED "it passes without 9085"
+  else rg_item check-display.without-9085 FAILED "9085 does not reverse"; fi
+  rg_rm $S/without-9085
+  # LibreELEC-settings-9086 (a setting that the A/B comparison or the frame packing card could not put back, said as
+  # one of the check; the second journal of "Your display" that cannot be written): the three tests with it reversed,
+  # each of which must fail
+  local t fails= failed=
+  rg_fresh $S/without-9086 && cp -a $S/src/. $S/without-9086/
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9086 < "$(ls $S/le/$P/patches/LibreELEC-settings-9086-*.patch)"; then
+    for t in setup/check_display_test.py ux/check_ab_test.py ux/check_fp_test.py; do
+      L=$RG_W/logs/$(basename $t .py).without-9086.log
+      rg_log "$L" $RG_PY $H/$t $S/without-9086/resources/lib $IN/edid/lg-c5-direct.bin $IN/edid/lg-c5-sound-bar.bin
+      [ "$(rg_exit $L)" != 0 ] && failed="$failed $(basename $t .py)" || fails="$fails $(basename $t .py)"
+    done
+    [ -z "$fails" ] && rg_item settings-9086.without PASSED "each fails without 9086:$failed" ||
+      rg_item settings-9086.without FAILED "passes without 9086:$fails"
+  else rg_item settings-9086.without FAILED "9086 does not reverse"; fi
+  rg_rm $S/without-9086
+}
+
+# the network control of a projector (xbmc/network/Projector*): its policy, and its protocols against simulators
+stage_projector() {
+  check projector_policy projector_link projector_src
+  mutants projector_policy projector_link projector_src
+  mutants_clean
+}
+
+stage_permemory() {
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  FMT=$(ls -d "$REGRESS_LE_BUILD"/build/libfmt-*/include 2> /dev/null | sort | tail -n 1)
+  [ -f "$FMT/fmt/format.h" ] || rg_fail "no fmt headers in $REGRESS_LE_BUILD"
+  check permemory permemory-src
+  mutants permemory permemory-src
   mutants_clean
 }
 

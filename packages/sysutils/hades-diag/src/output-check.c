@@ -3,7 +3,7 @@
 /*
  * hades-output-check: whether the graphics card passes the bytes of the Dolby Vision transport through its
  * display pipe unchanged, measured with the card's own CRC of its output (output-check.h says how). Run only on
- * request (System > Submit Log, "Check the Dolby Vision output"), by hades-output-check.service before Kodi starts:
+ * request (System > Check this setup, "Check the Dolby Vision output"), by hades-output-check.service before Kodi starts:
  * it needs the display for itself for about ten seconds. It sets the Dolby Vision tunnel
  * (DVBRIDGE_DV_STANDARD_LAB) on the HDMI output that has it, in a mode that the driver accepts for it, shows
  * test pictures of random bytes, reads the CRC that the driver computes of each frame (debugfs

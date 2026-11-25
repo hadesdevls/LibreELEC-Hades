@@ -864,7 +864,9 @@ static void Convert(struct gl* g, const struct pl_frame* source, const struct la
                 continue;
               }
               const double want = ((double)v[c] * 876 + 64) / 1023 * levels;
-              wrong += fabs((double)code - want) > 0.5005;
+              // (Hades: into 8 bits the copy dithers, dvbridge_gl_pack.c: the level below the value or
+              // the one above it; the nearest at 10 bits)
+              wrong += fabs((double)code - want) > (g->windowBits == 8 ? 0.9995 : 0.5005);
             }
           }
       }

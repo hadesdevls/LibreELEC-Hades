@@ -1,0 +1,1182 @@
+From 14d1a650768ad19a862997f8fad5071fc663feb7 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:51:33 +0000
+Subject: [PATCH] [Hades][VideoPlayer] The chroma of 4:2:0 video where it is,
+ with Lanczos 3, a level down where the GPU does not keep up
+
+Kodi's YUV shaders of GLES read the chroma planes of a 4:2:0 picture with the
+texture's bilinear filter at the place of each output pixel, and take every
+video's chroma samples as centred between two luma samples. Most video has
+them elsewhere: MPEG-2, H.264 and HEVC on the left, co-sited with the first
+luma sample of each pair, and UHD Blu-ray top-left. So every SDR, HDR10 and
+HLG video that Kodi draws itself (software decoding, VAAPI with its planes
+imported one by one, NVIDIA through nvidia-vaapi-driver) had its colour a
+quarter of a chroma sample off, and bilinear between samples. The bridge
+already draws its pictures with Lanczos 3 where the video says.
+
+Measured with these very shaders on the software GPU, against 4:4:4
+references made from 4K and 1080p masters (the luma reduced to where the
+chroma samples are), Delta E ITP (BT.2124):
+- the samples where the video places them, with the same bilinear filter (as
+  cheap as before): -6 % on average for animation, -21 % for film in PQ,
+  -19 % in SDR;
+- Lanczos 3 over 6 x 6 samples: -13 %, -26 %, -24 %; its 99th percentile
+  -18 %, -26 %, -26 %;
+- Spline16 over 4 x 4: -12 %, -25 %, -23 %, with less than half the samples.
+libplacebo measures the same filters within 2 %.
+
+gles_yuv2rgb_chroma.frag takes the chroma at the video's siting
+(m_chromaShift, from VideoPicture::chroma_position; an unspecified one as
+left, as libplacebo takes it), read at the centres of the texels it weighs,
+with the chroma textures read GL_NEAREST for the filters of more than one
+sample (a bilinear filter of fixed-point weights may weigh a neighbour in
+where a centre falls a hair short of it) and the samplers highp (a lowp
+sample may be a 16-bit float, as on Mesa's llvmpipe). It is inserted
+before main() of the basic shader and of the filter shader of GLES 3.1, for
+the 4:2:0 formats only (NV12, NV12_RRG, and the planar formats of 4:2:0: the
+same shader formats carry 4:2:2 and 4:4:4, which keep Kodi's way, as do the
+packed formats and the bob shader of interlaced fields). Without its defines
+the shaders draw the same bytes as before.
+
+Each video starts at Lanczos 3. Its pictures are timed on the GPU
+(GL_EXT_disjoint_timer_query) and the filter goes a level down, to Spline16
+and then to bilinear at the video's siting, where they do not keep up: two
+windows of 48 pictures in a row in which 5 % of them, 3 at least, take more
+than 80 % of a refresh, or one whose pictures take more than the refresh on
+average (the marks of the step-down of native Dolby Vision for frames that
+wait). The first 48 pictures after a start or a change are left out; a level
+is not taken back up within a video. kodi.log says how each video's chroma is
+drawn, what its pictures took, and each step. A shader that a GPU's compiler
+does not take leaves the video at bilinear at its siting, never without a
+picture. The scaling method Nearest keeps the sample nearest to each pixel,
+now where the video places it. advancedsettings.xml can force a level for every video, to compare
+them or to measure what each costs: <video><chromastep>N</chromastep>, 0
+Lanczos 3, 1 Spline16, 2 bilinear at the video's siting, 3 Kodi's own way.
+---
+ .../shaders/GLES/2.0/gles_yuv2rgb_basic.frag  |  16 +-
+ .../shaders/GLES/2.0/gles_yuv2rgb_chroma.frag | 125 ++++++++
+ .../GLES/3.1/gles310_yuv2rgb_filter.frag      |  16 +-
+ .../VideoRenderers/ChromaStepDown.h           | 252 +++++++++++++++
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 287 +++++++++++++++++-
+ .../VideoRenderers/LinuxRendererGLES.h        |  34 +++
+ .../VideoShaders/YUV2RGBShaderGLES.cpp        |  42 ++-
+ .../VideoShaders/YUV2RGBShaderGLES.h          |  29 +-
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   6 +
+ 10 files changed, 799 insertions(+), 10 deletions(-)
+ create mode 100644 system/shaders/GLES/2.0/gles_yuv2rgb_chroma.frag
+ create mode 100644 xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
+
+diff --git a/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag b/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
+index a34a6af..040a729 100644
+--- a/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
++++ b/system/shaders/GLES/2.0/gles_yuv2rgb_basic.frag
+@@ -21,6 +21,11 @@
+ #version 100
+ 
+ precision mediump float;
++#if defined(KODI_CHROMA) && defined(GL_FRAGMENT_PRECISION_HIGH)
++// Hades: the samples that the chroma filter weighs, at full precision (a lowp or mediump sample may be
++// a 16-bit float, and the filter adds up to 36 of them, some with negative weights)
++precision highp sampler2D;
++#endif
+ 
+ uniform sampler2D m_sampY;
+ uniform sampler2D m_sampU;
+@@ -41,13 +46,22 @@ uniform float m_toneP1;
+ uniform float m_luminance;
+ uniform vec3 m_coefsDst;
+ uniform float m_alpha;
++#if defined(KODI_CHROMA)
++// Hades: the chroma of the 4:2:0 formats where the video places it, and resampled (gles_yuv2rgb_chroma.frag)
++#define KODI_CHROMA_TEXTURE texture2D
++#endif
+ 
+ void main()
+ {
+   vec4 rgb;
+   vec4 yuv;
+ 
+-#if defined(XBMC_YV12) || defined(XBMC_NV12)
++#if defined(KODI_CHROMA)
++
++  // (BaseYUV2RGBGLSLShader defines it for the 4:2:0 formats only: YV12, NV12, YV12_HI, NV12_RRG)
++  yuv = vec4(texture2D(m_sampY, m_cordY).r, KodiChroma(m_cordU), 1.0);
++
++#elif defined(XBMC_YV12) || defined(XBMC_NV12)
+ 
+   yuv = vec4(texture2D(m_sampY, m_cordY).r,
+              texture2D(m_sampU, m_cordU).g,
+diff --git a/system/shaders/GLES/2.0/gles_yuv2rgb_chroma.frag b/system/shaders/GLES/2.0/gles_yuv2rgb_chroma.frag
+new file mode 100644
+index 0000000..ef62de0
+--- /dev/null
++++ b/system/shaders/GLES/2.0/gles_yuv2rgb_chroma.frag
+@@ -0,0 +1,125 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++// Hades: the chroma of a 4:2:0 picture, taken where the video says its samples are and, with a filter,
++// resampled with it (BaseYUV2RGBGLSLShader, KODI_CHROMA_*). Inserted before main() of the YUV shaders
++// of the 4:2:0 formats; KODI_CHROMA_TEXTURE is their texture function (texture2D or texture).
++//
++// The texture coordinates of the chroma planes are those of the luma halved: they take chroma texel i
++// to be centred between luma samples 2i and 2i + 1. A video whose chroma samples are co-sited with
++// luma sample 2i (left, top-left, top) has them half a luma sample, a quarter of a chroma texel,
++// before that: m_chromaShift is that quarter (0.25) on each axis where the samples are co-sited, 0
++// where they are centred, -0.25 at the bottom. The sample index of a texture coordinate is then
++// coord * size - 0.5 + m_chromaShift. Kodi's own sampling took every video as centred: a quarter of
++// a chroma sample off on the left for MPEG-2, H.264 and HEVC video, and up as well on UHD Blu-ray.
++
++#ifdef GL_FRAGMENT_PRECISION_HIGH
++#define KODI_CHROMA_P highp
++#else
++#define KODI_CHROMA_P mediump
++#endif
++
++uniform KODI_CHROMA_P vec4 m_chromaSize;  // the size of the chroma textures in texels, and its inverse
++uniform KODI_CHROMA_P vec2 m_chromaShift; // where the samples are from the centres of their texels
++
++// both chroma samples at a texture coordinate. NV12_RRG (VAAPI, DRM PRIME) and NV12 (an NV12 software
++// frame) bind their one chroma texture to both samplers (RendererVAAPIGLES.cpp, RendererDRMPRIMEGLES.cpp,
++// CreateNV12Texture()): one fetch takes both.
++#if defined(XBMC_NV12_RRG)
++#define KODI_CHROMA_FETCH(p) KODI_CHROMA_TEXTURE(m_sampU, p).rg
++#elif defined(XBMC_NV12)
++#define KODI_CHROMA_FETCH(p) KODI_CHROMA_TEXTURE(m_sampU, p).ga
++#elif defined(XBMC_YV12)
++#define KODI_CHROMA_FETCH(p) vec2(KODI_CHROMA_TEXTURE(m_sampU, p).g, KODI_CHROMA_TEXTURE(m_sampV, p).a)
++#else
++#define KODI_CHROMA_FETCH(p) vec2(KODI_CHROMA_TEXTURE(m_sampU, p).r, KODI_CHROMA_TEXTURE(m_sampV, p).r)
++#endif
++
++#if defined(KODI_CHROMA_LANCZOS3)
++#define KODI_CHROMA_TAPS 6
++// Lanczos 3 at the six taps k = -2..3 of a fraction f: sinc(x) sinc(x / 3), x = k - f, from one sin(pi f)
++// and one sin/cos of pi f / 3 (sin(pi (k - f)) = (-1)^(k + 1) sin(pi f), and the angle sum for pi (k - f) / 3);
++// at x = 0 the limit, 1. Normalised: the taps of a Lanczos window do not add up to 1 exactly.
++void KodiChromaWeights(KODI_CHROMA_P float f, out KODI_CHROMA_P float w[6])
++{
++  const KODI_CHROMA_P float pi = 3.14159265358979;
++  const KODI_CHROMA_P float s3 = 0.866025403784439;
++  KODI_CHROMA_P float a = sin(pi * f);
++  KODI_CHROMA_P float c = cos(pi * f / 3.0);
++  KODI_CHROMA_P float s = sin(pi * f / 3.0);
++  // sin(pi k / 3) and cos(pi k / 3), k = -2..3
++  KODI_CHROMA_P vec3 sk0 = vec3(-s3, -s3, 0.0), ck0 = vec3(-0.5, 0.5, 1.0);
++  KODI_CHROMA_P vec3 sk1 = vec3(s3, s3, 0.0), ck1 = vec3(0.5, -0.5, -1.0);
++  KODI_CHROMA_P vec3 x0 = vec3(-2.0, -1.0, 0.0) - f, x1 = vec3(1.0, 2.0, 3.0) - f;
++  KODI_CHROMA_P vec3 sg0 = vec3(-a, a, -a), sg1 = vec3(a, -a, a); // (-1)^(k + 1) sin(pi f)
++  KODI_CHROMA_P vec3 n0 = sg0 * (sk0 * c - ck0 * s), n1 = sg1 * (sk1 * c - ck1 * s);
++  KODI_CHROMA_P vec3 d0 = (pi * pi / 3.0) * x0 * x0, d1 = (pi * pi / 3.0) * x1 * x1;
++  KODI_CHROMA_P vec3 w0 = n0 / max(d0, 1e-12), w1 = n1 / max(d1, 1e-12);
++  // the tap at x = 0 (f = 0 only)
++  if (f < 1e-6)
++  {
++    w0 = vec3(0.0, 0.0, 1.0);
++    w1 = vec3(0.0);
++  }
++  KODI_CHROMA_P float sum = w0.x + w0.y + w0.z + w1.x + w1.y + w1.z;
++  w[0] = w0.x / sum;
++  w[1] = w0.y / sum;
++  w[2] = w0.z / sum;
++  w[3] = w1.x / sum;
++  w[4] = w1.y / sum;
++  w[5] = w1.z / sum;
++}
++#elif defined(KODI_CHROMA_SPLINE16)
++#define KODI_CHROMA_TAPS 4
++// Spline16 (Helmut Dersch's cubic spline through 4 points) at the taps k = -1..2 of a fraction f;
++// they add up to 1
++void KodiChromaWeights(KODI_CHROMA_P float f, out KODI_CHROMA_P float w[4])
++{
++  KODI_CHROMA_P float g = 1.0 - f;
++  w[0] = ((-1.0 / 3.0 * f + 4.0 / 5.0) * f - 7.0 / 15.0) * f;
++  w[1] = ((f - 9.0 / 5.0) * f - 1.0 / 5.0) * f + 1.0;
++  w[2] = ((g - 9.0 / 5.0) * g - 1.0 / 5.0) * g + 1.0;
++  w[3] = ((-1.0 / 3.0 * g + 4.0 / 5.0) * g - 7.0 / 15.0) * g;
++}
++#endif
++
++#if defined(KODI_CHROMA_TAPS)
++// the chroma at the place of a texture coordinate, from KODI_CHROMA_TAPS x KODI_CHROMA_TAPS samples
++// around it, each read at the centre of its texel (the renderer gives the chroma textures the
++// filter GL_NEAREST for these filters: a bilinear one may weigh a neighbour in by a step of its
++// fixed-point weights where the centre falls a hair short of it) and outside the picture the sample
++// at its edge (CLAMP_TO_EDGE)
++KODI_CHROMA_P vec2 KodiChroma(KODI_CHROMA_P vec2 coord)
++{
++  KODI_CHROMA_P vec2 pos = coord * m_chromaSize.xy - 0.5 + m_chromaShift;
++  KODI_CHROMA_P vec2 base = floor(pos);
++  KODI_CHROMA_P vec2 f = pos - base;
++  KODI_CHROMA_P float wx[KODI_CHROMA_TAPS];
++  KODI_CHROMA_P float wy[KODI_CHROMA_TAPS];
++  KodiChromaWeights(f.x, wx);
++  KodiChromaWeights(f.y, wy);
++  // the centre of the first texel of the window
++  KODI_CHROMA_P vec2 first = (base - float(KODI_CHROMA_TAPS / 2 - 1) + 0.5) * m_chromaSize.zw;
++  KODI_CHROMA_P vec2 sum = vec2(0.0);
++  for (int j = 0; j < KODI_CHROMA_TAPS; ++j)
++  {
++    KODI_CHROMA_P vec2 row = vec2(0.0);
++    KODI_CHROMA_P float y = first.y + float(j) * m_chromaSize.w;
++    for (int i = 0; i < KODI_CHROMA_TAPS; ++i)
++      row += wx[i] * KODI_CHROMA_FETCH(vec2(first.x + float(i) * m_chromaSize.z, y));
++    sum += wy[j] * row;
++  }
++  return sum;
++}
++#else
++// the chroma at the place of a texture coordinate, the texture's filter (bilinear) between its samples
++KODI_CHROMA_P vec2 KodiChroma(KODI_CHROMA_P vec2 coord)
++{
++  return KODI_CHROMA_FETCH(coord + m_chromaShift * m_chromaSize.zw);
++}
++#endif
+diff --git a/system/shaders/GLES/3.1/gles310_yuv2rgb_filter.frag b/system/shaders/GLES/3.1/gles310_yuv2rgb_filter.frag
+index 87b027f..f4dc372 100644
+--- a/system/shaders/GLES/3.1/gles310_yuv2rgb_filter.frag
++++ b/system/shaders/GLES/3.1/gles310_yuv2rgb_filter.frag
+@@ -9,6 +9,11 @@
+ #version 310 es
+ 
+ precision highp float;
++#if defined(KODI_CHROMA)
++// Hades: the samples that the chroma filter weighs, at full precision (a lowp sample may be a 16-bit
++// float, and the filter adds up to 36 of them, some with negative weights)
++precision highp sampler2D;
++#endif
+ 
+ uniform sampler2D m_sampY;
+ uniform sampler2D m_sampU;
+@@ -32,6 +37,10 @@ in vec2 m_cordY;
+ in vec2 m_cordU;
+ in vec2 m_cordV;
+ out vec4 fragColor;
++#if defined(KODI_CHROMA)
++// Hades: the chroma where the video places it, and resampled (gles_yuv2rgb_chroma.frag)
++#define KODI_CHROMA_TEXTURE texture
++#endif
+ 
+ vec4[4] load4x4_0(sampler2D sampler, vec2 pos)
+ {
+@@ -84,7 +93,12 @@ void main()
+   vec4 rgb;
+   vec4 yuv;
+ 
+-#if defined(XBMC_YV12) || defined(XBMC_NV12)
++#if defined(KODI_CHROMA)
++
++  // (BaseYUV2RGBGLSLShader defines it for the 4:2:0 formats only: YV12, NV12, YV12_HI, NV12_RRG)
++  yuv = vec4(filter_0(m_sampY, m_cordY), KodiChroma(m_cordU), 1.0);
++
++#elif defined(XBMC_YV12) || defined(XBMC_NV12)
+ 
+   yuv = vec4(filter_0(m_sampY, m_cordY),
+              texture2D(m_sampU, m_cordU).g,
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h b/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
+new file mode 100644
+index 0000000..b463b05
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
+@@ -0,0 +1,252 @@
++/*
++ *  Copyright (C) 2026 LibreELEC Hades
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++// Hades: the chroma of a 4:2:0 picture that Kodi's GLES renderer draws itself (its YUV shaders,
++// gles_yuv2rgb_chroma.frag), and the step-down of its filter where the GPU does not keep up.
++//
++// Kodi's YUV shaders read the chroma planes with the texture's bilinear filter at the place of each
++// output pixel, and take every video's chroma samples as centred between the luma samples. Most video
++// has them elsewhere: MPEG-2, H.264 and HEVC on the left (co-sited with the first luma sample of each
++// pair), UHD Blu-ray top-left. Measured against 4:4:4 references made from the luma of 4K and 1080p
++// masters (measured on 2026-11-20), with Kodi's own shaders on a software GPU: the samples taken
++// where the video places them (SITED, as cheap as before) bring Delta E ITP down by 6 % (animation)
++// to 21 % (film, PQ) on average; with Lanczos 3 over 6 x 6 samples, by 13 % to 26 %, and its 99th
++// percentile by 18 % to 26 %; Spline16 over 4 x 4, 12 % to 25 %, with less than half the samples of
++// Lanczos 3. The bridge draws its pictures with Lanczos 3 at the video's siting (libplacebo).
++//
++// No GL here: the policy is a plain class, so that the host tests build it alone
++// (tools/regress/kodi-host, chroma).
++
++#include <algorithm>
++#include <cstddef>
++
++namespace KODI
++{
++namespace CHROMA
++{
++
++//! How the YUV shaders take the chroma of a 4:2:0 picture, from the most faithful down. KODI is
++//! Kodi's own way, which pictures of other formats keep; the renderer uses it only where
++//! advancedsettings.xml asks for it (<video><chromastep>3</chromastep>).
++enum class Filter
++{
++  LANCZOS3 = 0, //!< Lanczos 3 over 6 x 6 samples, where the video places them
++  SPLINE16 = 1, //!< Spline16 over 4 x 4 samples, where the video places them
++  SITED = 2, //!< the texture's bilinear filter, where the video places them
++  KODI = 3, //!< the texture's bilinear filter, every video taken as centred
++};
++
++constexpr int FILTERS = 4;
++
++inline const char* Name(Filter filter)
++{
++  switch (filter)
++  {
++    case Filter::LANCZOS3:
++      return "Lanczos 3";
++    case Filter::SPLINE16:
++      return "Spline16";
++    case Filter::SITED:
++      return "bilinear";
++    case Filter::KODI:
++      return "bilinear, taken as centred (Kodi's own)";
++  }
++  return "?";
++}
++
++//! Where the chroma samples are from the centres of their texels, in texels of the chroma plane, as
++//! the shaders take it (m_chromaShift): 0.25 on an axis where the samples are co-sited with the first
++//! luma sample of their pair, 0 where they are centred, -0.25 at the bottom.
++struct Shift
++{
++  float x = 0.25f;
++  float y = 0.0f;
++};
++
++//! The shift of a chroma location as FFmpeg gives it (AVChromaLocation: 0 unspecified, 1 left,
++//! 2 centre, 3 top-left, 4 top, 5 bottom-left, 6 bottom). An unspecified one is taken as left, the
++//! siting of MPEG-2, H.264 and HEVC when the stream says nothing, as libplacebo takes it
++//! (pl_chroma_location_offset()) for the pictures that the bridge draws.
++inline Shift ShiftOf(int location)
++{
++  switch (location)
++  {
++    case 2:
++      return {0.0f, 0.0f};
++    case 3:
++      return {0.25f, 0.25f};
++    case 4:
++      return {0.0f, 0.25f};
++    case 5:
++      return {0.25f, -0.25f};
++    case 6:
++      return {0.0f, -0.25f};
++    default:
++      return {0.25f, 0.0f};
++  }
++}
++
++//! The name of a chroma location, for the log
++inline const char* LocationName(int location)
++{
++  switch (location)
++  {
++    case 1:
++      return "left";
++    case 2:
++      return "centre";
++    case 3:
++      return "top-left";
++    case 4:
++      return "top";
++    case 5:
++      return "bottom-left";
++    case 6:
++      return "bottom";
++    default:
++      return "not given, taken as left";
++  }
++}
++
++/*!
++ * \brief The step-down of the chroma filter of a video, by the GPU time of its pictures
++ *
++ * The renderer times each picture that it draws itself with a filter of more than one sample
++ * (LANCZOS3, SPLINE16) and gives the time here with the refresh period. The first SKIP timed
++ * pictures after the start of a video or a change of level are left out (the shaders are built,
++ * the clocks of the GPU rise). The rest are counted in windows of WINDOW pictures of one refresh
++ * period, as CDVStepDown counts the frames of native Dolby Vision that are presented the way that
++ * waits: a picture over LOADED of the period leaves too little of it for the rest of the frame.
++ * A window is behind when PART of its pictures, MIN_OVER at least, are over that mark; two
++ * windows behind in a row, or one whose pictures take more than the whole period on average
++ * (without its slowest picture: the GPU cannot keep up whatever comes), take the filter one level
++ * down: LANCZOS3, SPLINE16, SITED. SITED costs what Kodi's own sampling cost, and is the last
++ * level. A level is not taken back up within a video (the frames would stutter at each trial),
++ * and each video starts again from LANCZOS3 (what was found for the last one may not hold for this
++ * one: its size, its rate and the refresh rate are its own). A forced level (advancedsettings.xml)
++ * never changes.
++ */
++class CStepDown
++{
++public:
++  static constexpr unsigned int SKIP = 48;
++  static constexpr unsigned int WINDOW = 48;
++  static constexpr double LOADED = 0.8; //!< CDVStepDown::LOADED_WAITING
++  static constexpr double PART = 0.05; //!< CDVStepDown::LOST_PART
++  static constexpr unsigned int MIN_OVER = 3;
++
++  //! What a window found, for the log
++  struct Window
++  {
++    unsigned int frames = 0;
++    unsigned int over = 0; //!< pictures over LOADED of the period
++    double averageMs = 0; //!< without the slowest picture
++    double maxMs = 0;
++    double periodMs = 0;
++    bool behind = false;
++  };
++
++  //! A new video: from the most faithful level, or from the level that advancedsettings.xml forces
++  //! (0 to 3; any other value: none)
++  void Start(int forced = -1)
++  {
++    m_forced = forced >= 0 && forced < FILTERS;
++    m_filter = m_forced ? static_cast<Filter>(forced) : Filter::LANCZOS3;
++    m_windows = 0;
++    m_last = {};
++    Restart();
++  }
++
++  Filter Current() const { return m_filter; }
++  bool Forced() const { return m_forced; }
++  //! Whether the pictures are timed at this level: it can still go down
++  bool Timing() const
++  {
++    return !m_forced && (m_filter == Filter::LANCZOS3 || m_filter == Filter::SPLINE16);
++  }
++  //! Windows measured since the start of the video
++  unsigned int Windows() const { return m_windows; }
++  const Window& Last() const { return m_last; }
++
++  /*!
++   * \brief A timed picture
++   * \param ms its GPU time
++   * \param periodMs the refresh period of the display
++   * \return true when the level changed with it (Current() is the new one, Last() the window that
++   *         decided it); false otherwise, also when a window ended (Windows() counts it)
++   */
++  bool Timed(double ms, double periodMs)
++  {
++    if (!Timing() || !(ms >= 0) || !(periodMs > 0))
++      return false;
++    if (m_skip > 0)
++    {
++      --m_skip;
++      return false;
++    }
++    if (m_frames > 0 && periodMs != m_periodMs)
++      m_frames = 0; // (another refresh rate: a window of its own)
++    if (m_frames == 0)
++    {
++      m_periodMs = periodMs;
++      m_sumMs = m_maxMs = 0;
++      m_over = 0;
++    }
++    ++m_frames;
++    m_sumMs += ms;
++    m_maxMs = std::max(m_maxMs, ms);
++    m_over += ms > LOADED * periodMs ? 1 : 0;
++    if (m_frames < WINDOW)
++      return false;
++
++    Window w;
++    w.frames = m_frames;
++    w.over = m_over;
++    w.averageMs = (m_sumMs - m_maxMs) / (m_frames - 1);
++    w.maxMs = m_maxMs;
++    w.periodMs = m_periodMs;
++    const unsigned int part = static_cast<unsigned int>(PART * m_frames + 0.999);
++    w.behind = m_over >= std::max(MIN_OVER, part);
++    const bool cannot = w.averageMs > m_periodMs;
++    m_last = w;
++    m_frames = 0;
++    ++m_windows;
++    const bool down = cannot || (w.behind && m_behindBefore);
++    m_behindBefore = w.behind;
++    if (!down)
++      return false;
++    m_filter = m_filter == Filter::LANCZOS3 ? Filter::SPLINE16 : Filter::SITED;
++    Restart();
++    return true;
++  }
++
++private:
++  void Restart()
++  {
++    m_skip = SKIP;
++    m_frames = 0;
++    m_behindBefore = false;
++  }
++
++  Filter m_filter = Filter::LANCZOS3;
++  bool m_forced = false;
++  unsigned int m_skip = SKIP;
++  unsigned int m_frames = 0;
++  unsigned int m_over = 0;
++  double m_sumMs = 0;
++  double m_maxMs = 0;
++  double m_periodMs = 0;
++  bool m_behindBefore = false;
++  unsigned int m_windows = 0;
++  Window m_last;
++};
++
++} // namespace CHROMA
++} // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 7ac92fe..b00132b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -42,13 +42,57 @@
+ #include <cmath>
+ #endif
+ 
++#include <algorithm>
+ #include <mutex>
+ #include <string>
+ #include <utility>
+ 
++#if defined(HAS_EGL)
++#include <EGL/egl.h>
++#endif
++
+ using namespace Shaders;
+ using namespace Shaders::GLES;
+ 
++namespace
++{
++// Hades: GL_EXT_disjoint_timer_query, for the GPU time of the pictures drawn with a chroma filter of
++// more than one sample (CLinuxRendererGLES::ChromaTimerMark()); null where the GL has none
++struct ChromaTimerQueries
++{
++  PFNGLGENQUERIESEXTPROC gen = nullptr;
++  PFNGLDELETEQUERIESEXTPROC del = nullptr;
++  PFNGLQUERYCOUNTEREXTPROC counter = nullptr;
++  PFNGLGETQUERYOBJECTUIVEXTPROC getUiv = nullptr;
++  PFNGLGETQUERYOBJECTUI64VEXTPROC getUi64v = nullptr;
++  bool Usable() const { return gen && del && counter && getUiv && getUi64v; }
++};
++
++const ChromaTimerQueries& ChromaQueries()
++{
++  static const ChromaTimerQueries queries = []
++  {
++    ChromaTimerQueries q;
++#if defined(HAS_EGL) && defined(GL_TIMESTAMP_EXT)
++    if (const auto* renderSystem = CServiceBroker::GetRenderSystem();
++        renderSystem && renderSystem->IsExtSupported("GL_EXT_disjoint_timer_query"))
++    {
++      q.gen = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(eglGetProcAddress("glGenQueriesEXT"));
++      q.del = reinterpret_cast<PFNGLDELETEQUERIESEXTPROC>(eglGetProcAddress("glDeleteQueriesEXT"));
++      q.counter =
++          reinterpret_cast<PFNGLQUERYCOUNTEREXTPROC>(eglGetProcAddress("glQueryCounterEXT"));
++      q.getUiv = reinterpret_cast<PFNGLGETQUERYOBJECTUIVEXTPROC>(
++          eglGetProcAddress("glGetQueryObjectuivEXT"));
++      q.getUi64v = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
++          eglGetProcAddress("glGetQueryObjectui64vEXT"));
++    }
++#endif
++    return q;
++  }();
++  return queries;
++}
++} // namespace
++
+ CLinuxRendererGLES::CLinuxRendererGLES()
+ {
+   m_format = AV_PIX_FMT_NONE;
+@@ -123,6 +167,7 @@ CLinuxRendererGLES::~CLinuxRendererGLES()
+   UnInit();
+ 
+   ReleaseShaders();
++  ReleaseChromaTimers();
+ 
+   if (m_ditherTex)
+     glDeleteTextures(1, &m_ditherTex);
+@@ -220,6 +265,13 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   m_srcColorBits = picture.colorBits;
+   m_srcFullRange = picture.color_range == 1;
+   m_toneMap = false;
++  // Hades: the chroma of this video, where it places its samples: from Lanczos 3 again (or the level
++  // that advancedsettings.xml forces), said in the log once its shaders are made (LoadShaders())
++  m_chromaLocation = picture.chroma_position;
++  m_chroma.Start(CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_videoChromaStep);
++  m_chromaTold = false;
++  m_chromaTimed = 0;
++  m_chromaSumMs = 0;
+ #ifdef HAVE_DVBRIDGE
+   // Hades: decided again below (WantsUpscale()); not for native Dolby Vision, which returns before it
+   m_upscaled = false;
+@@ -2039,6 +2091,9 @@ void CLinuxRendererGLES::LoadShaders(int field)
+ 
+           EShaderFormat shaderFormat = GetShaderFormat();
+           m_toneMapMethod = m_videoSettings.m_ToneMapMethod;
++          // Hades: the chroma filter of this video's progressive pictures (the bob shader of
++          // interlaced fields keeps Kodi's own sampling)
++          const KODI::CHROMA::Filter chroma = ChromaFilter();
+ 
+           // Try single-pass filter shader for FAST scalers on GLES 3.1+
+           if (m_renderQuality == RQ_SINGLEPASS &&
+@@ -2047,7 +2102,7 @@ void CLinuxRendererGLES::LoadShaders(int field)
+           {
+             m_pYUVProgShader =
+                 new YUV2RGBFilterShader(shaderFormat, DrawnPrimaries(), m_srcPrimaries, m_toneMap,
+-                                        m_toneMapMethod, m_scalingMethod, m_useDithering);
++                                        m_toneMapMethod, m_scalingMethod, m_useDithering, chroma);
+             // TODO: GL gates this on !m_cmsOn. Add when CMS is ported to GLES.
+             m_pYUVProgShader->SetConvertFullColorRange(m_fullRange);
+ 
+@@ -2058,6 +2113,7 @@ void CLinuxRendererGLES::LoadShaders(int field)
+               if (m_useDithering && m_ditherTex)
+                 m_pYUVProgShader->SetDitherUniforms(ditherActive, m_ditherTex, effectiveDitherDepth,
+                                                     dither_size);
++              TellChroma(m_pYUVProgShader->ChromaFilter());
+               m_renderMethod = RENDER_GLSL;
+               UpdateVideoFilter();
+               break;
+@@ -2073,17 +2129,42 @@ void CLinuxRendererGLES::LoadShaders(int field)
+           // Fall back to regular progressive shader
+           m_pYUVProgShader =
+               new YUV2RGBProgressiveShader(shaderFormat, DrawnPrimaries(), m_srcPrimaries,
+-                                           m_toneMap, m_toneMapMethod, m_useDithering);
++                                           m_toneMap, m_toneMapMethod, m_useDithering, chroma);
+           m_pYUVProgShader->SetConvertFullColorRange(m_fullRange);
++          bool progressiveMade = m_pYUVProgShader->CompileAndLink();
++          // Hades: a chroma filter that this GPU's compiler does not take leaves the video with the
++          // samples where the video places them (or, failing that, Kodi's own way): never without a
++          // picture, and from then on that level for the video
++          for (KODI::CHROMA::Filter fewer :
++               {KODI::CHROMA::Filter::SITED, KODI::CHROMA::Filter::KODI})
++          {
++            const KODI::CHROMA::Filter had = m_pYUVProgShader->ChromaFilter();
++            if (progressiveMade || had == KODI::CHROMA::Filter::KODI ||
++                static_cast<int>(had) >= static_cast<int>(fewer))
++              continue;
++            CLog::Log(LOGWARNING,
++                      "Chroma: the shader with {} could not be made on this GPU; the chroma of this "
++                      "video is drawn with {}",
++                      KODI::CHROMA::Name(had), KODI::CHROMA::Name(fewer));
++            delete m_pYUVProgShader;
++            m_pYUVProgShader =
++                new YUV2RGBProgressiveShader(shaderFormat, DrawnPrimaries(), m_srcPrimaries,
++                                             m_toneMap, m_toneMapMethod, m_useDithering, fewer);
++            m_pYUVProgShader->SetConvertFullColorRange(m_fullRange);
++            progressiveMade = m_pYUVProgShader->CompileAndLink();
++            m_chroma.Start(static_cast<int>(fewer));
++            m_chromaTold = true; // (the line above says how it is drawn)
++          }
+ 
+           CLog::Log(LOGINFO, "GLES: Selecting YUV 2 RGB shader");
++          if (progressiveMade)
++            TellChroma(m_pYUVProgShader->ChromaFilter());
+ 
+           m_pYUVBobShader = new YUV2RGBBobShader(shaderFormat, DrawnPrimaries(), m_srcPrimaries,
+                                                  m_toneMap, m_toneMapMethod, m_useDithering);
+           m_pYUVBobShader->SetConvertFullColorRange(m_fullRange);
+ 
+-          if ((m_pYUVProgShader && m_pYUVProgShader->CompileAndLink())
+-              && (m_pYUVBobShader && m_pYUVBobShader->CompileAndLink()))
++          if (progressiveMade && (m_pYUVBobShader && m_pYUVBobShader->CompileAndLink()))
+           {
+             if (m_useDithering && m_ditherTex)
+             {
+@@ -2408,6 +2489,13 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+   else if (m_renderMethod & RENDER_GLSL)
+   {
+     UpdateVideoFilter();
++    // Hades: the GPU time of a progressive picture drawn with a chroma filter of more than one
++    // sample, for its step-down (what came back of the pictures before it, first)
++    ChromaTimerCollect();
++    const bool chromaTimed = m_currentField == FIELD_FULL && m_chroma.Timing() && m_pYUVProgShader &&
++                             m_pYUVProgShader->ChromaFilter() == m_chroma.Current();
++    if (chromaTimed)
++      ChromaTimerMark(true);
+     switch(m_renderQuality)
+     {
+     case RQ_LOW:
+@@ -2427,6 +2515,8 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+     default:
+       break;
+     }
++    if (chromaTimed)
++      ChromaTimerMark(false);
+   }
+   else
+   {
+@@ -2479,6 +2569,7 @@ void CLinuxRendererGLES::RenderSinglePass(int index, int field)
+   pYUVShader->SetContrast(m_videoSettings.m_Contrast * 0.02f);
+   pYUVShader->SetWidth(planes[0].texwidth);
+   pYUVShader->SetHeight(planes[0].texheight);
++  SetChroma(pYUVShader, planes[1].texwidth, planes[1].texheight);
+   pYUVShader->SetColParams(buf.m_srcColSpace, buf.m_srcBits, !buf.m_srcFullRange, buf.m_srcTextureBits);
+   pYUVShader->SetDisplayMetadata(buf.hasDisplayMetadata, buf.displayMetadata,
+                                  buf.hasLightMetadata, buf.lightMetadata);
+@@ -2617,6 +2708,7 @@ void CLinuxRendererGLES::RenderToFBO(int index, int field)
+   pYUVShader->SetContrast(m_videoSettings.m_Contrast * 0.02f);
+   pYUVShader->SetWidth(planes[0].texwidth);
+   pYUVShader->SetHeight(planes[0].texheight);
++  SetChroma(pYUVShader, planes[1].texwidth, planes[1].texheight);
+   pYUVShader->SetColParams(buf.m_srcColSpace, buf.m_srcBits, !buf.m_srcFullRange, buf.m_srcTextureBits);
+   pYUVShader->SetDisplayMetadata(buf.hasDisplayMetadata, buf.displayMetadata,
+                                  buf.hasLightMetadata, buf.lightMetadata);
+@@ -3510,3 +3602,190 @@ void CLinuxRendererGLES::CheckVideoParameters(int index)
+     m_toneMapMethod = toneMapMethod;
+   }
+ }
++
++bool CLinuxRendererGLES::Chroma420()
++{
++  const EShaderFormat format = GetShaderFormat();
++  if (format == SHADER_NV12 || format == SHADER_NV12_RRG)
++    return true;
++  if (format < SHADER_YV12 || format > SHADER_YV12_16)
++    return false;
++  const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(m_format);
++  return desc && desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1;
++}
++
++KODI::CHROMA::Filter CLinuxRendererGLES::ChromaFilter()
++{
++  if (!Chroma420())
++    return KODI::CHROMA::Filter::KODI;
++  // (the scaling method Nearest takes the chroma as it takes the luma: the sample nearest to each
++  // pixel, now where the video places it)
++  if (m_scalingMethod == VS_SCALINGMETHOD_NEAREST)
++    return KODI::CHROMA::Filter::SITED;
++  return m_chroma.Current();
++}
++
++void CLinuxRendererGLES::SetChroma(BaseYUV2RGBGLSLShader* shader, int width, int height) const
++{
++  shader->SetChroma(std::max(width, 1), std::max(height, 1),
++                    KODI::CHROMA::ShiftOf(m_chromaLocation));
++  // the filters of more than one sample read each sample at the centre of its texel, where a
++  // bilinear filter of fixed-point weights may weigh a neighbour in by a step where the centre falls
++  // a hair short of it: their chroma textures, bound to units 1 and 2, are read GL_NEAREST (the
++  // others keep the filter that UpdateVideoFilter() or the renderer of the decoder gave them,
++  // GL_LINEAR)
++  // (SITED: the filter Kodi gives them, as UpdateVideoFilter() sets it, back where a level of more
++  // samples set GL_NEAREST before a step down)
++  const KODI::CHROMA::Filter filter = shader->ChromaFilter();
++  if (filter == KODI::CHROMA::Filter::KODI)
++    return;
++  const GLint wanted = filter == KODI::CHROMA::Filter::LANCZOS3 ||
++                               filter == KODI::CHROMA::Filter::SPLINE16 ||
++                               (m_renderQuality == RQ_SINGLEPASS &&
++                                m_scalingMethod == VS_SCALINGMETHOD_NEAREST)
++                           ? GL_NEAREST
++                           : GL_LINEAR;
++  for (GLenum unit : {GL_TEXTURE1, GL_TEXTURE2})
++  {
++    glActiveTexture(unit);
++    glTexParameteri(m_textureTarget, GL_TEXTURE_MIN_FILTER, wanted);
++    glTexParameteri(m_textureTarget, GL_TEXTURE_MAG_FILTER, wanted);
++  }
++  glActiveTexture(GL_TEXTURE0);
++}
++
++void CLinuxRendererGLES::TellChroma(KODI::CHROMA::Filter filter)
++{
++  if (m_chromaTold)
++    return;
++  m_chromaTold = true;
++  if (filter == KODI::CHROMA::Filter::KODI && !m_chroma.Forced())
++  {
++    CLog::Log(LOGINFO,
++              "Chroma: the chroma of this {}x{} video is not 4:2:0 in a format whose chroma the "
++              "shaders take ({}): Kodi's own sampling",
++              m_sourceWidth, m_sourceHeight,
++              fmt::formatter<EShaderFormat>::ToString(GetShaderFormat()));
++    return;
++  }
++  const bool nearest = filter == KODI::CHROMA::Filter::SITED && m_scalingMethod == VS_SCALINGMETHOD_NEAREST;
++  CLog::Log(LOGINFO,
++            "Chroma: the 4:2:0 chroma of this {}x{} video (its samples {}) is drawn with {}{}",
++            m_sourceWidth, m_sourceHeight, KODI::CHROMA::LocationName(m_chromaLocation),
++            nearest ? "the sample nearest to each pixel (scaling method Nearest)"
++                    : KODI::CHROMA::Name(filter),
++            m_chroma.Forced() ? ", as advancedsettings.xml asks (chromastep)"
++            : !m_chroma.Timing() ? ""
++            : ChromaQueries().Usable()
++                ? ", a level down where the GPU time of its pictures says it does not keep up"
++                : "; its pictures are not timed (no GL_EXT_disjoint_timer_query): no step-down");
++}
++
++void CLinuxRendererGLES::ChromaTimerMark(bool begin)
++{
++  const ChromaTimerQueries& q = ChromaQueries();
++  if (!q.Usable())
++    return;
++  if (!m_chromaTimersMade)
++  {
++    m_chromaTimersMade = true;
++    for (auto& timer : m_chromaTimers)
++    {
++      q.gen(1, &timer.begin);
++      q.gen(1, &timer.end);
++    }
++  }
++  auto& timer = m_chromaTimers[m_chromaTimerIndex];
++  if (!timer.begin || !timer.end)
++    return;
++  if (begin)
++  {
++    if (timer.pending)
++      return; // (its result is not back yet: this picture is not timed)
++    q.counter(timer.begin, GL_TIMESTAMP_EXT);
++    timer.begun = true;
++  }
++  else if (timer.begun)
++  {
++    q.counter(timer.end, GL_TIMESTAMP_EXT);
++    timer.begun = false;
++    timer.pending = true;
++    m_chromaTimerIndex = (m_chromaTimerIndex + 1) % m_chromaTimers.size();
++  }
++}
++
++void CLinuxRendererGLES::ChromaTimerCollect()
++{
++  const ChromaTimerQueries& q = ChromaQueries();
++  if (!q.Usable() || !m_chromaTimersMade)
++    return;
++  // (reading the disjoint state clears it; a disjoint period makes the results in flight useless)
++  GLint disjoint = 0;
++  glGetIntegerv(GL_GPU_DISJOINT_EXT, &disjoint);
++  const float fps = CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS();
++  const double periodMs = fps > 0 ? 1000.0 / static_cast<double>(fps) : 0;
++  for (size_t n = 0; n < m_chromaTimers.size(); ++n)
++  {
++    auto& timer = m_chromaTimers[(m_chromaTimerIndex + n) % m_chromaTimers.size()];
++    if (!timer.pending)
++      continue;
++    GLuint available = 0;
++    q.getUiv(timer.end, GL_QUERY_RESULT_AVAILABLE_EXT, &available);
++    if (!available)
++      break;
++    timer.pending = false;
++    GLuint64 start = 0;
++    GLuint64 finish = 0;
++    q.getUi64v(timer.begin, GL_QUERY_RESULT_EXT, &start);
++    q.getUi64v(timer.end, GL_QUERY_RESULT_EXT, &finish);
++    if (disjoint || finish <= start || !m_chroma.Timing())
++      continue;
++    const double ms = static_cast<double>(finish - start) / 1e6;
++    const KODI::CHROMA::Filter was = m_chroma.Current();
++    const unsigned int windows = m_chroma.Windows();
++    ++m_chromaTimed;
++    m_chromaSumMs += ms;
++    if (m_chroma.Timed(ms, periodMs))
++    {
++      const auto& w = m_chroma.Last();
++      CLog::Log(LOGWARNING,
++                "Chroma: the chroma of this video is drawn with {} from now on, in place of {}: of "
++                "{} pictures, {} took more than {:.0f} % of a refresh of {:.1f} ms of GPU time "
++                "({:.1f} ms on average, {:.1f} at most)",
++                KODI::CHROMA::Name(m_chroma.Current()), KODI::CHROMA::Name(was), w.frames, w.over,
++                KODI::CHROMA::CStepDown::LOADED * 100, w.periodMs, w.averageMs, w.maxMs);
++      m_reloadShaders = true;
++      m_chromaTimed = 0;
++      m_chromaSumMs = 0;
++      // (the results still in flight are of the level before)
++      for (auto& other : m_chromaTimers)
++        other.pending = other.begun = false;
++      break;
++    }
++    if (windows == 0 && m_chroma.Windows() == 1)
++    {
++      const auto& w = m_chroma.Last();
++      CLog::Log(LOGINFO,
++                "Chroma: with {}, the first {} pictures measured took {:.2f} ms of GPU time on "
++                "average ({:.2f} at most, {} over {:.0f} % of the refresh) for a refresh of {:.1f} ms",
++                KODI::CHROMA::Name(m_chroma.Current()), w.frames, w.averageMs, w.maxMs, w.over,
++                KODI::CHROMA::CStepDown::LOADED * 100, w.periodMs);
++    }
++  }
++}
++
++void CLinuxRendererGLES::ReleaseChromaTimers()
++{
++  const ChromaTimerQueries& q = ChromaQueries();
++  if (!m_chromaTimersMade || !q.Usable())
++    return;
++  for (auto& timer : m_chromaTimers)
++  {
++    if (timer.begin)
++      q.del(1, &timer.begin);
++    if (timer.end)
++      q.del(1, &timer.end);
++    timer = {};
++  }
++  m_chromaTimersMade = false;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 2ade7e8..4321653 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -16,6 +16,7 @@
+ #include "system_gl.h"
+ 
+ #include "BaseRenderer.h"
++#include "ChromaStepDown.h"
+ #include "cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h"
+ #include "cores/VideoSettings.h"
+ #include "FrameBufferObject.h"
+@@ -307,6 +308,39 @@ protected:
+   unsigned int m_upscaleFailures = 0;
+   unsigned int m_upscaleFailedSerial = 0;
+ #endif
++  // Hades: the chroma of the 4:2:0 pictures that this renderer draws itself (ChromaStepDown.h,
++  // gles_yuv2rgb_chroma.frag): where the video places its samples, with Lanczos 3, a level down
++  // where the GPU does not keep up
++  //! Whether the pictures of this video are 4:2:0 in a format whose chroma the YUV shaders take
++  //! (NV12, NV12_RRG; the planar YV12 formats of 4:2:0 only: they also carry 4:2:2 and 4:4:4)
++  bool Chroma420();
++  //! The filter of the chroma of this video's progressive pictures (KODI where it is not 4:2:0)
++  KODI::CHROMA::Filter ChromaFilter();
++  //! Set the size of the chroma textures (in texels) and the siting of the video on a shader, and
++  //! the filter that its way of taking the chroma reads them with (those bound to units 1 and 2)
++  void SetChroma(Shaders::GLES::BaseYUV2RGBGLSLShader* shader, int width, int height) const;
++  //! Say in the log, once a video and at each change, how its chroma is drawn
++  void TellChroma(KODI::CHROMA::Filter filter);
++  //! The GPU time of the pictures drawn with a filter of more than one sample
++  //! (GL_EXT_disjoint_timer_query): around their drawing, and what has come back, to the step-down
++  void ChromaTimerMark(bool begin);
++  void ChromaTimerCollect();
++  void ReleaseChromaTimers();
++  KODI::CHROMA::CStepDown m_chroma;
++  int m_chromaLocation{0}; //!< VideoPicture::chroma_position of the video
++  bool m_chromaTold{false}; //!< the log said how this video's chroma is drawn
++  struct ChromaTimer
++  {
++    GLuint begin{0};
++    GLuint end{0};
++    bool begun{false};
++    bool pending{false};
++  };
++  std::array<ChromaTimer, 4> m_chromaTimers{};
++  unsigned int m_chromaTimerIndex{0};
++  bool m_chromaTimersMade{false};
++  unsigned int m_chromaTimed{0}; //!< pictures timed at this level, for the log
++  double m_chromaSumMs{0};
+   virtual void AfterRenderHook(int idx) {}
+ 
+   struct
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+index 75d843f..f6a4625 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.cpp
+@@ -147,6 +147,8 @@ void BaseYUV2RGBGLSLShader::OnCompiledAndLinked()
+   m_hToneP1 = glGetUniformLocation(ProgramHandle(), "m_toneP1");
+   m_hLuminance = glGetUniformLocation(ProgramHandle(), "m_luminance");
+   m_hRangeAfter = glGetUniformLocation(ProgramHandle(), "m_rangeAfter");
++  m_hChromaSize = glGetUniformLocation(ProgramHandle(), "m_chromaSize");
++  m_hChromaShift = glGetUniformLocation(ProgramHandle(), "m_chromaShift");
+ 
+   if (m_dither)
+   {
+@@ -166,6 +168,12 @@ bool BaseYUV2RGBGLSLShader::OnEnabled()
+   glUniform1i(m_hUTex, 1);
+   glUniform1i(m_hVTex, 2);
+   glUniform2f(m_hStep, 1.0 / m_width, 1.0 / m_height);
++  // Hades: the chroma textures and the siting of the video, where this shader takes them
++  if (m_hChromaSize >= 0)
++    glUniform4f(m_hChromaSize, static_cast<float>(m_chromaWidth),
++                static_cast<float>(m_chromaHeight), 1.0f / m_chromaWidth, 1.0f / m_chromaHeight);
++  if (m_hChromaShift >= 0)
++    glUniform2f(m_hChromaShift, m_chromaShift.x, m_chromaShift.y);
+ 
+   // Hades: the conversion alone takes the signal in full range, and the limited range of the output
+   // is applied after it (m_rangeAfter): applied before, as for the rest, its black of 16 went
+@@ -284,6 +292,25 @@ void BaseYUV2RGBGLSLShader::Free()
+ {
+ }
+ 
++bool BaseYUV2RGBGLSLShader::AddChromaDefines(KODI::CHROMA::Filter filter)
++{
++  using KODI::CHROMA::Filter;
++  // (the formats whose chroma planes are 4:2:0: in one texture, NV12 and NV12_RRG, or two)
++  const bool planar420 = m_format == SHADER_YV12 || m_format == SHADER_NV12 ||
++                         m_format == SHADER_NV12_RRG || m_format == SHADER_YV12_9 ||
++                         m_format == SHADER_YV12_10 || m_format == SHADER_YV12_12 ||
++                         m_format == SHADER_YV12_14 || m_format == SHADER_YV12_16;
++  m_chromaFilter = planar420 ? filter : Filter::KODI;
++  if (m_chromaFilter == Filter::KODI)
++    return false;
++  m_defines += "#define KODI_CHROMA\n";
++  if (m_chromaFilter == Filter::LANCZOS3)
++    m_defines += "#define KODI_CHROMA_LANCZOS3\n";
++  else if (m_chromaFilter == Filter::SPLINE16)
++    m_defines += "#define KODI_CHROMA_SPLINE16\n";
++  return true;
++}
++
+ void BaseYUV2RGBGLSLShader::SetColParams(AVColorSpace colSpace, int bits, bool limited,
+                                         int textureBits)
+ {
+@@ -322,10 +349,16 @@ YUV2RGBProgressiveShader::YUV2RGBProgressiveShader(EShaderFormat format,
+                                                    AVColorPrimaries srcPrimaries,
+                                                    bool toneMap,
+                                                    ETONEMAPMETHOD toneMapMethod,
+-                                                   bool dither)
++                                                   bool dither,
++                                                   KODI::CHROMA::Filter chroma)
+   : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither)
+ {
++  // Hades: the chroma of a 4:2:0 picture (gles_yuv2rgb_chroma.frag; it has none of the places the
++  // inserts below look for)
++  const bool chromaOwn = AddChromaDefines(chroma);
+   PixelShader()->LoadSource("gles_yuv2rgb_basic.frag", m_defines);
++  if (chromaOwn)
++    PixelShader()->InsertSource("gles_yuv2rgb_chroma.frag", "void main()");
+   PixelShader()->InsertSource("gles_tonemap.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_body.frag", "gl_FragColor");
+@@ -381,12 +414,17 @@ YUV2RGBFilterShader::YUV2RGBFilterShader(EShaderFormat format,
+                                          bool toneMap,
+                                          ETONEMAPMETHOD toneMapMethod,
+                                          ESCALINGMETHOD method,
+-                                         bool dither)
++                                         bool dither,
++                                         KODI::CHROMA::Filter chroma)
+   : BaseYUV2RGBGLSLShader(format, dstPrimaries, srcPrimaries, toneMap, toneMapMethod, dither)
+ {
+   m_scaling = method;
++  // Hades: the chroma of a 4:2:0 picture, as YUV2RGBProgressiveShader takes it
++  const bool chromaOwn = AddChromaDefines(chroma);
+   PixelShader()->LoadSource("gles310_yuv2rgb_filter.frag", m_defines);
+   VertexShader()->LoadSource("gles310_yuv2rgb.vert");
++  if (chromaOwn)
++    PixelShader()->InsertSource("gles_yuv2rgb_chroma.frag", "void main()");
+   PixelShader()->InsertSource("gles_tonemap.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_uniforms.frag", "void main()");
+   PixelShader()->InsertSource("gles_dither_body.frag", "fragColor = rgb");
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
+index 0a80b41..33ad258 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/YUV2RGBShaderGLES.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "../ChromaStepDown.h"
+ #include "ConversionMatrix.h"
+ #include "ShaderFormats.h"
+ #include "cores/VideoSettings.h"
+@@ -50,6 +51,17 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                             bool hasLightMetadata,
+                             AVContentLightMetadata lightMetadata);
+     void SetToneMapParam(float param) { m_toneMappingParam = param; }
++    //! Hades: the size of the chroma textures in texels and where the video places its chroma
++    //! samples, for a shader that takes the chroma its own way (ChromaFilter())
++    void SetChroma(int width, int height, KODI::CHROMA::Shift shift)
++    {
++      m_chromaWidth = width;
++      m_chromaHeight = height;
++      m_chromaShift = shift;
++    }
++    //! Hades: how this shader takes the chroma (KODI: Kodi's own way, for any format other than
++    //! the 4:2:0 ones, or where it was asked for)
++    KODI::CHROMA::Filter ChromaFilter() const { return m_chromaFilter; }
+ 
+     GLint GetVertexLoc() { return m_hVertex; }
+     GLint GetYcoordLoc() { return m_hYcoord; }
+@@ -64,6 +76,9 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+     bool OnEnabled() override;
+     void OnDisabled() override;
+     void Free();
++    //! Hades: the defines of a chroma filter for a 4:2:0 format (none for any other, or for KODI);
++    //! true where the shader then takes gles_yuv2rgb_chroma.frag, before main()
++    bool AddChromaDefines(KODI::CHROMA::Filter filter);
+ 
+     EShaderFormat m_format;
+     int m_width;
+@@ -84,6 +99,14 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+     bool m_conversionAlone{false};
+     GLint m_hRangeAfter{-1};
+ 
++    //! Hades: the chroma (AddChromaDefines(), SetChroma())
++    KODI::CHROMA::Filter m_chromaFilter{KODI::CHROMA::Filter::KODI};
++    int m_chromaWidth{1};
++    int m_chromaHeight{1};
++    KODI::CHROMA::Shift m_chromaShift;
++    GLint m_hChromaSize{-1};
++    GLint m_hChromaShift{-1};
++
+     float m_black;
+     float m_contrast;
+ 
+@@ -138,7 +161,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                              AVColorPrimaries srcPrimaries,
+                              bool toneMap,
+                              ETONEMAPMETHOD toneMapMethod,
+-                             bool dither = false);
++                             bool dither = false,
++                             KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI);
+   };
+ 
+   class YUV2RGBBobShader : public BaseYUV2RGBGLSLShader
+@@ -167,7 +191,8 @@ class BaseYUV2RGBGLSLShader : public CGLSLShaderProgram
+                         bool toneMap,
+                         ETONEMAPMETHOD toneMapMethod,
+                         ESCALINGMETHOD method,
+-                        bool dither = false);
++                        bool dither = false,
++                        KODI::CHROMA::Filter chroma = KODI::CHROMA::Filter::KODI);
+     ~YUV2RGBFilterShader() override;
+ 
+   protected:
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index a96c02c..8141b49 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -219,6 +219,7 @@ void CAdvancedSettings::Initialize()
+   m_videoHdrOwnBuffers = true;
+   m_videoHdrOwnBuffersAlways = false;
+   m_videoDVStepDown = -1;
++  m_videoChromaStep = -1;
+   m_videoDVKeepRepeats = true;
+   m_videoDVKeepByCommit = false;
+   m_videoDVVerify = 0;
+@@ -756,6 +757,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "hdrownbuffers", m_videoHdrOwnBuffers);
+     XMLUtils::GetBoolean(pElement, "hdrownbuffersalways", m_videoHdrOwnBuffersAlways);
+     XMLUtils::GetInt(pElement, "dvstepdown", m_videoDVStepDown, 0, 3);
++    XMLUtils::GetInt(pElement, "chromastep", m_videoChromaStep, 0, 3);
+     XMLUtils::GetBoolean(pElement, "dvkeeprepeats", m_videoDVKeepRepeats);
+     XMLUtils::GetBoolean(pElement, "dvkeepbycommit", m_videoDVKeepByCommit);
+     XMLUtils::GetInt(pElement, "dvverify", m_videoDVVerify, 0, 1000000);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index c21ca11..364d5cc 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -222,6 +222,12 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! saves. -1, when it is not there: Kodi chooses, only where the GPU cannot keep up
+     //! (CDVStepDown, videoscreen.hadesdvstepdown)
+     int m_videoDVStepDown;
++    //! Hades: the chroma filter of the 4:2:0 pictures that Kodi's GLES renderer draws itself, 0 to
++    //! 3, forced for every video (video/chromastep; KODI::CHROMA::Filter: 0 Lanczos 3, 1 Spline16,
++    //! 2 bilinear where the video places the samples, 3 Kodi's own, taken as centred). To compare
++    //! them, or to measure on a GPU what each costs. -1, when it is not there: Lanczos 3, a level
++    //! down only where the GPU cannot keep up (KODI::CHROMA::CStepDown)
++    int m_videoChromaStep;
+     //! Hades: a native Dolby Vision picture that is on the screen and would be drawn again the
+     //! same way (paused, or a film at a higher refresh rate) is kept there instead
+     //! (video/dvkeeprepeats). Off to have every refresh drawn, as before
+-- 
+2.53.0
+

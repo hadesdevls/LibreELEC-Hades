@@ -2,8 +2,8 @@
 # Copyright (C) 2024-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="pypackaging"
-PKG_VERSION="26.3"
-PKG_SHA256="94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79"
+PKG_VERSION="26.4"
+PKG_SHA256="c4b671c41ddb9bf26e543c37723610d28fb6bf7affc4da17cf048d419d2c062a"
 PKG_LICENSE="Apache-2.0 OR BSD-2-Clause"
 PKG_SITE="https://pypi.org/project/build/"
 PKG_URL="https://files.pythonhosted.org/packages/source/p/packaging/packaging-${PKG_VERSION}.tar.gz"

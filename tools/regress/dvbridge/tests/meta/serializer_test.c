@@ -24,6 +24,12 @@
 // DVBRIDGE_SENT_NO_L5); section 10 and the checks of the offsets that fit no reading say so. A bridge that sent a
 // level 5 block of zeros there gives BYTES lines 13 bytes longer in the frames of that case only.
 //
+// With a bridge that can send every frame as the first picture of a scene (it defines DVBRIDGE_REFRESH_ALL:
+// advancedsettings.xml, video/dvscenerefreshall), section 12 checks that switch; its frames are the last BYTES lines.
+//
+// With a bridge that has the form of the metadata (DVBRIDGE_FORM: dvbridge_set_form()), its last section checks that form
+// against what a licensed core sent, byte for byte, and each part of it alone; it prints no BYTES line.
+//
 // Usage: serializer_test (exit 0 when every check passed)
 #include <libavutil/dovi_meta.h>
 #include <libavutil/mem.h>
@@ -374,6 +380,365 @@ static void Refused(const char* what, struct dvbridge_context* ctx, const struct
   snprintf(line, sizeof line, "%s: refused, and why: \"%s\"", what, why ? why : "(made)");
   Check(why && strstr(why, word) != NULL, line);
 }
+
+// ---------------------------------------------------------------- the form of the metadata (dvbridge_set_form())
+// With a bridge that has it (DVBRIDGE_FORM): what a licensed core sends, read on the user's Amlogic player with Dolby's
+// own core (its "reversed md_reg3" of the first frame of two captures, 24 November 2026), byte for
+// byte from the RPUs of those frames (their "original md_buf") with the licensed form asked for; and each part of the
+// form alone, against Hades' own. No BYTES line is printed here, so that the payloads of the sections above stay
+// comparable with ref/meta/serializer-bytes.txt line by line.
+#ifdef DVBRIDGE_FORM
+// the fields of an extension block packed as an RPU has them: most significant bit first, zero bits to a whole byte
+static unsigned PackFields(uint8_t* out, const unsigned* values, const unsigned* widths, unsigned n)
+{
+  unsigned bit = 0;
+  memset(out, 0, 32);
+  for (unsigned k = 0; k < n; ++k)
+    for (unsigned b = widths[k]; b-- > 0; ++bit)
+      if (values[k] >> b & 1)
+        out[bit / 8] |= (uint8_t)(0x80 >> (bit % 8));
+  return (bit + 7) / 8;
+}
+
+static void AddPacked(struct md* d, int level, const unsigned* values, const unsigned* widths, unsigned n)
+{
+  uint8_t raw[32];
+  const unsigned length = PackFields(raw, values, widths, n);
+  AddRaw(d, level, raw, length);
+}
+
+static void AddL2Values(struct md* d, const unsigned v[7])
+{
+  AVDOVIDmData* e = Add(d, 2);
+  e->l2.target_max_pq = v[0];
+  e->l2.trim_slope = v[1];
+  e->l2.trim_offset = v[2];
+  e->l2.trim_power = v[3];
+  e->l2.trim_chroma_weight = v[4];
+  e->l2.trim_saturation_gain = v[5];
+  e->l2.ms_weight = (int16_t)v[6];
+}
+
+// the colour metadata of an RPU, its matrices in the units of the RPU (13, 28 and 14 fractional bits)
+static void SetColour(struct md* d, const int ycc[9], const unsigned off[3], const int lms[9], int space, int min,
+                      int max)
+{
+  AVDOVIColorMetadata* c = av_dovi_get_color(d->m);
+  for (int i = 0; i < 9; ++i)
+  {
+    c->ycc_to_rgb_matrix[i] = (AVRational){ycc[i], 8192};
+    c->rgb_to_lms_matrix[i] = (AVRational){lms[i], 16384};
+  }
+  for (int i = 0; i < 3; ++i)
+    c->ycc_to_rgb_offset[i] = (AVRational){(int)off[i], 1 << 28};
+  c->signal_color_space = space;
+  c->source_min_pq = min;
+  c->source_max_pq = max;
+}
+
+static int Hex(const char* hex, uint8_t* out)
+{
+  int n = 0;
+  for (; hex[0] && hex[1]; hex += 2)
+  {
+    unsigned v;
+    if (sscanf(hex, "%2x", &v) != 1)
+      return -1;
+    out[n++] = (uint8_t)v;
+  }
+  return n;
+}
+
+// the second frame of a stream (the first refreshes the scene; the captured frames do not) in a transport, read back
+static struct frame Second(struct dvbridge_context* ctx, const struct md* d, struct dvbridge_geometry g, int source)
+{
+  struct dvbridge_candidate* c = dvbridge_prepare_transport(ctx, d->m, d->size, 0, g, false, source);
+  if (c)
+    dvbridge_commit(ctx, c);
+  dvbridge_candidate_destroy(c);
+  c = dvbridge_prepare_transport(ctx, d->m, d->size, 41708, g, false, source);
+  struct frame f = Read(c);
+  dvbridge_candidate_destroy(c);
+  return f;
+}
+
+static void BlocksText(const struct frame* f, char* out, size_t size)
+{
+  size_t at = 0;
+  out[0] = 0;
+  for (unsigned i = 0; i < f->numBlocks && at < size; ++i)
+    at += (size_t)snprintf(out + at, size - at, "%s%u", i ? " " : "", f->blocks[i]);
+}
+
+// the payload of a block of the level given (the nth of that level) in a frame read back; its length, or -1
+static int BlockOf(const struct frame* f, unsigned level, unsigned nth, const uint8_t** at)
+{
+  unsigned pos = 71;
+  for (unsigned b = 0; b < f->numBlocks && pos + 5 <= f->size; ++b)
+  {
+    const unsigned length = (unsigned)f->payload[pos] << 24 | f->payload[pos + 1] << 16 |
+                            f->payload[pos + 2] << 8 | f->payload[pos + 3];
+    if (f->payload[pos + 4] == level && !nth--)
+    {
+      *at = f->payload + pos + 5;
+      return (int)length;
+    }
+    pos += 5 + length;
+  }
+  return -1;
+}
+
+// the RPU of the first frame of the profile 5 capture (cap-p5-20261124T162808Z.txt): content mapping v4.0
+static struct md P5Rpu(void)
+{
+  static const int ycc[9] = {8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545};
+  static const int lms[9] = {17081, -349, -349, -349, 17081, -349, -349, -349, 17081};
+  static const unsigned off[3] = {0, 1u << 27, 1u << 27};
+  static const unsigned l2a[7] = {0x821, 0x600, 0x803, 0x4bb, 0x800, 0x78f, 0x800};
+  static const unsigned l2b[7] = {0xb23, 0x7c1, 0x82d, 0x77f, 0x800, 0x7f4, 0x800};
+  static const unsigned l2c[7] = {0xc07, 0x800, 0x802, 0x801, 0x800, 0x800, 0x800};
+  static const unsigned w12x2[2] = {12, 12}, l4[2] = {0x100, 0x180};
+  static const unsigned w12x3[3] = {12, 12, 12}, l3[3] = {0x835, 0x800, 0x505};
+  static const unsigned w8[7] = {8, 12, 12, 12, 12, 12, 12}, l8[7] = {1, 0x7ee, 0x87e, 0x800, 0x800, 0x78f, 0x800};
+  static const uint8_t l9[1] = {0}, l254[2] = {0, 2}, l11[4] = {1, 0, 0, 0};
+  struct md d = NewMetadata();
+  SetColour(&d, ycc, off, lms, 2, 7, 3079);
+  AddL1(&d, 0x00c, 0x6d3, 0xbb3);
+  AddL2Values(&d, l2a);
+  AddL2Values(&d, l2b);
+  AddL2Values(&d, l2c);
+  AddPacked(&d, 4, l4, w12x2, 2);
+  AddL5(&d, 0, 0, 0, 0);
+  Add(&d, 6); // level 6 (never sent)
+  AddPacked(&d, 3, l3, w12x3, 3);
+  AddPacked(&d, 8, l8, w8, 7);
+  AddRaw(&d, 9, l9, 1);
+  AddRaw(&d, 254, l254, 2);
+  AddRaw(&d, 11, l11, 4);
+  return d;
+}
+
+// the RPU of the first frame of Top Gun: Maverick (cap-maverick-20261124T164325Z.txt): profile 7, content mapping v2.9
+static struct md MaverickRpu(void)
+{
+  static const int ycc[9] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
+  static const int lms[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
+  static const unsigned off[3] = {1u << 24, 1u << 27, 1u << 27};
+  static const unsigned l2[7] = {0x821, 0x70c, 0x82b, 0x723, 0x800, 0x714, 0x000};
+  static const unsigned w12x2[2] = {12, 12}, l4[2] = {0x28a, 0x192};
+  struct md d = NewMetadata();
+  SetColour(&d, ycc, off, lms, 0, 7, 3079);
+  AddL1(&d, 0x00c, 0x333, 0x83c);
+  AddL2Values(&d, l2);
+  AddPacked(&d, 4, l4, w12x2, 2);
+  AddL5(&d, 0, 0, 0, 0);
+  Add(&d, 6);
+  return d;
+}
+
+static const unsigned LICENSED = DVBRIDGE_FORM_LEVEL_ORDER | DVBRIDGE_FORM_L254_ZERO | DVBRIDGE_FORM_L3_NEUTRAL;
+
+static void Captured(const char* what, struct md (*rpu)(void), const char* want_hex)
+{
+  uint8_t want[512];
+  const int n = Hex(want_hex, want);
+  struct md d = rpu();
+  struct dvbridge_context* ctx = dvbridge_create();
+  dvbridge_set_form(ctx, DVBRIDGE_L5_NONE, LICENSED);
+  const struct frame f = Second(ctx, &d, RASTER, 2);
+  int first = -1;
+  for (int i = 0; i < n && i < (int)f.size && first < 0; ++i)
+    if (f.payload[i] != want[i])
+      first = i;
+  char blocks[160], line[512];
+  BlocksText(&f, blocks, sizeof blocks);
+  snprintf(line, sizeof line,
+           "the licensed form, %s: the payload of %u bytes (blocks %s) byte for byte what the licensed core sent (%d "
+           "bytes)%s",
+           what, f.size, blocks, n, first < 0 && (int)f.size == n ? "" : ", it is not");
+  Check(Full(&f) && (int)f.size == n && first < 0, line);
+  if (first >= 0)
+    printf("      first byte that differs: %d (0x%02x, want 0x%02x)\n", first, f.payload[first], want[first]);
+  // Hades' own form of the same frame is another payload (the default does not change)
+  struct dvbridge_context* own = dvbridge_create();
+  const struct frame g = Second(own, &d, RASTER, 2);
+  BlocksText(&g, blocks, sizeof blocks);
+  snprintf(line, sizeof line, "the licensed form, %s: Hades' own form is another payload (blocks %s, a level 5 block)",
+           what, blocks);
+  Check(Full(&g) && (g.size != f.size || memcmp(g.payload, f.payload, f.size)) && g.hasL5, line);
+  dvbridge_destroy(own);
+  dvbridge_destroy(ctx);
+  Free(&d);
+}
+
+static void FormTests(void)
+{
+  // 1. the two captures, byte for byte (the header of the IPT tunnel, the blocks, their order and values)
+  Captured("profile 5, content mapping v4.0 (level 5 and 6 left out, level 254 0000, the blocks by level)", P5Rpu,
+           "00002002031f06912002fc5b04432002010bea5700000000080000000800000042b8fea4fea4fea442b8fea4fea4fea442b8"
+           "ffff00000000000000000c02010100070c07002a0a0000000601000c0bb306d30000000e0208210600080304bb0800078f0800"
+           "0000000e020b2307c1082d077f080007f408000000000e020c070800080208010800080008000000000603083508000505000000"
+           "0404010001800000000d080107ee087e08000800078f0800000000010900000000040b0100000000000002fe0000");
+  Captured("Top Gun: Maverick, profile 7, content mapping v2.9 (a neutral level 3 added, no level 5)", MaverickRpu,
+           "00002002031f06912002fc5b04432002010bea5700000000080000000800000042b8fea4fea4fea442b8fea4fea4fea442b8"
+           "ffff00000000000000000c02010100070c07002a040000000601000c083c03330000000e020821070c082b072308000714000000"
+           "000006030800080008000000000404028a0192");
+
+  char line[512], blocks[160];
+  // 2. each part alone; Hades' own first
+  struct md p5 = P5Rpu();
+  struct dvbridge_context* ctx = dvbridge_create();
+  struct frame own = Second(ctx, &p5, RASTER, 1);
+  BlocksText(&own, blocks, sizeof blocks);
+  const uint8_t* b254 = NULL;
+  const int n254 = BlockOf(&own, 254, 0, &b254);
+  snprintf(line, sizeof line, "Hades' own form: the blocks in the order of their rank, the v2.9 part first (%s; want 1 2 2 2 4 5 3 8 9 11 254), "
+           "level 254 as the RPU has it (0002)", blocks);
+  Check(Full(&own) && !strcmp(blocks, "1 2 2 2 4 5 3 8 9 11 254") && n254 == 2 && b254[0] == 0 && b254[1] == 2, line);
+  dvbridge_destroy(ctx);
+
+  ctx = dvbridge_create();
+  dvbridge_set_form(ctx, DVBRIDGE_L5_PLACED, DVBRIDGE_FORM_LEVEL_ORDER);
+  struct frame ordered = Second(ctx, &p5, RASTER, 1);
+  struct dvbridge_candidate* c = dvbridge_prepare_transport(ctx, p5.m, p5.size, 83416, RASTER, false, 1);
+  struct dvbridge_reading r;
+  memset(&r, 0, sizeof r);
+  const int read = c && dvbridge_candidate_reading(c, &r);
+  uint8_t sent[40];
+  unsigned area[4];
+  const int count = dvbridge_sent_blocks(c, sent, 40, area);
+  dvbridge_candidate_destroy(c);
+  BlocksText(&ordered, blocks, sizeof blocks);
+  // the same blocks, each with the same bytes, in another order
+  int same = Full(&ordered) && ordered.size == own.size && ordered.numBlocks == own.numBlocks;
+  for (unsigned level = 0; level < 256 && same; ++level)
+    for (unsigned k = 0; k < 8; ++k)
+    {
+      const uint8_t *a = NULL, *b = NULL;
+      const int la = BlockOf(&own, level, k, &a), lb = BlockOf(&ordered, level, k, &b);
+      same &= la == lb && (la < 0 || !memcmp(a, b, (size_t)la));
+    }
+  snprintf(line, sizeof line, "the blocks in the order of their level: %s (want 1 2 2 2 3 4 5 8 9 11 254), each block "
+           "byte for byte Hades' own; the reading says so (%d), the player information reads %d blocks back", blocks,
+           r.level_order, count);
+  Check(same && !strcmp(blocks, "1 2 2 2 3 4 5 8 9 11 254") && read && r.level_order && count == 11 &&
+            sent[4] == 3 && sent[10] == 254,
+        line);
+  dvbridge_destroy(ctx);
+
+  ctx = dvbridge_create();
+  dvbridge_set_form(ctx, DVBRIDGE_L5_PLACED, DVBRIDGE_FORM_L254_ZERO);
+  struct frame zero = Second(ctx, &p5, RASTER, 1);
+  b254 = NULL;
+  const int z254 = BlockOf(&zero, 254, 0, &b254);
+  BlocksText(&zero, blocks, sizeof blocks);
+  snprintf(line, sizeof line, "level 254 with version 0: %02x%02x (want 0000), the rest as Hades' own (%s)",
+           z254 == 2 ? b254[0] : 0xff, z254 == 2 ? b254[1] : 0xff, blocks);
+  Check(Full(&zero) && z254 == 2 && b254[0] == 0 && b254[1] == 0 && zero.size == own.size &&
+            !memcmp(zero.payload, own.payload, (size_t)(b254 - zero.payload)),
+        line);
+  // ... and in the default v4.0 part, where it is added
+  struct md m29 = MaverickRpu();
+  dvbridge_set_cm40_default(ctx, true);
+  struct frame added = Second(ctx, &m29, RASTER, 1);
+  b254 = NULL;
+  const int a254 = BlockOf(&added, 254, 0, &b254);
+  snprintf(line, sizeof line, "level 254 with version 0 in the default v4.0 part: %02x%02x (want 0000)",
+           a254 == 2 ? b254[0] : 0xff, a254 == 2 ? b254[1] : 0xff);
+  Check(Full(&added) && a254 == 2 && b254[0] == 0 && b254[1] == 0, line);
+  dvbridge_destroy(ctx);
+
+  // 3. the neutral level 3: content mapping v2.9 only, a display that reads v4.0 only, one level 3 only
+  ctx = dvbridge_create();
+  dvbridge_set_form(ctx, DVBRIDGE_L5_PLACED, DVBRIDGE_FORM_L3_NEUTRAL);
+  struct frame n29 = Second(ctx, &m29, RASTER, 1);
+  const uint8_t* b3 = NULL;
+  const int l3 = BlockOf(&n29, 3, 0, &b3);
+  static const uint8_t neutral[6] = {0x08, 0x00, 0x08, 0x00, 0x08, 0x00};
+  BlocksText(&n29, blocks, sizeof blocks);
+  struct frame n40 = Second(ctx, &p5, RASTER, 1);
+  const uint8_t* b3b = NULL;
+  const int second3 = BlockOf(&n40, 3, 1, &b3b);
+  dvbridge_set_display_management(ctx, 2);
+  struct frame dm2 = Second(ctx, &m29, RASTER, 1);
+  dvbridge_set_display_management(ctx, 4);
+  dvbridge_set_cm40_default(ctx, true);
+  struct frame withdef = Second(ctx, &m29, RASTER, 1);
+  const uint8_t* b3c = NULL;
+  const int twice = BlockOf(&withdef, 3, 1, &b3c);
+  snprintf(line, sizeof line, "a neutral level 3: added to content mapping v2.9 (%s, level 3 %s), not to v4.0 (a "
+           "second level 3: %s), not for display management 2 (%s), not twice with the default v4.0 part (%s)",
+           blocks, l3 == 6 && !memcmp(b3, neutral, 6) ? "0800 0800 0800" : "wrong",
+           second3 >= 0 ? "yes" : "no", BlockOf(&dm2, 3, 0, &b3b) >= 0 ? "added" : "none",
+           twice >= 0 ? "twice" : "once");
+  Check(Full(&n29) && l3 == 6 && !memcmp(b3, neutral, 6) && Full(&n40) && second3 < 0 && n40.size == own.size &&
+            Full(&dm2) && BlockOf(&dm2, 3, 0, &b3b) < 0 && Full(&withdef) && twice < 0,
+        line);
+  dvbridge_destroy(ctx);
+  Free(&m29);
+
+  // 4. the level 5 block: the four forms, with bars inside the picture, drawn over, and bars of the player around a
+  // picture whose RPU has a level 5 block of zeros, or none
+  struct md bars = NewMetadata();
+  AddL1(&bars, 62, 1000, 3000);
+  AddL5(&bars, 0, 0, 276, 276);
+  struct md zeros = NewMetadata();
+  AddL1(&zeros, 62, 1000, 3000);
+  AddL5(&zeros, 0, 0, 0, 0);
+  struct md none = NewMetadata();
+  AddL1(&none, 62, 1000, 3000);
+  const struct dvbridge_geometry SCOPE = {3840, 1600, 0, 280, 3840, 1600};
+  static const char* names[4] = {"Hades' own", "as in the video", "not sent", "Hades' own, none made"};
+  static const int forms[4] = {DVBRIDGE_L5_PLACED, DVBRIDGE_L5_AS_GIVEN, DVBRIDGE_L5_NONE, DVBRIDGE_L5_UNMADE};
+  // what each form sends (-1: no block) for: bars, bars drawn over (every edge), a 3840x1600 picture placed at row 280
+  // with a level 5 block of zeros, and the same without a level 5 block
+  static const int want[4][4][4] = {
+      {{0, 0, 276, 276}, {0, 0, 0, 0}, {0, 0, 280, 280}, {0, 0, 280, 280}},
+      {{0, 0, 276, 276}, {0, 0, 276, 276}, {0, 0, 0, 0}, {-1, -1, -1, -1}},
+      {{-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1}},
+      {{0, 0, 276, 276}, {0, 0, 0, 0}, {0, 0, 280, 280}, {-1, -1, -1, -1}},
+  };
+  static const unsigned margins[4][4] = {{0, 0, 276, 276}, {0, 0, 276, 276}, {0, 0, 280, 280}, {0, 0, 280, 280}};
+  for (int k = 0; k < 4; ++k)
+  {
+    ctx = dvbridge_create();
+    dvbridge_set_form(ctx, forms[k], 0);
+    dvbridge_reset(ctx); // (kept through a reset: the user's)
+    int ok = 1;
+    char got[256];
+    size_t at = 0;
+    for (int s = 0; s < 4; ++s)
+    {
+      const struct md* d = s == 3 ? &none : s == 2 ? &zeros : &bars;
+      const struct dvbridge_geometry g = s >= 2 ? SCOPE : RASTER;
+      struct dvbridge_candidate* cand = dvbridge_prepare_transport(ctx, d->m, d->size, 0, g, false, 0);
+      if (cand && s == 1)
+        ok &= dvbridge_candidate_cover(cand, 15);
+      const struct frame f = Read(cand);
+      unsigned sentl5[4] = {0};
+      const int blocksBack = dvbridge_sent_blocks(cand, NULL, 0, sentl5);
+      dvbridge_candidate_destroy(cand);
+      const int has = want[k][s][0] >= 0;
+      ok &= Full(&f) && f.hasL5 == has && blocksBack >= 0 && !memcmp(f.margins, margins[s], 16);
+      for (int j = 0; j < 4 && has; ++j)
+        ok &= f.l5[j] == (unsigned)want[k][s][j] && sentl5[j] == (unsigned)want[k][s][j];
+      ok &= has || sentl5[0] == DVBRIDGE_SENT_NO_L5;
+      at += (size_t)snprintf(got + at, sizeof got - at, "%s%s", s ? "; " : "",
+                             f.hasL5 ? "" : "none");
+      if (f.hasL5)
+        at += (size_t)snprintf(got + at, sizeof got - at, "%u %u %u %u", f.l5[0], f.l5[1], f.l5[2], f.l5[3]);
+    }
+    snprintf(line, sizeof line, "level 5, %s: bars of 276 / drawn over / scope with a block of zeros / without: %s; the "
+             "blanking margins the film's in each", names[k], got);
+    Check(ok, line);
+    dvbridge_destroy(ctx);
+  }
+  Free(&bars);
+  Free(&zeros);
+  Free(&none);
+  Free(&p5);
+}
+#endif
 
 int main(void)
 {
@@ -1234,6 +1599,76 @@ int main(void)
     dvbridge_destroy(u);
     dvbridge_destroy(v);
   }
+#endif
+
+#ifdef DVBRIDGE_REFRESH_ALL
+  // ============================================================ 12. every frame the first picture of a scene
+  // (a comparison on a display, off by default): scene_refresh_flag 1 in every frame whatever the RPU says, the rest
+  // of the payload as without it; a scene whose metadata do not change keeps its metadata id; kept by a reset; off,
+  // the flag of the RPU again
+  {
+    const double P = 41708;
+    struct md a = NewMetadata(), b = NewMetadata();
+    AddL1(&a, 62, 1000, 3000); // scene_refresh_flag 0 in the RPU
+    AddL2(&a, 2081);
+    AddL5(&a, 0, 0, 276, 276);
+    AddL1(&b, 62, 1200, 3200);
+    char line[256];
+    struct dvbridge_context* plain = dvbridge_create();
+    struct dvbridge_context* all = dvbridge_create();
+    dvbridge_set_frame_period(plain, P);
+    dvbridge_set_frame_period(all, P);
+    dvbridge_set_refresh_all(all, true);
+    double t = 0;
+    struct frame p0 = Frame(plain, &a, t, RASTER, 1);
+    struct frame a0 = Frame(all, &a, t, RASTER, 1);
+    int ones = 0, zeros = 0, sameRest = 1;
+    unsigned id = a0.id;
+    int idKept = 1;
+    for (int k = 0; k < 10; ++k)
+    {
+      t += P;
+      struct frame p = Frame(plain, &a, t, RASTER, 1);
+      struct frame f = Frame(all, &a, t, RASTER, 1);
+      ones += Full(&f) && f.refresh == 1;
+      zeros += Full(&p) && p.refresh == 0;
+      // the payload with the switch is the one without it but for the flag (byte 1)
+      sameRest = sameRest && p.size == f.size && !memcmp(p.payload, f.payload, 1) &&
+                 !memcmp(p.payload + 2, f.payload + 2, f.size - 2);
+      idKept = idKept && f.id == id;
+    }
+    snprintf(line, sizeof line, "with the switch: %d of 10 frames whose RPU says 0 sent with 1; without it: %d of 10 with 0",
+             ones, zeros);
+    Check(Full(&a0) && Full(&p0) && a0.refresh == 1 && ones == 10 && zeros == 10, line);
+    Check(sameRest, "the payload with the switch is the one without it, but for scene_refresh_flag");
+    Check(idKept, "a scene whose metadata do not change keeps its metadata id with the switch (the payload is the same)");
+    // other metadata: a new id, and the flag 1 still
+    struct frame nb = Frame(all, &b, t += P, RASTER, 1);
+    Check(Full(&nb) && nb.refresh == 1 && nb.id == ((id + 1) & 15), "... new metadata take the next id, sent with 1");
+    // a repeat keeps 1
+    struct frame rep = Frame(all, &b, t, RASTER, 1);
+    Check(Full(&rep) && rep.refresh == 1 && rep.id == nb.id, "a repeated frame keeps the flag 1 and the id");
+    // a new stream keeps the switch
+    dvbridge_reset(all);
+    Frame(all, &a, 0, RASTER, 1);
+    struct frame r1 = Frame(all, &a, P, RASTER, 1);
+    snprintf(line, sizeof line, "after a reset: the second frame of the stream sent with %u (want 1)", r1.refresh);
+    Check(Full(&r1) && r1.refresh == 1, line);
+    // off again: the RPU's flag from the next frame on
+    dvbridge_set_refresh_all(all, false);
+    struct frame off = Frame(all, &a, 2 * P, RASTER, 1);
+    snprintf(line, sizeof line, "the switch off again: the next frame sent with %u (want the RPU's 0)", off.refresh);
+    Check(Full(&off) && off.refresh == 0, line);
+    printf("      %s\n", line);
+    Free(&a);
+    Free(&b);
+    dvbridge_destroy(plain);
+    dvbridge_destroy(all);
+  }
+#endif
+
+#ifdef DVBRIDGE_FORM
+  FormTests();
 #endif
 
   printf("%d checks, %d failed\n%s\n", g_checks, g_failures, g_failures ? "FAILED" : "ALL PASSED");

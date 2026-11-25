@@ -293,12 +293,13 @@ brender() {
   rg_bridge "$1" "$LP" "$FF" "$2/measured_pt.c" "$2/measured" "$SRC" || { echo "BUILD FAILED measured: $(grep -a -m1 -E 'FAIL|error' "$2/measured.build.log")"; return 1; }
   echo "built: render, measured; compiler warnings $(cat "$2/render.build.log" "$2/measured.build.log" | grep -a -c 'warning:')"
 }
-# rrun <log> <0: as it is | 1: the pass times on | resh: the composer by libplacebo's reshaping> <binary> <arguments...>:
+# rrun <log> <0: as it is | 1: the pass times on | 8: on, one render in 8 timed | resh: the composer by libplacebo's
+# reshaping> <binary> <arguments...>:
 # a run of a GL test, its whole output in its log
 rrun() {
   local L=$1 how=$2 bin=$3 e=DV_GL_TEST=1
   shift 3
-  case $how in 1) e=DV_PASSTIMES=1 ;; resh) e=DV_CCM=0 ;; esac
+  case $how in 1) e=DV_PASSTIMES=1 ;; 8) e=DV_PASSTIMES=8 ;; resh) e=DV_CCM=0 ;; esac
   rg_log "$L" env "$e" $RG_GPU_ENV nice -n 19 timeout 2400 "$bin" "$@"
 }
 reader() { grep -a -m1 '^CCM 001 reader:' "$1" | cut -c1-140; }
@@ -310,7 +311,7 @@ stage_render() {
   L=$RG_W/logs/render-build.log
   rg_log "$L" brender "$K" "$O"
   if ! [ -x "$O/render" ] || ! [ -x "$O/measured" ]; then
-    for v in oracle-render-full oracle-render-half oracle-measured k24 passtime-render passtime-measured; do
+    for v in oracle-render-full oracle-render-half oracle-measured k24 passtime-render passtime-measured passtime-sampled; do
       rg_item "$v" FAILED "not built: $(grep -a -m1 'BUILD FAILED' "$L" | cut -c1-160)"; done
     return 0
   fi
@@ -320,6 +321,8 @@ stage_render() {
   rrun "$RG_W/logs/render-resh.log" resh "$O/render" "$IN/BL_EL.mkv" 3 24 6
   rrun "$RG_W/logs/measured-off.log" 0 "$O/measured" "$IN/hdr10_240.mkv" 12 20
   rrun "$RG_W/logs/measured-on.log" 1 "$O/measured" "$IN/hdr10_240.mkv" 12 20
+  rrun "$RG_W/logs/render-sampled.log" 8 "$O/render" "$IN/BL_EL.mkv" 3 24 6
+  rrun "$RG_W/logs/measured-sampled.log" 8 "$O/measured" "$IN/hdr10_240.mkv" 12 20
   # the CCM 001 reader: every transport of every way read as the clause says
   for v in render-full:render-off render-half:render-half measured:measured-off; do
     L=$RG_W/logs/${v#*:}.log
@@ -353,6 +356,24 @@ stage_render() {
      grep -a -q '^ok: .*packing has the time' "$RG_W/logs/measured-on.log"; then
     rg_item passtime-measured PASSED "off and on ALL PASSED, the same $(wc -l < "$O/measured-on.draw") drawing lines; on: $(grep -a -m1 '^pass times:' "$RG_W/logs/measured-on.log" | cut -c1-110)"
   else rg_item passtime-measured FAILED "off: $(rg_rest "$b"); on: $(rg_rest "$a"); drawing lines $(wc -l < "$O/measured-off.draw") and $(wc -l < "$O/measured-on.draw"), $(cmp -s "$O/measured-off.draw" "$O/measured-on.draw" && echo same || echo DIFFER)"; fi
+  sampled "$O" "$RG_W/logs/render-sampled.log" "$RG_W/logs/measured-sampled.log" passtime-sampled
+}
+
+# sampled <folder> <render log> <measured log> <item>: one render in 8 timed (Kodi's default, DV_PASSTIMES=8): the same
+# drawings as without the timing, ALL PASSED (the measured test: the packing timed in the renders timed alone), and
+# libplacebo's passes of the render test with at most a quarter of the times of the run that times every render
+sampled() {
+  local O=$1 R=$2 M=$3 item=$4 a b on sm
+  grep -a -E '^picture [0-9]+.*: margins' "$R" > "$O/render-sampled.draw"
+  grep -a -E '^picture [0-9]+: ' "$M" > "$O/measured-sampled.draw"
+  a=$(rg_pass "$R" '^ALL PASSED'); b=$(rg_pass "$M" '^ALL PASSED')
+  on=$(grep -a -m1 '^pass times:' "$RG_W/logs/render-on.log" | sed -n "s/.* passes, \([0-9]*\) times of libplacebo's.*/\1/p")
+  sm=$(grep -a -m1 '^pass times:' "$R" | sed -n "s/.* passes, \([0-9]*\) times of libplacebo's.*/\1/p")
+  if [ "$(rg_say "$a")" = PASSED ] && [ "$(rg_say "$b")" = PASSED ] && cmp -s "$O/render-off.draw" "$O/render-sampled.draw" &&
+     cmp -s "$O/measured-off.draw" "$O/measured-sampled.draw" && [ -s "$O/render-sampled.draw" ] &&
+     grep -a -q '^ok: .*timed one render in n' "$M" && [ -n "$on" ] && [ -n "$sm" ] && [ "$sm" -gt 0 ] && [ $((sm * 4)) -le "$on" ]; then
+    rg_item "$item" PASSED "one render in 8 timed: ALL PASSED, the same drawings; libplacebo's times $sm of $on; measured: $(grep -a -m1 '^pass times:' "$M" | cut -c1-120)"
+  else rg_item "$item" FAILED "render: $(rg_rest "$a"); measured: $(rg_rest "$b"); libplacebo's times ${sm:-?} sampled, ${on:-?} every render; drawings $(cmp -s "$O/render-off.draw" "$O/render-sampled.draw" && echo same || echo DIFFER)/$(cmp -s "$O/measured-off.draw" "$O/measured-sampled.draw" && echo same || echo DIFFER); $(grep -a -m1 '^FAIL' "$M" | cut -c1-100)"; fi
 }
 
 # The mutants of the render and measured tests: the defects of the transport that only the reader sees, the pass
@@ -364,7 +385,7 @@ stage_mutants() {
   local O=$RG_W/rmut m test want L B n f
   SPEC=$T/mut_measure.py
   rg_fresh "$O"
-  for m in $($MUT list "$SPEC" | awk '$2 ~ /^(oracle-render|oracle-measured|passtime|passtime-measured|k24)$/ {print $1}'); do
+  for m in $($MUT list "$SPEC" | awk '$2 ~ /^(oracle-render|oracle-measured|passtime|passtime-measured|passtime-sampled|k24)$/ {print $1}'); do
     test=$($MUT list "$SPEC" | awk -v m="$m" '$1 == m {print $2}'); want=$(wanted "$SPEC" "$m")
     B=$RG_W/logs/mut-$m-build.log
     rg_rm "$O/render" "$O/measured"
@@ -377,6 +398,7 @@ stage_mutants() {
       k24) rrun "$L" 0 "$O/render" "$IN/BL_EL.mkv" 3 24 6 half ;;
       passtime) rrun "$L" 1 "$O/render" "$IN/BL_EL.mkv" 3 24 2; rrun "$L.measured" 1 "$O/measured" "$IN/hdr10_240.mkv" 12 20 ;;
       passtime-measured) rrun "$L" 1 "$O/measured" "$IN/hdr10_240.mkv" 12 20 ;;
+      passtime-sampled) rrun "$L" 8 "$O/measured" "$IN/hdr10_240.mkv" 12 20 ;;
     esac
     case $want in
       reader)
@@ -390,6 +412,9 @@ stage_mutants() {
       placebo)
         f=$(grep -a -c '^FAIL: libplacebo draws none of these pictures' "$L")
         rg_item "mutant-$m" "$([ "$f" = 1 ] && echo PASSED || echo FAILED)" "measured, timed: 'libplacebo draws none of these pictures' fails: $f; $(grep -a -m1 '^pass times:' "$L" | cut -c1-90) [$($MUT what "$SPEC" "$m")]" ;;
+      sampled)
+        f=$(grep -a -c '^FAIL: timed one render in n' "$L")
+        rg_item "mutant-$m" "$([ "$f" = 1 ] && echo PASSED || echo FAILED)" "measured, one render in 8 timed: 'the bridge's packing has the time of the renders timed alone' fails: $f; $(grep -a -m1 '^pass times:' "$L" | cut -c1-100) [$($MUT what "$SPEC" "$m")]" ;;
       clamp)
         f=$(grep -a -c '^FAIL: the colour of the float picture holds only values within \[0, 1\]' "$L")
         rg_item "mutant-$m" "$([ "$f" = 1 ] && echo PASSED || echo FAILED)" "half picture: 'the colour of the float picture holds only values within [0, 1]' fails: $f; $(grep -a -c '^FAIL' "$L") FAIL lines in all [$($MUT what "$SPEC" "$m")]" ;;
@@ -497,12 +522,19 @@ stage_dvplus() {
 KFILES="include/linux/hdmi.h include/drm/drm_hdr10plus.h drivers/gpu/drm/amd/display/dc/dc_types.h
   drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdr10plus.h drivers/gpu/drm/i915/display/intel_hdr10plus.h"
 kfiles() { # <dest>
-  local D=$1 pk ver sha tb P
+  local D=$1 pk ver sha name tb P
   pk=$(git -C "$REGRESS_LE_GIT" show "$REGRESS_LE_REF:packages/linux/package.mk") || return 1
   ver=$(echo "$pk" | awk '/^  \*\)/ {f = 1} f && /PKG_VERSION=/ {gsub(/^[^"]*"|".*$/, ""); print; exit}')
   sha=$(echo "$pk" | awk '/^  \*\)/ {f = 1} f && /PKG_SHA256=/ {gsub(/^[^"]*"|".*$/, ""); print; exit}')
   [ -n "$ver" ] && [ -n "$sha" ] || { echo "no version or PKG_SHA256 of the kernel (LINUX=default) at $REGRESS_LE_REF"; return 1; }
-  tb=$(rg_source linux "linux-$ver.tar.xz") || { echo "no linux-$ver.tar.xz in REGRESS_SOURCES"; return 1; }
+  # the archive's name: PKG_SOURCE_NAME where the recipe sets one (an archive of a commit, as for a release candidate:
+  # linux-${LINUX}-${PKG_VERSION}.tar.gz), else kernel.org's linux-<version>.tar.xz
+  name=$(echo "$pk" | awk '/^  \*\)/ {f = 1} f && /PKG_SOURCE_NAME=/ {gsub(/^[^"]*"|".*$/, ""); print; exit}')
+  name=${name:-linux-$ver.tar.xz}
+  name=${name//\$\{LINUX\}/default}
+  name=${name//\$\{PKG_VERSION\}/$ver}
+  case $name in *'$'*) echo "a kernel archive name that is not understood: $name"; return 1;; esac
+  tb=$(rg_source linux "$name") || { echo "no $name in REGRESS_SOURCES"; return 1; }
   [ "$(sha256sum < "$tb" | cut -c1-64)" = "$sha" ] || { echo "the sha256 of $tb is not PKG_SHA256 $sha"; return 1; }
   echo "kernel $ver: $tb, sha256 $sha (PKG_SHA256 of $REGRESS_LE_REF)"
   P=$D.patches

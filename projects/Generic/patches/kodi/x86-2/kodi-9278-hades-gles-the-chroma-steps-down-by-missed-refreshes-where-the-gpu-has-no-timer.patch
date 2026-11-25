@@ -1,0 +1,708 @@
+From deb8333903e1df35853a130ce1b11a59d2d8eb6e Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:40:18 +0000
+Subject: [PATCH] [Hades][GLES] The chroma steps down by missed refreshes where
+ the GPU has no timer
+
+The Lanczos 3 chroma of the 4:2:0 pictures that Kodi draws itself
+stepped down only by the GPU time of its pictures. A GPU without
+GL_EXT_disjoint_timer_query never stepped down, and one that has it
+with timestamps of no bits (GL_QUERY_COUNTER_BITS_EXT 0, which the
+extension allows) was told to step down where its time said so, and
+its time never came: kodi.log promised a step-down that nothing
+measured.
+
+The bits of the timestamps are now asked: a timer is usable only where
+they are more than 0, in Kodi's renderer and in the window system's own
+timers (native Dolby Vision, Dolby Vision rebuilt, HDR10 adapted), and
+the log says which of the two is missing. A GPU without a usable timer
+is measured by the refreshes that its pictures miss, the signal that
+the step-down of Dolby Vision rebuilt already uses: the window system
+reads the flip of each commit that carries such a picture from its
+out-fence, and a flip more than 1.5 refresh periods after the one
+before missed a refresh (CFlipChain). A window of 48 presentations is
+behind when 5 % of them, 3 at least, missed their refresh, and two
+windows behind in a row take the filter a level down; without the GPU
+time the cause of a missed refresh is not known, so one window alone
+never does. Where neither can be read (no out-fence), the log says so.
+
+A GPU with a usable timer is measured by its GPU time alone, as
+before: the same levels and the same bytes. Strong GPUs that miss no
+refresh never step down.
+---
+ .../VideoRenderers/ChromaStepDown.h           | 147 +++++++++++++++++-
+ .../VideoRenderers/LinuxRendererGLES.cpp      | 124 ++++++++++++++-
+ .../VideoRenderers/LinuxRendererGLES.h        |   7 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  91 ++++++++++-
+ xbmc/windowing/gbm/WinSystemGbmGLESContext.h  |  24 +++
+ 5 files changed, 371 insertions(+), 22 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h b/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
+index b463b05..f798b14 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/ChromaStepDown.h
+@@ -26,6 +26,8 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstdint>
++#include <utility>
+ 
+ namespace KODI
+ {
+@@ -116,7 +118,8 @@ inline const char* LocationName(int location)
+ }
+ 
+ /*!
+- * \brief The step-down of the chroma filter of a video, by the GPU time of its pictures
++ * \brief The step-down of the chroma filter of a video, by the GPU time of its pictures, or, where the GPU has no
++ *        timer, by the refreshes that its pictures miss
+  *
+  * The renderer times each picture that it draws itself with a filter of more than one sample
+  * (LANCZOS3, SPLINE16) and gives the time here with the refresh period. The first SKIP timed
+@@ -132,6 +135,16 @@ inline const char* LocationName(int location)
+  * and each video starts again from LANCZOS3 (what was found for the last one may not hold for this
+  * one: its size, its rate and the refresh rate are its own). A forced level (advancedsettings.xml)
+  * never changes.
++ *
++ * Hades: a GPU without a usable timer (no GL_EXT_disjoint_timer_query, or one whose timestamps have no bits:
++ * GL_QUERY_COUNTER_BITS_EXT 0) cannot say how long its pictures take. Its pictures are then measured by the refreshes
++ * that they miss (MISSED_REFRESHES), as Dolby Vision rebuilt is (CDVConvertStep: the flip of each commit that carries
++ * one, by its out-fence, more than CFlipChain::LATE_PERIODS refresh periods after the one before; Presented()): a
++ * window of WINDOW presentations is behind when PART of them, MIN_OVER at least, missed their refresh, and two windows
++ * behind in a row take the filter one level down, as above. Without the GPU time the cause of a missed refresh is not
++ * known (a decoder, the processor), so one window never decides alone. A GPU with a timer is measured by its GPU time
++ * alone, as before: the same levels, the same bytes. Where neither can be read (no fence of the flips), nothing is
++ * measured (NONE), and the log says so.
+  */
+ class CStepDown
+ {
+@@ -142,11 +155,20 @@ public:
+   static constexpr double PART = 0.05; //!< CDVStepDown::LOST_PART
+   static constexpr unsigned int MIN_OVER = 3;
+ 
++  //! How the pictures of a video are measured
++  enum class Measure
++  {
++    GPU_TIME, //!< the GPU time of each picture (GL_EXT_disjoint_timer_query)
++    MISSED_REFRESHES, //!< the refreshes that the commits of its pictures miss (the GPU has no usable timer)
++    NONE, //!< neither can be read: no step-down
++  };
++
+   //! What a window found, for the log
+   struct Window
+   {
+     unsigned int frames = 0;
+     unsigned int over = 0; //!< pictures over LOADED of the period
++    unsigned int lost = 0; //!< MISSED_REFRESHES: presentations that missed their refresh
+     double averageMs = 0; //!< without the slowest picture
+     double maxMs = 0;
+     double periodMs = 0;
+@@ -154,9 +176,10 @@ public:
+   };
+ 
+   //! A new video: from the most faithful level, or from the level that advancedsettings.xml forces
+-  //! (0 to 3; any other value: none)
+-  void Start(int forced = -1)
++  //! (0 to 3; any other value: none), measured as measure says
++  void Start(int forced = -1, Measure measure = Measure::GPU_TIME)
+   {
++    m_measure = measure;
+     m_forced = forced >= 0 && forced < FILTERS;
+     m_filter = m_forced ? static_cast<Filter>(forced) : Filter::LANCZOS3;
+     m_windows = 0;
+@@ -166,11 +189,17 @@ public:
+ 
+   Filter Current() const { return m_filter; }
+   bool Forced() const { return m_forced; }
+-  //! Whether the pictures are timed at this level: it can still go down
+-  bool Timing() const
++  Measure HowMeasured() const { return m_measure; }
++  //! Whether the pictures are measured at this level, one way or the other: it can still go down
++  bool Measuring() const
+   {
+-    return !m_forced && (m_filter == Filter::LANCZOS3 || m_filter == Filter::SPLINE16);
++    return !m_forced && (m_filter == Filter::LANCZOS3 || m_filter == Filter::SPLINE16) &&
++           m_measure != Measure::NONE;
+   }
++  //! Whether the pictures are timed at this level (by their GPU time): it can still go down
++  bool Timing() const { return Measuring() && m_measure == Measure::GPU_TIME; }
++  //! Whether the refreshes of the pictures are counted at this level (no timer): it can still go down
++  bool CountingRefreshes() const { return Measuring() && m_measure == Measure::MISSED_REFRESHES; }
+   //! Windows measured since the start of the video
+   unsigned int Windows() const { return m_windows; }
+   const Window& Last() const { return m_last; }
+@@ -227,6 +256,52 @@ public:
+     return true;
+   }
+ 
++  /*!
++   * \brief Hades: a picture presented, where the GPU has no timer (MISSED_REFRESHES): whether its commit missed its
++   *        refresh (CFlipChain)
++   * \param periodMs the refresh period of the display
++   * \return true when the level changed with it, as Timed()
++   */
++  bool Presented(bool late, double periodMs)
++  {
++    if (!CountingRefreshes() || !(periodMs > 0))
++      return false;
++    if (m_skip > 0)
++    {
++      --m_skip;
++      return false;
++    }
++    if (m_frames > 0 && periodMs != m_periodMs)
++      m_frames = 0; // (another refresh rate: a window of its own)
++    if (m_frames == 0)
++    {
++      m_periodMs = periodMs;
++      m_lost = 0;
++    }
++    ++m_frames;
++    m_lost += late ? 1 : 0;
++    if (m_frames < WINDOW)
++      return false;
++
++    Window w;
++    w.frames = m_frames;
++    w.lost = m_lost;
++    w.periodMs = m_periodMs;
++    const unsigned int part = static_cast<unsigned int>(PART * m_frames + 0.999);
++    w.behind = m_lost >= std::max(MIN_OVER, part);
++    m_last = w;
++    m_frames = 0;
++    ++m_windows;
++    // (the cause of a missed refresh is not known without the GPU time: never one window alone)
++    const bool down = w.behind && m_behindBefore;
++    m_behindBefore = w.behind;
++    if (!down)
++      return false;
++    m_filter = m_filter == Filter::LANCZOS3 ? Filter::SPLINE16 : Filter::SITED;
++    Restart();
++    return true;
++  }
++
+ private:
+   void Restart()
+   {
+@@ -236,7 +311,9 @@ private:
+   }
+ 
+   Filter m_filter = Filter::LANCZOS3;
++  Measure m_measure = Measure::GPU_TIME;
+   bool m_forced = false;
++  unsigned int m_lost = 0;
+   unsigned int m_skip = SKIP;
+   unsigned int m_frames = 0;
+   unsigned int m_over = 0;
+@@ -248,5 +325,63 @@ private:
+   Window m_last;
+ };
+ 
++/*!
++ * \brief Hades: whether the pictures that Kodi's renderer drew came with their refresh, by the flips of the commits
++ *        that carried them (the measure of CStepDown where the GPU has no timer)
++ *
++ * The window system reads when the commit of a frame flipped from its out-fence, in the pass after it
++ * (CWinSystemGbmGLESContext::PresentRender()), as it does for Dolby Vision rebuilt (CDVConvertStep::Flipped()): a flip
++ * more than LATE_PERIODS refresh periods after the flip of the commit before missed a refresh. A commit that carries a
++ * picture is told with a tag (the level of its chroma, so that what comes back after a change of level is not taken
++ * for the new one); the flips are read while a commit carries one, or the one before did, and the chain of flips ends
++ * where the pictures end, so that the first picture after a pause is timed from a flip of its own run. Pure logic: a
++ * host test runs it (tools/regress of LibreELEC, kodi-host: chroma_step_test.cpp).
++ */
++class CFlipChain
++{
++public:
++  //! CDVConvertStep::LATE_PERIODS
++  static constexpr double LATE_PERIODS = 1.5;
++
++  //! A picture whose flip is known: its tag, and whether it missed its refresh (tag -1: nothing known of one)
++  struct Outcome
++  {
++    int tag = -1;
++    bool late = false;
++  };
++
++  //! Whether the flip of the commit before is wanted (carries: the commit of this pass has a picture)
++  bool WantsFlips(bool carries) const { return m_committed >= 0 || carries; }
++
++  //! The commit of this pass carries a picture of that tag (-1: none)
++  void Committed(int tag) { m_committed = tag; }
++
++  /*!
++   * \brief The flip of the commit before came at flipNs (steady clock; 0: not known)
++   * \param carries the commit of this pass has a picture (whose flip is then timed from this one)
++   */
++  Outcome Flipped(int64_t flipNs, double periodMs, bool carries)
++  {
++    const int tag = std::exchange(m_committed, -1);
++    Outcome outcome;
++    if (flipNs <= 0 || !(periodMs > 0))
++    {
++      m_lastFlipNs = 0;
++      return outcome;
++    }
++    if (tag >= 0 && m_lastFlipNs > 0)
++    {
++      outcome.tag = tag;
++      outcome.late = static_cast<double>(flipNs - m_lastFlipNs) > LATE_PERIODS * periodMs * 1e6;
++    }
++    m_lastFlipNs = carries ? flipNs : 0;
++    return outcome;
++  }
++
++private:
++  int m_committed = -1;
++  int64_t m_lastFlipNs = 0;
++};
++
+ } // namespace CHROMA
+ } // namespace KODI
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+index 90d998f..2354dcb 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.cpp
+@@ -30,6 +30,7 @@
+ #include "utils/HDRUtils.h"
+ #include "utils/MathUtils.h"
+ #include "utils/SdrWide.h"
++#include "utils/StringUtils.h"
+ #include "utils/log.h"
+ #include "windowing/WinSystem.h"
+ #ifdef HAVE_DVBRIDGE
+@@ -66,7 +67,8 @@ using namespace Shaders::GLES;
+ namespace
+ {
+ // Hades: GL_EXT_disjoint_timer_query, for the GPU time of the pictures drawn with a chroma filter of
+-// more than one sample (CLinuxRendererGLES::ChromaTimerMark()); null where the GL has none
++// more than one sample (CLinuxRendererGLES::ChromaTimerMark()); null where the GL has none, and not usable where the
++// GPU's timestamps have no bits (GL_QUERY_COUNTER_BITS_EXT 0: its queries give no time)
+ struct ChromaTimerQueries
+ {
+   PFNGLGENQUERIESEXTPROC gen = nullptr;
+@@ -74,7 +76,10 @@ struct ChromaTimerQueries
+   PFNGLQUERYCOUNTEREXTPROC counter = nullptr;
+   PFNGLGETQUERYOBJECTUIVEXTPROC getUiv = nullptr;
+   PFNGLGETQUERYOBJECTUI64VEXTPROC getUi64v = nullptr;
+-  bool Usable() const { return gen && del && counter && getUiv && getUi64v; }
++  int bits = 0;
++  //! why it is not usable, for the log
++  const char* absent = "no GL_EXT_disjoint_timer_query";
++  bool Usable() const { return gen && del && counter && getUiv && getUi64v && bits > 0; }
+ };
+ 
+ const ChromaTimerQueries& ChromaQueries()
+@@ -94,6 +99,18 @@ const ChromaTimerQueries& ChromaQueries()
+           eglGetProcAddress("glGetQueryObjectuivEXT"));
+       q.getUi64v = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
+           eglGetProcAddress("glGetQueryObjectui64vEXT"));
++#if defined(GL_QUERY_COUNTER_BITS_EXT)
++      if (const auto getQueryiv =
++              reinterpret_cast<PFNGLGETQUERYIVEXTPROC>(eglGetProcAddress("glGetQueryivEXT")))
++      {
++        while (glGetError() != GL_NO_ERROR)
++          ;
++        GLint bits = 0;
++        getQueryiv(GL_TIMESTAMP_EXT, GL_QUERY_COUNTER_BITS_EXT, &bits);
++        q.bits = glGetError() == GL_NO_ERROR ? std::max(0, static_cast<int>(bits)) : 0;
++      }
++#endif
++      q.absent = q.bits > 0 ? "" : "the GPU's timestamps have no bits (GL_QUERY_COUNTER_BITS_EXT 0)";
+     }
+ #endif
+     return q;
+@@ -284,7 +301,8 @@ bool CLinuxRendererGLES::Configure(const VideoPicture &picture, float fps, unsig
+   // Hades: the chroma of this video, where it places its samples: from Lanczos 3 again (or the level
+   // that advancedsettings.xml forces), said in the log once its shaders are made (LoadShaders())
+   m_chromaLocation = picture.chroma_position;
+-  m_chroma.Start(CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_videoChromaStep);
++  m_chroma.Start(CServiceBroker::GetSettingsComponent()->GetAdvancedSettings()->m_videoChromaStep,
++                 ChromaMeasure());
+   m_chromaTold = false;
+   m_chromaTimed = 0;
+   m_chromaSumMs = 0;
+@@ -2949,6 +2967,15 @@ bool CLinuxRendererGLES::Render(unsigned int flags, int index)
+     }
+     if (chromaTimed)
+       ChromaTimerMark(false);
++#ifdef HAVE_DVBRIDGE
++    // Hades: ... or, on a GPU without a timer, the refresh that the commit of this pass makes or misses with it
++    // (CFlipChain), told with its level
++    if (m_currentField == FIELD_FULL && m_chroma.CountingRefreshes() && m_pYUVProgShader &&
++        m_pYUVProgShader->ChromaFilter() == m_chroma.Current())
++      if (auto* window = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++              CServiceBroker::GetWinSystem()))
++        window->KodiPictureDrawn(static_cast<int>(m_chroma.Current()));
++#endif
+ #ifdef HAVE_DVBRIDGE
+     // Hades: ... and whether it was applied, for kodi.log and the player information
+     Lut3dDrawn();
+@@ -4113,11 +4140,86 @@ void CLinuxRendererGLES::TellChroma(KODI::CHROMA::Filter filter)
+             m_sourceWidth, m_sourceHeight, KODI::CHROMA::LocationName(m_chromaLocation),
+             nearest ? "the sample nearest to each pixel (scaling method Nearest)"
+                     : KODI::CHROMA::Name(filter),
+-            m_chroma.Forced() ? ", as advancedsettings.xml asks (chromastep)"
+-            : !m_chroma.Timing() ? ""
+-            : ChromaQueries().Usable()
+-                ? ", a level down where the GPU time of its pictures says it does not keep up"
+-                : "; its pictures are not timed (no GL_EXT_disjoint_timer_query): no step-down");
++            ChromaStepSaid());
++}
++
++std::string CLinuxRendererGLES::ChromaStepSaid() const
++{
++  using Measure = KODI::CHROMA::CStepDown::Measure;
++  if (m_chroma.Forced())
++    return ", as advancedsettings.xml asks (chromastep)";
++  switch (m_chroma.HowMeasured())
++  {
++    case Measure::GPU_TIME:
++      return m_chroma.Timing() ? ", a level down where the GPU time of its pictures says it does not keep up" : "";
++    case Measure::MISSED_REFRESHES:
++      return m_chroma.CountingRefreshes()
++                 ? StringUtils::Format(", a level down where its pictures miss refreshes of the display (their GPU "
++                                       "time cannot be measured: {})",
++                                       ChromaQueries().absent)
++                 : "";
++    case Measure::NONE:
++      break;
++  }
++  return StringUtils::Format("; its pictures can be neither timed ({}) nor their refreshes read (the flips of the "
++                             "display have no fence): no step-down",
++                             ChromaQueries().absent);
++}
++
++KODI::CHROMA::CStepDown::Measure CLinuxRendererGLES::ChromaMeasure() const
++{
++  using Measure = KODI::CHROMA::CStepDown::Measure;
++  // the GPU time where the GPU has a timer (the same levels and bytes as ever); else the refreshes that the commits
++  // of its pictures miss, where the window system reads the flips (CFlipChain)
++  if (ChromaQueries().Usable())
++    return Measure::GPU_TIME;
++#ifdef HAVE_DVBRIDGE
++  if (const auto* window = dynamic_cast<const KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++          CServiceBroker::GetWinSystem());
++      window && window->KodiFlipsKnown())
++    return Measure::MISSED_REFRESHES;
++#endif
++  return Measure::NONE;
++}
++
++void CLinuxRendererGLES::ChromaFlipsCollect()
++{
++#ifdef HAVE_DVBRIDGE
++  auto* window =
++      dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(CServiceBroker::GetWinSystem());
++  if (!window)
++    return;
++  const float fps = CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS();
++  const double periodMs = fps > 0 ? 1000.0 / static_cast<double>(fps) : 0;
++  for (const auto& outcome : window->KodiFlipsTake())
++  {
++    // (a picture drawn at the level before a change is not this level's)
++    if (!m_chroma.CountingRefreshes() || outcome.tag != static_cast<int>(m_chroma.Current()))
++      continue;
++    const KODI::CHROMA::Filter was = m_chroma.Current();
++    const unsigned int windows = m_chroma.Windows();
++    if (m_chroma.Presented(outcome.late, periodMs))
++    {
++      const auto& w = m_chroma.Last();
++      CLog::Log(LOGWARNING,
++                "Chroma: the chroma of this video is drawn with {} from now on, in place of {}: of {} pictures "
++                "presented, {} missed their refresh of {:.1f} ms, in two windows in a row (this GPU's time cannot "
++                "be measured: {})",
++                KODI::CHROMA::Name(m_chroma.Current()), KODI::CHROMA::Name(was), w.frames, w.lost, w.periodMs,
++                ChromaQueries().absent);
++      m_reloadShaders = true;
++      break;
++    }
++    if (windows == 0 && m_chroma.Windows() == 1)
++    {
++      const auto& w = m_chroma.Last();
++      CLog::Log(LOGINFO,
++                "Chroma: with {}, of the first {} pictures presented, {} missed their refresh of {:.1f} ms "
++                "(counted by the flips of the display: this GPU's time cannot be measured)",
++                KODI::CHROMA::Name(m_chroma.Current()), w.frames, w.lost, w.periodMs);
++    }
++  }
++#endif
+ }
+ 
+ void CLinuxRendererGLES::ChromaTimerMark(bool begin)
+@@ -4160,6 +4262,12 @@ void CLinuxRendererGLES::ChromaTimerMark(bool begin)
+ 
+ void CLinuxRendererGLES::ChromaTimerCollect()
+ {
++  // Hades: on a GPU without a timer, the refreshes that its pictures missed (CFlipChain)
++  if (m_chroma.HowMeasured() == KODI::CHROMA::CStepDown::Measure::MISSED_REFRESHES)
++  {
++    ChromaFlipsCollect();
++    return;
++  }
+   const ChromaTimerQueries& q = ChromaQueries();
+   if (!q.Usable() || !m_chromaTimersMade)
+     return;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+index 74dd92b..06ef63d 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/LinuxRendererGLES.h
+@@ -368,6 +368,13 @@ protected:
+   //! (GL_EXT_disjoint_timer_query): around their drawing, and what has come back, to the step-down
+   void ChromaTimerMark(bool begin);
+   void ChromaTimerCollect();
++  //! Hades: how the pictures of a video are measured for the step-down: their GPU time where the GPU has a usable
++  //! timer, else the refreshes that their commits miss where the window system reads the flips, else not at all
++  KODI::CHROMA::CStepDown::Measure ChromaMeasure() const;
++  //! Hades: ... on a GPU without a timer, the refreshes that came back (CFlipChain), to the step-down
++  void ChromaFlipsCollect();
++  //! Hades: ... what the log says of the step-down of this video
++  std::string ChromaStepSaid() const;
+   void ReleaseChromaTimers();
+   KODI::CHROMA::CStepDown m_chroma;
+   int m_chromaLocation{0}; //!< VideoPicture::chroma_position of the video
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 1b0a892..f6f4125 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -575,6 +575,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     return;
+   // Hades: GL_GPU_DISJOINT_EXT is read again by the first reader of GPU times after this (CGpuDisjoint)
+   m_gpuDisjoint.Frame();
++  // Hades: a picture of Kodi's renderer in this pass whose refresh is counted (KodiPictureDrawn()); -1: none
++  const int kodiDrawn = std::exchange(m_kodiFlipDrawn, -1);
+   // Hades: a frame whose GUI pass was left out (CDVGuiReuse) where the picture and the GUI over it
+   // were drawn into the window's buffer (the HDR10/HLG composite: EndGuiComposite()) is a whole
+   // frame, swapped as one whose GUI pass drew. Kodi's Render() says rendered of its GUI pass
+@@ -1156,6 +1158,7 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     }
+     int lagFd = -1; // (Hades: the out-fence of the frame before, to read when it flipped)
+     bool convFlipTold = false; // (Hades: ... given to CDVConvertStep)
++    bool kodiFlipTold = false; // (Hades: ... given to CFlipChain)
+     if (rendered)
+     {
+       // Hades: before the fence of the frame, which stands for all of its GPU work
+@@ -1169,7 +1172,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ #ifdef HAVE_DVBRIDGE
+           // Hades: (EGL takes this fence; a copy of it says when that flip came, CPresentLag; and,
+           // for Dolby Vision sent as HDR10+, where the vblanks are: m_dvPlusClock)
+-          if (m_videoLagPendingNs > 0 || m_dvPlusOn == 1 || m_convStep.WantsFlips())
++          if (m_videoLagPendingNs > 0 || m_dvPlusOn == 1 || m_convStep.WantsFlips() ||
++              m_kodiFlips.WantsFlips(kodiDrawn >= 0))
+             lagFd = dup(fd);
+ #endif
+           m_eglFence->CreateKMSFence(fd);
+@@ -1209,6 +1213,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+             // (CDVConvertStep)
+             m_convStep.Flipped(flipRead ? flippedNs : 0, DVRefreshPeriodMs());
+             convFlipTold = true;
++            // Hades: ... and whether a picture of Kodi's renderer that it carried missed its refresh (CFlipChain)
++            KodiFlipTold(flipRead ? flippedNs : 0, kodiDrawn >= 0);
++            kodiFlipTold = true;
+             if (flipRead && flippedNs > 0 && m_videoLagPendingNs > 0)
+             {
+               m_videoLag.Add(CPresentLag::Way::ORDINARY, m_videoLagPendingNs, flippedNs);
+@@ -1240,6 +1247,9 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+     // Hades: a pass whose flip before was not read breaks the chain of flips (CDVConvertStep::Flipped())
+     if (!convFlipTold && m_convStep.WantsFlips())
+       m_convStep.Flipped(0, DVRefreshPeriodMs());
++    // (Hades: ... and so does it of the flips of Kodi's renderer: CFlipChain)
++    if (!kodiFlipTold && m_kodiFlips.WantsFlips(kodiDrawn >= 0))
++      KodiFlipTold(0, kodiDrawn >= 0);
+ #endif
+ 
+     // Hades: an output that FlipStalled() turned off and could not turn on again
+@@ -1255,6 +1265,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+ #ifdef HAVE_DVBRIDGE
+     // Hades: the new picture of Dolby Vision rebuilt that this commit carries, if any (CDVConvertStep)
+     m_convStep.Committed(std::exchange(m_convStepDrawn, CDVConvertStep::Frame()));
++    // Hades: ... and the picture of Kodi's renderer that it carries, if any (CFlipChain)
++    m_kodiFlips.Committed(kodiDrawn);
+ #endif
+     // Hades: with Kodi's own buffers, the next frame is drawn into one that Kodi does not hold for
+     // the screen, now that it has given back what it gives back (COwnScanout)
+@@ -4188,7 +4200,7 @@ void CWinSystemGbmGLESContext::Hdr10AdaptTimerMark(bool begin)
+             eglGetProcAddress("glGetQueryObjectui64vEXT"));
+     }
+     if (m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
+-        m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT)
++        m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT && GpuTimestampBits() > 0)
+       for (auto& timer : m_hdr10AdaptTimers)
+       {
+         m_glGenQueriesEXT(1, &timer.begin);
+@@ -4258,7 +4270,7 @@ void CWinSystemGbmGLESContext::Hdr10AdaptStatsLog(bool end)
+               end ? "at the end" : "last 10 s", s.mapped, s.kept, s.notMapped,
+               s.timed ? StringUtils::Format("{:.1f} ms on average, {:.1f} at most, of {} timed",
+                                             s.gpuSumMs / s.timed, s.gpuMaxMs, s.timed)
+-                      : std::string("not timed (no GL_EXT_disjoint_timer_query)"),
++                      : "not timed (" + GpuTimerAbsence() + ")",
+               DVRefreshPeriodMs());
+   s = {};
+   s.start = now;
+@@ -5978,6 +5990,67 @@ void CWinSystemGbmGLESContext::ConversionTimesDisjoint()
+     m_dvConvertBridge->PassTimesLost();
+ }
+ 
++bool CWinSystemGbmGLESContext::KodiFlipsKnown() const
++{
++#if defined(EGL_ANDROID_native_fence_sync) && defined(EGL_KHR_fence_sync)
++  // (the flip of each commit is read from its out-fence)
++  return m_eglFence != nullptr;
++#else
++  return false;
++#endif
++}
++
++void CWinSystemGbmGLESContext::KodiFlipTold(int64_t flipNs, bool carries)
++{
++  const KODI::CHROMA::CFlipChain::Outcome outcome = m_kodiFlips.Flipped(flipNs, DVRefreshPeriodMs(), carries);
++  if (outcome.tag < 0)
++    return;
++  // (taken by the renderer with its next picture; the oldest go where none takes them)
++  if (m_kodiFlipOutcomes.size() >= KODI_FLIPS_KEPT)
++    m_kodiFlipOutcomes.erase(m_kodiFlipOutcomes.begin());
++  m_kodiFlipOutcomes.push_back(outcome);
++}
++
++std::vector<KODI::CHROMA::CFlipChain::Outcome> CWinSystemGbmGLESContext::KodiFlipsTake()
++{
++  return std::exchange(m_kodiFlipOutcomes, {});
++}
++
++int CWinSystemGbmGLESContext::GpuTimestampBits()
++{
++  if (m_gpuTimestampBits >= 0)
++    return m_gpuTimestampBits;
++  m_gpuTimestampBits = 0;
++#if defined(GL_TIMESTAMP_EXT) && defined(GL_QUERY_COUNTER_BITS_EXT)
++  // (a GPU may give GL_EXT_disjoint_timer_query with timestamps of no bits: its queries then give no time)
++  if (IsExtSupported("GL_EXT_disjoint_timer_query"))
++  {
++    if (const auto getQueryiv =
++            reinterpret_cast<PFNGLGETQUERYIVEXTPROC>(eglGetProcAddress("glGetQueryivEXT")))
++    {
++      while (glGetError() != GL_NO_ERROR)
++        ;
++      GLint bits = 0;
++      getQueryiv(GL_TIMESTAMP_EXT, GL_QUERY_COUNTER_BITS_EXT, &bits);
++      m_gpuTimestampBits = glGetError() == GL_NO_ERROR ? std::max(0, static_cast<int>(bits)) : 0;
++    }
++  }
++#endif
++  CLog::Log(LOGINFO, "GPU timers: {}",
++            m_gpuTimestampBits > 0 ? StringUtils::Format("timestamps of {} bits", m_gpuTimestampBits)
++                                   : std::string("none: ") + GpuTimerAbsence());
++  return m_gpuTimestampBits;
++}
++
++std::string CWinSystemGbmGLESContext::GpuTimerAbsence()
++{
++  if (!IsExtSupported("GL_EXT_disjoint_timer_query"))
++    return "no GL_EXT_disjoint_timer_query";
++  if (GpuTimestampBits() == 0)
++    return "the GPU's timestamps have no bits (GL_QUERY_COUNTER_BITS_EXT 0)";
++  return "no picture timed";
++}
++
+ bool CWinSystemGbmGLESContext::GpuDisjointLost(CGpuDisjoint::Reader& reader)
+ {
+   return m_gpuDisjoint.Lost(reader,
+@@ -6010,7 +6083,7 @@ void CWinSystemGbmGLESContext::UpscaleStatsLog(bool end)
+         name ? name : "(none)", end ? "at the end" : "last 10 s", s.mapped, s.kept, s.notMapped,
+         s.timed ? StringUtils::Format("{:.1f} ms on average, {:.1f} at most, of {} timed",
+                                       s.gpuSumMs / s.timed, s.gpuMaxMs, s.timed)
+-                : std::string("not timed (no GL_EXT_disjoint_timer_query)"),
++                : "not timed (" + GpuTimerAbsence() + ")",
+         period);
+     // an upscaler that does not keep up with the display drops pictures: where its pictures took 85 %
+     // of a refresh or more on average, over at least 24 timed, it is turned off for the rest of the
+@@ -10237,7 +10310,8 @@ void CWinSystemGbmGLESContext::DVGpuTimerMark(bool begin)
+           eglGetProcAddress("glGetQueryObjectui64vEXT"));
+     }
+     const bool available = m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
+-                           m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT;
++                           m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT &&
++                           GpuTimestampBits() > 0;
+     if (available)
+     {
+       for (auto& timer : m_dvGpuTimers)
+@@ -10252,7 +10326,7 @@ void CWinSystemGbmGLESContext::DVGpuTimerMark(bool begin)
+     {
+       m_dvGpuTimerLogged = true;
+       CLog::Log(LOGINFO, "DVBridge: GPU timing of Dolby Vision frames {}",
+-                available ? "available" : "unavailable (no GL_EXT_disjoint_timer_query)");
++                available ? std::string("available") : "unavailable (" + GpuTimerAbsence() + ")");
+     }
+   }
+   auto& timer = m_dvGpuTimers[m_dvGpuTimerIndex];
+@@ -10619,7 +10693,7 @@ void CWinSystemGbmGLESContext::ConvTimerMark(bool begin, const CDVConvertStep::F
+             eglGetProcAddress("glGetQueryObjectui64vEXT"));
+     }
+     if (m_glGenQueriesEXT && m_glDeleteQueriesEXT && m_glQueryCounterEXT &&
+-        m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT)
++        m_glGetQueryObjectuivEXT && m_glGetQueryObjectui64vEXT && GpuTimestampBits() > 0)
+     {
+       for (auto& timer : m_convTimers)
+       {
+@@ -10631,7 +10705,8 @@ void CWinSystemGbmGLESContext::ConvTimerMark(bool begin, const CDVConvertStep::F
+     else
+       CLog::Log(LOGINFO,
+                 "DVBridge: the pictures of Dolby Vision rebuilt for output as HDR10 or SDR are not "
+-                "timed (no GL_EXT_disjoint_timer_query): their fidelity is not lowered");
++                "timed ({}): their fidelity is not lowered",
++                GpuTimerAbsence());
+   }
+   auto& timer = m_convTimers[m_convTimerIndex];
+   if (!timer.begin || !timer.end)
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+index 38a1553..8c501fa 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.h
+@@ -47,6 +47,7 @@
+ #include "DVRepeatKeep.h"
+ #include "DVStartSignal.h"
+ #include "DVStepDown.h"
++#include "cores/VideoPlayer/VideoRenderers/ChromaStepDown.h"
+ #include "GpuDisjoint.h"
+ #include "DVVerify.h"
+ #include "HDR10Adapt.h"
+@@ -391,6 +392,20 @@ public:
+   bool GpuDisjointLost(CGpuDisjoint::Reader& reader);
+   //! Hades: ... a reader that has just made its timers
+   void GpuDisjointJoin(CGpuDisjoint::Reader& reader) const { m_gpuDisjoint.Join(reader); }
++  //! Hades: the bits of the GPU's timestamps (GL_QUERY_COUNTER_BITS_EXT of GL_TIMESTAMP_EXT), asked once; 0: its timer
++  //! queries give no time, or it has no GL_EXT_disjoint_timer_query (render thread)
++  int GpuTimestampBits();
++  //! Hades: ... why the GPU's pictures are not timed, for the log
++  std::string GpuTimerAbsence();
++  //! Hades: Kodi's renderer drew a picture into this pass whose refresh is counted for the step-down of its chroma, on
++  //! a GPU without a timer (KODI::CHROMA::CStepDown::Measure::MISSED_REFRESHES); tag: the level it was drawn at
++  //! (render thread)
++  void KodiPictureDrawn(int tag) { m_kodiFlipDrawn = tag; }
++  //! Hades: ... whether the commits that carried those pictures came with their refresh, since the last call
++  //! (CFlipChain: the flips read from their out-fences)
++  std::vector<KODI::CHROMA::CFlipChain::Outcome> KodiFlipsTake();
++  //! Hades: ... whether the flips of the commits can be read at all (an out-fence of each commit)
++  bool KodiFlipsKnown() const;
+   //! Hades: ... after the picture is drawn (drawn: a picture went out): whether the renderer applied the LUT, and whether
+   //! it failed on this GPU; said in kodi.log, and on the screen where a LUT that is chosen cannot be applied (a file
+   //! that cannot be read, a LUT made for another kind of picture, a GPU that cannot draw it), once each
+@@ -877,6 +892,15 @@ private:
+   bool m_convStepRead = false;
+   bool m_convStepTold = false;
+   CDVConvertStep::Frame m_convStepDrawn;
++  // Hades: the flips of the commits that carry a picture of Kodi's renderer, on a GPU without a timer (CFlipChain):
++  // the picture of this pass (KodiPictureDrawn()), and what came back, until the renderer takes it (at most
++  // KODI_FLIPS_KEPT)
++  KODI::CHROMA::CFlipChain m_kodiFlips;
++  int m_kodiFlipDrawn = -1;
++  std::vector<KODI::CHROMA::CFlipChain::Outcome> m_kodiFlipOutcomes;
++  static constexpr size_t KODI_FLIPS_KEPT = 256;
++  void KodiFlipTold(int64_t flipNs, bool carries);
++  int m_gpuTimestampBits = -1; //!< GpuTimestampBits(); -1: not asked yet
+   unsigned int m_convSeeksSeen = 0;
+   struct ConvTimer
+   {
+-- 
+2.53.0
+

@@ -501,6 +501,11 @@ snapshot() {
   for f in /storage/.kodi/temp/kodi*.log; do [ -f "$f" ] && last 8388608 "$f" | clean | gzip > $S/${f##*/}.gz; done
   {
   echo "== date (UTC) and uptime"; date -u; cat /proc/uptime
+  # Hades: at the top, the settings that change the picture of an HDR video from the film (the trims left out,
+  # v4.0 added, a peak by hand, another transport...), as Kodi said them when the last videos of each kind were
+  # set up (settings/PictureDefaults.h of Kodi); a comparison of the picture with another build begins there
+  echo "== picture settings away from the film (kodi.log: the last line of each kind of video; none: no HDR video yet)"
+  grep -h 'Picture settings: for this ' /storage/.kodi/temp/kodi.log 2>/dev/null | tail -4 | clean
   echo "== clock: system time vs hardware clock (RTC; never written but where the setting Hardware clock is UTC)"
   s=$(date +%s); r=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)
   echo "system UTC $(date -u '+%F %T'), local $(date '+%F %T %Z'); RTC $(cat /sys/class/rtc/rtc0/date /sys/class/rtc/rtc0/time 2>&1 | tr '\n' ' ')"
@@ -580,12 +585,32 @@ snapshot() {
   echo "driver chosen at boot: $(cat /run/nvidia/driver 2>&1)"
   echo "nvidia_drm modeset=$(cat /sys/module/nvidia_drm/parameters/modeset 2>&1) fbdev=$(cat /sys/module/nvidia_drm/parameters/fbdev 2>&1)"
   echo "amdgpu dvbridge=$(cat /sys/module/amdgpu/parameters/dvbridge 2>&1)"
+  # Hades: sleep (issue 32): the kinds the kernel can use on this firmware (the one in brackets is used; "deep" only where
+  # the firmware offers S3), how the last ones went, what woke the PC, what may wake it, and what the NVIDIA driver keeps
+  echo "== sleep: the kinds the kernel can use ([the one used]), how the last ones went, what may wake the PC"
+  echo "mem_sleep: $(cat /sys/power/mem_sleep 2>&1); state: $(cat /sys/power/state 2>&1); pm_wakeup_irq: $(cat /sys/power/pm_wakeup_irq 2>/dev/null)"
+  for f in success fail failed_freeze failed_prepare failed_suspend failed_suspend_late failed_suspend_noirq failed_resume \
+           failed_resume_early failed_resume_noirq last_failed_dev last_failed_errno last_failed_step last_hw_sleep \
+           total_hw_sleep; do
+    [ -r /sys/power/suspend_stats/$f ] && printf '%s=%s ' $f "$(cat /sys/power/suspend_stats/$f | tr '\n' ' ' | sed 's/ $//')"
+  done
+  echo
+  echo "amd_pmc (s2idle of AMD processors): $([ -d /sys/module/amd_pmc ] && echo loaded || echo 'not loaded')"
+  dmesg | grep -E 'ACPI: PM: \(supports|ACPI: \(supports|PM: suspend (entry|exit)|PM: (Some devices failed|Device .* failed)|s2idle|amd_pmc|Low-power S0 idle|PM: Triggering wakeup|PM: Wakeup' | tail -30
+  echo "may wake the PC: ACPI (/proc/acpi/wakeup, enabled ones):"
+  grep -w enabled /proc/acpi/wakeup 2>/dev/null | sed 's/^/    /'
+  echo "    usb:$(for d in /sys/bus/usb/devices/*; do [ "$(cat $d/power/wakeup 2>/dev/null)" = enabled ] && printf ' %s(%s:%s)' ${d##*/} "$(cat $d/idVendor 2>/dev/null)" "$(cat $d/idProduct 2>/dev/null)"; done)"
+  echo "NVIDIA across a sleep: $(grep -E 'PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers|EnableS0ixPowerManagement|TemporaryFilePath' /proc/driver/nvidia/params 2>/dev/null | tr -s ' \n' ' '); /proc/driver/nvidia/suspend $([ -e /proc/driver/nvidia/suspend ] && echo there || echo 'not there'); hook $([ -x /usr/lib/systemd/system-sleep/hades-nvidia ] && echo there || echo 'not there'); $(cat /run/modprobe.d/hades-nvidia-sleep.conf 2>/dev/null || echo 'no option of the legacy driver')"
+  for p in /proc/driver/nvidia/gpus/*/power; do [ -r "$p" ] && { echo "  ${p#/proc/driver/nvidia/gpus/}:"; sed 's/^/    /' "$p"; }; done
   echo "kernel display messages: drm.debug=$(cat $G 2>&1)"
   echo "== drm connectors"
   for c in /sys/class/drm/card*-*; do
     n=${c##*/}; echo "$n: status=$(cat $c/status 2>/dev/null) enabled=$(cat $c/enabled 2>/dev/null) dpms=$(cat $c/dpms 2>/dev/null)"
     # sysfs reports size 0 for the EDID attribute, so read it and keep only non-empty copies
     cat $c/edid > $S/edid/$n.bin 2>/dev/null; [ -s $S/edid/$n.bin ] && echo "    edid $(wc -c < $S/edid/$n.bin) bytes" || rm -f $S/edid/$n.bin
+    # Hades: whether that EDID comes from the display or through a sound bar, an AV receiver or a switch (its HDMI
+    # address), with its Dolby Vision block and sound formats, which such a device changes (edid-path.awk)
+    [ -s $S/edid/$n.bin ] && od -An -v -tu1 $S/edid/$n.bin | awk -f /usr/lib/hades-diag/edid-path.awk | sed 's/^/    /'
     head -8 $c/modes 2>/dev/null | sed 's/^/    mode /'
   done
   echo "== usb devices (bus-port: vendor:product, speed, name, whether it may sleep and whether it does) and the driver of each interface (a drive: uas or usb-storage)"
@@ -654,7 +679,7 @@ snapshot() {
   echo "== kodi: Dolby Vision verdicts and output handling"
   grep -hE "DVBridge|native Dolby Vision|DV FEL|DV: |\[DV\]|Display resolution ADJUST|turning off .* output|turned off .* output|outputs stay on|/dev/dri/card|Using connector|transactional test commit|DRMDisplayWatch|look [0-9]* at the outputs" \
     /storage/.kodi/temp/kodi.log 2>/dev/null | tail -80 | clean
-  echo "== output check (System > Submit Log, \"Check the Dolby Vision output\"): the last report, if one was asked for"
+  echo "== output check (System > Check this setup, \"Check the Dolby Vision output\"): the last report, if one was asked for"
   oc=/storage/.cache/hades-output-check/result.txt
   if [ -s $oc ]; then echo "written: $(date -u -r $oc '+%F %T') UTC"; cat $oc; else echo "none"; fi
   # Hades: the last result of "Check this setup" (the settings write summary.txt, in English, at the end of each check;
@@ -662,6 +687,15 @@ snapshot() {
   echo "== check of this setup (System > Submit Log, \"Check this setup\"): the last result, if a check was made"
   hc=/storage/.cache/hades-check/summary.txt
   if [ -s $hc ]; then echo "written: $(date -u -r $hc '+%F %T') UTC"; head -c 65536 $hc; echo; else echo "none"; fi
+  # Hades: every answer of the A/B comparison of native Dolby Vision of that check (the last 50), each with the
+  # name of the TV from its EDID (no serial number): the data for settings per TV
+  echo "== A/B comparisons of native Dolby Vision (Check this setup): the answers kept, with the TV of each"
+  ab=/storage/.cache/hades-check/ab-results.json
+  if [ -s $ab ]; then head -c 65536 $ab; echo; else echo "none"; fi
+  # Hades: the line of "Share my results" of the last check (names of hardware and results only: the settings write it)
+  echo "== check of this setup: the line to share (Share my results)"
+  sh=/storage/.cache/hades-check/share.txt
+  if [ -s $sh ]; then head -c 4096 $sh; else echo "none"; fi
   echo "== kodi: VA-API"
   grep -hiE "vaapi|va-api|libva|nvidia_drv_video" /storage/.kodi/temp/kodi.log 2>/dev/null | head -40 | clean
   echo "== time sync (journal)"; lim journalctl -b --no-pager | grep -E 'RTC configured|ntp:|imeserver' | head -20 | clean
@@ -734,6 +768,8 @@ snapshot() {
 # and times, through the filter): that a start left nothing is then told apart from a start before it that kept
 # nothing. Either way the folder of this start is there from now on, not only from the first snapshot. One line
 # in the kernel log says which of the two it was ("hades-diag: previous-boot: ...").
+# With initcall_debug (the switch was on in that start), previous-boot/not-returned.txt lists the drivers that the
+# journal shows starting and not returned by its last line (not_returned).
 previous_boot() {
   local P=$T/previous-boot why= list
   rm -rf $P $P.filtered; mkdir -p $P
@@ -741,7 +777,10 @@ previous_boot() {
   if [ -e /run/hades-diag-journal ] || [ -f /storage/.cache/journald.conf.d/00_settings.conf ]; then
     if list=$(lim journalctl --list-boots --no-pager 2>&1) && echo "$list" | grep -q '^ *-1 '; then
       lim journalctl -b -1 --no-pager > $T/previous.txt
-      last 8388608 $T/previous.txt | clean | gzip > $P/journal.txt.gz
+      last 8388608 $T/previous.txt | clean > $T/previous.clean
+      gzip -c $T/previous.clean > $P/journal.txt.gz
+      not_returned "the journal of that start" $T/previous.clean $P/not-returned.txt
+      rm -f $T/previous.clean
       lim journalctl -b -1 -k --no-pager > $T/previous.txt
       last 8388608 $T/previous.txt | clean | gzip > $P/journal-kernel.txt.gz
       rm -f $T/previous.txt
@@ -783,7 +822,8 @@ previous_boot() {
 # the copy is not among the starts of the journal, EARLY.txt says that the journal saved here is of an earlier start
 # (QEMU, 2026-11-18: a start held before the flush of its journal had the journal of the start before it saved here,
 # and nothing said that it was another start's). The copies of starts other than this one are deleted then, not by the
-# report made on demand. A start whose journal got to the storage deleted its own copy.
+# report made on demand. A start whose journal got to the storage deleted its own copy. With initcall_debug,
+# previous-boot/early-not-returned.txt lists the drivers that the copy shows starting and not returned (not_returned).
 early_log() {
   local d=/storage/.cache/hades-diag/early-log me f n=0 newest= where note id
   [ -d $d ] || return 0
@@ -794,7 +834,10 @@ early_log() {
     [ -n "$newest" ] || newest=$f
   done
   if [ -n "$newest" ]; then
-    clean < $newest | gzip > $1/early-kernel-log.txt.gz
+    clean < $newest > $T/early.clean
+    gzip -c $T/early.clean > $1/early-kernel-log.txt.gz
+    not_returned "the kernel log of that start" $T/early.clean $1/early-not-returned.txt
+    rm -f $T/early.clean
     where=$(sed -n '3s/^copy [0-9]*, //p' $newest | clean)
     note="The kernel log of a start that ended before its journal was in the storage is saved here (early-kernel-log.txt.gz): that start copied it to the storage every second, and its last copy was made $where."
     [ $n -gt 1 ] && note="$note $n starts left such a copy; this is the newest."
@@ -813,6 +856,19 @@ early_log() {
   for f in $(ls -A $d 2>/dev/null); do
     case "$f" in "$me.txt"|"$me.txt.new") ;; *) rm -f "$d/$f" ;; esac
   done
+}
+# The drivers that a log of the start before shows starting and not returned by its last line (not-returned.awk:
+# the lines of initcall_debug, "calling" and "initcall ... returned"), which is where a start that hung while drivers
+# started was (issue 14). $1: what the log is, for the summary; $2: the log, through the filter already; $3: the file
+# written, whose first line, the summary, also goes to the kernel log. Nothing is written where the log has no line of
+# initcall_debug (the switch was off in that start).
+not_returned() {
+  lim awk -v what="$1" -f /usr/lib/hades-diag/not-returned.awk "$2" > "$3"
+  if [ -s "$3" ]; then
+    echo "hades-diag: previous-boot: $(head -n 1 "$3")" > /dev/kmsg 2>/dev/null
+  else
+    rm -f "$3"
+  fi
 }
 # Why the journal has no start before this one, in a sentence. $1: "kept", this start keeps its journal in the storage,
 # and $2 is what the init wrote to /run/hades-diag-journal (whether the start before this one kept its own: kept, new,

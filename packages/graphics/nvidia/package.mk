@@ -2,8 +2,8 @@
 # Copyright (C) 2021-present Team LibreELEC (https://libreelec.tv)
 
 PKG_NAME="nvidia"
-PKG_VERSION="620.70.06"
-PKG_SHA256="20894d898b83622e385dcfb934dbd656471f09e38822770cf4c9fea4112990f3"
+PKG_VERSION="620.73.04"
+PKG_SHA256="91f162952fa1d7a4fbdcc7a1a3a0266dfa079007be43d7235e5a6896bf29172a"
 PKG_ARCH="x86_64"
 PKG_LICENSE="LicenseRef-nonfree"
 PKG_SITE="https://www.nvidia.com/en-us/drivers/unix/"
@@ -166,6 +166,18 @@ makeinstall_target() {
   # (scripts/drm-wait, nvidia-drm-wait.service; for the 580 driver too)
     cp ${PKG_DIR}/scripts/drm-wait ${INSTALL}/usr/lib/nvidia
     chmod 0755 ${INSTALL}/usr/lib/nvidia/drm-wait
+
+  # Hades: the driver of the ASUS Xonar sound cards starts after nvidia has started (scripts/after-nvidia, which
+  # modprobe.d/after-nvidia.conf has kmod run in place of loading it)
+    cp ${PKG_DIR}/scripts/after-nvidia ${INSTALL}/usr/lib/nvidia
+    chmod 0755 ${INSTALL}/usr/lib/nvidia/after-nvidia
+
+  # Hades: NVIDIA's power management interface for the 580 driver, which keeps all of its video memory across a sleep
+  # (scripts/sleep, run by systemd-sleep before and after each one; scripts/stack-links sets the option). It does
+  # nothing with the 620 driver, which keeps it by itself.
+  mkdir -p ${INSTALL}/usr/lib/systemd/system-sleep
+    cp ${PKG_DIR}/scripts/sleep ${INSTALL}/usr/lib/systemd/system-sleep/hades-nvidia
+    chmod 0755 ${INSTALL}/usr/lib/systemd/system-sleep/hades-nvidia
 }
 
 post_install() {

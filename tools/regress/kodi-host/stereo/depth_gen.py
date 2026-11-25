@@ -9,7 +9,11 @@
 # subtitles.stereoscopicdepth setting, as OverlayRendererUtil.cpp computes it: 0 without 3D output and in mono,
 # signed by the eye otherwise). The answer of the store goes to the renderer as CVideoPlayer::GetSubtitlePlaneOffset()
 # hands it on; a disc's menu (COverlay::m_isDiscMenu) is placed by the setting, not by the subtitles' sequence.
-# usage: depth_gen.py <kodi tree> <output folder>   (writes <output folder>/depth_test.cpp)
+# A depth measured from the picture (CRenderer::m_measuredDepth, CStereoDepthMeter) places the subtitles where
+# the title gives them nothing, half of it to each eye; the title's offsets and the setting of a menu come first. The
+# body is also written alone, for autodepth_test.cpp.
+# usage: depth_gen.py <kodi tree> <output folder>   (writes <output folder>/depth_test.cpp and
+#        <output folder>/subtitle_depth_body.inc)
 import os
 import sys
 
@@ -54,6 +58,7 @@ static int GetStereoscopicDepth() {
 struct COverlay { bool m_isDiscMenu{false}; };
 struct CRenderer {
   std::optional<int> m_subtitlePlaneOffset;
+  std::optional<float> m_measuredDepth;
   CRect m_rs{0, 0, 1920, 1080}, m_rd{0, 0, 3840, 2160};
   float SubtitleDepth(const COverlay& o) const;
 };
@@ -72,8 +77,9 @@ static OffsetMetadata Block(int a, int b, int c) {
   return m;
 }
 static float Depth(const COffsetMetadataStore& store, double pts, int sequence, RenderStereoMode mode,
-                   RenderStereoView view) {
+                   RenderStereoView view, std::optional<float> measured = std::nullopt) {
   CRenderer r;
+  r.m_measuredDepth = measured;
   CServiceBroker::GetWinSystem()->GetGfxContext().mode = mode;
   CServiceBroker::GetWinSystem()->GetGfxContext().view = view;
   // as CVideoPlayer::GetSubtitlePlaneOffset(): no sequence, no answer; otherwise the store's
@@ -104,10 +110,23 @@ int main() {
   g_menu = true;
   check("a disc menu over a frame the title gives 5 for: the setting, not the subtitles' sequence", Depth(store, 2000.0, 0, SBS, L), 7);
   g_menu = false;
+  // a depth measured from the picture: a share of the picture's width (3840 as drawn), half to each eye
+  check("measured 2.5 %, a stream that follows no sequence, left eye: half of it to the right",
+        Depth(store, 2000.0, -1, SBS, L, 0.025f), 48);
+  check("measured 2.5 %, right eye: half of it to the left", Depth(store, 2000.0, -1, SBS, R, 0.025f), -48);
+  check("measured 0: the screen, not the setting", Depth(store, 2000.0, -1, SBS, L, 0.0f), 0);
+  check("measured, no 3D output: nothing", Depth(store, 2000.0, -1, MOFF, VOFF, 0.02f), 0);
+  check("measured, mono view: nothing", Depth(store, 2000.0, -1, MONO, L, 0.02f), 0);
+  check("measured, and a frame the title gives 5 for: the title's", Depth(store, 2000.0, 0, SBS, L, 0.02f), 10);
+  check("measured, and a frame the title gives 0 for: the title's 0", Depth(store, 1000.0, 0, SBS, L, 0.02f), 0);
+  g_menu = true;
+  check("measured, a disc menu: the setting", Depth(store, 2000.0, -1, SBS, L, 0.02f), 7);
+  g_menu = false;
   std::printf("%d failed\n", failures);
   return failures ? 1 : 0;
 }
 '''.replace('BODY', body)
 os.makedirs(out, exist_ok=True)
 open(os.path.join(out, 'depth_test.cpp'), 'w', encoding='utf-8').write(test)
+open(os.path.join(out, 'subtitle_depth_body.inc'), 'w', encoding='utf-8').write(body + '\n')
 print('depth_gen: the body of SubtitleDepth(const COverlay&) taken (%d lines)' % body.count('\n'))

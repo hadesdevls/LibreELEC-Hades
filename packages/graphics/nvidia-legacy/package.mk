@@ -5,8 +5,8 @@
 PKG_NAME="nvidia-legacy"
 # The newest release of NVIDIA's 580 branch, the last one for Maxwell, Pascal and Volta (the
 # 615 driver of nvidia lists them as legacybranch "580.xx" in its supported-gpus.json).
-PKG_VERSION="580.196.07"
-PKG_SHA256="2189c47fa87ae45b7a166b58c3742dd1629035069cb0fb4103ed375229c55867"
+PKG_VERSION="580.196.11"
+PKG_SHA256="cb77267538bfc7823ff14fb1a7834a91e541d8568c93b2ab7ead63f8f7ddea5d"
 PKG_ARCH="x86_64"
 PKG_LICENSE="LicenseRef-nonfree"
 PKG_SITE="https://www.nvidia.com/en-us/drivers/unix/"
@@ -23,7 +23,7 @@ unpack() {
   # The extraction of nvidia, without executing the .run: its makeself header checks the
   # payload with cksum and md5sum over "tail -n +4" and extracts it with
   # "tail -n +${skip} | zstd -d | tar x"; do the same, and stop on any mismatch. (The header of
-  # 580.196.07 has the form of that of nvidia's .run, with its own sums, sizes and dates and the
+  # 580.196.11 has the form of that of nvidia's .run, with its own sums, sizes and dates and the
   # help of some options worded otherwise.)
   local run="${SOURCES}/${PKG_NAME}/${PKG_SOURCE_NAME}"
   local skip crc md5

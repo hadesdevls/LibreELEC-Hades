@@ -5,17 +5,23 @@
 # run-ffmpeg.sh: the FFmpeg patches of the image that change what FFmpeg reads, checked on the host with FFmpeg of the
 # recipe (lib-ffmpeg.sh):
 #   fate      FATE, the test suite of FFmpeg, on what the patches change: ac3/eac3 (ffmpeg-9945, 9946), IMF (9934),
-#             Matroska (9932-01, 9940, 9950), FLV (9932-02), Ogg (9932-03 to 05), the coded bitstreams and LCEVC
+#             Matroska (9932-01, 9940, 9950, 9953), FLV (9932-02), Ogg (9932-03 to 05), the coded bitstreams and LCEVC
 #             (9932-06 to 08), CDXL (9933-01), G2M (9933-02), Sun raster (9933-03, 06), PCX (9933-04), HuffYUV
 #             (9933-05); every test of each that can run with the samples of inputs-ffmpeg.tsv passes, and those that
 #             cannot are named. The two references of ffmpeg-9946 must give the new output (and the old _v2 ones a
 #             difference), and the reference of the IMF unit test of before ffmpeg-9934 must fail.
+#   hls       ffmpeg-9972 (the HLS demuxer loads one variant of a master playlist with load_all_variants=0, the one
+#             that max_bandwidth selects): tools/hls_variants.sh with FFmpeg built with AddressSanitizer, with all the
+#             patches, and without ffmpeg-9972, where it must fail (HLS_FAILS_WITHOUT checks)
 #   playback  ffmpeg-9930 (an enhancement track of Dolby Vision in an 'hvc1'/'hev1' sample entry of MP4 grouped) and
 #             ffmpeg-9931 (an HEVC picture whose parameter sets came in a PES without a time takes the time of the PES
 #             of its first slice), each against FFmpeg without it: what changes, and that nothing else does; and
 #             Kodi's join of two tracks (DVLayerMerge.cpp) with the module of the layer on the 'hvc1'/'hev1' files.
 # Host test only: it builds and runs everything under $REGRESS_WORK/ffmpeg.
-# usage: run-ffmpeg.sh all | verdict [<log>] | <stage>...       stages: inputs build fate playback
+#   mvcmkv    ffmpeg-9953 (the second view of H.264 MVC declared by a block addition mapping or only by the
+#             stream of a Matroska file), against FFmpeg without it, and what Kodi's MultiviewChoice.h decides
+#             of what it gives (the function mvcmkv() says what is checked)
+# usage: run-ffmpeg.sh all | verdict [<log>] | <stage>...       stages: inputs build fate hls playback mvcmkv
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -30,7 +36,7 @@ P=$RG_W/playback
 # the FATE tests of each group: name : the patches whose files they exercise : ERE of the test names
 FGROUPS="ac3:9945+9946:^fate-(ac3|eac3)-
 imf:9934:^fate-imf
-matroska:9932-01+9940+9950:^fate-(lavf-mkv|matroska|mkv)
+matroska:9932-01+9940+9950+9953:^fate-(lavf-mkv|matroska|mkv)
 flv:9932-02:^fate-(lavf-flv|flv)
 ogg:9932-03+04+05:^fate-(lavf-ogg|ogg)
 cbs-lcevc:9932-06+07+08:^fate-(cbs-(av1|h264|hevc|h265|h266|vvc|mpeg2|lcevc)-|lcevc)
@@ -141,7 +147,8 @@ stage_fate() {
     done
   }
   rg_log "$RG_W/logs/ac3-old-refs.log" old
-  x=$(grep -c -E ': make exit [1-9]; MAXDIFF: \|[1-9][0-9]* - 0\| >= 1' "$RG_W/logs/ac3-old-refs.log")
+  # (each with the fuzz that FATE gives it: ac3.mak of FFmpeg 9.1 gives fate-ac3-2.0 FUZZ = 2)
+  x=$(grep -c -E ': make exit [1-9]; MAXDIFF: \|[1-9][0-9]* - 0\| >= [1-9][0-9]*$' "$RG_W/logs/ac3-old-refs.log")
   if [ "$x" = 3 ]; then rg_item ac3-old-refs-fail PASSED "the three differ from the _v2 references: $(grep -o -E '^fate-[^ ]+|MAXDIFF: \|[0-9]+' "$RG_W/logs/ac3-old-refs.log" | paste -sd' ' -)"
   else rg_item ac3-old-refs-fail FAILED "$x of 3 differ from the _v2 references by their output: $(grep -E 'make exit|not there' "$RG_W/logs/ac3-old-refs.log" | tr '\n' ';' | cut -c1-200)"; fi
   # ffmpeg-9934: the reference of the IMF unit test before it (its hunk of tests/ref/fate/imf reversed on a copy) fails,
@@ -221,11 +228,14 @@ mov() {
     if [ "$(grep -c '^packet' "$L/$n.after")" -lt 100 ]; then echo "FAIL: $n: $(grep -c '^packet' "$L/$n.after") packets read"; fail=1
     elif cmp -s "$L/$n.before" "$L/$n.after"; then echo "ok: $n: the same before and after ($(grep -c '^packet' "$L/$n.after") packets)"
     elif [ "$n" = FEL_test_dual_hvc1.mp4 ] || [ "$n" = FEL_test_dual_hev1.mp4 ]; then
-      # only the group may differ: the "after" listing is the "before" one with the group section in it (its
-      # stream_group line, which also holds its first stream, the line of its second stream and a blank line)
-      if ! grep -q '^stream_group' "$L/$n.before" && cmp -s "$L/$n.before" <(sed '/^stream_group/,/^$/d' "$L/$n.after") &&
-         [ "$(sed -n '/^stream_group/,/^$/p' "$L/$n.after" | grep -c '^stream')" = 2 ] &&
-         [ "$(sed -n '/^stream_group/,/^$/p' "$L/$n.after" | grep -c '^packet')" = 0 ]; then
+      # only the group may differ: the "after" listing is the "before" one with the group section in it, which with
+      # FFmpeg 9.1's ffprobe (groups list their entries) is its stream_group line and one line for each of its two
+      # streams, the same lines as streams 0 and 1 of the listing
+      if ! grep -q '^stream_group' "$L/$n.before" && [ "$(grep -c '^stream_group' "$L/$n.after")" = 1 ] &&
+         cmp -s "$L/$n.before" <(sed '/^stream_group/,+2d' "$L/$n.after") &&
+         [ "$(sed -n '/^stream_group/,+2p' "$L/$n.after" | sed -n 2p)" = "$(grep -m1 '^stream|index=0|' "$L/$n.before")" ] &&
+         [ "$(sed -n '/^stream_group/,+2p' "$L/$n.after" | sed -n 3p)" = "$(grep -m1 '^stream|index=1|' "$L/$n.before")" ] &&
+         [ -n "$(grep -m1 '^stream|index=1|' "$L/$n.before")" ]; then
         echo "ok: $n: only the stream group differs ($(grep -c '^packet' "$L/$n.after") packets the same)"
       else echo "FAIL: $n: more than the group differs"; fail=1; fi
     else echo "FAIL: $n: differs before and after"; fail=1; fi
@@ -341,6 +351,38 @@ merge() {
   [ $fail = 0 ] && echo "ALL PASSED" || echo "SOME FAILED"
 }
 
+# ffmpeg-9972: the FFmpeg of the test, with and without the patch (no other patch left out)
+HLS_FF="--disable-everything --enable-avdevice --enable-avfilter --enable-swscale --enable-swresample
+  --enable-indev=lavfi --enable-filter=testsrc,sine,scale,format,aformat,aresample,null,anull,buffer,buffersink,abuffer,abuffersink
+  --enable-encoder=mpeg2video,mp2 --enable-decoder=mpeg2video,mp2,wrapped_avframe,pcm_s16le --enable-parser=mpegvideo,mpegaudio
+  --enable-demuxer=hls,mpegts --enable-muxer=mpegts --enable-protocol=file,pipe --enable-ffmpeg --enable-ffprobe
+  --extra-cflags=-fsanitize=address --extra-ldflags=-fsanitize=address"
+# the checks of hls_variants.sh that fail without ffmpeg-9972 (measured when it was written: ffprobe does not know
+# load_all_variants and max_bandwidth)
+HLS_FAILS_WITHOUT=14
+stage_hls() {
+  local L=$RG_W/logs b v
+  for b in after before; do
+    # shellcheck disable=SC2086
+    if [ $b = before ]; then RG_FF_LEAVE_OUT='^ffmpeg-9972-' rg_log "$L/build-hls-$b.log" rg_ffmpeg "$RG_W/hls-$b" $HLS_FF
+    else rg_log "$L/build-hls-$b.log" rg_ffmpeg "$RG_W/hls-$b" $HLS_FF; fi
+    v=$(rg_pass "$L/build-hls-$b.log" '^FF: (built in|.*already built)' '^FF: (PATCH FAILED|BUILD FAILED|sha256|no )')
+    rg_item "build-hls-$b" "$(rg_say "$v")" "$(rg_rest "$v"); $(grep -a -m1 '^FFSRC' "$L/build-hls-$b.log" | cut -c7-)"
+  done
+  export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
+  if [ -x "$RG_W/hls-after/prefix/bin/ffprobe" ]; then
+    rg_log "$L/hls.log" bash "$HERE/tools/hls_variants.sh" "$RG_W/hls-after/prefix/bin" "$RG_W/hls-run"
+    v=$(rg_pass "$L/hls.log" '^ALL PASSED$' '^FAIL')
+    rg_item hls-one-variant "$(rg_say "$v")" "ffmpeg-9972: $(grep -c '^ok:' "$L/hls.log") ok; $(rg_rest "$v")"
+  else rg_item hls-one-variant FAILED "no FFmpeg built with ffmpeg-9972"; fi
+  if [ -x "$RG_W/hls-before/prefix/bin/ffprobe" ]; then
+    rg_log "$L/hls-before.log" bash "$HERE/tools/hls_variants.sh" "$RG_W/hls-before/prefix/bin" "$RG_W/hls-run-before"
+    v=$(rg_fails "$L/hls-before.log" "$HLS_FAILS_WITHOUT" '^FAIL')
+    rg_item hls-one-variant.without-9972 "$(rg_say "$v")" "$(rg_rest "$v")"
+  else rg_item hls-one-variant.without-9972 FAILED "no FFmpeg built without ffmpeg-9972"; fi
+  rg_rm "$RG_W/hls-run" "$RG_W/hls-run-before"
+}
+
 stage_playback() {
   local v
   rg_fresh "$P"
@@ -361,4 +403,99 @@ stage_playback() {
   else rg_item merge-hvc1 FAILED "no 'hvc1' sample made (mov-dv-group), or no FFmpeg with and without ffmpeg-9930"; fi
 }
 
-rg_main "inputs build fate playback" "$@"
+# ------------------------------------------------------------------------------------------------- MVC in Matroska
+# mvcmkv: ffmpeg-9953. Matroska files of one H.264 MVC stream (the 1920x1080 two-view stream of the reference encoder,
+# which tools/regress/mvc decodes against JM) in each form that declares its second view, and a 2D one
+# (tools/mkv-mvc.py), read by ffprobe with and without the patch (tools/ff-extradata.py: the private data after
+# avformat_find_stream_info(), and the tag mvc_configuration), and what Kodi decides of that private data with its own
+# header, MultiviewChoice.h (tools/mvc_declared.cpp). With the patch: every form is decoded as two views; the mapping
+# forms give the bytes of the legacy form; the stream form opens the decoder of both views with the same record as the
+# legacy form; the legacy form, both forms together and the 2D file keep their bytes. Without it: the mapping and the
+# stream forms are plain H.264. And every packet of the six files is the same with and without it.
+mvcmkv() {
+  local Nb Ab K D=$RG_W/mvcmkv fail=0 n v line
+  Nb=$(ffbin nomvc); Ab=$(ffbin after2)
+  rg_fresh "$D"
+  mkdir -p "$D/x"
+  $RG_PY "$HERE/tools/mkv-mvc.py" "$SM/mvc-bd1080.264" "$D" || { echo "FAIL: mkv-mvc.py"; return 1; }
+  K=$(rg_kodi) || { echo "FAIL: no Kodi tree"; return 1; }
+  g++ -std=c++20 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$K/xbmc/cores/VideoPlayer" -o "$D/mvc_declared" "$HERE/tools/mvc_declared.cpp" > "$D/build.log" 2>&1 \
+    || { echo "FAIL: mvc_declared does not build: $(head -n 3 "$D/build.log" | tr '\n' ' ')"; return 1; }
+  for n in legacy mapping maponly both stream plain; do
+    for v in nomvc after2; do
+      line=$($RG_PY "$HERE/tools/ff-extradata.py" "$(ffbin $v)/ffprobe" "$D/$n.mkv" "$D/x/$n.$v.bin") \
+        || { echo "FAIL: $n ($v): ffprobe"; fail=1; continue; }
+      echo "$n $v: private data of ${line%% *} bytes, mvc_configuration ${line#* }"
+      echo "${line#* }" > "$D/x/$n.$v.tag"
+    done
+  done
+  "$D/mvc_declared" "$D"/x/*.bin "$D/expected-legacy.bin" "$D/expected-base.bin" > "$D/decided.txt" 2>&1 \
+    || { echo "FAIL: mvc_declared: $(tail -n 2 "$D/decided.txt" | tr '\n' ' ')"; fail=1; }
+  sed "s#$D/##" "$D/decided.txt"
+  dec() { grep "/$1 " "$D/decided.txt" | sed 's/^[^ ]* //'; }
+  rec() { dec "$1" | sed 's/.*record=//'; }
+  want() { # what, got, wanted
+    if [ "$2" = "$3" ]; then echo "ok: $1: $2"; else echo "FAIL: $1: $2 (want $3)"; fail=1; fi
+  }
+  same() { # what, file, file
+    if cmp -s "$2" "$3"; then echo "ok: $1"; else echo "FAIL: $1: the bytes differ"; fail=1; fi
+  }
+  # the premises: the legacy form is the record of the base view with the box, which Kodi decodes as two views
+  want "the legacy form, as written" "$(dec expected-legacy.bin | cut -d' ' -f1-2)" "declared=1 twoviews=1"
+  want "the record of the base view alone" "$(dec expected-base.bin | cut -d' ' -f1-2)" "declared=0 twoviews=0"
+  # without the patch
+  for n in legacy both; do
+    want "$n without ffmpeg-9953" "$(dec $n.nomvc.bin | cut -d' ' -f1-2)" "declared=1 twoviews=1"
+  done
+  for n in mapping maponly stream plain; do
+    want "$n without ffmpeg-9953 (plain H.264)" "$(dec $n.nomvc.bin | cut -d' ' -f1-2)" "declared=0 twoviews=0"
+  done
+  # with it
+  for n in legacy mapping maponly both stream; do
+    want "$n with ffmpeg-9953" "$(dec $n.after2.bin | cut -d' ' -f1-2)" "declared=1 twoviews=1"
+  done
+  want "plain with ffmpeg-9953 (plain H.264)" "$(dec plain.after2.bin | cut -d' ' -f1-2)" "declared=0 twoviews=0"
+  for n in mapping maponly both; do
+    same "$n with ffmpeg-9953: the bytes of the legacy form" "$D/x/$n.after2.bin" "$D/expected-legacy.bin"
+  done
+  for n in legacy both plain; do
+    same "$n: the same bytes with and without ffmpeg-9953" "$D/x/$n.nomvc.bin" "$D/x/$n.after2.bin"
+  done
+  same "stream without ffmpeg-9953: the record of the base view" "$D/x/stream.nomvc.bin" "$D/expected-base.bin"
+  want "stream with ffmpeg-9953: the decoder of both views opened with the record of the legacy form" \
+    "$(rec stream.after2.bin)" "$(rec legacy.after2.bin)"
+  want "legacy: the tag" "$(cat "$D/x/legacy.after2.tag")" "codec private"
+  want "both: the tag" "$(cat "$D/x/both.after2.tag")" "codec private"
+  want "mapping: the tag" "$(cat "$D/x/mapping.after2.tag")" "block addition mapping"
+  want "maponly: the tag" "$(cat "$D/x/maponly.after2.tag")" "block addition mapping"
+  want "stream: the tag" "$(cat "$D/x/stream.after2.tag")" "stream"
+  want "plain: no tag" "$(cat "$D/x/plain.after2.tag")" "-"
+  # every packet, with and without the patch
+  for n in legacy mapping maponly both stream plain; do
+    for v in nomvc after2; do
+      "$(ffbin $v)/ffprobe" -hide_banner -v error -show_packets -show_data_hash MD5 -of compact "$D/$n.mkv" \
+        < /dev/null > "$D/x/$n.$v.packets" 2>&1
+    done
+    if [ "$(grep -c '^packet' "$D/x/$n.after2.packets")" != 25 ]; then
+      echo "FAIL: $n: $(grep -c '^packet' "$D/x/$n.after2.packets") packets read (want 25)"; fail=1
+    else same "$n: the 25 packets the same with and without ffmpeg-9953" "$D/x/$n.nomvc.packets" "$D/x/$n.after2.packets"; fi
+  done
+  [ $fail = 0 ] && echo "ALL PASSED" || echo "SOME FAILED"
+}
+
+stage_mvcmkv() {
+  local v L=$RG_W/logs
+  # shellcheck disable=SC2086
+  rg_log "$L/build-nomvc.log" ff_variant "$V/nomvc" '^ffmpeg-9953-' $RG_FF_BRIDGE
+  v=$(rg_pass "$L/build-nomvc.log" '^(FF: |/)' '^FF: (PATCH FAILED|BUILD FAILED|sha256|no )')
+  rg_item build-nomvc "$(rg_say "$v")" "$(rg_rest "$v")$(grep -a -m1 '^FFSRC' "$L/build-nomvc.log" | sed 's/^FFSRC/;/')"
+  rg_log "$L/build-after2-mvc.log" rg_ff_bridge
+  if [ -x "$(ffbin nomvc)/ffprobe" ] && [ -x "$(ffbin after2)/ffprobe" ]; then
+    rg_log "$L/mvcmkv.log" mvcmkv
+    v=$(rg_pass "$L/mvcmkv.log" '^ALL PASSED$' '^FAIL')
+    rg_item mvc-matroska "$(rg_say "$v")" "ffmpeg-9953: $(grep -c '^ok:' "$L/mvcmkv.log") ok; $(rg_rest "$v")"
+  else rg_item mvc-matroska FAILED "no FFmpeg built without ffmpeg-9953, or with all"; fi
+}
+
+rg_main "inputs build fate hls playback mvcmkv" "$@"

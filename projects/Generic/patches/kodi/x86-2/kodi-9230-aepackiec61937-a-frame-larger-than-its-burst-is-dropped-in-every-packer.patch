@@ -1,0 +1,271 @@
+From e1f40e159a975a14f9b37af9aa1b933fe7c07963 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:59:09 +0000
+Subject: [PATCH] AEPackIEC61937: a frame larger than its burst is dropped in
+ every packer
+
+PackAC3(), PackEAC3() and PackTrueHD() checked the size of a frame with
+an assert(), which a release build leaves out, and against the whole
+burst rather than its payload (the burst less its 8 bytes of preamble).
+A frame larger than the payload was swapped past it, and the padding
+after it, memset(m_data + size, 0, burst - 8 - size), took an unsigned
+length that wraps to about 4 GB. For TrueHD the burst is 61440 bytes in
+a buffer of 65536, the CAEBitstreamPacker's own. Frame sizes come from a
+stream parser, so a damaged or misread header is enough. PackDTSHD()
+already dropped such a frame (0ed2895); the three others now do the
+same, through one check (FrameFitsBurst()) that counts the frame as
+packed, rounded up to a whole word. A frame that does not fit is said
+in the log once for each size and burst, not at every frame of a
+damaged stream; the packer returns 0, which the sink already takes as
+nothing to write, as it does from PackDTS().
+
+The three also swap the bytes with SwapEndianFrame() (a15c8c8), as the
+DTS packers do: a frame of an odd size no longer reads the byte after
+it, which is not the frame's, into its last word.
+
+PackDTS() loses its assert() as well: a frame larger than frameSize was
+already neither sent as it is nor packed, and returns 0.
+
+Found by SamuriHL (SamuriHL/coreelec-xbmc commit 505a0b814c, "ae: drop
+an oversized frame instead of overrunning the IEC 61937 burst"), from a
+review of avdvplus R10.
+---
+ .../AudioEngine/Utils/AEPackIEC61937.cpp      | 63 ++++++++++------
+ .../Utils/test/TestAEPackIEC61937.cpp         | 72 +++++++++++++++++++
+ 2 files changed, 114 insertions(+), 21 deletions(-)
+
+diff --git a/xbmc/cores/AudioEngine/Utils/AEPackIEC61937.cpp b/xbmc/cores/AudioEngine/Utils/AEPackIEC61937.cpp
+index dcb6659..03062bc 100644
+--- a/xbmc/cores/AudioEngine/Utils/AEPackIEC61937.cpp
++++ b/xbmc/cores/AudioEngine/Utils/AEPackIEC61937.cpp
+@@ -10,13 +10,39 @@
+ 
+ #include "utils/log.h"
+ 
+-#include <cassert>
++#include <atomic>
++#include <cstdint>
+ #include <string.h>
+ 
+ #define IEC61937_PREAMBLE1  0xF872
+ #define IEC61937_PREAMBLE2  0x4E1F
+ 
+-inline void SwapEndian(uint16_t *dst, uint16_t *src, unsigned int size)
++namespace
++{
++// Hades: a frame of `size` bytes, rounded up to a whole word as it is packed, fits the payload of a
++// burst of `burst` bytes (the burst less its preamble), and the burst fits the destination
++// (MAX_IEC61937_PACKET). Otherwise the byte swap writes past the payload and the padding after it
++// gets an unsigned length that wraps to about 4 GB. Frame sizes come from a stream parser, so a
++// damaged or misread header is enough. An assert() stood for this in three packers: out of a
++// release build, and against the whole burst, which lets the last IEC61937_DATA_OFFSET bytes past.
++// A frame that does not fit is dropped (0, as PackDTS() says of a stream it cannot pack), and said
++// once for each size and burst: a damaged stream repeats it at every frame, on the audio thread.
++bool FrameFitsBurst(unsigned int size, unsigned int burst, const char* packer)
++{
++  if (burst <= MAX_IEC61937_PACKET && burst >= IEC61937_DATA_OFFSET &&
++      size + (size & 0x1) <= burst - IEC61937_DATA_OFFSET)
++    return true;
++
++  static std::atomic<uint64_t> lastSaid{0};
++  const uint64_t said = (static_cast<uint64_t>(burst) << 32) | size;
++  if (lastSaid.exchange(said) != said)
++    CLog::Log(LOGERROR, "CAEPackIEC61937::{} - {} byte frame does not fit a {} byte burst, dropped",
++              packer, size, burst);
++  return false;
++}
++} // namespace
++
++inline void SwapEndian(uint16_t* dst, const uint16_t* src, unsigned int size)
+ {
+   for (unsigned int i = 0; i < size; ++i, ++dst, ++src)
+     *dst = ((*src & 0xFF00) >> 8) | ((*src & 0x00FF) << 8);
+@@ -25,10 +51,10 @@ inline void SwapEndian(uint16_t *dst, uint16_t *src, unsigned int size)
+ // Hades: byte-swaps the 16-bit words of a frame of `size` bytes into dst (which may be src) and
+ // returns the size written, rounded up to a whole word. A frame of an odd size ends in half a word:
+ // its last byte is swapped with a zero, as the byte after the frame is not the frame's to read.
+-inline unsigned int SwapEndianFrame(uint8_t* dst, uint8_t* src, unsigned int size)
++inline unsigned int SwapEndianFrame(uint8_t* dst, const uint8_t* src, unsigned int size)
+ {
+   const uint8_t last = (size & 0x1) ? src[size - 1] : 0;
+-  SwapEndian(reinterpret_cast<uint16_t*>(dst), reinterpret_cast<uint16_t*>(src), size >> 1);
++  SwapEndian(reinterpret_cast<uint16_t*>(dst), reinterpret_cast<const uint16_t*>(src), size >> 1);
+   if (size & 0x1)
+   {
+     dst[size - 1] = 0;
+@@ -40,7 +66,8 @@ inline unsigned int SwapEndianFrame(uint8_t* dst, uint8_t* src, unsigned int siz
+ 
+ int CAEPackIEC61937::PackAC3(uint8_t *data, unsigned int size, uint8_t *dest)
+ {
+-  assert(size <= OUT_FRAMESTOBYTES(AC3_FRAME_SIZE));
++  if (!FrameFitsBurst(size, OUT_FRAMESTOBYTES(AC3_FRAME_SIZE), "PackAC3"))
++    return 0;
+   struct IEC61937Packet *packet = (struct IEC61937Packet*)dest;
+ 
+   packet->m_preamble1 = IEC61937_PREAMBLE1;
+@@ -57,8 +84,7 @@ int CAEPackIEC61937::PackAC3(uint8_t *data, unsigned int size, uint8_t *dest)
+   int bitstream_mode  = data[5] & 0x7;
+   packet->m_type      = IEC61937_TYPE_AC3 | (bitstream_mode << 8);
+ 
+-  size += size & 0x1;
+-  SwapEndian((uint16_t*)packet->m_data, (uint16_t*)data, size >> 1);
++  size = SwapEndianFrame(packet->m_data, data, size);
+ #endif
+ 
+   memset(packet->m_data + size, 0, OUT_FRAMESTOBYTES(AC3_FRAME_SIZE) - IEC61937_DATA_OFFSET - size);
+@@ -67,7 +93,8 @@ int CAEPackIEC61937::PackAC3(uint8_t *data, unsigned int size, uint8_t *dest)
+ 
+ int CAEPackIEC61937::PackEAC3(uint8_t *data, unsigned int size, uint8_t *dest)
+ {
+-  assert(size <= OUT_FRAMESTOBYTES(EAC3_FRAME_SIZE));
++  if (!FrameFitsBurst(size, OUT_FRAMESTOBYTES(EAC3_FRAME_SIZE), "PackEAC3"))
++    return 0;
+   struct IEC61937Packet *packet = (struct IEC61937Packet*)dest;
+ 
+   packet->m_preamble1 = IEC61937_PREAMBLE1;
+@@ -81,8 +108,7 @@ int CAEPackIEC61937::PackEAC3(uint8_t *data, unsigned int size, uint8_t *dest)
+   else
+     memcpy(packet->m_data, data, size);
+ #else
+-  size += size & 0x1;
+-  SwapEndian((uint16_t*)packet->m_data, (uint16_t*)data, size >> 1);
++  size = SwapEndianFrame(packet->m_data, data, size);
+ #endif
+ 
+   memset(packet->m_data + size, 0, OUT_FRAMESTOBYTES(EAC3_FRAME_SIZE) - IEC61937_DATA_OFFSET - size);
+@@ -109,7 +135,8 @@ int CAEPackIEC61937::PackTrueHD(const uint8_t* data, unsigned int size, uint8_t*
+   if (size == 0)
+     return OUT_FRAMESTOBYTES(TRUEHD_FRAME_SIZE);
+ 
+-  assert(size <= OUT_FRAMESTOBYTES(TRUEHD_FRAME_SIZE));
++  if (!FrameFitsBurst(size, OUT_FRAMESTOBYTES(TRUEHD_FRAME_SIZE), "PackTrueHD"))
++    return 0;
+   struct IEC61937Packet *packet = (struct IEC61937Packet*)dest;
+   packet->m_preamble1 = IEC61937_PREAMBLE1;
+   packet->m_preamble2 = IEC61937_PREAMBLE2;
+@@ -122,8 +149,7 @@ int CAEPackIEC61937::PackTrueHD(const uint8_t* data, unsigned int size, uint8_t*
+   else
+     memcpy(packet->m_data, data, size);
+ #else
+-  size += size & 0x1;
+-  SwapEndian((uint16_t*)packet->m_data, (uint16_t*)data, size >> 1);
++  size = SwapEndianFrame(packet->m_data, data, size);
+ #endif
+ 
+   memset(packet->m_data + size, 0, OUT_FRAMESTOBYTES(TRUEHD_FRAME_SIZE) - IEC61937_DATA_OFFSET - size);
+@@ -148,14 +174,9 @@ int CAEPackIEC61937::PackDTSHD(uint8_t *data, unsigned int size, uint8_t *dest,
+ 
+   /* The payload must fit the burst, and the burst the destination buffer. Otherwise the padding
+    * memset below gets a negative length, i.e. about 4 GB. Drop the burst instead. */
+-  unsigned int burstsize = period << 2;
+-  if (burstsize > MAX_IEC61937_PACKET || size + (size & 0x1) > burstsize - IEC61937_DATA_OFFSET)
+-  {
+-    CLog::Log(LOGERROR,
+-              "CAEPackIEC61937::PackDTSHD - {} byte frame does not fit a period {} burst, dropped",
+-              size, period);
++  const unsigned int burstsize = period << 2;
++  if (!FrameFitsBurst(size, burstsize, "PackDTSHD"))
+     return 0;
+-  }
+ 
+   struct IEC61937Packet *packet = (struct IEC61937Packet*)dest;
+   packet->m_preamble1 = IEC61937_PREAMBLE1;
+@@ -182,7 +203,7 @@ int CAEPackIEC61937::PackDTSHD(uint8_t *data, unsigned int size, uint8_t *dest,
+ int CAEPackIEC61937::PackDTS(uint8_t *data, unsigned int size, uint8_t *dest, bool littleEndian,
+                              unsigned int frameSize, uint16_t type)
+ {
+-  assert(size <= frameSize);
++  // (a frame larger than frameSize is neither sent as it is nor packed: the last case below)
+ 
+   /* BE is the standard endianness, byteswap needed if LE */
+   bool byteSwapNeeded = littleEndian;
+diff --git a/xbmc/cores/AudioEngine/Utils/test/TestAEPackIEC61937.cpp b/xbmc/cores/AudioEngine/Utils/test/TestAEPackIEC61937.cpp
+index 703ffdc..5223a47 100644
+--- a/xbmc/cores/AudioEngine/Utils/test/TestAEPackIEC61937.cpp
++++ b/xbmc/cores/AudioEngine/Utils/test/TestAEPackIEC61937.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "cores/AudioEngine/Utils/AEPackIEC61937.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -117,3 +118,74 @@ TEST(TestAEPackIEC61937, AnUnknownPeriodIsDropped)
+   for (unsigned int i = 0; i < dest.size(); ++i)
+     ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written";
+ }
++
++//! Hades: an AC-3, E-AC-3 or TrueHD frame larger than the payload of its burst (the burst less its
++//! 8 bytes of preamble) is dropped and nothing is written, in a release build too; one that fills it
++//! is packed, and nothing past its burst is written. An assert() stood there, against the whole
++//! burst: out of a release build, the padding after the frame got a length that wraps to 4 GB.
++TEST(TestAEPackIEC61937, AnAc3FrameLargerThanItsPayloadIsDropped)
++{
++  const unsigned int burst = OUT_FRAMESTOBYTES(AC3_FRAME_SIZE);
++  std::vector<uint8_t> frame(burst - IEC61937_DATA_OFFSET, 0x11);
++  std::vector<uint8_t> dest(MAX_IEC61937_PACKET + GUARD, CANARY);
++
++  EXPECT_EQ(static_cast<int>(burst), CAEPackIEC61937::PackAC3(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = burst; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written past the burst";
++
++  std::fill(dest.begin(), dest.end(), CANARY);
++  frame.resize(burst - IEC61937_DATA_OFFSET + 2, 0x11);
++  EXPECT_EQ(0, CAEPackIEC61937::PackAC3(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = 0; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written";
++}
++
++TEST(TestAEPackIEC61937, AnEac3FrameLargerThanItsPayloadIsDropped)
++{
++  const unsigned int burst = OUT_FRAMESTOBYTES(EAC3_FRAME_SIZE);
++  std::vector<uint8_t> frame(burst - IEC61937_DATA_OFFSET, 0x11);
++  std::vector<uint8_t> dest(MAX_IEC61937_PACKET + GUARD, CANARY);
++
++  EXPECT_EQ(static_cast<int>(burst), CAEPackIEC61937::PackEAC3(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = burst; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written past the burst";
++
++  std::fill(dest.begin(), dest.end(), CANARY);
++  frame.resize(burst - IEC61937_DATA_OFFSET + 1, 0x11); // odd: one word over once rounded up
++  EXPECT_EQ(0, CAEPackIEC61937::PackEAC3(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = 0; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written";
++}
++
++TEST(TestAEPackIEC61937, ATrueHdFrameLargerThanItsPayloadIsDropped)
++{
++  const unsigned int burst = OUT_FRAMESTOBYTES(TRUEHD_FRAME_SIZE);
++  std::vector<uint8_t> frame(burst - IEC61937_DATA_OFFSET, 0x11);
++  std::vector<uint8_t> dest(MAX_IEC61937_PACKET + GUARD, CANARY);
++
++  EXPECT_EQ(static_cast<int>(burst), CAEPackIEC61937::PackTrueHD(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = burst; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written past the burst";
++
++  std::fill(dest.begin(), dest.end(), CANARY);
++  frame.resize(burst, 0x11);
++  EXPECT_EQ(0, CAEPackIEC61937::PackTrueHD(frame.data(), frame.size(), dest.data()));
++  for (unsigned int i = 0; i < dest.size(); ++i)
++    ASSERT_EQ(CANARY, dest[i]) << "byte " << i << " written";
++}
++
++//! An AC-3 frame of an odd size, followed in memory by a byte that is not the frame's: the packed
++//! frame ends with its last byte and a zero, swapped, and the byte after it is not read
++TEST(TestAEPackIEC61937, AnOddSizedAc3FrameIsReadNoFurtherThanItsEnd)
++{
++  constexpr unsigned int SIZE = 1001;
++  std::vector<uint8_t> memory(SIZE + 1, 0x11);
++  memory[SIZE - 1] = 0x33; // the frame's last byte
++  memory[SIZE] = 0xEE; // not the frame's
++  std::vector<uint8_t> dest(MAX_IEC61937_PACKET + GUARD, CANARY);
++
++  EXPECT_EQ(static_cast<int>(OUT_FRAMESTOBYTES(AC3_FRAME_SIZE)),
++            CAEPackIEC61937::PackAC3(memory.data(), SIZE, dest.data()));
++  EXPECT_EQ(0x00u, dest[IEC61937_DATA_OFFSET + SIZE - 1]);
++  EXPECT_EQ(0x33u, dest[IEC61937_DATA_OFFSET + SIZE]);
++}
+-- 
+2.53.0
+

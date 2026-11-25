@@ -2,12 +2,12 @@
 # Copyright (C) 2026-present Hades
 
 PKG_NAME="nvidia-legacy-open"
-PKG_VERSION="580.196.07"
-# NVIDIA's open-gpu-kernel-modules at the tag 580.196.07 (git ls-remote: the tag object
-# 1365c67cd1de65aaed10398025ae4063f4c64552 points at this commit). Its kernel-open/ is the
-# kernel-open/ of the 580.196.07 .run file by file, but for the two prebuilt objects.
-PKG_COMMIT="02e64bf229e77873c9df22ebcfed6a3e0b813206"
-PKG_SHA256="5e9e92f1c70d1487a365179704ae14bab3eedfd60b5e005c214bba40a926db45"
+PKG_VERSION="580.196.11"
+# NVIDIA's open-gpu-kernel-modules at the tag 580.196.11 (git ls-remote: the tag object
+# 6f322270add89c975ddbdf16460481c0ae577ad8 points at this commit). Its kernel-open/ is the
+# kernel-open/ of the 580.196.11 .run file by file, but for the two prebuilt objects.
+PKG_COMMIT="853787f5371efe9ddcaf02b139e68b5032045d7d"
+PKG_SHA256="c682c88caecd21ff5b0bad2bef166f279ae304b3ff904d499258e7c7aab664ca"
 PKG_ARCH="x86_64"
 PKG_LICENSE="MIT OR GPL-2.0-only"
 PKG_SITE="https://github.com/NVIDIA/open-gpu-kernel-modules"

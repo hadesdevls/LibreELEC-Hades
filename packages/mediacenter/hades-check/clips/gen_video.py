@@ -2,7 +2,8 @@
 # Copyright (C) 2026 Hades
 """Makes the picture clips of "Check this setup": the Hades check card (card.py) in SDR, HDR10, HLG,
 Dolby Vision 8.1 and Dolby Vision 5, as Matroska files, with clips.json (what each clip is and what it
-must show). Runs at build time on the build host: x265 encodes, everything else is this directory's
+must show); the clip of the A/B comparison of native Dolby Vision (abclip.py: clips.json "ab", apart
+from the card's list); and the 3D clip of the frame packing card (fpclip.py: clips.json "fp"). Runs at build time on the build host: x265 encodes, everything else is this directory's
 Python (standard library only). Deterministic: the same bytes on every run.
 
 usage: gen_video.py --x265 <x265> --ffprobe <ffprobe> --out <dir> [--only <format,...>] [--frames <n>]
@@ -16,8 +17,10 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import abclip  # noqa: E402
 import card  # noqa: E402
 import dovi  # noqa: E402
+import fpclip  # noqa: E402
 import hevc  # noqa: E402
 import mkv  # noqa: E402
 
@@ -42,7 +45,7 @@ X265_COMMON = ["--preset", "medium", "--aq-mode", "0", "--bframes", "0", "--no-s
                "--no-open-gop", "--frame-threads", "1", "--pools", "4", "--lookahead-slices", "0",
                "--no-info", "--sar", "1:1", "--no-asm", "--log-level", "error"]
 QUANTISER = {"sdr": ["--lossless"], "hdr10": ["--qp", "8"], "hlg": ["--qp", "8"], "dv81": ["--qp", "8"],
-             "dv5": ["--qp", "8"]}
+             "dv5": ["--qp", "8"], abclip.FORMAT: ["--qp", "8"], fpclip.FORMAT: ["--lossless"]}
 
 P3_D65 = ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060))
 
@@ -75,8 +78,11 @@ def static_metadata(f):
     return md, max_cll, max_fall
 
 
-def encode(x265, f, path, log, quantiser):
-    planes = card.planes(f)
+def encode(x265, f, path, log, quantiser, planes=None, static=None):
+    """(planes: the picture, the card's where not given; static: its HDR10 static metadata, the card's where
+    not given, as static_metadata() gives them)"""
+    if planes is None:
+        planes = card.planes(f)
     frame = b"".join(planes)
     args = [x265, "--input", "-", "--input-res", "%dx%d" % (f["width"], f["height"]),
             "--fps", "%d/%d" % f["fps"], "--input-depth", str(f["bits"]), "--output-depth", str(f["bits"]),
@@ -84,7 +90,7 @@ def encode(x265, f, path, log, quantiser):
             "--keyint", str(f["frames"]), "--min-keyint", str(f["frames"])]
     args += X265_COMMON + quantiser + x265_colour(f)
     if f["signal"] == "pq":
-        md, max_cll, max_fall = static_metadata(f)
+        md, max_cll, max_fall = static_metadata(f) if static is None else static
         args += ["--master-display", md, "--max-cll", "%d,%d" % (max_cll, max_fall)]
     args += ["-o", path]
     env = {"LC_ALL": "C", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
@@ -178,6 +184,90 @@ def make_clip(f, stream, out_dir):
     return entry
 
 
+def ab_static(f):
+    """the HDR10 static metadata of the A/B clip: the mastering display of the card, its own light"""
+    md, _, _ = static_metadata(card.fmt("hdr10"))
+    peak, mean = abclip.light_stats(f)
+    return md, card.rnd(peak, "MaxCLL"), card.rnd(mean, "MaxFALL")
+
+
+def make_ab_clip(x265, ffprobe, out_dir, tmp, frames=0):
+    """the clip of the A/B comparison (abclip.py) and its entry of clips.json ("ab")"""
+    f = abclip.fmt()
+    if frames:
+        f["frames"] = frames
+    values = abclip.region_values()
+    static = ab_static(f)
+    hevc_path = os.path.join(tmp, f["id"] + ".hevc")
+    args = encode(x265, f, hevc_path, os.path.join(tmp, f["id"] + ".log"), QUANTISER[f["id"]],
+                  planes=card.planes(f, values), static=static)
+    with open(hevc_path, "rb") as fh:
+        nals = hevc.split_annexb(fh.read())
+    aus = hevc.access_units(nals)
+    if len(aus) != f["frames"]:
+        raise SystemExit("%s: %d access units, %d pictures expected" % (f["id"], len(aus), f["frames"]))
+    hv, sps = hevc.hvcc(nals)
+    if (sps["width"], sps["height"], sps["bit_depth_luma"], sps["chroma_format_idc"]) != (f["width"], f["height"], 10, 1):
+        raise SystemExit("%s: the stream is not what was asked for: %r" % (f["id"], sps))
+    _, cll, fall = static
+    l1_measured, l1 = abclip.level1(f)
+    l2, l5 = abclip.level2(), abclip.level5(f)
+    first = dovi.rpu_nal(dovi.metadata(8, l1, card.MASTERING, cll, fall, True, l2, l5))
+    rest = dovi.rpu_nal(dovi.metadata(8, l1, card.MASTERING, cll, fall, False, l2, l5))
+    aus = [au + [first if k == 0 else rest] for k, au in enumerate(aus)]
+    level = dovi.dv_level(f["width"], f["height"], f["fps"])
+    dv = (dovi.config_box_type(8), dovi.config_record(8, level, 1))
+    m = card.MASTERING
+    mastering = (P3_D65, card.D65, m["max_nits"], m["min_nits"])
+    path = os.path.join(out_dir, f["file"])
+    mkv.write(path, f, hv, [hevc.length_prefixed(au) for au in aus], (9, 1, 16, 9), mastering, cll, fall, dv)
+    if ffprobe:
+        self_check(ffprobe, path, f)
+    s = f["width"] // card.GRID_W
+    regions = {n: {"rect": [c * s for c in r], "codes": list(values[n].codes),
+                   "light": [rounded(c, 3, n) for c in values[n].light]} for n, r in abclip.regions()}
+    with open(path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return {"file": f["file"], "format": f["id"], "label": f["label"], "width": f["width"], "height": f["height"],
+            "fps": list(f["fps"]), "frames": f["frames"],
+            "duration": rounded(f["frames"] * f["fps"][1] / f["fps"][0], 3, "duration"), "bit_depth": 10,
+            "range": "limited", "colour": {"primaries": 9, "transfer": 16, "matrix": 9},
+            "max_cll": cll, "max_fall": fall,
+            "dovi": {"profile": 8, "level": level, "compatibility": 1, "l1_measured": list(l1_measured),
+                     "l1": list(l1), "l2": l2, "l5": l5, "rpu_bytes": [len(first), len(rest)]},
+            "regions": regions, "x265": args, "bytes": os.path.getsize(path), "sha256": digest}
+
+
+def make_fp_clip(x265, ffprobe, out_dir, tmp, frames=0):
+    """the 3D clip of the frame packing card (fpclip.py) and its entry of clips.json ("fp")"""
+    f = fpclip.fmt()
+    if frames:
+        f["frames"] = frames
+    hevc_path = os.path.join(tmp, f["id"] + ".hevc")
+    args = encode(x265, f, hevc_path, os.path.join(tmp, f["id"] + ".log"), QUANTISER[f["id"]],
+                  planes=fpclip.planes())
+    with open(hevc_path, "rb") as fh:
+        nals = hevc.split_annexb(fh.read())
+    aus = hevc.access_units(nals)
+    if len(aus) != f["frames"]:
+        raise SystemExit("%s: %d access units, %d pictures expected" % (f["id"], len(aus), f["frames"]))
+    hv, sps = hevc.hvcc(nals)
+    if (sps["width"], sps["height"], sps["bit_depth_luma"], sps["chroma_format_idc"]) != (f["width"], f["height"], 8, 1):
+        raise SystemExit("%s: the stream is not what was asked for: %r" % (f["id"], sps))
+    path = os.path.join(out_dir, f["file"])
+    mkv.write(path, f, hv, [hevc.length_prefixed(au) for au in aus], (1, 1, 1, 1), stereo=fpclip.STEREO_MODE)
+    if ffprobe:
+        self_check(ffprobe, path, f)
+    with open(path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return {"file": f["file"], "format": f["id"], "label": f["label"], "width": f["width"], "height": f["height"],
+            "fps": list(f["fps"]), "frames": f["frames"],
+            "duration": rounded(f["frames"] * f["fps"][1] / f["fps"][0], 3, "duration"), "bit_depth": 8,
+            "range": "limited", "colour": {"primaries": 1, "transfer": 1, "matrix": 1},
+            "stereo_mode": fpclip.STEREO_NAME, "eyes": list(fpclip.LABELS), "x265": args,
+            "bytes": os.path.getsize(path), "sha256": digest}
+
+
 def self_check(ffprobe, path, f):
     """a quick look with the host's ffprobe at what a decoder sees in the file (the full checks are the
     tests of this directory)"""
@@ -228,8 +318,20 @@ def main():
                 self_check(a.ffprobe, os.path.join(a.out, f["file"]), f)
             entries.append(entry)
             print("%s: %d bytes" % (f["file"], entry["bytes"]), flush=True)
+        ab = None
+        if not only or abclip.FORMAT in only:
+            ab = make_ab_clip(a.x265, a.ffprobe, a.out, tmp, a.frames)
+            print("%s: %d bytes" % (ab["file"], ab["bytes"]), flush=True)
+        fp = None
+        if not only or fpclip.FORMAT in only:
+            fp = make_fp_clip(a.x265, a.ffprobe, a.out, tmp, a.frames)
+            print("%s: %d bytes" % (fp["file"], fp["bytes"]), flush=True)
     doc = {"version": 1, "card": {"grid": [card.GRID_W, card.GRID_H], "reference_white_nits": card.REF_WHITE},
            "clips": entries}
+    if ab:
+        doc["ab"] = ab
+    if fp:
+        doc["fp"] = fp
     with open(os.path.join(a.out, "clips.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
         fh.write("\n")

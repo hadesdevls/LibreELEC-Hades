@@ -20,6 +20,7 @@
 // Usage: dvmerge_test <two-track .m2ts> <one-track .mkv> <two-track .m2ts signalled as a disc> [<samples>]
 // <samples>: the folder of the files of sections 8 to 17, which also holds BL_EL.mkv and FEL_test_for_AVS.m2ts
 #include "DVLayerMerge.h"
+#include "StreamGroupStreams.h"
 
 // tools/regress: the join under test has every part that this test checks; a build without one of them fails
 #ifdef DVMERGE_NO_PROBE
@@ -898,9 +899,10 @@ static void Unverified(const std::string& dir, const Joins& felDeclared)
       if (g->type != AV_STREAM_GROUP_PARAMS_DOLBY_VISION)
         continue;
       // (a group the wrong way round, its "enhancement" track the larger one)
-      const bool wrongWay = g->nb_streams == 2 && g->params.layered_video &&
-                            g->streams[g->params.layered_video->el_index]->codecpar->width >
-                                g->streams[1 - g->params.layered_video->el_index]->codecpar->width;
+      const AVStream* el = KODI::STREAMGROUP::Stream(g, g->params.layered_video ? g->params.layered_video->el_index : 0);
+      const AVStream* bl = KODI::STREAMGROUP::Stream(g, g->params.layered_video ? 1 - g->params.layered_video->el_index : 0);
+      const bool wrongWay = KODI::STREAMGROUP::Size(g) == 2 && g->params.layered_video && el && bl &&
+                            el->codecpar->width > bl->codecpar->width;
       groups += c.reversed && wrongWay ? 100 : 1;
     }
     const auto& l = s.layers;
