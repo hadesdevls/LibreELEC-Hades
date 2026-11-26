@@ -1031,13 +1031,15 @@ stage_hostpol() {
 
 # the IPT tunnel (dvbridge_ipt.h, the IPT pass of dvbridge_source.c): the 14 pictures against an IPT conversion in
 # float64 and float32 of the exact composed planes (src/ccm_ref.c; ipt_check.py, ipt_eval.py); the direct and the
-# composed way the same bytes; the GUI over it; a profile 5 picture taken from the matrices of its RPU to those of
-# the tunnel (a licensed core's), the direct and the composed way the same bytes, and decoded as the picture as
-# composed is; two mutants that the oracle must see
-# (with the matrices of the licensed core in the tunnel, 2026-11; with those of the RPUs of profile 5 before it was
-# "I 0.036% off max 1 | P 0.034% max 1 | T 0.041% max 1": the shares move with the rounding of other matrices, the
-# maximum of one code is the target)
-IPT_F64="I 0.043% off max 1 | P 0.029% max 1 | T 0.036% max 1"
+# composed way the same bytes; the compute pass of the tunnel (9c, as Kodi asks for it by default) and its fragment
+# passes (9a and 9b) the same bytes, each saying which made the pictures; the GUI over it; a profile 5 picture taken
+# from the matrices of its RPU to those of the tunnel (a licensed core's), the direct and the composed way the same
+# bytes, and decoded as the picture as composed is; six mutants that these must see
+# (PQ from the tables of pass 9, 2026-11; with PQ computed in the shader, "I 0.043% off max 1 | P 0.029% max 1 | T
+# 0.036% max 1", and with the matrices of the RPUs of profile 5 in the tunnel before that, "I 0.036% off max 1 | P
+# 0.034% max 1 | T 0.041% max 1": the shares move with the rounding of the matrices and of PQ, the maximum of one code
+# is the target, and a change of the shares is a change of the tunnel's arithmetic that is explained before this is)
+IPT_F64="I 0.008% off max 1 | P 0.007% max 1 | T 0.005% max 1"
 stage_ipt() {
   local K L F O p v n m d5 bad
   K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
@@ -1060,8 +1062,10 @@ stage_ipt() {
     # shellcheck disable=SC2086
     rg_log "$O/$tag.log" gpu "$@" nice -n 19 timeout 3000 "$b" "$DATA" "$O/$tag" "$tag" $pics
   }
-  # --- ipt-oracle and ipt-ways: the 14 pictures
-  ipt_run ipt "$O/fb" "$PICS" FB_SOURCE=1 FB_IPT=1
+  # computed <log> <0|1>: how many pictures of a run say that the compute pass did (1) or did not (0) convert them
+  computed() { grep -a -c -E "^picture [0-9]+: IPT 1, computed $2\$" "$1"; }
+  # --- ipt-oracle and ipt-ways: the 14 pictures, with the compute pass of the tunnel as Kodi asks for it
+  ipt_run ipt "$O/fb" "$PICS" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1
   # shellcheck disable=SC2086
   rg_log "$O/check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" bridge "$DATA" "$O/ipt" ipt $PICS
   n=$(sed -n 's/^ALL vs float64 oracle: //p' "$O/check.log")
@@ -1084,9 +1088,21 @@ PY
 )
   [ "$bad" = 0 ] && rg_item ipt-ways PASSED "the IPT tunnel of the direct and the composed way the same bytes in all 14 pictures" \
     || rg_item ipt-ways FAILED "${bad:-?} of 14 pictures differ between the direct and the composed way"
-  rg_rm "$O/ipt"
+  # --- ipt-forms: the 14 pictures by the fragment passes of the tunnel (compute forms not asked for, as on a GPU
+  # without OpenGL ES 3.1): the same bytes as by its compute pass, and each run made by the pass it says
+  ipt_run frag "$O/fb" "$PICS" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=0
+  # shellcheck disable=SC2086
+  rg_log "$O/forms.log" nice -n 19 $RG_PY "$TS/ipt_check.py" same "$O/ipt" ipt "$O/frag" frag direct.rgba $PICS
+  local c1 c0
+  c1=$(computed "$O/ipt.log" 1); c0=$(computed "$O/frag.log" 0)
+  if [ "$c1" = 14 ] && [ "$c0" = 14 ] && grep -a -q '^SAME PASSED$' "$O/forms.log"; then
+    rg_item ipt-forms PASSED "the compute pass made the 14 pictures with the compute forms asked for, the fragment passes without; the same bytes"
+  else
+    rg_item ipt-forms FAILED "by the compute pass: $c1 of 14 (asked), by the fragment passes: $c0 of 14 (not asked); $(grep -a -m1 '^SAME' "$O/forms.log")"
+  fi
+  rg_rm "$O/ipt" "$O/frag"
   # --- ipt-gui: the GUI over the IPT tunnel; every pixel not drawn over as the direct way
-  ipt_run gui "$O/fb" "51 960 2640" FB_SOURCE=1 FB_IPT=1 FB_GUI=2
+  ipt_run gui "$O/fb" "51 960 2640" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1 FB_GUI=2
   rg_log "$O/gui-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" gui "$O/gui" gui 51 960 2640
   v=$(rg_pass "$O/gui-check.log" '^GUI PASSED$')
   rg_item ipt-gui "$(rg_say "$v")" "the pixels the GUI does not reach as the direct way, pictures 51 960 2640: $(rg_rest "$v")"
@@ -1111,7 +1127,7 @@ PY
   cp "$IN/p5-chart.meta" "$d5/meta.bin"
   for m in 0 1; do
     rg_fresh "$O/p5-$m"
-    rg_log "$O/p5-$m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=$m nice -n 19 timeout 1800 "$O/fb" "$O/data5" "$O/p5-$m" p5 1
+    rg_log "$O/p5-$m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=$m FB_COMPUTE=1 nice -n 19 timeout 1800 "$O/fb" "$O/data5" "$O/p5-$m" p5 1
   done
   n=0; for m in 0 1; do cmp -s "$O/p5-$m/p5-p1-direct.rgba" "$O/p5-$m/p5-p1-composed.rgba" && [ -s "$O/p5-$m/p5-p1-direct.rgba" ] && n=$((n + 1)); done
   rg_log "$O/p5-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" p5 "$O/p5-0" p5 "$O/p5-1" p5 1
@@ -1122,28 +1138,42 @@ PY
   if mutant ipt-p5lms "$TS/mut-ipt-p5lms.py" dvbridge_source.c &&
      rg_bridge "$RG_W/mut/ipt-p5lms" "$L" "$F" "$O/fidbench-ipt.c" "$O/fb-p5lms" "$SRC"; then
     rg_fresh "$O/p5-m"
-    rg_log "$O/p5-m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=1 nice -n 19 timeout 1800 "$O/fb-p5lms" "$O/data5" "$O/p5-m" p5 1
+    rg_log "$O/p5-m.log" gpu FB_SOURCE=1 FB_NOEL=1 FB_IPT=1 FB_COMPUTE=1 nice -n 19 timeout 1800 "$O/fb-p5lms" "$O/data5" "$O/p5-m" p5 1
     rg_log "$O/p5-m-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" p5 "$O/p5-0" p5 "$O/p5-m" p5 1
     grep -a -q '^P5-IPT FAILED$' "$O/p5-m-check.log" &&
       rg_item ipt-p5-mutant PASSED "profile 5 converted through the RGBtoLMS of BT.2020: caught, $(grep -a -m1 '^p1 ' "$O/p5-m-check.log" | sed 's/^p1 *//' | cut -c1-150)" ||
       rg_item ipt-p5-mutant FAILED "profile 5 converted through the RGBtoLMS of BT.2020: not caught; $(grep -a -m1 -E '^(p1 |P5-IPT|Traceback)' "$O/p5-m-check.log")"
   else rg_item ipt-p5-mutant FAILED "the mutant no longer applies or does not build"; fi
   rg_rm "$O/p5-0" "$O/p5-1" "$O/p5-m" "$O/data5" "$O/fb-p5lms" "$RG_W/mut/ipt-p5lms"
-  # --- ipt-mutants: a coefficient of the matrix, Cb and Cr swapped; caught where the checker fails, or where pictures
-  # 51 and 960 are not as far from the float64 oracle as the bridge as it is puts them (the lines of check.log)
+  # --- ipt-mutants, each run on pictures 51 and 960 by both forms of the tunnel, and caught by the check it is
+  # written for: "oracle" where the checker fails, or where those pictures are not as far from the float64 oracle as
+  # the bridge as it is puts them (the lines of check.log: ipt-oracle); "forms" where the two forms differ, or a run
+  # was not made by the pass it asked for (ipt-forms). A coefficient of the matrix of the tunnel and Cb and Cr swapped
+  # (oracle), the EOTF table read one cell off (oracle), the OETF table without the low part of its values (oracle:
+  # every code within one, the shares of codes off grown), the compute pass rounding the chroma of the odd pixels down
+  # (forms), the compute pass never used (forms)
   v=""; n=0
   f64() { grep -a -E "^p(51|960) " "$1" | sed 's/.*| vs float64 oracle: \([^|]*\) | vs ideal.*/\1/'; }
-  for m in matrix:dvbridge_ipt.h swap:dvbridge_source.c; do
-    if mutant "ipt-${m%%:*}" "$TS/mut-ipt-${m%%:*}.py" "${m#*:}" && rg_bridge "$RG_W/mut/ipt-${m%%:*}" "$L" "$F" "$O/fidbench-ipt.c" "$O/fb-${m%%:*}" "$SRC"; then
-      ipt_run "mut-${m%%:*}" "$O/fb-${m%%:*}" "51 960" FB_SOURCE=1 FB_IPT=1
-      rg_log "$O/mut-${m%%:*}-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" bridge "$DATA" "$O/mut-${m%%:*}" "mut-${m%%:*}" 51 960
-      if grep -a -q '^BRIDGE-IPT FAILED$' "$O/mut-${m%%:*}-check.log" ||
-         { [ -n "$(f64 "$O/check.log")" ] && [ "$(f64 "$O/mut-${m%%:*}-check.log")" != "$(f64 "$O/check.log")" ]; }; then n=$((n + 1)); fi
-      v="$v ${m%%:*}: $(grep -a -m1 '^ALL vs float64' "$O/mut-${m%%:*}-check.log" | cut -c1-90), $(grep -a -m1 '^BRIDGE-IPT' "$O/mut-${m%%:*}-check.log");"
-    else v="$v ${m%%:*}: THE MUTANT NO LONGER APPLIES OR DOES NOT BUILD;"; fi
-    rg_rm "$O/mut-${m%%:*}" "$O/fb-${m%%:*}" "$RG_W/mut/ipt-${m%%:*}"
+  local m t w caught
+  for m in matrix:dvbridge_ipt.h:oracle swap:dvbridge_source.c:oracle eotfcell:dvbridge_source.c:oracle \
+           oetflo:dvbridge_source.c:oracle computeodd:dvbridge_source.c:forms nocompute:dvbridge_source.c:forms; do
+    t=${m%%:*}; w=${m##*:}; m=${m#*:}; m=${m%%:*}
+    if mutant "ipt-$t" "$TS/mut-ipt-$t.py" "$m" && rg_bridge "$RG_W/mut/ipt-$t" "$L" "$F" "$O/fidbench-ipt.c" "$O/fb-$t" "$SRC"; then
+      ipt_run "mut-$t" "$O/fb-$t" "51 960" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1
+      ipt_run "mutf-$t" "$O/fb-$t" "51 960" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=0
+      rg_log "$O/mut-$t-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" bridge "$DATA" "$O/mut-$t" "mut-$t" 51 960
+      rg_log "$O/mut-$t-forms.log" nice -n 19 $RG_PY "$TS/ipt_check.py" same "$O/mut-$t" "mut-$t" "$O/mutf-$t" "mutf-$t" direct.rgba 51 960
+      caught=""
+      if grep -a -q '^BRIDGE-IPT FAILED$' "$O/mut-$t-check.log" ||
+         { [ -n "$(f64 "$O/check.log")" ] && [ "$(f64 "$O/mut-$t-check.log")" != "$(f64 "$O/check.log")" ]; }; then caught="oracle"; fi
+      if ! grep -a -q '^SAME PASSED$' "$O/mut-$t-forms.log" || [ "$(computed "$O/mut-$t.log" 1)" != 2 ] ||
+         [ "$(computed "$O/mutf-$t.log" 0)" != 2 ]; then caught="${caught:+$caught }forms"; fi
+      case " $caught " in *" $w "*) n=$((n + 1)) ;; esac
+      v="$v $t (by $w): caught by ${caught:-nothing}, $(grep -a -m1 '^ALL vs float64' "$O/mut-$t-check.log" | cut -c1-90), $(grep -a -m1 '^BRIDGE-IPT' "$O/mut-$t-check.log"), $(grep -a -m1 '^SAME' "$O/mut-$t-forms.log"), computed $(computed "$O/mut-$t.log" 1) of 2;"
+    else v="$v $t: THE MUTANT NO LONGER APPLIES OR DOES NOT BUILD;"; fi
+    rg_rm "$O/mut-$t" "$O/mutf-$t" "$O/fb-$t" "$RG_W/mut/ipt-$t"
   done
-  [ "$n" = 2 ] && rg_item ipt-mutants PASSED "2 of 2 caught by the float64 oracle:$v" || rg_item ipt-mutants FAILED "$n of 2 caught:$v"
+  [ "$n" = 6 ] && rg_item ipt-mutants PASSED "6 of 6 caught by the check each is written for:$v" || rg_item ipt-mutants FAILED "$n of 6 caught by their check:$v"
   rg_rm "$O/fb"
 }
 
@@ -1311,11 +1341,13 @@ stage_mmr() {
 
 # The 3D LUT of a display (dvbridge_lut.h, dvbridge_render_set_lut()): lut3d_test.c on the PQ chart (mapped to SDR, to
 # a projector with and without its black, as it is, kept as 10-bit codes) and on picture 3 of the FEL stream (native and
-# Low-Latency, with the bars written first and not), with the LUT files of lut3d_check.py (.cube, .3dl, madVR's), whose
+# Low-Latency, with the bars written first and not), with the LUT files of lut3d_check.py (.cube, .3dl, madVR's, and the
+# 1D LUTs: ArgyllCMS's .cal, a .cube of LUT_1D_SIZE alone and as Resolve's shaper before a 3D LUT), whose
 # check applies each LUT to the picture drawn without it with arithmetic of its own; and the mutants it must catch, each
 # with the lines "FAIL..." of the test and of the check that it makes (measured when written): a .3dl in the order of its
 # file, the video levels of a LUT's input left out, the bars of Low-Latency left to the LUT, 10-bit codes made before
-# the LUT, the LUT applied to HDR over the tunnel, a LUT that fails not drawn again without it.
+# the LUT, the LUT applied to HDR over the tunnel, a LUT that fails not drawn again without it, the 1D LUT left out, its
+# green read from the curve of red, the red of a .cal read from another column.
 stage_lut3d() {
   local K L F O v m got n=0 ok=0
   K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
@@ -1337,7 +1369,7 @@ stage_lut3d() {
   v=$(rg_pass "$O/tree.check" '^LUT3D-CHECK PASSED: 0 failed$')
   rg_item lut3d-reference "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.check") checks against the LUT applied in Python; sdr $(grep -a -m1 'sdr (tint)' "$O/tree.check" | grep -o 'at most [^ ]* apart'); ll $(grep -a -m1 '^ok:   ll (tint)' "$O/tree.check" | grep -o 'at most [^ ]* apart')"
   # the mutants: <name> <edit file> <file under tools/dvbridge> <FAIL lines of the test> <of the check>
-  for m in "3dl-order mut-lut-3dl-order.py dvbridge_lut.c 0 3" "range mut-lut-range.py dvbridge_lut.c 0 2"            "bars mut-lut-bars.py dvbridge_render.c 2 0" "codes mut-lut-codes.py dvbridge_render.c 0 1"            "tunnel mut-lut-tunnel.py dvbridge_render.c 2 0" "retry mut-lut-retry.py dvbridge_render.c 3 0"; do
+  for m in "3dl-order mut-lut-3dl-order.py dvbridge_lut.c 0 3" "range mut-lut-range.py dvbridge_lut.c 0 2"            "bars mut-lut-bars.py dvbridge_render.c 2 0" "codes mut-lut-codes.py dvbridge_render.c 0 1"            "tunnel mut-lut-tunnel.py dvbridge_render.c 2 0" "retry mut-lut-retry.py dvbridge_render.c 3 0"            "curve mut-lut-curve.py dvbridge_lut.c 0 4" "curve-channel mut-lut-curve-channel.py dvbridge_lut.c 0 4"            "cal-fields mut-lut-cal-fields.py dvbridge_lut.c 2 4"; do
     set -- $m
     n=$((n + 1))
     if mutant "lut3d-$1" "$TS/$2" "$3"; then
@@ -1347,7 +1379,7 @@ stage_lut3d() {
     got="$(grep -a -c '^FAIL' "$O/m-$1.log") $(grep -a -c '^FAIL' "$O/m-$1.check")"
     if [ "$got" = "$4 $5" ]; then ok=$((ok + 1)); else echo "mutant $1: $got lines FAIL (test, check), $4 $5 expected"; fi
   done
-  rg_item lut3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: a .3dl in its file's order 0 and 3, video levels left out 0 and 2, the bars of Low-Latency 2 and 0, codes before the LUT 0 and 1, HDR over the tunnel 2 and 0, no retry without a LUT that fails 3 and 0)"
+  rg_item lut3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: a .3dl in its file's order 0 and 3, video levels left out 0 and 2, the bars of Low-Latency 2 and 0, codes before the LUT 0 and 1, HDR over the tunnel 2 and 0, no retry without a LUT that fails 3 and 0, the 1D LUT left out 0 and 4, its green read from the curve of red 0 and 4, the red of a .cal from the column of RGB_G 2 and 4)"
 }
 
 # The 3D LUT of a display in the video shaders of Kodi's own renderer, the way SDR videos that Kodi draws itself take it
@@ -1387,11 +1419,11 @@ stage_lutsdr() {
   rg_item lutsdr-reference "$(rg_say "$v")" "$(rg_rest "$v"): $(grep -a -c '^ok:' "$O/tree.check") checks against the LUT applied in Python; $(grep -a -o 'at most [^ ]* apart' "$O/tree.check" | sort -k3 -g | tail -n 1) at worst"
   # the mutants: <name> <edit file> <file under the tree> <FAIL lines of the test> <of the check>
   for m in "range mut-lutsdr-range.py system/shaders/GLES/2.0/gles_lut3d.frag 0 2" \
-           "tetra mut-lutsdr-tetra.py system/shaders/GLES/2.0/gles_lut3d.frag 10 11" \
-           "atlas mut-lutsdr-atlas.py tools/dvbridge/dvbridge_lut_atlas.c 11 11" \
+           "tetra mut-lutsdr-tetra.py system/shaders/GLES/2.0/gles_lut3d.frag 11 15" \
+           "atlas mut-lutsdr-atlas.py tools/dvbridge/dvbridge_lut_atlas.c 12 15" \
            "shaper mut-lutsdr-shaper.py system/shaders/GLES/2.0/gles_lut3d.frag 0 1" \
            "apply mut-lutsdr-apply.py system/shaders/GLES/2.0/gles_lut3d.frag 8 0" \
-           "beyond mut-lutsdr-beyond.py system/shaders/GLES/2.0/gles_lut3d.frag 3 2"; do
+           "beyond mut-lutsdr-beyond.py system/shaders/GLES/2.0/gles_lut3d.frag 3 2"            "curve mut-lutsdr-curve.py system/shaders/GLES/2.0/gles_lut3d.frag 0 4"            "curve-row mut-lutsdr-curve-row.py system/shaders/GLES/2.0/gles_lut3d_curve.frag 0 1"; do
     set -- $m
     n=$((n + 1))
     if lutsdr_copy "$RG_W/mut/lutsdr-$1" && rg_edit "$RG_W/mut/lutsdr-$1/$3" "$TS/$2" > "$RG_W/mut/lutsdr-$1.edit.log" 2>&1; then
@@ -1402,7 +1434,7 @@ stage_lutsdr() {
     echo "mutant $1: $got lines FAIL (test, check), $4 $5 expected"
     if [ "$got" = "$4 $5" ]; then ok=$((ok + 1)); fi
   done
-  rg_item lutsdr-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: the input range of a LUT left out 0 and 2, a tetrahedron of other corners 10 and 11, the slices of the table out of place 11 and 11, Nuke's shaper left out 0 and 1, a shader told not to apply the LUT applying it 8 and 0, what is beyond black and white of a limited output lost 3 and 2)"
+  rg_item lutsdr-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: the input range of a LUT left out 0 and 2, a tetrahedron of other corners 11 and 15, the slices of the table out of place 12 and 15, Nuke's shaper left out 0 and 1, a shader told not to apply the LUT applying it 8 and 0, what is beyond black and white of a limited output lost 3 and 2, the 1D LUT left out 0 and 4, its points read from the first row of their texture 0 and 1)"
 }
 
 # An 8-bit HLG picture sent as Dolby Vision (dvbridge_gl_widen.c; Kodi's VAAPI renderer, WidenForBridge()): the HLG

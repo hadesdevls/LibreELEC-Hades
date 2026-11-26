@@ -34,11 +34,27 @@ static uint64_t word(uint64_t seed, uint32_t stream, uint32_t index)
 #define S_BIT(v, c, b) (200u + 24u * (v) + 8u * (c) + (b))
 #define S_ONE_DA(c) (300u + 2u * (c))
 #define S_ONE_DB(c) (301u + 2u * (c))
+/* 400 + 10 s for Zs of set s, 401 + 10 s + 2 t and 402 + 10 s + 2 t for dAs and dBs of trial t */
+#define S_STEP_Z(s) (400u + 10u * (s))
+#define S_STEP_DA(s, t) (401u + 10u * (s) + 2u * (t))
+#define S_STEP_DB(s, t) (402u + 10u * (s) + 2u * (t))
+
+/* A pixel whose three components are values of set s (OC_SET_*), k * 0x11 or k * 0x55, k from the bits of w */
+static uint32_t step_pixel(uint64_t w, unsigned int s)
+{
+	const uint32_t step = s == OC_SET_0X55 ? 0x55u : 0x11u, kmask = s == OC_SET_0X55 ? 3u : 15u;
+	uint32_t px = 0;
+	unsigned int c;
+
+	for (c = 0; c < 3; c++)
+		px |= (step * ((uint32_t)(w >> (8 * c)) & kmask)) << (8 * c);
+	return px;
+}
 
 uint32_t oc_pixel(const struct oc_picture *p, uint64_t seed, uint32_t index)
 {
 	const uint32_t z = (uint32_t)word(seed, S_Z, index) & 0xffffffu;
-	uint32_t da, db, half, mask;
+	uint32_t da, db, half, mask, zs;
 
 	switch (p->kind) {
 	case OC_Z:
@@ -83,6 +99,23 @@ uint32_t oc_pixel(const struct oc_picture *p, uint64_t seed, uint32_t index)
 		if (p->kind == OC_ONE_B)
 			return z ^ db;
 		return z ^ da ^ db;
+	case OC_STEP_Z:
+	case OC_STEP_A:
+	case OC_STEP_B:
+	case OC_STEP_C:
+		if (p->set >= OC_SETS || p->trial >= OC_TRIALS)
+			return z;
+		/* each set is closed under XOR: (k1 * step) ^ (k2 * step) = (k1 ^ k2) * step */
+		zs = step_pixel(word(seed, S_STEP_Z(p->set), index), p->set);
+		if (p->kind == OC_STEP_Z)
+			return zs;
+		da = step_pixel(word(seed, S_STEP_DA(p->set, p->trial), index), p->set);
+		db = step_pixel(word(seed, S_STEP_DB(p->set, p->trial), index), p->set);
+		if (p->kind == OC_STEP_A)
+			return zs ^ da;
+		if (p->kind == OC_STEP_B)
+			return zs ^ db;
+		return zs ^ da ^ db;
 	}
 	return z;
 }
@@ -142,7 +175,7 @@ void oc_analyse(const struct oc_measure *m, struct oc_result *r)
 	bool all_measured = m->z.measured && m->z_end.measured && m->d.measured && m->e.measured &&
 			    m->f.measured;
 	bool constant;
-	unsigned int t, c, b;
+	unsigned int t, c, b, s;
 
 	memset(r, 0, sizeof(*r));
 	if (n == 0 || n > OC_MAX_VALUES) {
@@ -224,4 +257,33 @@ void oc_analyse(const struct oc_measure *m, struct oc_result *r)
 		r->verdict = OC_NOT_EXACT;
 	else
 		r->verdict = OC_EXACT;
+
+	/*
+	 * The sets that a widening keeps linear (output-check.h): read whenever measured, and a fit only for a change
+	 * that the exactness relation found and nothing else did (stable, linear CRC, every bit reaching it).
+	 */
+	r->steps_measured = true;
+	for (s = 0; s < OC_SETS; s++) {
+		r->steps_measured = r->steps_measured && m->step_z[s].measured;
+		for (t = 0; t < OC_TRIALS; t++)
+			r->steps_measured = r->steps_measured && m->step_a[s][t].measured &&
+					    m->step_b[s][t].measured && m->step_c[s][t].measured;
+	}
+	if (!r->steps_measured)
+		return;
+	for (s = 0; s < OC_SETS; s++)
+		for (t = 0; t < OC_TRIALS; t++)
+			if (!relation(&m->step_z[s], &m->step_a[s][t], &m->step_b[s][t], &m->step_c[s][t], n)) {
+				r->steps_failed[s]++;
+				r->steps_broken[s] |= broken(&m->step_z[s], &m->step_a[s][t], &m->step_b[s][t],
+							     &m->step_c[s][t], n);
+			}
+	if (r->verdict != OC_NOT_EXACT || r->reasons != OC_R_TRANSFORMED)
+		return;
+	if (r->steps_failed[OC_SET_0X55])
+		r->fit = OC_FIT_VALUES;
+	else if (r->steps_failed[OC_SET_0X11])
+		r->fit = OC_FIT_WIDENING_10;
+	else
+		r->fit = OC_FIT_WIDENING_12;
 }

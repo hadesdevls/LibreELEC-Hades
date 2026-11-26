@@ -1,0 +1,766 @@
+From 9088e6398d5a221d7c6df182f51e2a174c80e344 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:42:21 +0000
+Subject: [PATCH] [Hades][dvbridge] A 1D LUT of the display: a .cube of
+ LUT_1D_SIZE, Resolve's shaper and ArgyllCMS's .cal
+
+The display LUT took 3D LUTs only: a .cube with LUT_1D_SIZE was refused,
+and the curves that a calibration loads into a video card's gamma table
+(ArgyllCMS's .cal, as dispcal and DisplayCAL write it, the "videoLUT")
+could not be given at all. A display calibrated with curves alone, or
+a .cube made as Resolve makes one with a shaper before its 3D table,
+had no way in.
+
+The reader now takes:
+- a .cube of LUT_1D_SIZE (2 to 65536) alone: three curves;
+- a .cube with LUT_1D_SIZE and LUT_3D_SIZE: Resolve's form, the 1D
+  values first, applied as a shaper before the 3D table;
+  LUT_1D_INPUT_RANGE must be 0 1, as LUT_3D_INPUT_RANGE;
+- ArgyllCMS's .cal (CGATS): the identifier CAL, DEVICE_CLASS "DISPLAY",
+  COLOR_REP "RGB", the fields RGB_I, RGB_R, RGB_G and RGB_B in any
+  order, RGB_I on a uniform grid from 0 to 1, values within [0, 1]; its
+  values are the device's in full range whatever TV_OUTPUT_ENCODING says
+  (the format never stores them encoded: it says how they were loaded),
+  so the range of a .cal is its own, not the setting's. Other keywords
+  are left out, as the format says; the first table is the calibration.
+Anything else is refused with the reason, as before.
+
+The 1D LUT is applied before the 3D table, after the input range, each
+channel by its own curve and linearly between the two points around the
+signal (the interpolation of a 1D LUT in Resolve, OpenColorIO and a
+video card's gamma table), from a texture of its own of 32-bit floats,
+its points in rows of 4096, read at the centres of the texels: at its
+points it gives the file's values. A 1D LUT alone has the identity of 2
+points a side for its 3D table, which the tetrahedral interpolation
+gives back to the last places of a float, so every path that takes a
+LUT takes it without a case of its own.
+
+Measured (numpy, float64, against the exact curve): a dispcal curve of
+256 points applied at its own resolution is within 0.055 of a 10-bit
+code of it; baked into a 3D table it would be 0.25 off at 65 points and
+1.1 at 17, and a steep curve that opens a crushed black 55 to 99 codes.
+
+The GPU object of a LUT is now struct dvbridge_lut_state (the table's
+pl_shader_obj and the texture of the curves), destroyed with
+dvbridge_lut_state_destroy(). A LUT without a 1D LUT gives the shader of
+before, to the byte. dvbridge_lut_atlas_layout() gives the layout of the
+curves' texture for Kodi's own shaders.
+---
+ tools/dvbridge/dvbridge_lut.c       | 374 ++++++++++++++++++++++++++--
+ tools/dvbridge/dvbridge_lut.h       |  61 ++++-
+ tools/dvbridge/dvbridge_lut_atlas.c |  19 ++
+ tools/dvbridge/dvbridge_lut_atlas.h |  10 +
+ tools/dvbridge/dvbridge_render.c    |  19 +-
+ 5 files changed, 444 insertions(+), 39 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_lut.c b/tools/dvbridge/dvbridge_lut.c
+index 397b60a..623618c 100644
+--- a/tools/dvbridge/dvbridge_lut.c
++++ b/tools/dvbridge/dvbridge_lut.c
+@@ -205,10 +205,30 @@ void dvbridge_lut_free(struct dvbridge_lut **lut)
+     if (!lut || !*lut)
+         return;
+     free((*lut)->data);
++    free((*lut)->curve);
+     free(*lut);
+     *lut = NULL;
+ }
+ 
++/* Hades: the 3D table of a LUT that is a 1D LUT alone: the identity of 2 points a side (its corners), which the
++ * tetrahedral interpolation gives back */
++static struct dvbridge_lut *make_identity(enum dvbridge_lut_format format)
++{
++    struct dvbridge_lut *lut = make(2, format);
++    if (!lut)
++        return NULL;
++    for (int b = 0; b < 2; ++b)
++        for (int g = 0; g < 2; ++g)
++            for (int r = 0; r < 2; ++r) {
++                float *to = lut->data + ((size_t)(b * 2 + g) * 2 + r) * 3;
++                to[0] = (float)r;
++                to[1] = (float)g;
++                to[2] = (float)b;
++            }
++    lut->curve_only = true;
++    return lut;
++}
++
+ static void finish(struct dvbridge_lut *lut, const void *bytes, size_t size)
+ {
+     /* the signature of the table (libplacebo makes it again when it changes): the file's bytes and its format */
+@@ -230,8 +250,10 @@ static struct dvbridge_lut *parse_cube(const char *bytes, size_t size, struct dv
+                                        char *why, size_t ws)
+ {
+     struct text t = {bytes, bytes + size}, line, rest;
+-    int number_of_line = 0, n = 0;
+-    size_t values = 0, want = 0;
++    /* n: LUT_3D_SIZE; n1: LUT_1D_SIZE (Hades: a 1D LUT alone, or Resolve's shaper before the 3D LUT, its values
++     * first) */
++    int number_of_line = 0, n = 0, n1 = 0;
++    size_t values = 0, want = 0, want1 = 0;
+     struct dvbridge_lut *lut = NULL;
+     char title[128] = "";
+     bool data = false;
+@@ -268,9 +290,23 @@ static struct dvbridge_lut *parse_cube(const char *bytes, size_t size, struct dv
+                     goto fail;
+                 }
+                 n = (int)l;
+-            } else if (keyword(&line, "LUT_1D_SIZE", &rest) || keyword(&line, "LUT_1D_INPUT_RANGE", &rest)) {
+-                say(why, ws, "a 1D LUT (line %d): only 3D LUTs are applied", number_of_line);
+-                goto fail;
++            } else if (keyword(&line, "LUT_1D_SIZE", &rest)) {
++                if (n1) {
++                    say(why, ws, "LUT_1D_SIZE given twice (line %d)", number_of_line);
++                    goto fail;
++                }
++                if (!integer(&rest, &l) || !at_end(&rest) || l < 2 || l > DVBRIDGE_LUT_MAX_CURVE) {
++                    say(why, ws, "LUT_1D_SIZE is not a size from 2 to %d (line %d)", DVBRIDGE_LUT_MAX_CURVE,
++                        number_of_line);
++                    goto fail;
++                }
++                n1 = (int)l;
++            } else if (keyword(&line, "LUT_1D_INPUT_RANGE", &rest)) {
++                if (!number(&rest, &a) || !number(&rest, &b) || !at_end(&rest) || a != 0.0 || b != 1.0) {
++                    say(why, ws, "LUT_1D_INPUT_RANGE is not 0 1 (line %d): only LUTs of the domain [0, 1] are read",
++                        number_of_line);
++                    goto fail;
++                }
+             } else if (keyword(&line, "DOMAIN_MIN", &rest)) {
+                 if (!number(&rest, &a) || !number(&rest, &b) || !number(&rest, &c) || !at_end(&rest) || a != 0.0 ||
+                     b != 0.0 || c != 0.0) {
+@@ -302,21 +338,27 @@ static struct dvbridge_lut *parse_cube(const char *bytes, size_t size, struct dv
+             continue;
+         }
+         /* a line of values */
+-        if (!n) {
+-            say(why, ws, "values before LUT_3D_SIZE (line %d)", number_of_line);
++        if (!n && !n1) {
++            say(why, ws, "values before LUT_3D_SIZE or LUT_1D_SIZE (line %d)", number_of_line);
+             goto fail;
+         }
+         if (!lut) {
+-            lut = make(n, DVBRIDGE_LUT_CUBE);
+-            if (!lut) {
+-                say(why, ws, "no memory for a LUT of %d points a side", n);
++            /* (Hades: a 1D LUT alone has the identity for its 3D table) */
++            lut = n ? make(n, DVBRIDGE_LUT_CUBE) : make_identity(DVBRIDGE_LUT_CUBE);
++            if (lut && n1)
++                lut->curve = malloc((size_t)n1 * 3 * sizeof(float));
++            if (!lut || (n1 && !lut->curve)) {
++                say(why, ws, "no memory for a LUT of %d points a side", n ? n : n1);
+                 goto fail;
+             }
+-            want = (size_t)n * n * n;
++            lut->curve_size = n1;
++            want1 = (size_t)n1;
++            want = want1 + (n ? (size_t)n * n * n : 0);
+             data = true;
+         }
+         if (values >= want) {
+-            say(why, ws, "more lines of values than LUT_3D_SIZE %d says (line %d)", n, number_of_line);
++            say(why, ws, "more lines of values than %s says (line %d)",
++                n && n1 ? "LUT_1D_SIZE and LUT_3D_SIZE" : n ? "LUT_3D_SIZE" : "LUT_1D_SIZE", number_of_line);
+             goto fail;
+         }
+         double v[3];
+@@ -329,17 +371,25 @@ static struct dvbridge_lut *parse_cube(const char *bytes, size_t size, struct dv
+                 say(why, ws, "a value far outside [0, 1] (line %d)", number_of_line);
+                 goto fail;
+             }
+-            /* red fastest, as libplacebo's table */
+-            lut->data[values * 3 + (size_t)c] = (float)v[c];
++            /* (Hades: the 1D LUT's values first, then the 3D table's) red fastest, as libplacebo's table */
++            if (values < want1)
++                lut->curve[values * 3 + (size_t)c] = (float)v[c];
++            else
++                lut->data[(values - want1) * 3 + (size_t)c] = (float)v[c];
+         }
+         ++values;
+     }
+-    if (!n) {
+-        say(why, ws, "no LUT_3D_SIZE");
++    if (!n && !n1) {
++        say(why, ws, "no LUT_3D_SIZE nor LUT_1D_SIZE");
+         goto fail;
+     }
+     if (values != want) {
+-        say(why, ws, "%zu lines of values where LUT_3D_SIZE %d says %zu", values, n, want);
++        if (n1 && n)
++            say(why, ws, "%zu lines of values where LUT_1D_SIZE %d and LUT_3D_SIZE %d say %zu", values, n1, n, want);
++        else if (n1)
++            say(why, ws, "%zu lines of values where LUT_1D_SIZE %d says %zu", values, n1, want);
++        else
++            say(why, ws, "%zu lines of values where LUT_3D_SIZE %d says %zu", values, n, want);
+         goto fail;
+     }
+     lut->in = lut->out = range;
+@@ -490,6 +540,217 @@ fail:
+     return NULL;
+ }
+ 
++/* ------------------------------------------------------------------------------------------------- .cal */
++
++/* the next word of a CGATS line (a "string" without its quotes); false at the end of the line */
++static bool word(struct text *t, struct text *w)
++{
++    skip_blanks(t);
++    if (t->at >= t->end)
++        return false;
++    if (*t->at == '"') {
++        const char *close = memchr(t->at + 1, '"', (size_t)(t->end - t->at - 1));
++        if (!close)
++            return false;
++        w->at = t->at + 1;
++        w->end = close;
++        t->at = close + 1;
++        return true;
++    }
++    w->at = t->at;
++    while (t->at < t->end && !blank(*t->at))
++        ++t->at;
++    w->end = t->at;
++    return true;
++}
++
++static bool is(const struct text *w, const char *s)
++{
++    const size_t n = strlen(s);
++    return (size_t)(w->end - w->at) == n && !memcmp(w->at, s, n);
++}
++
++/* the names of the fields of a CGATS table on a line, up to END_DATA_FORMAT (which ends *in_format); where RGB_I,
++ * RGB_R, RGB_G and RGB_B are among them; false past 64 fields */
++static bool field_names(struct text *t, bool *in_format, int *fields, int *at_i, int *at_r, int *at_g, int *at_b)
++{
++    struct text w;
++    while (word(t, &w)) {
++        if (is(&w, "END_DATA_FORMAT")) {
++            *in_format = false;
++            return true;
++        }
++        if (*fields >= 64)
++            return false;
++        *at_i = is(&w, "RGB_I") ? *fields : *at_i;
++        *at_r = is(&w, "RGB_R") ? *fields : *at_r;
++        *at_g = is(&w, "RGB_G") ? *fields : *at_g;
++        *at_b = is(&w, "RGB_B") ? *fields : *at_b;
++        ++*fields;
++    }
++    return true;
++}
++
++/*
++ * ArgyllCMS's .cal (doc/cal_format.html of ArgyllCMS): CGATS.5 text, its identifier CAL; the keywords DEVICE_CLASS
++ * (here "DISPLAY": the curves of a display's video card) and COLOR_REP ("RGB"); the table of NUMBER_OF_SETS sets,
++ * each on its line, of the fields BEGIN_DATA_FORMAT names (RGB_I, the input, and RGB_R, RGB_G, RGB_B, the output of
++ * each channel, all within 0 to 1). Other keywords are left out, as the format says; the first table is the
++ * calibration (others are of the device).
++ */
++static struct dvbridge_lut *parse_cal(const char *bytes, size_t size, char *why, size_t ws)
++{
++    struct text t = {bytes, bytes + size}, line, w;
++    int number_of_line = 0, sets = 0, fields = 0;
++    int at_i = -1, at_r = -1, at_g = -1, at_b = -1;
++    bool identified = false, display = false, rgb = false, in_format = false, in_data = false, tv = false;
++    size_t values = 0;
++    struct dvbridge_lut *lut = NULL;
++    while (next_line(&t, &line, &number_of_line)) {
++        if (line.at == line.end || *line.at == '#')
++            continue;
++        struct text rest = line;
++        if (!identified) {
++            if (!word(&rest, &w) || !is(&w, "CAL")) {
++                say(why, ws, "a .cal whose first line is not CAL (ArgyllCMS's calibration)");
++                goto fail;
++            }
++            identified = true;
++            continue;
++        }
++        if (in_format) {
++            /* the names of the fields, on one line or more */
++            if (!field_names(&rest, &in_format, &fields, &at_i, &at_r, &at_g, &at_b)) {
++                say(why, ws, "more than 64 fields in the .cal (line %d)", number_of_line);
++                goto fail;
++            }
++            continue;
++        }
++        if (in_data) {
++            if (word(&rest, &w) && is(&w, "END_DATA")) {
++                if ((int)values != sets) {
++                    say(why, ws, "%zu sets of values where NUMBER_OF_SETS says %d", values, sets);
++                    goto fail;
++                }
++                /* (the first table is the calibration; what follows is not read) */
++                break;
++            }
++            if ((int)values >= sets) {
++                say(why, ws, "more sets of values than NUMBER_OF_SETS %d says (line %d)", sets, number_of_line);
++                goto fail;
++            }
++            rest = line;
++            double v[64];
++            for (int k = 0; k < fields; ++k)
++                if (!number(&rest, &v[k])) {
++                    say(why, ws, "line %d is not the %d numbers of a set", number_of_line, fields);
++                    goto fail;
++                }
++            if (!at_end(&rest)) {
++                say(why, ws, "line %d is not the %d numbers of a set", number_of_line, fields);
++                goto fail;
++            }
++            /* the input on a uniform grid from 0 to 1 (within the six places a .cal writes, and a tenth of a step) */
++            const double grid = (double)values / (double)(sets - 1);
++            const double near = fmin(1e-5, 0.1 / (double)(sets - 1));
++            if (fabs(v[at_i] - grid) > near) {
++                say(why, ws, "RGB_I of line %d is %.9g where a uniform grid of %d points has %.9g: such a .cal is not "
++                    "read", number_of_line, v[at_i], sets, grid);
++                goto fail;
++            }
++            const int at[3] = {at_r, at_g, at_b};
++            for (int c = 0; c < 3; ++c) {
++                if (!(v[at[c]] >= 0.0 && v[at[c]] <= 1.0)) {
++                    say(why, ws, "a value outside [0, 1] (line %d)", number_of_line);
++                    goto fail;
++                }
++                lut->curve[values * 3 + (size_t)c] = (float)v[at[c]];
++            }
++            ++values;
++            continue;
++        }
++        if (!word(&rest, &w))
++            continue;
++        struct text value;
++        if (is(&w, "DEVICE_CLASS")) {
++            if (!word(&rest, &value) || !is(&value, "DISPLAY")) {
++                say(why, ws, "a .cal of another device than a display (DEVICE_CLASS, line %d)", number_of_line);
++                goto fail;
++            }
++            display = true;
++        } else if (is(&w, "COLOR_REP")) {
++            if (!word(&rest, &value) || !is(&value, "RGB")) {
++                say(why, ws, "a .cal of other colours than RGB (COLOR_REP, line %d)", number_of_line);
++                goto fail;
++            }
++            rgb = true;
++        } else if (is(&w, "TV_OUTPUT_ENCODING")) {
++            tv = word(&rest, &value) && is(&value, "YES");
++        } else if (is(&w, "NUMBER_OF_SETS")) {
++            long l;
++            if (sets || !integer(&rest, &l) || !at_end(&rest) || l < 2 || l > DVBRIDGE_LUT_MAX_CURVE) {
++                say(why, ws, "NUMBER_OF_SETS is not a number of points from 2 to %d (line %d)", DVBRIDGE_LUT_MAX_CURVE,
++                    number_of_line);
++                goto fail;
++            }
++            sets = (int)l;
++        } else if (is(&w, "BEGIN_DATA_FORMAT")) {
++            if (fields) {
++                say(why, ws, "BEGIN_DATA_FORMAT given twice (line %d)", number_of_line);
++                goto fail;
++            }
++            in_format = true;
++            /* (the names may follow on the same line) */
++            if (!field_names(&rest, &in_format, &fields, &at_i, &at_r, &at_g, &at_b)) {
++                say(why, ws, "more than 64 fields in the .cal (line %d)", number_of_line);
++                goto fail;
++            }
++        } else if (is(&w, "BEGIN_DATA")) {
++            if (!display || !rgb) {
++                say(why, ws, "a .cal that does not say it is of an RGB display (DEVICE_CLASS \"DISPLAY\", COLOR_REP "
++                    "\"RGB\")");
++                goto fail;
++            }
++            if (at_i < 0 || at_r < 0 || at_g < 0 || at_b < 0) {
++                say(why, ws, "a .cal without the fields RGB_I, RGB_R, RGB_G and RGB_B");
++                goto fail;
++            }
++            if (!sets) {
++                say(why, ws, "a .cal without NUMBER_OF_SETS");
++                goto fail;
++            }
++            lut = make_identity(DVBRIDGE_LUT_CAL);
++            if (lut)
++                lut->curve = malloc((size_t)sets * 3 * sizeof(float));
++            if (!lut || !lut->curve) {
++                say(why, ws, "no memory for a 1D LUT of %d points", sets);
++                goto fail;
++            }
++            lut->curve_size = sets;
++            in_data = true;
++        }
++        /* (any other keyword: left out, as the format says) */
++    }
++    if (!identified) {
++        say(why, ws, "an empty .cal");
++        goto fail;
++    }
++    if (!lut || (int)values != sets) {
++        say(why, ws, "a .cal without its table of values (BEGIN_DATA ... END_DATA)");
++        goto fail;
++    }
++    /* the values of the device in full range (never encoded in the file), as the video card takes them */
++    lut->range_declared = true;
++    lut->tv_encoding = tv;
++    lut->signal = DVBRIDGE_LUT_SIGNAL_UNKNOWN;
++    lut->gamut = DVBRIDGE_LUT_GAMUT_UNKNOWN;
++    finish(lut, bytes, size);
++    return lut;
++fail:
++    dvbridge_lut_free(&lut);
++    return NULL;
++}
++
+ /* ---------------------------------------------------------------------------------------------- madVR */
+ 
+ #define MADVR_HEADER 96
+@@ -657,7 +918,9 @@ struct dvbridge_lut *dvbridge_lut_parse(const void *bytes, size_t size, const ch
+         return parse_3dl(bytes, size, range, why, why_size);
+     if (ends_with(name, ".cube"))
+         return parse_cube(bytes, size, range, why, why_size);
+-    say(why, why_size, "the name of the file ends in neither .cube, .3dl nor .3dlut");
++    if (ends_with(name, ".cal"))
++        return parse_cal(bytes, size, why, why_size);
++    say(why, why_size, "the name of the file ends in neither .cube, .3dl, .3dlut nor .cal");
+     return NULL;
+ }
+ 
+@@ -667,6 +930,7 @@ const char *dvbridge_lut_format_name(enum dvbridge_lut_format format)
+     case DVBRIDGE_LUT_CUBE: return ".cube";
+     case DVBRIDGE_LUT_3DL: return ".3dl";
+     case DVBRIDGE_LUT_MADVR: return "madVR 3DLUT";
++    case DVBRIDGE_LUT_CAL: return ".cal";
+     default: return "none";
+     }
+ }
+@@ -706,7 +970,74 @@ static bool full(struct dvbridge_lut_range r)
+     return r.lo == 0.0f && r.hi == 255.0f;
+ }
+ 
+-bool dvbridge_lut_shader(pl_shader sh, const struct dvbridge_lut *lut, pl_shader_obj *state)
++void dvbridge_lut_state_destroy(pl_gpu gpu, struct dvbridge_lut_state *state)
++{
++    if (!state)
++        return;
++    pl_shader_obj_destroy(&state->table);
++    if (gpu)
++        pl_tex_destroy(gpu, &state->curve);
++    state->curve = NULL;
++    state->curve_signature = 0;
++}
++
++/* Hades: the texture of a LUT's 1D LUT (its points in rows of DVBRIDGE_LUT_CURVE_ROW, RGBA of 32-bit floats, read at
++ * the centres of its texels), made again only for another LUT */
++static bool curve_texture(pl_gpu gpu, const struct dvbridge_lut *lut, struct dvbridge_lut_state *state)
++{
++    if (state->curve && state->curve_signature == lut->pl.signature)
++        return true;
++    pl_tex_destroy(gpu, &state->curve);
++    state->curve_signature = 0;
++    const int n = lut->curve_size, w = n < DVBRIDGE_LUT_CURVE_ROW ? n : DVBRIDGE_LUT_CURVE_ROW;
++    const int h = (n + w - 1) / w;
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
++    float *rgba = fmt ? calloc((size_t)w * (size_t)h * 4, sizeof(float)) : NULL;
++    if (!rgba)
++        return false;
++    for (int i = 0; i < n; ++i)
++        memcpy(rgba + (size_t)i * 4, lut->curve + (size_t)i * 3, 3 * sizeof(float));
++    state->curve = pl_tex_create(gpu, pl_tex_params(.w = w, .h = h, .format = fmt, .sampleable = true,
++                                                     .initial_data = rgba, .debug_tag = PL_DEBUG_TAG));
++    free(rgba);
++    if (!state->curve)
++        return false;
++    state->curve_signature = lut->pl.signature;
++    return true;
++}
++
++/* Hades: a LUT's 1D LUT on the signal at the input of its 3D table, each channel by its curve, linearly between its
++ * two points around it */
++static bool curve_shader(pl_gpu gpu, pl_shader sh, const struct dvbridge_lut *lut, struct dvbridge_lut_state *state)
++{
++    if (!gpu || !curve_texture(gpu, lut, state))
++        return false;
++    const int n = lut->curve_size, w = n < DVBRIDGE_LUT_CURVE_ROW ? n : DVBRIDGE_LUT_CURVE_ROW;
++    char body[1024];
++    snprintf(body, sizeof(body),
++             "{\n"
++             "    vec3 lut_p = clamp(color.rgb, 0.0, 1.0) * vec3(%d.0);\n"
++             "    ivec3 lut_i = ivec3(min(floor(lut_p), vec3(%d.0)));\n"
++             "    vec3 lut_f = lut_p - vec3(lut_i);\n"
++             "    ivec3 lut_j = lut_i + ivec3(1);\n"
++             "    color.r = mix(texelFetch(dvbridge_curve, ivec2(lut_i.r %% %d, lut_i.r / %d), 0).r,\n"
++             "                  texelFetch(dvbridge_curve, ivec2(lut_j.r %% %d, lut_j.r / %d), 0).r, lut_f.r);\n"
++             "    color.g = mix(texelFetch(dvbridge_curve, ivec2(lut_i.g %% %d, lut_i.g / %d), 0).g,\n"
++             "                  texelFetch(dvbridge_curve, ivec2(lut_j.g %% %d, lut_j.g / %d), 0).g, lut_f.g);\n"
++             "    color.b = mix(texelFetch(dvbridge_curve, ivec2(lut_i.b %% %d, lut_i.b / %d), 0).b,\n"
++             "                  texelFetch(dvbridge_curve, ivec2(lut_j.b %% %d, lut_j.b / %d), 0).b, lut_f.b);\n"
++             "}\n",
++             n - 1, n - 2, w, w, w, w, w, w, w, w, w, w, w, w);
++    const struct pl_shader_desc curve = {
++        .desc = {.name = "dvbridge_curve", .type = PL_DESC_SAMPLED_TEX},
++        .binding = {.object = state->curve, .sample_mode = PL_TEX_SAMPLE_NEAREST}};
++    return pl_shader_custom(sh, &(struct pl_custom_shader){
++                                    .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR, .body = body,
++                                    .descriptors = &curve, .num_descriptors = 1,
++                                    .description = "1D LUT before the 3D LUT"});
++}
++
++bool dvbridge_lut_shader(pl_gpu gpu, pl_shader sh, const struct dvbridge_lut *lut, struct dvbridge_lut_state *state)
+ {
+     if (!sh || !lut || !state)
+         return false;
+@@ -734,7 +1065,10 @@ bool dvbridge_lut_shader(pl_shader sh, const struct dvbridge_lut *lut, pl_shader
+                                         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR,
+                                         .body = body, .description = "3D LUT: its input"}))
+         return false;
+-    pl_shader_custom_lut(sh, &lut->pl, state);
++    /* Hades: its 1D LUT, where it has one (a shader of its own: without one, the shader of before) */
++    if (lut->curve && lut->curve_size >= 2 && !curve_shader(gpu, sh, lut, state))
++        return false;
++    pl_shader_custom_lut(sh, &lut->pl, &state->table);
+     if (pl_shader_is_failed(sh))
+         return false;
+     /* its output: back from its range, held within [0, 1] */
+diff --git a/tools/dvbridge/dvbridge_lut.h b/tools/dvbridge/dvbridge_lut.h
+index 83c6140..3f70c45 100644
+--- a/tools/dvbridge/dvbridge_lut.h
++++ b/tools/dvbridge/dvbridge_lut.h
+@@ -13,11 +13,18 @@
+  * colour step of what it draws for a display that it maps to (dvbridge_render_set_lut()).
+  *
+  * The formats, each read here exactly as its file says or refused with the reason:
+- *   - .cube (Adobe / Resolve): LUT_3D_SIZE, TITLE, DOMAIN_MIN 0 0 0, DOMAIN_MAX 1 1 1, LUT_3D_INPUT_RANGE 0 1;
+- *     red fastest. A 1D LUT, another domain or input range, or any other keyword is refused: libplacebo's
+- *     pl_lut_parse_cube() passes unknown keywords over with a warning, reads a file with both a 1D and a 3D size
+- *     as one of them, scales the output values by the domain and takes a first data line that starts with a
+- *     space for a header line; the values of a LUT that it reads are the same as here.
++ *   - .cube (Adobe / Resolve): LUT_3D_SIZE, LUT_1D_SIZE, TITLE, DOMAIN_MIN 0 0 0, DOMAIN_MAX 1 1 1,
++ *     LUT_3D_INPUT_RANGE 0 1, LUT_1D_INPUT_RANGE 0 1; red fastest. A 1D LUT alone (three curves) is applied as it
++ *     is; a file with both sizes is Resolve's: its 1D LUT (the values first) is a shaper applied before its 3D LUT.
++ *     Another domain or input range, or any other keyword is refused: libplacebo's pl_lut_parse_cube() passes
++ *     unknown keywords over with a warning, reads a file with both a 1D and a 3D size as one of them, scales the
++ *     output values by the domain and takes a first data line that starts with a space for a header line; the
++ *     values of a LUT that it reads are the same as here.
++ *   - .cal (ArgyllCMS's calibration of a display, as dispcal and DisplayCAL write it: the curves that it loads into
++ *     the video card's gamma table, the "videoLUT"): CGATS text whose identifier is CAL, DEVICE_CLASS "DISPLAY",
++ *     COLOR_REP "RGB", the fields RGB_I, RGB_R, RGB_G and RGB_B, RGB_I on a uniform grid from 0 to 1; its values are
++ *     those of the device in full range (TV_OUTPUT_ENCODING says how they were loaded into the hardware, not what
++ *     they are: ArgyllCMS's format never stores them encoded), applied as a 1D LUT on the signal of the display.
+  *   - .3dl (Autodesk Lustre / Nuke): optional "3DMESH" and "Mesh <in bits> <out bits>", then the shaper line
+  *     (the input codes of the grid) and the integer outputs, blue fastest. The shaper of a uniform grid (code
+  *     i (max) / (N - 1), rounded) and the shaper of Nuke and Flame (codes i 2^bits / (N - 1), the last one the
+@@ -33,6 +40,14 @@
+  * points per axis, red fastest: libplacebo's pl_custom_lut, which pl_shader_custom_lut() interpolates
+  * tetrahedrally from a 3D texture of 32-bit floats (on OpenGL ES 3, sh_lut() takes RGBA32F, the first float format
+  * that is not emulated): at its grid points it gives the values of the file, to the bit.
++ *
++ * A 1D LUT (curve, curve_size points a channel on a uniform grid of [0, 1] of the LUT's input) is applied before the
++ * 3D table, each channel by its own curve, linearly between its points (the interpolation of a 1D LUT that Resolve,
++ * OpenColorIO and the gamma table of a video card make), read at the centres of the texels of a texture of 32-bit
++ * floats: at its points it gives the values of the file, to the bit, at its own resolution (a curve of 256 points
++ * baked into a 3D table of 65 would be 5 times further from it, of 17 points 20 times: measured).
++ * A LUT that is a 1D LUT alone has the identity of 2 points a side for its 3D table, which the tetrahedral
++ * interpolation gives back to the last places of a float (the same codes of 10 and 12 bits).
+  */
+ 
+ #include <libplacebo/shaders.h>
+@@ -47,6 +62,7 @@ enum dvbridge_lut_format {
+     DVBRIDGE_LUT_CUBE = 1,
+     DVBRIDGE_LUT_3DL = 2,
+     DVBRIDGE_LUT_MADVR = 3,
++    DVBRIDGE_LUT_CAL = 4, /* Hades: ArgyllCMS's .cal: a 1D LUT */
+ };
+ 
+ /* what a file says it was made for: its signal (UNKNOWN where it does not say: .cube and .3dl) */
+@@ -75,6 +91,10 @@ struct dvbridge_lut_range {
+ #define DVBRIDGE_LUT_MAX_SIZE 256
+ /* the largest file that is read */
+ #define DVBRIDGE_LUT_MAX_BYTES ((size_t)256 << 20)
++/* Hades: the largest 1D LUT that is read (points a curve: 65536, the largest of a .cube's LUT_1D_SIZE), and the
++ * texels a row of the texture that holds it (its points in rows of at most this many, so that it fits any GPU) */
++#define DVBRIDGE_LUT_MAX_CURVE 65536
++#define DVBRIDGE_LUT_CURVE_ROW 4096
+ 
+ struct dvbridge_lut {
+     /* the LUT as libplacebo takes it: size (N, N, N), data (N^3 RGB floats, red fastest), signature (of the
+@@ -95,7 +115,27 @@ struct dvbridge_lut {
+     /* the depth of the integers of a .3dl's output, or of madVR's (16); 0: floats */
+     int out_bits;
+     char title[128]; /* TITLE of a .cube; empty where none */
++    /* Hades: a 1D LUT applied before the 3D table (NULL, 0: none): curve_size points a channel, the red, green and
++     * blue of each point one after the other; curve_only: the file is that 1D LUT alone (a .cube of LUT_1D_SIZE
++     * alone, a .cal), and the 3D table is the identity of 2 points a side; tv_encoding: a .cal says that it was loaded
++     * into the hardware in the levels of video (for the log: its values are not encoded) */
++    float *curve;
++    int curve_size;
++    bool curve_only;
++    bool tv_encoding;
++};
++
++/*
++ * Hades: what the bridge keeps on the GPU for a LUT, the caller's (one for each renderer): the object of its 3D table
++ * (libplacebo's), and the texture of its 1D LUT with the signature of the LUT it holds. All zero: none yet;
++ * dvbridge_lut_state_destroy() lets them go.
++ */
++struct dvbridge_lut_state {
++    pl_shader_obj table;
++    pl_tex curve;
++    uint64_t curve_signature;
+ };
++void dvbridge_lut_state_destroy(pl_gpu gpu, struct dvbridge_lut_state *state);
+ 
+ /*
+  * Reads a LUT from the bytes of its file. name: the file's name (its extension says the format where its bytes
+@@ -115,12 +155,13 @@ const char *dvbridge_lut_gamut_name(enum dvbridge_lut_gamut gamut);
+ 
+ /*
+  * Appends the LUT to a shader whose colour is the signal in full range within [0, 1] (the output of the bridge's
+- * last pass): the input taken to the LUT's range and grid (its shaper), the LUT (pl_shader_custom_lut(), with
+- * state, the GPU object that holds its table: the caller's, destroyed with pl_shader_obj_destroy()), the output
+- * taken back from its range and held within [0, 1]. False where the shader could not take it (nothing then is
+- * to be drawn with this shader).
++ * last pass): the input taken to the LUT's range and grid (its shaper: Nuke's of a .3dl, or its 1D LUT), the LUT
++ * (pl_shader_custom_lut(), with state->table, the GPU object that holds its table), the output taken back from its
++ * range and held within [0, 1]. state: the caller's (dvbridge_lut_state_destroy()); gpu: the shader's, which makes the
++ * texture of a 1D LUT. False where the shader could not take it (nothing then is to be drawn with this shader). A LUT
++ * without a 1D LUT gives the shader of before, to the byte.
+  */
+-bool dvbridge_lut_shader(pl_shader sh, const struct dvbridge_lut *lut, pl_shader_obj *state);
++bool dvbridge_lut_shader(pl_gpu gpu, pl_shader sh, const struct dvbridge_lut *lut, struct dvbridge_lut_state *state);
+ 
+ /* The value of the LUT at grid point (r, g, b), as the file gives it (for the tests) */
+ void dvbridge_lut_point(const struct dvbridge_lut *lut, int r, int g, int b, float rgb[3]);
+diff --git a/tools/dvbridge/dvbridge_lut_atlas.c b/tools/dvbridge/dvbridge_lut_atlas.c
+index 6110f4a..8d35697 100644
+--- a/tools/dvbridge/dvbridge_lut_atlas.c
++++ b/tools/dvbridge/dvbridge_lut_atlas.c
+@@ -112,6 +112,25 @@ bool dvbridge_lut_atlas_layout(const struct dvbridge_lut *lut, int max_texture_s
+         atlas->shaper[2] = (float)steps;
+         atlas->shaper[3] = (float)(1.0 / (1.0 - knee));
+     }
++    /* Hades: its 1D LUT (points of 3 floats in rows of DVBRIDGE_LUT_CURVE_ROW at most, straight from lut->curve) */
++    if (lut->curve && lut->curve_size >= 2) {
++        const int c = lut->curve_size, w = c < DVBRIDGE_LUT_CURVE_ROW ? c : DVBRIDGE_LUT_CURVE_ROW;
++        const int h = (c + w - 1) / w;
++        if (w > max_texture_size || h > max_texture_size) {
++            if (why)
++                snprintf(why, why_size, "its 1D LUT of %d points needs a texture of %dx%d, and this GPU takes at most %d "
++                                        "a side", c, w, h, max_texture_size);
++            memset(atlas, 0, sizeof(*atlas));
++            return false;
++        }
++        atlas->curve_size = c;
++        atlas->curve_width = w;
++        atlas->curve_height = h;
++        atlas->curve[0] = (float)(c - 1);
++        atlas->curve[1] = (float)w;
++        atlas->curve[2] = (float)(1.0 / w);
++        atlas->curve[3] = (float)(1.0 / h);
++    }
+     /* the output: (v 255 - lo) / (hi - lo), held within [0, 1] by the shader */
+     if (full(lut->out)) {
+         atlas->out[0] = 1.0f;
+diff --git a/tools/dvbridge/dvbridge_lut_atlas.h b/tools/dvbridge/dvbridge_lut_atlas.h
+index 836c667..dbde3e3 100644
+--- a/tools/dvbridge/dvbridge_lut_atlas.h
++++ b/tools/dvbridge/dvbridge_lut_atlas.h
+@@ -21,6 +21,10 @@
+  * The values that the shader takes its input to the LUT's range and grid with, and its output back, are those of
+  * dvbridge_lut_shader(): the input range of the LUT (full, or video levels), the shaper of two slopes of a .3dl of
+  * Nuke's shaper, and the output range.
++ *
++ * Hades: a LUT with a 1D LUT (a .cube of LUT_1D_SIZE, alone or as Resolve's shaper, ArgyllCMS's .cal) has it in a
++ * texture of its own (curve_*), applied before the table by gles_lut3d_curve.frag, as dvbridge_lut_shader() applies
++ * it: each channel by its curve, linearly between the two points around it, read at the centres of their texels.
+  */
+ 
+ #include <stdbool.h>
+@@ -39,6 +43,12 @@ struct dvbridge_lut_atlas {
+     float shaper[4];   /* a .3dl of Nuke's shaper: knee, (N - 2) / knee, N - 2, 1 / (1 - knee); all 0: a uniform
+                           grid */
+     float out[2];      /* scale, offset: the output range of the LUT back to full (1, 0: full) */
++    /* Hades: the 1D LUT applied before the table (dvbridge_lut::curve; curve_size 0: none), a texture of its own of
++     * curve_width x curve_height texels of 3 floats: its points one after the other in rows of
++     * DVBRIDGE_LUT_CURVE_ROW at most, the last row filled as far as they go (gles_lut3d_curve.frag), and the uniform of
++     * that shader: points - 1, texels a row, 1 / width, 1 / height */
++    int curve_size, curve_width, curve_height;
++    float curve[4];
+ };
+ 
+ /*
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index eb4900b..40a9eea 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -260,7 +260,7 @@ struct dvbridge_renderer {
+      * render in hand applies it (lut_tried), the last picture drawn had it (lut_applied), and a render with it
+      * failed on this GPU: the pictures are drawn without it until another one is set (lut_failed; lut_retry()) */
+     const struct dvbridge_lut *lut;
+-    pl_shader_obj lut_state;
++    struct dvbridge_lut_state lut_state;
+     bool lut_tried, lut_applied, lut_failed;
+ };
+ 
+@@ -293,7 +293,7 @@ struct active_mask {
+     /* Hades: Low-Latency: the 3D LUT of the display after that (NULL: none), the GPU object of its table, and
+      * whether it was put in the shader (dvbridge_render_set_lut()) */
+     const struct dvbridge_lut *lut;
+-    pl_shader_obj *lut_state;
++    struct dvbridge_lut_state *lut_state;
+     bool lut_called;
+ };
+ 
+@@ -661,7 +661,8 @@ static struct pl_hook_res mask_low_latency(struct active_mask *mask, const struc
+                     "gl_FragCoord.y < dvbridge_active.y || gl_FragCoord.y >= dvbridge_active.w) && "
+                     "dvbridge_pattern == 0u) color.rgb = vec3(0.0);",
+             .description = "DV Low-Latency bars after the 3D LUT"};
+-        mask->lut_called = dvbridge_lut_shader(p->sh, mask->lut, mask->lut_state) && pl_shader_custom(p->sh, &bars);
++        mask->lut_called =
++            dvbridge_lut_shader(p->gpu, p->sh, mask->lut, mask->lut_state) && pl_shader_custom(p->sh, &bars);
+         mask->failed = !mask->lut_called;
+     }
+     return (struct pl_hook_res){.failed = mask->failed, .output = PL_HOOK_SIG_NONE};
+@@ -894,7 +895,7 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     pl_tex_destroy(r->gpu, &r->hdr10[0]);
+     pl_tex_destroy(r->gpu, &r->hdr10[1]);
+     pl_tex_destroy(r->gpu, &r->rgb);
+-    pl_shader_obj_destroy(&r->lut_state);
++    dvbridge_lut_state_destroy(r->gpu, &r->lut_state);
+     pl_renderer_destroy(&r->renderer);
+     for (int i = 0; i < PASS_TIMERS; ++i)
+         if (r->timers[i].made)
+@@ -2070,20 +2071,20 @@ struct picture_clamp {
+     float levels; /* 1023 */
+     /* Hades: the 3D LUT of the display (dvbridge_render_set_lut(); NULL: none) and the GPU object of its table */
+     const struct dvbridge_lut *lut;
+-    pl_shader_obj *lut_state;
++    struct dvbridge_lut_state *lut_state;
+ };
+ 
+ /* Hades: the 3D LUT of the display after the shader of a hook that held the picture within its range (and the
+  * display's peak), and then the quantization to 10-bit codes where the picture is kept so: the LUT is the last step
+  * of the colour, on the signal before it is quantized once. The variable of the levels is that of the shader before
+  * it (one shader, its names declared once). */
+-static bool lut_then_codes(const struct pl_hook_params *p, const struct dvbridge_lut *lut, pl_shader_obj *state,
+-                           bool codes)
++static bool lut_then_codes(const struct pl_hook_params *p, const struct dvbridge_lut *lut,
++                           struct dvbridge_lut_state *state, bool codes)
+ {
+     static const struct pl_custom_shader quantize = {
+         .input = PL_SHADER_SIG_COLOR, .output = PL_SHADER_SIG_COLOR, .body = QUANTIZE_CODES,
+         .description = "the picture after the 3D LUT, as 10-bit codes"};
+-    return dvbridge_lut_shader(p->sh, lut, state) && (!codes || pl_shader_custom(p->sh, &quantize));
++    return dvbridge_lut_shader(p->gpu, p->sh, lut, state) && (!codes || pl_shader_custom(p->sh, &quantize));
+ }
+ 
+ static struct pl_hook_res clamp_picture(void *priv, const struct pl_hook_params *p)
+@@ -2120,7 +2121,7 @@ struct display_clamp {
+     float black;
+     /* Hades: the 3D LUT of the display after that (NULL: none; lut_then_codes()) */
+     const struct dvbridge_lut *lut;
+-    pl_shader_obj *lut_state;
++    struct dvbridge_lut_state *lut_state;
+ };
+ 
+ /* Hades: the black level lift of the EETF of ITU-R BT.2390 (5.4.1: E3 = E2 + b (1 - E2)^4, b the display's
+-- 
+2.53.0
+

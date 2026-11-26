@@ -1,0 +1,488 @@
+From 3568c2dd5a24690a4076abf1fb4102ddd70c284b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:27:41 +0000
+Subject: [PATCH] [Hades][dvbridge] The IPT tunnel reads PQ from tables made in
+ double precision
+
+Pass 9 computed the PQ EOTF and OETF of every pixel with exp, log, power
+and division, written for float (series, P and T from logarithms of
+ratios): 18 exponentials and logarithms and about 9 divisions a pixel,
+whose precision is in the end that of each GPU's own functions.
+
+Read PQ from two tables made once in double precision instead:
+- the EOTF: a quadratic in each cell of 1/4096 of [2^-6, 1] and of 1/256
+  of each octave of [2^-22, 2^-6), the cell found from the bits of the
+  float, 0 below 2^-22 (128 KiB);
+- the OETF: a quadratic in each cell of 1/128 of each octave of
+  [2^-126, 2), the value at the start of a cell held as two floats
+  (256 KiB).
+L'M'S' are kept as the high part and the rest, so that P and T come
+from L' - M' and S' - M' without a difference of two rounded values.
+A pixel is then six fetches and plain arithmetic, the same on every GPU.
+Dividing by the code scale becomes a multiplication by its exact
+reciprocal (the same values).
+
+Against ST 2084 in double precision over a dense sample, with the
+entries in float, the tables are within 2.6e-5 of a code (the EOTF
+taken back to PQ) and 3.5e-6 of a code (the OETF).
+
+Measured with the software bridge on the 14 pictures of a profile 7
+FEL stream, against the chain in double precision: 0.008 % of the I,
+0.007 % of the P and 0.005 % of the T one code off, never more, where
+the functions gave 0.043 %, 0.029 % and 0.036 %. The compute pass and
+the fragment passes give the same bytes.
+---
+ tools/dvbridge/dvbridge_source.c | 308 ++++++++++++++++++++-----------
+ tools/dvbridge/dvbridge_source.h |   9 +-
+ 2 files changed, 206 insertions(+), 111 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 325abbd..6e52263 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -1676,32 +1676,31 @@ struct common_uniforms {
+ };
+ /* 9. Hades: the IPT tunnel (dvbridge_source_to_ipt()): the codes of a pixel of the composer's YCbCr
+  * picture in IPT-PQ-c2, in floats; the luma of the picture (9a, a float a pixel) and its rows of
+- * 4:2:2 (9b, as pass 2 lays them out). The chroma between the pairs is Lanczos 6 in integers, the
+- * filter of pass 2. Outside the active picture nothing is read: the transport is black there.
++ * 4:2:2 (9b, as pass 2 lays them out), or both in one compute pass (9c). The chroma between the
++ * pairs is Lanczos 6 in integers, the filter of pass 2. Outside the active picture nothing is read:
++ * the transport is black there.
+  *
+- * The chain is written so that float keeps the precision of its inputs, not as SMPTE ST 2084 writes
+- * it:
+- *  - the EOTF with q = 1 - N^(1/m2) = -expm1(ln(N) / m2) by its series, as libplacebo-9942 writes
+- *    it: c2 - c3 N^(1/m2) is a difference of numbers close to each other above a few cd/m2;
+- *  - the OETF as exp(m2 log1p(-w)), w = k (1 - t) / (1 + c3 t), t = l^m1, k = 1 - c1 = c2 - c3:
+- *    (c1 + c2 t) / (1 + c3 t) is 1 - w, a number close to 1 whose float loses most of w, which
+- *    the power m2 = 78.84 then makes a relative error 79 times its size;
+- *  - P and T from the differences L' - M' and S' - M' (the rows of the inverse of YCCtoRGB that
+- *    give them sum to 0, as the first column of YCCtoRGB is 1), made from L - M and S - M without
+- *    a difference of the values in PQ: L' - M' = M' expm1(m2 (log1p(-w_L) - log1p(-w_M))), the
+- *    logarithm of the ratio of 1 - w_L to 1 - w_M from w_M - w_L = k (1 + c3) (t_L - t_M) /
+- *    ((1 + c3 t_L) (1 + c3 t_M)), and t_L - t_M = t_M expm1(m1 log1p((L - M) / M)); each series
+- *    where its argument is at most 1/4 (beyond, the difference of the two logarithms, or
+- *    exp(x) - 1, loses nothing); and rounded about 0, 2048 added after: at 2048 a float has
+- *    1/4096 of a code, near 0 far less.
+- * Every series is exact to 1e-9 or better on its range. Measured against the chain in double
+- * precision on 14 pictures of a profile 7 FEL stream, on Mesa's software OpenGL ES: written as
+- * ST 2084 writes it, 0.58 % of the I, 3.6 % of the P and 0.97 % of the T were one code off (up
+- * to 6.7 % of the P of a picture where the composer's own chroma is); written so, 0.036 %, 0.034 %
+- * and 0.041 % (at most 0.11 % of those samples of a picture), never more than one code. That is
+- * of the order of single precision itself (the same chain on the processor, each operation
+- * rounded once, is off on 0.003 % to 0.045 % of the samples of five of them): exact codes would
+- * take more than the single precision that OpenGL ES 3.0 has. */
++ * PQ is read from two tables made once in double precision (ipt_tables()): no exp, log, power or
++ * division in the shader, whose precision would then be that of each GPU's own functions.
++ *  - The EOTF of each of R', G' and B': a quadratic in each cell of 1/4096 of [2^-6, 1] and of 1/256
++ *    of each octave of [2^-22, 2^-6) (the cell from the bits of the float), 0 below 2^-22 (ST 2084
++ *    gives 0 up to 2^-20.4). Against the EOTF in double precision over a dense sample, with the
++ *    entries in float: within 6.2e-8 of Y (relative, where Y > 1e-6), 2.6e-5 of a code taken back
++ *    to PQ.
++ *  - The OETF of each of L, M and S: a quadratic in each cell of 1/128 of each octave of [2^-126, 2)
++ *    (again from the bits of the float), its value at the start of the cell held as two floats (hi +
++ *    lo); within 3.5e-6 of a code. L'M'S' are kept as hi and the rest, not added.
++ *  - I from the hi and the rests; P and T from L' - M' and S' - M' (the rows of the inverse of
++ *    YCCtoRGB that give them sum to 0), each the difference of the hi (exact where they are close)
++ *    plus that of the rests: no difference of two values rounded in PQ, which the matrix of P and T
++ *    would multiply.
++ * Measured against the chain in double precision on 14 pictures of a profile 7 FEL stream, on
++ * Mesa's software OpenGL ES: 0.008 % of the I, 0.007 % of the P and 0.005 % of the T one code off,
++ * never more. Before, as ST 2084 writes it in floats: 0.58 %, 3.6 % and 0.97 %; with exp and log
++ * written for float (libplacebo-9942's series, P and T from logarithms of ratios): 0.043 %, 0.029 %
++ * and 0.036 %. What is left is the single precision of the matrices: the chain with PQ exact and
++ * each matrix product rounded once to float, emulated on the processor, is off on 0.008 %, 0.007 %
++ * and 0.001 % of them. */
+ #define IPT_HEAD "#version 300 es\n" IPT_BODY
+ /* (Hades: and 9c, the compute form, after its own first line) */
+ #define IPT_BODY                                                                                  \
+@@ -1715,50 +1714,33 @@ struct common_uniforms {
+     "uniform ivec4 active_box;\n" /* x0, y0, x1, y1 of the active picture, in the picture */          \
+     "uniform ivec2 pairs;\n"  /* the first and the last pair of the active picture */             \
+     "uniform int hweights[12];\n"                                                                 \
+-    "const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;\n"                          \
+-    "const float c3 = 2392.0 / 4096.0 * 32.0;\n"                                                  \
+-    "const float k = 672.0 / 4096.0;\n" /* 1 - c1 = c2 - c3, exactly */                           \
+-    "vec3 expm1_series(vec3 x)\n" /* |x| <= 1/4 */                                                \
+-    "{\n"                                                                                         \
+-    "    return x * (1.0 + x * (1.0 / 2.0) * (1.0 + x * (1.0 / 3.0) * (1.0 + x * (1.0 / 4.0)\n"    \
+-    "           * (1.0 + x * (1.0 / 5.0) * (1.0 + x * (1.0 / 6.0) * (1.0 + x * (1.0 / 7.0)\n"      \
+-    "           * (1.0 + x * (1.0 / 8.0))))))));\n"                                               \
+-    "}\n"                                                                                         \
+-    "vec2 expm1_series(vec2 x)\n"                                                                 \
+-    "{\n"                                                                                         \
+-    "    return expm1_series(vec3(x, 0.0)).xy;\n"                                                 \
+-    "}\n"                                                                                         \
+-    "vec2 expm1_any(vec2 x)\n"                                                                    \
+-    "{\n"                                                                                         \
+-    "    return mix(exp(x) - 1.0, expm1_series(clamp(x, -0.25, 0.25)),\n"                         \
+-    "               lessThanEqual(abs(x), vec2(0.25)));\n"                                        \
+-    "}\n"                                                                                         \
+-    "vec3 log1p_series(vec3 u)\n" /* |u| <= 1/4: 2 atanh(u / (2 + u)) */                          \
++    "uniform highp sampler2D eotf_table, oetf_table;\n" /* dvbridge_source_to_ipt() */            \
++    /* the PQ EOTF of e in [0, 1] from eotf_table: a quadratic in each cell, of 1/4096 from 2^-6 on, */ \
++    /* of 1/256 of an octave from 2^-22 to 2^-6 (cells 4096 on; e by the bits of its float), 0 below */ \
++    "float eotf1(float e)\n"                                                                      \
+     "{\n"                                                                                         \
+-    "    vec3 s = u / (2.0 + u), s2 = s * s;\n"                                                   \
+-    "    return 2.0 * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (1.0 / 5.0 + s2 * (1.0 / 7.0\n"            \
+-    "           + s2 * (1.0 / 9.0 + s2 * (1.0 / 11.0))))));\n"                                    \
++    "    float f = e * 4096.0;\n"                                                                 \
++    "    int ju = min(int(f), 4095);\n"                                                           \
++    "    uint b = floatBitsToUint(e);\n"                                                          \
++    "    bool uni = e >= 1.0 / 64.0, zero = e < 1.0 / 4194304.0;\n"                               \
++    "    int j = uni ? ju : zero ? 0 : int(b >> 15u) - 22784;\n" /* 4096 - (105 << 8) */          \
++    "    float t = uni ? f - float(ju) : zero ? 0.0 : float(b & 32767u) * (1.0 / 32768.0);\n"     \
++    "    vec4 q = texelFetch(eotf_table, ivec2(j & 255, j >> 8), 0);\n"                           \
++    "    return q.x + t * (q.y + t * q.z);\n"                                                     \
+     "}\n"                                                                                         \
+-    "vec2 log1p_series(vec2 u)\n"                                                                 \
++    /* the PQ OETF of x from oetf_table: cells of 1/128 of an octave from 2^-126 to 2 (x by the bits */ \
++    /* of its float), each its value at its start as hi + lo and a quadratic for the rest; below 2^-126 */ \
++    /* (0, negative) PQ(0), cell 16383. As (hi, rest), not added: L' - M' and S' - M' are taken from */ \
++    /* the hi (exact where they are close) and the rests */                                       \
++    "vec2 oetf1(float x)\n"                                                                       \
+     "{\n"                                                                                         \
+-    "    return log1p_series(vec3(u, 0.0)).xy;\n"                                                 \
+-    "}\n"                                                                                         \
+-    "vec3 eotf(vec3 e)\n"                                                                         \
+-    "{\n"                                                                                         \
+-    "    vec3 x = log(max(clamp(e, 0.0, 1.0), vec3(1e-30))) * (1.0 / m2);\n"                      \
+-    "    vec3 q = mix(-expm1_series(clamp(x, -0.25, 0.0)), vec3(1.0), lessThan(x, vec3(-0.25)));\n" \
+-    "    return pow(max(vec3(k) - q, 0.0) / (vec3(k) + c3 * q), vec3(1.0 / m1));\n"               \
+-    "}\n"                                                                                         \
+-    /* the OETF of l as exp(m2 lam): its logarithm, t = l^m1, w and lam = log1p(-w) */            \
+-    "void oetf_parts(vec3 l, out vec3 lnl, out vec3 t, out vec3 w, out vec3 lam)\n"               \
+-    "{\n"                                                                                         \
+-    "    lnl = log(max(l, vec3(1e-37)));\n"                                                       \
+-    "    vec3 a = m1 * lnl;\n"                                                                    \
+-    "    t = exp(a);\n"                                                                           \
+-    "    vec3 rest = mix(1.0 - t, -expm1_series(clamp(a, -0.25, 0.25)),\n"                        \
+-    "                    lessThanEqual(abs(a), vec3(0.25)));\n"                                   \
+-    "    w = k * rest / (1.0 + c3 * t);\n"                                                        \
+-    "    lam = log1p_series(clamp(-w, -0.25, 0.25));\n"                                           \
++    "    float v = min(x, 1.99999988);\n"                                                         \
++    "    uint b = floatBitsToUint(v);\n"                                                          \
++    "    bool tiny = !(v > 0.0) || b < 8388608u;\n"                                               \
++    "    int k = tiny ? 16383 : int(b >> 16u) - 128;\n"                                           \
++    "    float t = tiny ? 0.0 : float(b & 65535u) * (1.0 / 65536.0);\n"                           \
++    "    vec4 q = texelFetch(oetf_table, ivec2(k & 255, k >> 8), 0);\n"                           \
++    "    return vec2(q.x, q.y + t * (q.z + t * q.w));\n"                                          \
+     "}\n"                                                                                         \
+     "uvec2 pair(int n, int r)\n"                                                                  \
+     "{\n"                                                                                         \
+@@ -1771,51 +1753,49 @@ struct common_uniforms {
+     "}\n"                                                                                         \
+     "vec3 linear_of(float y, vec2 c)\n"                                                           \
+     "{\n"                                                                                         \
+-    "    return eotf(clamp(ycc_src * (vec3(y, c) / code_scale - off_src), 0.0, 1.0));\n"          \
++    "    vec3 e = clamp(ycc_src * (vec3(y, c) * (1.0 / code_scale) - off_src), 0.0, 1.0);\n"      \
++    "    return vec3(eotf1(e.x), eotf1(e.y), eotf1(e.z));\n"                                      \
+     "}\n"                                                                                         \
+-    /* I from L'M'S' (e) */                                                                       \
+-    "uint i_of(vec3 e)\n"                                                                         \
++    /* L'M'S' of a pixel, as hi and rest */                                                       \
++    "void pq_of(float y, vec2 c, out vec3 hi, out vec3 rest)\n"                                   \
+     "{\n"                                                                                         \
+-    "    return uint(clamp(floor((to_ipt * e).x * 4096.0 + 0.5), 0.0, 4095.0));\n"                \
++    "    vec3 lms = to_lms * linear_of(y, c);\n"                                                  \
++    "    vec2 l = oetf1(lms.x), m = oetf1(lms.y), s = oetf1(lms.z);\n"                            \
++    "    hi = vec3(l.x, m.x, s.x);\n"                                                             \
++    "    rest = vec3(l.y, m.y, s.y);\n"                                                           \
+     "}\n"                                                                                         \
+-    "uint ipt_i(float y, vec2 c)\n"                                                               \
++    "uint i_of(vec3 hi, vec3 rest)\n"                                                             \
+     "{\n"                                                                                         \
+-    "    vec3 lnl, t, w, lam;\n"                                                                  \
+-    "    oetf_parts(to_lms * linear_of(y, c), lnl, t, w, lam);\n"                                 \
+-    "    return i_of(exp(m2 * lam));\n"                                                           \
++    "    float i = (to_ipt * hi).x + (to_ipt * rest).x;\n"                                        \
++    "    return uint(clamp(floor(i * 4096.0 + 0.5), 0.0, 4095.0));\n"                             \
+     "}\n"                                                                                         \
+-    /* P and T from the chain of a pixel up to the OETF's parts; mp: its M', exp(m2 lam.y) */     \
+-    "uvec2 pt_of(vec3 lin, vec3 lms, vec3 lnl, vec3 t, vec3 w, vec3 lam, float mp)\n"             \
++    /* P and T from L' - M' and S' - M' (the rows of the inverse of YCCtoRGB that give them sum to 0) */ \
++    "uvec2 pt_of(vec3 hi, vec3 rest)\n"                                                           \
+     "{\n"                                                                                         \
+-    "    mat3 lr = transpose(to_lms), ir = transpose(to_ipt);\n"                                  \
+-    "    vec2 d = vec2(dot(lr[0] - lr[1], lin), dot(lr[2] - lr[1], lin));\n" /* L - M, S - M */   \
+-    "    vec2 u = d / max(lms.y, 1e-37);\n"                                                       \
+-    "    vec2 ratio = mix(lnl.xz - lnl.yy, log1p_series(clamp(u, -0.25, 0.25)),\n"               \
+-    "                     lessThanEqual(abs(u), vec2(0.25)));\n" /* log(L / M), log(S / M) */      \
+-    "    vec2 dt = t.yy * expm1_any(m1 * ratio);\n"                                               \
+-    "    vec2 v = k * (1.0 + c3) * dt / ((1.0 + c3 * t.xz) * (1.0 + c3 * t.y) * (1.0 - w.y));\n"  \
+-    "    vec2 dl = mix(lam.xz - lam.yy, log1p_series(clamp(v, -0.25, 0.25)),\n"                   \
+-    "                  lessThanEqual(abs(v), vec2(0.25)));\n"                                     \
+-    "    vec2 dp = mp * expm1_any(m2 * dl);\n" /* L' - M', S' - M' */                             \
++    "    mat3 ir = transpose(to_ipt);\n"                                                          \
++    "    vec2 dp = vec2(hi.x - hi.y, hi.z - hi.y) + vec2(rest.x - rest.y, rest.z - rest.y);\n"    \
+     "    vec2 pt = vec2(ir[1].x * dp.x + ir[1].z * dp.y, ir[2].x * dp.x + ir[2].z * dp.y);\n"     \
+     "    return uvec2(clamp(floor(pt * 4096.0 + 0.5) + 2048.0, 0.0, 4095.0));\n"                  \
+     "}\n"                                                                                         \
++    "uint ipt_i(float y, vec2 c)\n"                                                               \
++    "{\n"                                                                                         \
++    "    vec3 hi, rest;\n"                                                                        \
++    "    pq_of(y, c, hi, rest);\n"                                                                \
++    "    return i_of(hi, rest);\n"                                                                \
++    "}\n"                                                                                         \
+     "uvec2 ipt_pt(float y, vec2 c)\n"                                                             \
+     "{\n"                                                                                         \
+-    "    vec3 lin = linear_of(y, c), lms = to_lms * lin;\n"                                       \
+-    "    vec3 lnl, t, w, lam;\n"                                                                  \
+-    "    oetf_parts(lms, lnl, t, w, lam);\n"                                                      \
+-    "    return pt_of(lin, lms, lnl, t, w, lam, exp(m2 * lam.y));\n"                              \
++    "    vec3 hi, rest;\n"                                                                        \
++    "    pq_of(y, c, hi, rest);\n"                                                                \
++    "    return pt_of(hi, rest);\n"                                                               \
+     "}\n"                                                                                         \
+-    /* (9c) I of the even pixel of a pair and the pair's P and T, from one chain */               \
++    /* (9c) I of the even pixel of a pair and the pair's P and T */                               \
+     "uint ipt_pair(float y, vec2 c, out uvec2 pt)\n"                                              \
+     "{\n"                                                                                         \
+-    "    vec3 lin = linear_of(y, c), lms = to_lms * lin;\n"                                       \
+-    "    vec3 lnl, t, w, lam;\n"                                                                  \
+-    "    oetf_parts(lms, lnl, t, w, lam);\n"                                                      \
+-    "    vec3 e = exp(m2 * lam);\n"                                                               \
+-    "    pt = pt_of(lin, lms, lnl, t, w, lam, e.y);\n"                                            \
+-    "    return i_of(e);\n"                                                                       \
++    "    vec3 hi, rest;\n"                                                                        \
++    "    pq_of(y, c, hi, rest);\n"                                                                \
++    "    pt = pt_of(hi, rest);\n"                                                                 \
++    "    return i_of(hi, rest);\n"                                                                \
+     "}\n"                                                                                         \
+     "bool active_at(int x, int y)\n"                                                              \
+     "{\n"                                                                                         \
+@@ -1843,7 +1823,7 @@ static const char IPT_LUMA[] =
+     "            acc += hweights[k] * ivec2(pair(n - 5 + k, q.y));\n"
+     "        c = vec2(clamp((acc + (1 << 13)) >> 14, ivec2(0), ivec2(4095)));\n"
+     "    }\n"
+-    "    color = vec4(float(ipt_i(luma_at(q), c)) / code_scale, 0.0, 0.0, 1.0);\n"
++    "    color = vec4(float(ipt_i(luma_at(q), c)) * (1.0 / code_scale), 0.0, 0.0, 1.0);\n"
+     "}\n";
+ 
+ /* 9b. P and T of each pair, from its even pixel; fragment (n, i): rows 2 i (rg) and 2 i + 1 (ba) */
+@@ -1872,11 +1852,8 @@ static const char IPT_ROWS[] =
+  * the two pairs of rows 2 i and 2 i + 1: the chain of each pixel once (the even one gives its I and
+  * its pair's P and T, ipt_pair()), the odd pixels' chroma from one fetch of each of the 12 texels
+  * of the filter (both rows are in it), and no branch between the pixels. The same functions on the
+- * same codes, and the same integer sums. Measured with the software bridge on the 14 pictures of
+- * the profile 7 FEL stream: P, T and the I of the odd pixels the same bytes as 9a and 9b; the I of
+- * the even pixels one code apart on 0.003 % of them (the GPU fuses a multiply and an add of the
+- * OETF where only I uses it, and not where P and T share it), and overall as close to the chain in
+- * double precision or closer (I 0.042 % of the samples off by one code, from 0.043 %). */
++ * same codes, and the same integer sums: the same bytes as 9a and 9b, measured with the software
++ * bridge on the 14 pictures of the profile 7 FEL stream. */
+ #define IPT_GROUP 8
+ _Static_assert(IPT_GROUP == 8, "the compute form of pass 9 is written for workgroups of 8 x 8");
+ static const char IPT_COMPUTE[] =
+@@ -1908,11 +1885,12 @@ static const char IPT_COMPUTE[] =
+     "        if (active_at(x, r)) {\n"
+     "            uvec2 pt;\n"
+     "            i0 = float(ipt_pair(luma_at(ivec2(x, r)), vec2(h == 0 ? even.rg : even.ba), pt))\n"
+-    "                 / code_scale;\n"
++    "                 * (1.0 / code_scale);\n"
+     "            if (h == 0) out_.rg = pt; else out_.ba = pt;\n"
+     "        }\n"
+     "        if (active_at(x + 1, r))\n"
+-    "            i1 = float(ipt_i(luma_at(ivec2(x + 1, r)), vec2(h == 0 ? odd.xy : odd.zw))) / code_scale;\n"
++    "            i1 = float(ipt_i(luma_at(ivec2(x + 1, r)), vec2(h == 0 ? odd.xy : odd.zw)))\n"
++    "                 * (1.0 / code_scale);\n"
+     "        imageStore(luma_out, ivec2(x, r), vec4(i0, 0.0, 0.0, 1.0));\n"
+     "        if (x + 1 < size.z)\n"
+     "            imageStore(luma_out, ivec2(x + 1, r), vec4(i1, 0.0, 0.0, 1.0));\n"
+@@ -2085,10 +2063,13 @@ struct dvbridge_source_packer {
+      * those (rows_ipt: set by it, cleared by dvbridge_source_rows() and dvbridge_source_scale()) */
+     GLuint ipt_luma_program, ipt_rows_program;
+     struct ipt_uniforms {
+-        GLint luma, rows, code_scale, ycc_src, to_lms, to_ipt, off_src, active, pairs, hweights;
++        GLint luma, rows, code_scale, ycc_src, to_lms, to_ipt, off_src, active, pairs, eotf, oetf,
++            hweights;
+     } il, ir;
+     GLint ir_rows;
+     struct texture ipt_luma, ipt_rows;
++    /* Hades: the PQ tables of pass 9 (ipt_tables()), made at its first picture */
++    GLuint ipt_eotf, ipt_oetf;
+     bool rows_ipt;
+     /* Hades: pass 9 as one compute pass (9c): its program and uniforms (those of 9a, in their order,
+      * and rows and size), whether it failed on this GPU (it is not tried again: 9a and 9b make the
+@@ -2502,7 +2483,7 @@ static struct dvbridge_source_packer *create_packer(bool allow_quad)
+     {
+         static const char *const ipt[] = {"luma_plane", "chroma_rows", "code_scale", "ycc_src",
+                                           "to_lms", "to_ipt", "off_src", "active_box", "pairs",
+-                                          "hweights"};
++                                          "eotf_table", "oetf_table", "hweights"};
+         _Static_assert(sizeof(p->il) == COUNT(ipt) * sizeof(GLint), "ipt uniforms");
+         p->ipt_luma_program = link(IPT_LUMA);
+         p->ipt_rows_program = link(IPT_ROWS);
+@@ -2626,6 +2607,8 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     glDeleteProgram(p->ipt_luma_program);
+     glDeleteProgram(p->ipt_rows_program);
+     glDeleteProgram(p->ipt_compute);
++    glDeleteTextures(1, &p->ipt_eotf);
++    glDeleteTextures(1, &p->ipt_oetf);
+     free(p);
+ }
+ 
+@@ -3073,6 +3056,111 @@ bool dvbridge_source_can_ipt(const struct dvbridge_source_packer *p)
+     return p && p->ipt_luma_program && p->ipt_rows_program;
+ }
+ 
++/* Hades: SMPTE ST 2084 in double precision, for the tables of pass 9: the EOTF of e in [0, 1], and the
++ * OETF of y >= 0 (beyond 1 as well: an LMS of the tunnel can exceed 1 slightly) */
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++static double pq_eotf(double e)
++{
++    const double p = pow(e, 1.0 / PQ_M2);
++    return pow(fmax(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), 1.0 / PQ_M1);
++}
++
++static double pq_oetf(double y)
++{
++    const double p = pow(y, PQ_M1);
++    return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
++}
++
++/* f on [x0, x1] as the quadratic through its ends and its middle: f(x0 + t (x1 - x0)) ~ a + t (c1 +
++ * t c2) */
++static void quadratic(double (*f)(double), double x0, double x1, double q[3])
++{
++    const double a = f(x0), m = f((x0 + x1) / 2), b = f(x1);
++    q[0] = a;
++    q[1] = 4 * m - 3 * a - b;
++    q[2] = 2 * (a + b) - 4 * m;
++}
++
++/* Hades: the PQ tables of pass 9, once (see the comment above IPT_HEAD): eotf_table, 256 x 32 RGBA32F,
++ * a cell (Y at its start, c1, c2, 0) for each of 1/4096 of [2^-6, 1] (cells 64 to 4095) and each 1/256
++ * of an octave of [2^-22, 2^-6) (4096 on), cell 0 Y = 0 (below 2^-22); oetf_table, 256 x 64 RGBA32F, a
++ * cell (L' at its start as hi + lo, c1, c2) for each 1/128 of an octave of [2^-126, 2), and in cell
++ * 16383 PQ(0) */
++static bool ipt_tables(struct dvbridge_source_packer *p)
++{
++    if (p->ipt_eotf && p->ipt_oetf)
++        return true;
++    float *e = calloc((size_t)256 * 32 * 4, sizeof(float));
++    float *o = calloc((size_t)256 * 64 * 4, sizeof(float));
++    bool ok = e && o;
++    for (int j = 64; ok && j < 8192; ++j) {
++        double x0, x1, q[3];
++        if (j < 4096) {
++            x0 = j / 4096.0;
++            x1 = (j + 1) / 4096.0;
++        } else {
++            const double s = ldexp(1.0, ((j - 4096) >> 8) - 22);
++            x0 = s * (1.0 + ((j - 4096) & 255) / 256.0);
++            x1 = x0 + s / 256.0;
++        }
++        quadratic(pq_eotf, x0, x1, q);
++        for (int i = 0; i < 3; ++i)
++            e[4 * j + i] = (float)q[i];
++    }
++    for (int k = 0; ok && k < 16256; ++k) {
++        const double s = ldexp(1.0, (k >> 7) - 126);
++        const double x0 = s * (1.0 + (k & 127) / 128.0);
++        double q[3];
++        quadratic(pq_oetf, x0, x0 + s / 128.0, q);
++        o[4 * k] = (float)q[0];
++        o[4 * k + 1] = (float)(q[0] - (double)o[4 * k]);
++        o[4 * k + 2] = (float)q[1];
++        o[4 * k + 3] = (float)q[2];
++    }
++    if (ok) {
++        const double z = pq_oetf(0.0);
++        o[4 * 16383] = (float)z;
++        o[4 * 16383 + 1] = (float)(z - (double)o[4 * 16383]);
++    }
++    /* (the pixel store as it is by default, from no buffer, for the uploads; then as it was) */
++    GLint unpack_buffer = 0, row_length = 0, skip_rows = 0, skip_pixels = 0, alignment = 4;
++    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack_buffer);
++    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
++    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
++    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
++    glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    for (int i = 0; ok && i < 2; ++i) {
++        GLuint *t = i ? &p->ipt_oetf : &p->ipt_eotf;
++        glGenTextures(1, t);
++        glBindTexture(GL_TEXTURE_2D, *t);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, 256, i ? 64 : 32);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, i ? 64 : 32, GL_RGBA, GL_FLOAT, i ? o : e);
++        ok = glGetError() == GL_NO_ERROR;
++    }
++    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack_buffer);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
++    glPixelStorei(GL_UNPACK_SKIP_ROWS, skip_rows);
++    glPixelStorei(GL_UNPACK_SKIP_PIXELS, skip_pixels);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
++    free(e);
++    free(o);
++    if (!ok) {
++        glDeleteTextures(1, &p->ipt_eotf);
++        glDeleteTextures(1, &p->ipt_oetf);
++        p->ipt_eotf = p->ipt_oetf = 0;
++    }
++    return ok;
++}
++
+ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+                             const struct dvbridge_source_params *src, unsigned luma, int width,
+                             int height, int x, int y, const unsigned margins[4],
+@@ -3118,6 +3206,8 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+     }
+     struct dvbridge_gl_state state;
+     begin(p, &state);
++    if (!ipt_tables(p))
++        return end(&state, false);
+     const int cw = (width + 1) / 2, half = (height + 1) / 2;
+     /* Hades: by the compute form (9c) where the compute forms are asked for and it was made; where it
+      * fails (a GL error), the codes are made again by 9a and 9b at once, and 9c is not tried again on
+@@ -3145,6 +3235,10 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+             glUniform4i(u->active, a, c, b, d);
+             glUniform2i(u->pairs, first_pair, last_pair);
+             glUniform1iv(u->hweights, DVBRIDGE_SOURCE_TAPS, weights);
++            bind(p, 2, p->ipt_eotf);
++            bind(p, 3, p->ipt_oetf);
++            glUniform1i(u->eotf, 2);
++            glUniform1i(u->oetf, 3);
+             if (!compute) {
+                 if (k)
+                     glUniform1i(p->ir_rows, height);
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 3d210f8..639ba51 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -352,9 +352,9 @@ bool dvbridge_source_rows_computed(const struct dvbridge_source_packer *packer);
+ /* Hades: use (above) asks for the compute form of dvbridge_source_to_ipt() as well: one pass where
+  * each invocation takes the chain of each pixel of two pairs once (the even pixel gives its I and its
+  * pair's P and T), where the fragment passes take that of the even pixel twice; the same functions
+- * on the same codes (a float rounding apart where the GPU fuses operations otherwise: within one
+- * code, measured as close to the chain in double precision). Where the GL does not make it (OpenGL
+- * ES 3.1), or it fails on the GPU (it is then not tried again), the fragment passes. usable: it was
++ * on the same codes: the same bytes, measured with the software bridge. Where the GL does not make
++ * it (OpenGL ES 3.1), or it fails on the GPU (it is then not tried again), the fragment passes.
++ * usable: it was
+  * made and has not failed; computed: the codes of the rows in use (dvbridge_source_to_ipt()) were
+  * made by it. */
+ #define DVBRIDGE_SOURCE_COMPUTE_IPT 1
+@@ -364,7 +364,8 @@ bool dvbridge_source_ipt_computed(const struct dvbridge_source_packer *packer);
+  * IPT-PQ-c2, 12 bits, in two fragment passes or one compute pass (above): the chroma of every pixel (between the pairs, Lanczos 6 in
+  * integers, the filter of the rows, DVBRIDGE_SOURCE_LANCZOS), its codes through YCCtoRGB of the RPU,
+  * the PQ EOTF, RGBtoLMS of the RPU (src->lms_rpu), the crosstalk of the tunnel undone, the PQ OETF and
+- * the inverse of YCCtoRGB of the tunnel (dvbridge_ipt.h), in floats; I of every pixel, P and T of each pair from its even pixel (where
++ * the inverse of YCCtoRGB of the tunnel (dvbridge_ipt.h), in floats, PQ from tables made in double
++ * precision (the comment above IPT_HEAD in dvbridge_source.c); I of every pixel, P and T of each pair from its even pixel (where
+  * the chroma of the composer is, so that those samples are the composer's colour exactly). luma: the
+  * luma that the calls above would take (the composed one, or *scaled_luma), at width x height;
+  * *ipt_luma: the one that they take instead, with the parameters of dvbridge_source_ipt_setup(). The
+-- 
+2.53.0
+

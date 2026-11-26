@@ -43,7 +43,39 @@ enum pipe_kind {
 	P_INVERT,	/* every bit inverted */
 	P_CURVE_RED,	/* a curve on red alone, green and blue as they are */
 	P_MIX_RG,	/* green made from red and green (a colour conversion), red and blue as they are */
+	P_GAIN,		/* each component times 255/256, truncated (a gain) */
 };
+
+/*
+ * Widenings: what a pipe that carries each component at more than 8 bits makes of the 8 bits of the output of
+ * the pipe above, before a CRC taken at that width (C_CRC16X3_WIDE; AMD DCE, output-check.h). W_NONE: 8 bits.
+ */
+enum widen_kind {
+	W_NONE,
+	W_ZERO12,	/* v << 4 */
+	W_REPEAT12,	/* v << 4 | v >> 4 */
+	W_SCALE12,	/* v * 4095 / 255, rounded */
+	W_SCALE10,	/* v * 1023 / 255, rounded */
+};
+
+static enum widen_kind widen;
+
+static unsigned int widen_apply(unsigned int v)
+{
+	switch (widen) {
+	case W_NONE:
+		return v;
+	case W_ZERO12:
+		return v << 4;
+	case W_REPEAT12:
+		return (v << 4) | (v >> 4);
+	case W_SCALE12:
+		return (v * 4095 + 127) / 255;
+	case W_SCALE10:
+		return (v * 1023 + 127) / 255;
+	}
+	return v;
+}
 
 static unsigned int frame_no;
 
@@ -103,6 +135,13 @@ static unsigned int f_spatial(unsigned int v, unsigned int c, uint32_t pos)
 	return out > 255 ? 255 : out;
 }
 
+static unsigned int f_gain(unsigned int v, unsigned int c, uint32_t pos)
+{
+	(void)c;
+	(void)pos;
+	return v * 255 / 256;
+}
+
 static uint32_t pipe_apply(enum pipe_kind kind, uint32_t rgb, uint32_t pos)
 {
 	switch (kind) {
@@ -126,6 +165,8 @@ static uint32_t pipe_apply(enum pipe_kind kind, uint32_t rgb, uint32_t pos)
 		return ((uint32_t)f_gamma((rgb >> 16) & 255, 0, pos) << 16) | (rgb & 0xffff);
 	case P_MIX_RG:
 		return (rgb & 0xff00ff) | (((((rgb >> 16) & 255) + ((rgb >> 8) & 255) + 1) / 2) << 8);
+	case P_GAIN:
+		return per_component(rgb, f_gain, pos);
 	}
 	return rgb;
 }
@@ -136,6 +177,7 @@ enum crc_kind {
 	C_CRC16X3,	/* three CRC-16, one over each component (as amdgpu gives three) */
 	C_SUM,		/* one sum of the bytes: not a CRC */
 	C_CONSTANT,	/* always the same */
+	C_CRC16X3_WIDE,	/* three CRC-16, one over each component widened (widen), two bytes a component */
 };
 
 static uint32_t crc32_byte(uint32_t crc, uint8_t byte)
@@ -160,7 +202,7 @@ static uint16_t crc16_byte(uint16_t crc, uint8_t byte)
 
 static unsigned int crc_values(enum crc_kind kind)
 {
-	return kind == C_CRC16X3 ? 3 : 1;
+	return kind == C_CRC16X3 || kind == C_CRC16X3_WIDE ? 3 : 1;
 }
 
 /* The CRC of one frame of a picture through a pipe; corrupt: a byte of pixel 7 changed after the pipe */
@@ -168,8 +210,9 @@ static void frame_crc(enum crc_kind ck, enum pipe_kind pk, const struct oc_pictu
 		      struct oc_crc *out)
 {
 	uint32_t c32 = 0xffffffffU, sum = 0;
-	uint16_t c16[3] = {0xffff, 0xffff, 0xffff};
+	uint16_t c16[3] = {0xffff, 0xffff, 0xffff}, w16[3] = {0xffff, 0xffff, 0xffff};
 	uint32_t i;
+	unsigned int k;
 
 	for (i = 0; i < W * H; i++) {
 		uint32_t px = pipe_apply(pk, oc_pixel(p, SEED, i), i);
@@ -185,6 +228,11 @@ static void frame_crc(enum crc_kind ck, enum pipe_kind pk, const struct oc_pictu
 		c16[1] = crc16_byte(c16[1], g);
 		c16[2] = crc16_byte(c16[2], b);
 		sum += (uint32_t)r + g + b;
+		for (k = 0; k < 3; k++) {
+			const unsigned int w = widen_apply((px >> (8 * (2 - k))) & 255);
+
+			w16[k] = crc16_byte(crc16_byte(w16[k], (uint8_t)(w >> 8)), (uint8_t)w);
+		}
 	}
 	memset(out, 0, sizeof(*out));
 	out->measured = true;
@@ -203,6 +251,11 @@ static void frame_crc(enum crc_kind ck, enum pipe_kind pk, const struct oc_pictu
 	case C_CONSTANT:
 		out->v[0] = 0x1234;
 		break;
+	case C_CRC16X3_WIDE:
+		out->v[0] = w16[0];
+		out->v[1] = w16[1];
+		out->v[2] = w16[2];
+		break;
 	}
 	frame_no++;
 }
@@ -212,13 +265,14 @@ struct options {
 	bool corrupt_c0;	/* a byte of C of trial 0 changed after the pipe */
 	bool skip_bit;		/* one bit picture left unmeasured */
 	bool force_retry;	/* variant 0 of bit 0 of green made equal to Z: the second set must decide */
+	bool no_steps;		/* the sets that a widening keeps linear not measured (a check made before them) */
 };
 
 static void measure(enum crc_kind ck, enum pipe_kind pk, const struct options *o, struct oc_measure *m)
 {
 	struct oc_picture p = {.kind = OC_Z};
 	struct oc_crc x, y, prev;
-	unsigned int i, t, c, b;
+	unsigned int i, t, c, b, s;
 
 	memset(m, 0, sizeof(*m));
 	m->values = crc_values(ck);
@@ -279,6 +333,21 @@ static void measure(enum crc_kind ck, enum pipe_kind pk, const struct options *o
 			if (!memcmp(m->bits[c][b][0].v, m->z.v, sizeof(m->z.v))) {
 				q.variant = 1;
 				HOLD(&q, false, &m->bits[c][b][1]);
+			}
+		}
+	if (!(o && o->no_steps))
+		for (s = 0; s < OC_SETS; s++) {
+			struct oc_picture zs = {.kind = OC_STEP_Z, .set = s};
+
+			HOLD(&zs, false, &m->step_z[s]);
+			for (t = 0; t < OC_TRIALS; t++) {
+				struct oc_picture a = {.kind = OC_STEP_A, .set = s, .trial = t},
+						  bb = {.kind = OC_STEP_B, .set = s, .trial = t},
+						  cc = {.kind = OC_STEP_C, .set = s, .trial = t};
+
+				HOLD(&a, false, &m->step_a[s][t]);
+				HOLD(&bb, false, &m->step_b[s][t]);
+				HOLD(&cc, false, &m->step_c[s][t]);
 			}
 		}
 	HOLD(&p, false, &m->z_end);
@@ -374,6 +443,55 @@ static void test_pictures(void)
 			CHECK(n > W * H * 2 / 5 && n < W * H * 3 / 5, "bit %u of %s changes %u of %u pixels", b,
 			      oc_channel_name(c), n, W * H);
 		}
+	/* the sets that a widening keeps linear: every component a value of the set, the relation by construction,
+	 * most components changed by each trial and every value of the set used */
+	{
+		unsigned int s;
+
+		for (s = 0; s < OC_SETS; s++) {
+			const uint32_t step = s == OC_SET_0X55 ? 0x55 : 0x11, levels = s == OC_SET_0X55 ? 4 : 16;
+			unsigned int seen[16] = {0}, changed = 0, k, kinds;
+
+			for (i = 0; i < W * H; i++)
+				for (t = 0; t < OC_TRIALS; t++) {
+					struct oc_picture zs = {.kind = OC_STEP_Z, .set = s},
+							  a = {.kind = OC_STEP_A, .set = s, .trial = t},
+							  bb = {.kind = OC_STEP_B, .set = s, .trial = t},
+							  cc = {.kind = OC_STEP_C, .set = s, .trial = t};
+					const struct oc_picture *all[4] = {&zs, &a, &bb, &cc};
+					uint32_t x = 0;
+
+					for (kinds = 0; kinds < 4; kinds++) {
+						const uint32_t px = oc_pixel(all[kinds], SEED, i);
+
+						x ^= px;
+						for (c = 0; c < 3; c++) {
+							const uint32_t v = (px >> (8 * c)) & 255;
+
+							CHECK(v % step == 0 && v / step < levels,
+							      "set %u pixel %u: component %u is 0x%02x", s, i, c, v);
+							if (v % step == 0 && v / step < levels)
+								seen[v / step]++;
+						}
+					}
+					CHECK(x == 0 && oc_pixel(all[0], SEED, i) <= 0xffffff,
+					      "set %u pixel %u trial %u: Zs ^ As ^ Bs ^ Cs = 0x%06x", s, i, t, x);
+					changed += oc_pixel(&a, SEED, i) != oc_pixel(&zs, SEED, i);
+				}
+			for (k = 0; k < levels; k++)
+				CHECK(seen[k] > 0, "set %u: the value 0x%02x never used", s, k * step);
+			CHECK(changed > W * H * OC_TRIALS * 9 / 10, "set %u: A changes %u of %u pixels", s, changed,
+			      W * H * OC_TRIALS);
+		}
+		/* out of range: Z */
+		{
+			struct oc_picture q1 = {.kind = OC_STEP_A, .set = OC_SETS}, q2 = {.kind = OC_STEP_C, .trial = OC_TRIALS},
+					  z = {.kind = OC_Z};
+
+			CHECK(oc_pixel(&q1, SEED, 5) == oc_pixel(&z, SEED, 5) && oc_pixel(&q2, SEED, 5) == oc_pixel(&z, SEED, 5),
+			      "a set or a trial out of range is not Z");
+		}
+	}
 	/* another seed, other pictures */
 	{
 		struct oc_picture z = {.kind = OC_Z};
@@ -510,6 +628,22 @@ static void test_edges(void)
 	m.c[0] = m.z;
 	expect(&m, OC_EXACT, 0, "all like Z but trial 0, which keeps the relation");
 
+	/* a picture of the sets that a widening keeps linear unmeasured: judged as before, no fit */
+	{
+		struct oc_result r;
+
+		m = m0;
+		m.step_c[OC_SET_0X55][OC_TRIALS - 1].measured = false;
+		oc_analyse(&m, &r);
+		CHECK(r.verdict == OC_EXACT && r.reasons == 0 && !r.steps_measured && r.fit == OC_FIT_NONE,
+		      "a step picture unmeasured: verdict %d reasons 0x%x measured %d fit %d", r.verdict, r.reasons,
+		      r.steps_measured, r.fit);
+		oc_analyse(&m0, &r);
+		CHECK(r.steps_measured && !r.steps_failed[0] && !r.steps_failed[1] && r.fit == OC_FIT_NONE,
+		      "identity: the sets measured %d, failed %u %u, fit %d", r.steps_measured, r.steps_failed[0],
+		      r.steps_failed[1], r.fit);
+	}
+
 	/* the second set of pixels is asked only where the first gave the CRC of Z */
 	m = m0;
 	m.bits[2][3][1] = m.z;
@@ -609,6 +743,69 @@ int main(void)
 		      q.channel_broken[1] == 2 && !q.channel_broken[0] && !q.channel_broken[2],
 		      "green alone broken by hand: verdict %d reasons %x alone %x %x %x", q.verdict, q.reasons,
 		      q.channel_broken[0], q.channel_broken[1], q.channel_broken[2]);
+	}
+
+	/*
+	 * Widening (output-check.h; issue #20): a CRC taken on 12 bits before a formatter. A scaled widening of the
+	 * identity breaks the relation in each component alone, as the RX 550 did, and holds on both sets; a curve or a
+	 * gain breaks them; a range or a widening to 10 bits holds on k * 0x55 alone. None of it changes the verdict.
+	 */
+	{
+		const struct options nosteps = {.no_steps = true};
+
+		widen = W_ZERO12;
+		judge("12 bits, the identity widened by zeros", C_CRC16X3_WIDE, P_IDENTITY, NULL, OC_EXACT, 0, 0, &r);
+		CHECK(r.steps_measured && !r.steps_failed[0] && !r.steps_failed[1] && r.fit == OC_FIT_NONE,
+		      "zeros: failed %u %u fit %d", r.steps_failed[0], r.steps_failed[1], r.fit);
+		widen = W_REPEAT12;
+		judge("12 bits, the identity widened by repeating", C_CRC16X3_WIDE, P_IDENTITY, NULL, OC_EXACT, 0, 0, &r);
+		CHECK(r.fit == OC_FIT_NONE, "repeating: fit %d", r.fit);
+		widen = W_SCALE12;
+		judge("12 bits, the identity widened by scaling", C_CRC16X3_WIDE, P_IDENTITY, NULL, OC_NOT_EXACT,
+		      OC_R_TRANSFORMED, 0, &r);
+		CHECK(r.trials_failed == OC_TRIALS && r.values_broken == 7 && r.channel_broken[0] == 1 &&
+		      r.channel_broken[1] == 2 && r.channel_broken[2] == 4,
+		      "scaling: as the RX 550 of issue #20 (trials failed %u, broken %x, alone %x %x %x)", r.trials_failed,
+		      r.values_broken, r.channel_broken[0], r.channel_broken[1], r.channel_broken[2]);
+		CHECK(r.steps_measured && !r.steps_failed[0] && !r.steps_failed[1] && r.fit == OC_FIT_WIDENING_12,
+		      "scaling: the sets fail %u %u, fit %d (expected 0 0, a widening to 12 bits)", r.steps_failed[0],
+		      r.steps_failed[1], r.fit);
+		judge("12 bits, scaling, the sets not measured", C_CRC16X3_WIDE, P_IDENTITY, &nosteps, OC_NOT_EXACT,
+		      OC_R_TRANSFORMED, 0, &r);
+		CHECK(!r.steps_measured && r.fit == OC_FIT_NONE, "scaling without the sets: measured %d fit %d",
+		      r.steps_measured, r.fit);
+		judge("12 bits, a curve widened by scaling", C_CRC16X3_WIDE, P_GAMMA, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED,
+		      0, &r);
+		CHECK(r.steps_failed[0] && r.steps_failed[1] && r.steps_broken[1] == 7 && r.fit == OC_FIT_VALUES,
+		      "curve: the sets fail %u %u (k * 0x55 in %x), fit %d", r.steps_failed[0], r.steps_failed[1],
+		      r.steps_broken[1], r.fit);
+		judge("12 bits, a gain widened by scaling", C_CRC16X3_WIDE, P_GAIN, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0,
+		      &r);
+		CHECK(r.steps_failed[1] && r.fit == OC_FIT_VALUES, "gain: the sets fail %u %u, fit %d", r.steps_failed[0],
+		      r.steps_failed[1], r.fit);
+		judge("12 bits, a curve on red alone widened by scaling", C_CRC16X3_WIDE, P_CURVE_RED, NULL, OC_NOT_EXACT,
+		      OC_R_TRANSFORMED, 0, &r);
+		CHECK(r.steps_broken[1] == 1 && r.fit == OC_FIT_VALUES, "curve on red: k * 0x55 breaks in %x, fit %d",
+		      r.steps_broken[1], r.fit);
+		widen = W_SCALE10;
+		judge("10 bits, the identity widened by scaling", C_CRC16X3_WIDE, P_IDENTITY, NULL, OC_NOT_EXACT,
+		      OC_R_TRANSFORMED, 0, &r);
+		CHECK(r.steps_failed[0] && !r.steps_failed[1] && r.fit == OC_FIT_WIDENING_10,
+		      "10 bits: the sets fail %u %u, fit %d", r.steps_failed[0], r.steps_failed[1], r.fit);
+		widen = W_ZERO12;
+		judge("12 bits, a limited range widened by zeros", C_CRC16X3_WIDE, P_LIMITED, NULL, OC_NOT_EXACT,
+		      OC_R_TRANSFORMED, 0, &r);
+		CHECK(r.steps_failed[0] && !r.steps_failed[1] && r.fit == OC_FIT_WIDENING_10,
+		      "limited: the sets fail %u %u, fit %d", r.steps_failed[0], r.steps_failed[1], r.fit);
+		/* a change that more than the exactness relation found has no fit */
+		widen = W_SCALE12;
+		judge("12 bits, two low bits dropped then scaled", C_CRC16X3_WIDE, P_TRUNC6, NULL, OC_NOT_EXACT,
+		      OC_R_BIT_LOST | OC_R_TRANSFORMED, low2, &r);
+		CHECK(r.fit == OC_FIT_NONE, "dropped bits: fit %d", r.fit);
+		widen = W_NONE;
+		/* at 8 bits, a curve breaks k * 0x55 too */
+		judge("crc16x3 curve, the sets", C_CRC16X3, P_GAMMA, NULL, OC_NOT_EXACT, OC_R_TRANSFORMED, 0, &r);
+		CHECK(r.fit == OC_FIT_VALUES, "8 bits, curve: fit %d", r.fit);
 	}
 
 	/* What is not a CRC, or measures nothing */

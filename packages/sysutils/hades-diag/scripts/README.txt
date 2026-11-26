@@ -74,7 +74,7 @@ WHAT IS WRITTEN HERE
           in or out;
         - lspci.txt: the devices of the PC;
         - acpi-tables.tar.gz: the description of the PC that its firmware gives (how its sockets are wired
-          and switched). It is much the same for every PC of that model;
+          and switched, and the kinds of sleep it offers). It is much the same for every PC of that model;
         - boot-time.txt: how long the start took, and what it waited for (systemd-analyze). Where the
           start had not finished by then, the second has it too.
       With an AMD graphics card, both also say how much memory it uses: its video memory (on an integrated

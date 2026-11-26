@@ -596,10 +596,14 @@ snapshot() {
   done
   echo
   echo "amd_pmc (s2idle of AMD processors): $([ -d /sys/module/amd_pmc ] && echo loaded || echo 'not loaded')"
-  dmesg | grep -E 'ACPI: PM: \(supports|ACPI: \(supports|PM: suspend (entry|exit)|PM: (Some devices failed|Device .* failed)|s2idle|amd_pmc|Low-power S0 idle|PM: Triggering wakeup|PM: Wakeup' | tail -30
-  echo "may wake the PC: ACPI (/proc/acpi/wakeup, enabled ones):"
+  # (the kernel's lines of each sleep of this start, with the lines that sleep.sh leaves before and after each one:
+  # what the firmware offers, what may wake the PC, how the sleep went and what woke it)
+  dmesg | grep -E 'ACPI: PM: \(supports|ACPI: \(supports|PM: suspend (entry|exit)|PM: (Some devices failed|Device .* failed)|amd_pmc|PM: Triggering wakeup|PM: Wakeup|hades-sleep: ' | tail -60
+  # (now: whether the firmware offers deep or a low-power S0 idle, the devices armed to wake the PC and the USB input
+  # devices that could wake it and are not armed)
+  sh /usr/lib/hades-diag/sleep.sh state 2>&1 | sed 's/^hades-sleep: //'
+  echo "ACPI devices that may wake the PC (/proc/acpi/wakeup, enabled ones; through them the devices armed above):"
   grep -w enabled /proc/acpi/wakeup 2>/dev/null | sed 's/^/    /'
-  echo "    usb:$(for d in /sys/bus/usb/devices/*; do [ "$(cat $d/power/wakeup 2>/dev/null)" = enabled ] && printf ' %s(%s:%s)' ${d##*/} "$(cat $d/idVendor 2>/dev/null)" "$(cat $d/idProduct 2>/dev/null)"; done)"
   echo "NVIDIA across a sleep: $(grep -E 'PreserveVideoMemoryAllocations|UseKernelSuspendNotifiers|EnableS0ixPowerManagement|TemporaryFilePath' /proc/driver/nvidia/params 2>/dev/null | tr -s ' \n' ' '); /proc/driver/nvidia/suspend $([ -e /proc/driver/nvidia/suspend ] && echo there || echo 'not there'); hook $([ -x /usr/lib/systemd/system-sleep/hades-nvidia ] && echo there || echo 'not there'); $(cat /run/modprobe.d/hades-nvidia-sleep.conf 2>/dev/null || echo 'no option of the legacy driver')"
   for p in /proc/driver/nvidia/gpus/*/power; do [ -r "$p" ] && { echo "  ${p#/proc/driver/nvidia/gpus/}:"; sed 's/^/    /' "$p"; }; done
   echo "kernel display messages: drm.debug=$(cat $G 2>&1)"
@@ -724,9 +728,10 @@ snapshot() {
   if [ "$1" = 1-minute ] || [ "$1" = now ]; then
     # The firmware's description of the machine: its ACPI tables DSDT and SSDT, also the ones it loads while
     # it runs (how its sockets, buttons and power are wired and switched; much the same for every machine of
-    # a model). Not the other tables: one of them holds the licence key of Windows.
+    # a model), and the FADT (FACP: the kinds of sleep and of idle that the firmware declares, such as a
+    # low-power S0 idle). Not the other tables: one of them holds the licence key of Windows.
     ( cd /sys/firmware/acpi/tables 2>/dev/null &&
-        l=$(ls | grep -E '^(DSDT|SSDT[0-9]*)$'; ls dynamic 2>/dev/null | grep -E '^SSDT[0-9]*$' | sed 's|^|dynamic/|') &&
+        l=$(ls | grep -E '^(DSDT|SSDT[0-9]*|FACP)$'; ls dynamic 2>/dev/null | grep -E '^SSDT[0-9]*$' | sed 's|^|dynamic/|') &&
         [ -n "$l" ] && tar -cf - $l 2>/dev/null | gzip > $S/acpi-tables.tar.gz )
     [ -s $S/acpi-tables.tar.gz ] || rm -f $S/acpi-tables.tar.gz
   fi

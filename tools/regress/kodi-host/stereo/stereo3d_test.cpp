@@ -267,7 +267,8 @@ int main()
   Check(ren.find("else if (KODI::UTILS::STEREO3D::MixesEyes(") != std::string::npos,
         "CheckVideoParameters(): SDR in a wide gamut ends only in a mode that mixes the eyes");
   Check(ctx.find("window->StereoPictureTaken(*picture, !picture->doviBaseIsPicture)") != std::string::npos &&
-            ctx.find("!picture->stereoMode.empty() && !window->StereoPictureTaken(*picture, false)") != std::string::npos,
+            ctx.find("KODI::UTILS::STEREO3D::IsStereo(picture->stereoMode) &&\n          "
+                     "!window->StereoPictureTaken(*picture, false)") != std::string::npos,
         "WantsConversion() and WantsPlainMapping(): a 3D picture where the bridge takes it");
   Check(ctx.find("stream.interlaced, stereoKept,") != std::string::npos,
         "ConversionTargetOf(): a 3D stream decoded for the bridge where it takes it");

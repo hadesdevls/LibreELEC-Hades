@@ -39,7 +39,10 @@
 #   output    the output of native Dolby Vision: frames ahead (DVAhead.h, with the 10 s windows of real logs, an
 #             input), dual-mode connectors, the frame tests, the wake, the pictures kept, the lag, the
 #             presentation fixes of 1.0 RC3, the link set up again after a hot-plug (HotplugRelink.h), and the
-#             change of mode from TMDS to HDMI FRL with the way back from its hang (FrlModeChange.h)
+#             change of mode from TMDS to HDMI FRL with the way back from its hang (FrlModeChange.h), and a link that
+#             the kernel marks Bad set up again by a commit of link-status Good alone, the output as it is
+#             (linkbad_test.cpp: drm/LinkStatus.h against a model of the kernel's atomic commit; linkbad_src.py: its
+#             callers, CDRMAtomic::DrmAtomicCommit() and CWinSystemGbm::LookAtLinkStatus())
 #   linkdepth the depth of the link (LinkDepth.h) and what in the sources writes "max bpc" (src_check.py)
 #   fix       a render that libplacebo failed (dvbridge_render.c on the software GPU, a real profile 7 stream as
 #             input), the reads of the connector (DRMConnector.cpp), what a replacement retires (RetiredKept.h),
@@ -94,12 +97,32 @@
 #             the caller in RenderManager.cpp); a 3D video and the Dolby Vision bridge (stereo3d_test.cpp: Stereo3DVideo.h,
 #             how a 3D video goes out, which 3D pictures the bridge draws and that the default draws none it did not
 #             before, the views cut at the seam and placed in the eye, their timing, SDR in a wide gamut in 3D,
-#             profile 20 in 3D, and the callers; the rules before, which must fail)
+#             profile 20 in 3D, and the callers; the rules before, which must fail); the frame of HDMI 3D frame
+#             packing on nvidia-drm in buffers that Kodi allocates itself where the driver refuses the window's
+#             (issue #33; fpown_gl_test.cpp: FramePackedOwn.h, OwnScanout.cpp and StereoGap.h on the same OpenGL ES
+#             3, with the build folder's gbm.h and drm_fourcc.h: when they are made, which buffers go out, the lines
+#             of 1080p and 720p frame packing, the checks of 8 bits and of 10 as before, and a frame of Kodi flipped
+#             by the GPU into the buffer that goes to the screen: the left eye, 45 black lines, the right eye; and
+#             fpown_src.py: in the source, where they are made, asked, kept and taken away, and that the driver is
+#             only asked in a test commit); the GUI's FBO of the HDR composite in a 3D output over several frames
+#             (issue #34; guifbo_gl_test.cpp: WholeBuffer.h's ClearWhole(), StereoViews.h and StereoGap.h on the same
+#             OpenGL ES 3: the menus of before a video and the subtitles before never left in the right eye, its GUI
+#             the left eye's at the other eye's depth, also for an FBO made in a frame whose GUI pass is left out; the
+#             rule before, which must fail; 2D the same bytes; the caller) and a 3D video gone back to 2D and the
+#             bridge (issue #34; fallback2d_test.cpp: Stereo3DVideo.h's IsStereo() with Kodi's RenderFlags.cpp: the base
+#             view alone decided as the picture in 2D from the start, every reader of a picture's stereo mode on its
+#             way to the bridge; the rule before, which must fail)
 #   capture   the SDR copy of an HDR screenshot and the peak it is mapped from (Kodi's TestCaptureConvert with
 #             googletest: CaptureConvert.cpp with libswscale and libavutil of the FFmpeg of the recipe, built for the
 #             host as the bridge's is, rg_ff_bridge), and when the keys of the TV's remote and the commands of the TV
 #             are taken (TestPeripheralCecKeys and TestPeripheralCecPicture: PeripheralCecKeys.h with the libcec
-#             headers of the build folder's sysroot)
+#             headers of the build folder's sysroot); the frame of the video at its own size (issue #30): where it
+#             comes from (Kodi's TestVideoFrameCapture with googletest: VideoFrameCapture.h), the picture drawn again
+#             at its own size and the one before Kodi's scaler read value for value on Mesa's OpenGL ES 3, at 8 and 10
+#             bits and in half floats, the state of GL put back, the SDR copy of 1.2 made from a 10-bit PQ frame
+#             (videoframe_gl_test.cpp: CaptureOwnSize.cpp, CaptureReadback.cpp and CaptureConvert.cpp), and in the
+#             source which picture the renderer gives, where it is served, how it is asked for and its strings
+#             (videoframe_src.py)
 #   setup     the display and its connection: whether an EDID comes through a sound bar or AV receiver, and its sound
 #             (edidpath_test.cpp: EdidHdmiPath.h, on an LG C5 read both ways, AV receivers and TVs; edid_path_diag_test.sh:
 #             hades-diag's edid-path.awk with the image's busybox); the defaults of the file cache from the RAM and from
@@ -130,6 +153,12 @@
 #             another version), and in the source what no host test runs (permemory/src_check.py: where the player takes
 #             the settings and keeps them, which items keep them by their ids, the table of the video database, the
 #             setting and its strings)
+#   devchange the messages of the audio engine and its device change events: Kodi's TestActorProtocol with googletest
+#             (the messages that a purge takes out of a queue are given back, counted and shown to the caller: Kodi
+#             pull request 29331), TestActiveAEDeviceChange (whether a change of the devices reopens the output) and
+#             TestActiveAEDeviceChangePace (the bound of a second of the listings, the events kept while the engine
+#             reconfigures), and in the source the change of the devices of a driver or of the default device that
+#             takes the events of both kinds queued behind it and lists the outputs once for them (devchange/src_check.py)
 # usage: run-kodi-host.sh all | verdict [<log>] | <stage>...      (settings: lib/regress.sh)
 # Needs REGRESS_KODI_GIT, REGRESS_LE_BUILD (googletest, swig, libdrm and GLES headers, busybox), REGRESS_SOURCES
 # (libplacebo, FFmpeg, LibreELEC-settings) and REGRESS_INPUTS (inputs-kodi-host.tsv).
@@ -146,7 +175,7 @@ MUT="$RG_PY $H/mutate.py"
 CXX="g++ -std=c++20 -O1 -g -Wall -Wextra"
 SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
 export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} UBSAN_OPTIONS=${UBSAN_OPTIONS:-print_stacktrace=1}
-STAGES="existing policy window modes output linkdepth fix own ux overlay stereo capture chroma cefix setup projector permemory"
+STAGES="existing policy window modes output linkdepth fix own ux overlay stereo capture chroma cefix setup projector permemory devchange"
 SWIG_HADES_LINES=66 # the lines of the generated xbmcaddon module with the text of Hades' typemap
 IN=$RG_W/in
 VP=xbmc/cores/VideoPlayer/DVDCodecs/Video
@@ -168,6 +197,15 @@ glesinc() {
   mkdir -p "$d" && for x in GLES2 GLES3 EGL KHR; do
     [ "$(readlink "$d/$x")" = "$s/$x" ] || ln -sfn "$s/$x" "$d/$x" || return 1
   done
+  echo "$d"
+}
+# gbm.h and libdrm's drm_fourcc.h of the build folder's sysroot, in a folder of their own (made once; issue #33)
+fpinc() {
+  local s=$REGRESS_LE_BUILD/toolchain/x86_64-libreelec-linux-gnu/sysroot/usr/include d=$RG_SHARED/fpinc
+  [ -f "$s/gbm.h" ] && [ -f "$s/libdrm/drm_fourcc.h" ] || { echo "no gbm.h or drm_fourcc.h in $s" >&2; return 1; }
+  mkdir -p "$d" || return 1
+  [ "$(readlink "$d/gbm.h")" = "$s/gbm.h" ] || ln -sfn "$s/gbm.h" "$d/gbm.h" || return 1
+  [ "$(readlink "$d/libdrm")" = "$s/libdrm" ] || ln -sfn "$s/libdrm" "$d/libdrm" || return 1
   echo "$d"
 }
 # the headers of FFmpeg of the build folder's sysroot (libavcodec, libavutil), in a folder of their own
@@ -235,6 +273,7 @@ build() {
       sdrcontainer_gl) gles=$(glesinc) && ff=$(ffinc) && $CXX ${WERR:-} -Wshadow $SAN -DKODI_TREE="\"$K\"" -I $X \
                          -isystem $gles -isystem $ff $S/output/sdrcontainer_gl_test.cpp \
                          /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      linkbad_src) cp $S/output/presfix/linkbad_src.py $D/t ;;
       *_test) $CXX ${WERR:-} -Wshadow $SAN -I $X -I $K/$GB -I $S/output/presfix $S/output/presfix/$t.cpp -o $D/t ;;
       linkdepth) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/linkdepth/linkdepth_test.cpp -o $D/t ;;
       src_check) cp $S/linkdepth/src_check.py $D/t ;;
@@ -284,6 +323,15 @@ build() {
                          $X/rendering/capture/test/TestCaptureConvert.cpp $X/rendering/capture/CaptureConvert.cpp \
                          $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o $FFB/lib/libswscale.a $FFB/lib/libavutil.a \
                          -lm -o $D/t ;;
+      # (Hades: the frame of the video at its own size; Kodi's own capture files as they are: not with -Werror)
+      video-frame) $CXX $SAN -pthread -I $X -I $GT $X/rendering/capture/test/TestVideoFrameCapture.cpp \
+                     $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      videoframe_gl) gles=$(glesinc) && $CXX $SAN -pthread -DHAS_GLES=3 -I $S/capture/stub -I $S/stereo/glstub -I $X \
+                       -isystem $gles -isystem $FFB/include $S/capture/videoframe_gl_test.cpp \
+                       $X/rendering/capture/CaptureOwnSize.cpp $X/rendering/capture/CaptureReadback.cpp \
+                       $X/rendering/capture/CaptureConvert.cpp $FFB/lib/libswscale.a $FFB/lib/libavutil.a \
+                       /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -lm -o $D/t ;;
+      videoframe_src) cp $S/capture/videoframe_src.py $D/t ;;
       cec-keys) $CXX $SAN -pthread -I $X -isystem $CEC -I $GT $X/peripherals/test/TestPeripheralCecKeys.cpp \
                   $X/peripherals/test/TestPeripheralCecPicture.cpp $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o \
                   -o $D/t ;;
@@ -306,10 +354,26 @@ build() {
                      $X/cores/VideoPlayer/VideoRenderers/StereoDepthCapture.cpp \
                      $X/cores/VideoPlayer/VideoRenderers/StereoDepthMeter.cpp /usr/lib/x86_64-linux-gnu/libEGL.so.1 \
                      /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      # (issue #34: the GUI's FBO of the HDR composite over frames; -DOLD_RULE the clear before, which must fail)
+      guifbo_gl|guifbo_gl-old-rule)
+        gles=$(glesinc) && $CXX $([ $t = guifbo_gl ] && echo "${WERR:-}" || echo -DOLD_RULE) $SAN -pthread -DHAS_GLES=3 \
+          -DKODI_TREE="\"$K\"" -I $S/stereo/glstub -I $X -isystem $gles $S/stereo/guifbo_gl_test.cpp \
+          /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      # (issue #34: a 3D video gone back to 2D and the bridge, with Kodi's RenderFlags.cpp; -DOLD_RULE the rule before)
+      fallback2d|fallback2d-old-rule) ff=$(ffinc) && $CXX $([ $t = fallback2d ] && echo "${WERR:-}" || echo -DOLD_RULE) \
+                         -Wshadow $SAN -DKODI_TREE="\"$K\"" -I $X -isystem $ff $S/stereo/fallback2d_test.cpp \
+                         $X/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp -o $D/t ;;
       hdr3d_gl|hdr3d_gl-old-rule)
         gles=$(glesinc) && $CXX $([ $t = hdr3d_gl ] && echo "${WERR:-}" || echo -DOLD_RULE) $SAN -pthread -DHAS_GLES=3 \
           -DKODI_TREE="\"$K\"" -I $S/stereo/glstub -I $X -isystem $gles $S/stereo/hdr3d_gl_test.cpp \
           /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      # (Kodi's OwnScanout.cpp as it is, with the defines of the image's build of it: not with -Werror, which its
+      # warnings would stop; the build folder's gbm.h and drm_fourcc.h, the host's libgbm only to link)
+      fpown_gl) gles=$(glesinc) && fp=$(fpinc) && $CXX $SAN -pthread -DHAS_GLES=3 -DHAS_GBM_MODIFIERS \
+                  -I $S/stereo/fpstub -I $S/stereo/glstub -I $X -isystem $gles -isystem $fp -isystem $fp/libdrm \
+                  $S/stereo/fpown_gl_test.cpp $X/windowing/gbm/OwnScanout.cpp /usr/lib/x86_64-linux-gnu/libgbm.so.1 \
+                  /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
+      fpown_src) cp $S/stereo/fpown_src.py $D/t ;;
       settings_resize) $CXX -pthread $SAN -I $X $H/settings_resize_test.cpp -o $D/t ;;
       settings_resize-D*) $CXX -pthread $SAN -D${t#settings_resize-D} -I $X $H/settings_resize_test.cpp -o $D/t ;;
       settings_resize-tsan) $CXX -pthread -fsanitize=thread -I $X $H/settings_resize_test.cpp -o $D/t ;;
@@ -346,6 +410,14 @@ build() {
       font) $RG_PY $S/cefix/font_gen.py $K $D/gen && $CXX $SAN -I $S/cefix -isystem $FTINC $D/gen/font_pieces.cpp \
               $S/cefix/font_test.cpp $FTLIB -o $D/t ;;
       cefix-src) cp $S/cefix/src_check.py $D/t ;;
+      # (Kodi's own files and tests as they are, as a release build compiles them: NDEBUG; Kodi pull request 29331)
+      ae-actor) $CXX -DNDEBUG $SAN -pthread -DTARGET_POSIX -DTARGET_LINUX -I $X -I $X/platform/posix -I $GT \
+                  $X/utils/test/TestActorProtocol.cpp $X/utils/ActorProtocol.cpp $X/threads/Event.cpp \
+                  $X/platform/posix/threads/RecursiveMutex.cpp $RG_SHARED/gtest/main.o $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      ae-devchange) $CXX -DNDEBUG $SAN -pthread -I $X -I $GT $X/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChange.cpp \
+                      $X/cores/AudioEngine/Sinks/test/TestActiveAEDeviceChangePace.cpp $RG_SHARED/gtest/main.o \
+                      $RG_SHARED/gtest/gtest-all.o -o $D/t ;;
+      devchange-src) cp $S/devchange/src_check.py $D/t ;;
       edidpath) $CXX ${WERR:-} -Wshadow $SAN -I $X $S/setup/edidpath_test.cpp -o $D/t ;;
       cachedefaults|cachedefaults-old-rule)
         $CXX $([ $t = cachedefaults ] && echo "${WERR:-}" || echo -DOLD_RULE) -Wshadow $SAN -I $X \
@@ -413,16 +485,16 @@ run() {
     vrr_pacer) timeout 60 $D/t 10 ;;
     chroma_shader) env $RG_GPU_ENV timeout 600 $D/t $K ;;
     copy_dither) env $RG_GPU_ENV timeout 600 $D/t ;;
-    stereo-names|cefix-src|permemory-src) $RG_PY $D/t $K ;;
+    stereo-names|cefix-src|permemory-src|devchange-src) $RG_PY $D/t $K ;;
     edidpath) $D/t $IN/edid/lg-c5-direct.bin $IN/edid/lg-c5-sound-bar.bin $IN/edid/receiver-denon.bin \
                 $IN/edid/receiver-onkyo.bin $IN/edid/receiver-pioneer.bin -- $IN/edid/tv-lg-1.bin $IN/edid/tv-lg-2.bin \
                 $IN/edid/tv-lg-3.bin ;;
     cachedefaults*) $D/t $K ;;
     projector_link) timeout 600 $RG_PY $D/t $D/cli ;;
     projector_src) $RG_PY $D/t $K ;;
-    lut_src|info_refresh_src|keymap_check|lost_frames_src) $RG_PY $D/t $K ;;
+    lut_src|info_refresh_src|keymap_check|lost_frames_src|videoframe_src) $RG_PY $D/t $K ;;
     display_lut_loader-tsan) TSAN_OPTIONS=halt_on_error=1 timeout 120 $D/t ;;
-    chroma_src|disjoint_src|power_src) $RG_PY $D/t $K ;;
+    chroma_src|disjoint_src|power_src|fpown_src|linkbad_src) $RG_PY $D/t $K ;;
     font) $D/t $K/addons/skin.estuary/fonts/NotoSans-Regular.ttf $K/addons/skin.estuary/fonts/NotoMono-Regular.ttf ;;
     *) $D/t ;;
   esac
@@ -457,12 +529,17 @@ pass_re() {
     dvpathprior*) echo '^DVPATHPRIOR-TEST PASSED$' ;;
     swig) echo "^lines with Hades text: $SWIG_HADES_LINES\$" ;;
     fadelabel) echo '^PASSED: 0 of [0-9]+ passes' ;;
-    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory) echo '^\[  PASSED  \] [0-9]+ tests' ;;
+    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory|video-frame|ae-actor|ae-devchange) echo '^\[  PASSED  \] [0-9]+ tests' ;;
+    videoframe_gl) echo '^PASSED$' ;;
+    videoframe_src) echo '^VIDEOFRAME-SRC PASSED$' ;;
     stereo-names) echo '^STEREO-NAMES PASSED$' ;;
     font) echo '^FONT-TEST PASSED$' ;;
     cefix-src) echo '^CEFIX-SRC PASSED$' ;;
     permemory-src) echo '^PERMEMORY-SRC PASSED$' ;;
-    aus|depth|autodepth*|hdr3d_gl*|hdrdepth_gl|sdrcontainer_gl|stereo3d*) echo '^0 failed$' ;;
+    devchange-src) echo '^DEVCHANGE-SRC PASSED$' ;;
+    aus|depth|autodepth*|hdr3d_gl*|hdrdepth_gl|sdrcontainer_gl|stereo3d*|fpown_gl|guifbo_gl*|fallback2d*) echo '^0 failed$' ;;
+    fpown_src) echo '^FPOWN-SRC PASSED$' ;;
+    linkbad_src) echo '^LINKBAD-SRC PASSED$' ;;
     settings_resize*) echo '^[0-9]+ checks, 0 failed' ;;
     vrr|vrr_gui|vrr_video|display_modes|display_lut|exact_rate|video_size|picture_timing|content_type) echo '^PASSED$' ;;
     display_lut_loader|display_lut_loader-tsan) echo '^PASSED$' ;;
@@ -487,7 +564,7 @@ pass_re() {
 }
 fail_re() {
   case $1 in
-    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory) echo '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' ;;
+    audio-follow|offsets|capture-convert|cec-keys|cefix-ae|stereo-eye|permemory|video-frame|ae-actor|ae-devchange) echo '^\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' ;;
     widths) echo 'OVER' ;;
     reachable*) echo '^WRONG' ;;
     *) echo '^FAIL' ;;
@@ -623,12 +700,14 @@ for line in open(sys.argv[1], encoding="utf-8"):
   check dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
     finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
     dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test sdrsignal_test dvform_test \
+    linkbad_test linkbad_src \
     sdrcontainer_gl convstep_test
   must_fail dvframetest-old-rule 4
   must_fail presentlag-old-rule 5
   mutants dvahead dualmode dualmode-table dvframetest drmwake dvrepeatkeep presentlag \
     finishrequest_test stall_ahead_test keep_pacing_test flip_recovery_test held_mode_test float_blame_test \
     dv_announce_test gui_hold_test dv_move_test hdrsettle_test relink_test frl_mode_change_test frl_keep_test sdrsignal_test dvform_test \
+    linkbad_test linkbad_src \
     sdrcontainer_gl convstep_test
   mutants_clean
 }
@@ -800,11 +879,14 @@ stage_overlay() {
 stage_stereo() {
   inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
   GT=$(gtest) || rg_fail "googletest of the build folder"
-  check offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d
+  check offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d
   must_fail autodepth-old-rule 3
   must_fail hdr3d_gl-old-rule 19
   must_fail stereo3d-old-rule 5
-  mutants offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d
+  # (issue #34: the right eye of each 3D layout, two frame sequences each; the base view alone taken for 3D)
+  must_fail guifbo_gl-old-rule 9
+  must_fail fallback2d-old-rule 1
+  mutants offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d
   mutants_clean
 }
 stage_chroma() {
@@ -818,8 +900,8 @@ stage_capture() {
   GT=$(gtest) || rg_fail "googletest of the build folder"
   FFB=$(rg_ff_bridge) || rg_fail "the FFmpeg of the bridge"
   CEC=$(cecinc) || rg_fail "the libcec headers of the build folder"
-  check capture-convert cec-keys
-  mutants capture-convert cec-keys
+  check capture-convert cec-keys video-frame videoframe_gl videoframe_src
+  mutants capture-convert cec-keys video-frame videoframe_gl videoframe_src
   mutants_clean
 }
 
@@ -920,6 +1002,13 @@ stage_permemory() {
   [ -f "$FMT/fmt/format.h" ] || rg_fail "no fmt headers in $REGRESS_LE_BUILD"
   check permemory permemory-src
   mutants permemory permemory-src
+  mutants_clean
+}
+
+stage_devchange() {
+  GT=$(gtest) || rg_fail "googletest of the build folder"
+  check ae-actor ae-devchange devchange-src
+  mutants ae-actor ae-devchange devchange-src
   mutants_clean
 }
 

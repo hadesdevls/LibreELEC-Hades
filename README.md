@@ -9,7 +9,7 @@
 <p align="center"><b>Native Dolby Vision, HDR10+, HD audio and 3D from your PC, on LibreELEC.</b></p>
 
 <p align="center">
-  <a href="https://github.com/hadesdevls/LibreELEC-Hades/releases/latest"><img alt="Version 1.2" src="docs/images/version.svg" height="28"></a>
+  <a href="https://github.com/hadesdevls/LibreELEC-Hades/releases/latest"><img alt="Version 1.2.1" src="docs/images/version.svg" height="28"></a>
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@ LibreELEC Hades is an unofficial build of [LibreELEC](https://libreelec.tv) for 
 
 <p align="center">
   <img alt="The player information of LibreELEC Hades over a Dolby Vision profile 7 film: the path of the signal from the film through Hades to the TV, the details of each part, and a bar with the graphics, the memory and the button for the output of the video" src="docs/images/player-information.png" width="900">
-  <br><sub>The player information (press O): Kodi's own rendering of the page, in a virtual machine, with the values of a Dolby Vision profile 7 film with Dolby TrueHD Atmos on an LG C5 filled in. The capture is of version 1.1; 1.2 adds a few lines to it.</sub>
+  <br><sub>The player information (press O): Kodi's own rendering of the page, in a virtual machine, with the values of a Dolby Vision profile 7 film with Dolby TrueHD Atmos on an LG C5 filled in.</sub>
 </p>
 
 **Why the screen says "LibreELEC Hades".** The media centre of this build is Kodi with changes that the XBMC Foundation has not approved, and Kodi's trademark policy asks such a build not to use Kodi's name and logos as its own. Underneath, it is Kodi: add-ons, skins and remote-control apps work as with Kodi, its log is still `kodi.log`, and other programs still see Kodi. The page "About this build" of the system information says what it is and how to support Kodi and LibreELEC.
@@ -87,12 +87,13 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 - **Truer colour edges** in every video that Kodi draws itself (SDR, HDR10 and HLG): the colour is placed where the video puts it, and filled in with a sharper filter. It is on by default, and where the graphics cannot keep up it steps down by itself to a lighter filter.
 - **Smooth gradients on an 8-bit screen.** Where Hades maps or upscales a picture into 8 bits (an SDR screen, a laptop panel), it adds a fine noise instead of rounding, so skies and fades show no steps. Never on native Dolby Vision, nor on a 10-bit output.
 - **Upscalers,** an expert choice: RAVU, FSRCNNX 8, FSRCNNX 16 or AiUpscale rebuild the fine detail of a video smaller than the screen, such as 1080p on a 4K TV, with a choice of its own for animation. While a video plays, the Video page of the player information (O) has a button for them.
+- **The frame of the video, saved alone:** Shift+Print Screen, or *Save the frame of the video* in the video settings of the player, saves the frame of the film without menus or subtitles, at the video's own size, with an SDR copy beside it when it is HDR.
 - **Subtitles in the black bars,** an option: for a film wider than the screen, such as a 2.39:1 film on a 16:9 TV, subtitles go into the bar under the picture so that they never cover it.
 
 ### For a home cinema
 
 - **Filmmaker Mode by itself.** While a video plays, Hades tells the TV over HDMI that it is a film (Game for games), where the TV says it takes that, so a TV with an automatic Filmmaker Mode switches to it for the film and back for the menus, with no black screen of its own. On by default.
-- **A 3D LUT for each display,** an expert choice: the calibration of your display (`.cube`, `.3dl` or madVR's `.3dlut`), one for SDR and one for HDR, applied as the last step of the colour of the video, on SDR videos and on the HDR that Hades maps to the display. Each display keeps its own.
+- **A LUT for each display,** an expert choice: the calibration of your display, a 3D LUT (`.cube`, `.3dl` or madVR's `.3dlut`), a 1D LUT (the `.cal` of DisplayCAL and ArgyllCMS, or a 1D `.cube`) or both, one for SDR and one for HDR, applied as the last step of the colour of the video, on SDR videos and on the HDR that Hades maps to the display. Each display keeps its own.
 - **A projector that follows the film,** an option: over the network, the lens memory of a home-cinema projector follows the shape of the picture, for a wide screen with constant image height, and its picture mode follows the signal (SDR, HDR10, HLG, Dolby Vision, 3D). JVC D-ILA, Sony and Epson.
 - **Settings for projectors:** HDR mapped by Hades to a dim screen, and a few questions at the first start that set it up (see [HDR10 and HDR10+](#hdr10-and-hdr10) above and [the settings guide](docs/settings.md#for-projectors-and-displays-that-map-hdr-poorly)).
 
@@ -132,6 +133,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 ### Made for a PC
 
 - **PCs with two graphics chips, and laptops:** Kodi starts on the TV, whichever chip it is connected to, and moves to a TV connected later (on the same graphics without a restart).
+- **The remote wakes the PC:** the receiver of a remote control (a flirc, a Media Center receiver) may wake the PC from sleep, and *Settings > LibreELEC > System > Sleep > Wake from sleep* chooses what may.
 - **Safer defaults, a Windows installer, and a diagnostic report made with one button** (see below).
 
 [Extras of Hades](docs/features.md) explains each of these, and the smaller ones that are not listed here.
@@ -148,7 +150,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 
 ## Installing and starting
 
-You need the image file (`LibreELEC-Generic.x86_64-...img.gz`), from the [releases](https://github.com/hadesdevls/LibreELEC-Hades/releases) of this repository or built yourself. The Windows installer is in the same place and comes with its own README.
+You need the image file (`LibreELEC-Hades-...img.gz`), from the [releases](https://github.com/hadesdevls/LibreELEC-Hades/releases) of this repository or built yourself. The Windows installer is in the same place and comes with its own README.
 
 1. **Write the image to a USB drive.** On Windows, run `LibreELEC-Hades-Installer.exe`: it lists your drives with their model, size and serial number, asks you to type a word before it touches anything, and checks what it wrote. Any other program that writes disk images works too. The drive is erased.
 2. **Start the PC from the drive.** Restart the PC, open the firmware's boot menu (F8, F11, F12 or Esc on most PCs) and choose the USB drive.
@@ -217,7 +219,7 @@ Your settings, add-ons and the diagnostics folder are kept whichever way you upd
 - On "auto": Hades downloads a new version by itself and installs it at the next start, as LibreELEC does.
 - To stop looking: keep "manual" and turn off *Show Update Notifications*. *Available Versions* still looks when you choose it.
 
-**Other ways to update.** 1.0 and 1.1 do not look by themselves, so the update to 1.2 is made one of these ways:
+**Other ways to update.** 1.0 and 1.1 do not look by themselves, so they are updated one of these ways:
 
 - **With the Windows installer:** choose the drive that has Hades and "Update". It writes the new system and keeps everything else.
 - **As in LibreELEC, with the `.tar` file** of the new version: copy it to the `Update` folder (`/storage/.update`) and restart. Over the network that folder is a share of the system, and file sharing (Samba) is off in Hades until you turn it on:
@@ -296,7 +298,7 @@ If the same problem happens with an official LibreELEC image, it belongs to Libr
 - [Changelog](CHANGELOG.md): what changed in each version.
 - [Credits](CREDITS.md): whose code, findings and ideas are in Hades, with the source of each.
 
-Versions in 1.2: Linux 7.4-rc4 (a release candidate of Linux 7.4), Kodi 22 (the `Piers` branch after 22.0rc2, up to c1d4d42d1a74), FFmpeg 9.1 (with fixes from `master`), Mesa 26.3.1, libplacebo (bfdb8dec6ef6), NVIDIA 620.73.04 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.11, and OpenJDK 27.0.1.1 for Blu-ray Java menus, on LibreELEC `master` (13.0 development, up to c1800c3c4228). LibreELEC has not released version 13.
+Versions in 1.2.1: Linux 7.4-rc4 (a release candidate of Linux 7.4), Kodi 22 (the `Piers` branch after 22.0rc2, up to e1f5bbb647), FFmpeg 9.1 (with fixes from `master`), Mesa 26.3.1, libplacebo (bfdb8dec6ef6), NVIDIA 620.73.04 and, for the GeForce GTX 900 and GTX 10 cards and the TITAN V, NVIDIA 580.196.11, and OpenJDK 27.0.1.1 for Blu-ray Java menus, on LibreELEC `master` (13.0 development, up to c301806e95fc). LibreELEC has not released version 13.
 
 ## Building from source
 
@@ -314,7 +316,7 @@ Good to know:
 - Everything in the image is compiled from source, except the files that [NOTICE.md](NOTICE.md) names (NVIDIA's closed parts and the BIOS boot files of syslinux, as LibreELEC takes them) and the firmware. The test clips of *Check this setup* are made during the build, with x265 and FFmpeg built for the build machine; no encoder goes into the image.
 - The dates written into a build come from the time of its commit (`SOURCE_DATE_EPOCH`), so that builds of the same commit can be compared byte for byte.
 - A clean build takes 20 to 45 minutes on a 32-thread machine, much longer on a small one. My builds run without network access, from sources fetched and verified beforehand.
-- **If you change the tree and share your build, give it your own name** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one, the build calls itself "Hades 1.2".
+- **If you change the tree and share your build, give it your own name** (`BUILDER_NAME=<your name> make image`) and say that it is yours. Without one, the build calls itself "Hades 1.2.1".
 - The Windows installer is a small C# program in `tools/hades-installer/`. `build.ps1` builds it with the compiler that Windows already has, as `LibreELEC-Hades-Installer.exe`, the one that is published, and `LibreELEC-Hades-Installer-tests.exe`, the same installer with the self-tests for developers.
 - The pictures of this README are in `docs/images`, with the script that draws the header, the version and the diagrams from the mark of the build.
 

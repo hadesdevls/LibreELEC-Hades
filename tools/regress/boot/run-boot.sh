@@ -47,12 +47,28 @@
 #                writes suspend, hibernate and resume to /proc/driver/nvidia/suspend as systemd-sleep runs it, and nothing
 #                with the 620 driver; stack-links writes the option that keeps the video memory for the legacy driver only
 #                (nvidia_sleep_test.sh, with the busybox of the image); each of its 6 mutations must fail a check
+#   sleepreport  the lines that each sleep leaves in the kernel log and that the diagnostics print (sleep.sh of
+#                packages/sysutils/hades-diag/scripts): what the firmware offers (deep, a low-power S0 idle in the
+#                FADT, an LPS0 device), what may wake the PC and the input devices that could and are not armed, how
+#                the sleep went and what woke it, on a /sys and a /proc of files like the PC of issue 32 and one with
+#                deep, with the busybox of the image (sleep_report_test.sh); each of its 7 mutations must fail a check
+#   wake         what may wake the PC from sleep (wake.sh of packages/sysutils/hades-wake, which udev, the sleep hook and
+#                the setting "Wake from sleep" run) on a /sys of files with the USB devices of issue 32 and others (a
+#                Media Center IR receiver, a mouse, a game pad, a TV tuner with IR, an IR receiver on the board), each
+#                HID interface with a report descriptor of bytes: each choice of the setting, a device plugged in, a
+#                device seen before all its interfaces, the hook after a sleep, another device on a port, and what
+#                sleep.sh then says of each device (wake_test.sh, with the busybox of the image); each of its 14
+#                mutations must fail a check
+#   wakesettings the setting "Wake from sleep" of the LibreELEC settings add-on (LibreELEC-settings-9093, system.py and
+#                its strings, with stand-ins for Kodi: wake_settings_test.py) on the add-on of the recipe (archive
+#                checked against PKG_SHA256, every patch with -F0), and the same with 9093 reversed, which must fail
 # Not a stage (it needs an image and KVM): picture_race_qemu.sh, Kodi's "hades-picture release" that comes while a
 # picture of the start is being drawn, in QEMU (its head says what it checks).
 # Host test only: it writes under $REGRESS_WORK/boot and reads the tree at $REGRESS_LE_REF and the busybox of the build
 # folder ($REGRESS_LE_BUILD/install_pkg/busybox-*).
 # usage: run-boot.sh all | verdict [<log>] | <stage>...       stages: menus today olderlook oldertext notice themeupdate installer picture
 #                                                              scripts netwait notreturned afternvidia nvidiasleep
+#                                                              sleepreport wake wakesettings
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -343,4 +359,75 @@ stage_nvidiasleep() {
   done
 }
 
-rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep" "$@"
+stage_sleepreport() {
+  local bb L v m T=$RG_W/le-sleepreport SC=packages/sysutils/hades-diag/scripts/sleep.sh
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $SC
+  if [ -z "$bb" ] || [ ! -f "$T/$SC" ]; then
+    rg_item sleep-report FAILED "no busybox of the image, or no sleep.sh at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/sleep-report.log
+  rg_log "$L" bash "$HERE/sleep_report_test.sh" "$bb" "$T/$SC"
+  v=$(rg_pass "$L" '^SLEEP-REPORT PASSED$' '^  FAIL ')
+  rg_item sleep-report "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5 M6 M7; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item sleep-report.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item sleep-report.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+stage_wake() {
+  local bb L m v T=$RG_W/le-wake W=packages/sysutils/hades-wake SC=packages/sysutils/hades-diag/scripts/sleep.sh
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $W $SC
+  if [ -z "$bb" ] || [ ! -f "$T/$W/scripts/wake.sh" ]; then
+    rg_item wake FAILED "no busybox of the image, or no wake.sh at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/wake.log
+  rg_log "$L" bash "$HERE/wake_test.sh" "$bb" "$T/$W/scripts/wake.sh" "$T/$SC" "$T/$W/udev.d/70-hades-wake.rules" \
+    "$T/$W/sleep.d/hades-wake"
+  v=$(rg_pass "$L" '^WAKE PASSED$' '^  FAIL ')
+  rg_item wake "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13 M14; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item wake.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item wake.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+# the setting "Wake from sleep" of the LibreELEC settings add-on: the add-on of the recipe (archive checked against
+# PKG_SHA256, every patch with -F0), with stand-ins for Kodi; and the same with LibreELEC-settings-9093 reversed (and
+# every patch after it, the last first), which must fail
+stage_wakesettings() {
+  local P=packages/mediacenter/LibreELEC-settings ver sha tb S=$RG_W/wakesettings L p n v
+  ver=$(rg_pkgvar $P PKG_VERSION); sha=$(rg_pkgvar $P PKG_SHA256)
+  tb=$(rg_source LibreELEC-settings "LibreELEC-settings-$ver.tar.gz")
+  rg_fresh $S/src $S/without
+  rg_le_tree $S/le $P/patches
+  if [ -z "$tb" ] || [ "$(sha256sum < "$tb" | cut -c1-64)" != "$sha" ]; then
+    rg_item wake-settings FAILED "no LibreELEC-settings-$ver.tar.gz with PKG_SHA256 in REGRESS_SOURCES"
+    rg_item wake-settings.without-9093 FAILED "no LibreELEC-settings source"; return 1
+  fi
+  tar -xzf "$tb" --strip-components=1 -C $S/src
+  for p in $(ls $S/le/$P/patches/*.patch | sort); do
+    patch -d $S/src -p1 -F0 -s --no-backup-if-mismatch < "$p" ||
+      { rg_item wake-settings FAILED "patch $(basename $p) does not apply with -F0"; return 1; }
+  done
+  L=$RG_W/logs/wake-settings.log
+  rg_log "$L" python3 -I "$HERE/wake_settings_test.py" $S/src
+  v=$(rg_pass "$L" '^ALL PASSED$')
+  rg_item wake-settings "$(rg_say "$v")" "$(rg_rest "$v") ($(grep -c '^ok:' $L) ok)"
+  cp -a $S/src/. $S/without/
+  for p in $(ls $S/le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
+    n=$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')
+    [ "$n" -ge 9093 ] || continue
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without < "$p" ||
+      { rg_item wake-settings.without-9093 FAILED "$(basename $p) does not reverse"; return 1; }
+  done
+  L=$RG_W/logs/wake-settings.without-9093.log
+  rg_log "$L" python3 -I "$HERE/wake_settings_test.py" $S/without
+  [ "$(rg_exit $L)" != 0 ] && rg_item wake-settings.without-9093 PASSED "it fails without 9093: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+    rg_item wake-settings.without-9093 FAILED "it passes without 9093"
+  rg_rm $S/without
+}
+
+rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep sleepreport wake wakesettings" "$@"

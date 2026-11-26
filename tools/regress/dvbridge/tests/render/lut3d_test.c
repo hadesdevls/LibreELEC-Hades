@@ -6,11 +6,13 @@
 // libplacebo of the build. lut3d_check.py makes the LUT files (make) and checks what this writes (check).
 //
 //   - every LUT file is read as lut3d_check.py made it, or refused (the line "parse <file>: ..."), with grid
-//     points of each LUT that is read, by which the orientation of its table is checked;
+//     points of each LUT that is read, by which the orientation of its table is checked, and points of its 1D LUT
+//     (a .cube of LUT_1D_SIZE alone or as Resolve's shaper, ArgyllCMS's .cal; the lines "curve ...");
 //   - the paths that take the LUT: the PQ chart mapped to SDR (the reference display) and to a projector of
 //     150 cd/m2 (HDR10 adapted, with and without the display's black), drawn as it is (clamp_picture()), kept as
 //     10-bit codes, and a Dolby Vision picture in Low-Latency (with and without the display's black): written for
-//     lut3d_check.py (every third pixel of every third row) with the LUT and without it;
+//     lut3d_check.py (every third pixel of every third row) with the LUT and without it; the 1D LUTs on SDR (a .cal,
+//     a steep curve, one of 5000 points) and Resolve's shaper on the projector;
 //   - an identity LUT gives the picture without it: compared here over the whole picture, the floats and the
 //     codes of 10 and 12 bits;
 //   - what never takes it: native Dolby Vision (TV-led) and HDR over the tunnel, with a LUT set: the same bytes
@@ -182,6 +184,9 @@ struct gl
 struct luts
 {
   struct dvbridge_lut *id17, *id33, *id65, *tint, *crlf, *video, *nuke, *unif, *madvr, *madvrpq;
+  // the 1D LUTs: ArgyllCMS's .cal (and one loaded in video levels), a .cube of LUT_1D_SIZE alone (steep, 5000 points,
+  // the identity), Resolve's shaper before a 3D LUT
+  struct dvbridge_lut *cal, *caltv, *steep, *long1d, *id1d, *shaper;
 };
 
 static struct dvbridge_lut* Parse(const char* dir, const char* name, struct dvbridge_lut_range range)
@@ -212,6 +217,14 @@ static struct dvbridge_lut* Parse(const char* dir, const char* name, struct dvbr
       dvbridge_lut_point(lut, pts[k][0], pts[k][1], pts[k][2], rgb);
       printf("point %s %d %d %d: %.9g %.9g %.9g\n", name, pts[k][0], pts[k][1], pts[k][2], (double)rgb[0],
              (double)rgb[1], (double)rgb[2]);
+    }
+    // ... and points of its 1D LUT, each channel its own
+    if (lut->curve)
+    {
+      const int c = lut->curve_size, at[3] = {0, c / 2 + 1, c - 1};
+      for (int k = 0; k < 3; ++k)
+        printf("curve %s %d of %d: %.9g %.9g %.9g\n", name, at[k], c, (double)lut->curve[at[k] * 3],
+               (double)lut->curve[at[k] * 3 + 1], (double)lut->curve[at[k] * 3 + 2]);
     }
   }
   free(bytes);
@@ -277,7 +290,16 @@ int main(int argc, char** argv)
   L.unif = Parse(luts, "unif9.3dl", FULL);
   L.madvr = Parse(luts, "madvr16.3dlut", FULL);
   L.madvrpq = Parse(luts, "madvrpq8.3dlut", FULL);
-  static const char* const refused[] = {"bad-1d.cube", "bad-domain.cube", "bad-keyword.cube", "bad-count.cube",
+  L.cal = Parse(luts, "vcgt256.cal", VIDEO);
+  L.caltv = Parse(luts, "vcgt-tv.cal", FULL);
+  L.steep = Parse(luts, "steep1d.cube", FULL);
+  L.long1d = Parse(luts, "long1d.cube", FULL);
+  L.id1d = Parse(luts, "id1d256.cube", FULL);
+  L.shaper = Parse(luts, "shaper.cube", FULL);
+  static const char* const refused[] = {"bad-1drange.cube", "bad-1dcount.cube", "bad-1d3dcount.cube",
+                                        "bad-printer.cal", "bad-cmyk.cal", "bad-fields.cal", "bad-grid.cal",
+                                        "bad-header.cal", "bad-value.cal", "bad-domain.cube", "bad-keyword.cube",
+                                        "bad-count.cube",
                                         "bad-inputrange.cube", "bad-shaper.3dl", "bad-compressed.3dlut",
                                         "bad-header.3dlut", "empty.cube", "bad-value.cube", "bad-name.txt"};
   int refusedAll = 1;
@@ -287,11 +309,12 @@ int main(int argc, char** argv)
     refusedAll = refusedAll && !bad;
     dvbridge_lut_free(&bad);
   }
-  Check(L.id17 && L.id33 && L.id65 && L.tint && L.crlf && L.video && L.nuke && L.unif && L.madvr && L.madvrpq,
+  Check(L.id17 && L.id33 && L.id65 && L.tint && L.crlf && L.video && L.nuke && L.unif && L.madvr && L.madvrpq &&
+            L.cal && L.caltv && L.steep && L.long1d && L.id1d && L.shaper,
         "every good LUT file read");
   Check(refusedAll, "every file that cannot be read exactly refused, with why");
   if (!L.id17 || !L.id33 || !L.id65 || !L.tint || !L.crlf || !L.video || !L.nuke || !L.unif || !L.madvr ||
-      !L.madvrpq)
+      !L.madvrpq || !L.cal || !L.caltv || !L.steep || !L.long1d || !L.id1d || !L.shaper)
   {
     printf("FAILED: %d failed\n", g_failures);
     return 1;
@@ -308,6 +331,20 @@ int main(int argc, char** argv)
         "madVR: a LUT of PQ in BT.2020, in full range, said so by its parameters");
   Check(L.nuke->shaper_two && !L.unif->shaper_two && L.nuke->out_bits == 12 && L.unif->out_bits == 10,
         ".3dl: Nuke's shaper of two slopes and a uniform one, the output depths of 12 and 10 bits");
+  // the 1D LUTs: alone (the identity of 2 points for the 3D table), or a shaper before one; a .cal in full range
+  // whatever the caller says (its values are the device's), the same table with its fields in another order and loaded
+  // in video levels
+  Check(L.cal->format == DVBRIDGE_LUT_CAL && L.cal->curve_only && L.cal->curve_size == 256 && L.cal->size == 2 &&
+            L.cal->range_declared && L.cal->in.lo == 0.0f && L.cal->in.hi == 255.0f && !L.cal->tv_encoding &&
+            L.caltv->tv_encoding && L.caltv->curve_size == 256 &&
+            !memcmp(L.cal->curve, L.caltv->curve, (size_t)256 * 12),
+        ".cal: a 1D LUT alone of 256 points, in full range as its file says, read the same with its fields in another "
+        "order and loaded in video levels (TV_OUTPUT_ENCODING)");
+  Check(L.steep->curve_only && L.steep->curve_size == 1024 && L.long1d->curve_size == 5000 && L.id1d->curve_only &&
+            L.shaper->format == DVBRIDGE_LUT_CUBE && !L.shaper->curve_only && L.shaper->curve_size == 64 &&
+            L.shaper->size == 17 && !strcmp(L.steep->title, "a 1D LUT of lut3d_check.py"),
+        ".cube: LUT_1D_SIZE alone (1024 and 5000 points, CRLF), and Resolve's shaper of 64 points before a 3D LUT of "
+        "17");
 
   // --- GL
   EGLDisplay dpy = EGL_NO_DISPLAY;
@@ -410,6 +447,8 @@ int main(int argc, char** argv)
       {"sdr", &sdr, L.tint, L.id33},       {"sdr-video", &sdr, L.video, NULL},  {"sdr-nuke", &sdr, L.nuke, NULL},
       {"sdr-unif", &sdr, L.unif, NULL},    {"sdr-madvr", &sdr, L.madvr, NULL},  {"proj", &proj, L.tint, L.id65},
       {"projblack", &projBlack, L.tint, L.id17}, {"asis", &none, L.tint, L.id33},
+      {"sdr-cal", &sdr, L.cal, L.id1d},    {"sdr-steep1d", &sdr, L.steep, NULL}, {"sdr-long1d", &sdr, L.long1d, NULL},
+      {"proj-shaper", &proj, L.shaper, NULL},
   };
   for (size_t w = 0; w < sizeof(ways) / sizeof(*ways); ++w)
   {
@@ -495,9 +534,11 @@ int main(int argc, char** argv)
 
   // --- the time of a render (informative: zink on lavapipe; the LUT is in the output pass, no pass of its own)
   dvbridge_render_hdr10_mapping(r, &sdr);
-  printf("time sdr: without a LUT %.1f ms, with a LUT of 17 points %.1f ms, of 65 points %.1f ms (best of 4)\n",
+  printf("time sdr: without a LUT %.1f ms, with a LUT of 17 points %.1f ms, of 65 points %.1f ms, a .cal %.1f ms, "
+         "a shaper and 17 points %.1f ms (best of 4)\n",
          TimePlain(r, &b.frame, &plain, NULL), TimePlain(r, &b.frame, &plain, L.tint),
-         TimePlain(r, &b.frame, &plain, L.id65));
+         TimePlain(r, &b.frame, &plain, L.id65), TimePlain(r, &b.frame, &plain, L.cal),
+         TimePlain(r, &b.frame, &plain, L.shaper));
   dvbridge_render_set_lut(r, NULL);
   dvbridge_renderer_destroy(r);
 
@@ -653,6 +694,12 @@ int main(int argc, char** argv)
   dvbridge_lut_free(&L.unif);
   dvbridge_lut_free(&L.madvr);
   dvbridge_lut_free(&L.madvrpq);
+  dvbridge_lut_free(&L.cal);
+  dvbridge_lut_free(&L.caltv);
+  dvbridge_lut_free(&L.steep);
+  dvbridge_lut_free(&L.long1d);
+  dvbridge_lut_free(&L.id1d);
+  dvbridge_lut_free(&L.shaper);
   printf("%s: %d failed\n", g_failures ? "FAILED" : "PASSED", g_failures);
   return g_failures ? 1 : 0;
 }

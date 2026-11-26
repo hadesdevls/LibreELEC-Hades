@@ -8,7 +8,12 @@
 #  - Kodi's renderer makes no copy of the table (no dvbridge_lut_atlas_make()) and puts it on the GPU a part at a time,
 #    at most LUT_PART_BYTES a frame, the picture without it until all of it is there (CLut3dGLES::Ready()), and says it
 #    is loading meanwhile (LutDrawn(..., pending)), which the window system tells as LOADING, not as a failure;
-#  - the player information has a word for LOADING, in Estuary's strings and in the core's.
+#  - the player information has a word for LOADING, in Estuary's strings and in the core's;
+#  - a 1D LUT (1.2.1): its texture made with the table, straight from the LUT; the shaders made again where a 1D LUT
+#    comes or goes (also where one LUT takes another's place in one frame); its functions put in before those of the
+#    table; a 1D LUT alone checked for its signal and not for a gamut; Kodi's automatic dither on where its pass applies
+#    the LUT, and its pictures dithered into an 8-bit window where Kodi's dither is off; the file browser of both
+#    settings offers .cal.
 # Prints FAIL lines and LUT-SRC PASSED or FAILED (n) last.
 import os
 import re
@@ -85,6 +90,27 @@ m = re.search(r'LUT_PART_BYTES = size_t\{(\d+)\} << 20;', h)
 need(m and 1 <= int(m.group(1)) <= 64, 'LUT_PART_BYTES is not a few MB')
 lg = read('xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.h')
 need('bool Valid() const { return m_texture != 0 && m_ready; }' in lg, 'CLut3dGLES is valid before all of it is there')
+# (1.2.1) the 1D LUT
+need('m_lut3d.PutCurve(lut->curve, layout.curve_size, layout.curve_width, layout.curve_height, why)' in take,
+     'the 1D LUT is not put on the GPU with the table, straight from the LUT')
+need(re.search(r'const bool curve = want && m_lut3d\.HasCurve\(\);', take) and
+     re.search(r'if \(want != m_lut3dShaders \|\| curve != m_lut3dCurveShaders \|\|', take),
+     'the shaders are not made again where a 1D LUT comes or goes')
+lgc = read('xbmc/cores/VideoPlayer/VideoRenderers/VideoShaders/Lut3dGLES.cpp')
+need(re.search(r'\(!HasCurve\(\) \|\| pixel\.InsertSource\("gles_lut3d_curve\.frag", "void main\(\)"\)\) &&\s*'
+               r'pixel\.InsertSource\("gles_lut3d\.frag", "void main\(\)"\)', lgc),
+     'the functions of a 1D LUT are not put in before those of the table')
+need('&d.detail, got.table->curve_only);' in lf, 'a 1D LUT alone is checked for a gamut')
+need('ditherActive = ditherActive || lutDithered;' in rd and
+     'ditherActive = ditherActive || m_pVideoFilterShader->HasLut3d();' in rd,
+     'Kodi\'s automatic dither is not on where its pass applies the LUT')
+need(re.search(r'lutDither = redBits == 8 && LutDitherTexture\(\);', take) and
+     re.search(r'\|\| lutDither != m_lutDither\)', take) and
+     'useDither = m_useDithering || (m_lutDither && lut3d);' in rd and
+     'const bool useDither = m_useDithering || (m_lutDither && lutDithered);' in rd,
+     'the pictures of the LUT are not dithered into an 8-bit window where Kodi\'s dither is off')
+st =read('system/settings/settings.xml')
+need(st.count('<masking>.cube|.3dl|.3dlut|.cal</masking>') == 2, 'the settings of the LUTs do not offer .cal')
 # the words
 core = read('addons/resource.language.en_gb/resources/strings.po')
 need(re.search(r'msgctxt "#62821"\nmsgid "loading"', core), 'no core string #62821 "loading"')

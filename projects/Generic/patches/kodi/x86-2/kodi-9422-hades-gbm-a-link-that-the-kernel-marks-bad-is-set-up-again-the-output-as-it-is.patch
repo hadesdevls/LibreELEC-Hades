@@ -1,0 +1,251 @@
+From c7bb571697630a54c561cb214c389924b84df9ac Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:27:27 +0000
+Subject: [PATCH] [Hades][GBM] A link that the kernel marks Bad is set up
+ again, the output as it is
+
+i915 marks the link of a connector Bad after a DisplayPort link training
+that failed or fell back (an HDMI port that the board drives through a
+DisplayPort converter included) and sends a hot-plug event; the display
+then shows nothing until a modeset sets link-status Good, as the kernel
+documents it. Kodi heard the event and did not do that.
+
+CWinSystemGbm::LookAtLinkStatus(), called for every frame by the thread
+that draws (after LookAtModes()), as LinkStatus.h says:
+
+- a connector without link-status (or without Good and Bad in it) is
+  never read again;
+- the link is read after a hot-plug event of the device in use, once
+  1.5 s after each change of mode of Kodi's (where no event came), and
+  when a look it asked for is due; for the frames in between, a count
+  and a time are compared, and nothing is read;
+- Bad on the connector that Kodi drives, with the output on and on
+  Kodi's CRTC, and no change of mode of Kodi's pending: one blocking
+  commit of link-status Good alone, with a modeset allowed
+  (OUTPUT_STATE::CLibdrmKms), which the kernel makes a modeset of the
+  output as it is: the same mode and HDR metadata, colour, depth, Dolby
+  Vision transport and InfoFrame, 3D layout and VRR, and the same
+  framebuffer. Again at 2 s and then 8 s where it reads Bad again, then
+  no more until Kodi's next change of mode;
+- kodi.log says, at INFO, the Bad that was seen and the commit made,
+  then the result: Good again, or Bad again with the next attempt, and a
+  warning where it is given up.
+
+Where the link is Good, or the driver never sets it Bad (amdgpu,
+nvidia-drm, i915 on a native HDMI connector), nothing is committed and
+nothing is written.
+
+The gap was noticed while reviewing the public repository of CroqueMr's
+build. This implementation follows the kernel's documented link-status
+contract and Hades' own code; no code was taken from that build.
+---
+ xbmc/windowing/gbm/WinSystemGbm.cpp           | 125 ++++++++++++++++++
+ xbmc/windowing/gbm/WinSystemGbm.h             |  21 +++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |   2 +
+ 3 files changed, 148 insertions(+)
+
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.cpp b/xbmc/windowing/gbm/WinSystemGbm.cpp
+index fdedbf4..72878d3 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbm.cpp
+@@ -28,6 +28,7 @@
+ #include "drm/DRMWake.h"
+ #include "drm/DVBridgeLink.h"
+ #include "drm/DetectedProperty.h"
++#include "drm/LibdrmKms.h"
+ #ifdef HAVE_DVBRIDGE
+ #include "DVEndOfStream.h"
+ #include "OutputCheckVerdict.h"
+@@ -3302,6 +3303,130 @@ void CWinSystemGbm::LookAtModes()
+   PostModesLook();
+ }
+ 
++void CWinSystemGbm::LookAtLinkStatus()
++{
++  using namespace LINK_STATUS;
++  const auto drm = std::dynamic_pointer_cast<CDRMAtomic>(m_DRM);
++  CDRMConnector* connector = drm ? drm->GetConnector() : nullptr;
++  if (!connector)
++    return;
++  // What the connector's property is, once for each connector Kodi drives: where it has none, or
++  // not with Good and Bad, nothing more is ever done here
++  const uint32_t id = connector->GetId();
++  if (id != m_linkConnector)
++  {
++    m_linkConnector = id;
++    m_linkProperty = connector->GetPropertyId(PROPERTY);
++    m_linkValues = ValuesOf(connector->GetPropertyEnumValue(PROPERTY, "Good"),
++                            connector->GetPropertyEnumValue(PROPERTY, "Bad"));
++    m_linkRetrain = CRetrain();
++    m_linkHotplugs = m_displayWatch ? m_displayWatch->Hotplugs() : 0;
++    m_linkModesetSeen.reset();
++    m_linkModesetLook.reset();
++  }
++  if (!m_linkValues || !m_linkProperty)
++    return;
++
++  // (a count and a time compared for each frame while nothing is due)
++  const auto now = std::chrono::steady_clock::now();
++  const int64_t nowMs =
++      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
++  const unsigned int hotplugs = m_displayWatch ? m_displayWatch->Hotplugs() : 0;
++  // A change of mode of Kodi's is a new link, with the whole budget again; the link is read once a
++  // moment after it, where a Bad that the driver set then came with no event that Kodi heard
++  const auto modesetAt = drm->LastModesetAt();
++  if (modesetAt && modesetAt != m_linkModesetSeen)
++  {
++    m_linkModesetSeen = modesetAt;
++    m_linkRetrain.KodiModeset();
++    m_linkModesetLook = *modesetAt + std::chrono::milliseconds(AFTER_MODESET_MS);
++  }
++  const bool event = hotplugs != m_linkHotplugs;
++  const bool afterModeset = m_linkModesetLook && now >= *m_linkModesetLook;
++  if (!m_linkRetrain.Due(nowMs, event, afterModeset))
++    return;
++  m_linkHotplugs = hotplugs;
++  if (afterModeset)
++    m_linkModesetLook.reset();
++
++  // The output, asked only where the link is Bad: on, the connector on Kodi's CRTC, and no change
++  // of mode of Kodi's pending (that commit sets it Good itself: CDRMAtomic::DrmAtomicCommit())
++  const auto output = [&drm, connector]()
++  {
++    Output out;
++    CDRMCrtc* crtc = drm->GetCrtc();
++    out.on = drm->IsActive() && crtc && crtc->ReadPropertyValue("ACTIVE").value_or(0) != 0;
++    out.routed = crtc && connector->ReadPropertyValue("CRTC_ID") == crtc->GetCrtcId();
++    out.kodiModesetPending = drm->ModesetPending() || drm->ModesetRetryPending();
++    return out;
++  };
++  OUTPUT_STATE::CLibdrmKms kms(drm->GetFileDescriptor());
++  const Look look = LookAt(m_linkRetrain, kms, id, m_linkProperty, m_linkValues, output, nowMs);
++
++  const std::string name = connector->GetName();
++  switch (look.verdict)
++  {
++    case Verdict::COMMIT:
++    {
++      const drmModeModeInfo* mode = drm->GetSelectedMode();
++      const std::string result =
++          look.error == 0
++              ? std::string("the driver took it; the link is read again in 1 s")
++              : StringUtils::Format("the driver refused it ({}){}", strerror(look.error),
++                                    m_linkRetrain.NextWaitMs() > 0
++                                        ? StringUtils::Format("; asked again in {} s",
++                                                              m_linkRetrain.NextWaitMs() / 1000)
++                                        : std::string("; none is left"));
++      CLog::Log(
++          LOGINFO,
++          "Link: the kernel marks the link of {} Bad (link-status: a link training that "
++          "failed){}: it is set up again by a commit that sets it Good and changes nothing "
++          "else, a modeset of the output as it is ({}x{} @ {} Hz, with the HDR, colour, Dolby "
++          "Vision, 3D and VRR it has), attempt {} of {}: {}",
++          name,
++          event          ? ", after a hot-plug event"
++          : afterModeset ? ", after a change of mode"
++                         : "",
++          mode ? mode->hdisplay : 0, mode ? mode->vdisplay : 0, mode ? mode->vrefresh : 0,
++          look.attempt, ATTEMPTS, result);
++      break;
++    }
++    case Verdict::GOOD_AGAIN:
++      CLog::Log(LOGINFO, "Link: the link of {} is Good again after attempt {} of {} (link-status)",
++                name, m_linkRetrain.Attempts(), ATTEMPTS);
++      break;
++    case Verdict::STILL_BAD:
++      CLog::Log(LOGINFO,
++                "Link: the link of {} is Bad again after attempt {} of {}: the next one in {} s",
++                name, m_linkRetrain.Attempts(), ATTEMPTS, m_linkRetrain.NextWaitMs() / 1000);
++      break;
++    case Verdict::GIVE_UP:
++      CLog::Log(LOGWARNING,
++                "Link: the link of {} is still Bad after {} attempts: it is left so until Kodi's "
++                "next change of mode (the kernel log says why its training failed; where the mode "
++                "no longer fits the link, the modes of the display are read again after the "
++                "hot-plug event, as for any other)",
++                name, ATTEMPTS);
++      break;
++    case Verdict::KODI_MODESET:
++      CLog::Log(LOGDEBUG,
++                "Link: the link of {} is Bad: the change of mode that is pending sets it Good",
++                name);
++      break;
++    case Verdict::OFF:
++      CLog::Log(LOGDEBUG,
++                "Link: the link of {} is Bad while the output is off or not Kodi's: turning it on "
++                "sets it Good",
++                name);
++      break;
++    case Verdict::GONE:
++      CLog::Log(LOGDEBUG, "Link: the connector {} could not be read", name);
++      break;
++    default:
++      break;
++  }
++}
++
+ void CWinSystemGbm::RefreshModes()
+ {
+   m_modesQueued = false;
+diff --git a/xbmc/windowing/gbm/WinSystemGbm.h b/xbmc/windowing/gbm/WinSystemGbm.h
+index c055d33..ebdfb02 100644
+--- a/xbmc/windowing/gbm/WinSystemGbm.h
++++ b/xbmc/windowing/gbm/WinSystemGbm.h
+@@ -29,6 +29,7 @@
+ #include "drm/DRMObject.h"
+ #include "drm/DRMUtils.h"
+ #include "drm/DRMWake.h"
++#include "drm/LinkStatus.h"
+ #include "messaging/ApplicationMessenger.h"
+ #include "settings/lib/ISettingCallback.h"
+ #include "threads/CriticalSection.h"
+@@ -106,6 +107,15 @@ public:
+   //! the thread that draws, which posts the look to the application thread (RefreshModes()).
+   //! While no such event came, nothing at all is done.
+   void LookAtModes();
++  /*!
++   * \brief Hades: the link of the output, where the kernel marks it Bad (link-status, after a link
++   *        training that failed): set up again as the kernel asks, by a commit that sets it Good and
++   *        changes nothing else, a modeset of the output as it is (LinkStatus.h). Called for every
++   *        frame by the thread that draws, which makes Kodi's commits; the link is read only after a
++   *        hot-plug event of the device, once after each change of mode of Kodi's, and when a look
++   *        that this asked for is due. Nothing at all otherwise.
++   */
++  void LookAtLinkStatus();
+   //! Hades: a commit of the ordinary output that is due and waits for a frame (CDRMAtomic::CommitDue():
+   //! a change of mode that the driver refused, asked for again; the outputs that Kodi does not use
+   //! turned off): where this pass draws none (frameComes false), the interface is marked dirty, so
+@@ -1177,6 +1187,17 @@ private:
+   std::chrono::steady_clock::time_point m_modesNext;
+   //! Hades: what a due look waited for, as written last
+   std::string m_modesWaitTold;
++  //! Hades: LookAtLinkStatus(): the commits made for the link, the connector they are for, its
++  //! property and the values of Good and Bad (none: it has no such property, nothing is done)
++  LINK_STATUS::CRetrain m_linkRetrain;
++  uint32_t m_linkConnector{0};
++  uint32_t m_linkProperty{0};
++  std::optional<LINK_STATUS::Values> m_linkValues;
++  //! ... the hot-plug events that it looked after, the change of mode of Kodi's that it saw last,
++  //! and when the link is read after it
++  unsigned int m_linkHotplugs{0};
++  std::optional<std::chrono::steady_clock::time_point> m_linkModesetSeen;
++  std::optional<std::chrono::steady_clock::time_point> m_linkModesetLook;
+   //! ... the user is asked whether to start Kodi again now, which shows it on that monitor (the
+   //! start that takes it, now or later, asks whether to keep it: ArmMonitorConfirm())
+   //! \param text the core and the Estuary ids of the question, which takes the monitor as {0}
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index b5882d9..f1d458c 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -590,6 +590,8 @@ void CWinSystemGbmGLESContext::PresentRender(bool rendered, bool videoLayer)
+   LookForWake();
+   // Hades: the modes of the display, where a hot-plug event of the device came (nothing otherwise)
+   LookAtModes();
++  // Hades: ... and its link, where the kernel marks it Bad (link-status; nothing otherwise)
++  LookAtLinkStatus();
+   // Hades: ... and a frame for a commit that is due, where this pass draws none (a change of mode
+   // that the driver refused, the outputs that Kodi does not use turned off)
+   AskFrameForCommit(rendered || videoLayer);
+-- 
+2.53.0
+

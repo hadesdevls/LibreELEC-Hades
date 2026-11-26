@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 21:53:26 +0000
+Subject: [PATCH] drm/i915: a repair of a sink's link shortly after a relink
+ keeps the port off as well
+
+Issue #28 (corgeone), after linux-9882: with Hades 1.2 the port kept off
+before the link of an Anthem AVM 90 is set up again after a drop of its
+HPD (an input switch, the AVM leaving standby) acts every time and mostly
+brings the picture back, but not always, at hdmi_relink_off_ms=300 and
+1000 alike. Every failure had the same pattern, and no good case had it:
+a few seconds after the link came back with the port kept off (a relink;
+2.2 s in the log he gave), a later look of intel_ddi_hotplug() (linux-9934, 9981) read the sink's
+TMDS_Config as 0x00 again, and the repair modeset of
+intel_hdmi_reset_link() went out with no time off, since 9882 keeps the
+port off only before the first set up after HPD comes back. The AVM then
+showed no picture until the output was turned off for 0.3 s and on again
+from user space (Kodi's ToggleDPMS twice), which brought it back at once.
+His log at 1000 ms (uptime in s): 2368.86 the relink; 2371.02 "Sink's
+TMDS config 0x00 doesn't match the link (scrambling yes, 1/40),
+modeset"; 2371.06 its mode set, and no picture.
+
+So within 5 s (INTEL_HDMI_RELINK_WATCH_MS) of a relink, a repair modeset
+of intel_hdmi_reset_link() keeps the port off first as well, as a relink
+does: until it has been off i915.hdmi_relink_off_ms, and HPD back as long
+where HPD came back again meanwhile. That is what the DPMS toggle does,
+the one thing that worked every time. Each such repair is a relink and
+starts the 5 s again; the cap of 3 modesets in 20 s still holds. For
+those 5 s intel_ddi_hotplug() also goes on looking at the sink's SCDC
+once a second, as it does after a look put off by a pending commit
+(linux-9981, 14 looks after a hotplug at most), so that a reset after a
+repair made near the end of the looks is seen as well. The kernel log
+says each such repair, with what the sink reports of the link it gets
+(SCDC 0x40 and 0x21: clock detected, channels locked, scrambling seen),
+and how long the port stayed off.
+
+Not taken: writing the sink's TMDS_Config again without a modeset
+(upstream's comment in intel_hdmi_reset_link(): HDMI 2.0 wants the TMDS
+clock and data suspended while the sink's TMDS clock rate changes, which
+is why it makes a full modeset; and on this AVM a modeset with the clock
+stopped for a few ms already failed in 1.1); and a later first look after
+a relink (a longer wait before the repair, scdc_settle_ms=2000 in 1.1,
+did not help, and the reset to repair is the sink's own, at a time of
+its own).
+
+Nothing changes where no relink came less than 5 s before: a normal
+start, the mode sets asked by user space, a sink that never drops HPD, an
+LG G5 whose drop answers a modeset of the output (no relink there).
+hdmi_relink_off_ms=0 turns this off with the rest, as in 1.1.
+
+KUnit (drm_hdmi_scdc_settle): the watch and the repair at its edges, the
+failing case of the report at 1000 and at 300 ms, with HPD back again
+meanwhile, the parameter off, and an LG G5's repair as before.
+
+Not tried on hardware: corgeone can, with his DPMS service stopped, by
+switching the AVM's input and by waking it from standby.
+---
+ drivers/gpu/drm/i915/display/intel_ddi.c      | 96 +++++++++++++++++--
+ .../drm/i915/display/intel_display_types.h    |  9 ++
+ .../drm/i915/display/intel_hdmi_scdc_settle.h | 46 ++++++++-
+ .../gpu/drm/tests/drm_hdmi_scdc_settle_test.c | 50 ++++++++++
+ 4 files changed, 189 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_ddi.c b/drivers/gpu/drm/i915/display/intel_ddi.c
+index 7901c9b..c57012e 100644
+--- a/drivers/gpu/drm/i915/display/intel_ddi.c
++++ b/drivers/gpu/drm/i915/display/intel_ddi.c
+@@ -3439,15 +3439,31 @@ gen9_chicken_trans_reg_by_port(struct intel_display *display, enum port port)
+ 
+ /*
+  * Hades: after a drop of a sink's HPD that no modeset of the output explains, the first set up of
+- * the output keeps its port off until it has been off this long and HPD back this long
+- * (intel_hdmi_scdc_settle.h); 0 turns it off
++ * the output keeps its port off until it has been off this long and HPD back this long, and so does
++ * a repair modeset of the link within INTEL_HDMI_RELINK_WATCH_MS after that (intel_hdmi_scdc_settle.h);
++ * 0 turns it off
+  */
+ static unsigned int hdmi_relink_off_ms = 300;
+ module_param(hdmi_relink_off_ms, uint, 0644);
+ MODULE_PARM_DESC(hdmi_relink_off_ms,
+ 	"HDMI: ms that the port stays off before its link is set up again, after a drop of the sink's "
+ 	"HPD that no modeset of the output explains, such as an AV receiver switching inputs or "
+-	"leaving standby (default 300, 0: as before; at most 2000)");
++	"leaving standby, and before a repair of that link in the 5 s after it (default 300, 0: as "
++	"before; at most 2000)");
++
++/*
++ * Hades: ms since the output was last set up after its port was kept off (intel_hdmi_relink_off());
++ * -1 where it never was, or INTEL_HDMI_RELINK_WATCH_MS or more ago
++ */
++static long intel_hdmi_since_relink(struct intel_connector *connector)
++{
++	const unsigned long at = READ_ONCE(connector->relinked_at);
++
++	if (!READ_ONCE(connector->relinked) ||
++	    time_after_eq(jiffies, at + msecs_to_jiffies(INTEL_HDMI_RELINK_WATCH_MS)))
++		return -1;
++	return jiffies_to_msecs(jiffies - at);
++}
+ 
+ /* Hades: i915.hdmi_relink_off_ms, before intel_ddi_enable_hdmi() sets the link up */
+ static void intel_hdmi_relink_off(struct intel_connector *connector)
+@@ -3457,15 +3473,21 @@ static void intel_hdmi_relink_off(struct intel_connector *connector)
+ 				       INTEL_HDMI_RELINK_OFF_MAX_MS);
+ 	const unsigned long back_at = connector->hpd_back_at;
+ 	const unsigned long off_at = READ_ONCE(connector->output_off_at);
+-	unsigned int since_back, since_off = UINT_MAX, wait;
++	const bool drop = READ_ONCE(connector->relink_off_due);
++	const bool repair = READ_ONCE(connector->relink_repair_due);
++	unsigned int since_back = UINT_MAX, since_off = UINT_MAX, wait;
+ 
+-	if (!READ_ONCE(connector->relink_off_due))
++	if (!drop && !repair)
+ 		return;
+ 	WRITE_ONCE(connector->relink_off_due, false);
++	WRITE_ONCE(connector->relink_repair_due, false);
++	if (!off)
++		return;
+ 	/* (a set up long after HPD came back is not the one of that hotplug) */
+-	if (!off || time_after(jiffies, back_at + msecs_to_jiffies(INTEL_HDMI_HPD_BACK_MS)))
++	if (!time_after(jiffies, back_at + msecs_to_jiffies(INTEL_HDMI_HPD_BACK_MS)))
++		since_back = jiffies_to_msecs(jiffies - back_at);
++	else if (!repair)
+ 		return;
+-	since_back = jiffies_to_msecs(jiffies - back_at);
+ 	if (READ_ONCE(connector->output_off) &&
+ 	    !time_after(jiffies, off_at + msecs_to_jiffies(INTEL_HDMI_HPD_BACK_MS)))
+ 		since_off = jiffies_to_msecs(jiffies - off_at);
+@@ -3473,7 +3495,20 @@ static void intel_hdmi_relink_off(struct intel_connector *connector)
+ 	wait = intel_hdmi_relink_off_wait_ms(off, true, since_back, since_off);
+ 	if (wait)
+ 		msleep(wait);
+-	if (since_off == UINT_MAX)
++	/* the link of this set up is a relink (INTEL_HDMI_RELINK_WATCH_MS) */
++	WRITE_ONCE(connector->relinked_at, jiffies);
++	WRITE_ONCE(connector->relinked, true);
++	if (!drop || since_back == UINT_MAX) {
++		if (since_off == UINT_MAX)
++			drm_info(display->drm,
++				 "[CONNECTOR:%d:%s] Repair of a link set up again after a drop of HPD: the link is set up %u ms later (hdmi_relink_off_ms)\n",
++				 connector->base.base.id, connector->base.name, wait);
++		else
++			drm_info(display->drm,
++				 "[CONNECTOR:%d:%s] Repair of a link set up again after a drop of HPD: the port was kept off %u ms more (off %u ms in all) before its link is set up again (hdmi_relink_off_ms)\n",
++				 connector->base.base.id, connector->base.name, wait,
++				 since_off + wait);
++	} else if (since_off == UINT_MAX)
+ 		drm_info(display->drm,
+ 			 "[CONNECTOR:%d:%s] HPD came back %u ms ago from a drop that no modeset of this output explains: the link is set up %u ms later, %u ms or more after HPD came back (hdmi_relink_off_ms)\n",
+ 			 connector->base.base.id, connector->base.name, since_back, wait, off);
+@@ -4969,6 +5004,8 @@ static bool intel_hdmi_scdc_settle(struct intel_connector *connector, u8 config)
+  * for 10 more passes at most: a commit that carries the connector at each
+  * look (an HDR10+ vendor InfoFrame per scene or frame, HDR metadata, a mode)
+  * left a sink whose TMDS_Config was reset after the hotplug unchecked.
++ * The same for the looks within INTEL_HDMI_RELINK_WATCH_MS of a relink
++ * (intel_ddi_hotplug(), intel_hdmi_scdc_settle.h).
+  */
+ #define HDMI_SCDC_LOOKS			4
+ #define HDMI_SCDC_DEFERRED_LOOKS	10
+@@ -4978,6 +5015,38 @@ static bool hdmi_scdc_look_again(int retries, bool deferred)
+ 	       (deferred && retries < HDMI_SCDC_LOOKS + HDMI_SCDC_DEFERRED_LOOKS);
+ }
+ 
++/*
++ * Hades: the repair modeset of intel_hdmi_reset_link() keeps the port off first where the output was
++ * set up again after a relink less than INTEL_HDMI_RELINK_WATCH_MS ago (intel_hdmi_scdc_settle.h):
++ * the sink, an AV receiver still settling, reset its SCDC once more. What the sink says of the
++ * link it gets goes to the kernel log with it.
++ */
++static void intel_hdmi_relink_repair(struct intel_connector *connector)
++{
++	struct intel_display *display = to_intel_display(connector);
++	const unsigned int off = min_t(unsigned int, READ_ONCE(hdmi_relink_off_ms),
++				       INTEL_HDMI_RELINK_OFF_MAX_MS);
++	const long since_relink = intel_hdmi_since_relink(connector);
++	u8 flags, scrambler;
++
++	if (!intel_hdmi_relink_repair_due(off, since_relink))
++		return;
++	WRITE_ONCE(connector->relink_repair_due, true);
++
++	if (drm_scdc_readb(connector->base.ddc, SCDC_STATUS_FLAGS_0, &flags) < 0 ||
++	    drm_scdc_readb(connector->base.ddc, SCDC_SCRAMBLER_STATUS, &scrambler) < 0)
++		drm_info(display->drm,
++			 "[CONNECTOR:%d:%s] Sink's TMDS config lost %ld ms after its link was set up again after a drop of HPD (its status not read): the port is kept off %u ms first (hdmi_relink_off_ms)\n",
++			 connector->base.base.id, connector->base.name, since_relink, off);
++	else
++		drm_info(display->drm,
++			 "[CONNECTOR:%d:%s] Sink's TMDS config lost %ld ms after its link was set up again after a drop of HPD (its status: clock detected %s, channels 0/1/2 locked %s/%s/%s, scrambling seen %s): the port is kept off %u ms first (hdmi_relink_off_ms)\n",
++			 connector->base.base.id, connector->base.name, since_relink,
++			 str_yes_no(flags & SCDC_CLOCK_DETECT), str_yes_no(flags & SCDC_CH0_LOCK),
++			 str_yes_no(flags & SCDC_CH1_LOCK), str_yes_no(flags & SCDC_CH2_LOCK),
++			 str_yes_no(scrambler & SCDC_SCRAMBLING_STATUS), off);
++}
++
+ static int intel_hdmi_reset_link(struct intel_encoder *encoder,
+ 				 struct drm_modeset_acquire_ctx *ctx)
+ {
+@@ -5083,7 +5152,12 @@ static int intel_hdmi_reset_link(struct intel_encoder *encoder,
+ 		 connector->base.base.id, connector->base.name, config,
+ 		 str_yes_no(crtc_state->hdmi_scrambling),
+ 		 crtc_state->hdmi_high_tmds_clock_ratio ? 40 : 10);
+-	return intel_modeset_commit_pipes(display, BIT(crtc->pipe), ctx);
++	/* Hades: with the port kept off first, shortly after a relink (intel_hdmi_scdc_settle.h) */
++	intel_hdmi_relink_repair(connector);
++	ret = intel_modeset_commit_pipes(display, BIT(crtc->pipe), ctx);
++	/* (the commit is blocking: its set up has taken the flag, or there was none) */
++	WRITE_ONCE(connector->relink_repair_due, false);
++	return ret;
+ }
+ 
+ static void intel_ddi_link_check(struct intel_encoder *encoder)
+@@ -5183,7 +5257,9 @@ intel_ddi_hotplug(struct intel_encoder *encoder,
+ 		connector->base.connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+ 		connector->base.status == connector_status_connected &&
+ 		hdmi_scdc_look_again(connector->hotplug_retries,
+-				     connector->hdmi_scdc_deferred);
++				     connector->hdmi_scdc_deferred ||
++				     /* Hades: and after a relink (intel_hdmi_scdc_settle.h) */
++				     intel_hdmi_relink_watching(intel_hdmi_since_relink(connector)));
+ 	if (scdc_recheck && connector->hdmi_scdc_deferred &&
+ 	    !connector->hdmi_scdc_recheck &&
+ 	    connector->base.status == connector_status_connected)
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index 99c6587..7f8de31 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -656,6 +656,15 @@ struct intel_connector {
+ 	bool relink_off_due;
+ 	bool output_off;
+ 	unsigned long output_off_at;
++	/*
++	 * Hades: i915.hdmi_relink_off_ms after a relink (INTEL_HDMI_RELINK_WATCH_MS): the output was
++	 * last set up after its port was kept off at relinked_at (relinked, intel_hdmi_relink_off()),
++	 * and the repair modeset of intel_hdmi_reset_link() under way keeps the port off as well
++	 * (relink_repair_due)
++	 */
++	bool relinked;
++	bool relink_repair_due;
++	unsigned long relinked_at;
+ 
+ 	/* since POLL and HPD connectors may use the same HPD line keep the native
+ 	   state of connector->polled in case hotplug storm detection changes it */
+diff --git a/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+index ffc9c3a..764a26f 100644
+--- a/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
++++ b/drivers/gpu/drm/i915/display/intel_hdmi_scdc_settle.h
+@@ -80,8 +80,8 @@ static inline bool intel_hdmi_scdc_settle_waits(unsigned int settle_ms, bool bac
+  * How long the output waits before its link is set up again, in ms (0: not at all):
+  * @off_ms: i915.hdmi_relink_off_ms (0: never; above INTEL_HDMI_RELINK_OFF_MAX_MS, that)
+  * @due: HPD came back from a drop that no modeset of the output explains, and the output has not
+- *       been set up since
+- * @since_back_ms: since HPD came back
++ *       been set up since; or a repair modeset after a relink (intel_hdmi_relink_repair_due())
++ * @since_back_ms: since HPD came back (UINT_MAX: long ago)
+  * @since_off_ms: since the port was last turned off (UINT_MAX: never on, or long ago)
+  */
+ static inline unsigned int intel_hdmi_relink_off_wait_ms(unsigned int off_ms, bool due,
+@@ -101,4 +101,46 @@ static inline unsigned int intel_hdmi_relink_off_wait_ms(unsigned int off_ms, bo
+ 	return wait;
+ }
+ 
++/*
++ * i915.hdmi_relink_off_ms after a relink, issue #28 with Hades 1.2: the port kept off before the link
++ * is set up again brought the AVM 90's picture back, but not every time, at 300 ms and at 1000 ms
++ * alike. Each failure had the same pattern, and no good case had it: a few seconds after the link
++ * came back (the relink; 2.2 s in the log of the report), a later look of intel_ddi_hotplug() read
++ * the sink's TMDS_Config as 0x00 again, and the repair modeset of intel_hdmi_reset_link() went out
++ * with no time off; the AVM then showed no picture until the output was turned off for 0.3 s and on
++ * again (DPMS), which brought it back at once. While it settles, the AVM's SCDC can read as reset
++ * once more, and the repair of that needs what the first one needed: the TMDS clock stopped for a
++ * moment.
++ *
++ * So for INTEL_HDMI_RELINK_WATCH_MS after a relink, a repair modeset of intel_hdmi_reset_link()
++ * keeps the port off as well (intel_hdmi_relink_off_wait_ms() with @due), and intel_ddi_hotplug()
++ * goes on looking at the sink's SCDC once a second until that time is up (within the most looks
++ * after a hotplug that hdmi_scdc_look_again() allows), so that a reset after a repair made near
++ * the end of the looks is seen as well. Each repair with the port kept off is a relink, and starts
++ * the time again; the cap of intel_hdmi_reset_link() (3 modesets in 20 s) still holds. A repair
++ * that no relink came shortly before (an LG G5 whose drop answers a modeset of the output, or a
++ * sink that never drops HPD) and every mode set asked by user space are as before. 5 s: twice the
++ * reset seen (2.2 s after the relink), and the look after it.
++ */
++#define INTEL_HDMI_RELINK_WATCH_MS	5000
++
++/*
++ * The output was set up again after a relink less than INTEL_HDMI_RELINK_WATCH_MS ago:
++ * @since_relink_ms: since then (negative: no relink, or one too long ago to be known)
++ */
++static inline bool intel_hdmi_relink_watching(long since_relink_ms)
++{
++	return since_relink_ms >= 0 && since_relink_ms < INTEL_HDMI_RELINK_WATCH_MS;
++}
++
++/*
++ * The repair modeset of intel_hdmi_reset_link() keeps the port off first, as a relink does:
++ * @off_ms: i915.hdmi_relink_off_ms (0: never)
++ * @since_relink_ms: as for intel_hdmi_relink_watching()
++ */
++static inline bool intel_hdmi_relink_repair_due(unsigned int off_ms, long since_relink_ms)
++{
++	return off_ms && intel_hdmi_relink_watching(since_relink_ms);
++}
++
+ #endif /* __INTEL_HDMI_SCDC_SETTLE_H__ */
+diff --git a/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+index ae83ff8..ebfa75e 100644
+--- a/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
++++ b/drivers/gpu/drm/tests/drm_hdmi_scdc_settle_test.c
+@@ -105,11 +105,61 @@ static void drm_test_scdc_relink_off(struct kunit *test)
+ 			300);
+ }
+ 
++/*
++ * i915.hdmi_relink_off_ms after a relink: a sink that lost its TMDS config again shortly after its
++ * link was set up again with the port kept off has its repair with the port kept off as well
++ */
++static void drm_test_scdc_relink_repair(struct kunit *test)
++{
++	/* no relink, or one too long ago: as before */
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_relink_watching(-1));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_relink_watching(INTEL_HDMI_RELINK_WATCH_MS));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_relink_repair_due(300, -1));
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_relink_repair_due(300, INTEL_HDMI_RELINK_WATCH_MS));
++	/* the parameter off: nothing, as in 1.1 */
++	KUNIT_EXPECT_FALSE(test, intel_hdmi_relink_repair_due(0, 2160));
++	/* from the relink itself to the end of the watch */
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_relink_watching(0));
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_relink_repair_due(300, 0));
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_relink_repair_due(300, INTEL_HDMI_RELINK_WATCH_MS - 1));
++	/*
++	 * issue #28 with 1.2 at 1000 ms (uptime 2368.86 the relink, 2371.02 TMDS_Config 0x00 again):
++	 * the repair 2160 ms after the relink, the port turned off 4 ms before its set up, stays off
++	 * 1000 ms; HPD came back long before
++	 */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(1000, intel_hdmi_relink_repair_due(1000, 2160),
++						      UINT_MAX, 4),
++			996);
++	/* ... and at 300 ms */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, intel_hdmi_relink_repair_due(300, 2160),
++						      4300, 4),
++			296);
++	/* where the sink dropped HPD again and it came back just now: HPD back that long as well */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, intel_hdmi_relink_repair_due(300, 2160), 60, 4),
++			296);
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, intel_hdmi_relink_repair_due(300, 2160), 10, 200),
++			290);
++	/*
++	 * the looks go on after a repair near the end of the looks of the hotplug: a reset as late as
++	 * the latest seen (2.2 s) is seen at the look after it
++	 */
++	KUNIT_EXPECT_TRUE(test, intel_hdmi_relink_watching(2200 + 1000));
++	/* an LG G5, never relinked (its drops answer a modeset of the output): its repair at once */
++	KUNIT_EXPECT_EQ(test,
++			intel_hdmi_relink_off_wait_ms(300, intel_hdmi_relink_repair_due(300, -1), 60, 4),
++			0);
++}
++
+ static struct kunit_case drm_hdmi_scdc_settle_tests[] = {
+ 	KUNIT_CASE(drm_test_scdc_settle_answers),
+ 	KUNIT_CASE(drm_test_scdc_settle_waits),
+ 	KUNIT_CASE(drm_test_scdc_settle_looks),
+ 	KUNIT_CASE(drm_test_scdc_relink_off),
++	KUNIT_CASE(drm_test_scdc_relink_repair),
+ 	{ }
+ };
+ 
+-- 
+2.53.0
+

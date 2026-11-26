@@ -4,6 +4,60 @@ The versions of LibreELEC Hades. Before 1.0 RC1 there were only private test bui
 
 Patch numbers are those of the version in whose section they appear. In 1.0 the patches of Hades were numbered again in the order in which they apply, so a number in an older section may name another patch today.
 
+## 1.2.1
+
+A short version after 1.2: a 1D LUT for the calibration of a display, the frame of the video saved alone, HDMI 3D frame packing on NVIDIA graphics, the remote waking the PC from sleep, Dolby Vision in IPT with much less work for the graphics, two fixes for HDR and Dolby Vision in 3D, a check of the Dolby Vision output that says more on older Radeon cards, and fixes for AV receivers and for audio outputs that come and go.
+
+### What's new for you
+
+**Picture**
+
+- **A 1D LUT of the display.** Next to 3D LUTs, the display calibration takes a 1D LUT: the `.cal` of ArgyllCMS and DisplayCAL (the curves that a calibration loads into the video card) and a `.cube` of `LUT_1D_SIZE`, alone or with a 3D LUT as Resolve's shaper. It is applied at its own resolution, in the bridge and in Kodi's own shaders, and fits an SDR output of any gamut. `kodi.log` says what a LUT holds.
+- **The pictures of the display's LUT dithered.** Where Kodi draws a video with the LUT into an 8-bit window, the picture is now dithered, as Hades already dithers the pictures it maps, so a slow gradient keeps no bands from the LUT. Pictures without a LUT, and windows of more than 8 bits, are drawn as before.
+- **Dolby Vision sent in IPT takes much less work** (the expert transport *As licensed players send (IPT)*). Each pixel is now converted once, where the left pixel of each pair was converted twice, and the PQ curves are read from tables made in double precision instead of being worked out with exponentials and logarithms for every pixel. On the software renderer the conversion takes half the time, and the picture comes closer to the exact conversion than before: one step of 4096 off in under 0.01 % of the samples, against up to 0.04 % before. After a report by MrMagic.
+- **The frame of the video alone** (issue #30). Shift+Print Screen, or *Save the frame of the video* in the video settings of the player, saves the frame of the film without menus, the player information or subtitles, at the video's own size wherever it can be drawn so, as `videoNNNNN.png` in the screenshot folder, with an SDR copy beside it when it is HDR.
+
+**3D**
+
+- **HDMI 3D frame packing on NVIDIA** (issue #33). Where NVIDIA's driver refuses the picture buffer of a frame-packed mode, Hades now draws the two eyes into buffers of its own that the display engine can show, and the 3D mode goes out in frame packing instead of falling back to top and bottom or side by side; `kodi.log` says which buffer was used.
+- **3D subtitles no longer leave old menus and subtitles in the right eye** (issue #34). With an HDR video in frame packing, top and bottom or side by side, the right eye showed the menus from before the video and earlier subtitles over the picture whenever a subtitle was on screen. The layer of the menus and subtitles is now cleared for both eyes, so each eye shows only the current subtitle, at its depth. Found by cinemaONE.
+- **A Dolby Vision 3D film keeps its colours after going back to 2D** (issue #34). Where the processor cannot keep up with both views and the video goes on in 2D, a profile 20 film turned green and purple from that point; it is now rebuilt exactly as when it plays in 2D from the start. Found by cinemaONE.
+
+**Graphics and connections**
+
+- **A DisplayPort link that the kernel reports as failed is set up again, also behind the HDMI port of a PC that feeds it from DisplayPort,** with the same picture, as the kernel asks of the program that drives the display. Found by CroqueMr's build.
+- **AV receivers that lose the HDMI link again while they settle** (issue #28). When a receiver such as the Anthem AVM 90 loses the setup of the link once more a few seconds after Hades set it up again, the repair now also keeps the port off for `i915.hdmi_relink_off_ms` first, as switching the output off and on does, and the link is checked once a second for 5 s after each such set up. Found and analysed by corgeone.
+
+**Sound**
+
+- **The audio outputs listed once for a burst of device changes** (a Bluetooth output that comes or goes), instead of once per event, and the events that the audio engine takes out of its queue no longer leak (Kodi pull request 29331, by sopparus).
+
+**Sleep**
+
+- **The remote wakes the PC from sleep** (issue #32). Linux lets only some keyboards wake a PC, so the receiver of a remote control could not, and a PC that does not wake looks hung. The receivers of remote controls (a flirc, a Media Center receiver, the USB receiver of a remote with media keys) may now wake it by default, and *Settings > LibreELEC > System > Sleep > Wake from sleep* chooses remotes, remotes and keyboards, or only the power button. Mice and game controllers never wake it, a change applies at once, and the kernel log names each device that may wake the PC, and a receiver that was not made to wake one.
+
+**The diagnostics**
+
+- **Check the Dolby Vision output says more on Radeon RX 400, RX 500 and Vega cards** (issue #20). On these cards the card's own check is taken inside the display pipe, before the stage that brings each colour back to 8 bits. The result now also says whether a change it finds fits only a widening of the colours inside the pipe, with the 8 bits kept, or a change of the colours themselves. An output whose check is not exact still plays Dolby Vision as HDR10.
+- **The diagnostic report and the kernel log say, around each sleep, whether the firmware offers suspend to RAM or a low-power idle, how long the PC slept, what woke it, and which keyboards or remotes could wake it but are not allowed to** (issue #32).
+
+**Up to date**
+
+- Kodi's Piers branch up to `e1f5bbb647`: its one change since 1.2, `cf719c653e`, is of Kodi's continuous integration and changes nothing in the image. LibreELEC master up to `c301806e95fc`: add-ons, other devices, and NVIDIA's driver 580.196.11, which Hades already has for the GeForce GTX 900 and 10 series.
+
+### Details
+
+- The Kodi changes of this version are `kodi-9350` to `kodi-9353` (the 1D LUT in the bridge, in Kodi's shaders and in the settings, and the dither of the LUT's pictures), `kodi-9370` to `kodi-9372` (buffers of Kodi's own of 8 bits and linear, a test commit that asks nvidia-drm whether it takes a buffer in a frame-packed mode, and frame packing through those buffers where it refuses the window's), `kodi-9400` and `kodi-9401` (the frame of the video at its own size, and Shift+Print Screen, `TakeScreenshot(video)` and the button of the video settings that save it), `kodi-9410` and `kodi-9411` (the GUI's layer of the HDR composite cleared for both eyes, and a 3D video gone back to 2D rebuilt by the Dolby Vision bridge as a 2D one), `kodi-9420` to `kodi-9422` (a link that the kernel marks Bad), `kodi-9430` and `kodi-9431` (Kodi pull request 29331, taken before it reaches Piers), `kodi-9440` (Piers), and `kodi-9450` and `kodi-9451` (the IPT transport converted in one compute pass, each pixel once, and PQ read from tables made in double precision).
+- `x86/linux-9887`: a repair of the link within 5 s of a set up with the port kept off keeps the port off as well, and the SCDC looks go on for those 5 s (`i915.hdmi_relink_off_ms`).
+- `hades-wake`, a new package: `wake.sh` sets the `power/wakeup` of each USB input device by the setting *Wake from sleep* (`LibreELEC-settings-9093`), from udev (`70-hades-wake.rules`), after each sleep and when the setting changes, and writes `hades-wake:` lines to the kernel log.
+- `hades-diag` 29: `hades-output-check` shows two more sets of test pictures, whose values (multiples of 0x11 and of 0x55) every widening keeps linear, and writes "what the change fits" to its report and to the kernel log; `sleep.sh`, which systemd-sleep runs before and after each sleep (`/usr/lib/systemd/system-sleep/hades-sleep`), writes `hades-sleep:` lines to the kernel log, with the setting of *Wake from sleep* and why each input device may wake the PC or not.
+- The update channel: 1.2.1 is 1020199.
+- `tools/regress` gained the tests of each change, each proven by a mutant that must make it fail.
+
+### Credits
+
+- Thank you to SunnySnacks for the new report of issue #20, to NTM-3D and Khazar321 for the logs of issue #33, to cinemaONE for issue #34, to corgeone for issue #28, to Mibix for issue #32, to MrMagic, whose report made the IPT transport lighter, and to MrPhenix007, who asked for the frame of the video in issue #30.
+
 ## 1.2
 
 More for the picture and for 3D, and fixes for what was reported after 1.1. 3D videos in MV-HEVC, such as the spatial video of an iPhone, play in 3D, and subtitles and menus over a 3D video sit in front of the picture. The player information names the settings of yours that change the picture from the film, and *Check this setup* compares Hades with licensed players on your own TV. Kodi draws the colours of its videos more truly, subtitles can go into the black bars, and HDR mapped to SDR can go out in BT.2020 or DCI-P3. A TV with an automatic Filmmaker Mode switches to it for films by itself, a home-cinema projector can be controlled over the network (its lens memory by the shape of the picture, its picture mode by the signal), and a 3D LUT can calibrate each display. The settings of the display are laid out by what goes out, and a few questions at the first start set the picture for your display. Hades now finds its own new versions, signed, and installs them after your yes. It also brings Linux 7.4-rc4, FFmpeg 9.1 and the latest NVIDIA drivers. Every change was tested before release, with the code that the image runs on the host or in a virtual machine, and on my PC where it has the hardware; [What has been tested](docs/tested.md) says what has been seen working, and on which hardware.

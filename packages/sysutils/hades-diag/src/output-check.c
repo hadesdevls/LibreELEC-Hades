@@ -967,7 +967,7 @@ static int start_measure(struct run *r)
 
 static int all_pictures(struct run *r)
 {
-	unsigned int t, c, b;
+	unsigned int t, c, b, s;
 	int n;
 
 	for (t = 0; t < OC_TRIALS; t++) {
@@ -1005,6 +1005,22 @@ static int all_pictures(struct run *r)
 					return n;
 			}
 		}
+	/* the sets that a widening keeps linear (output-check.h), before Z again at the end */
+	for (s = 0; s < OC_SETS; s++) {
+		struct oc_picture zs = {.kind = OC_STEP_Z, .set = s};
+
+		if ((n = picture(r, &zs, &r->m.step_z[s])))
+			return n;
+		for (t = 0; t < OC_TRIALS; t++) {
+			struct oc_picture a = {.kind = OC_STEP_A, .set = s, .trial = t},
+					  bb = {.kind = OC_STEP_B, .set = s, .trial = t},
+					  cc = {.kind = OC_STEP_C, .set = s, .trial = t};
+
+			if ((n = picture(r, &a, &r->m.step_a[s][t])) || (n = picture(r, &bb, &r->m.step_b[s][t])) ||
+			    (n = picture(r, &cc, &r->m.step_c[s][t])))
+				return n;
+		}
+	}
 	{
 		struct oc_picture z = {.kind = OC_Z};
 
@@ -1080,6 +1096,54 @@ static void where_text(const struct oc_result *res, unsigned int values)
 	kernel_log("%s", line);
 }
 
+/*
+ * The sets that a widening keeps linear (output-check.h): how each held, and what a change found by the exactness
+ * relation alone fits. The fit goes to the kernel log as well.
+ */
+static void steps_text(const struct oc_result *res, unsigned int values)
+{
+	static const char *const set_name[OC_SETS] = {"values k * 0x11 (16 a component)",
+						      "values k * 0x55 (4 a component)"};
+	char line[512], broken_at[OC_SETS][256];
+	const char *fit = NULL;
+	unsigned int s;
+
+	if (!res->steps_measured) {
+		say("exactness on values that a widening of 8 bits keeps linear: not measured\n");
+		return;
+	}
+	for (s = 0; s < OC_SETS; s++)
+		value_names(res->steps_broken[s], res, values, broken_at[s], sizeof(broken_at[s]));
+	say("exactness on values that a widening of 8 bits keeps linear: %s: %u of %u trials hold%s%s; %s: %u of %u "
+	    "trials hold%s%s\n",
+	    set_name[0], OC_TRIALS - res->steps_failed[0], OC_TRIALS, res->steps_failed[0] ? ", breaks in " : "",
+	    res->steps_failed[0] ? broken_at[0] : "", set_name[1], OC_TRIALS - res->steps_failed[1], OC_TRIALS,
+	    res->steps_failed[1] ? ", breaks in " : "", res->steps_failed[1] ? broken_at[1] : "");
+	switch (res->fit) {
+	case OC_FIT_NONE:
+		return;
+	case OC_FIT_WIDENING_12:
+		fit = "a widening of each 8-bit component to 12 bits by scaling, in the pipe before the CRC: the 8 bits "
+		      "that a formatter after the CRC keeps would be those drawn (on AMD DCE the CRC is taken before "
+		      "the formatter); not a change of those 8 bits by a curve, a gain or a range";
+		break;
+	case OC_FIT_WIDENING_10:
+		fit = "a widening of each 8-bit component to 10 bits by scaling, or a range conversion (16 to 235)";
+		break;
+	case OC_FIT_VALUES:
+		fit = "a change of the 8 bits of a component (a curve, a gain or a rounding of each), not a widening "
+		      "alone";
+		break;
+	}
+	say("what the change fits: %s\n", fit);
+	snprintf(line, sizeof(line), "fits: %s (k * 0x11: %u of %u trials hold, k * 0x55: %u of %u)\n",
+		 res->fit == OC_FIT_WIDENING_12   ? "a widening to 12 bits, the 8 bits kept"
+		 : res->fit == OC_FIT_WIDENING_10 ? "a widening to 10 bits, or a range"
+						  : "a change of the 8 bits",
+		 OC_TRIALS - res->steps_failed[0], OC_TRIALS, OC_TRIALS - res->steps_failed[1], OC_TRIALS);
+	kernel_log("%s", line);
+}
+
 static void verdict_text(const struct oc_result *res, const struct run *r)
 {
 	char reason[256] = "", lost[512] = "";
@@ -1119,6 +1183,7 @@ static void verdict_text(const struct oc_result *res, const struct run *r)
 	say("values changed by the bits of red, green and blue: %#x, %#x, %#x\n", res->changed_values[0],
 	    res->changed_values[1], res->changed_values[2]);
 	where_text(res, r->values);
+	steps_text(res, r->values);
 
 	switch (res->verdict) {
 	case OC_EXACT:
@@ -1135,6 +1200,15 @@ static void verdict_text(const struct oc_result *res, const struct run *r)
 			       "the display pipe does not pass the bytes through as they are (a dither in time, "
 			       "for example): a Dolby Vision display cannot read its metadata from them, and shows "
 			       "black or wrong colours.");
+		else if (res->fit == OC_FIT_WIDENING_12)
+			/* still "not-exact" for Kodi: Dolby Vision stays converted to HDR10 on this output */
+			finish("not-exact", reason,
+			       "the card's CRC saw the test pictures changed, in a way that fits only a widening of each "
+			       "component to 12 bits inside its display pipe",
+			       "the check cannot tell whether the bytes that leave the card change: a card that takes its "
+			       "CRC before its formatter (AMD DCE: Radeon RX 400, RX 500 and Vega) measures the 12 bits "
+			       "inside the pipe, of which the formatter keeps the 8 that were drawn. Dolby Vision stays "
+			       "converted to HDR10 on this output.");
 		else if (res->reasons & OC_R_TRANSFORMED)
 			finish("not-exact", reason,
 			       "the card changed the bytes of the test pictures on their way out",
@@ -1496,6 +1570,8 @@ next:
 		say_crc("C1", &r.m.c[0], r.values);
 		say_crc("D", &r.m.d, r.values);
 		say_crc("Z at the end", &r.m.z_end, r.values);
+		say_crc("Zs of k * 0x11", &r.m.step_z[OC_SET_0X11], r.values);
+		say_crc("Zs of k * 0x55", &r.m.step_z[OC_SET_0X55], r.values);
 		verdict_text(&res, &r);
 	}
 	for (i = 0; i < BUFFERS; i++)

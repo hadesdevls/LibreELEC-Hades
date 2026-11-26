@@ -3,7 +3,7 @@
 # boot/DIAG-OFF.TXT is that switch as an image carries it (scripts/image, scripts/mkimage).
 
 PKG_NAME="hades-diag"
-PKG_VERSION="26"
+PKG_VERSION="29"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE=""
 PKG_URL=""
@@ -36,6 +36,13 @@ makeinstall_target() {
     ${INSTALL}/usr/lib/hades-diag/DIAG-OFF.TXT
   # (read by the scripts, not run)
   chmod 0644 ${INSTALL}/usr/lib/hades-diag/folder.sh
+  # (each sleep says in the kernel log what the firmware offers, what may wake the PC, how it went and what woke it:
+  # systemd-sleep runs it before and after each one; collect.sh runs it with "state")
+  cp ${PKG_DIR}/scripts/sleep.sh ${INSTALL}/usr/lib/hades-diag
+  chmod 0755 ${INSTALL}/usr/lib/hades-diag/sleep.sh
+  mkdir -p ${INSTALL}/usr/lib/systemd/system-sleep
+  cp ${PKG_DIR}/scripts/sleep.sh ${INSTALL}/usr/lib/systemd/system-sleep/hades-sleep
+  chmod 0755 ${INSTALL}/usr/lib/systemd/system-sleep/hades-sleep
 }
 
 post_makeinstall_target() {

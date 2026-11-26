@@ -1,0 +1,450 @@
+From 36042d4a2151e6820b8870b8d98db60ae0436f8a Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 00:27:41 +0000
+Subject: [PATCH] [Hades][dvbridge] The IPT tunnel converts each pixel once, in
+ one compute pass
+
+Pass 9 (the IPT tunnel, an expert choice) took the conversion of the
+left pixel of each pair twice: in 9a for its I and in 9b for the P and
+T of the pair. In 9a, the even and the odd pixels of a group of
+invocations also ran both sides of a branch (the 12-tap chroma filter
+of the odd pixel).
+
+Add 9c, a compute form, used where OpenGL ES 3.1 makes it and the
+compute forms are asked for (dvcomputerows, on by default). Each
+invocation makes one texel of the rows: two pairs on two rows. Each
+pixel is converted once (the even one gives its I and the P and T of
+its pair), and the chroma of the odd pixels takes one fetch of each of
+the 12 texels of the filter for both rows. 9a and 9b stay as they were,
+for a GPU that cannot make 9c or where it fails (then never again), and
+kodi.log says which is used.
+
+Measured with the software bridge on the 14 pictures of a profile 7
+FEL stream, against the chain in double precision:
+- 9a and 9b: the same bytes as before.
+- 9c: P, T and the I of the odd pixels are the same bytes. The I of
+  0.003 % of the even pixels moves by one code: the GPU fuses a
+  multiply and an add of the OETF where only I uses it, and not where
+  P and T share it. Overall I is 0.042 % one code off (0.043 % before),
+  P 0.029 % and T 0.036 % as before, never more than one code.
+- Pass 9 of a 4K frame on llvmpipe: about 63 ms instead of 116.
+---
+ tools/dvbridge/dvbridge_render.c              |  10 +
+ tools/dvbridge/dvbridge_render.h              |   7 +
+ tools/dvbridge/dvbridge_source.c              | 197 +++++++++++++++---
+ tools/dvbridge/dvbridge_source.h              |  13 +-
+ .../VideoRenderers/DVBridgeGLES.cpp           |  22 ++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   2 +
+ xbmc/settings/AdvancedSettings.h              |   3 +-
+ 7 files changed, 223 insertions(+), 31 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 40a9eea..83e5a22 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -3934,6 +3934,16 @@ bool dvbridge_render_compute_rows_usable(const struct dvbridge_renderer *r)
+     return r && dvbridge_source_compute_rows_usable(r->source_packer);
+ }
+ 
++bool dvbridge_render_compute_ipt_usable(const struct dvbridge_renderer *r)
++{
++    return r && dvbridge_source_ipt_compute_usable(r->source_packer);
++}
++
++bool dvbridge_render_ipt_computed(const struct dvbridge_renderer *r)
++{
++    return dvbridge_render_ipt(r) && dvbridge_source_ipt_computed(r->source_packer);
++}
++
+ unsigned dvbridge_render_source_quad(const struct dvbridge_renderer *r)
+ {
+     return r ? dvbridge_source_quad(r->source_packer) : 0u;
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 789c6f7..60a64a9 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -655,6 +655,13 @@ bool dvbridge_render_ipt(const struct dvbridge_renderer *renderer);
+ #define DVBRIDGE_RENDER_COMPUTE_ROWS 1
+ void dvbridge_render_use_compute_rows(struct dvbridge_renderer *renderer, bool use);
+ bool dvbridge_render_compute_rows_usable(const struct dvbridge_renderer *renderer);
++/* Hades: the request above takes the conversion of the IPT tunnel (dvbridge_render_use_ipt()) to one
++ * compute pass as well, where each pixel's chain is taken once and not the left pixel's of a pair
++ * twice (dvbridge_source_ipt_compute_usable(); OpenGL ES 3.1). usable: made on this GPU and not
++ * failed; computed: the last picture prepared in IPT was converted so. */
++#define DVBRIDGE_RENDER_COMPUTE_IPT 1
++bool dvbridge_render_compute_ipt_usable(const struct dvbridge_renderer *renderer);
++bool dvbridge_render_ipt_computed(const struct dvbridge_renderer *renderer);
+ /* Hades: which forms of pass 4 of the source transport take the even pixel's codes of a pair drawn
+  * over from the invocation next to it (dvbridge_source_quad(): bit 1, the GUI read in place; bit 0,
+  * the composited picture, is never set); 0 without quad operations, and in the reference of a check
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index dcb4dbf..325abbd 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -1702,8 +1702,9 @@ struct common_uniforms {
+  * of the order of single precision itself (the same chain on the processor, each operation
+  * rounded once, is off on 0.003 % to 0.045 % of the samples of five of them): exact codes would
+  * take more than the single precision that OpenGL ES 3.0 has. */
+-#define IPT_HEAD                                                                                  \
+-    "#version 300 es\n"                                                                           \
++#define IPT_HEAD "#version 300 es\n" IPT_BODY
++/* (Hades: and 9c, the compute form, after its own first line) */
++#define IPT_BODY                                                                                  \
+     "precision highp float;\n"                                                                    \
+     "precision highp int;\n"                                                                      \
+     "uniform highp sampler2D luma_plane;\n"                                                       \
+@@ -1772,19 +1773,22 @@ struct common_uniforms {
+     "{\n"                                                                                         \
+     "    return eotf(clamp(ycc_src * (vec3(y, c) / code_scale - off_src), 0.0, 1.0));\n"          \
+     "}\n"                                                                                         \
++    /* I from L'M'S' (e) */                                                                       \
++    "uint i_of(vec3 e)\n"                                                                         \
++    "{\n"                                                                                         \
++    "    return uint(clamp(floor((to_ipt * e).x * 4096.0 + 0.5), 0.0, 4095.0));\n"                \
++    "}\n"                                                                                         \
+     "uint ipt_i(float y, vec2 c)\n"                                                               \
+     "{\n"                                                                                         \
+     "    vec3 lnl, t, w, lam;\n"                                                                  \
+     "    oetf_parts(to_lms * linear_of(y, c), lnl, t, w, lam);\n"                                 \
+-    "    return uint(clamp(floor((to_ipt * exp(m2 * lam)).x * 4096.0 + 0.5), 0.0, 4095.0));\n"    \
++    "    return i_of(exp(m2 * lam));\n"                                                           \
+     "}\n"                                                                                         \
+-    "uvec2 ipt_pt(float y, vec2 c)\n"                                                             \
++    /* P and T from the chain of a pixel up to the OETF's parts; mp: its M', exp(m2 lam.y) */     \
++    "uvec2 pt_of(vec3 lin, vec3 lms, vec3 lnl, vec3 t, vec3 w, vec3 lam, float mp)\n"             \
+     "{\n"                                                                                         \
+-    "    vec3 lin = linear_of(y, c), lms = to_lms * lin;\n"                                       \
+     "    mat3 lr = transpose(to_lms), ir = transpose(to_ipt);\n"                                  \
+     "    vec2 d = vec2(dot(lr[0] - lr[1], lin), dot(lr[2] - lr[1], lin));\n" /* L - M, S - M */   \
+-    "    vec3 lnl, t, w, lam;\n"                                                                  \
+-    "    oetf_parts(lms, lnl, t, w, lam);\n"                                                      \
+     "    vec2 u = d / max(lms.y, 1e-37);\n"                                                       \
+     "    vec2 ratio = mix(lnl.xz - lnl.yy, log1p_series(clamp(u, -0.25, 0.25)),\n"               \
+     "                     lessThanEqual(abs(u), vec2(0.25)));\n" /* log(L / M), log(S / M) */      \
+@@ -1792,10 +1796,27 @@ struct common_uniforms {
+     "    vec2 v = k * (1.0 + c3) * dt / ((1.0 + c3 * t.xz) * (1.0 + c3 * t.y) * (1.0 - w.y));\n"  \
+     "    vec2 dl = mix(lam.xz - lam.yy, log1p_series(clamp(v, -0.25, 0.25)),\n"                   \
+     "                  lessThanEqual(abs(v), vec2(0.25)));\n"                                     \
+-    "    vec2 dp = exp(m2 * lam.y) * expm1_any(m2 * dl);\n" /* L' - M', S' - M' */                \
++    "    vec2 dp = mp * expm1_any(m2 * dl);\n" /* L' - M', S' - M' */                             \
+     "    vec2 pt = vec2(ir[1].x * dp.x + ir[1].z * dp.y, ir[2].x * dp.x + ir[2].z * dp.y);\n"     \
+     "    return uvec2(clamp(floor(pt * 4096.0 + 0.5) + 2048.0, 0.0, 4095.0));\n"                  \
+     "}\n"                                                                                         \
++    "uvec2 ipt_pt(float y, vec2 c)\n"                                                             \
++    "{\n"                                                                                         \
++    "    vec3 lin = linear_of(y, c), lms = to_lms * lin;\n"                                       \
++    "    vec3 lnl, t, w, lam;\n"                                                                  \
++    "    oetf_parts(lms, lnl, t, w, lam);\n"                                                      \
++    "    return pt_of(lin, lms, lnl, t, w, lam, exp(m2 * lam.y));\n"                              \
++    "}\n"                                                                                         \
++    /* (9c) I of the even pixel of a pair and the pair's P and T, from one chain */               \
++    "uint ipt_pair(float y, vec2 c, out uvec2 pt)\n"                                              \
++    "{\n"                                                                                         \
++    "    vec3 lin = linear_of(y, c), lms = to_lms * lin;\n"                                       \
++    "    vec3 lnl, t, w, lam;\n"                                                                  \
++    "    oetf_parts(lms, lnl, t, w, lam);\n"                                                      \
++    "    vec3 e = exp(m2 * lam);\n"                                                               \
++    "    pt = pt_of(lin, lms, lnl, t, w, lam, e.y);\n"                                            \
++    "    return i_of(e);\n"                                                                       \
++    "}\n"                                                                                         \
+     "bool active_at(int x, int y)\n"                                                              \
+     "{\n"                                                                                         \
+     "    return x >= active_box.x && x < active_box.z && y >= active_box.y && y < active_box.w;\n"                \
+@@ -1844,6 +1865,61 @@ static const char IPT_ROWS[] =
+     "    color = out_;\n"
+     "}\n";
+ 
++/* 9c. Hades: pass 9 as one compute pass (where the GL makes it and the compute forms are asked for,
++ * dvbridge_source_compute_rows()). 9a and 9b take the chain of the even pixel of a pair twice, I in
++ * 9a and P and T in 9b, and in 9a the even and the odd pixels of a group of invocations run both
++ * sides of its branch (the filter of the odd one); here an invocation makes a texel of 9b's rows,
++ * the two pairs of rows 2 i and 2 i + 1: the chain of each pixel once (the even one gives its I and
++ * its pair's P and T, ipt_pair()), the odd pixels' chroma from one fetch of each of the 12 texels
++ * of the filter (both rows are in it), and no branch between the pixels. The same functions on the
++ * same codes, and the same integer sums. Measured with the software bridge on the 14 pictures of
++ * the profile 7 FEL stream: P, T and the I of the odd pixels the same bytes as 9a and 9b; the I of
++ * the even pixels one code apart on 0.003 % of them (the GPU fuses a multiply and an add of the
++ * OETF where only I uses it, and not where P and T share it), and overall as close to the chain in
++ * double precision or closer (I 0.042 % of the samples off by one code, from 0.043 %). */
++#define IPT_GROUP 8
++_Static_assert(IPT_GROUP == 8, "the compute form of pass 9 is written for workgroups of 8 x 8");
++static const char IPT_COMPUTE[] =
++    "#version 310 es\n"
++    IPT_BODY
++    "layout(local_size_x = 8, local_size_y = 8) in;\n"
++    "layout(r32f, binding = 0) writeonly uniform highp image2D luma_out;\n"
++    "layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D rows_out;\n"
++    "uniform int rows;\n" /* of the picture */
++    "uniform ivec3 size;\n" /* the texels of the rows (x, y) and the width of the picture (z) */
++    "void main()\n"
++    "{\n"
++    "    ivec2 q = ivec2(gl_GlobalInvocationID.xy);\n"
++    "    if (q.x >= size.x || q.y >= size.y)\n"
++    "        return;\n"
++    /* the chroma of the odd pixels of rows 2 q.y (xy) and 2 q.y + 1 (zw), as 9a makes it */
++    "    ivec4 acc = ivec4(0);\n"
++    "    for (int k = 0; k < 12; k++)\n"
++    "        acc += hweights[k] * ivec4(texelFetch(chroma_rows,\n"
++    "                                              ivec2(clamp(q.x - 5 + k, pairs.x, pairs.y), q.y), 0));\n"
++    "    ivec4 odd = clamp((acc + (1 << 13)) >> 14, ivec4(0), ivec4(4095));\n"
++    "    uvec4 even = texelFetch(chroma_rows, ivec2(clamp(q.x, pairs.x, pairs.y), q.y), 0);\n"
++    "    uvec4 out_ = uvec4(0u);\n"
++    "    for (int h = 0; h < 2; h++) {\n"
++    "        int r = 2 * q.y + h, x = 2 * q.x;\n"
++    "        if (r >= rows)\n"
++    "            break;\n"
++    "        float i0 = 0.0, i1 = 0.0;\n"
++    "        if (active_at(x, r)) {\n"
++    "            uvec2 pt;\n"
++    "            i0 = float(ipt_pair(luma_at(ivec2(x, r)), vec2(h == 0 ? even.rg : even.ba), pt))\n"
++    "                 / code_scale;\n"
++    "            if (h == 0) out_.rg = pt; else out_.ba = pt;\n"
++    "        }\n"
++    "        if (active_at(x + 1, r))\n"
++    "            i1 = float(ipt_i(luma_at(ivec2(x + 1, r)), vec2(h == 0 ? odd.xy : odd.zw))) / code_scale;\n"
++    "        imageStore(luma_out, ivec2(x, r), vec4(i0, 0.0, 0.0, 1.0));\n"
++    "        if (x + 1 < size.z)\n"
++    "            imageStore(luma_out, ivec2(x + 1, r), vec4(i1, 0.0, 0.0, 1.0));\n"
++    "    }\n"
++    "    imageStore(rows_out, q, out_);\n"
++    "}\n";
++
+ static const char *const COMMON_NAMES[] = {"luma_plane", "chroma_rows", "picture_rect",
+     "active_rect", "black", "code_scale", "ycc_forward", "lms_forward", "ycc_offset", "affine"};
+ 
+@@ -2014,6 +2090,13 @@ struct dvbridge_source_packer {
+     GLint ir_rows;
+     struct texture ipt_luma, ipt_rows;
+     bool rows_ipt;
++    /* Hades: pass 9 as one compute pass (9c): its program and uniforms (those of 9a, in their order,
++     * and rows and size), whether it failed on this GPU (it is not tried again: 9a and 9b make the
++     * codes), and whether it made the last codes */
++    GLuint ipt_compute;
++    struct ipt_uniforms ic;
++    GLint ic_rows, ic_size;
++    bool ipt_compute_failed, ipt_computed;
+     /* Hades: pass 2 as a compute shader (2c, dvbridge_source_compute_rows()): its program and its
+      * uniforms (those of pass 2, in its order, and the size of the rows), whether it is asked for,
+      * whether it failed on this GPU (it is not tried again: pass 2 makes the rows), and whether it
+@@ -2435,6 +2518,19 @@ static struct dvbridge_source_packer *create_packer(bool allow_quad)
+             fprintf(stderr, "DV source transport: the passes of the IPT tunnel could not be made; "
+                             "the pictures go out as composed\n");
+         }
++        /* (Hades: and 9c where the GL makes it; without it, 9a and 9b) */
++        if (p->ipt_luma_program) {
++            p->ipt_compute = link_compute(IPT_COMPUTE);
++            if (p->ipt_compute &&
++                ((p->ic_rows = glGetUniformLocation(p->ipt_compute, "rows")) < 0 ||
++                 (p->ic_size = glGetUniformLocation(p->ipt_compute, "size")) < 0 ||
++                 !locate(p->ipt_compute, &p->ic.luma, ipt, COUNT(ipt)))) {
++                glDeleteProgram(p->ipt_compute);
++                p->ipt_compute = 0;
++            }
++            while (glGetError() != GL_NO_ERROR) {
++            }
++        }
+     }
+     /* Hades: pass 2 as a compute shader (2c), where the GL makes it; without it, pass 2 */
+     {
+@@ -2529,6 +2625,7 @@ void dvbridge_source_packer_destroy(struct dvbridge_source_packer *p)
+     texture_destroy(&p->ipt_rows);
+     glDeleteProgram(p->ipt_luma_program);
+     glDeleteProgram(p->ipt_rows_program);
++    glDeleteProgram(p->ipt_compute);
+     free(p);
+ }
+ 
+@@ -3022,28 +3119,60 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+     struct dvbridge_gl_state state;
+     begin(p, &state);
+     const int cw = (width + 1) / 2, half = (height + 1) / 2;
+-    for (int k = 0; k < 2; ++k) {
+-        const struct ipt_uniforms *u = k ? &p->ir : &p->il;
+-        struct texture *into = k ? &p->ipt_rows : &p->ipt_luma;
+-        if (!target(into, k ? GL_RGBA16UI : GL_R32F, k ? cw : width, k ? half : height))
+-            return end(&state, false);
+-        glUseProgram(k ? p->ipt_rows_program : p->ipt_luma_program);
+-        bind(p, 0, luma);
+-        bind(p, 1, p->chroma.texture);
+-        glUniform1i(u->luma, 0);
+-        glUniform1i(u->rows, 1);
+-        glUniform1f(u->code_scale, (float)(1 << src->bits));
+-        set_matrix(u->ycc_src, src->ycc_forward);
+-        set_matrix(u->to_lms, to_lmsf);
+-        set_matrix(u->to_ipt, to_iptf);
+-        glUniform3fv(u->off_src, 1, src->offset);
+-        glUniform4i(u->active, a, c, b, d);
+-        glUniform2i(u->pairs, first_pair, last_pair);
+-        glUniform1iv(u->hweights, DVBRIDGE_SOURCE_TAPS, weights);
+-        if (k)
+-            glUniform1i(p->ir_rows, height);
+-        glDrawArrays(GL_TRIANGLES, 0, 3);
++    /* Hades: by the compute form (9c) where the compute forms are asked for and it was made; where it
++     * fails (a GL error), the codes are made again by 9a and 9b at once, and 9c is not tried again on
++     * this GPU */
++    bool compute = p->compute_rows && p->ipt_compute && !p->ipt_compute_failed;
++    for (;;) {
++        for (int k = 0; k < (compute ? 1 : 2); ++k) {
++            const struct ipt_uniforms *u = compute ? &p->ic : k ? &p->ir : &p->il;
++            /* (both textures made, that of the fragment pass k bound last; 9c writes both) */
++            struct texture *into = k ? &p->ipt_rows : &p->ipt_luma;
++            struct texture *other = k ? &p->ipt_luma : &p->ipt_rows;
++            if (!target(other, k ? GL_R32F : GL_RGBA16UI, k ? width : cw, k ? height : half) ||
++                !target(into, k ? GL_RGBA16UI : GL_R32F, k ? cw : width, k ? half : height))
++                return end(&state, false);
++            glUseProgram(compute ? p->ipt_compute : k ? p->ipt_rows_program : p->ipt_luma_program);
++            bind(p, 0, luma);
++            bind(p, 1, p->chroma.texture);
++            glUniform1i(u->luma, 0);
++            glUniform1i(u->rows, 1);
++            glUniform1f(u->code_scale, (float)(1 << src->bits));
++            set_matrix(u->ycc_src, src->ycc_forward);
++            set_matrix(u->to_lms, to_lmsf);
++            set_matrix(u->to_ipt, to_iptf);
++            glUniform3fv(u->off_src, 1, src->offset);
++            glUniform4i(u->active, a, c, b, d);
++            glUniform2i(u->pairs, first_pair, last_pair);
++            glUniform1iv(u->hweights, DVBRIDGE_SOURCE_TAPS, weights);
++            if (!compute) {
++                if (k)
++                    glUniform1i(p->ir_rows, height);
++                glDrawArrays(GL_TRIANGLES, 0, 3);
++                continue;
++            }
++            glUniform1i(p->ic_rows, height);
++            glUniform3i(p->ic_size, cw, half, width);
++            /* (as 2c: what the GPU did before done first, the codes written for the passes that
++             * sample them) */
++            glMemoryBarrier(GL_ALL_BARRIER_BITS);
++            glBindImageTexture(0, p->ipt_luma.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
++            glBindImageTexture(1, p->ipt_rows.texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16UI);
++            glDispatchCompute((GLuint)((cw + IPT_GROUP - 1) / IPT_GROUP),
++                              (GLuint)((half + IPT_GROUP - 1) / IPT_GROUP), 1);
++            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
++                            GL_FRAMEBUFFER_BARRIER_BIT);
++            glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32F);
++            glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16UI);
++        }
++        if (!compute || glGetError() == GL_NO_ERROR)
++            break;
++        p->ipt_compute_failed = true;
++        compute = false;
++        fprintf(stderr, "DV source transport: the compute form of pass 9 failed on this GPU; the "
++                        "codes of the IPT tunnel are made by its fragment passes\n");
+     }
++    p->ipt_computed = compute;
+     const bool ok = end(&state, true);
+     if (ok) {
+         p->rows_ipt = true;
+@@ -3052,6 +3181,16 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+     return ok;
+ }
+ 
++bool dvbridge_source_ipt_compute_usable(const struct dvbridge_source_packer *p)
++{
++    return p && p->ipt_compute && !p->ipt_compute_failed;
++}
++
++bool dvbridge_source_ipt_computed(const struct dvbridge_source_packer *p)
++{
++    return p && p->rows_ipt && p->ipt_computed;
++}
++
+ /* Hades: the tiles of what is drawn over, on unit 3, and how a pass takes them (tiles_mode) */
+ static void set_tiles(struct dvbridge_source_packer *p, GLint tiles, GLint mode, int how)
+ {
+diff --git a/tools/dvbridge/dvbridge_source.h b/tools/dvbridge/dvbridge_source.h
+index 1755ab2..3d210f8 100644
+--- a/tools/dvbridge/dvbridge_source.h
++++ b/tools/dvbridge/dvbridge_source.h
+@@ -349,8 +349,19 @@ bool dvbridge_source_can_ipt(const struct dvbridge_source_packer *packer);
+ void dvbridge_source_compute_rows(struct dvbridge_source_packer *packer, bool use);
+ bool dvbridge_source_compute_rows_usable(const struct dvbridge_source_packer *packer);
+ bool dvbridge_source_rows_computed(const struct dvbridge_source_packer *packer);
++/* Hades: use (above) asks for the compute form of dvbridge_source_to_ipt() as well: one pass where
++ * each invocation takes the chain of each pixel of two pairs once (the even pixel gives its I and its
++ * pair's P and T), where the fragment passes take that of the even pixel twice; the same functions
++ * on the same codes (a float rounding apart where the GPU fuses operations otherwise: within one
++ * code, measured as close to the chain in double precision). Where the GL does not make it (OpenGL
++ * ES 3.1), or it fails on the GPU (it is then not tried again), the fragment passes. usable: it was
++ * made and has not failed; computed: the codes of the rows in use (dvbridge_source_to_ipt()) were
++ * made by it. */
++#define DVBRIDGE_SOURCE_COMPUTE_IPT 1
++bool dvbridge_source_ipt_compute_usable(const struct dvbridge_source_packer *packer);
++bool dvbridge_source_ipt_computed(const struct dvbridge_source_packer *packer);
+ /* Hades: after dvbridge_source_rows() or dvbridge_source_scale() of a picture of src, its codes in
+- * IPT-PQ-c2, 12 bits, in two passes: the chroma of every pixel (between the pairs, Lanczos 6 in
++ * IPT-PQ-c2, 12 bits, in two fragment passes or one compute pass (above): the chroma of every pixel (between the pairs, Lanczos 6 in
+  * integers, the filter of the rows, DVBRIDGE_SOURCE_LANCZOS), its codes through YCCtoRGB of the RPU,
+  * the PQ EOTF, RGBtoLMS of the RPU (src->lms_rpu), the crosstalk of the tunnel undone, the PQ OETF and
+  * the inverse of YCCtoRGB of the tunnel (dvbridge_ipt.h), in floats; I of every pixel, P and T of each pair from its even pixel (where
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index 50283e6..c2886be 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -639,6 +639,19 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+                          "fetches each row of 4:2:0 once for 8 of them (the same bytes; dvcomputerows), "
+                          "unless it fails on this GPU, which the log then says");
+     }
++    // Hades: and the conversion of the IPT tunnel (where it is chosen) by one compute pass that
++    // takes each pixel once, where the fragment passes take the left pixel of a pair twice
++    if (computeRows && dvbridge_render_compute_ipt_usable(m_renderer))
++    {
++      m_computeIptSaid = true;
++      CLog::Log(LOGINFO, "DVBridge: the conversion of the IPT tunnel, where it is chosen, is made by a "
++                         "compute pass that converts each pixel once (dvcomputerows), unless it fails "
++                         "on this GPU, which the log then says");
++    }
++    else if (computeRows)
++      CLog::Log(LOGINFO, "DVBridge: the conversion of the IPT tunnel, where it is chosen, is made by "
++                         "its fragment passes: the compute pass could not be made on this GPU (it "
++                         "takes OpenGL ES 3.1)");
+   }
+   UseComposerSetting();
+   UseGamutSetting();
+@@ -1130,6 +1143,15 @@ void CDVBridgeGLES::LogNotes()
+                           "(a GL error): the rows are made by the fragment pass from here on, the "
+                           "frame that it failed on included (the same bytes; dvcomputerows)");
+   }
++  // Hades: and the compute pass of the IPT tunnel (the frame it failed on was converted again by
++  // the fragment passes)
++  if (m_computeIptSaid && m_renderer && !dvbridge_render_compute_ipt_usable(m_renderer))
++  {
++    m_computeIptSaid = false;
++    CLog::Log(LOGWARNING, "DVBridge: the compute pass of the IPT tunnel failed on this GPU (a GL "
++                          "error): its conversion is made by the fragment passes from here on, the "
++                          "frame that it failed on included (dvcomputerows)");
++  }
+   dvbridge_render_notes notes{};
+   if (!m_renderer || !dvbridge_render_take_notes(m_renderer, &notes))
+     return;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 11e01d2..7d447f1 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -755,6 +755,8 @@ private:
+   //! Hades: Initialize() said that the rows of 4:2:2 chroma are made by the compute pass
+   //! (dvcomputerows); LogNotes() says once if it fails afterwards
+   bool m_computeRowsSaid = false;
++  //! Hades: and that the conversion of the IPT tunnel is made by its compute pass
++  bool m_computeIptSaid = false;
+   unsigned m_guiCacheFrames = 0;
+   unsigned long long m_guiCacheTiles[3] = {0, 0, 0};
+   bool m_guiCacheDiffered = false;
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 399897e..9f0cb90 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -270,7 +270,8 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     bool m_videoDVMmrTable;
+     //! Hades: the rows of 4:2:2 chroma of the source transport made by a compute shader that reads each
+     //! row of 4:2:0 once for a tile of 8 of them (video/dvcomputerows; dvbridge_render_use_compute_rows():
+-    //! the same bytes, fewer texture fetches; OpenGL ES 3.1). Off to measure what it saves
++    //! the same bytes, fewer texture fetches; OpenGL ES 3.1). Off to measure what it saves. It also
++    //! takes the conversion of the IPT tunnel to its compute pass (dvbridge_render_compute_ipt_usable())
+     bool m_videoDVComputeRows;
+     //! Hades: a frame whose RPU has no content mapping v4.0 part is sent to the display with the one that
+     //! dovi_tool adds as its "safe" default (levels 3, 9, 11 and 254, no level 8 trims;
+-- 
+2.53.0
+

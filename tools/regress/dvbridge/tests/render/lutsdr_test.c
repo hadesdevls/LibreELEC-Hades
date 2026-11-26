@@ -17,9 +17,11 @@
 //     limited range), the filter shader of GLES 3.1, the field of an interlaced picture, HDR tone mapped to SDR by
 //     Kodi's shaders, and two passes with Kodi's scalers (6x6 into RGBA16F, 4x4 into RGBA8), where the LUT is in the
 //     second;
-//   - each with no LUT, with an identity LUT (17 points; 33 and 65 on the first way) and with a known LUT (in each
-//     format on the first way: .cube full range and video levels, .3dl of Nuke's shaper and uniform, madVR's);
-//     written for lutsdr_check.py, which applies the LUT to the picture drawn without it in float64;
+//   - each with no LUT, with an identity LUT (17 points; 33 and 65 and a 1D identity on the first way) and with a
+//     known LUT (in each format on the first way: .cube full range and video levels, .3dl of Nuke's shaper and
+//     uniform, madVR's, and the 1D LUTs: ArgyllCMS's .cal, a .cube of LUT_1D_SIZE alone, steep and of 5000 points (two
+//     rows of its texture), Resolve's shaper before a 3D LUT: gles_lut3d_curve.frag put in first); written for
+//     lutsdr_check.py, which applies the LUT to the picture drawn without it in float64;
 //   - an identity LUT gives every byte of RGBA8 and every code of RGB10_A2 of the picture without it;
 //   - a shader made with the LUT but told not to apply it (a capture) gives the picture without it, to the bit;
 //   - the shaders put together without a LUT have nothing of it; with one, its call comes after the clamp of the
@@ -51,6 +53,7 @@
 // every STRIDE-th pixel of every STRIDE-th row is written for lutsdr_check.py
 #define STRIDE 2
 #define LUT_UNIT 5
+#define CURVE_UNIT 6
 
 static int g_failures;
 
@@ -256,7 +259,8 @@ struct way
 };
 
 // The program of a way, put together as the shader classes of Kodi put it (YUV2RGBShaderGLES.cpp,
-// VideoFilterShaderGLES.cpp); lut: with the LUT's files. *source: the pixel shader as compiled.
+// VideoFilterShaderGLES.cpp); lut: with the LUT's files (2: and those of its 1D LUT, first: CLut3dGLES::Insert()).
+// *source: the pixel shader as compiled.
 static GLuint Program(const char* tree, const struct way* w, enum kind kind, int lut, char** source)
 {
   char defines[512] = "";
@@ -284,6 +288,8 @@ static GLuint Program(const char* tree, const struct way* w, enum kind kind, int
     ok = Insert(&fs, tree, "gles_tonemap.frag", "void main()");
   ok = ok && Insert(&fs, tree, "gles_dither_uniforms.frag", "void main()");
   // (Lut3dGLES.cpp CLut3dGLES::Insert(): before the dither is put in)
+  if (ok && lut == 2)
+    ok = Insert(&fs, tree, "gles_lut3d_curve.frag", "void main()");
   if (ok && lut)
     ok = Insert(&fs, tree, "gles_lut3d.frag", "void main()") && Insert(&fs, tree, "gles_lut3d_body.frag", out);
   ok = ok && Insert(&fs, tree, "gles_dither_body.frag", out);
@@ -325,6 +331,7 @@ static GLuint Program(const char* tree, const struct way* w, enum kind kind, int
 struct lutgl
 {
   GLuint tex;
+  GLuint curveTex; // its 1D LUT (0: none)
   struct dvbridge_lut_atlas atlas;
   int apply;
 };
@@ -355,6 +362,23 @@ static int LutUpload(const struct dvbridge_lut* lut, struct lutgl* g, char* why,
     dvbridge_lut_atlas_slice(&g->atlas, b, &x0, &y0);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, n, n, GL_RGB, GL_FLOAT, dvbridge_lut_atlas_slice_data(lut, b));
   }
+  // (as CLut3dGLES::PutCurve(): its 1D LUT, the full rows and then the points of the last, straight from the LUT)
+  if (g->atlas.curve_size)
+  {
+    const int c = g->atlas.curve_size, cw = g->atlas.curve_width, full = c / cw, rest = c - full * cw;
+    glGenTextures(1, &g->curveTex);
+    glActiveTexture(GL_TEXTURE0 + CURVE_UNIT);
+    glBindTexture(GL_TEXTURE_2D, g->curveTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, cw, g->atlas.curve_height, 0, GL_RGB, GL_FLOAT, NULL);
+    if (full > 0)
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, cw, full, GL_RGB, GL_FLOAT, lut->curve);
+    if (rest > 0)
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, full, rest, 1, GL_RGB, GL_FLOAT, lut->curve + (size_t)full * cw * 3);
+  }
   glActiveTexture(GL_TEXTURE0);
   g->apply = 1;
   return glGetError() == GL_NO_ERROR;
@@ -364,6 +388,8 @@ static void LutFree(struct lutgl* g)
 {
   if (g->tex)
     glDeleteTextures(1, &g->tex);
+  if (g->curveTex)
+    glDeleteTextures(1, &g->curveTex);
   dvbridge_lut_atlas_free(&g->atlas);
   memset(g, 0, sizeof *g);
 }
@@ -381,6 +407,14 @@ static void LutBind(GLuint p, const struct lutgl* g, int limited)
   glUniform2fv(glGetUniformLocation(p, "m_lut3dOut"), 1, g->atlas.out);
   glUniform3f(glGetUniformLocation(p, "m_lut3dSignal"), limited ? (940.0f - 64.0f) / 1023.0f : 1.0f,
               limited ? 64.0f / 1023.0f : 0.0f, g->apply ? 1.0f : 0.0f);
+  if (g->curveTex)
+  {
+    glActiveTexture(GL_TEXTURE0 + CURVE_UNIT);
+    glBindTexture(GL_TEXTURE_2D, g->curveTex);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(glGetUniformLocation(p, "m_lut3dCurveTable"), CURVE_UNIT);
+    glUniform4fv(glGetUniformLocation(p, "m_lut3dCurve"), 1, g->atlas.curve);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------- drawing
@@ -761,11 +795,12 @@ struct lutfile
   int video;       // read with the range of video levels (videoscreen.hadeslut3drange)
 };
 static const struct lutfile TINT = {"tint17.cube", "tint", 0};
-static const struct lutfile MORE[] = {{"video17.cube", "video", 1},
-                                      {"nuke17.3dl", "nuke", 0},
-                                      {"unif9.3dl", "unif", 0},
-                                      {"madvr16.3dlut", "madvr", 0}};
-static const struct lutfile IDS[] = {{"id17.cube", "id17", 0}, {"id33.cube", "id33", 0}, {"id65.cube", "id65", 0}};
+static const struct lutfile MORE[] = {{"video17.cube", "video", 1},  {"nuke17.3dl", "nuke", 0},
+                                      {"unif9.3dl", "unif", 0},       {"madvr16.3dlut", "madvr", 0},
+                                      {"vcgt256.cal", "cal", 0},      {"steep1d.cube", "steep1d", 0},
+                                      {"long1d.cube", "long1d", 0},   {"shaper.cube", "shaper", 0}};
+static const struct lutfile IDS[] = {{"id17.cube", "id17", 0}, {"id33.cube", "id33", 0}, {"id65.cube", "id65", 0},
+                                     {"id1d256.cube", "id1d256", 0}};
 
 // ------------------------------------------------------------------------------------------------- one way
 static const char* g_tree;
@@ -784,7 +819,7 @@ static float* Picture(const struct way* w, const struct lutgl* lut, GLenum forma
   float* f = NULL;
   if (!two)
   {
-    GLuint p = Program(g_tree, w, w->kind, lut != NULL, source);
+    GLuint p = Program(g_tree, w, w->kind, lut ? (lut->curveTex ? 2 : 1) : 0, source);
     if (p)
     {
       DrawYuv(p, w, w->kind, &t, lut);
@@ -797,7 +832,7 @@ static float* Picture(const struct way* w, const struct lutgl* lut, GLenum forma
     // the first pass, without the LUT, at the picture's size (CLinuxRendererGLES::RenderToFBO()), then the scaler
     struct target first;
     GLuint p1 = Program(g_tree, w, BASIC, 0, NULL);
-    GLuint p2 = Program(g_tree, w, w->kind, lut != NULL, source);
+    GLuint p2 = Program(g_tree, w, w->kind, lut ? (lut->curveTex ? 2 : 1) : 0, source);
     if (p1 && p2 && Target(&first, g_w, g_h, w->fbo))
     {
       DrawYuv(p1, w, BASIC, &first, NULL);
@@ -829,7 +864,7 @@ static void Time(const struct way* w, const struct lutgl* g, int W, int H)
   for (int with = 0; with < 2; ++with)
   {
     struct target t;
-    GLuint p = Program(g_tree, w, w->kind, with, NULL);
+    GLuint p = Program(g_tree, w, w->kind, with ? (g->curveTex ? 2 : 1) : 0, NULL);
     if (!p || !Target(&t, W, H, GL_RGBA8))
       return;
     DrawYuv(p, w, w->kind, &t, with ? g : NULL);
@@ -911,6 +946,12 @@ static void Way(const struct way* w, int all)
       Check(call && dither && call < dither && (!clamp || clamp < call) && head && mainAt && head < mainAt,
             "%s: %s: the LUT's call after the clamp of the output and before the dither, its functions before main()",
             w->name, files[i]->file);
+      // (a 1D LUT: its functions before those of the table, which call them; none of them without one)
+      const char* curve = src ? strstr(src, "highp vec3 KodiLut3dCurve(highp vec3 c)") : NULL;
+      Check(g.curveTex ? curve && head && curve < head : !curve && src && !strstr(src, "m_lut3dCurve"),
+            "%s: %s: %s", w->name, files[i]->file,
+            g.curveTex ? "the functions of its 1D LUT before those of the table"
+                       : "no function or uniform of a 1D LUT in the shader of a LUT without one");
       free(src);
       if (i == 0)
       {
@@ -1006,7 +1047,7 @@ static void Table(void)
         a.width, a.height, a.cols, n * n * n, bad);
   // the layout without a copy is that of the copy, and each slice straight from the LUT holds the copy's texels
   struct dvbridge_lut_atlas l;
-  const int laid = dvbridge_lut_atlas_layout(lut, 16384, &l, why, sizeof why);
+  int laid = dvbridge_lut_atlas_layout(lut, 16384, &l, why, sizeof why);
   Check(laid && l.rgb == NULL && l.size == a.size && l.cols == a.cols && l.rows == a.rows && l.width == a.width &&
             l.height == a.height && !memcmp(l.grid, a.grid, sizeof l.grid) && !memcmp(l.in, a.in, sizeof l.in) &&
             !memcmp(l.shaper, a.shaper, sizeof l.shaper) && !memcmp(l.out, a.out, sizeof l.out),
@@ -1027,6 +1068,21 @@ static void Table(void)
   Check(!made && a.rgb == NULL && strstr(why, "takes at most 100"),
         "a table larger than the GPU takes is refused with the reason (%s)", why);
   dvbridge_lut_atlas_free(&a);
+  Check(l.curve_size == 0 && l.curve_width == 0, "a LUT without a 1D LUT has no texture of one");
+  dvbridge_lut_free(&lut);
+  // a 1D LUT of 5000 points: rows of 4096 texels, the last filled as far as they go; the uniform of its shader
+  lut = Parse(g_luts, "long1d.cube", (struct dvbridge_lut_range){0.0f, 255.0f});
+  if (!lut)
+    return;
+  laid = dvbridge_lut_atlas_layout(lut, 16384, &l, why, sizeof why);
+  Check(laid && l.size == 2 && l.curve_size == 5000 && l.curve_width == DVBRIDGE_LUT_CURVE_ROW && l.curve_height == 2 &&
+            l.curve[0] == 4999.0f && l.curve[1] == (float)DVBRIDGE_LUT_CURVE_ROW &&
+            l.curve[2] == (float)(1.0 / DVBRIDGE_LUT_CURVE_ROW) && l.curve[3] == 0.5f,
+        "a 1D LUT of 5000 points: a texture of %dx%d, its uniform %g %g %g %g (the identity of 2 points its table)",
+        l.curve_width, l.curve_height, (double)l.curve[0], (double)l.curve[1], (double)l.curve[2], (double)l.curve[3]);
+  laid = dvbridge_lut_atlas_layout(lut, 2048, &l, why, sizeof why);
+  Check(!laid && strstr(why, "1D LUT of 5000 points") && strstr(why, "takes at most 2048"),
+        "a 1D LUT wider than the GPU takes is refused with the reason (%s)", why);
   dvbridge_lut_free(&lut);
 }
 

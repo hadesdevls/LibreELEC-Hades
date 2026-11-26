@@ -81,6 +81,15 @@ int main()
   Check(Fits(Kind::SDR, SIGNAL_SDR, GAMUT_BT709, GAMUT_P3_D65, GAMUT_P3_D65, &why) == Reason::OTHER_KIND &&
             why.find("its file says so") != std::string::npos,
         "SDR: a file that says BT.709 is refused on an SDR output in DCI-P3, whatever the setting says");
+  // (a 1D LUT alone, a curve of each channel: any gamut, its signal still checked)
+  Check(Fits(Kind::SDR, SIGNAL_UNKNOWN, GAMUT_UNKNOWN, GAMUT_BT709, GAMUT_BT2020, nullptr, true) == Reason::NONE,
+        "SDR: a 1D LUT alone (.cal, LUT_1D_SIZE) fits an SDR output in BT.2020, whatever the gamut setting says");
+  Check(Fits(Kind::SDR, SIGNAL_UNKNOWN, GAMUT_UNKNOWN, GAMUT_BT2020, GAMUT_P3_D65, nullptr, true) == Reason::NONE,
+        "SDR: a 1D LUT alone fits an SDR output in DCI-P3");
+  Check(Fits(Kind::SDR, SIGNAL_PQ, GAMUT_UNKNOWN, GAMUT_BT709, GAMUT_BT709, nullptr, true) == Reason::OTHER_KIND,
+        "SDR: a 1D LUT that says it is of PQ is still refused");
+  Check(Fits(Kind::HDR, SIGNAL_SDR, GAMUT_UNKNOWN, GAMUT_BT709, GAMUT_BT709, nullptr, true) == Reason::OTHER_KIND,
+        "HDR: a 1D LUT that says it is of SDR is still refused");
   Check(GamutOfSetting(0) == GAMUT_BT709 && GamutOfSetting(1) == GAMUT_BT2020 && GamutOfSetting(2) == GAMUT_P3_D65 &&
             GamutOfSetting(7) == GAMUT_BT709,
         "the gamut of the settings of SDR (0 BT.709, 1 BT.2020, 2 DCI-P3; anything else BT.709)");
