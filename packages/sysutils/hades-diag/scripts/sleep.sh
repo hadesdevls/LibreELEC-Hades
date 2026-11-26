@@ -18,7 +18,8 @@
 #        USB input devices that could wake it and are not armed, and a note of the kernel's wakeup counts in
 #        /run/hades-sleep for the line after the sleep. With hades-wake, the setting "Wake from sleep", the kind of each
 #        input device (why it may wake the PC or not), and the remotes' receivers that the setting would arm and that
-#        cannot wake a PC (no remote wakeup in their USB configuration).
+#        cannot wake a PC (no remote wakeup in their USB configuration); the paired Bluetooth input devices that may
+#        wake it at this sleep (allowed, and their adapter armed) and those that may not, with why.
 # post:  whether the sleep was carried out or failed (at which step, on which device), how long the system was away,
 #        the interrupt that woke it (pm_wakeup_irq, with its name in /proc/interrupts), each source of wakeups of the
 #        kernel whose count of wakeups grew while it slept (a USB controller, a USB device, a network card, the power
@@ -150,7 +151,7 @@ why() {
 }
 
 devices() {
-  local d c w armed="" could="" cannot="" R=""
+  local d c w armed="" could="" cannot="" R="" bta btn
   # (hades-wake: the setting, and the kind of each input device)
   if [ -r "${WAKE}" ]; then
     R=$(sh "${WAKE}" reasons 2>/dev/null)
@@ -181,9 +182,15 @@ devices() {
   for d in "${SYSFS}"/class/net/*; do
     [ "$(one "${d}/device/power/wakeup")" = enabled ] && armed="${armed}${armed:+; }network ${d##*/} (Wake-on-LAN)"
   done
+  # (the paired Bluetooth input devices, as hades-wake told them: "bt <address>|enabled|<class>|<name>: <why>" for one
+  # that may wake the PC at this sleep, disabled with why not)
+  bta=$(echo "${R}" | awk -F'|' '$1 ~ /^bt / && $2 == "enabled" { printf "%s%s", (n++ ? "; " : ""), $4 }')
+  btn=$(echo "${R}" | awk -F'|' '$1 ~ /^bt / && $2 != "enabled" { printf "%s%s", (n++ ? "; " : ""), $4 }')
+  [ -n "${bta}" ] && armed="${armed}${armed:+; }${bta}"
   say "may wake the PC: ${armed:-nothing that this can see}"
+  [ -n "${btn}" ] && say "Bluetooth input devices that may not wake it: ${btn}"
   if [ -n "${could}" ]; then
-    say "could wake it but are not armed: ${could} (the setting Wake from sleep chooses which kinds may; echo enabled > /sys/bus/usb/devices/<port>/power/wakeup arms one until the next start)"
+    say "could wake it but are not armed: ${could} (the setting Wake from sleep chooses which kinds may, and its list which devices; echo enabled > /sys/bus/usb/devices/<port>/power/wakeup arms one until the next start)"
   else
     say "no USB input device that could wake the PC is left unarmed"
   fi

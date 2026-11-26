@@ -9,7 +9,8 @@
 # geometry of a view, the composed planes in 16 bits, the composer with a base layer in BT.1886, HDR mapped to SDR in
 # BT.2020 and DCI-P3, the step-down levels of Dolby Vision rebuilt as HDR10 and SDR, the 3D LUT of a display (in the
 # bridge, and in the video shaders of Kodi's own renderer: stage lutsdr), a 3D picture drawn a view at a time (stage
-# stereo3d), an 8-bit HLG picture sent as Dolby Vision the same bytes as the same picture in 10 bits (stage hlg8).
+# stereo3d), an 8-bit HLG picture sent as Dolby Vision the same bytes as the same picture in 10 bits (stage hlg8), a
+# picture drawn again with the GUI over it, which takes what its frame before made of it (stage reuse).
 # Host test only.
 #
 # usage: run-dvbridge-render.sh all | verdict [<log>] | <stage>...
@@ -31,7 +32,7 @@ DATA=$RG_W/data
 export LP_NUM_THREADS=${LP_NUM_THREADS:-4}
 # the pictures of the stream that the fidelity bench draws
 PICS="3 27 51 240 480 720 960 1200 1440 1680 1920 2160 2400 2640"
-STAGES="build data fid measured rt r56 rscale gamut sdrgamut convstep gui geom r8 p82 fidx mmr hdr10area startsignal padding wextra p84 hostpol ipt p5gui p84gpu lut3d lutsdr stereo3d hlg8"
+STAGES="build data fid measured rt r56 rscale gamut sdrgamut convstep gui geom r8 p82 fidx mmr hdr10area startsignal padding wextra p84 hostpol ipt p5gui p84gpu lut3d lutsdr stereo3d hlg8 reuse"
 
 # --------------------------------------------------------------------------------------------------- helpers
 lp() { rg_lp_shared; }
@@ -1347,7 +1348,8 @@ stage_mmr() {
 # with the lines "FAIL..." of the test and of the check that it makes (measured when written): a .3dl in the order of its
 # file, the video levels of a LUT's input left out, the bars of Low-Latency left to the LUT, 10-bit codes made before
 # the LUT, the LUT applied to HDR over the tunnel, a LUT that fails not drawn again without it, the 1D LUT left out, its
-# green read from the curve of red, the red of a .cal read from another column.
+# green read from the curve of red, the red of a .cal read from another column, and libplacebo without libplacebo-9983
+# (its tetrahedra summed as weights: the identities of the 3D tables no longer to the bit).
 stage_lut3d() {
   local K L F O v m got n=0 ok=0
   K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
@@ -1379,7 +1381,15 @@ stage_lut3d() {
     got="$(grep -a -c '^FAIL' "$O/m-$1.log") $(grep -a -c '^FAIL' "$O/m-$1.check")"
     if [ "$got" = "$4 $5" ]; then ok=$((ok + 1)); else echo "mutant $1: $got lines FAIL (test, check), $4 $5 expected"; fi
   done
-  rg_item lut3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: a .3dl in its file's order 0 and 3, video levels left out 0 and 2, the bars of Low-Latency 2 and 0, codes before the LUT 0 and 1, HDR over the tunnel 2 and 0, no retry without a LUT that fails 3 and 0, the 1D LUT left out 0 and 4, its green read from the curve of red 0 and 4, the red of a .cal from the column of RGB_G 2 and 4)"
+  # libplacebo without libplacebo-9983: its tetrahedra summed as weights
+  local lp9983 lpk=$L
+  n=$((n + 1))
+  if lp9983=$(lpvar lut3d-no9983 - '9983'); then
+    L=$lp9983; lt "$K" m-no9983 > "$O/m-no9983.build" 2>&1; L=$lpk
+    got="$(grep -a -c '^FAIL' "$O/m-no9983.log") $(grep -a -c '^FAIL' "$O/m-no9983.check")"
+    if [ "$got" = "8 0" ]; then ok=$((ok + 1)); else echo "mutant no9983: $got lines FAIL (test, check), 8 0 expected"; fi
+  else echo "mutant no9983: libplacebo did not build"; fi
+  rg_item lut3d-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants failed as expected (lines FAIL of the test and of the check: a .3dl in its file's order 0 and 3, video levels left out 0 and 2, the bars of Low-Latency 2 and 0, codes before the LUT 0 and 1, HDR over the tunnel 2 and 0, no retry without a LUT that fails 3 and 0, the 1D LUT left out 0 and 4, its green read from the curve of red 0 and 4, the red of a .cal from the column of RGB_G 2 and 4, libplacebo without libplacebo-9983 8 and 0)"
 }
 
 # The 3D LUT of a display in the video shaders of Kodi's own renderer, the way SDR videos that Kodi draws itself take it
@@ -1489,6 +1499,102 @@ PY
   [ "$got" = 1 ] && rg_item hlg8-src.without PASSED "the renderer without the widening on the native output: 1 check fails, as it must" ||
     rg_item hlg8-src.without FAILED "the renderer without the widening on the native output: $got checks fail, not 1"
   rg_rm "$C"
+}
+
+# A frame with the GUI over it that draws the picture of the frame before it again (dvbridge_render_reused(): a pause with
+# the OSD over it, a picture shown for another refresh): fidbench-reuse.py on pictures 51 and 960 of the FEL stream (the
+# same GL textures, one after the other) in the four transports of native output (YCbCr as composed, IPT, converted,
+# Low-Latency), each picture drawn again 3 times with the GUI over it, with the reuse on and off: every file the same
+# bytes both ways; the frames drawn again that reused, 3 of 3 in the source transport and 2 of 3 converted (the first
+# of them keeps the copy of the picture, which the GUI is composited into); none with it off. Four mutants, each caught
+# by the bytes: the picture taken although the GUI was composited into it (drawn), the key not compared (key: picture
+# 960 takes 51's), the copy not made (kept), the luma of the composer taken in place of the codes of the IPT tunnel (luma).
+# And HDR over the tunnel drawn again, with and without a GUI composited into it, and its mutant (hdrsdr_test.c).
+REUSE_CFGS="src:FB_SOURCE=1:3 ipt:FB_SOURCE=1,FB_IPT=1,FB_COMPUTE=1:3 cnv:FB_SOURCE=0:2 ll:FB_LL=700:2"
+stage_reuse() {
+  local K L F O c t e want b v n m ok=0 bad=0 detail="" times=""
+  K=$(rg_kodi) || rg_fail "Kodi tree"; L=$(lp) || rg_fail "libplacebo"; F=$(ff) || rg_fail "FFmpeg"
+  [ -f "$DATA/p51/meta.bin" ] && [ -f "$DATA/p960/meta.bin" ] || { rg_item reuse FAILED "no pictures (stage data)"; return 1; }
+  O=$RG_W/reuse; rg_fresh "$O"
+  cp "$SRC/fidbench.c" "$O/fb.c"
+  if ! rg_edit "$O/fb.c" "$TS/fidbench-ipt.py" > "$O/edit.log" 2>&1 || ! rg_edit "$O/fb.c" "$TS/fidbench-reuse.py" >> "$O/edit.log" 2>&1; then
+    rg_item reuse FAILED "the edits no longer apply to src/fidbench.c: $(tail -n 1 "$O/edit.log")"; return 1
+  fi
+  rg_bridge "$K" "$L" "$F" "$O/fb.c" "$O/fb" "$SRC" || { rg_item reuse FAILED "did not build: $(tail -n 3 "$O/fb.build.log" | tr '\n' ' ')"; return 1; }
+  # rr <binary> <out> <config tag> <reuse> <settings, comma separated>: the two pictures drawn, then again 3 times each
+  rr() {
+    rg_fresh "$2"
+    # shellcheck disable=SC2086
+    rg_log "$2.log" gpu ${5//,/ } FB_GUI=1 FB_AGAIN=3 FB_NODIRECT=1 FB_REUSE=$4 nice -n 19 timeout 2400 "$1" "$DATA" "$2" "$3" 51 960
+  }
+  # same <dir a> <dir b>: every file of a the same bytes in b (and as many files)
+  same() {
+    local f k=0
+    [ "$(ls "$1" | wc -l)" = "$(ls "$2" | wc -l)" ] || return 1
+    for f in "$1"/*; do cmp -s "$f" "$2/$(basename "$f")" || return 1; k=$((k + 1)); done
+    [ $k -gt 0 ]
+  }
+  for c in $REUSE_CFGS; do
+    t=${c%%:*}; e=${c#*:}; want=${e##*:}; e=${e%:*}
+    rr "$O/fb" "$O/on-$t" "$t" 1 "$e"
+    rr "$O/fb" "$O/off-$t" "$t" 0 "$e"
+    n=$(grep -a -c "drawn again 3 times, $want reused" "$O/on-$t.log")
+    m=$(grep -a -c 'drawn again 3 times, 0 reused' "$O/off-$t.log")
+    v=no; same "$O/on-$t" "$O/off-$t" && v=yes
+    b=no; for p in 51 960; do cmp -s "$O/on-$t/$t-p$p-composed.rgba" "$O/on-$t/$t-p$p-again.rgba" || b=yes; done
+    detail="$detail $t: the same bytes with it off $v ($(ls "$O/on-$t" | wc -l) files), reused $want of 3 in $n of 2 pictures, none with it off in $m of 2;"
+    times="$times $t $(grep -a -o 'median [0-9.]* ms (render [0-9.]* ms)' "$O/on-$t.log" | head -n 1 | tr -d '()') against $(grep -a -o 'median [0-9.]* ms (render [0-9.]* ms)' "$O/off-$t.log" | head -n 1 | tr -d '()');"
+    if [ "$(rg_exit "$O/on-$t.log")" = 0 ] && [ "$(rg_exit "$O/off-$t.log")" = 0 ] && [ $v = yes ] && [ $b = no ] && [ "$n" = 2 ] && [ "$m" = 2 ]; then
+      ok=$((ok + 1))
+    else
+      bad=$((bad + 1)); detail="$detail (FAILED: exits $(rg_exit "$O/on-$t.log") $(rg_exit "$O/off-$t.log"), again differs from the first $b);"
+    fi
+  done
+  rg_item reuse "$([ $bad = 0 ] && echo PASSED || echo FAILED)" "$ok of 4 transports:$detail times on the software renderer, a frame drawn again (reuse on, off):$times"
+  # the mutants: each must change the bytes of its transport against the outputs with the reuse off
+  n=0; ok=0; detail=""
+  for c in "drawn:cnv:FB_SOURCE=0" "key:src:FB_SOURCE=1" "kept:cnv:FB_SOURCE=0" "luma:ipt:FB_SOURCE=1,FB_IPT=1,FB_COMPUTE=1"; do
+    m=${c%%:*}; t=${c#*:}; e=${t#*:}; t=${t%%:*}
+    n=$((n + 1))
+    if mutant "reuse-$m" "$TS/mut-reuse-$m.py" dvbridge_render.c && rg_bridge "$RG_W/mut/reuse-$m" "$L" "$F" "$O/fb.c" "$O/fb-$m" "$SRC"; then
+      rr "$O/fb-$m" "$O/mut-$m" "$t" 1 "$e"
+      if same "$O/mut-$m" "$O/off-$t"; then detail="$detail $m: NOT CAUGHT;"
+      else ok=$((ok + 1)); detail="$detail $m: caught ($(for f in "$O/mut-$m"/*.rgba; do cmp -s "$f" "$O/off-$t/$(basename "$f")" || basename "$f"; done | sed "s/^$t-//" | tr '\n' ' '| sed 's/ $//') differ);"; fi
+      rg_rm "$O/fb-$m" "$O/mut-$m"
+    else detail="$detail $m: no longer applies or does not build;"; fi
+    rg_rm "$RG_W/mut/reuse-$m"
+  done
+  rg_item reuse-mutants "$([ $ok = $n ] && echo PASSED || echo FAILED)" "$ok of $n mutants caught by the bytes:$detail"
+  # HDR over the tunnel drawn again (hdrsdr-tunnel-reuse.py): the PQ chart drawn four times into the tunnel of a
+  # transport renderer, with a GUI composited into it each time (200 pixels further right) and without one, the reuse on
+  # and off: every file the same bytes; reused 2 of 4 with the GUI (the second draw keeps the copy), 3 of 4 without, none
+  # with it off; and a mutant that takes the picture although the GUI was composited into it
+  cp "$TS/hdrsdr_test.c" "$O/hs.c"
+  if rg_edit "$O/hs.c" "$TS/hdrsdr-tunnel-reuse.py" > "$O/hs-edit.log" 2>&1 && rg_bridge "$K" "$L" "$F" "$O/hs.c" "$O/hs"; then
+    tun() { # <binary> <tag> <reuse> <GUI>
+      rg_fresh "$O/$2"
+      rg_log "$O/$2.log" gpu TUNNEL_REUSE=$3 TUNNEL_GUI=$4 nice -n 19 timeout 2400 "$1" "$IN/chart-pq.yuv" 1 pq 4000 0.005 4000 400 p3 "$O/$2/"
+    }
+    ok=0; detail=""
+    for gui in 1 0; do
+      want=3; [ $gui = 1 ] && want=2
+      tun "$O/hs" t-on-$gui 1 $gui
+      tun "$O/hs" t-off-$gui 0 $gui
+      v=no; same "$O/t-on-$gui" "$O/t-off-$gui" && v=yes
+      n=$(grep -a -c "drawn 4 of 4 times (GUI $gui, reuse 1), $want reused" "$O/t-on-$gui.log")
+      m=$(grep -a -c "drawn 4 of 4 times (GUI $gui, reuse 0), 0 reused" "$O/t-off-$gui.log")
+      detail="$detail GUI $gui: the same bytes with it off $v ($(ls "$O/t-on-$gui" | wc -l) files), reused $want of 4 $n, none with it off $m;"
+      [ $v = yes ] && [ "$n" = 1 ] && [ "$m" = 1 ] && [ "$(rg_exit "$O/t-on-$gui.log")" = 0 ] && ok=$((ok + 1))
+    done
+    rg_item reuse-tunnel "$([ $ok = 2 ] && echo PASSED || echo FAILED)" "HDR over the tunnel, the PQ chart:$detail"
+    if mutant reuse-tunnel "$TS/mut-reuse-tunnel.py" dvbridge_render.c && rg_bridge "$RG_W/mut/reuse-tunnel" "$L" "$F" "$O/hs.c" "$O/hs-m"; then
+      tun "$O/hs-m" t-mut 1 1
+      if same "$O/t-mut" "$O/t-off-1"; then rg_item reuse-tunnel-mutant FAILED "the picture taken although the GUI was composited into it: NOT CAUGHT"
+      else rg_item reuse-tunnel-mutant PASSED "the picture taken although the GUI was composited into it: caught ($(for f in "$O/t-mut"/*.rgba; do cmp -s "$f" "$O/t-off-1/$(basename "$f")" || basename "$f"; done | tr '\n' ' ' | sed 's/ $//') differ)"; fi
+    else rg_item reuse-tunnel-mutant FAILED "the mutant no longer applies or does not build"; fi
+    rg_rm "$RG_W/mut/reuse-tunnel" "$O/hs-m"
+  else rg_item reuse-tunnel FAILED "the edit or the build: $(tail -n 2 "$O/hs-edit.log" | tr '\n' ' ')"; fi
+  rg_rm "$O"
 }
 
 rg_main "$STAGES" "$@"

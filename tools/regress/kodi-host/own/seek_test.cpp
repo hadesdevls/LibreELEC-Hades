@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 LibreELEC Hades
 //
-// Host test of CSeekTrace (SeekTrace.h) and CSeekPending (SeekPending.h).
+// Host test of CSeekTrace (SeekTrace.h) and CSeekPending (SeekPending.h), and of what the player measures
+// and shows of a slow source while it buffers (SourceRate.h, and where VideoPlayer.cpp calls it).
 // Build: g++ -std=c++20 -O1 -Wall -Wextra -I<dir with the headers> seek_test.cpp -o seek_test -lpthread
 #include "ModeChangeTime.h"
 #include "SeekPending.h"
 #include "SeekTrace.h"
+#include "SourceRate.h"
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -278,6 +282,71 @@ static void TestRelativeWhilePending()
   }
 }
 
+static std::string ReadTree(const char* rel)
+{
+  std::ifstream in(std::string(KODI_TREE) + "/" + rel);
+  std::stringstream s;
+  s << in.rdbuf();
+  return s.str();
+}
+
+static std::string BodyOf(const std::string& text, const char* head)
+{
+  const size_t at = text.find(head);
+  if (at == std::string::npos)
+    return {};
+  const size_t end = text.find("\n}\n", at);
+  return text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+}
+
+static void TestSourceRate()
+{
+  namespace R = SOURCE_RATE;
+  // a film of 3840x2160 at 48 frames a second, two views: about 6 MB/s (48 Mbit/s) on average
+  const uint32_t film = 6000000;
+  CHECK(std::fabs(R::Mbits(6000000, 1000) - 48.0) < 1e-9);
+  CHECK(std::fabs(R::Mbits(27000000, 14600) - 14.794520547945206) < 1e-9);
+  CHECK(R::Mbits(1000, 0) == 0.0);
+  // 14.6 s of a buffering after a seek, a third of what the film takes: slower, told
+  CHECK(R::Slower(14600, 29200000, film));
+  // the same source for 2.9 s: not told yet
+  CHECK(!R::Slower(2900, 5800000, film));
+  // as fast as the film, or faster: never told
+  CHECK(!R::Slower(5000, 30000000, film));
+  CHECK(!R::Slower(5000, 60000000, film));
+  // nothing known of the video, or of what came: not told
+  CHECK(!R::Slower(5000, 1000, 0));
+  CHECK(!R::Slower(5000, -1, film));
+  // just below and just at what the film takes, after 3 s
+  CHECK(R::Slower(3000, 17999999, film));
+  CHECK(!R::Slower(3000, 18000000, film));
+
+  // the level shown while buffering: how far the player got to playing on (4 s of queue)
+  CHECK(R::Progress(0.0, 2.0, 4.0) == 0.5);
+  CHECK(R::Progress(0.0, 5.0, 4.0) == 1.0);
+  CHECK(R::Progress(0.3, 0.4, 4.0) == 0.3);
+  CHECK(R::Progress(-1.0, 1.0, 4.0) == 0.25);
+  CHECK(R::Progress(-1.0, 0.0, 4.0) == 0.0);
+  CHECK(R::Progress(0.0, 2.0, 0.0) == 0.0);
+
+  const std::string player = ReadTree("xbmc/cores/VideoPlayer/VideoPlayer.cpp");
+  CHECK(Has(player, "    state.cache_level = state.caching\n"
+                    "                            ? SOURCE_RATE::Progress(cache.level, cache.time, "
+                    "m_messageQueueTimeSize)\n"));
+  const std::string caching = BodyOf(player, "void CVideoPlayer::SetCaching(ECacheState state)");
+  CHECK(Has(caching, "  if (state == CACHESTATE_FLUSH || (m_caching == CACHESTATE_FULL && state != "
+                     "CACHESTATE_FULL))\n    WatchBuffering(true);"));
+  const std::string speed = BodyOf(player, "void CVideoPlayer::HandlePlaySpeed()");
+  CHECK(Has(speed, "  if (m_caching == CACHESTATE_FULL)\n  {\n    // Hades: what the source sends while "
+                   "the player buffers (SourceRate.h)\n    WatchBuffering(false);"));
+  const std::string watch = BodyOf(player, "void CVideoPlayer::WatchBuffering(bool ends)");
+  CHECK(Has(watch, "  if (m_buffering.told || !SOURCE_RATE::Slower(ms, sent, status.maxrate))\n    return;\n"
+                   "  m_buffering.told = true;"));
+  CHECK(Has(watch, "position + static_cast<int64_t>(status.forward)"));
+  const std::string open = BodyOf(player, "bool CVideoPlayer::OpenInputStream()");
+  CHECK(Has(open, "  m_buffering = BufferingState{};"));
+}
+
 int main()
 {
   TestTime();
@@ -285,6 +354,7 @@ int main()
   TestPending();
   TestModeChange();
   TestRelativeWhilePending();
+  TestSourceRate();
   std::printf("%s: %d passed, %d failed\n", g_fail ? "FAILED" : "PASSED", g_pass, g_fail);
   return g_fail ? 1 : 0;
 }

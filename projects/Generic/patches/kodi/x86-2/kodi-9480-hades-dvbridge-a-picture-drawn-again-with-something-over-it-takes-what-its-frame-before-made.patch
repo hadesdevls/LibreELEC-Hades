@@ -1,0 +1,754 @@
+From 0644e0bc94113b31573e8b3cc35aab1fd8ca0ee4 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:32:14 +0000
+Subject: [PATCH] [Hades][dvbridge] A picture drawn again with something over
+ it takes what its frame before made
+
+A frame with the GUI or subtitles over it that shows the same picture as the frame before it (a pause
+with the OSD over it, a picture shown for another refresh) was composed and converted again in full at
+every refresh: libplacebo's composition, the rows of 4:2:2 chroma and the codes of the IPT tunnel in
+the source transport, and the whole libplacebo render (the mapping to the display in Low-Latency) in
+the converted one. The same inputs give the same bytes, so nothing of that is made again now.
+
+render() keeps a key of what it draws from: the GL textures of the planes of the picture and of its
+layer with their offsets and depth, the times of both, the bytes of the metadata, the place and the
+part of the picture drawn, the active area of the prepared metadata, the target, and every setting of
+the renderer that the composition, the rows, the IPT codes or the converted picture depend on (the
+step-down level, the composer, the transfer of the base layer, the transports asked for, Low-Latency
+with its mapping, test pattern, HDR10+ tone curve, trims, 3D LUT and gamut table, and what failed on
+this GPU). A render of a frame with something drawn over it (dvbridge_render_set_drawn()) whose key
+and metadata are those of the render before takes:
+ - in the source transport, the composed planes, their rows and the IPT codes as that render left
+   them (the GUI is composited into rgb, which pass 3 makes again from them, and the frame is packed
+   as before);
+ - converted, rgb as that render left it, where nothing was drawn into it since (the GUI composited by
+   the packer); else a copy of it that the first render of the same picture again keeps (132 MB at
+   3840x2160, made once and freed when the stream ends). The caller says when it draws into rgb
+   (dvbridge_render_texture_drawn(), as CDVBridgeGLES::PQTextureDrawn() always did).
+Any other render, a failure, a recover or reset, the HDR10, plain and graphics renders, the warm-up
+and a change of the tunnel forget it. A frame with nothing over it is not affected: the window system
+keeps such a picture on the screen, and where it does not, it is drawn whole as before.
+
+Such a frame costs less than a picture: the window system does not take its GPU time for the levels
+of the frames with GUI elements (CDVGuiLevel, CDVGuiStep) nor for presenting a frame ahead
+(CDVBridgeGLES::Reused()), as it does not for a picture that stands still. kodi.log says once in a
+video that it happened. <video><dvreuse>false</dvreuse></video> in advancedsettings.xml turns it off,
+to measure what it saves.
+
+Measured on the software renderer (zink over lavapipe, LP_NUM_THREADS=4; the CPU does the GPU's
+work, so this is a proxy), pictures 51 and 960 of a profile 7 FEL stream with the bench's GUI of
+bands over 1200 of the 2160 rows (opaque, half and nearly transparent), a frame drawn again (render,
+composite and pack; the render alone in parentheses):
+ - YCbCr as composed: 266 ms (193) before, 100 ms (27) after;
+ - IPT tunnel: 395 ms (250) before, 186 ms (41) after;
+ - converted: 213 ms (175) before, 46 ms (7) after;
+ - Low-Latency mapped to 700 cd/m2: 299 ms (264) before, 43 ms (7) after.
+Every file the same bytes with it and without it (tools/regress/dvbridge, stage reuse, with four
+mutants caught by the bytes).
+---
+ tools/dvbridge/dvbridge_render.c              | 325 +++++++++++++++++-
+ tools/dvbridge/dvbridge_render.h              |  17 +
+ .../VideoRenderers/DVBridgeGLES.cpp           |  25 ++
+ .../VideoPlayer/VideoRenderers/DVBridgeGLES.h |   7 +
+ xbmc/settings/AdvancedSettings.cpp            |   2 +
+ xbmc/settings/AdvancedSettings.h              |   4 +
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  15 +-
+ 7 files changed, 372 insertions(+), 23 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index 83e5a22..c6fceb1 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -89,6 +89,39 @@ struct gamut_ahead {
+     double asked_at; /* now_ms() when it was asked for */
+ };
+ 
++/* Hades: everything that a render of render() draws from (reuse_key_of()): the GL textures of the
++ * planes of the picture and of its layer, with their offsets and depth, the times of both, the size
++ * of the metadata (whose bytes are compared apart), the place and the part of the picture drawn,
++ * the target of the direct way, and every setting of the renderer that render() reads to make the
++ * composed planes, their rows, the codes of the IPT tunnel or the converted picture. Made whole with
++ * memset, so that two keys of the same values compare equal byte for byte. */
++struct reuse_key {
++    double pts, el_pts;
++    unsigned textures[8];
++    float shifts[16];
++    int planes, el_planes;
++    struct pl_bit_encoding bits, el_bits;
++    int comps[8];
++    int mapping[8][4];
++    struct dvbridge_geometry geometry;
++    unsigned margins[4]; /* the active area of the prepared metadata (render() fills it in) */
++    size_t bytes;
++    uintptr_t target;
++    int step, base_transfer, gui_level, gamut_asked;
++    bool el_known, flip, early, legacy, mmr, identity_off, all_rows, ipt_wanted, source_wanted,
++        compute, ipt_compute, serializer, tunnel, low_latency, ll_pattern, ll_curve_failed,
++        trim_failed, lut_failed, gamut_fine_failed;
++    uintptr_t lut;
++    uint64_t lut_signature;
++    struct dvbridge_hdr10_mapping ll_mapping;
++    struct dvbridge_plain_hdr10plus ll_hdr10plus;
++};
++
++/* Hades: what the last render left that a render of the same picture takes (dvbridge_render_reused()):
++ * nothing; the composed planes with their rows and the codes of the IPT tunnel (the source
++ * transport); or the converted picture (rgb) */
++enum { REUSE_NONE, REUSE_SOURCE, REUSE_CONVERTED };
++
+ struct dvbridge_renderer {
+     pl_gpu gpu;
+     pl_renderer renderer;
+@@ -262,6 +295,27 @@ struct dvbridge_renderer {
+     const struct dvbridge_lut *lut;
+     struct dvbridge_lut_state lut_state;
+     bool lut_tried, lut_applied, lut_failed;
++    /* Hades: a render that draws the picture of the render before it again, the same way (a pause
++     * with the OSD or a menu over it, a picture shown for more than one refresh with subtitles),
++     * takes what that render made instead of making it again: the same inputs give the same bytes.
++     * reuse_kind: what the last render left (REUSE_*), drawn from reuse_key and the reuse_bytes of
++     * metadata in reuse_meta (of reuse_meta_size); reuse_luma, reuse_w, reuse_h: the luma that its
++     * transport took and its size (render_source()). rgb_drawn: the caller drew into rgb since the
++     * last render (the GUI composited over a converted picture, dvbridge_render_texture_drawn()):
++     * the converted picture is then taken from rgb_kept, a copy of it made by the first render
++     * that drew it again (rgb_kept_valid: it holds the picture of reuse_key). reused: the last
++     * render took it. reuse_off: dvbridge_render_allow_reuse() */
++    struct reuse_key reuse_key;
++    void *reuse_meta;
++    size_t reuse_meta_size;
++    int reuse_kind;
++    unsigned reuse_luma;
++    int reuse_w, reuse_h;
++    bool rgb_drawn;
++    pl_tex rgb_kept;
++    bool rgb_kept_valid;
++    bool reused, reuse_off;
++    bool reuse_ccm; /* (the converted render that left it composed as ETSI GS CCM 001 does) */
+ };
+ 
+ /* Hades: the alpha of the picture of the composed way, that Kodi draws over: its blend functions
+@@ -768,7 +822,7 @@ static struct dvbridge_renderer *create_renderer(pl_gpu gpu, pl_log log, bool tr
+                              PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
+     if (fmt && transport)
+         r->rgb = pl_tex_create(gpu, pl_tex_params(.w = 3840, .h = 2160, .format = fmt,
+-            .sampleable = true, .renderable = true, .blit_dst = true));
++            .sampleable = true, .renderable = true, .blit_dst = true, .blit_src = true));
+     if (!r->renderer || !r->context || (transport ? !r->rgb : !fmt)) {
+         dvbridge_renderer_destroy(r);
+         return NULL;
+@@ -796,6 +850,10 @@ void dvbridge_renderer_recover(struct dvbridge_renderer *r)
+     r->hdr10_ready = false;
+     r->tunnel_frame = false;
+     r->ll_gui = 0;
++    /* Hades: nothing of the render before is taken by the next one (render()) */
++    r->reuse_kind = REUSE_NONE;
++    r->rgb_kept_valid = false;
++    r->reused = false;
+     if (r->renderer)
+         pl_renderer_reset_errors(r->renderer, NULL);
+ }
+@@ -805,6 +863,8 @@ void dvbridge_renderer_reset(struct dvbridge_renderer *r)
+     if (!r)
+         return;
+     dvbridge_renderer_recover(r);
++    /* Hades: (and the copy of a converted picture, made again where a picture is drawn again) */
++    pl_tex_destroy(r->gpu, &r->rgb_kept);
+     if (r->renderer)
+         pl_renderer_flush_cache(r->renderer);
+     dvbridge_reset(r->context);
+@@ -829,8 +889,11 @@ void dvbridge_render_set_display_management(struct dvbridge_renderer *r, unsigne
+ 
+ void dvbridge_render_texture_drawn(struct dvbridge_renderer *r)
+ {
+-    if (r)
++    if (r) {
+         r->rgb_clean = false;
++        /* Hades: (and the converted picture in it is no longer the one its render made) */
++        r->rgb_drawn = true;
++    }
+ }
+ 
+ bool dvbridge_render_take_notes(struct dvbridge_renderer *r, struct dvbridge_render_notes *notes)
+@@ -895,6 +958,8 @@ void dvbridge_renderer_destroy(struct dvbridge_renderer *r)
+     pl_tex_destroy(r->gpu, &r->hdr10[0]);
+     pl_tex_destroy(r->gpu, &r->hdr10[1]);
+     pl_tex_destroy(r->gpu, &r->rgb);
++    pl_tex_destroy(r->gpu, &r->rgb_kept);
++    free(r->reuse_meta);
+     dvbridge_lut_state_destroy(r->gpu, &r->lut_state);
+     pl_renderer_destroy(&r->renderer);
+     for (int i = 0; i < PASS_TIMERS; ++i)
+@@ -1421,6 +1486,112 @@ static bool identity_planes(const struct dvbridge_renderer *r, const struct pl_f
+     return true;
+ }
+ 
++/* Hades: the key of a render of render() (struct reuse_key), but its margins, which render() takes
++ * from the metadata it prepares. false where a texture of the picture is not a GL one: then nothing
++ * of the render before is taken. */
++static bool reuse_key_of(const struct dvbridge_renderer *r, const struct pl_frame *source,
++                         size_t bytes, double pts, double el_pts, struct dvbridge_geometry geometry,
++                         pl_tex packed, bool flip, bool early, struct reuse_key *k)
++{
++    memset(k, 0, sizeof(*k));
++    const struct pl_frame *frames[2] = {source, source->enhancement_layer};
++    for (int f = 0; f < 2; ++f) {
++        const struct pl_frame *fr = frames[f];
++        if (!fr)
++            continue;
++        if (f) {
++            k->el_planes = fr->num_planes;
++            k->el_bits = fr->repr.bits;
++        } else {
++            k->planes = fr->num_planes;
++            k->bits = fr->repr.bits;
++        }
++        for (int p = 0; p < fr->num_planes && p < 4; ++p) {
++            const struct pl_plane *plane = &fr->planes[p];
++            const int i = 4 * f + p;
++            k->textures[i] = pl_opengl_unwrap(r->gpu, plane->texture, NULL, NULL, NULL);
++            if (!k->textures[i])
++                return false;
++            k->shifts[2 * i] = plane->shift_x;
++            k->shifts[2 * i + 1] = plane->shift_y;
++            k->comps[i] = plane->components;
++            for (int c = 0; c < 4; ++c)
++                k->mapping[i][c] = plane->component_mapping[c];
++        }
++    }
++    k->pts = pts;
++    k->el_known = isfinite(el_pts);
++    k->el_pts = k->el_known ? el_pts : 0.0;
++    k->geometry = geometry;
++    k->bytes = bytes;
++    k->target = (uintptr_t)packed;
++    k->flip = flip;
++    k->early = early;
++    k->step = r->step;
++    k->base_transfer = r->base_transfer;
++    k->gui_level = r->gui_level;
++    k->gamut_asked = r->gamut_asked;
++    k->legacy = r->legacy_composer;
++    k->mmr = r->mmr_table;
++    k->identity_off = r->identity_off;
++    k->all_rows = r->all_rows;
++    k->ipt_wanted = r->ipt_wanted;
++    k->source_wanted = r->source_wanted;
++    k->compute = dvbridge_source_compute_rows_usable(r->source_packer);
++    k->ipt_compute = dvbridge_source_ipt_compute_usable(r->source_packer);
++    k->serializer = r->serializer != NULL;
++    k->tunnel = r->tunnel;
++    k->low_latency = r->low_latency;
++    k->ll_pattern = r->ll_pattern;
++    k->ll_curve_failed = r->ll_curve_failed;
++    k->trim_failed = r->trim_failed;
++    k->lut_failed = r->lut_failed;
++    k->gamut_fine_failed = r->gamut_fine_failed;
++    k->lut = (uintptr_t)r->lut;
++    k->lut_signature = r->lut ? r->lut->pl.signature : 0;
++    k->ll_mapping = r->ll_mapping;
++    k->ll_hdr10plus = r->ll_hdr10plus;
++    return true;
++}
++
++/* Hades: what the render before left (left, REUSE_*) is of the picture that this render draws, the
++ * same way: the same key (its margins filled in) and the same bytes of metadata */
++static bool reuse_same(const struct dvbridge_renderer *r, int left, int kind,
++                       const struct reuse_key *key, const void *metadata, size_t bytes)
++{
++    return left == kind && key && r->reuse_meta && r->reuse_meta_size == bytes && metadata &&
++           !memcmp(key, &r->reuse_key, sizeof(*key)) && !memcmp(metadata, r->reuse_meta, bytes);
++}
++
++/* Hades: this render left kind (REUSE_*) for the next one, from key and the metadata (nothing where
++ * they cannot be kept) */
++static void reuse_leave(struct dvbridge_renderer *r, int kind, const struct reuse_key *key,
++                        const void *metadata, size_t bytes)
++{
++    r->reuse_kind = REUSE_NONE;
++    if (!key || !metadata || !bytes)
++        return;
++    if (r->reuse_meta_size != bytes) {
++        void *m = realloc(r->reuse_meta, bytes);
++        if (!m)
++            return;
++        r->reuse_meta = m;
++        r->reuse_meta_size = bytes;
++    }
++    memcpy(r->reuse_meta, metadata, bytes);
++    r->reuse_key = *key;
++    r->reuse_kind = kind;
++}
++
++/* Hades: nothing of the last render is taken by the next one (another kind of render drew into what
++ * it left) */
++static void reuse_forget(struct dvbridge_renderer *r)
++{
++    r->reuse_kind = REUSE_NONE;
++    r->rgb_kept_valid = false;
++    r->reused = false;
++}
++
+ /* Hades: the source transport (dvbridge_source.h). libplacebo composes the planes into ours and
+  * draws nothing else (pl_render_params.dovi_ccm_only: no scaling of the chroma to 4:4:4, no
+  * decoding, nothing written to the target), with the filters of the step-down level (step_down():
+@@ -1432,7 +1603,8 @@ static bool identity_planes(const struct dvbridge_renderer *r, const struct pl_f
+ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *source,
+                           const void *metadata, size_t bytes, double pts,
+                           struct dvbridge_geometry geometry, struct dvbridge_color mapped,
+-                          pl_tex target, bool flip, bool active_rows, bool *composed)
++                          pl_tex target, bool flip, bool active_rows, bool *composed,
++                          struct reuse_key *key, int left)
+ {
+     *composed = false;
+     const char *why = NULL;
+@@ -1482,8 +1654,20 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+     }
+     /* Hades: the decoder's planes where they are the composer's (identity_planes()) */
+     r->identity_taken = identity_planes(r, source, metadata, bytes, geometry);
++    /* Hades: the picture that the render before composed, the same way (a pause with the OSD over
++     * it, a picture drawn again for another refresh): its composed planes, their rows of 4:2:2 and
++     * the codes of the IPT tunnel are as it left them (the GUI is composited into rgb, which pass 3
++     * makes again below), so they are not made again: the same inputs, the same bytes */
++    if (key)
++        memcpy(key->margins, margins, sizeof(key->margins));
++    const bool reuse = reuse_same(r, left, REUSE_SOURCE, key, metadata, bytes);
+     bool ok;
+-    if (r->identity_taken) {
++    if (reuse) {
++        *composed = true;
++        if (r->identity_taken)
++            r->early_mask = false;
++        ok = true;
++    } else if (r->identity_taken) {
+         /* (no rows are left out: the decoder's planes hold every row) */
+         *composed = true;
+         r->early_mask = false;
+@@ -1506,13 +1690,19 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+     r->pack_luma = 0;
+     r->pack_w = geometry.source_width;
+     r->pack_h = geometry.source_height;
+-    if (composed_luma && chroma)
++    if (composed_luma && chroma && !reuse)
+         timer_begin(r, TIMER_ROWS);
+     /* Hades: a picture that is scaled is scaled here, in the composer's representation: its luma
+      * at the size it is drawn at, and its rows of 4:2:2 chroma at that size, every one of them */
+     unsigned luma = composed_luma;
+     float view[4];
+-    if (composed_luma && chroma && scaled(geometry)) {
++    if (reuse) {
++        /* (the luma that the transport took, at the size it took it: render before) */
++        luma = r->reuse_luma;
++        r->pack_w = r->reuse_w;
++        r->pack_h = r->reuse_h;
++        ok = ok && luma;
++    } else if (composed_luma && chroma && scaled(geometry)) {
+         ok = dvbridge_source_scale(r->source_packer, &r->source_params, composed_luma, chroma,
+                                    geometry.source_width, geometry.source_height,
+                                    view_of(&geometry, view), geometry.width, geometry.height,
+@@ -1525,7 +1715,7 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+                                   geometry.source_width, geometry.source_height, geometry.x,
+                                   geometry.y, margins, r->all_rows);
+     /* Hades: the codes of the IPT tunnel (pass 9 of dvbridge_source.c), timed with the rows */
+-    if (ok && r->ipt) {
++    if (ok && r->ipt && !reuse) {
+         unsigned ipt_luma = 0;
+         ok = dvbridge_source_to_ipt(r->source_packer, &r->source_params, luma, r->pack_w,
+                                     r->pack_h, geometry.x, geometry.y, margins, &ipt_luma);
+@@ -1534,8 +1724,13 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+             r->source_why = "the codes of the IPT tunnel could not be made";
+     }
+     timer_end(r, TIMER_ROWS);
+-    if (ok)
++    if (ok) {
+         r->pack_luma = luma;
++        r->reuse_luma = luma;
++        r->reuse_w = r->pack_w;
++        r->reuse_h = r->pack_h;
++    }
++    r->reused = ok && reuse;
+     unsigned fbo = 0;
+     if (ok && target) {
+         /* the framebuffer of the target. Hades: the window, the default framebuffer that Kodi wraps
+@@ -1568,6 +1763,7 @@ static bool render_source(struct dvbridge_renderer *r, const struct pl_frame *so
+         /* it writes the whole raster, and outside the place of the picture the alpha is 2: not
+          * the black that a converted picture at that place leaves */
+         r->rgb_clean = false;
++        r->rgb_drawn = true;
+     }
+     if (!ok && !r->source_why)
+         r->source_why = !*composed ? "the picture was not composed as ETSI GS CCM 001 composes it"
+@@ -1642,6 +1838,11 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+     /* Hades: the picture that a composed render of the source transport made in the tiles of what
+      * was drawn over it is another frame's */
+     dvbridge_source_forget(r->source_packer);
++    /* Hades: what the render before left (struct reuse_key): taken where this one draws the same
++     * picture the same way, and left again only by a render that succeeds */
++    const int left = r->reuse_kind;
++    r->reuse_kind = REUSE_NONE;
++    r->reused = false;
+     if (!source || !isfinite(pts) || source->num_planes < 1 || source->num_planes > 4 || source->rotation ||
+         source->crop.x0 != 0 || source->crop.y0 != 0 ||
+         source->crop.x1 != geometry.source_width || source->crop.y1 != geometry.source_height) {
+@@ -1665,6 +1866,16 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+                 return false;
+             }
+     }
++    /* (Hades: only for a frame with something drawn over it, the GUI or subtitles (the caller said
++     * so: dvbridge_render_set_drawn()). A frame with nothing over it that draws the same picture
++     * again is kept on the screen by the caller, and where it is not, it is drawn whole as before:
++     * the caller measures the time of such frames as that of a picture) */
++    struct reuse_key key_store;
++    struct reuse_key *key = !r->reuse_off && r->drawn_gui &&
++                                    reuse_key_of(r, source, bytes, pts, el_pts, geometry, packed,
++                                                 flip, early, &key_store)
++                                ? &key_store
++                                : NULL;
+     bool paired = source->enhancement_layer && isfinite(el_pts) && fabs(pts - el_pts) < 0.00001;
+     /* Hades: HLG sent as Dolby Vision is a single layer: one with an enhancement layer is not drawn
+         */
+@@ -1698,11 +1909,13 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         !gui_converts(r, packed) && source_planes(r, source)) {
+         bool composed = false;
+         if (render_source(r, source, metadata, bytes, pts, geometry, mapped, packed, flip, early,
+-                          &composed)) {
++                          &composed, key, left)) {
+             r->source = true;
+             r->ready = true;
++            reuse_leave(r, REUSE_SOURCE, key, metadata, bytes);
+             return true;
+         }
++        r->reused = false;
+         /* converted then, as without the source transport: what that composition left goes, but
+          * a failure of the composer, which stays until a reset as libplacebo has it (the converted
+          * picture is then composed by its reshaping) */
+@@ -1857,16 +2070,45 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+      * texture by the caller (the GUI and the subtitles: dvbridge_render_texture_drawn()). It was
+      * cleared for every frame, 132 MB written for each. */
+     const bool whole = !geometry.x && !geometry.y && geometry.width == 3840 && geometry.height == 2160;
+-    if (!packed && !whole && (!r->rgb_clean || !same_place(r->clean_place, geometry))) {
+-        pl_tex_clear(r->gpu, r->rgb, (float[4]){0, 0, 0, 2});
+-        r->rgb_clean = true;
+-        r->clean_place[0] = geometry.x;
+-        r->clean_place[1] = geometry.y;
+-        r->clean_place[2] = geometry.width;
+-        r->clean_place[3] = geometry.height;
++    /* Hades: the converted picture of the render before, where this one draws the same picture the
++     * same way (a pause with the OSD over it, a picture drawn again for another refresh): rgb as that
++     * render left it, where nothing was drawn into it since; else the copy of it that the first render
++     * of the same picture again kept (rgb_kept), where the caller composited the GUI into it. The
++     * same inputs, the same bytes: it is not drawn again. */
++    if (key)
++        memcpy(key->margins, margins, sizeof(key->margins));
++    const bool repeat = !packed && reuse_same(r, left, REUSE_CONVERTED, key, metadata, bytes);
++    bool rendered = false, reused = false;
++    if (repeat && !r->rgb_drawn) {
++        reused = rendered = true;
++    } else if (repeat && r->rgb_kept && r->rgb_kept_valid) {
++        dvbridge_gl_drain_errors();
++        pl_tex_blit(r->gpu, pl_tex_blit_params(.src = r->rgb_kept, .dst = r->rgb));
++        reused = rendered = glGetError() == GL_NO_ERROR;
++        /* (as the render left it: black around a picture that does not fill the raster) */
++        r->rgb_clean = reused && !whole;
++        memcpy(r->clean_place, (int[4]){geometry.x, geometry.y, geometry.width, geometry.height},
++               sizeof(r->clean_place));
++    }
++    if (reused) {
++        /* (what the hooks of that render found, which it succeeded with) */
++        mask.called = true;
++        mask.early_called = mask.early_mask;
++        mask.lut_called = mask.lut != NULL;
++        trim.called = trim.on;
++        ccm_composed = r->reuse_ccm;
++    } else {
++        if (!packed && !whole && (!r->rgb_clean || !same_place(r->clean_place, geometry))) {
++            pl_tex_clear(r->gpu, r->rgb, (float[4]){0, 0, 0, 2});
++            r->rgb_clean = true;
++            r->clean_place[0] = geometry.x;
++            r->clean_place[1] = geometry.y;
++            r->clean_place[2] = geometry.width;
++            r->clean_place[3] = geometry.height;
++        }
++        time_render(r, &params);
++        rendered = pl_render_image(r->renderer, &image, &target, &params);
+     }
+-    time_render(r, &params);
+-    const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
+     r->ready = rendered && mask.called && !mask.failed && (!trim.on || trim.called) && (!mask.lut || mask.lut_called);
+     /* An EL sampling failure can otherwise return a successfully rendered BL-only frame. A composer of
+      * ETSI GS CCM 001 that failed on this GPU is not one: libplacebo composed the picture by its own
+@@ -1899,6 +2141,30 @@ static bool render(struct dvbridge_renderer *r, const struct pl_frame *source,
+         dvbridge_candidate_destroy(r->pending);
+         r->pending = NULL;
+     }
++    /* Hades: what this render leaves for the next one (above). The first render of a picture drawn
++     * again, into which the caller had drawn, keeps a copy of what it drew (132 MB at 3840x2160, made
++     * once, until the stream ends: dvbridge_renderer_reset()); a picture of another key leaves no copy
++     * of it. Where the copy cannot be made, such a picture is drawn again each time, as before. */
++    if (r->ready && !packed) {
++        if (repeat && !reused) {
++            if (!r->rgb_kept)
++                r->rgb_kept = pl_tex_create(r->gpu, pl_tex_params(.w = r->rgb->params.w,
++                    .h = r->rgb->params.h, .format = r->rgb->params.format, .sampleable = true,
++                    .renderable = true, .blit_src = true, .blit_dst = true));
++            r->rgb_kept_valid = false;
++            if (r->rgb_kept) {
++                dvbridge_gl_drain_errors();
++                pl_tex_blit(r->gpu, pl_tex_blit_params(.src = r->rgb, .dst = r->rgb_kept));
++                r->rgb_kept_valid = glGetError() == GL_NO_ERROR;
++            }
++        } else if (!repeat) {
++            r->rgb_kept_valid = false;
++        }
++        r->rgb_drawn = false;
++        r->reuse_ccm = ccm_composed;
++        r->reused = reused;
++        reuse_leave(r, REUSE_CONVERTED, key, metadata, bytes);
++    }
+     return r->ready;
+ }
+ 
+@@ -3033,6 +3299,8 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     /* Hades: (why nothing is drawn, for the log: dvbridge_render_refused(), dvbridge_render_not_drawn()) */
+     r->refused = NULL;
+     r->not_drawn = NULL;
++    /* (Hades: it may draw into rgb: nothing of render() is taken after it) */
++    reuse_forget(r);
+     /* (HDR over the tunnel: a picture that is not drawn leaves no frame to pack) */
+     if (r->tunnel) {
+         r->tunnel_frame = false;
+@@ -3482,6 +3750,22 @@ bool dvbridge_render_identity_planes(const struct dvbridge_renderer *r)
+     return r && r->ready && r->source && r->identity_taken;
+ }
+ 
++void dvbridge_render_allow_reuse(struct dvbridge_renderer *r, bool allow)
++{
++    if (!r)
++        return;
++    r->reuse_off = !allow;
++    if (!allow) {
++        reuse_forget(r);
++        pl_tex_destroy(r->gpu, &r->rgb_kept);
++    }
++}
++
++bool dvbridge_render_reused(const struct dvbridge_renderer *r)
++{
++    return r && r->ready && r->reused;
++}
++
+ void dvbridge_render_set_step(struct dvbridge_renderer *r, int level)
+ {
+     if (r)
+@@ -3756,6 +4040,8 @@ static void give_back_state(struct dvbridge_renderer *r, const struct kept_state
+     /* the picture was drawn into: what is outside the place of the next one is not known to be
+      * black (it is cleared then, which writes the same bytes) */
+     r->rgb_clean = false;
++    /* (Hades: and what these left is not taken by the frames: render()) */
++    reuse_forget(r);
+     /* a render of these that failed leaves nothing turned off for the frames */
+     pl_renderer_reset_errors(r->renderer, NULL);
+     dvbridge_gl_drain_errors();
+@@ -4106,6 +4392,7 @@ bool dvbridge_render_complete(struct dvbridge_renderer *r)
+     if (!r->pending || !dvbridge_active_area(r->pending, margins))
+         return false;
+     pl_opengl_unwrap(r->gpu, r->rgb, NULL, NULL, &fbo);
++    r->rgb_drawn = true;
+     /* (Hades: the luma at the size it is packed at, render_source()) */
+     return fbo && r->pack_luma &&
+            dvbridge_source_complete(r->source_packer, transport_params(r), r->pack_luma,
+@@ -4259,6 +4546,7 @@ bool dvbridge_render_graphics(struct dvbridge_renderer *r, const void *metadata,
+     r->ready = false;
+     r->ll_gui = 0;
+     r->tunnel_frame = false;
++    reuse_forget(r); /* (Hades: it draws into rgb) */
+     r->refused = NULL;
+     r->not_drawn = NULL;
+     r->early_mask = false;
+@@ -4330,6 +4618,7 @@ bool dvbridge_render_set_tunnel(struct dvbridge_renderer *r, bool tunnel)
+         /* (what is outside a place is not known: the other kind of frame drew into the same
+            texture) */
+         r->rgb_clean = false;
++        reuse_forget(r);
+     }
+     return true;
+ }
+diff --git a/tools/dvbridge/dvbridge_render.h b/tools/dvbridge/dvbridge_render.h
+index 60a64a9..777727c 100644
+--- a/tools/dvbridge/dvbridge_render.h
++++ b/tools/dvbridge/dvbridge_render.h
+@@ -430,6 +430,23 @@ void dvbridge_render_allow_early_mask(struct dvbridge_renderer *renderer, bool a
+ #define DVBRIDGE_RENDER_IDENTITY_PLANES 1
+ void dvbridge_render_allow_identity_planes(struct dvbridge_renderer *renderer, bool allow);
+ bool dvbridge_render_identity_planes(const struct dvbridge_renderer *renderer);
++/* Hades: a render of a frame with something drawn over it (dvbridge_render_set_drawn()) that draws
++ * the picture of the render before it again, the same way (the same GL textures of its planes and of
++ * its layer, the same times, metadata, place, part of the picture, active area, settings and
++ * target), takes what that render made instead of making it again: in
++ * the source transport its composed planes, their rows of 4:2:2 and the codes of the IPT tunnel
++ * (the picture under the GUI is made again from them, and packed); converted (Low-Latency too),
++ * its picture, as that render left it where nothing was drawn into it since, else from a copy of it
++ * that the first render of the same picture again keeps (132 MB at 3840x2160, until the stream
++ * ends). The same inputs, the same bytes: a pause with the OSD or a menu over it, and a picture
++ * shown for more than one refresh with something over it, no longer compose and convert the
++ * picture at every refresh. reuse (the default): allowed; turned off to measure what it saves, and
++ * by the host test, to compare. reused: the last render took it (such a frame costs less than the
++ * render of a picture, and is not one to measure the cost of a picture by). The caller tells the
++ * renderer when it draws into the picture (dvbridge_render_texture_drawn()). */
++#define DVBRIDGE_RENDER_REUSE 1
++void dvbridge_render_allow_reuse(struct dvbridge_renderer *renderer, bool allow);
++bool dvbridge_render_reused(const struct dvbridge_renderer *renderer);
+ /* Hades: a step down from the faithful picture, for graphics that cannot draw a frame in the time
+  * of a refresh. With libplacebo's reshaping (dvbridge_render_use_ccm_composer(), false), the
+  * planes that are scaled up to the size of the picture are scaled up bilinearly (the sampling of
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index c2886be..f2dc193 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -618,6 +618,19 @@ bool CDVBridgeGLES::Initialize(bool allowSoftware)
+       CLog::Log(LOGINFO, "DVBridge: the GUI cache is checked, as advancedsettings.xml asks "
+                          "(dvguicachecheck): the tiles copied are packed again and compared");
+   }
++  // Hades: a frame with something drawn over it that draws the picture of the frame before it
++  // again, the same way (a pause with the OSD over it), takes what that frame made of the picture
++  // instead of composing and converting it again (the same bytes; dvbridge_render_allow_reuse()).
++  // advancedsettings.xml can turn it off, to measure what it saves:
++  // <video><dvreuse>false</dvreuse></video>
++  {
++    const auto settings = CServiceBroker::GetSettingsComponent();
++    const bool reuse = !settings || settings->GetAdvancedSettings()->m_videoDVReuse;
++    dvbridge_render_allow_reuse(m_renderer, reuse);
++    if (!reuse)
++      CLog::Log(LOGINFO, "DVBridge: a picture drawn again with something over it is composed and "
++                         "converted again at every frame, as advancedsettings.xml asks (dvreuse)");
++  }
+   // Hades: the rows of 4:2:2 chroma of the source transport by a compute shader that reads the rows
+   // of 4:2:0 of a tile once, where the GL makes it (OpenGL ES 3.1; the same bytes, fewer texture
+   // fetches, the technique of YBLOD's pack). advancedsettings.xml can turn it off, to measure what it
+@@ -731,6 +744,7 @@ void CDVBridgeGLES::Reset()
+   m_l1Changes = 0;
+   m_prepared = m_packed = false;
+   m_direct = false;
++  m_reusedSaid = false;
+   m_sourceWhyLogged = nullptr;
+   m_refusalsCount = 0;
+   // (resetting the renderer destroys what libplacebo had cached, and it checks for errors then)
+@@ -835,6 +849,17 @@ bool CDVBridgeGLES::Prepare(const Layer& base, const Layer* enhancement,
+                                                base.pts, elPts, geometry);
+   if (!m_direct)
+     LogEarlyMask(false);
++  // Hades: a picture drawn again with something over it, taken as its frame before made it (said
++  // once in a video)
++  if (Reused() && !m_reusedSaid)
++  {
++    m_reusedSaid = true;
++    CLog::Log(LOGINFO,
++              "DVBridge: a picture drawn again with something over it (a pause with the OSD, for "
++              "example) takes what its frame before made of it: its composition and conversion "
++              "are not made again (the same bytes; such frames are not measured as the cost of a "
++              "picture; video/dvreuse)");
++  }
+   LogNotes();
+   // Give the packed path up only when it fails on frames that the full-precision path draws: a
+   // frame that neither path accepts (its metadata) says nothing about the packed path.
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+index 7d447f1..a835087 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.h
+@@ -115,6 +115,10 @@ public:
+   bool Composable() const { return m_prepared && !m_direct; }
+   //! The prepared frame was drawn directly into the output
+   bool Direct() const { return m_prepared && m_direct; }
++  //! Hades: the prepared frame, with something drawn over it, took the picture of the frame before
++  //! it as that one made it (the same picture drawn the same way: dvbridge_render_reused()). It
++  //! costs less than a picture, and its time is not taken for one.
++  bool Reused() const { return m_prepared && !m_direct && dvbridge_render_reused(m_renderer); }
+   //! Hades: a frame of this geometry that is allowed to be drawn directly will be tried so
+   //! (Prepare()): what a check of it before it is drawn takes it to be drawn as
+   bool TriesDirect(const dvbridge_geometry& geometry) const
+@@ -757,6 +761,9 @@ private:
+   bool m_computeRowsSaid = false;
+   //! Hades: and that the conversion of the IPT tunnel is made by its compute pass
+   bool m_computeIptSaid = false;
++  //! Hades: a prepared frame took the picture of the frame before it (Reused()), and the log said
++  //! so in this video (Prepare(); Reset() forgets it)
++  bool m_reusedSaid = false;
+   unsigned m_guiCacheFrames = 0;
+   unsigned long long m_guiCacheTiles[3] = {0, 0, 0};
+   bool m_guiCacheDiffered = false;
+diff --git a/xbmc/settings/AdvancedSettings.cpp b/xbmc/settings/AdvancedSettings.cpp
+index 2df1b4d..c3e7659 100644
+--- a/xbmc/settings/AdvancedSettings.cpp
++++ b/xbmc/settings/AdvancedSettings.cpp
+@@ -266,6 +266,7 @@ void CAdvancedSettings::Initialize()
+   m_videoHotplugRelink = true;
+   m_videoDVDrawnTiles = true;
+   m_videoDVGuiCache = true;
++  m_videoDVReuse = true;
+   m_videoDVGpuProfile = true;
+   m_videoDVGpuForceHigh = false;
+   m_videoDVGuiCacheCheck = false;
+@@ -810,6 +811,7 @@ void CAdvancedSettings::ParseSettingsFile(const std::string &file)
+     XMLUtils::GetBoolean(pElement, "hotplugrelink", m_videoHotplugRelink);
+     XMLUtils::GetBoolean(pElement, "dvdrawntiles", m_videoDVDrawnTiles);
+     XMLUtils::GetBoolean(pElement, "dvguicache", m_videoDVGuiCache);
++    XMLUtils::GetBoolean(pElement, "dvreuse", m_videoDVReuse);
+     XMLUtils::GetBoolean(pElement, "dvgpuprofile", m_videoDVGpuProfile);
+     XMLUtils::GetBoolean(pElement, "dvgpuforcehigh", m_videoDVGpuForceHigh);
+     XMLUtils::GetBoolean(pElement, "dvguicachecheck", m_videoDVGuiCacheCheck);
+diff --git a/xbmc/settings/AdvancedSettings.h b/xbmc/settings/AdvancedSettings.h
+index 9f0cb90..603bb6a 100644
+--- a/xbmc/settings/AdvancedSettings.h
++++ b/xbmc/settings/AdvancedSettings.h
+@@ -175,6 +175,10 @@ class CAdvancedSettings : public ISettingCallback, public ISettingsHandler
+     //! did not change, instead of converting it again (video/dvguicache; the same bytes). Off for a
+     //! measurement of what that saves; video/dvguicachecheck packs those again and compares them
+     bool m_videoDVGuiCache;
++    //! Hades: a frame with something drawn over it that draws the picture of the frame before it
++    //! again takes what that frame made of it, instead of composing and converting it again
++    //! (video/dvreuse; the same bytes). Off for a measurement of what that saves
++    bool m_videoDVReuse;
+     //! Hades: amdgpu's COMPUTE power profile while the Dolby Vision bridge draws, where the driver
+     //! has power profiles (video/dvgpuprofile; the same bytes, at a higher clock). Off for a
+     //! measurement of what it gives
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 3527231..92ca767 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -8716,6 +8716,11 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+   // one that stands still, nor one whose metadata are made here: HDR10 measured, HDR10+ sent as it)
+   DVCheckL5(layer, metadata, still || measuredPicture || hdr10Plus != 0);
+   const bool measured = overlayFree && !still;
++  // Hades: a frame with something drawn over it that took the picture of its frame before as
++  // that one made it (CDVBridgeGLES::Reused(): a pause with the OSD over it, a picture shown for
++  // another refresh) costs less than a picture: like one that stands still, it is not measured,
++  // neither for the levels of the frames with GUI elements nor for presenting a frame ahead
++  const bool reused = m_dvFrame && m_dvBridge->Reused();
+   // (Hades: and one of the two ways that the choice of the way compares)
+   const bool pathMeasured = measured && !sourceWay;
+   if (overlayFree && still)
+@@ -8739,17 +8744,17 @@ bool CWinSystemGbmGLESContext::RenderDVBridge(const CDVBridgeGLES::Layer& layer,
+     // residual, whose level 1 sends such frames converted), while the video plays, is one that the
+     // decision of the level of the conversion under the GUI takes (CDVGuiLevel)
+     const int guiTop = m_dvBridge->GuiTop();
+-    const bool guiMeasured = guiFrame && !still && guiTop > 0;
++    const bool guiMeasured = guiFrame && !still && !reused && guiTop > 0;
+     // Hades: ... and one whose ladder, as it was drawn, has a level below that of the frames without
+     // GUI elements of its format, of the step-down level of the frames with GUI elements
+     // (CDVGuiStep; not one that CDVGuiLevel measures: the two never share a frame)
+     const bool guiStepMeasured =
+-        guiFrame && !still && !guiMeasured && CDVGuiStep::Applies(m_dvStepBase, ladder);
++        guiFrame && !still && !reused && !guiMeasured && CDVGuiStep::Applies(m_dvStepBase, ladder);
+     if (guiFrame && still)
+       m_dvGuiStep.Interrupted();
+-    DVGpuTimerTag(measured, pathMeasured, direct, m_dvBridge->Direct(), layered, load, !still,
+-                  comparing, ladder, guiMeasured, guiTop, m_dvBridge->GuiConverts(),
+-                  !guiElements && !still, guiStepMeasured);
++    DVGpuTimerTag(measured, pathMeasured, direct, m_dvBridge->Direct(), layered, load,
++                  !still && !reused, comparing, ladder, guiMeasured, guiTop,
++                  m_dvBridge->GuiConverts(), !guiElements && !still, guiStepMeasured);
+     // what its presentation is told with (DVStepPresented())
+     m_dvStepFrame.valid = true;
+     m_dvStepFrame.layered = layered;
+-- 
+2.53.0
+

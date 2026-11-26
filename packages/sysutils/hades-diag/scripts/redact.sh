@@ -26,6 +26,10 @@
 #                              the filter left of the name of this system in all of <out> (hostnote)
 #   redact.sh btname <file>    the name and the alias of a Bluetooth device in a file of BlueZ, as the
 #                              markers that the filter puts where they stand: "Name: [bt-name-...]"
+#   redact.sh file <in> <out>  a log in a file, through the whole filter as from standard input, into <out>: a big
+#                              one in parts, each through the filter at once on a processor of its own (logfile()).
+#                              The result is the same as from standard input; <out> is there only when all of it
+#                              went through (exit status 0)
 #   redact.sh hostnote <dir>   what the filter left of the name of this system in the files of a folder that
 #                              went through it: the times it stands as a word of its own (none, where it is a
 #                              name of its own: the last pass of redact-ids.awk takes it wherever it stands
@@ -75,7 +79,76 @@ btnames() {
 # emit() in redact-ids.awk)
 last=hades-end-$(head -c 12 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
 # (the digests that one file of a run made are kept in $W/dg for the files after it: see digest() in redact-ids.awk)
-ids() { { cat; printf '\n%s\n' "$last"; } | awk -v KEYFILE="$key" -v TMP="$W/h" -v DGFILE="$W/dg" -v HOST="$host" -v NAMES="$W/names" -v MODE="$1" -v LAST="$last" -v DROPCUT="${HADES_REDACT_DROP_UNENDED:-}" -v STATS="${HADES_REDACT_STATS:-}" -f "$L/redact-ids.awk"; }
+# ($2 and $3: the file for the hashing and the file of the digests of a part of logfile(); those of this run otherwise)
+ids() { { cat; printf '\n%s\n' "$last"; } | awk -v KEYFILE="$key" -v TMP="${2:-$W/h}" -v DGFILE="${3:-$W/dg}" -v HOST="$host" -v NAMES="$W/names" -v MODE="$1" -v LAST="$last" -v DROPCUT="${HADES_REDACT_DROP_UNENDED:-}" -v STATS="${HADES_REDACT_STATS:-}" -f "$L/redact-ids.awk"; }
+# Hades: a log in a file ($1) through the whole filter into $2, in parts where it is big: the filter of one stream keeps
+# two processors busy (redact-ids.awk and redact.sed), and a debug log of Kodi of 1.3 million lines (205 MB) took 28 s
+# on a fast one, while the share Logfiles showed only the note that it was being made. A file of HADES_REDACT_PART_MIN
+# bytes or more (4 MiB) is cut into as many parts as the system has processors (at most 8; HADES_REDACT_PARTS), each
+# cut before a line that starts with the time of a line of Kodi's log or of the journal ("2026-11-25 19:23:05", "Nov 25
+# 19:23:05 "). Where the filter keeps something of a line for the line after it (a section "[...]" waits for its
+# "path =", rows of hex for the end of what may be an EDID), such a line ends it, and the end of a part ends it the
+# same way (redact-ids.awk, END): no cut falls inside rows of hex. Each part goes through the filter with its own files
+# for the hashing and the digests, beside the others, and they are joined in their order in the folder of $2. The
+# markers are the same: a marker is made from the secret and the value alone. The one difference is the budget of a run
+# of awk (20000 new values; past it a marker has no second part): each part has its own, so a part has more room,
+# never less. A cut that is not where it should be (no line end before it, or not such a line after it: NUL bytes in
+# a line move what awk counts) is not made. A part that fails leaves no $2 (exit status 1).
+# the bytes of the file $1 from the offset $2, $3 of them at most (dd reads only those: no reader that is stopped half
+# way, as tail would be by head)
+range() { dd if="$1" bs=65536 iflag=skip_bytes,count_bytes skip="$2" count="$3" status=none; }
+logfile() {
+  local in="$1" out="$2" size n min t c from i rc=0 cuts="" last_cut=0
+  [ -f "$in" ] || return 1
+  size=$(wc -c < "$in") || return 1
+  min=${HADES_REDACT_PART_MIN:-4194304}
+  n=${HADES_REDACT_PARTS:-$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)}
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  [ "$n" -gt 8 ] && n=8
+  while [ "$n" -gt 1 ] && [ $((size / n)) -lt "$min" ]; do n=$((n - 1)); done
+  i=1
+  while [ "$i" -lt "$n" ]; do
+    t=$((size / n * i))
+    c=$(range "$in" "$t" 4194304 | awk -v base="$t" '
+      NR == 1 { off = length($0) + 1; next }
+      /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/ ||
+      /^[A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] / { print base + off; exit }
+      { off += length($0) + 1 }')
+    if [ -n "$c" ] && [ "$c" -gt "$last_cut" ] && [ "$c" -lt "$size" ] &&
+      [ "$(range "$in" $((c - 1)) 1 | od -An -tx1 | tr -d ' ')" = 0a ] &&
+      range "$in" "$c" 32 | grep -q -E '^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}|[A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} )'; then
+      cuts="$cuts $c"; last_cut=$c
+    fi
+    i=$((i + 1))
+  done
+  rm -f "$out"
+  if [ -z "$cuts" ]; then
+    (set -o pipefail; ids log < "$in" | sed -E -f "$L/redact.sed" > "$out") || { rm -f "$out"; return 1; }
+    return 0
+  fi
+  from=0; i=0
+  for c in $cuts $size; do
+    i=$((i + 1))
+    ( set -o pipefail
+      range "$in" "$from" $((c - from)) | ids log "$W/h.$i" "$W/dg.$i" | sed -E -f "$L/redact.sed" > "$out.part.$i"
+      echo $? > "$W/rc.$i" ) &
+    from=$c
+  done
+  wait
+  c=$i; i=1
+  while [ "$i" -le "$c" ]; do [ "$(cat "$W/rc.$i" 2>/dev/null)" = 0 ] || rc=1; i=$((i + 1)); done
+  if [ $rc = 0 ]; then
+    : > "$out" || rc=1
+    i=1
+    while [ $rc = 0 ] && [ "$i" -le "$c" ]; do
+      cat "$out.part.$i" >> "$out" || rc=1
+      rm -f "$out.part.$i"; i=$((i + 1))
+    done
+  fi
+  i=1; while [ "$i" -le "$c" ]; do rm -f "$out.part.$i"; i=$((i + 1)); done
+  [ $rc = 0 ] || { rm -f "$out"; return 1; }
+  return 0
+}
 edid() {
   e=$(set -o pipefail; od -An -v -tx1 < "$1" | awk -v MODE=edid -f "$L/redact-ids.awk") || return 1
   printf "$e" > "$2"
@@ -130,13 +203,14 @@ hostnote() {
   esac
 }
 
-case "$1" in ''|ids|tree) btnames ;; esac
+case "$1" in ''|ids|tree|file) btnames ;; esac
 case "$1" in
   '') set -o pipefail; ids log | sed -E -f "$L/redact.sed" ;;
+  file) [ $# -eq 3 ] || exit 2; logfile "$2" "$3" ;;
   ids) ids ;;
   edid) edid "$2" "$3" ;;
   tree) tree "$2" "$3" ;;
   hostnote) hostnote "$2" ;;
   btname) [ -r "$2" ] && awk -v KEYFILE="$key" -v TMP="$W/h" -v MODE=btmark -f "$L/redact-ids.awk" "$2" < /dev/null ;;
-  *) echo "usage: $0 [ids | edid <in> <out> | tree <in> <out> | btname <file> | hostnote <dir>]" >&2; exit 2 ;;
+  *) echo "usage: $0 [ids | edid <in> <out> | tree <in> <out> | file <in> <out> | btname <file> | hostnote <dir>]" >&2; exit 2 ;;
 esac

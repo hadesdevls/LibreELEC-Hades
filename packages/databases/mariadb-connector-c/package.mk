@@ -11,12 +11,18 @@ PKG_DEPENDS_TARGET="toolchain zlib openssl"
 PKG_LONGDESC="mariadb-connector: library to connect to mariadb/mysql database server"
 PKG_BUILD_FLAGS="-gold"
 
+# Hades: REMOTEIO_PLUGIN_TYPE=OFF. CMakeLists.txt looks for curl whatever WITH_CURL says (FIND_PACKAGE(CURL)), and
+# where it finds it and the remote I/O plugin is not OFF (with WITH_CURL=OFF it is not even registered, so not OFF)
+# compiles libmariadb with HAVE_REMOTEIO: whether libmariadb.so.3 has the code of remote files depended on whether curl,
+# which is not among the dependencies, happened to be built before it (1.2 without, 1.2.1 with). The plugin itself is
+# never built (WITH_CURL=OFF) nor installed, so OFF is what WITH_CURL=OFF means, the same at any order of the build.
 PKG_CMAKE_OPTS_TARGET="-DWITH_EXTERNAL_ZLIB=ON
                        -DWITH_UNIT_TESTS=OFF
                        -DCLIENT_PLUGIN_DIALOG=STATIC
                        -DCLIENT_PLUGIN_MYSQL_CLEAR_PASSWORD=STATIC
                        -DCLIENT_PLUGIN_MYSQL_OLD_PASSWORD=STATIC
                        -DWITH_CURL=OFF
+                       -DREMOTEIO_PLUGIN_TYPE=OFF
                        -DDEFAULT_SSL_VERIFY_SERVER_CERT=OFF
                       "
 

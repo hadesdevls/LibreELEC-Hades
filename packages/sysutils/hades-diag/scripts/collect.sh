@@ -676,6 +676,10 @@ snapshot() {
     [ -e $f ] && { echo "${f##*/}: $(wc -c < $f) bytes"; head -n 5 $f | cut -c1-120 | awk '{ gsub(/\r/, "\\\\r"); gsub(/\t/, "\\\\t"); print $0 "$" }'; }
   done
   echo "INPUT: $(lim iptables -S INPUT | head -n 1) | $(lim ip6tables -S INPUT | head -n 1)"
+  # Hades: the network access in effect (Settings > LibreELEC > Services > Network access): Recommended, As in
+  # LibreELEC, or own settings, and what it is made of
+  echo "== network access"
+  lim sh /usr/lib/hades-diag/net-access.sh
   echo "== sockets (the Varlink system installer of systemd 262 must not listen)"
   echo "systemd-sysinstall.socket: enabled=$(lim systemctl is-enabled systemd-sysinstall.socket) active=$(lim systemctl is-active systemd-sysinstall.socket)"
   lim systemctl list-sockets --all --no-pager | grep -iE "sysinstall|listen" | head -20

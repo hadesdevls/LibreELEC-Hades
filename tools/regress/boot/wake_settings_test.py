@@ -29,8 +29,8 @@ def check(ok, text):
     print(('ok:   ' if ok else 'FAIL: ') + text)
 
 
-# ---- the strings
-IDS = range(34100, 34109)
+# ---- the strings (34100 to 34108 of LibreELEC-settings-9093, 34109 to 34120 of 9094: the list of devices)
+IDS = [n for n in range(34100, 34121) if n != 34111]
 
 
 def po_entries(path):
@@ -46,7 +46,7 @@ for lang in ('en_gb', 'es_es', 'es_ar', 'es_mx'):
     p = os.path.join(ADDON, 'resources', 'language', f'resource.language.{lang}', 'strings.po')
     entries = po_entries(p) if os.path.exists(p) else {}
     ok = all(len(entries.get(n, [])) == 1 for n in IDS)
-    check(ok, f'{lang}: the strings 34100 to 34108, once each')
+    check(ok, f'{lang}: the strings 34100 to 34120, once each')
     if not ok:
         continue
     if lang == 'en_gb':
@@ -59,7 +59,11 @@ for lang in ('en_gb', 'es_es', 'es_ar', 'es_mx'):
           f'{lang}: the same placeholders as the English')
     check(len(entries[34106][0][1] % 99) <= 64, f'{lang}: the notification fits the 64 characters that oe.notify shows')
 check(english and len(english[34106] % 99) <= 64, 'en_gb: the notification fits the 64 characters that oe.notify shows')
-check(english and 'flirc' in english.get(34102, '') and 'never' in english.get(34102, ''), 'en_gb: the help names the kinds')
+check(english and 'flirc' in english.get(34102, '') and 'Devices that may wake it' in english.get(34102, '') and
+      'Bluetooth devices and Wake-on-LAN are not changed' not in english.get(34102, ''),
+      'en_gb: the help names the kinds, and the list of devices; Bluetooth is no longer said to be left alone')
+check(english and all(w in english.get(34110, '') for w in ('adapter', 'firmware', 'ErP', 'serial number', 'address')),
+      'en_gb: the help of the list says what Bluetooth depends on and how a device is remembered')
 
 
 # ---- stand-ins for Kodi
@@ -71,6 +75,12 @@ class Dialog:
         Dialog.shown.append(('select', h, list(items), preselect))
         if not Dialog.script:
             raise AssertionError('no answer scripted for select')
+        return Dialog.script.pop(0)
+
+    def multiselect(self, h, items, preselect=None, **kw):
+        Dialog.shown.append(('multiselect', h, list(items), list(preselect or [])))
+        if not Dialog.script:
+            raise AssertionError('no answer scripted for multiselect')
         return Dialog.script.pop(0)
 
     def ok(self, h, t):
@@ -122,9 +132,12 @@ try:
     states = os.path.join(work, 'state')
     choice = os.path.join(work, 'cache', 'hades-wake')
 
-    def fake_helper(status=0, last='armed 2'):
+    listing = os.path.join(work, 'listing')
+
+    def fake_helper(status=0, last='armed 2', list_status=0):
         with open(helper, 'w') as f:
             f.write(f'echo "$*" >> {record}\necho "PATH=$PATH" >> {record}\n'
+                    f'if [ "$1" = list ]; then cat {listing}; exit {list_status}; fi\n'
                     f'echo "wake from sleep with: whatever; USB input devices that may wake the PC: x"\n'
                     f'echo "{last}"\nexit {status}\n')
         if os.path.exists(record):
@@ -212,6 +225,69 @@ try:
     check(system.wake_choice(choice) == 'keyboards', 'write_wake_choice then wake_choice')
     system.write_wake_choice(choice, 'remotes')
     check(not os.path.exists(choice) and system.wake_choice(choice) == 'remotes', 'the default is no file')
+
+    # ---- the list of devices (LibreELEC-settings-9094)
+    devfile = os.path.join(work, 'cache', 'hades-wake-devices')
+    check(d.get('WAKE_DEVICES') == f'{defaults.CONFIG_CACHE}/hades-wake-devices', 'defaults: WAKE_DEVICES in CONFIG_CACHE')
+    sd = g.get('settings', {}).get('wake_devices', {})
+    check(sd.get('action') == 'set_wake_devices' and sd.get('type') == 'button' and sd.get('name') == 34109 and
+          sd.get('InfoText') == 34110, 'System > Sleep > Devices that may wake it: a button')
+    s.WAKE_DEVICES = devfile
+    open(listing, 'w').write(
+        'usb|20a0:0006|enabled|remote|USB 5-2.4.1 20a0:0006 flirc|an IR receiver known by its ID (flirc)|-\n'
+        'usb|046d:c077 port=3-2|disabled|pointer|USB 3-2 046d:c077 Logitech USB Optical Mouse|a mouse or another pointer|-\n'
+        'usb|1234:5678||remote|USB 3-6 1234:5678 Plain Remote|a remote\'s receiver|-\n'
+        'usb|045e:02ea serial=3039363431|disabled|gamepad|USB 3-3 045e:02ea|a game controller|-\n'
+        'bt|11:22:33:44:55:02|disabled|gamepad|Bluetooth 11:22:33:44:55:02 Xbox Wireless Controller|a Bluetooth game controller|-\n'
+        'bt|11:22:33:44:55:04|enabled|other|Bluetooth 11:22:33:44:55:04|a Bluetooth input device|on\n'
+        'garbage line\n')
+    devs, cannot = system.parse_wake_list(open(listing).read())
+    check([x['key'] for x in devs] == ['usb 20a0:0006', 'usb 046d:c077 port=3-2', 'usb 045e:02ea serial=3039363431',
+                                       'bt 11:22:33:44:55:02', 'bt 11:22:33:44:55:04'] and cannot == 1,
+          'the list: the devices that can wake a computer, one without power/wakeup counted apart, nothing else')
+    check([system.wake_device_name(x) for x in devs] == ['flirc', 'Logitech USB Optical Mouse', '045e:02ea',
+                                                          'Xbox Wireless Controller', '11:22:33:44:55:04'],
+          'plain names: make and model, the IDs where there is none, the name or the address of a Bluetooth device')
+    Dialog.shown.clear(); NOTIFY.clear(); LOG.clear(); fake_helper()
+    # tick the mouse and the Xbox controller, untick the flirc
+    Dialog.script = [[1, 3, 4]]
+    s.set_wake_devices()
+    ms = [x for x in Dialog.shown if x[0] == 'multiselect']
+    check(len(ms) == 1 and ms[0][3] == [0, 4] and ms[0][2][1] == 'Logitech USB Optical Mouse (s34115, USB)' and
+          ms[0][2][3] == 'Xbox Wireless Controller (s34116, Bluetooth)', 'the list: plain labels, what may wake it ticked')
+    check(open(devfile).read() == 'off usb 20a0:0006\non usb 046d:c077 port=3-2\non bt 11:22:33:44:55:02\n' and
+          stat.S_IMODE(os.stat(devfile).st_mode) == 0o644, 'only what was changed is written, on and off, by its key')
+    check(recorded()[:1] == ['list'] and recorded()[2:3] == ['apply'] and NOTIFY == [('s34109', 's34106 2')],
+          'applied at once, and said')
+    check(any(m == f'{devfile}: on bt 11:22:33:44:55:02' for l, m in LOG), 'each change in the log of Kodi')
+    # the flirc ticked again: its line changes and goes last; the others stay
+    open(listing, 'w').write(
+        'usb|20a0:0006|disabled|remote|USB 5-2.4.1 20a0:0006 flirc|an IR receiver known by its ID (flirc)|off\n'
+        'usb|046d:c077 port=3-2|enabled|pointer|USB 3-2 046d:c077 Logitech USB Optical Mouse|a mouse or another pointer|on\n')
+    Dialog.script = [[0, 1]]; fake_helper()
+    s.set_wake_devices()
+    check(open(devfile).read() == 'on usb 046d:c077 port=3-2\non bt 11:22:33:44:55:02\non usb 20a0:0006\n',
+          'a line changed goes last, the others are kept')
+    for answer, what in ((None, 'the list closed'), ([1], 'nothing changed')):
+        Dialog.script = [answer]; NOTIFY.clear(); fake_helper(); before = open(devfile).read()
+        s.set_wake_devices()
+        check(open(devfile).read() == before and [x for x in recorded() if x] == ['list', 'PATH=/usr/bin:/usr/sbin'] and NOTIFY == [],
+              f'{what}: nothing written, nothing applied')
+    open(choice, 'w').write('button\n'); Dialog.shown.clear(); fake_helper()
+    s.set_wake_devices()
+    check(('ok', 's34109', 's34118') in Dialog.shown and recorded() == [], 'with only the power button: said, no list')
+    os.remove(choice)
+    Dialog.shown.clear(); fake_helper(list_status=1)
+    s.set_wake_devices()
+    check(('ok', 's34109', 's34119') in Dialog.shown, 'a list that cannot be read: said')
+    open(listing, 'w').write('usb|1234:5678||remote|USB 3-6 1234:5678 Plain Remote|a remote\'s receiver|-\n')
+    Dialog.shown.clear(); fake_helper()
+    s.set_wake_devices()
+    check(('ok', 's34109', 's34120') in Dialog.shown, 'no device that can wake a computer: said')
+    system.write_wake_devices(devfile, {'usb 046d:c077 port=3-2': 'off'})
+    check(system.wake_device_lines(devfile)[-1] == ('off', 'usb 046d:c077 port=3-2'), 'write_wake_devices reads back')
+    open(devfile, 'a').write('on usb ZZZZ:1\nmaybe usb 1234:5678\non bt 11:22:33:44:55\n')
+    check(len(system.wake_device_lines(devfile)) == 3, 'lines that hades-wake would not understand are not read')
 finally:
     shutil.rmtree(work, ignore_errors=True)
 

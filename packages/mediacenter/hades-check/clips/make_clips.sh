@@ -4,7 +4,7 @@
 #
 # Makes the clips of "Check this setup" at build time, on the build host, into one folder: the
 # pictures (gen_video.py: the Hades check card in SDR, HDR10, HLG, Dolby Vision 8.1 and 5, the clip of the A/B
-# comparison and the 3D clip of the frame packing card, clips.json)
+# comparison, the 3D clip of the frame packing card and the HDR 3D clip of the card "3D: HDR", clips.json)
 # and the sounds (make_audio.py), and a SHA256SUMS of everything made. Nothing of a third party goes in:
 # the card, its font and the sounds are made here. The encoders run only here; none goes into the image.
 #

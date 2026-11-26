@@ -94,16 +94,19 @@ int main()
             S::ChoiceOfSetting(2) == S::Choice::SDR_BT2020 && S::ChoiceOfSetting(3) == S::Choice::SDR_BT709 &&
             S::ChoiceOfSetting(7) == S::Choice::AUTOMATIC && S::ChoiceOfSetting(-1) == S::Choice::AUTOMATIC,
         "the values of videoscreen.hades3dcolour (anything else: Automatic)");
-  Check(!S::AsSdr(S::Choice::AUTOMATIC, false) && S::AsSdr(S::Choice::AUTOMATIC, true) &&
-            !S::AsSdr(S::Choice::HDR, true) && S::AsSdr(S::Choice::SDR_BT2020, false) &&
-            S::AsSdr(S::Choice::SDR_BT709, false),
-        "SDR or HDR: Automatic as \"Play HDR videos as SDR\" says; HDR over it; the SDR choices SDR");
+  // (1.2.2: Automatic for each display: SDR until Check this setup found HDR in 3D there, Stereo3DVideo.h)
+  const S::HdrIn3D unknown = S::HdrIn3D::NOT_CHECKED;
+  Check(S::AsSdr(S::Choice::AUTOMATIC, unknown) && !S::AsSdr(S::Choice::HDR, unknown) &&
+            S::AsSdr(S::Choice::SDR_BT2020, unknown) && S::AsSdr(S::Choice::SDR_BT709, unknown) &&
+            S::ChoosesSdr(S::Choice::AUTOMATIC, unknown) && !S::ChoosesSdr(S::Choice::HDR, unknown),
+        "SDR or HDR, nothing checked on the display: Automatic SDR; HDR only where chosen; the SDR choices SDR");
   bool containers = true;
   for (int g = 0; g < 3; ++g)
-    containers = containers && S::Container(S::Choice::AUTOMATIC, g) == g &&
+    containers = containers && S::Container(S::Choice::AUTOMATIC, g) == 1 &&
                  S::Container(S::Choice::HDR, g) == g && S::Container(S::Choice::SDR_BT2020, g) == 1 &&
                  S::Container(S::Choice::SDR_BT709, g) == 0;
-  Check(containers, "the gamut of SDR: the setting's for Automatic and HDR, BT.2020 and BT.709 as chosen");
+  Check(containers, "the gamut of SDR: BT.2020 asked for at Automatic, the setting's for HDR, BT.2020 and BT.709 as "
+                    "chosen");
 
   // --- which 3D pictures the bridge draws
   bool defaultSplit = true, noPictureAll = true, sdrSplit = true, mixedNone = true;

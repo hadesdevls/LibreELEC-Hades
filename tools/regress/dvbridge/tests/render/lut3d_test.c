@@ -14,7 +14,7 @@
 //     lut3d_check.py (every third pixel of every third row) with the LUT and without it; the 1D LUTs on SDR (a .cal,
 //     a steep curve, one of 5000 points) and Resolve's shaper on the projector;
 //   - an identity LUT gives the picture without it: compared here over the whole picture, the floats and the
-//     codes of 10 and 12 bits;
+//     codes of 10 and 12 bits, and every float to the bit (the 3D tables);
 //   - what never takes it: native Dolby Vision (TV-led) and HDR over the tunnel, with a LUT set: the same bytes
 //     as without, over the whole picture;
 //   - a LUT set and then taken away gives the picture of none, to the bit;
@@ -488,6 +488,14 @@ int main(int argc, char** argv)
                "last place of 1.0 in a float), every code of 10 bits the same",
                way->name, way->identity->size);
       Check(d3 && dvbridge_render_lut_applied(r) && a.most <= 1.0 / 2097152.0 && a.codes10 == 0, what);
+      // (Hades: the tetrahedra of libplacebo-9983 give an identity table back to the bit; not an identity 1D LUT of
+      // 256 points, whose points i/255 are not floats)
+      if (!way->identity->curve)
+      {
+        snprintf(what, sizeof what, "%s: an identity LUT of %d points gives back every float of the picture, to the bit",
+                 way->name, way->identity->size);
+        Check(d3 && a.floats == 0, what);
+      }
     }
   }
 
@@ -644,6 +652,8 @@ int main(int argc, char** argv)
                    "the same",
                    tag);
           Check(drawn && ia.most <= 1.0 / 2097152.0 && ia.codes12 == 0, what);
+          snprintf(what, sizeof what, "%s: an identity LUT gives back every float of the picture, to the bit", tag);
+          Check(drawn && ia.floats == 0, what);
           if (!k)
           {
             // the bars where they are not written first (the early mask off: advancedsettings.xml dvearlymask):

@@ -1,0 +1,416 @@
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 06:42:22 +0000
+Subject: [PATCH] colorspace: the PQ curves of the colour mapping from tables made
+ in double precision
+
+The colour mapping (tone and gamut mapping to a display, HDR to SDR)
+evaluates SMPTE ST 2084 with pow() at every pixel: the linearization of a
+PQ picture, the cone (LMS) values taken to PQ for the tone curve and back,
+the brightest channel there and back, the IPT of the gamut mapping and back
+to light, and the delinearization to a PQ display. That is 37 pow() of a
+component per pixel mapped to SDR and 40 to a PQ display: 74 to 80
+exponentials and logarithms, which GPUs run at a quarter of their rate, and
+whose precision is each GPU's own (the EOTF in its usual form also cancels
+two terms near black).
+
+While the colour mapping runs, sh_pq_eotf() and sh_pq_eotf_inv() now read
+PQ from two tables made once in double precision (pq_tables_make()), with
+no pow(), exp(), log() or division in the shader:
+ - the EOTF, 256 x 32 RGBA32F: a quadratic through the ends and middle of
+   each cell of 1/4096 of [2^-6, 1] and of 1/256 of each octave of
+   [2^-22, 2^-6) (the cell taken from the bits of the float), 0 below 2^-22;
+ - the inverse EOTF, 256 x 64 RGBA32F: a cell for each 1/128 of an octave of
+   [2^-126, 2), its value at the start held as two floats (hi + lo) and a
+   quadratic for the rest; 0 (and what a GPU flushes to 0) takes the value
+   of 0, and from 2 on (20000 cd/m^2) pow() as before.
+Where the GPU cannot make them (no sampleable 32-bit float texture, or a
+GLSL without texelFetch() and floatBitsToUint()), PQ is computed with pow()
+as before, and the log says why, once. pl_renderer_pq_tables() tells which
+the colour mapping of a renderer takes.
+
+Measured on Mesa's software OpenGL ES (llvmpipe through zink), the curves
+as the GPU evaluates them against ST 2084 in double precision, over every
+16-bit code and 6.3 million samples a function (dense uniform and
+log-uniform over the domain the shaders feed them):
+ - EOTF, the error of the output taken back to 12-bit PQ codes: with pow()
+   at most 0.0537 (mean 0.0087) from 0.5 up, 0.0238 (0.0039) from 2^-6,
+   0.0011 below; from the tables at most 5.2e-5 (mean 1.2e-5), 4.6e-5 and
+   7.3e-6. Relative error of Y: 1.25e-4 against 1.2e-7.
+ - Inverse EOTF, in 12-bit codes: with pow() at most 0.0855 (mean 0.0134)
+   from 0.01 up, 0.0389 from 1e-6, 0.0014 below; from the tables at most
+   2.5e-4 (mean 8.8e-5), 1.2e-4 and 4.0e-6. At 0 both give its value; from 2
+   on both pow().
+Every region more precise, by 200 to 1000 times. The pow(x, 1/2.4) of an
+SDR target is not replaced (within 7e-5 of an 8-bit code).
+
+Where a mapped picture changes, it is at the edge of the target gamut,
+where the gamut mapping leaves a channel at or near 0: the LMS-to-RGB
+matrix cancels terms thousands to millions of times larger than that
+channel, and the gamma and PQ curves are steep near 0, so an error of
+1e-4 in a cone becomes up to 9 codes of 255 to SDR, or 205 of 4095 to a
+PQ display, in a channel of less than 0.1 cd/m^2 beside others of 100 to
+800 cd/m^2. Between before and after, over every changed pixel of 19
+pictures and charts, at most 0.072 delta E ITP (ITU-R BT.2124). Read back
+after the gamut mapping and taken to the output in double precision, the
+last part of the chain is exact with the tables (at most 7 codes of
+4095, 0.14 on average, in the picture where it cancels most) and was up to
+150 codes off with pow(). Moving each
+PQ call by the error its table may have bounds how far the new picture is
+from the same mapping with exact curves: of the 14.3 million samples that
+changed, 13.1 million are provably nearer to it with the tables, and the
+rest lie within that bound, which float arithmetic cannot settle.
+---
+diff --git a/src/include/libplacebo/renderer.h b/src/include/libplacebo/renderer.h
+index 700ab1e..faacbd9 100644
+--- a/src/include/libplacebo/renderer.h
++++ b/src/include/libplacebo/renderer.h
+@@ -90,6 +90,12 @@ struct pl_render_errors {
+ PL_API pl_renderer pl_renderer_create(pl_log log, pl_gpu gpu);
+ PL_API void pl_renderer_destroy(pl_renderer *rr);
+ 
++// Hades: how the colour mapping of this renderer takes the PQ curves: 1 read
++// from tables made in double precision, -1 computed with pow() (the GPU
++// does not make the tables; libplacebo says why), 0 not known yet
++#define PL_RENDERER_PQ_TABLES 1
++PL_API int pl_renderer_pq_tables(pl_renderer rr);
++
+ // Returns current renderer state, see pl_render_errors.
+ PL_API struct pl_render_errors pl_renderer_get_errors(pl_renderer rr);
+ 
+diff --git a/src/renderer.c b/src/renderer.c
+index 246c656..e864b38 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -215,6 +215,11 @@ static void renderer_uninit(pl_renderer rr)
+     pl_dispatch_destroy(&rr->dp);
+ }
+ 
++int pl_renderer_pq_tables(pl_renderer rr)
++{
++    return rr ? sh_color_map_pq_state(rr->tone_map_state) : 0;
++}
++
+ void pl_renderer_destroy(pl_renderer *p_rr)
+ {
+     pl_renderer rr = *p_rr;
+diff --git a/src/shaders.h b/src/shaders.h
+index eaaf5d0..ffcc64e 100644
+--- a/src/shaders.h
++++ b/src/shaders.h
+@@ -117,12 +117,21 @@ struct pl_shader_t {
+ 
+     // cached result of `pl_shader_finalize`
+     struct pl_shader_res result;
++
++    // Hades: the PQ tables of the colour mapping while it reads them (pq_tables_use() in
++    // shaders/colorspace.c), and their samplers in this shader once made
++    pl_tex pq_tab[2];
++    ident_t pq_id[2];
+ };
+ 
+ // Free temporary resources associated with a shader. Normally called by
+ // pl_shader_reset(), but used internally to reduce memory waste.
+ void sh_deref(pl_shader sh);
+ 
++// Hades: how the last colour mapping with this state took PQ (shaders/colorspace.c):
++// 1 from tables, -1 with pow() (no tables on this GPU), 0 not known yet
++int sh_color_map_pq_state(pl_shader_obj state);
++
+ // Same as `pl_shader_finalize` but doesn't generate `sh->res`, instead returns
+ // the string builder with everything but the prelude, which the caller places
+ // before any declaration. Assumes the caller will access the shader's internal
+diff --git a/src/shaders/colorspace.c b/src/shaders/colorspace.c
+index 707e6b6..b89428d 100644
+--- a/src/shaders/colorspace.c
++++ b/src/shaders/colorspace.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include <math.h>
++#include <stdlib.h>
+ 
+ #include "cache.h"
+ #include "colorspace.h"
+@@ -48,9 +49,92 @@ void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
+     }
+ }
+ 
++// Hades: the PQ tables of the colour mapping (pq_tables_use()) as a sampler of
++// the shader, made once in it
++static ident_t pq_table(pl_shader sh, int i)
++{
++    if (!sh->pq_id[i]) {
++        sh->pq_id[i] = sh_desc(sh, (struct pl_shader_desc) {
++            .desc = {
++                .name = i ? "pq_oetf_table" : "pq_eotf_table",
++                .type = PL_DESC_SAMPLED_TEX,
++            },
++            .binding = {
++                .object = sh->pq_tab[i],
++                .sample_mode = PL_TEX_SAMPLE_NEAREST,
++            },
++        });
++    }
++    return sh->pq_id[i];
++}
++
++// Hades: a function of one component as one of comps (1 or 3)
++static ident_t pq_each(pl_shader sh, ident_t f1, int comps, const char *name)
++{
++    if (comps == 1)
++        return f1;
++    ident_t f = sh_fresh(sh, name);
++    GLSLH("vec3 "$"(vec3 x) { return vec3("$"(x.x), "$"(x.y), "$"(x.z)); } \n",
++          f, f1, f1, f1);
++    return f;
++}
++
++// Hades: the EOTF of e, clamped to [0, 1] as sh_pq_eotf() clamps it, from the
++// table (pq_tables_make()): the cell of e (of 1/4096 from 2^-6 on, of 1/256 of
++// its octave from 2^-22 to 2^-6, by the bits of its float, 0 below) and the
++// quadratic of the cell. No pow(), exp(), log() or division.
++static ident_t pq_eotf_table(pl_shader sh, int comps)
++{
++    ident_t f1 = sh_fresh(sh, "pq_eotf_t");
++    GLSLH("float "$"(float e)                                                   \n"
++          "{                                                                     \n"
++          "    e = clamp(e, 0.0, 1.0);                                           \n"
++          "    float f = e * 4096.0;                                             \n"
++          "    int ju = min(int(f), 4095);                                       \n"
++          "    uint b = floatBitsToUint(e);                                      \n"
++          "    bool uni = e >= 0.015625, zero = e < 2.384185791015625e-07;       \n"
++          "    int j = uni ? ju : zero ? 0 : int(b >> 15u) - 22784;              \n"
++          "    float t = uni ? f - float(ju)                                     \n"
++          "            : zero ? 0.0 : float(b & 32767u) * 3.0517578125e-05;      \n"
++          "    vec4 q = texelFetch("$", ivec2(j & 255, j >> 8), 0);              \n"
++          "    return q.x + t * (q.y + t * q.z);                                 \n"
++          "}                                                                     \n",
++          f1, pq_table(sh, 0));
++    return pq_each(sh, f1, comps, "pq_eotf_t3");
++}
++
++static ident_t pq_eotf_inv_pow(pl_shader sh, int comps);
++
++// Hades: the inverse EOTF of max(x, 0), as sh_pq_eotf_inv() takes it, from the
++// table (pq_tables_make()): the cell of 1/128 of its octave (by the bits of its
++// float; 0 and what a GPU flushes to 0, the value of 0), its value at the start
++// held as hi + lo, and the quadratic of the rest. From 2 on (20000 cd/m^2, which
++// no picture reaches) by pow(), as before.
++static ident_t pq_eotf_inv_table(pl_shader sh, int comps)
++{
++    ident_t f1 = sh_fresh(sh, "pq_eotf_inv_t");
++    GLSLH("float "$"(float x)                                                   \n"
++          "{                                                                     \n"
++          "    float v = max(x, 0.0);                                            \n"
++          "    if (!(v < 2.0))                                                   \n"
++          "        return "$"(v);                                                \n"
++          "    uint b = floatBitsToUint(v);                                      \n"
++          "    bool tiny = b < 8388608u;                                         \n"
++          "    int k = tiny ? 16383 : int(b >> 16u) - 128;                       \n"
++          "    float t = tiny ? 0.0 : float(b & 65535u) * 1.52587890625e-05;     \n"
++          "    vec4 q = texelFetch("$", ivec2(k & 255, k >> 8), 0);              \n"
++          "    return q.x + (q.y + t * (q.z + t * q.w));                         \n"
++          "}                                                                     \n",
++          f1, pq_eotf_inv_pow(sh, 1), pq_table(sh, 1));
++    return pq_each(sh, f1, comps, "pq_eotf_inv_t3");
++}
++
+ // SMPTE ST 2084 EOTF
+ ident_t sh_pq_eotf(pl_shader sh, int comps)
+ {
++    // Hades: from the tables of the colour mapping, while it reads them
++    if (sh->pq_tab[0] && (comps == 1 || comps == 3))
++        return pq_eotf_table(sh, comps);
+     const uint8_t mask = (1 << comps) - 1;
+     ident_t fun = sh_fresh(sh, "pq_eotf");
+ #pragma GLSLH                                                                   \
+@@ -67,6 +151,15 @@ ident_t sh_pq_eotf(pl_shader sh, int comps)
+ 
+ // SMPTE ST 2084 inverse EOTF
+ ident_t sh_pq_eotf_inv(pl_shader sh, int comps)
++{
++    // Hades: from the tables of the colour mapping, while it reads them
++    if (sh->pq_tab[1] && (comps == 1 || comps == 3))
++        return pq_eotf_inv_table(sh, comps);
++    return pq_eotf_inv_pow(sh, comps);
++}
++
++// (Hades: the inverse EOTF as ST 2084 writes it, in floats)
++static ident_t pq_eotf_inv_pow(pl_shader sh, int comps)
+ {
+     const uint8_t mask = (1 << comps) - 1;
+     ident_t fun = sh_fresh(sh, "pq_eotf_inv");
+@@ -1355,6 +1448,11 @@ struct sh_color_map_obj {
+                                                 // (maximum of maxRGB), in PQ
+         float max_y_pq;                         // maximum PQ luminance
+     } peak;
++
++    // Hades: the PQ tables (pq_tables_make()), and whether they are read: 1
++    // read, -1 PQ computed with pow() (they could not be made), 0 not asked yet
++    pl_tex pq_eotf, pq_oetf;
++    int pq_state;
+ };
+ 
+ // Excluding size, since this is checked by sh_lut
+@@ -1377,9 +1475,144 @@ static void sh_color_map_uninit(pl_gpu gpu, void *ptr)
+     pl_shader_obj_destroy(&obj->gamut.lut);
+     pl_buf_destroy(gpu, &obj->peak.buf);
+     pl_buf_destroy(gpu, &obj->peak.readback);
++    pl_tex_destroy(gpu, &obj->pq_eotf);
++    pl_tex_destroy(gpu, &obj->pq_oetf);
+     memset(obj, 0, sizeof(*obj));
+ }
+ 
++// Hades: SMPTE ST 2084 in double precision, for the PQ tables of the colour
++// mapping (pq_tables_make()): the EOTF of e in [0, 1] and the inverse EOTF of
++// y >= 0
++static double pq_eotf_d(double e)
++{
++    const double p = pow(e, 1.0 / PQ_M2);
++    return pow(fmax(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), 1.0 / PQ_M1);
++}
++
++static double pq_eotf_inv_d(double y)
++{
++    const double p = pow(y, PQ_M1);
++    return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
++}
++
++// f on [x0, x1] as the quadratic through its ends and its middle:
++// f(x0 + t (x1 - x0)) ~ q[0] + t (q[1] + t q[2])
++static void pq_quadratic(double (*f)(double), double x0, double x1, double q[3])
++{
++    const double a = f(x0), m = f((x0 + x1) / 2), b = f(x1);
++    q[0] = a;
++    q[1] = 4 * m - 3 * a - b;
++    q[2] = 2 * (a + b) - 4 * m;
++}
++
++// Hades: the two PQ tables of the colour mapping, made once in double
++// precision, so that no pow() of the GPU enters the curves (its precision is
++// each GPU's own). The EOTF, 256 x 32 RGBA32F: a quadratic in each cell of
++// 1/4096 of [2^-6, 1] (cells 64 to 4095) and of 1/256 of each octave of
++// [2^-22, 2^-6) (cells 4096 on, found from the bits of the float), 0 below
++// 2^-22 (ST 2084 gives 0 up to 2^-20.4). The inverse EOTF, 256 x 64 RGBA32F: a
++// cell for each 1/128 of an octave of [2^-126, 2), its value at the start of
++// the cell held as two floats (hi + lo) and a quadratic for the rest; cell
++// 16383 holds the value of 0. Against ST 2084 in double precision, with the
++// entries in floats: within 6.2e-8 of Y (relative, where Y > 1e-6) and within
++// 3.5e-6 of a 12-bit code respectively; the evaluation in floats adds its own
++// rounding (the same tables as the IPT tunnel of LibreELEC Hades' bridge).
++static bool pq_tables_make(pl_gpu gpu, struct sh_color_map_obj *obj)
++{
++    pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 32, 32, PL_FMT_CAP_SAMPLEABLE);
++    if (!fmt)
++        return false;
++    float *e = calloc((size_t) 256 * 32 * 4, sizeof(float));
++    float *o = calloc((size_t) 256 * 64 * 4, sizeof(float));
++    bool ok = e && o;
++    for (int j = 64; ok && j < 8192; j++) {
++        double x0, x1, q[3];
++        if (j < 4096) {
++            x0 = j / 4096.0;
++            x1 = (j + 1) / 4096.0;
++        } else {
++            const double s = ldexp(1.0, ((j - 4096) >> 8) - 22);
++            x0 = s * (1.0 + ((j - 4096) & 255) / 256.0);
++            x1 = x0 + s / 256.0;
++        }
++        pq_quadratic(pq_eotf_d, x0, x1, q);
++        for (int i = 0; i < 3; i++)
++            e[4 * j + i] = (float) q[i];
++    }
++    for (int k = 0; ok && k < 16256; k++) {
++        const double s = ldexp(1.0, (k >> 7) - 126);
++        const double x0 = s * (1.0 + (k & 127) / 128.0);
++        double q[3];
++        pq_quadratic(pq_eotf_inv_d, x0, x0 + s / 128.0, q);
++        o[4 * k + 0] = (float) q[0];
++        o[4 * k + 1] = (float) (q[0] - (double) o[4 * k]);
++        o[4 * k + 2] = (float) q[1];
++        o[4 * k + 3] = (float) q[2];
++    }
++    if (ok) {
++        const double z = pq_eotf_inv_d(0.0);
++        o[4 * 16383 + 0] = (float) z;
++        o[4 * 16383 + 1] = (float) (z - (double) o[4 * 16383]);
++    }
++    if (ok) {
++        obj->pq_eotf = pl_tex_create(gpu, pl_tex_params(
++            .w = 256, .h = 32, .format = fmt, .sampleable = true, .initial_data = e));
++        obj->pq_oetf = pl_tex_create(gpu, pl_tex_params(
++            .w = 256, .h = 64, .format = fmt, .sampleable = true, .initial_data = o));
++        ok = obj->pq_eotf && obj->pq_oetf;
++    }
++    free(e);
++    free(o);
++    if (!ok) {
++        pl_tex_destroy(gpu, &obj->pq_eotf);
++        pl_tex_destroy(gpu, &obj->pq_oetf);
++    }
++    return ok;
++}
++
++// Hades: the colour mapping reads PQ from its tables from here on (until
++// pq_tables_done()), where the GPU makes them: sh_pq_eotf() and
++// sh_pq_eotf_inv() then return functions that read them. Where it does not
++// (no 32-bit float texture, or a GLSL without texelFetch() and
++// floatBitsToUint()), PQ is computed with pow() as before, and the log says
++// why, once (pq_state -1; pl_renderer_pq_tables())
++static void pq_tables_use(pl_shader sh, struct sh_color_map_obj *obj)
++{
++    pl_gpu gpu = SH_GPU(sh);
++    if (!obj || !gpu || obj->pq_state < 0)
++        return;
++    if (!obj->pq_state) {
++        const struct pl_glsl_version glsl = sh_glsl(sh);
++        const char *why = NULL;
++        if (glsl.version < (glsl.gles ? 300 : 130))
++            why = "the GLSL has no texelFetch() and floatBitsToUint()";
++        else if (!pq_tables_make(gpu, obj))
++            why = "no 32-bit float texture for its tables could be made";
++        obj->pq_state = why ? -1 : 1;
++        if (why) {
++            PL_WARN(sh, "The PQ curves of the colour mapping are computed with pow(), "
++                    "not read from tables: %s", why);
++            return;
++        }
++    }
++    sh->pq_tab[0] = obj->pq_eotf;
++    sh->pq_tab[1] = obj->pq_oetf;
++    sh->pq_id[0] = sh->pq_id[1] = NULL_IDENT;
++}
++
++static void pq_tables_done(pl_shader sh)
++{
++    sh->pq_tab[0] = sh->pq_tab[1] = NULL;
++    sh->pq_id[0] = sh->pq_id[1] = NULL_IDENT;
++}
++
++int sh_color_map_pq_state(pl_shader_obj state)
++{
++    struct sh_color_map_obj *obj = SH_OBJ_LOOKUP(state, PL_SHADER_OBJ_COLOR_MAP,
++                                                 struct sh_color_map_obj);
++    return obj ? obj->pq_state : 0;
++}
++
+ static inline float iir_coeff(float rate)
+ {
+     if (!rate)
+@@ -2513,6 +2746,8 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+                          dt_exposure != 1.0f;
+     bool need_gamut_map = !pl_gamut_map_params_noop(&gamut);
+ 
++    // Hades: PQ from the tables (pq_tables_use()), up to the end of the mapping
++    pq_tables_use(sh, obj);
+     if (!args->prelinearized)
+         pl_shader_linearize(sh, &src);
+ 
+@@ -2831,6 +3066,7 @@ void pl_shader_color_map_ex(pl_shader sh, const struct pl_color_map_params *para
+ 
+ done:
+     pl_shader_delinearize(sh, &dst);
++    pq_tables_done(sh);
+     GLSL("}\n");
+ }
+ 

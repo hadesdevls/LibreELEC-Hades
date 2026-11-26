@@ -1,0 +1,262 @@
+From 67b5da3849b11040348f564fcd2e70dd321c2657 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:19:06 +0000
+Subject: [PATCH] [Hades][VideoPlayer] A processor that cannot decode both
+ views in time is found by the decoder's work, in four seconds
+
+Where the processor decodes both views of a 3D stream and does not keep
+up, the stream goes back to its base view in 2D. That was decided by
+the playback falling behind: two windows of four seconds in a row with
+one picture in eight late, after a grace of two seconds, so ten seconds
+and more of a picture that juddered first (a Radeon 780M laptop with a
+4K MV-HEVC film: 15 to 20 seconds, each time it was played).
+
+The decoder's own work tells it sooner. The player now measures the
+time it spends in the decoder of both views (sending it packets, asking
+it for pictures) between one picture of two views and the next. With
+threads, the decoder takes a packet only when one of them is free, so
+where the processor is what holds the playback back this time is what a
+picture costs; where it keeps up, the player waits elsewhere and the
+time is short. After the first 8 pictures of a start or a seek (the
+threads fill), where two windows of 48 pictures in a row give fewer
+pictures a second of that work than nine tenths of the video's rate,
+the stream goes back to its base view at once: about four seconds into
+the film. A processor that keeps up, or nearly, is left to the rule of
+the playback, which stays as it was; NVDEC is not measured this way.
+
+kodi.log says the rate measured and the video's: "the processor does
+not decode both views in time: it gives N pictures of two views a
+second of its work, measured over two windows of 48 pictures in a row,
+and the video has R", and the player information says that the second
+view was given up because the processor does not keep up, as before.
+---
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   | 22 ++++++-
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.h     |  4 ++
+ .../DVDCodecs/Video/MultiviewPacker.cpp       | 21 +++++++
+ .../DVDCodecs/Video/MultiviewPacker.h         | 11 ++++
+ xbmc/cores/VideoPlayer/MultiviewChoice.h      | 60 +++++++++++++++++++
+ 5 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index e22703b..6e67d75 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -940,9 +940,17 @@ int CDVDVideoCodecFFmpeg::ReceiveMultiviewFrame(int result)
+       // Hades: how the playback keeps up with the pictures of two views: the player asks for
+       // pictures to be dropped when it falls behind (not at another speed, nor before the target
+       // of a seek), which this decoder never does (SetCodecControl())
++      // ... and, where the processor decodes them, by the work of the decoder since the picture
++      // before, which finds a processor that cannot keep up sooner (KODI::MULTIVIEW::Worked())
++      const double busyMs =
++          std::chrono::duration<double, std::milli>(std::exchange(m_multiviewBusy, {})).count();
++      const double fps = m_hints.fpsrate > 0 && m_hints.fpsscale > 0
++                             ? static_cast<double>(m_hints.fpsrate) / m_hints.fpsscale
++                             : 0.0;
+       m_multiview->Paced(
+           (m_codecControlFlags & DVD_CODEC_CTRL_DROP_ANY) != 0,
+-          !(m_codecControlFlags & (DVD_CODEC_CTRL_NO_POSTPROC | DVD_CODEC_CTRL_DROP)));
++          !(m_codecControlFlags & (DVD_CODEC_CTRL_NO_POSTPROC | DVD_CODEC_CTRL_DROP)), busyMs,
++          m_multiviewNvdec ? 0.0 : fps);
+       return 0;
+     }
+     if (result == AVERROR_EOF)
+@@ -950,7 +958,10 @@ int CDVDVideoCodecFFmpeg::ReceiveMultiviewFrame(int result)
+     // no picture could be made: the second view is given up, by the caller
+     if (made == CMultiviewPacker::Result::FAILED)
+       return AVERROR(EAGAIN);
++    const auto receiveStart = std::chrono::steady_clock::now();
+     result = avcodec_receive_frame(m_pCodecContext, m_pDecodedFrame);
++    if (!m_multiviewNvdec)
++      m_multiviewBusy += std::chrono::steady_clock::now() - receiveStart;
+   }
+ }
+ 
+@@ -1424,7 +1435,13 @@ bool CDVDVideoCodecFFmpeg::SendPacket(AVPacket* avpkt, const CDrainRestart::Info
+     }
+   }
+ 
++  // Hades: the time in the decoder of both views that the processor runs (CMultiviewPacker::Paced())
++  const bool timed = m_multiview && !m_multiviewNvdec;
++  const auto sendStart =
++      timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+   int ret = avcodec_send_packet(m_pCodecContext, avpkt);
++  if (timed)
++    m_multiviewBusy += std::chrono::steady_clock::now() - sendStart;
+ 
+   // Whether Kodi sends this packet again (false below): on EAGAIN, and on a hardware decoder
+   // without free surfaces.
+@@ -2220,7 +2237,10 @@ CDVDVideoCodec::VCReturn CDVDVideoCodecFFmpeg::GetBasePicture(VideoPicture* pVid
+     av_packet_free(&avpkt);
+   }
+ 
++  const auto receiveStart = std::chrono::steady_clock::now();
+   int ret = avcodec_receive_frame(m_pCodecContext, m_pDecodedFrame);
++  if (m_multiview && !m_multiviewNvdec)
++    m_multiviewBusy += std::chrono::steady_clock::now() - receiveStart;
+ 
+   // Hades: the two views of an access unit come as two pictures and go on as one. A stream
+   // that this cannot be done for goes back to the decoder of every other stream (not at its
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+index 56d0354..c727807 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.h
+@@ -17,6 +17,7 @@
+ #include "utils/HDR10PlusVsif.h"
+ #include "utils/SideData.h"
+ 
++#include <chrono>
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -293,6 +294,9 @@ protected:
+   //! views copied from the card (DownloadView(), m_viewDownload); FFmpeg no longer offered it
+   //! (GetFormat()); it failed for this stream, which outlives Dispose() as m_multiviewFailed does
+   bool m_multiviewNvdec = false;
++  //! Hades: the time spent in the decoder of both views that the processor runs since the last
++  //! picture of two views (CMultiviewPacker::Paced())
++  std::chrono::steady_clock::duration m_multiviewBusy{};
+   bool m_multiviewNvdecLost = false;
+   bool m_multiviewNvdecFailed = false;
+   AVFrame* m_viewDownload = nullptr;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
+index a0ec373..9a4956b 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.cpp
+@@ -515,6 +515,27 @@ void CMultiviewPacker::Reset()
+   m_withoutPicture = 0;
+   // (the pace is judged anew after a seek, from its grace on)
+   m_pace = {};
++  m_work = {};
++}
++
++void CMultiviewPacker::Paced(bool late, bool judged, double busyMs, double fps)
++{
++  if (m_slow)
++    return;
++  if (KODI::MULTIVIEW::Worked(m_work, busyMs, fps, judged))
++  {
++    m_slow = true;
++    char text[320];
++    snprintf(text, sizeof(text),
++             "the processor does not decode both views in time: it gives %.1f pictures of two "
++             "views a second of its work, measured over two windows of %u pictures in a row, and "
++             "the video has %.3f",
++             m_work.rate, KODI::MULTIVIEW::WORK_WINDOW, fps);
++    m_slowText = text;
++    Fail(m_slowText.c_str());
++    return;
++  }
++  Paced(late, judged);
+ }
+ 
+ void CMultiviewPacker::Paced(bool late, bool judged)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
+index 0dcb4d3..93eca95 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/MultiviewPacker.h
+@@ -12,6 +12,7 @@
+ 
+ #include <cstdint>
+ #include <optional>
++#include <string>
+ 
+ struct AVBufferPool;
+ struct AVCodec;
+@@ -103,6 +104,13 @@ public:
+    *        the processor is taken not to keep up, the second view is given up (GivenUp(), Slow())
+    */
+   void Paced(bool late, bool judged);
++  /*!
++   * \brief (Hades) The same, with the work of the decoder since the picture before
++   *        (KODI::MULTIVIEW::Worked()): the processor that cannot keep up is found by it sooner
++   * \param busyMs the time the player spent in the decoder since the picture before
++   * \param fps the pictures a second of the video (0: not known)
++   */
++  void Paced(bool late, bool judged, double busyMs, double fps);
+   //! Whether the second view was given up because the processor did not keep up
+   bool Slow() const { return m_slow; }
+ 
+@@ -131,6 +139,9 @@ private:
+   int m_disparity{0};
+   bool m_sizeTold{false}; //!< what the eyes are was said in the log
+   KODI::MULTIVIEW::Pace m_pace;
++  KODI::MULTIVIEW::Work m_work;
++  //! (Hades) why the processor was taken not to keep up, where it was by the work of the decoder
++  std::string m_slowText;
+   bool m_slow{false};
+   AVFrame* m_waiting{nullptr}; //!< the picture that waits for the other view of its access unit
+   std::optional<KODI::MULTIVIEW::View> m_waitingView; //!< ... and what it is, when one waits
+diff --git a/xbmc/cores/VideoPlayer/MultiviewChoice.h b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+index 1fb52a8..46ce6b5 100644
+--- a/xbmc/cores/VideoPlayer/MultiviewChoice.h
++++ b/xbmc/cores/VideoPlayer/MultiviewChoice.h
+@@ -1635,6 +1635,66 @@ inline bool Paced(Pace& pace, bool late, bool judged)
+   return pace.slowWindows >= PACE_SLOW_WINDOWS;
+ }
+ 
++//! Hades: pictures after a start or a seek before the work of the decoder is measured (its threads
++//! fill, and the first pictures of each cost more)
++inline constexpr unsigned int WORK_SKIP = 8;
++//! Hades: the pictures over which the work of the decoder is measured (two seconds of film)
++inline constexpr unsigned int WORK_WINDOW = 48;
++//! Hades: the share of the rate of the video under which a window is a slow one: the decoder gives
++//! fewer pictures a second of its own work than nine tenths of the pictures of a second of film
++inline constexpr double WORK_MARGIN = 0.9;
++//! Hades: slow windows in a row after which the processor is taken not to keep up (four seconds)
++inline constexpr unsigned int WORK_SLOW_WINDOWS = 2;
++
++//! Hades: the work of the decoder of both views, measured (Worked())
++struct Work
++{
++  unsigned int skipped{0}; //!< pictures since the start or the last seek, up to WORK_SKIP
++  unsigned int inWindow{0};
++  double busyMs{0.0}; //!< the time spent in the decoder for the pictures of the window
++  unsigned int slowWindows{0}; //!< slow windows in a row
++  double rate{0.0}; //!< pictures a second of the decoder's own work, in the last window
++};
++
++/*!
++ * \brief Hades: a picture of two views went out of the decoder that the processor runs; whether
++ *        the processor is now taken not to keep up, by the work of the decoder itself
++ * \param busyMs the time that the player spent in the decoder (sending it packets, asking it for
++ *        pictures) since the picture before: with threads, the decoder takes a packet only when
++ *        one of them is free, so that where the processor is what holds the playback back, this
++ *        is the time it needs for a picture; where it keeps up, the player waits elsewhere (for
++ *        the display, for its source) and this is short
++ * \param fps the pictures a second of the video (0 where it is not known: never judged)
++ * \param judged as for Paced()
++ *
++ * Paced() sees that the processor does not keep up only once the playback has fallen behind, again
++ * and again, for eight seconds after a grace of two: ten seconds and more of a picture that
++ * judders. The work of the decoder tells it sooner: where, in two windows in a row of
++ * WORK_WINDOW pictures, it gives fewer pictures a second of its own work than WORK_MARGIN of the
++ * pictures of a second of film, it cannot keep up, and the stream goes back to its base view at
++ * once, about four seconds into the film. A processor that keeps up, or nearly, is left to
++ * Paced(), as before.
++ */
++inline bool Worked(Work& work, double busyMs, double fps, bool judged)
++{
++  if (!judged || !(fps > 0.0))
++    return false;
++  if (work.skipped < WORK_SKIP)
++  {
++    ++work.skipped;
++    return false;
++  }
++  ++work.inWindow;
++  work.busyMs += busyMs > 0.0 ? busyMs : 0.0;
++  if (work.inWindow < WORK_WINDOW)
++    return false;
++  work.rate = work.busyMs > 0.0 ? work.inWindow * 1000.0 / work.busyMs : 1.0e9;
++  work.slowWindows = work.rate < WORK_MARGIN * fps ? work.slowWindows + 1 : 0;
++  work.inWindow = 0;
++  work.busyMs = 0.0;
++  return work.slowWindows >= WORK_SLOW_WINDOWS;
++}
++
+ //! @}
+ 
+ /*!
+-- 
+2.53.0
+

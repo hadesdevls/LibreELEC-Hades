@@ -199,6 +199,15 @@ SAMPLES = {
     "hades.audio.bitrate": "18432",
     "hades.audio.bits": ["24", "float"],
     "hades.audio.format": ["truehd", "dtshd_ma", "eac3"],  # BitstreamName()
+    # the plan of the speakers and its rows (G SpeakerPlanInfo(), utils/SpeakerPlan.h): the layout declared (the most
+    # places of the plan: 12 floor, 1 LFE, 9 heights), the name of the display (DisplayModel(): the monitor name of the
+    # EDID, up to 13 characters), the layout of the channels sent,
+    # what a downmix folds (7.1 to stereo, the most folds) and what it leaves out
+    "hades.audio.decl": ["12.1.9", "5.1.2"],
+    "hades.audio.declby": "SONY TV  *00",
+    "hades.audio.sent": "7.1",
+    "hades.audio.fold": "FC > FL+FR; BL+BR > FL+FR; SL+SR > FL+FR",
+    "hades.audio.folddrop": "LFE",
     # the upscaler of the videos of this kind, on the button of the Video page (GUIDialogVideoSettings.cpp
     # UpscalerScope(), UpscalerValueName())
     "hades.video.upscalerscope": ["$ADDON[skin.estuary 54076]", "$ADDON[skin.estuary 54077]", "$ADDON[skin.estuary 54078]"],
@@ -257,7 +266,8 @@ SAMPLES = {
     "hades.sum.arg": ["passthroughoff", "syncdisplay", "notqueued"],  # H Summarize(): the code of the first note
     "hades.sum.more": "14",  # H: the notes but the first
     "hades.sum.vbadge": ["Dolby Vision" + D + "P8.4", "Dolby Vision" + D + "FEL"],  # H VideoBadge()
-    "hades.sum.abadge": ["Dolby Digital+ 7.1.4", "Dolby TrueHD 7.1.4"],  # H AudioBadge()
+    "hades.sum.abadge": ["Dolby Digital+ 7.1.4", "Dolby TrueHD 7.1.4", "TrueHD Atmos 7.1.4 + objects",
+                         "DD+ 7.1, no Atmos", "TrueHD 7.1, no Atmos"],  # H AudioBadge()
     # Kodi's own labels (P, unless said)
     "Player.CacheLevel": "100",
     "Player.Process(videodecoder)": ["ff-mpeg2video-vaapi", "hevc-drm_prime", "ff-hevc"],

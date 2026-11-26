@@ -47,7 +47,7 @@ def record(name, ok, detail=""):
 def import_clips(clips_dir, extra=()):
     """fresh modules of the generator (card, dovi, hevc, mkv and the extra ones), not shared with any
     earlier import, so that a mutant's changes stay in its own modules"""
-    names = ("card", "dovi", "hevc", "mkv", "abclip", "fpclip") + tuple(extra)
+    names = ("card", "dovi", "hevc", "mkv", "abclip", "fpclip", "hdr3dclip") + tuple(extra)
     for m in names + ("gen_video",):
         sys.modules.pop(m, None)
     sys.path.insert(0, clips_dir)
@@ -680,6 +680,70 @@ def check_fp(gen, mods, prefix=""):
                   if not bad else "; ".join(bad))
 
 
+def check_hdr3d(gen, mods, prefix=""):
+    """the HDR 3D clip of the card "3D: HDR" (hdr3dclip.py, clips.json "hdr3d"): its entry; 1920x1080 at
+    24000/1001, 10 bits, PQ and BT.2020 with the HDR10 static metadata of the card (its mastering display, MaxCLL the
+    peak of the card, MaxFALL the mean of its two eyes); the 3D layout as FFmpeg gives it to Kodi (stereo_mode
+    "left_right" and its Stereo 3D side data); and every code of every picture, decoded, with the two halves the same
+    card but for the label of each eye"""
+    h3 = mods["hdr3dclip"]
+    card = mods["card"]
+    e = clips_doc(gen).get("hdr3d")
+    if not e:
+        return record(prefix + "the HDR 3D clip", False, "no entry \"hdr3d\" in clips.json")
+    path = os.path.join(gen, e.get("file", ""))
+    if e.get("file") != h3.FILE or not os.path.isfile(path):
+        return record(prefix + "the HDR 3D clip", False, "file %r" % e.get("file"))
+    bad = []
+    if e.get("sha256") != sha256(path) or e.get("bytes") != os.path.getsize(path):
+        bad.append("digest or size in clips.json")
+    f = dict(h3.fmt(), frames=e.get("frames"))
+    got = (e.get("format"), e.get("width"), e.get("height"), e.get("fps"), e.get("bit_depth"), e.get("stereo_mode"),
+           e.get("colour"))
+    if got != (h3.FORMAT, 1920, 1080, [24000, 1001], 10, "left_right", {"primaries": 9, "transfer": 16, "matrix": 9}):
+        bad.append("entry %r" % (got,))
+    exact = f["frames"] * f["fps"][1] / f["fps"][0]
+    if not isinstance(e.get("duration"), (int, float)) or abs(e["duration"] - exact) > 0.0005:
+        bad.append("duration %r, %.4f s" % (e.get("duration"), exact))
+    eyes = [card.light_stats(dict(h3.base(), label=label)) for label in h3.LABELS]
+    want_cll = card.rnd(max(p for p, _ in eyes), "MaxCLL")
+    want_fall = card.rnd(sum(m for _, m in eyes) / 2, "MaxFALL")
+    if (e.get("max_cll"), e.get("max_fall")) != (want_cll, want_fall):
+        bad.append("MaxCLL and MaxFALL %r, %r wanted" % ((e.get("max_cll"), e.get("max_fall")), (want_cll, want_fall)))
+    st = ffprobe_json(path, "-show_streams")["streams"][0]
+    if (st.get("width"), st.get("height"), st.get("pix_fmt"), frac(st.get("r_frame_rate")), st.get("color_transfer"),
+            st.get("color_primaries")) != (1920, 1080, "yuv420p10le", 24000 / 1001, "smpte2084", "bt2020"):
+        bad.append("FFmpeg reads %r" % ((st.get("width"), st.get("height"), st.get("pix_fmt"), st.get("r_frame_rate"),
+                                         st.get("color_transfer"), st.get("color_primaries")),))
+    if (st.get("tags") or {}).get("stereo_mode") != "left_right":
+        bad.append("FFmpeg's stereo_mode %r" % (st.get("tags") or {}).get("stereo_mode"))
+    side = {d.get("side_data_type"): d for d in st.get("side_data_list", [])}
+    s3d = side.get("Stereo 3D") or {}
+    if s3d.get("type") != "side by side" or s3d.get("inverted"):
+        bad.append("Stereo 3D side data %r" % s3d)
+    cll = side.get("Content light level metadata") or {}
+    if (cll.get("max_content"), cll.get("max_average")) != (want_cll, want_fall):
+        bad.append("content light level %r" % cll)
+    md = side.get("Mastering display metadata") or {}
+    if frac(md.get("max_luminance")) != card.MASTERING["max_nits"] or frac(md.get("red_x")) != 0.68:
+        bad.append("mastering display %r" % md)
+    analyze.card = card
+    exp = analyze.to_planes(b"".join(h3.planes()), f)
+    differ = np.nonzero((exp[0][:, :960] != exp[0][:, 960:]).any(axis=1))[0]
+    rows = (card.LABEL_Y, card.LABEL_Y + 7 * card.DOT)
+    if not len(differ) or differ.min() < rows[0] or differ.max() >= rows[1]:
+        bad.append("the eyes differ in rows %s, the labels are in %s" % (differ[:3].tolist() + differ[-3:].tolist(), rows))
+    n = good = 0
+    for planes in analyze.decoded_pictures(A.ffmpeg, path, f):
+        good += all((planes[c] == exp[c]).all() for c in range(3))
+        n += 1
+    if n != f["frames"] or good != n:
+        bad.append("%d of %d pictures exact" % (good, n))
+    return record(prefix + "the HDR 3D clip %s: clips.json, its HDR and 3D as FFmpeg reads them, its pictures" % h3.FILE,
+                  not bad, "%d pictures of 1920x1080 at 24000/1001 in HDR10 (MaxCLL %d, MaxFALL %d), side by side with "
+                  "the left eye first, every code exact" % (n, want_cll, want_fall) if not bad else "; ".join(bad))
+
+
 def check_sizes(gen, mods, prefix="", limit=SIZE_LIMIT):
     """everything the folder holds (the pictures, the sounds when they were made, the JSON files and
     SHA256SUMS) under the limit"""
@@ -1008,6 +1072,18 @@ def run_mutants(gen, ref):
     mutant("the 3D clip with its eyes swapped", check_fp, generate(w("fp-swapped"), "sdr-3d-sbs", 2, swap), ref,
            "mutant: ")
 
+    # the HDR 3D clip of the card "3D: HDR": a control, then without its StereoMode, and with the MaxFALL of one eye
+    say("--- control of the HDR 3D clip (two pictures, no fault): the check below must pass")
+    control.append(check_hdr3d(generate(w("hdr3d-control"), "hdr10-3d-sbs", 2), ref, "control: "))
+    mutant("the HDR 3D clip without its StereoMode", check_hdr3d,
+           generate(w("hdr3d-nostereo"), "hdr10-3d-sbs", 2, lambda m: setattr(m["hdr3dclip"], "STEREO_MODE", None)),
+           ref, "mutant: ")
+
+    def one_eye(m):
+        m["hdr3dclip"].LABELS = (m["hdr3dclip"].LABELS[0], m["hdr3dclip"].LABELS[0])
+    mutant("the HDR 3D clip with one eye's label on both", check_hdr3d,
+           generate(w("hdr3d-one-eye"), "hdr10-3d-sbs", 2, one_eye), ref, "mutant: ")
+
 
 def main():
     global A
@@ -1053,6 +1129,8 @@ def main():
         check_ab(gen, ref)
     if want("fp"):
         check_fp(gen, ref)
+    if want("hdr3d"):
+        check_hdr3d(gen, ref)
     if want("sizes"):
         check_sizes(gen, ref)
     if want("guard"):

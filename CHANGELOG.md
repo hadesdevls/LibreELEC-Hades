@@ -4,6 +4,76 @@ The versions of LibreELEC Hades. Before 1.0 RC1 there were only private test bui
 
 Patch numbers are those of the version in whose section they appear. In 1.0 the patches of Hades were numbered again in the order in which they apply, so a number in an older section may name another patch today.
 
+## 1.2.2
+
+A short version after 1.2.1. 3D works on more PCs: HDMI 3D frame packing on NVIDIA through the driver's own buffers, side by side and top and bottom of a 2160p mode kept at 2160p, HDR in 3D decided display by display, subtitles in 3D that keep their shape, and MV-HEVC 3D decoded about twice as fast on the processor. The graphics do less work for a picture that is the same or more exact: a paused video with a menu over it is no longer converted again at every refresh, the PQ curves of every mapping of HDR come from tables made in double precision, and an identity 3D LUT gives the picture back to the bit. The Audio page has a plan of the speakers that says what each one gets, the devices that may wake the PC are chosen one by one, Bluetooth ones too, and network access is one choice: as Hades recommends it or as in LibreELEC.
+
+### What's new for you
+
+**3D**
+
+- **HDMI 3D frame packing on NVIDIA through buffers the display engine shows.** Where the GBM of NVIDIA cannot make the picture buffers of a frame-packed mode, Hades now uses the driver's own buffers, which are always in video memory; `kodi.log` says which buffers went out and how. Reported by NTM-3D.
+- **Side by side and top and bottom of a 2160p mode go out at 2160p,** never at fewer lines. On NVIDIA the display is now told of them at 2160p where its EDID declares it, at 24 to 30 Hz too: the driver names those 4K formats by their CTA-861 number next to the 3D layout, by the same rule as Linux on Intel and AMD, on the GeForce GTX 900 and 10 series as well. `kodi.log` lists the 3D layouts that the display declares. Reported by NTM-3D and Ryudoadema.
+- **HDR in 3D, display by display.** Nothing a display sends says whether it shows HDR in 3D, so until that is known for a display, an HDR 3D video goes out in SDR (in BT.2020 where the display takes it), and the first one says once where to check it. *Check this setup > 3D: HDR* plays a short HDR clip in 3D, asks what you saw and keeps the answer for that display; *Automatic* then sends HDR in 3D where you saw it. The player information says which it is, and a choice of your own in *How 3D video goes out* still wins. Asked by Ryudoadema.
+- **Subtitles in 3D side by side and top and bottom keep their shape.** They came out deformed (twice as wide in side by side), a fault of Kodi since version 20. Reported by NTM-3D.
+- **Leaving a 3D video changes the display mode once,** straight to the menus in 2D, where it changed it twice (a projector takes seconds for each). Reported by Ryudoadema.
+- **A 3D Dolby Vision video in the player information:** *Output of this video* and the reason say that Dolby Vision is not sent in 3D and that each view is rebuilt. Reported by Ryudoadema.
+- **MV-HEVC 3D on the processor:** FFmpeg lets the next picture start before the slices of the current one are decoded (cinemaONE's patch, from FFmpeg issue #26347), with the same pictures to the bit, and the decoder of both views uses up to 24 threads, so a desktop processor decodes a 2160p 3D film about twice as fast as before. A processor that still cannot keep up goes to 2D in about four seconds instead of ten to twenty, and does not try both views again when the output of the video is changed. Patch by cinemaONE; reported by cinemaONE, ht2tweak and NTM-3D.
+
+**Picture**
+
+- **A paused video with the OSD or a menu over it,** and a picture shown for more than one refresh with subtitles over it, is no longer made and converted again at every refresh: the frame takes what the one before made of the same picture, the same bytes, for much less work of the graphics. HDR10 and HLG over the 12-bit tunnel likewise.
+- **The PQ curves of every mapping of HDR to a display** (Dolby Vision as HDR10 adapted, as SDR and in Low-Latency, HDR10, HDR10+ and HLG to SDR) are read from tables made in double precision instead of being worked out with powers on the graphics chip: no exponential or logarithm left in those curves, and a picture a little closer to the exact mapping, by far less than the eye can see.
+- **An identity 3D LUT of the display gives the picture back to the bit.**
+
+**Sound**
+
+- **The speakers of the Audio page** say which speakers get sound, which ones your TV or receiver declares, the Atmos objects that your receiver renders to its heights, and the channels sent with the downmix, with a legend. The Dolby Atmos label says "+ objects" when it is passed through and "no Atmos" when it is decoded. Asked by Ryudoadema.
+
+**Playback**
+
+- **A network source slower than the video:** the buffering after a seek shows how far along it is (it showed nothing, which looked like a freeze), and where the source sends less than the video needs, Hades says so once, with both numbers. Reported by NTM-3D.
+- **Game controllers:** holding Start opens the player information while a video plays (the Menu button on an Xbox controller, Options on a PlayStation one, over USB or Bluetooth). A short press does what it did. Asked by Ryudoadema.
+
+**Graphics and connections**
+
+- **Deep colour that a display does not lock onto** (some laptop HDMI ports, 4K at 24 to 30 Hz in 10 bits): on Intel graphics Hades reads the display's status a couple of seconds after such a mode, and where the display did not lock on, that mode goes out in 8 bits for the rest of the session instead of leaving no picture. `kodi.log` says what the display answered. Reported by NTM-3D.
+
+**Sleep**
+
+- **Choose which devices may wake the PC, one by one** (*Settings > LibreELEC > System > Sleep > Devices that may wake it*): tick a remote, a gamepad, a mouse or a paired Bluetooth device to let it wake the PC, or untick a keyboard. Mice and game controllers still never wake it unless ticked. Bluetooth devices follow the same choice, and the Bluetooth adapter is set to wake the PC only while a Bluetooth device is ticked. Xbox 360 receivers and wired Xbox controllers are now listed as game controllers. Whether a device can wake a PC depends on the device, the adapter and the firmware; the kernel log says what each one may do.
+- **Nothing that woke the PC stops after the update:** where the firmware lets the Bluetooth adapter wake the PC, a Bluetooth mouse or game controller paired before the update that could wake it then is ticked in that list, so that it still does, and can be unticked there.
+
+**Network and sharing**
+
+- **Network access in one choice** (*Settings > LibreELEC > Services*, and the first-start wizard): "Recommended (safer)", the defaults of LibreELEC Hades, or "As in LibreELEC" (file sharing without a password, SSH with the default password, no firewall, AirPlay on). It shows what will change and asks first; every setting stays adjustable on its own, and an update changes nothing.
+- **Samba: How to connect** shows the address, the user and the password at any time, and what Windows and macOS need. Turning the Samba password off now asks first and says what that opens.
+- **SSH says why it takes only keys:** the *SSH Password* button says when root still has the default password, and SSH shows a short note before the login (FileZilla's "No more authentication methods available" is this).
+- **The Logfiles share is faster with a big log:** a 205 MB debug log goes through the filter in parts at once, in 7 s instead of 30 s on my build PC, with exactly the same result; the note shown meanwhile says plainly what it is and when to look again.
+- The help of *Adjust display HDR mode* and *HDR to SDR: the display it is made for* says where they were up to 1.1.
+- The changes of this group follow the feedback of ht2tweak.
+
+**Up to date**
+
+- LibreELEC master up to `ceb19682c636`: game add-ons (bluemsx, same_cdi, yabasanshiro and the shader presets), none of them in the image.
+- Kodi's `Piers` branch up to `9b6dec95455c`: its only change since 1.2.1 brings two fixes of DTS-HD passthrough by tanio99 that Hades already carried.
+
+### Details
+
+- The Kodi changes of this version are `kodi-9460` to `kodi-9475` (frame packing on nvidia-drm through its dumb buffers; Start held on a game controller; the player information of a 3D Dolby Vision video and the Atmos label; a processor that cannot decode both views found by the decoder's work; side by side and top and bottom of 2160p at 2160p; the shape of 3D subtitles; HDR in 3D in SDR until checked; no second try of both views; the threads of the decoder of both views; deep colour checked on the display; the buffering of a slow source; one change of mode when 3D stops; 2160p layouts told on nvidia-drm; *Automatic* by what *Check this setup* found; the plan of the speakers; 2160p at 24 to 30 Hz on nvidia-drm), `kodi-9476` (up to 24 threads for both views), `kodi-9477` (the "\brief" of ten comments), `kodi-9480` to `kodi-9482` (a picture drawn again takes what the frame before made, also over the HDR tunnel, and `kodi.log` says how the mapping takes the PQ curves) and `kodi-9490` (the help of two settings that moved in 1.2).
+- `ffmpeg-9974`: cinemaONE's patch from FFmpeg issue 26347: the HEVC decoder with frame threads lets the next frame thread start before the slice data of a picture of two layers is decoded. `ffmpeg-9975`: its debug line, which says how many slices waited for the setup to end.
+- `libplacebo-9982` (the PQ curves of the colour mapping from tables made in double precision) and `libplacebo-9983` (the tetrahedral interpolation of a 3D LUT as steps along the edges).
+- `nvidia-open-kernel-modules-9086` and `nvidia-legacy-open-9083`: with a client's vendor InfoFrame of side by side (half) or top and bottom in a mode that NVKMS names by its HDMI_VIC, the AVI InfoFrame carries the CTA VIC of the mode where the EDID declares that layout for it, and the read-only connector property `NV_HDMI_3D_AVI_CTA_VIC` says so.
+- `LibreELEC-settings-9094` to `9097`: the devices that may wake the computer, Samba and SSH, network access, and the card *3D: HDR* of *Check this setup*; `hades-check` makes its HDR 3D clip.
+- `hades-wake` 2: the list of devices, Bluetooth (BlueZ's `WakeAllowed` of each device, the adapter armed for the list), and a rule of udev that notes the Bluetooth devices paired before the update; `hades-diag` 30: `sleep.sh` says the Bluetooth devices, the Logfiles share filters a big log in parts, and the report says the network access.
+- `mariadb-connector-c`: its remote I/O code is left out at any order of the build (`-DREMOTEIO_PLUGIN_TYPE=OFF`), as `WITH_CURL=OFF` means.
+- The update channel: 1.2.2 is 1020299.
+- `tools/regress` gained the tests of each change, each proven by a mutant that must make it fail.
+
+### Credits
+
+- Thank you to NTM-3D for the reports of 3D on an RTX 5050 and an Intel laptop, to Ryudoadema for the photos and the questions of 3D, the player information and the speakers, to ht2tweak for the log of 3D on a Ryzen 7 and for the feedback on Samba, SSH and the log, to cinemaONE for the confirmation of issue #34 on a Radeon RX 7600 and for the FFmpeg patch that decodes MV-HEVC with frame threads (FFmpeg issue 26347), and to Mibix, whose report of issue #32 showed a Bluetooth adapter that the firmware lets wake the PC.
+
 ## 1.2.1
 
 A short version after 1.2: a 1D LUT for the calibration of a display, the frame of the video saved alone, HDMI 3D frame packing on NVIDIA graphics, the remote waking the PC from sleep, Dolby Vision in IPT with much less work for the graphics, two fixes for HDR and Dolby Vision in 3D, a check of the Dolby Vision output that says more on older Radeon cards, and fixes for AV receivers and for audio outputs that come and go.

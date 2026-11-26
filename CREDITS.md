@@ -36,6 +36,7 @@ Patch names such as `kodi-9110` or `linux-9935` are files of the version in whos
 
 - **Dom Cobley (popcornmix)**: the decoding of the second view of 3D Blu-ray video, his series of changes to FFmpeg's H.264 decoder ([FFmpeg pull request 24303](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/24303)), applied to a copy of that decoder; and, in Kodi, how the two clips of a 3D disc are read together and one change to how the 3D modes of a display are read.
 - **cinemaONE** ([cinema-ONE/LibreELEC.tv](https://github.com/cinema-ONE/LibreELEC.tv)): four changes to AMD's kernel driver for 3D over HDMI (`linux-9911` to `linux-9914`) and the frame-packed 3D modes in Kodi (`kodi-9115`); with Dom Cobley, the subtitle depth of 3D remuxes and their plane offsets; and the lunasvg fixes that Hades carries.
+- **cinemaONE**: the FFmpeg patch that decodes MV-HEVC 3D with frame threads, letting the next picture start before the slices of the current one are decoded (`ffmpeg-9974`, with his authorship, from [FFmpeg issue 26347](https://code.ffmpeg.org/FFmpeg/FFmpeg/issues/26347)).
 - **Portisch**: full side by side and top and bottom in 3D file names, and one eye of a full 3D frame given the size of the whole frame, from his changes for CoreELEC ([CoreELEC/xbmc ae5090539e](https://github.com/CoreELEC/xbmc/commit/ae5090539edee29d72163a6091638167952d3492), [40f14dcdbe](https://github.com/CoreELEC/xbmc/commit/40f14dcdbef14b685b260fe8677f9e15195f9074)).
 
 ### Graphics and HDMI
@@ -164,6 +165,11 @@ Sources that Hades read to learn a format or a rule, and then wrote its own code
 - **MrMagic**: the load of the IPT transport on the graphics of a mini PC with a Radeon 660M ([forum thread of Hades, post 214](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=210073#post210073)).
 - **cinemaONE**: with an HDR video in 3D, old menus and subtitles left in the right eye, and the colours of a Dolby Vision 3D film after it goes back to 2D ([issue 34](https://github.com/hadesdevls/LibreELEC-Hades/issues/34)).
 - **MrPhenix007**: screenshots in HDR that came out dark ([issue 30](https://github.com/hadesdevls/LibreELEC-Hades/issues/30)).
+- **NTM-3D**: with 1.2.1 on a laptop with an RTX 5050 and on an Intel laptop, frame packing that NVIDIA's GBM still could not give buffers for, subtitles of 3D side by side twice as wide, a deep colour mode that the HDMI port of the Intel laptop did not lock onto, a 2160p 3D film that the processor could not decode in both views, and a seek over Wi-Fi that looked like a freeze ([forum thread of Hades](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/)).
+- **Ryudoadema**: with photos of his display, old menus in the right eye of a 3D video, 3D at 2160p that the display was not told of, two changes of mode when 3D stops, and the questions on HDR in 3D, the player information of a 3D Dolby Vision video and the plan of the speakers ([forum thread of Hades](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/)).
+- **ht2tweak**: the log of an MV-HEVC 3D film on a Ryzen 7 that went to 2D after seconds of stutter, and the feedback on the Samba password, SSH that takes only keys and the filtered log ([forum thread of Hades, post 210077](https://forum.libreelec.tv/thread/30682-x86-64-hadesdevls-builds-libreelec-hades-native-dolby-vision-hdr10-and-3d/?postID=210077#post210077)).
+- **cinemaONE**: the confirmation of issue 34 on a Radeon RX 7600 with a JVC projector, frame packing at 1080p ([issue 34](https://github.com/hadesdevls/LibreELEC-Hades/issues/34#issuecomment-7184961436)).
+- **Mibix**: a Bluetooth adapter that the firmware lets wake the PC ([issue 32](https://github.com/hadesdevls/LibreELEC-Hades/issues/32#issuecomment-7179691515)).
 
 ## Where requests came from
 

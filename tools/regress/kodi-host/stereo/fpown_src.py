@@ -14,6 +14,9 @@
 #  - the buffers of more than 8 bits are made as before (not linear)
 #  - CDRMAtomic::TestFramePacked() only tests (DRM_MODE_ATOMIC_TEST_ONLY), with the mode, and only a frame-packed mode
 #    of nvidia-drm on an output that is meant to be on
+#  - the driver's dumb buffers (where GBM's could not be made or were refused): made, given a dma-buf, their handle
+#    closed and imported into GBM (MakeDumb()), at the driver's pitch, linear; copied into by the processor only where
+#    they are dumb buffers that EGL cannot draw into, with that copy checked first; unmapped before they go
 # Prints FAIL lines and FPOWN-SRC PASSED or FAILED (n) last.
 import os
 import sys
@@ -69,10 +72,44 @@ need('{DRM_FORMAT_MOD_LINEAR}, true, true, failed)' in start,
      'FramePackedOwnStart(): buffers of DRM_FORMAT_MOD_LINEAR, flipped by the GPU, linear without modifiers too')
 need('SetReflectY(true)' not in start and 'SetReflectY(false)' in start,
      'FramePackedOwnStart(): the plane is never asked to reflect them (a frame-packed plane takes no rotation)')
-need('for (unsigned int i = 0; i < COwnScanout::BUFFERS && ownAsked == FP_OWN::Asked::TAKEN; ++i)' in start and
-     'm_DRM->FramePackedBufferUsable(own->BufferAt(i), wrong)' in start and
-     'ownAsked = FP_OWN::AskedOf(m_DRM->TestFramePacked(own->BufferAt(i), ownWhy));' in start,
+need('for (unsigned int i = 0; i < COwnScanout::BUFFERS && taken == FP_OWN::Asked::TAKEN; ++i)' in start and
+     'm_DRM->FramePackedBufferUsable(buffers->BufferAt(i), wrong)' in start and
+     'taken = FP_OWN::AskedOf(m_DRM->TestFramePacked(buffers->BufferAt(i), refusal));' in start,
      'FramePackedOwnStart(): each buffer checked for what nvidia-drm asks of a frame-packed one, and asked')
+# (the driver's dumb buffers: only after GBM's, only where TryDumb() says so, GBM's given back first, and asked the
+# same way)
+dumb_call = 'COwnScanout::Memory::DUMB, m_DRM->GetFileDescriptor());\n    ownAsked = ask(own, failed, ownWhy);'
+need(start.count('ownAsked = ask(own, failed, ownWhy);') == 2 and
+     'FP_OWN::Asked ownAsked = ask(own, failed, ownWhy);' in start and dumb_call in start and
+     before(start, '{DRM_FORMAT_MOD_LINEAR}, true, true, failed);', 'FP_OWN::TryDumb(own != nullptr, ownAsked)') and
+     before(start, 'FP_OWN::TryDumb(own != nullptr, ownAsked)', '    own.reset();\n') and
+     before(start, '    own.reset();\n', 'COwnScanout::Memory::DUMB'),
+     "FramePackedOwnStart(): the driver's dumb buffers only after GBM's, where TryDumb() says so, GBM's given back "
+     'first, each one asked as GBM\'s are')
+need('{DRM_FORMAT_MOD_LINEAR}, true, true, failed,\n' in start,
+     "FramePackedOwnStart(): the dumb buffers flipped by the GPU or copied, linear")
+
+OWN = read('xbmc/windowing/gbm/OwnScanout.cpp')
+make = body(OWN, 'gbm_bo* MakeDumb(')
+need(before(make, 'DRM_IOCTL_MODE_CREATE_DUMB', 'drmPrimeHandleToFD(') and
+     before(make, 'drmPrimeHandleToFD(', 'DRM_IOCTL_MODE_DESTROY_DUMB') and
+     before(make, 'DRM_IOCTL_MODE_DESTROY_DUMB', 'gbm_bo_import(') and
+     before(make, 'gbm_bo_import(', 'close(fd);'),
+     'MakeDumb(): made, given a dma-buf, its handle closed, imported into GBM by the dma-buf (one handle, GBM\'s)')
+need('data.strides[0] = static_cast<int>(create.pitch);' in make and 'data.modifier = DRM_FORMAT_MOD_LINEAR;' in make and
+     'pitch = create.pitch;' in make and 'create.bpp = 32;' in make,
+     "MakeDumb(): imported at the driver's pitch, linear, 32 bits a pixel")
+create_own = body(OWN, 'std::shared_ptr<COwnScanout> COwnScanout::Create(')
+need('      if (memory != Memory::DUMB)\n      {\n        failed = drawFailed;\n        return nullptr;\n      }' in create_own,
+     'Create(): only dumb buffers are copied into by the processor; a buffer of GBM that EGL cannot draw into is refused')
+need('    if (own->m_copy\n            ? !own->CopyProbe(failed)' in create_own,
+     'Create(): the copy is checked before use, as the flip of the GPU is')
+swap = body(OWN, 'bool COwnScanout::Swap(')
+need(before(swap, 'if (m_copy && m_ring.BackIndex() >= 0)', 'CopyOut(static_cast<unsigned int>(m_ring.BackIndex()), failed)'),
+     'Swap(): a frame copied into the buffer chosen for it where the frames are copied')
+gone_own = body(OWN, 'COwnScanout::~COwnScanout(')
+need(before(gone_own, 'munmap(buffer.map, buffer.mapSize);', 'gbm_bo_destroy(buffer.bo);'),
+     'the mapping of a dumb buffer goes before the buffer')
 need(before(start, 'if (verdict.use != FP_OWN::Use::OWN)', 'SetOwnBuffers(own)') and
      'FP_OWN::Decide(asked, own != nullptr, ownAsked)' in start,
      'FramePackedOwnStart(): the buffers are put in place only where Decide() says so')

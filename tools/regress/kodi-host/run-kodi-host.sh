@@ -53,7 +53,8 @@
 #             (decoderdrain_test.cpp: DecoderDrain.h, and in the source that VideoPlayerVideo drains only through it),
 #             and why an HLG video stays HLG where HLG as Dolby Vision cannot take it (hlgreason_test.cpp:
 #             HlgDolbyVisionIneligibility() against HlgDolbyVisionEligible(), DVPlaybackPolicy.h)
-#   own       the trace of a seek (SeekTrace.h, SeekPending.h, ModeChangeTime.h), the module xbmcaddon through the
+#   own       the trace of a seek (SeekTrace.h, SeekPending.h, ModeChangeTime.h), a slow source while the player
+#             buffers (SourceRate.h), the plan of the speakers (SpeakerPlan.h, on real and made EDIDs), the module xbmcaddon through the
 #             build's swig, pwr() of hades-diag's watch-dv.sh with the image's busybox, and the plane of the speakers
 #             of the player information through Kodi's data cache and the audio engine's clear of it (speakers_test.cpp:
 #             HadesPlayerInfo.h with DataCacheCore.cpp and AEChannelInfo.cpp), and the use of an amdgpu GPU from the
@@ -111,7 +112,11 @@
 #             rule before, which must fail; 2D the same bytes; the caller) and a 3D video gone back to 2D and the
 #             bridge (issue #34; fallback2d_test.cpp: Stereo3DVideo.h's IsStereo() with Kodi's RenderFlags.cpp: the base
 #             view alone decided as the picture in 2D from the start, every reader of a picture's stereo mode on its
-#             way to the bridge; the rule before, which must fail)
+#             way to the bridge; the rule before, which must fail); the driver's dumb buffers of a frame-packed mode
+#             of nvidia-drm after GBM's, and the copy of the processor into them (fpown_gl_test.cpp, fpown_src.py);
+#             1.2.2 (pc3d_test.cpp: the pixel ratio that libass is given in a 3D output, the glyphs of their shape
+#             side by side and top and bottom, the rule before failing; the Atmos badge; holding Start on a game
+#             controller; a 3D Dolby Vision video in the player information)
 #   capture   the SDR copy of an HDR screenshot and the peak it is mapped from (Kodi's TestCaptureConvert with
 #             googletest: CaptureConvert.cpp with libswscale and libavutil of the FFmpeg of the recipe, built for the
 #             host as the bridge's is, rg_ff_bridge), and when the keys of the TV's remote and the commands of the TV
@@ -206,6 +211,9 @@ fpinc() {
   mkdir -p "$d" || return 1
   [ "$(readlink "$d/gbm.h")" = "$s/gbm.h" ] || ln -sfn "$s/gbm.h" "$d/gbm.h" || return 1
   [ "$(readlink "$d/libdrm")" = "$s/libdrm" ] || ln -sfn "$s/libdrm" "$d/libdrm" || return 1
+  # (xf86drm.h: OwnScanout.cpp makes the driver's dumb buffers)
+  [ -f "$s/xf86drm.h" ] || { echo "no xf86drm.h in $s" >&2; return 1; }
+  [ "$(readlink "$d/xf86drm.h")" = "$s/xf86drm.h" ] || ln -sfn "$s/xf86drm.h" "$d/xf86drm.h" || return 1
   echo "$d"
 }
 # the headers of FFmpeg of the build folder's sysroot (libavcodec, libavutil), in a folder of their own
@@ -300,11 +308,16 @@ build() {
                     $CXX -pthread $f -I $D/gen -I $X -I $X/platform/posix -isystem $FF/include $S/fix/aesink_test.cpp \
                       $X/cores/AudioEngine/Utils/AEDeviceInfo.cpp $X/cores/AudioEngine/Utils/AEChannelInfo.cpp -o $D/aesink-$san || return 1
                   done; } ;;
-      seek) $CXX ${WERR:-} $SAN -I $X/cores/VideoPlayer -I $X/utils $S/own/seek_test.cpp -o $D/t -lpthread ;;
+      seek) $CXX ${WERR:-} $SAN -DKODI_TREE="\"$K\"" -I $X/cores/VideoPlayer -I $X/utils $S/own/seek_test.cpp \
+              -o $D/t -lpthread ;;
       # (Kodi's own files built as they are: not with -Werror, which their warnings would stop)
       speakers) $CXX $SAN -pthread -DTARGET_POSIX -DTARGET_LINUX -I $S/own/speakers_stub -I $X $X/cores/DataCacheCore.cpp \
                   $X/platform/posix/threads/RecursiveMutex.cpp $X/cores/AudioEngine/Utils/AEChannelInfo.cpp \
                   $S/own/speakers_test.cpp -o $D/t ;;
+      # (Hades: the plan of the speakers, with the host's libswresample of the build folder)
+      speakerplan) f=$(ls -d $REGRESS_LE_BUILD/build/ffmpeg-[0-9]*/.x86_64-linux-gnu | head -n 1) &&
+                     $CXX ${WERR:-} $SAN -I $X -I $f -I $f/.. $S/own/speaker_plan_test.cpp \
+                       $f/libswresample/libswresample.a $f/libavutil/libavutil.a -lm -lpthread -o $D/t ;;
       swig) cp $S/own/swig_check.py $D/t ;;
       gpusensors) $CXX ${WERR:-} -Wshadow $SAN -pthread -I $X/windowing/gbm $S/own/gpusensors_test.cpp -o $D/t ;;
       fadelabel) mkdir -p $D/src $D/stub/guilib/guiinfo $D/stub/utils $D/stub/windowing &&
@@ -360,6 +373,11 @@ build() {
           -DKODI_TREE="\"$K\"" -I $S/stereo/glstub -I $X -isystem $gles $S/stereo/guifbo_gl_test.cpp \
           /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
       # (issue #34: a 3D video gone back to 2D and the bridge, with Kodi's RenderFlags.cpp; -DOLD_RULE the rule before)
+      # (1.2.2: the subtitles of a 3D output, the Atmos badge, holding Start, a 3D Dolby Vision video in the player
+      # information; -DOLD_RULE the pixel ratio of libass as before)
+      pc3d|pc3d-old-rule) $CXX $([ $t = pc3d ] && echo "${WERR:-}" || echo -DOLD_RULE) $SAN -DKODI_TREE="\"$K\"" \
+                         -I $S/stereo/glstub -I $X \
+                         $S/stereo/pc3d_test.cpp -o $D/t ;;
       fallback2d|fallback2d-old-rule) ff=$(ffinc) && $CXX $([ $t = fallback2d ] && echo "${WERR:-}" || echo -DOLD_RULE) \
                          -Wshadow $SAN -DKODI_TREE="\"$K\"" -I $X -isystem $ff $S/stereo/fallback2d_test.cpp \
                          $X/cores/VideoPlayer/VideoRenderers/RenderFlags.cpp -o $D/t ;;
@@ -368,10 +386,12 @@ build() {
           -DKODI_TREE="\"$K\"" -I $S/stereo/glstub -I $X -isystem $gles $S/stereo/hdr3d_gl_test.cpp \
           /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
       # (Kodi's OwnScanout.cpp as it is, with the defines of the image's build of it: not with -Werror, which its
-      # warnings would stop; the build folder's gbm.h and drm_fourcc.h, the host's libgbm only to link)
+      # warnings would stop; the build folder's gbm.h, drm_fourcc.h and xf86drm.h, the host's libgbm and libdrm only to
+      # link)
       fpown_gl) gles=$(glesinc) && fp=$(fpinc) && $CXX $SAN -pthread -DHAS_GLES=3 -DHAS_GBM_MODIFIERS \
                   -I $S/stereo/fpstub -I $S/stereo/glstub -I $X -isystem $gles -isystem $fp -isystem $fp/libdrm \
                   $S/stereo/fpown_gl_test.cpp $X/windowing/gbm/OwnScanout.cpp /usr/lib/x86_64-linux-gnu/libgbm.so.1 \
+                  /usr/lib/x86_64-linux-gnu/libdrm.so.2 \
                   /usr/lib/x86_64-linux-gnu/libEGL.so.1 /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 -o $D/t ;;
       fpown_src) cp $S/stereo/fpown_src.py $D/t ;;
       settings_resize) $CXX -pthread $SAN -I $X $H/settings_resize_test.cpp -o $D/t ;;
@@ -490,6 +510,8 @@ run() {
                 $IN/edid/receiver-onkyo.bin $IN/edid/receiver-pioneer.bin -- $IN/edid/tv-lg-1.bin $IN/edid/tv-lg-2.bin \
                 $IN/edid/tv-lg-3.bin ;;
     cachedefaults*) $D/t $K ;;
+    speakerplan) $D/t $K $IN/edid/lg-c5-direct.bin $IN/edid/lg-c5-sound-bar.bin $IN/edid/receiver-denon.bin \
+                   $IN/edid/receiver-onkyo.bin $IN/edid/tv-lg-1.bin ;;
     projector_link) timeout 600 $RG_PY $D/t $D/cli ;;
     projector_src) $RG_PY $D/t $K ;;
     lut_src|info_refresh_src|keymap_check|lost_frames_src|videoframe_src) $RG_PY $D/t $K ;;
@@ -524,6 +546,7 @@ pass_re() {
     aesink-race) echo '^race \(address\): 0 ThreadSanitizer reports, 0 AddressSanitizer errors' ;;
     seek) echo '^PASSED: [0-9]+ passed, 0 failed' ;;
     speakers) echo '^SPEAKERS-TEST PASSED$' ;;
+    speakerplan) echo '^SPEAKER-PLAN PASSED$' ;;
     edidpath) echo '^EDIDPATH-TEST PASSED$' ;;
     cachedefaults*) echo '^CACHEDEFAULTS-TEST PASSED$' ;;
     dvpathprior*) echo '^DVPATHPRIOR-TEST PASSED$' ;;
@@ -537,7 +560,7 @@ pass_re() {
     cefix-src) echo '^CEFIX-SRC PASSED$' ;;
     permemory-src) echo '^PERMEMORY-SRC PASSED$' ;;
     devchange-src) echo '^DEVCHANGE-SRC PASSED$' ;;
-    aus|depth|autodepth*|hdr3d_gl*|hdrdepth_gl|sdrcontainer_gl|stereo3d*|fpown_gl|guifbo_gl*|fallback2d*) echo '^0 failed$' ;;
+    aus|depth|autodepth*|hdr3d_gl*|hdrdepth_gl|sdrcontainer_gl|stereo3d*|fpown_gl|guifbo_gl*|fallback2d*|pc3d*) echo '^0 failed$' ;;
     fpown_src) echo '^FPOWN-SRC PASSED$' ;;
     linkbad_src) echo '^LINKBAD-SRC PASSED$' ;;
     settings_resize*) echo '^[0-9]+ checks, 0 failed' ;;
@@ -731,8 +754,9 @@ stage_fix() {
 }
 stage_own() {
   local bb L
-  check seek swig speakers gpusensors
-  mutants seek swig speakers gpusensors
+  inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
+  check seek swig speakers speakerplan gpusensors
+  mutants seek swig speakers speakerplan gpusensors
   mutants_clean
   # pwr() of watch-dv.sh (hades-diag, the LibreELEC tree of REGRESS_LE_REF) with the image's busybox; its six
   # mutations are made by the test itself, on the function it takes out of the script
@@ -833,6 +857,23 @@ PY
       rg_item check-fp.without-9074 FAILED "it passes without 9074"
   else rg_item check-fp.without-9074 FAILED "9074 does not reverse"; fi
   rg_rm $S/without-9074
+  # Hades: the card "3D: HDR" of Check this setup (hades_check.py and hades_check_ui.py of LibreELEC-settings-9097,
+  # with stand-ins for Kodi; the file of each display's answer against Kodi's Stereo3DVideo.h), and the same with 9097
+  # reversed, which must fail
+  L=$RG_W/logs/check-hdr3d.log
+  rg_log "$L" $RG_PY $H/ux/check_hdr3d_test.py $S/src/resources/lib "$(kodi)"
+  rg_item check-hdr3d "$(rg_say "$(rg_pass "$L" '^ALL PASSED$')")" "$(rg_rest "$(rg_pass "$L" '^ALL PASSED$')") ($(grep -c '^ok:' $L) ok)"
+  rg_fresh $S/without-9097 && cp -a $S/src/. $S/without-9097/
+  L=$RG_W/logs/check-hdr3d.without-9097.log
+  for later in $(settings_after 9097); do
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9097 < "$later" || rg_item check-hdr3d.without-9097 FAILED "$(basename $later) does not reverse"
+  done
+  if patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without-9097 < "$(ls $S/le/$P/patches/LibreELEC-settings-9097-*.patch)"; then
+    rg_log "$L" $RG_PY $H/ux/check_hdr3d_test.py $S/without-9097/resources/lib "$(kodi)"
+    [ "$(rg_exit $L)" != 0 ] && rg_item check-hdr3d.without-9097 PASSED "it fails without 9097: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item check-hdr3d.without-9097 FAILED "it passes without 9097"
+  else rg_item check-hdr3d.without-9097 FAILED "9097 does not reverse"; fi
+  rg_rm $S/without-9097
   # Hades: the sentence of the player information as Check this setup says it, with the frames that Kodi lost in
   # steady playback (hades_check.py of LibreELEC-settings-9087 and Estuary's Variables.xml of the Kodi tree, with
   # stand-ins for Kodi), and the same with 9087 reversed, which must fail
@@ -879,14 +920,15 @@ stage_overlay() {
 stage_stereo() {
   inputs || rg_fail "an input of inputs-kodi-host.tsv is missing"
   GT=$(gtest) || rg_fail "googletest of the build folder"
-  check offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d
+  check offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d pc3d
   must_fail autodepth-old-rule 3
   must_fail hdr3d_gl-old-rule 19
   must_fail stereo3d-old-rule 5
   # (issue #34: the right eye of each 3D layout, two frame sequences each; the base view alone taken for 3D)
   must_fail guifbo_gl-old-rule 9
   must_fail fallback2d-old-rule 1
-  mutants offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d
+  must_fail pc3d-old-rule 3
+  mutants offsets aus depth autodepth autodepth_gl hdr3d_gl hdrdepth_gl stereo3d fpown_gl fpown_src guifbo_gl fallback2d pc3d
   mutants_clean
 }
 stage_chroma() {

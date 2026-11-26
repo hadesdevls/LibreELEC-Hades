@@ -106,7 +106,7 @@ cases() {
   has "may wake the PC: the power button; USB 5-2.4.2.6 6c38:3901 AX68004; network eth0 (Wake-on-LAN)" "$T/out" &&
     hasnt "usb5" "$T/out" && hasnt "network lo" "$T/out"; check "2 armed" $?
   echo "3. state: the input devices that could wake it and are not armed; not the UPS, the hub, the game receiver, a device that cannot"
-  has "could wake it but are not armed: USB 5-2.4.1 20a0:0006 flirc; USB 5-2.4.2.1 046d:c52b USB Receiver (the setting Wake from sleep chooses which kinds may; echo enabled" "$T/out" &&
+  has "could wake it but are not armed: USB 5-2.4.1 20a0:0006 flirc; USB 5-2.4.2.1 046d:c52b USB Receiver (the setting Wake from sleep chooses which kinds may, and its list which devices; echo enabled" "$T/out" &&
     hasnt "Back-UPS" "$T/out" && hasnt "Hub" "$T/out" && hasnt "Xbox" "$T/out" && hasnt "Audio" "$T/out"; check "3 could, not armed" $?
   echo "4. state where the firmware offers deep and an LPS0 device: said so, and no note of a sleep without a low-power state"
   modern; run "$S" state

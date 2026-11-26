@@ -15,6 +15,10 @@
 //  - a frame drawn as Kodi draws a frame-packed one (each eye under a scissor of its own, the lines between them
 //    left as they were and cleared by STEREO_GAP::Clear()) and flipped by COwnScanout::FlipBlit() into the buffer
 //    that goes to the screen: from its first line, the left eye, 45 black lines, the right eye
+//  - the driver's dumb buffers wherever GBM's own were not made or not all taken (TryDumb()), and the copy of the
+//    processor into them where EGL cannot draw into them (CopyRowsFlipped(): the rows read back, the bottom one
+//    first, written top first at the driver's pitch, red and blue where the format lays them): the same frame,
+//    read back and copied into a dumb buffer of AR24 with a pitch of 8192 bytes, the same lines
 // A renderbuffer holds its row 0 first in memory, as a buffer imported into EGL does (OwnScanout.h): row m of the
 // buffer that goes to the screen is the line m that the display shows.
 // Prints a FAIL line for each failed check and "<n> failed" last.
@@ -26,8 +30,10 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include <drm_fourcc.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -96,6 +102,53 @@ void Gating()
   check(!FP_OWN::MakeOwn(true, false, Asked::REFUSED), "MakeOwn(): not with desktop OpenGL");
   check(!FP_OWN::MakeOwn(true, true, Asked::TAKEN), "MakeOwn(): not where the window's buffer was taken");
   check(!FP_OWN::MakeOwn(true, true, Asked::NOT_ASKED), "MakeOwn(): not where nothing could be asked");
+}
+
+// The driver's dumb buffers after GBM's (TryDumb()), and the copy of the processor into them (CopyRowsFlipped())
+void Dumb()
+{
+  using FP_OWN::Asked;
+  check(FP_OWN::TryDumb(false, Asked::NOT_ASKED), "TryDumb(): GBM's could not be made: the driver's dumb buffers");
+  check(FP_OWN::TryDumb(true, Asked::REFUSED), "TryDumb(): GBM's refused: the driver's dumb buffers");
+  check(FP_OWN::TryDumb(true, Asked::NOT_ASKED), "TryDumb(): GBM's not asked: the driver's dumb buffers");
+  check(!FP_OWN::TryDumb(true, Asked::TAKEN), "TryDumb(): GBM's taken: nothing else is made");
+
+  check(COwnScanout::MemoryIsBgra(DRM_FORMAT_ARGB8888) == std::optional<bool>(true) &&
+            COwnScanout::MemoryIsBgra(DRM_FORMAT_XRGB8888) == std::optional<bool>(true),
+        "MemoryIsBgra(): AR24 and XR24 lie as B, G, R, A");
+  check(COwnScanout::MemoryIsBgra(DRM_FORMAT_ABGR8888) == std::optional<bool>(false) &&
+            COwnScanout::MemoryIsBgra(DRM_FORMAT_XBGR8888) == std::optional<bool>(false),
+        "MemoryIsBgra(): AB24 and XB24 lie as R, G, B, A");
+  check(!COwnScanout::MemoryIsBgra(DRM_FORMAT_ABGR2101010) && !COwnScanout::MemoryIsBgra(DRM_FORMAT_ABGR16161616F),
+        "MemoryIsBgra(): nothing for a format of more than 8 bits");
+
+  // 3 x 2 pixels read back (the bottom row first), into a buffer whose rows are 16 bytes apart (4 of padding)
+  const uint8_t rgba[2][12] = {{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}};
+  std::vector<uint8_t> rows;
+  for (const auto& r : rgba)
+    rows.insert(rows.end(), r, r + 12);
+  std::vector<uint8_t> buffer(32, 0xee);
+  check(COwnScanout::CopyRowsFlipped(rows.data(), 3, 2, false, DRM_FORMAT_ARGB8888, buffer.data(), 16),
+        "CopyRowsFlipped(): RGBA rows into AR24");
+  // top row of the buffer = the last row read back, red and blue exchanged; the padding untouched
+  const uint8_t topAr24[12] = {23, 22, 21, 24, 27, 26, 25, 28, 31, 30, 29, 32};
+  const uint8_t bottomAr24[12] = {3, 2, 1, 4, 7, 6, 5, 8, 11, 10, 9, 12};
+  check(std::equal(topAr24, topAr24 + 12, buffer.begin()) && std::equal(bottomAr24, bottomAr24 + 12, buffer.begin() + 16),
+        "CopyRowsFlipped(): the bottom row read back is the bottom row of the buffer, red and blue exchanged for AR24");
+  check(buffer[12] == 0xee && buffer[15] == 0xee && buffer[28] == 0xee && buffer[31] == 0xee,
+        "CopyRowsFlipped(): each row at the pitch of the buffer, the bytes past the width left alone");
+
+  std::fill(buffer.begin(), buffer.end(), 0xee);
+  check(COwnScanout::CopyRowsFlipped(rows.data(), 3, 2, false, DRM_FORMAT_XBGR8888, buffer.data(), 16) &&
+            std::equal(rgba[1], rgba[1] + 12, buffer.begin()) && std::equal(rgba[0], rgba[0] + 12, buffer.begin() + 16),
+        "CopyRowsFlipped(): RGBA rows into XB24 as they are, flipped");
+  std::fill(buffer.begin(), buffer.end(), 0xee);
+  check(COwnScanout::CopyRowsFlipped(rows.data(), 3, 2, true, DRM_FORMAT_XRGB8888, buffer.data(), 16) &&
+            std::equal(rgba[1], rgba[1] + 12, buffer.begin()) && std::equal(rgba[0], rgba[0] + 12, buffer.begin() + 16),
+        "CopyRowsFlipped(): rows read as BGRA into XR24 as they are, flipped");
+  check(!COwnScanout::CopyRowsFlipped(rows.data(), 3, 2, false, DRM_FORMAT_ABGR2101010, buffer.data(), 16) &&
+            !COwnScanout::CopyRowsFlipped(rows.data(), 3, 2, false, DRM_FORMAT_ARGB8888, buffer.data(), 11),
+        "CopyRowsFlipped(): no copy into a format of more than 8 bits, or at a pitch shorter than a row");
 }
 
 void Verdicts()
@@ -334,6 +387,40 @@ void FramePacked()
   const auto rows = FP_OWN::RowsOf(Mode1080p24FramePacked());
   check(rows && rows->gapFirst == EYE_H && rows->gapEnd == EYE_H + GAP && rows->rightEnd == H,
         "RowsOf(): the rows of the frame that was drawn");
+
+  // COwnScanout::CopyOut(): the same frame read back as RGBA and copied by the processor into a dumb buffer of AR24
+  // (2048 pixels, a pitch of 8192 bytes as nvidia-drm gives it, B, G, R, A in memory): from its first line, the left
+  // eye, 45 black lines, the right eye
+  std::vector<uint8_t> read(static_cast<size_t>(W) * H * 4);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, frame);
+  glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, read.data());
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+  constexpr uint32_t PITCH = 8192;
+  std::vector<uint8_t> dumb(static_cast<size_t>(PITCH) * H, 0x77);
+  check(COwnScanout::CopyRowsFlipped(read.data(), W, H, false, DRM_FORMAT_ARGB8888, dumb.data(), PITCH),
+        "CopyRowsFlipped(): the frame-packed frame copied into a dumb buffer of AR24");
+  int copyLeft = 0, copyGap = 0, copyRight = 0;
+  for (int row = 0; row < H; ++row)
+  {
+    const uint8_t* p = dumb.data() + static_cast<size_t>(row) * PITCH;
+    uint8_t want[3];
+    int* wrong;
+    if (row < EYE_H)
+      want[0] = 20, want[1] = 10, want[2] = 200, wrong = &copyLeft;
+    else if (row < EYE_H + GAP)
+      want[0] = 0, want[1] = 0, want[2] = 0, wrong = &copyGap;
+    else
+      want[0] = 30, want[1] = 200, want[2] = 10, wrong = &copyRight;
+    for (int x = 0; x < EYE_W; ++x)
+      if (p[x * 4] != want[0] || p[x * 4 + 1] != want[1] || p[x * 4 + 2] != want[2])
+      {
+        ++*wrong;
+        break;
+      }
+  }
+  check(copyLeft == 0, "the dumb buffer copied into: the left eye in lines 0-1079", std::to_string(copyLeft));
+  check(copyGap == 0, "... black in the 45 lines 1080-1124", std::to_string(copyGap));
+  check(copyRight == 0, "... the right eye in lines 1125-2204", std::to_string(copyRight));
   glDeleteFramebuffers(1, &frame);
   glDeleteFramebuffers(1, &target);
   glDeleteRenderbuffers(1, &rbFrame);
@@ -344,6 +431,7 @@ void FramePacked()
 int main()
 {
   Gating();
+  Dumb();
   Verdicts();
   Geometry();
   Formats();

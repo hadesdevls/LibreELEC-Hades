@@ -3,7 +3,9 @@
 """Makes the picture clips of "Check this setup": the Hades check card (card.py) in SDR, HDR10, HLG,
 Dolby Vision 8.1 and Dolby Vision 5, as Matroska files, with clips.json (what each clip is and what it
 must show); the clip of the A/B comparison of native Dolby Vision (abclip.py: clips.json "ab", apart
-from the card's list); and the 3D clip of the frame packing card (fpclip.py: clips.json "fp"). Runs at build time on the build host: x265 encodes, everything else is this directory's
+from the card's list); the 3D clip of the frame packing card (fpclip.py: clips.json "fp"); and the HDR 3D clip of
+the card "3D: HDR" (hdr3dclip.py: clips.json "hdr3d"). Runs at build time on the build host: x265 encodes, everything
+else is this directory's
 Python (standard library only). Deterministic: the same bytes on every run.
 
 usage: gen_video.py --x265 <x265> --ffprobe <ffprobe> --out <dir> [--only <format,...>] [--frames <n>]
@@ -21,6 +23,7 @@ import abclip  # noqa: E402
 import card  # noqa: E402
 import dovi  # noqa: E402
 import fpclip  # noqa: E402
+import hdr3dclip  # noqa: E402
 import hevc  # noqa: E402
 import mkv  # noqa: E402
 
@@ -32,6 +35,8 @@ import mkv  # noqa: E402
 #  - 10 bits (HDR10, HLG, Dolby Vision): a constant QP of 8, adaptive quantisation off (the picture is
 #    flat). At QP 8 every picture of the three decodes exactly; at QP 12 a chroma code near the edges is
 #    off by one;
+#  - the HDR 3D clip (10 bits, each eye squeezed to half its width): lossless, as the SDR clips. At QP 8
+#    luma codes near the edges of its halved regions decode off by up to 2, and chroma by 1 (measured);
 #  - 8 bits (SDR): lossless. Lossy 8-bit coding leaves luma codes off by one near the edges of the
 #    regions (within 8 pixels; without SAO, inside them too), and its P pictures change them again,
 #    whatever the quantiser (QP 8 down to 0), sign data hiding, RDOQ, psy-rd, the largest transform or
@@ -45,7 +50,8 @@ X265_COMMON = ["--preset", "medium", "--aq-mode", "0", "--bframes", "0", "--no-s
                "--no-open-gop", "--frame-threads", "1", "--pools", "4", "--lookahead-slices", "0",
                "--no-info", "--sar", "1:1", "--no-asm", "--log-level", "error"]
 QUANTISER = {"sdr": ["--lossless"], "hdr10": ["--qp", "8"], "hlg": ["--qp", "8"], "dv81": ["--qp", "8"],
-             "dv5": ["--qp", "8"], abclip.FORMAT: ["--qp", "8"], fpclip.FORMAT: ["--lossless"]}
+             "dv5": ["--qp", "8"], abclip.FORMAT: ["--qp", "8"], fpclip.FORMAT: ["--lossless"],
+             hdr3dclip.FORMAT: ["--lossless"]}
 
 P3_D65 = ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060))
 
@@ -268,6 +274,53 @@ def make_fp_clip(x265, ffprobe, out_dir, tmp, frames=0):
             "bytes": os.path.getsize(path), "sha256": digest}
 
 
+def hdr3d_static():
+    """the HDR10 static metadata of the HDR 3D clip: the mastering display of the card; MaxCLL the peak of the card,
+    MaxFALL the mean of its two eyes (each half of the frame is one eye, squeezed on whole chroma samples, its label
+    included)"""
+    md, _, _ = static_metadata(card.fmt("hdr10"))
+    stats = [card.light_stats(dict(hdr3dclip.base(), label=label)) for label in hdr3dclip.LABELS]
+    return md, card.rnd(max(p for p, _ in stats), "MaxCLL"), card.rnd(sum(m for _, m in stats) / 2, "MaxFALL")
+
+
+def make_hdr3d_clip(x265, ffprobe, out_dir, tmp, frames=0):
+    """the HDR 3D clip of the card "3D: HDR" (hdr3dclip.py) and its entry of clips.json ("hdr3d")"""
+    f = hdr3dclip.fmt()
+    if frames:
+        f["frames"] = frames
+    static = hdr3d_static()
+    hevc_path = os.path.join(tmp, f["id"] + ".hevc")
+    args = encode(x265, f, hevc_path, os.path.join(tmp, f["id"] + ".log"), QUANTISER[f["id"]],
+                  planes=hdr3dclip.planes(), static=static)
+    with open(hevc_path, "rb") as fh:
+        nals = hevc.split_annexb(fh.read())
+    aus = hevc.access_units(nals)
+    if len(aus) != f["frames"]:
+        raise SystemExit("%s: %d access units, %d pictures expected" % (f["id"], len(aus), f["frames"]))
+    hv, sps = hevc.hvcc(nals)
+    if (sps["width"], sps["height"], sps["bit_depth_luma"], sps["chroma_format_idc"]) != (f["width"], f["height"], 10, 1):
+        raise SystemExit("%s: the stream is not what was asked for: %r" % (f["id"], sps))
+    _, cll, fall = static
+    m = card.MASTERING
+    mastering = (P3_D65, card.D65, m["max_nits"], m["min_nits"])
+    path = os.path.join(out_dir, f["file"])
+    mkv.write(path, f, hv, [hevc.length_prefixed(au) for au in aus], (9, 1, 16, 9), mastering, cll, fall,
+              stereo=hdr3dclip.STEREO_MODE)
+    if ffprobe:
+        self_check(ffprobe, path, f)
+    with open(path, "rb") as fh:
+        digest = hashlib.sha256(fh.read()).hexdigest()
+    return {"file": f["file"], "format": f["id"], "label": f["label"], "width": f["width"], "height": f["height"],
+            "fps": list(f["fps"]), "frames": f["frames"],
+            "duration": rounded(f["frames"] * f["fps"][1] / f["fps"][0], 3, "duration"), "bit_depth": 10,
+            "range": "limited", "colour": {"primaries": 9, "transfer": 16, "matrix": 9},
+            "mastering": {"primaries": [list(p) for p in P3_D65], "white": list(card.D65),
+                          "max_nits": m["max_nits"], "min_nits": m["min_nits"]},
+            "max_cll": cll, "max_fall": fall,
+            "stereo_mode": hdr3dclip.STEREO_NAME, "eyes": list(hdr3dclip.LABELS), "x265": args,
+            "bytes": os.path.getsize(path), "sha256": digest}
+
+
 def self_check(ffprobe, path, f):
     """a quick look with the host's ffprobe at what a decoder sees in the file (the full checks are the
     tests of this directory)"""
@@ -326,12 +379,18 @@ def main():
         if not only or fpclip.FORMAT in only:
             fp = make_fp_clip(a.x265, a.ffprobe, a.out, tmp, a.frames)
             print("%s: %d bytes" % (fp["file"], fp["bytes"]), flush=True)
+        hdr3d = None
+        if not only or hdr3dclip.FORMAT in only:
+            hdr3d = make_hdr3d_clip(a.x265, a.ffprobe, a.out, tmp, a.frames)
+            print("%s: %d bytes" % (hdr3d["file"], hdr3d["bytes"]), flush=True)
     doc = {"version": 1, "card": {"grid": [card.GRID_W, card.GRID_H], "reference_white_nits": card.REF_WHITE},
            "clips": entries}
     if ab:
         doc["ab"] = ab
     if fp:
         doc["fp"] = fp
+    if hdr3d:
+        doc["hdr3d"] = hdr3d
     with open(os.path.join(a.out, "clips.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(doc, fh, indent=1, sort_keys=True)
         fh.write("\n")

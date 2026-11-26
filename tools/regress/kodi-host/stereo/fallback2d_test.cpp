@@ -130,8 +130,8 @@ int main()
                  "window->StereoPictureTaken(*picture, !picture->doviBaseIsPicture)) &&") != std::string::npos,
         "WantsConversion(): a picture that is no 3D picture is rebuilt as in 2D; a 3D one where the bridge draws it a "
         "view at a time");
-  Check(ctx.find("(KODI::UTILS::STEREO3D::IsStereo(picture->stereoMode) &&\n                    "
-                 "KODI::UTILS::STEREO3D::ChoosesSdr(window->Stereo3DChoice()))") != std::string::npos,
+  Check(ctx.find("(KODI::UTILS::STEREO3D::IsStereo(picture->stereoMode) &&\n                                        "
+                 "window->Stereo3DAsSdr()))") != std::string::npos,
         "WantsConversion(): the choice of SDR for 3D video only for a 3D picture");
   Check(ctx.find("KODI::UTILS::STEREO3D::IsStereo(picture->stereoMode) &&\n          "
                  "!window->StereoPictureTaken(*picture, false));") != std::string::npos,

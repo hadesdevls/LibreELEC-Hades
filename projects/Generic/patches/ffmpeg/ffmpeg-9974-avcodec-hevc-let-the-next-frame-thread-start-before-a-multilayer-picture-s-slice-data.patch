@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: cinemaONE <35371193+cinema-ONE@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:16:38 +0000
+Subject: [PATCH] avcodec/hevc: let the next frame thread start before a
+ multilayer picture's slice data
+
+When setup ends at a later NAL than the base picture's first slice, set
+each slice aside after its header has been read and its picture started,
+with the state its data decodes against (the slice header, the bit reader
+past it, the layer's RPS and PPS). Once every layer's picture has started
+and setup has ended, decode the slices set aside, in order, marking a
+layer's picture complete when the next layer's data begins, as before.
+Nothing else moves: headers, picture starts, reference marking and output
+happen where they did.
+
+Measured on n9.0.2, i9-14900, 24 threads, both views to null: film A
+(3840x2160/eye, DV profile 20, one slice, no tiles, no WPP): 22 -> 90
+pairs/s; slice threads 15. Films B and C: 119 and 82 pairs/s with it.
+DVprofile20.mp4 (WPP): 121 pairs/s against 89 on slice threads. framemd5
+of both views equal to the unpatched decoder on film A (from the start,
+from 600 s, from a seek mid-GOP), film C at 5400 s and the whole
+DVprofile20.mp4; base view alone and two single-layer HEVC files (HDR10,
+DV profile 5) unchanged.
+
+Hades: taken from FFmpeg issue #26347, whose page lost the leading
+whitespace of every line: the indentation is put back (the object code is
+the same as with the patch applied without it); no other change. On
+FFmpeg 9.1 with Hades' patches, against the same FFmpeg without it: every
+picture with 1, 2, 4, 8 and 16 frame threads equals that FFmpeg's with
+one thread on the ITU-T MV-HEVC conformance streams A, B, C, E and F
+(their reference MD5s too), MP4 files with seeks, x265 two-view streams
+of 8 and 10 bits with one slice and no WPP, with WPP and with four
+slices, streams that start in the middle of a GOP or lack the second
+view, skip_frame, explode and the 22 single-layer HEVC conformance
+streams of FATE; where that FFmpeg itself depends on the threads (ITU D
+and I, damaged streams decoded into cleared buffers), the same pictures
+with the same threads. AddressSanitizer and ThreadSanitizer: no report.
+On a Ryzen 9 7950X3D, two 2160p views of 84 Mbit/s with one slice and no
+WPP, in pairs of views a second: 28 with one thread, 54 at best before
+with any threads, 77-80 with 16 threads and 97-102 with 24; the same, run
+for run, as the design measured next to it (Hades' own, which set aside
+only the base layer's CTB decoding).
+---
+ libavcodec/hevc/hevcdec.c | 133 +++++++++++++++++++++++++++++++++++++-
+ libavcodec/hevc/hevcdec.h |  28 ++++++++
+ 2 files changed, 159 insertions(+), 2 deletions(-)
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 3bb0690..3e3afa5 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3601,8 +3601,20 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+     // after starting the base-layer frame we know which layers will be decoded,
+     // so we can now figure out which NALUs to wait for before we can call
+     // ff_thread_finish_setup()
+-    if (l == &s->layers[0])
++    if (l == &s->layers[0]) {
+         s->finish_setup_nal_idx = find_finish_setup_nal(s);
++        // setup ends at a later layer's first slice: hold back the slice data
++        // until then, so the next frame thread does not wait for this picture
++        s->defer_slices = s->avctx->active_thread_type == FF_THREAD_FRAME &&
++                          !s->avctx->hwaccel &&
++                          s->finish_setup_nal_idx > nal_idx;
++    }
++
++    if (s->defer_slices) {
++        HEVCDeferredLayer *dl = &s->deferred_layers[l - s->layers];
++        memcpy(dl->rps, s->rps, sizeof(dl->rps));
++        av_refstruct_replace(&dl->pps, s->pps);
++    }
+ 
+     if (nal_idx >= s->finish_setup_nal_idx)
+         ff_thread_finish_setup(s->avctx);
+@@ -3735,6 +3747,106 @@ static int hevc_frame_end(HEVCContext *s, HEVCLayerContext *l)
+     return 0;
+ }
+ 
++static int defer_slice(HEVCContext *s, unsigned layer_idx, unsigned nal_idx,
++                       const GetBitContext *gb)
++{
++    HEVCDeferredSlice *d;
++
++    if (s->nb_deferred >= s->deferred_size) {
++        unsigned size = FFMAX(2 * s->deferred_size, 8);
++        d = av_realloc_array(s->deferred, size, sizeof(*d));
++        if (!d)
++            return AVERROR(ENOMEM);
++        s->deferred = d;
++        s->deferred_size = size;
++    }
++
++    d = &s->deferred[s->nb_deferred++];
++    d->sh = s->sh;
++    d->own_short_term_rps = s->sh.short_term_rps == &s->sh.slice_rps;
++    d->gb = *gb;
++    d->nal_idx = nal_idx;
++    d->layer_idx = layer_idx;
++    d->nal_unit_type = s->nal_unit_type;
++    d->temporal_id = s->temporal_id;
++    d->nuh_layer_id = s->nuh_layer_id;
++
++    // the entry point arrays go with the slice; the next header makes its own
++    s->sh.entry_point_offset = NULL;
++    s->sh.offset = NULL;
++    s->sh.size = NULL;
++
++    // a dependent slice segment after this one takes its header as read
++    s->slice_initialized = 1;
++
++    return 0;
++}
++
++static int decode_deferred_slices(HEVCContext *s)
++{
++    // cur_layer is the last layer whose header was read, not one decoded
++    int decoded_layer = -1;
++    int ret = 0;
++
++    for (unsigned i = 0; i < s->nb_deferred; i++) {
++        HEVCDeferredSlice *d = &s->deferred[i];
++        HEVCDeferredLayer *dl = &s->deferred_layers[d->layer_idx];
++        HEVCLayerContext *l = &s->layers[d->layer_idx];
++        GetBitContext gb = d->gb;
++        int err;
++
++        av_freep(&s->sh.entry_point_offset);
++        av_freep(&s->sh.offset);
++        av_freep(&s->sh.size);
++        s->sh = d->sh;
++        if (d->own_short_term_rps)
++            s->sh.short_term_rps = &s->sh.slice_rps;
++        d->sh.entry_point_offset = NULL;
++        d->sh.offset = NULL;
++        d->sh.size = NULL;
++
++        if (ret < 0 || !l->cur_frame)
++            continue;
++
++        // switching to a new layer, mark previous layer's frame (if any) as done
++        if (decoded_layer >= 0 && decoded_layer != d->layer_idx &&
++            s->layers[decoded_layer].cur_frame)
++            ff_progress_frame_report(&s->layers[decoded_layer].cur_frame->tf, INT_MAX);
++        decoded_layer = d->layer_idx;
++
++        s->cur_layer = d->layer_idx;
++        s->cur_frame = l->cur_frame;
++        s->nal_unit_type = d->nal_unit_type;
++        s->temporal_id = d->temporal_id;
++        s->nuh_layer_id = d->nuh_layer_id;
++        av_refstruct_replace(&s->pps, dl->pps);
++        memcpy(s->rps, dl->rps, sizeof(s->rps));
++        if (s->sh.first_slice_in_pic_flag) {
++            s->slice_idx = 0;
++            if (s->pps->tiles_enabled_flag)
++                s->local_ctx[0].end_of_tiles_x = s->pps->column_width[0] << s->pps->sps->log2_ctb_size;
++        }
++        // the independent segment before it failed: so does a dependent one
++        if (s->sh.dependent_slice_segment_flag && !s->slice_initialized)
++            continue;
++        s->slice_initialized = 0;
++
++        err = decode_slice_data(s, l, &s->pkt.nals[d->nal_idx], &gb);
++        if (err == AVERROR_INVALIDDATA &&
++            !(s->avctx->err_recognition & AV_EF_EXPLODE)) {
++            av_log(s->avctx, AV_LOG_WARNING,
++                   "Skipping invalid undecodable NALU: %d\n", d->nal_unit_type);
++        } else if (err < 0) {
++            av_log(s->avctx, AV_LOG_WARNING,
++                   "Error parsing NAL unit #%u.\n", d->nal_idx);
++            ret = err;
++        }
++    }
++    s->nb_deferred = 0;
++
++    return ret;
++}
++
+ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+ {
+     const int layer_idx = s->vps ? s->vps->layer_idx[s->nuh_layer_id] : 0;
+@@ -3779,9 +3891,11 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+         s->skipping_frame = 0;
+ 
+     // switching to a new layer, mark previous layer's frame (if any) as done
++    // (a deferred picture is marked when its data has been decoded)
+     if (s->cur_layer != layer_idx &&
+         s->layers[s->cur_layer].cur_frame &&
+-        s->avctx->active_thread_type == FF_THREAD_FRAME)
++        s->avctx->active_thread_type == FF_THREAD_FRAME &&
++        !s->defer_slices)
+         ff_progress_frame_report(&s->layers[s->cur_layer].cur_frame->tf, INT_MAX);
+ 
+     s->cur_layer = layer_idx;
+@@ -3808,6 +3922,9 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    if (s->defer_slices)
++        return defer_slice(s, layer_idx, nal_idx, gb);
++
+     ret = decode_slice_data(s, l, &s->pkt.nals[nal_idx], gb);
+     if (ret < 0)
+         return ret;
+@@ -3956,6 +4073,8 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+     s->last_eos = s->eos;
+     s->eos = 0;
+     s->slice_initialized = 0;
++    s->defer_slices = 0;
++    s->nb_deferred = 0;
+     if (s->last_eos)
+         decode_reset_recovery_point(s);
+ 
+@@ -4063,6 +4182,12 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+     }
+ 
+ fail:
++    if (s->nb_deferred) {
++        int err = decode_deferred_slices(s);
++        if (ret >= 0)
++            ret = err;
++    }
++
+     for (int i = 0; i < FF_ARRAY_ELEMS(s->layers); i++) {
+         HEVCLayerContext *l = &s->layers[i];
+ 
+@@ -4241,6 +4366,10 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
+     av_freep(&s->sh.offset);
+     av_freep(&s->sh.size);
+ 
++    av_freep(&s->deferred);
++    for (int i = 0; i < FF_ARRAY_ELEMS(s->deferred_layers); i++)
++        av_refstruct_unref(&s->deferred_layers[i].pps);
++
+     av_freep(&s->local_ctx);
+ 
+     ff_h2645_packet_uninit(&s->pkt);
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+index 703b8df..d309d05 100644
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -490,6 +490,26 @@ typedef struct HEVCLayerContext {
+     struct AVRefStructPool *rpl_tab_pool;
+ } HEVCLayerContext;
+ 
++/** A slice whose data waits until every layer of its access unit has started
++ * its picture (frame threading over several layers). */
++typedef struct HEVCDeferredSlice {
++    SliceHeader sh;
++    // sh.short_term_rps pointed at sh.slice_rps
++    int own_short_term_rps;
++    GetBitContext gb;
++    unsigned nal_idx;
++    unsigned layer_idx;
++    enum HEVCNALUnitType nal_unit_type;
++    int temporal_id;
++    int nuh_layer_id;
++} HEVCDeferredSlice;
++
++/** The per-picture state a deferred slice of one layer decodes against. */
++typedef struct HEVCDeferredLayer {
++    RefPicList rps[NB_RPS_TYPE];
++    const HEVCPPS *pps; ///< RefStruct reference
++} HEVCDeferredLayer;
++
+ typedef struct HEVCContext {
+     const AVClass *c;  // needed by private avoptions
+     AVCodecContext *avctx;
+@@ -564,6 +584,14 @@ typedef struct HEVCContext {
+     // ff_thread_finish_setup()
+     unsigned finish_setup_nal_idx;
+ 
++    // multilayer frame threading: slice data waits until every layer's
++    // picture has started, so the next frame thread is not held back
++    int defer_slices;
++    HEVCDeferredSlice *deferred;
++    unsigned nb_deferred;
++    unsigned deferred_size;
++    HEVCDeferredLayer deferred_layers[HEVC_VPS_MAX_LAYERS];
++
+     int is_nalff;           ///< this flag is != 0 if bitstream is encapsulated
+                             ///< as a format defined in 14496-15
+     int apply_defdispwin;
+-- 
+2.53.0
+

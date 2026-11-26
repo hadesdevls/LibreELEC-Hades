@@ -39,7 +39,7 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 
 **You would want it** to check that Dolby Vision is really on, or to see why it is not, and to change how a video goes out while it plays: O, then OK, opens the choice of output.
 
-**Where.** Press O on a keyboard, or the red key of a TV remote that sends keys over HDMI-CEC. On a remote without colour keys (a Fire TV remote over Bluetooth, for one), hold Menu while the video plays; a short press of Menu still opens the on-screen controls. There is also a button in the video's on-screen controls. Down from the tabs goes to the button, with a remote, a keyboard or Yatse.
+**Where.** Press O on a keyboard, or the red key of a TV remote that sends keys over HDMI-CEC. On a remote without colour keys (a Fire TV remote over Bluetooth, for one), hold Menu while the video plays; a short press of Menu still opens the on-screen controls. On a game controller, hold Start while the video plays: the Menu button of an Xbox controller, Options on a PlayStation one, over USB or Bluetooth; on another controller, the button set as Start in *Settings > System > Input*. A short press of Start still shows the information of the video, as in Kodi. There is also a button in the video's on-screen controls. Down from the tabs goes to the button, with a remote, a keyboard or Yatse.
 
 **Status.** Seen working on an RTX 4080 SUPER with an LG C5 (author), and, with changing the output from the on-screen controls, on a Ryzen 7 5800H (user); see [what has been tested](tested.md).
 
@@ -50,6 +50,8 @@ Nothing here replaces anything that LibreELEC does. Without a Dolby Vision TV, m
 **You would want it** after installing, after changing the TV or the receiver, or when a sound format plays silence. It switches on only the sound formats that you heard, and switches one off only if you say so; nothing of the picture settings changes. DTS cannot be checked this way.
 
 **Frame packing.** Where the display says it takes 3D, a 15-second 3D clip goes out in frame packing, and the card says whether the graphics driver took it, or what it went out as and why. It is skipped on a display without 3D.
+
+**3D: HDR.** Nothing that a display sends says whether it shows HDR in 3D, and many 3D projectors and TVs do not. On a display that takes 3D and HDR, *3D: HDR* plays a short HDR10 clip in 3D, in the 3D layout of the display, and asks what you saw. The answer is kept for that display (by the make and model in its EDID): *How 3D video goes out* on *Automatic* then sends HDR in 3D where you saw it, and SDR where you did not. Until a display has been checked, an HDR 3D video goes out in SDR (in BT.2020 where the display takes it), the first one says once where to check it, and the player information says "HDR in 3D not checked yet".
 
 **A/B comparison.** *Dolby Vision: Hades or licensed players (A/B)* shows a test clip as Hades sends it and as licensed players send it, and asks which looks right on your TV; it can also copy the clip to a USB drive, to see it first with the TV's own player. Your answer goes into the diagnostic report with the name of your TV; nothing changes unless you say so.
 
@@ -271,6 +273,8 @@ It changes only together with a change of the display mode that happens anyway (
 
 ![The Audio page of the player information: the sound of the film, the sound that goes out, and the speakers on a plan of the room](images/player-information-audio.png)
 
+**The speakers on the Audio page.** A plan of the room with four kinds of mark, explained under it: a full mark for a speaker that gets sound (passed through: the channels of the track; decoded: the channels sent, with the downmix said in words, such as "FC > FL+FR"); a ring of the same colour for a speaker of the receiver that renders the Atmos objects (passed through to a receiver that declares Atmos, its declared speakers beyond the base); a grey ring for a speaker that the TV or receiver declares and that gets no sound; a faint ring where nothing is known. The declared speakers are read from the EDID of the display that Kodi plays to. The Dolby Atmos label says "+ objects" when it is passed through and "no Atmos" when it is decoded, which is when the heights are lost.
+
 **Also.** Dynamic range compression for Dolby Digital, the level of the dialogue when 5.1 plays on fewer speakers, and the choice of the audio output that follows the screen you use. Sound that Hades decodes goes out in 16 bits to a display that declares PCM of 16 or 20 bits only (one such TV played nothing), a 6.1 or 6.0 track keeps its back centre on a receiver that has that speaker, and Dolby Digital at 32 kHz is passed through.
 
 ### Surround sound through a USB-C adapter or hub
@@ -298,6 +302,8 @@ It changes only together with a change of the display mode that happens anyway (
 ### 3D Blu-ray
 
 **What it does.** Decodes both eyes of a 3D Blu-ray and switches a 3D display to 3D over HDMI. It needs a display that says it takes 3D. I have no 3D display; users have seen 3D Blu-ray video (MVC) and full side by side on a Ryzen 7 5800H, and frame packing on a Philips 3D TV from Intel graphics. In 1.0 the lines between the two eyes of frame packing are sent black, and the second view stays right after a picture that empties the decoder. Through an active DisplayPort or USB-C converter the graphics driver offers no 3D mode, and `kodi.log` says so.
+
+**Side by side and top and bottom of 2160p** go out at 2160p, never at fewer lines. On NVIDIA, which lists no 3D modes, Hades reads the 3D layouts from the EDID, and the display is told of them where the EDID declares them, at 2160p at 24 to 30 Hz too: there the driver names the format by its CTA-861 number next to the layout, as Linux does on Intel and AMD. `kodi.log` lists what the EDID declares. Leaving a 3D video changes the display mode once, straight to the menus in 2D.
 
 **Where.** *Decode both views of 3D video (Blu-ray MVC, MV-HEVC)*, *Switch the display to 3D (HDMI)* and *How 3D video goes out*, all Expert.
 
@@ -361,7 +367,7 @@ Files on this PC and on the local network, discs and the library keep their sett
 
 ### Safe defaults
 
-Hades is made for a PC that also holds your other disks and your Windows. The internal disks are hidden when it runs from USB, file sharing is off until you turn it on and then has a password, and the update server of LibreELEC is not used. Every one of these can be turned back on. The README lists them with the reason in [Defaults that differ from LibreELEC](../README.md#defaults-that-differ-from-libreelec).
+Hades is made for a PC that also holds your other disks and your Windows. The internal disks are hidden when it runs from USB, file sharing is off until you turn it on and then has a password, and the update server of LibreELEC is not used. Every one of these can be turned back on, and *Network access* (*Settings > LibreELEC > Services*) sets the network ones as LibreELEC has them in one choice, after showing what changes. The README lists them with the reason in [Defaults that differ from LibreELEC](../README.md#defaults-that-differ-from-libreelec).
 
 ### Updates from Hades itself
 

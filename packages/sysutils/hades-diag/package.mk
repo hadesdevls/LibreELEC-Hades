@@ -3,7 +3,7 @@
 # boot/DIAG-OFF.TXT is that switch as an image carries it (scripts/image, scripts/mkimage).
 
 PKG_NAME="hades-diag"
-PKG_VERSION="29"
+PKG_VERSION="30"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE=""
 PKG_URL=""
@@ -40,6 +40,9 @@ makeinstall_target() {
   # systemd-sleep runs it before and after each one; collect.sh runs it with "state")
   cp ${PKG_DIR}/scripts/sleep.sh ${INSTALL}/usr/lib/hades-diag
   chmod 0755 ${INSTALL}/usr/lib/hades-diag/sleep.sh
+  # (the network access in effect, which the report says: collect.sh)
+  cp ${PKG_DIR}/scripts/net-access.sh ${INSTALL}/usr/lib/hades-diag
+  chmod 0755 ${INSTALL}/usr/lib/hades-diag/net-access.sh
   mkdir -p ${INSTALL}/usr/lib/systemd/system-sleep
   cp ${PKG_DIR}/scripts/sleep.sh ${INSTALL}/usr/lib/systemd/system-sleep/hades-sleep
   chmod 0755 ${INSTALL}/usr/lib/systemd/system-sleep/hades-sleep

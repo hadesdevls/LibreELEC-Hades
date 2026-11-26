@@ -28,12 +28,20 @@
 #            elsewhere, both views carry the metadata of the RPU, Kodi's packer keeps them on the picture of the two,
 #            the views are those of the same file without the RPU; and its mutants (profile 20 always one view, as before; the packer
 #            dropping the metadata)
+#   threads  frame threading of two layers (ffmpeg-9974, 9975): FFmpeg of this tree with and without them, every picture
+#            (mvhevc_frames.c) with 1 to 16 frame threads against the one without it with 1 thread, on the conformance
+#            streams, files, seeks, two x265 streams, streams made by mvhevc_au.py and the 22 single-layer HEVC
+#            conformance streams of FATE; where the slices of the base layer wait; and its mutants (stage_threads)
 # Settings (environment):
 #   MVHEVC_WORK    the work folder (required; nothing is written anywhere else)
 #   MVHEVC_KODI    the Kodi tree under test (read only; required)
 #   MVHEVC_ITU     the folder with the nine MVHEVCS_*.zip (required)
 #   MVHEVC_FFMPEG  the FFmpeg release tarball (required); MVHEVC_FFMPEG_SHA256 its SHA256 (default: ffmpeg-9.1.tar.xz)
 #   MVHEVC_RPU     for p20: profile5.bin of dovi_tool's test assets (MIT, quietvoid; dovi_tool 614c816b, SHA256 below)
+#   MVHEVC_INPUTS  for threads: folders of inputs named by SHA256 (default REGRESS_INPUTS): the two x265 streams below and
+#                  the single-layer conformance streams that ../ffmpeg/inputs-ffmpeg.tsv lists
+#   MVHEVC_LE      for threads: the LibreELEC tree whose FFmpeg patches are built (default: the one of this runner)
+#   MVHEVC_JOBS    for threads: jobs at once (default 8)
 # usage: run-mvhevc.sh all | <stage>...     Prints MVHEVC PASSED or MVHEVC FAILED (n) at the end.
 set -uo pipefail
 export LC_ALL=C
@@ -192,6 +200,13 @@ stage_choice() {
   try_choice pace-judged-ignored '  if (!judged)
     return false;' '  if (!judged && false)
     return false;'
+  try_choice work-never '  return work.slowWindows >= WORK_SLOW_WINDOWS;' '  return false;'
+  try_choice work-no-margin '  work.slowWindows = work.rate < WORK_MARGIN * fps ? work.slowWindows + 1 : 0;' '  work.slowWindows = work.rate < 1.1 * fps ? work.slowWindows + 1 : 0;'
+  try_choice work-not-in-a-row '  work.slowWindows = work.rate < WORK_MARGIN * fps ? work.slowWindows + 1 : 0;' '  work.slowWindows = work.rate < WORK_MARGIN * fps ? work.slowWindows + 1 : work.slowWindows;'
+  try_choice work-no-skip '  if (work.skipped < WORK_SKIP)' '  if (false)'
+  try_choice work-judged-ignored '  if (!judged || !(fps > 0.0))' '  if ((!judged && false) || !(fps > 0.0))'
+  try_choice slow-any-file '  return !file.empty() && slow.file == file && slow.width == width && slow.height == height;' '  return !file.empty() && slow.width == width && slow.height == height;'
+  try_choice slow-no-name '  return !file.empty() && slow.file == file && slow.width == width && slow.height == height;' '  return slow.file == file && slow.width == width && slow.height == height;'
   try_choice hevc-not-asked '  if (track.hevc)' '  if (false)'
   try_choice inband-sets-not-needed '        return !search.sps.empty() && !search.pps.empty() ? InBand::FOUND : InBand::NOT_THERE;' '        return InBand::FOUND;'
   try_choice inband-no-end '  return search.packets >= IN_BAND_PACKETS ? InBand::NOT_THERE : InBand::LOOKING;' '  return InBand::LOOKING;'
@@ -326,7 +341,176 @@ stage_p20() {
   else item p20-mutant-metadata-dropped FAILED "not applied"; fi
 }
 
-[ "${1:-}" = all ] && set -- ffmpeg streams views files choice pack mkv note depth p20
+# threads: frame threading of two layers (ffmpeg-9974, cinemaONE's; 9975, its debug line). FFmpeg of this tree (the archive of MVHEVC_FFMPEG with every
+# FFmpeg patch of the image, in the recipe's order, but 9913, which needs h264-mvc/twin.sh and touches no HEVC code)
+# and the same without ffmpeg-9974 and 9975, built for the host (C only, offline); mvhevc_frames.c gives the MD5 of every
+# picture as Kodi opens the decoder. The tree's FFmpeg with 1, 2, 4, 8 and 16 frame threads (two runs of each above 1)
+# must give, line for line, the pictures of the one without the patch with 1 thread for: the ITU streams A-C, E and F,
+# MP4 files of A and E and two seeks in each, two x265 streams of two views (MVHEVC_INPUTS: 8 bits, one slice a
+# picture, no WPP; 10 bits, four slices a picture and WPP), streams made of A, C, E, F and those by mvhevc_au.py (a
+# start in the middle of a GOP, the second view missing in ten access units and to the end), skip_frame, explode, the
+# base view alone, and the 22 single-layer HEVC conformance streams of FATE (MVHEVC_INPUTS). Where upstream itself
+# gives other pictures with frame threads (D,
+# G, H, I; and the damaged streams: the base view missing in one access unit, a base-layer slice cut short or changed,
+# each decoded into cleared buffers, "zero"), the same pictures as the one without the patch with the same threads.
+# The change must set aside the slices (of both layers) with 2 threads or more in every access unit of the plain form
+# (mvhevc_au.py info), and never with 1 thread, with the base view alone, or on a single-layer stream
+# its mutants must fail. Needs the stages ffmpeg, streams, views and files before it (the MP4 files).
+X265SUMS="2f2cd1840a35ee8c3a37e7fcf824fd55dca69b8ad671eb1912413d5e589cfe14  mv8-1080-nowpp.hevc
+038201e0b274ce0357a71af78458cfab0a0ede036b811b0159b350ab88268da6  mv10-1080-s4.hevc"
+thr_find() { # <sha256> <ext>: the input of that SHA256 in MVHEVC_INPUTS
+  local d
+  for d in ${MVHEVC_INPUTS:-${REGRESS_INPUTS:-}}; do
+    [ -f "$d/$1.$2" ] && [ "$(sha256sum < "$d/$1.$2" | cut -c1-64)" = "$1" ] && { echo "$d/$1.$2"; return 0; }
+  done
+  return 1
+}
+thr_build() { # <dir> <ERE of patch names left out>: FFmpeg of the tree in <dir> (in-tree build, kept for the mutants)
+  local D=$1 skip=$2 p
+  rm -rf "$D" && mkdir -p "$D" && tar --no-same-owner -xf "$FFT" --strip-components=1 -C "$D" || return 1
+  for p in "$LE"/packages/multimedia/ffmpeg/patches/postproc/*.patch "$LE"/packages/multimedia/ffmpeg/patches/libreelec/*.patch \
+    $(ls "$LE"/projects/Generic/patches/ffmpeg/*.patch | sort); do
+    case $(basename "$p") in ffmpeg-9913-*) continue ;; esac
+    basename "$p" | grep -E -q -- "$skip" && continue
+    patch -d "$D" -p1 -F0 -s --no-backup-if-mismatch < "$p" || { echo "PATCH FAILED $(basename "$p")"; return 1; }
+  done
+  (cd "$D" && unshare -rn ./configure --disable-everything --disable-autodetect --disable-doc --disable-network \
+    --disable-x86asm --enable-static --disable-shared --disable-programs --enable-decoder=hevc --enable-parser=hevc \
+    --enable-demuxer=hevc,mov --enable-protocol=file > configure.log 2>&1 &&
+    nice -n 19 unshare -rn make -j"${MVHEVC_JOBS:-8}" > make.log 2>&1) || return 1
+}
+thr_frames() { # <ffmpeg dir> <out>
+  gcc -O1 -Wall -Wextra -Werror -I"$1" -o "$2" "$HERE/mvhevc_frames.c" -L"$1/libavformat" -L"$1/libavcodec" \
+    -L"$1/libavutil" -lavformat -lavcodec -lavutil -lm -lpthread
+}
+# thr_run <tool> <list> <out dir> <runs above 1 thread> <threads...>: each line of the list with each thread count
+thr_run() {
+  local tool=$1 list=$2 O=$3 runs=$4 label input views extra t r; shift 4
+  mkdir -p "$O"
+  while read -r label input views extra; do
+    for t in "$@"; do
+      for r in $(seq 1 "$runs"); do
+        [ "$t" = 1 ] && [ "$r" -gt 1 ] && continue
+        echo "$tool $input $t $views${extra:+ $extra} > $O/$label.$t.$r.txt 2> $O/$label.$t.$r.err"
+      done
+    done
+  done < "$list" | xargs -P "${MVHEVC_JOBS:-8}" -I{} sh -c 'timeout 900 {}'
+}
+stage_threads() {
+  local T=$W/threads TI=$W/threads/in LE=${MVHEVC_LE:-$(cd "$HERE/../../.." && pwd)} f n x m t r sum name label views
+  local extra want bad=0 total=0 kept slices A="python3 -I $HERE/mvhevc_au.py"
+  [ "$(sha256sum "$FFT" | cut -c1-64)" = "$FFSHA" ] || { item threads FAILED "$FFT is not $FFSHA"; return; }
+  ls "$LE"/projects/Generic/patches/ffmpeg/ffmpeg-9974-*.patch > /dev/null 2>&1 || { item threads FAILED "no ffmpeg-9974 in $LE"; return; }
+  [ -s "$W/files/A.mp4" ] && [ -s "$W/files/E.mp4" ] || { item threads FAILED "no MP4 files: run the stage files first"; return; }
+  rm -rf "$T" && mkdir -p "$TI"
+  { thr_build "$T/before" '^ffmpeg-997[45]-' > "$W/logs/threads-build-before.log" 2>&1 && thr_frames "$T/before" "$T/frames-before" &&
+    thr_build "$T/kept" '^$' > "$W/logs/threads-build-kept.log" 2>&1 && thr_frames "$T/kept" "$T/frames-kept"; } ||
+    { item threads FAILED "the builds (logs/threads-build-*.log)"; return; }
+  # the inputs: <label> <file> <views> [options]; "same" lines are compared with the same threads
+  local L=$T/list.txt LS=$T/same.txt
+  : > "$L"; : > "$LS"
+  for n in A B C E F; do echo "itu-$n $S/MVHEVCS_$n.bit -1" >> "$L"; done
+  for n in D G H I; do echo "itu-$n $S/MVHEVCS_$n.bit -1" >> "$LS"; done
+  for n in A E; do
+    echo "mp4-$n $W/files/$n.mp4 -1" >> "$L"
+    echo "seek50-$n $W/files/$n.mp4 -1 seek 50" >> "$L"
+    echo "seek20-$n $W/files/$n.mp4 -1 seek 20" >> "$L"
+  done
+  while read -r sum name; do
+    f=$(thr_find "$sum" hevc) || { item threads FAILED "$name ($sum) is not in MVHEVC_INPUTS"; return; }
+    cp "$f" "$TI/$name"
+    echo "x265-${name%.hevc} $TI/$name -1" >> "$L"
+  done <<< "$X265SUMS"
+  for x in A:$S/MVHEVCS_A.bit C:$S/MVHEVCS_C.bit E:$S/MVHEVCS_E.bit F:$S/MVHEVCS_F.bit N8:$TI/mv8-1080-nowpp.hevc \
+    S10:$TI/mv10-1080-s4.hevc; do
+    n=${x%%:*}; f=${x#*:}
+    { $A midgop "$f" "$TI/midgop-$n.bit" > /dev/null && $A dropview "$f" "$TI/dropview-$n.bit" 5 15 &&
+      $A dropview "$f" "$TI/dropview-tail-$n.bit" 20 1000 && $A dropbase "$f" "$TI/dropbase-$n.bit" 7 &&
+      $A cut "$f" "$TI/cut-$n.bit" 9 60 && $A cut "$f" "$TI/cut-early-$n.bit" 13 10 && $A flip "$f" "$TI/flip-$n.bit" 11; } ||
+      { item threads FAILED "mvhevc_au.py on $f"; return; }
+    for m in midgop dropview dropview-tail; do echo "$m-$n $TI/$m-$n.bit -1" >> "$L"; done
+    for m in dropbase cut cut-early flip; do echo "$m-$n $TI/$m-$n.bit -1 zero" >> "$LS"; done
+  done
+  echo "skipnonref-A $S/MVHEVCS_A.bit -1 skip 8" >> "$L"
+  echo "skipbidir-N8 $TI/mv8-1080-nowpp.hevc -1 skip 16" >> "$L"
+  echo "explode-A $S/MVHEVCS_A.bit -1 explode" >> "$L"
+  echo "unset-A $S/MVHEVCS_A.bit none" >> "$L"
+  local n1
+  n1=$(wc -l < "$L")
+  grep 'fate-suite/hevc-conformance/' "$HERE/../ffmpeg/inputs-ffmpeg.tsv" | while IFS=$'\t' read -r sum _ name _; do
+    f=$(thr_find "$sum" bit) && echo "single-$(basename "$name" .bit) $f none" || echo "MISSING $name"
+  done >> "$L"
+  grep -q '^MISSING' "$L" && { item threads FAILED "single-layer streams not in MVHEVC_INPUTS: $(grep -c '^MISSING' "$L")"; return; }
+  [ $(($(wc -l < "$L") - n1)) = 22 ] || { item threads FAILED "not 22 single-layer conformance streams"; return; }
+  cat "$L" "$LS" > "$T/all.txt"
+  thr_run "$T/frames-before" "$L" "$T/before" 1 1
+  thr_run "$T/frames-before" "$LS" "$T/before" 1 1 2 4 8 16
+  thr_run "$T/frames-kept" "$T/all.txt" "$T/kept" 2 1 2 4 8 16
+  while read -r label f views extra; do
+    grep -q '^eof' "$T/before/$label.1.1.txt" || { echo "$label: the reference did not end"; bad=$((bad + 1)); continue; }
+    for t in 1 2 4 8 16; do
+      want=$T/before/$label.1.1.txt
+      grep -q "^$label " "$LS" && want=$T/before/$label.$t.1.txt
+      for r in 1 2; do
+        [ "$t" = 1 ] && [ "$r" = 2 ] && continue
+        total=$((total + 1))
+        cmp -s "$want" "$T/kept/$label.$t.$r.txt" || { echo "$label: $t threads (run $r) differ"; bad=$((bad + 1)); }
+      done
+    done
+  done < "$T/all.txt"
+  [ $bad = 0 ] && item threads PASSED "$total runs of $(wc -l < "$T/all.txt") streams with 1-16 threads: the pictures of the decoder without ffmpeg-9974 and 9975 with 1 thread ($(wc -l < "$LS") with the same threads, where upstream depends on them)" ||
+    item threads FAILED "$bad of $total runs"
+  # the kept path is taken where it is meant to and nowhere else
+  bad=0
+  for x in itu-A itu-B itu-C itu-E itu-F x265-mv8-1080-nowpp x265-mv10-1080-s4; do
+    case $x in itu-*) f=$S/MVHEVCS_${x#itu-}.bit ;; *) f=$TI/${x#x265-}.hevc ;; esac
+    # (the access units of the plain form, and all their slices, of both layers)
+    kept=$($A info "$f" | awk '{print $6}')
+    slices=$($A info "$f" | awk '{print $10}')
+    for t in 2 4 8 16; do
+      [ "$(grep -h '^deferred' "$T/kept/$x.$t.1.err" | cut -d' ' -f2-)" = "$kept $slices" ] ||
+        { echo "$x, $t threads: $(grep -h '^deferred' "$T/kept/$x.$t.1.err"), want $kept AUs $slices slices"; bad=$((bad + 1)); }
+    done
+    grep -q '^deferred 0 0$' "$T/kept/$x.1.1.err" || { echo "$x: kept with 1 thread"; bad=$((bad + 1)); }
+  done
+  for x in unset-A $(grep '^single-' "$L" | cut -d' ' -f1); do
+    grep -q '^deferred 0 0$' "$T/kept/$x.8.1.err" || { echo "$x: kept"; bad=$((bad + 1)); }
+  done
+  [ $bad = 0 ] && item threads-kept PASSED "slices set aside in every plain AU with 2-16 threads (all their slices), never with 1 thread or one layer" ||
+    item threads-kept FAILED "$bad"
+  # the mutants: the tree's FFmpeg with one edit in hevcdec.c, rebuilt, on the streams of two views, 1 and 8 threads
+  grep -E '^(itu-[ACEF]|x265-|midgop-N8|dropview-S10|seek50-A) ' "$L" > "$T/mut.txt"
+  try_threads() { # <name> <old> <new>
+    local M=$T/mut-$1 out=0
+    rm -rf "$M" && cp -a "$T/kept" "$M"
+    python3 -I - "$M/libavcodec/hevc/hevcdec.c" "$2" "$3" << 'PY' || { item "threads-mutant-$1" FAILED "not applied"; rm -rf "$M"; return; }
+import sys
+p, old, new = sys.argv[1:4]
+t = open(p, encoding='utf-8').read()
+if t.count(old) != 1:
+    print('MUTANT NOT APPLIED: the text is there %d times: %r' % (t.count(old), old[:80]))
+    sys.exit(3)
+open(p, 'w', encoding='utf-8').write(t.replace(old, new))
+PY
+    { (cd "$M" && nice -n 19 make -j"${MVHEVC_JOBS:-8}" > make-mutant.log 2>&1) && thr_frames "$M" "$M/frames"; } ||
+      { item "threads-mutant-$1" FAILED "does not build"; rm -rf "$M"; return; }
+    thr_run "$M/frames" "$T/mut.txt" "$M/out" 2 1 8
+    while read -r label f views extra; do
+      for x in 1.1 8.1 8.2; do cmp -s "$T/before/$label.1.1.txt" "$M/out/$label.$x.txt" || out=$((out + 1)); done
+      # (and the access units and slices kept, as the tree's FFmpeg keeps them)
+      [ "$(grep -h '^deferred' "$M/out/$label.8.1.err")" = "$(grep -h '^deferred' "$T/kept/$label.8.1.err")" ] || out=$((out + 1))
+    done < "$T/mut.txt"
+    [ $out -gt 0 ] && item "threads-mutant-$1" PASSED "caught: $out runs differ or keep nothing" ||
+      item "threads-mutant-$1" FAILED "NOT CAUGHT"
+    rm -rf "$M"
+  }
+  try_threads never-kept '        s->defer_slices = s->avctx->active_thread_type == FF_THREAD_FRAME &&' '        s->defer_slices = 0 && s->avctx->active_thread_type == FF_THREAD_FRAME &&'
+  try_threads header-not-restored '        s->sh = d->sh;
+        if (d->own_short_term_rps)' '        if (d->own_short_term_rps)'
+  rm -rf "$T/mut-"*
+}
+
+[ "${1:-}" = all ] && set -- ffmpeg streams views files choice pack mkv note depth p20 threads
 : > "$W/logs/items.txt"
 for s in "$@"; do "stage_$s"; done
 rm -rf "$W/mut"

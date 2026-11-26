@@ -15,7 +15,10 @@
 #                            filter of Submit Log): filtered-log-<date>-<time>[-FAILED].zip. Run by
 #                            hades-share-log.service when the share Logfiles is opened, and by kodi.sh, with FAILED,
 #                            where Kodi failed again and again (LibreELEC left createlog's zip there, unfiltered).
-#                            While the one of the share is made, a note in the folder says so, and since when.
+#                            While the one of the share is made, a note in the folder says so in plain words: what
+#                            it is, since when, how big the log of Kodi is (debug logging makes it big), and when
+#                            to open the folder again. A big log goes through the filter in parts, one on each
+#                            processor (redact.sh file).
 #   report.sh open           Samba's "root preexec" of the share Logfiles: starts hades-share-log.service and waits for
 #                            it 10 s at most, so that the folder has the new log when it opens on a PC that is quick
 #                            enough, and the note otherwise. It never keeps the share from opening.
@@ -45,6 +48,7 @@ SAVED_MAX=16384
 FILTERED=4
 UNIT=hades-share-log.service
 NOTE=filtered-log-in-progress.txt
+KODI_TEMP=/storage/.kodi/temp
 
 umask 077
 export LC_ALL=C
@@ -209,12 +213,24 @@ share() {
   name="filtered-log-$(date +%Y-%m-%d-%H.%M.%S)${1:+-$1}"
   if [ -z "$1" ]; then
     mkdir -p "$LOGS" 2>/dev/null
+    # (the size of Kodi's logs, which are most of it: with debug logging on, hundreds of MB)
+    mb=$(du -ck "$KODI_TEMP"/*.log 2>/dev/null | tail -n 1 | awk '{ print int(($1 + 1023) / 1024) }')
     {
-      echo "A new filtered log of LibreELEC Hades is being made, since $(date '+%F %T'): $name.zip."
-      echo "It takes from a few seconds to a few minutes. Open this folder again then."
+      echo "This is not the log yet: it is a note that a new one is being made."
       echo
-      echo "Se está haciendo un registro filtrado nuevo de LibreELEC Hades, desde el $(date '+%F a las %T'): $name.zip."
-      echo "Tarda de unos segundos a unos minutos. Vuelve a abrir esta carpeta entonces."
+      echo "LibreELEC Hades is putting its logs through the filter that takes out addresses, names and passwords,"
+      echo "since $(date '+%T') ($(date '+%F')): $name.zip will be here when it is ready, and this note will be gone."
+      echo "The log of Kodi is ${mb:-?} MB. A few MB take seconds; with debug logging on it can be hundreds of MB, which"
+      echo "takes up to a few minutes. Open (or refresh) this folder again in a minute."
+      echo "Nothing is sent anywhere: the log stays on this computer until you copy it."
+      echo
+      echo "Esto todavía no es el registro: es una nota de que se está haciendo uno nuevo."
+      echo
+      echo "LibreELEC Hades está pasando sus registros por el filtro que quita direcciones, nombres y contraseñas,"
+      echo "desde las $(date '+%T') (del $(date '+%F')): $name.zip estará aquí cuando esté listo, y esta nota ya no."
+      echo "El registro de Kodi ocupa ${mb:-?} MB. Unos pocos MB tardan segundos; con el registro de depuración puede"
+      echo "ocupar cientos de MB, que tardan hasta unos minutos. Vuelve a abrir (o actualiza) esta carpeta en un minuto."
+      echo "No se envía nada a ningún sitio: el registro se queda en este equipo hasta que lo copies."
     } > "$LOGS/$NOTE" 2>/dev/null && chmod 0644 "$LOGS/$NOTE" && NOTED=1
   fi
   # (createlog with a folder leaves its files there, as it wrote them, and packs nothing; the folder that it makes for
@@ -225,7 +241,10 @@ share() {
   mkdir -p "$O/$name"
   for f in $(cd "$S/files" && find . -type f | sed 's|^\./||'); do
     case $f in */*) mkdir -p "$O/$name/${f%/*}" ;; esac
-    sh "$R" < "$S/files/$f" > "$O/$name/$f" 2>/dev/null || rm -f "$O/$name/$f"
+    # (the filter for logs, a big file in parts at once: redact.sh file; each file leaves the folder in RAM once it
+    # went through, so that the two do not both hold it)
+    sh "$R" file "$S/files/$f" "$O/$name/$f" < /dev/null > /dev/null 2>&1 || rm -f "$O/$name/$f"
+    [ -f "$O/$name/$f" ] && rm -f "$S/files/$f"
   done
   [ -n "$(find "$O/$name" -type f | head -n 1)" ] || exit 11
   sh "$R" hostnote "$O/$name" > "$O/$name/filter.txt" 2>/dev/null || rm -f "$O/$name/filter.txt"
@@ -233,7 +252,8 @@ share() {
     echo "LibreELEC Hades: the log of the share Logfiles (what LibreELEC's createlog collects), $(date '+%F %T %Z')."
     echo "Every file went through the filter of the diagnostics for logs. No filter is perfect: read it before you"
     echo "give it to anyone."
-    left_out "$S/files" "$O/$name" | sed -e 's/^/Left out: /' -e 's/$/ (the filter failed on it)./'
+    # (what is still in the folder in RAM is what did not go through)
+    (cd "$S/files" && find . -type f | sed 's|^\./||' | sort) | sed -e 's/^/Left out: /' -e 's/$/ (the filter failed on it)./'
   } > "$N"
   sh "$R" ids < "$N" > "$O/$name/README.txt" 2>/dev/null || rm -f "$O/$name/README.txt"
   rm -rf "$S"; S=

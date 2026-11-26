@@ -110,12 +110,14 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 - **3D in MV-HEVC:** the spatial videos of an iPhone or a Vision Pro, and 3D films made for the Vision Pro, in MP4, MOV or Matroska, play in 3D the same way. NVIDIA graphics with driver 620 (Turing and later) decode both views on the card, other graphics on the processor; where the processor cannot keep up, the video goes on in 2D and the player information says why.
 - **The depth the video was made with.** A spatial video's own depth correction is applied, so far things sit behind the screen as on the Vision Pro, and a film at 3840x2160 per eye is reduced to each eye of the 3D mode.
 - **Subtitles and menus in front of the picture.** Where a 3D video carries no depth for its subtitles (MV-HEVC, side by side, top and bottom, and Blu-ray remuxes without it), Hades measures how near the picture comes where a subtitle goes and places the subtitle just in front, within a comfortable limit. The menus and the player information open in front of the picture too.
-- **HDR in 3D** shows in both eyes, and a Dolby Vision 3D film (profile 20) plays in 3D, each view rebuilt from its Dolby Vision metadata as HDR10 or SDR, since no display takes Dolby Vision in 3D.
+- **HDR in 3D** shows in both eyes, and a Dolby Vision 3D film (profile 20) plays in 3D, each view rebuilt from its Dolby Vision metadata as HDR10 or SDR, since no display takes Dolby Vision in 3D. Whether a display shows HDR in 3D is decided display by display: SDR until *Check this setup > 3D: HDR* has asked you, then what you saw.
+- **Side by side and top and bottom of a 2160p mode stay at 2160p,** and the display is told of them where its EDID declares them, on NVIDIA at 24 to 30 Hz too.
 
 ### Sound
 
 - **Dolby Atmos and the HD sound formats passed through untouched:** Dolby TrueHD and Dolby Digital Plus with Atmos, and DTS-HD. Sound that Hades decodes goes out in no more channels and bits than your display says it takes, so that it does not go silent.
 - **The sound follows the display you use,** and an AV receiver on its own output can keep it.
+- **A plan of the speakers** in the player information: which speakers get sound, which ones your TV or receiver declares, and the Atmos objects that a receiver renders to its heights.
 
 ### Add-ons, streams and discs
 
@@ -133,7 +135,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 ### Made for a PC
 
 - **PCs with two graphics chips, and laptops:** Kodi starts on the TV, whichever chip it is connected to, and moves to a TV connected later (on the same graphics without a restart).
-- **The remote wakes the PC:** the receiver of a remote control (a flirc, a Media Center receiver) may wake the PC from sleep, and *Settings > LibreELEC > System > Sleep > Wake from sleep* chooses what may.
+- **The remote wakes the PC:** the receiver of a remote control (a flirc, a Media Center receiver) may wake the PC from sleep, and *Settings > LibreELEC > System > Sleep* chooses what may, device by device too, Bluetooth ones included.
 - **Safer defaults, a Windows installer, and a diagnostic report made with one button** (see below).
 
 [Extras of Hades](docs/features.md) explains each of these, and the smaller ones that are not listed here.
@@ -246,8 +248,9 @@ Nothing from LibreELEC is removed. LibreELEC is made for a box that does nothing
 
 ### Network and logins
 
-- **Samba (file sharing) is off.** When you turn Samba on, in the first-run wizard or in *Settings > LibreELEC > Services*, a window shows the address, the user (`libreelec`) and a password that Hades generates, and the same page keeps them. Sharing without a password can still be chosen. This is the login that you need to copy an update file ([Updating](#updating)).
-- **SSH is off,** as in LibreELEC, and while the root password is the default one it accepts only keys. Set a password first if you want to log in with one.
+- **One choice for all of it:** *Network access* in *Settings > LibreELEC > Services* (and in the first-run wizard) is "Recommended (safer)", the defaults below, or "As in LibreELEC": file sharing without a password, SSH with the default password, no firewall and AirPlay on. It shows what will change and asks first, each setting stays adjustable on its own, and an update never changes it.
+- **Samba (file sharing) is off.** When you turn Samba on, in the first-run wizard or in *Settings > LibreELEC > Services*, a window shows the address, the user (`libreelec`) and a password that Hades generates; *How to connect* shows them again at any time, with what Windows and macOS ask for. Sharing without a password can still be chosen, after a question that says what it opens. This is the login that you need to copy an update file ([Updating](#updating)).
+- **SSH is off,** as in LibreELEC, and while the root password is the default one it accepts only keys, and says so before the login. Set a password first if you want to log in with one.
 - **The firewall** starts in "home" mode on a new installation, and **AirPlay** is off.
 - **Bluetooth** uses stricter pairing rules, with an option for older input devices.
 - **Blu-ray Java (BD-J) menus** run in a service of their own, apart from Kodi, with no network. *Player > Discs > BD-Live: Internet for disc menus* gives them the Internet, and only the Internet ([how](docs/how-it-works.md#bd-live)).

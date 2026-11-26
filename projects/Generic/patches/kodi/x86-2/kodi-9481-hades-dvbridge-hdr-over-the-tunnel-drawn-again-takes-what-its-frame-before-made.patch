@@ -1,0 +1,211 @@
+From af7135a380c4cfdbc3eb32815819ecd6b5df8c5b Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:58:53 +0000
+Subject: [PATCH] [Hades][dvbridge] HDR over the tunnel drawn again takes what
+ its frame before made
+
+HDR10 and HLG over the tunnel (YCbCr 4:2:2 at 12 bits on HDMI 2.0) keep no
+picture on the screen: every refresh draws the picture again, and with the
+GUI over it (a pause with the OSD, a picture shown for another refresh) the
+whole render of libplacebo was made again each time.
+
+render_hdr10() into the tunnel now takes what its render before made where
+it draws the same picture the same way: the key of render() (the GL
+textures of the planes, their offsets and depth, the time, the place, the
+settings) with the view, the size of the output, the mapping to the display
+and the upscaler, and the plain picture (its colour, HDR10+ and scene)
+compared byte for byte as its metadata. rgb is taken as that render left it
+where nothing was drawn into it since; else from a copy of it that the first
+render of the same picture again keeps (132 MB at 3840x2160, until the
+stream ends), as render() takes a converted picture. The same inputs, the
+same bytes.
+
+Such frames cost less than a picture: the guard of the tunnel (whether the
+GPU keeps up with it) does not take their GPU time, as it does not take
+that of a picture that is not drawn. kodi.log says once in a video that it
+happened; <video><dvreuse>false</dvreuse></video> turns it off.
+---
+ tools/dvbridge/dvbridge_render.c              | 89 +++++++++++++++++--
+ .../VideoRenderers/DVBridgeGLES.cpp           |  8 ++
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp |  6 +-
+ 3 files changed, 96 insertions(+), 7 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_render.c b/tools/dvbridge/dvbridge_render.c
+index c6fceb1..81525f4 100644
+--- a/tools/dvbridge/dvbridge_render.c
++++ b/tools/dvbridge/dvbridge_render.c
+@@ -115,12 +115,18 @@ struct reuse_key {
+     uint64_t lut_signature;
+     struct dvbridge_hdr10_mapping ll_mapping;
+     struct dvbridge_plain_hdr10plus ll_hdr10plus;
++    /* Hades: HDR over the tunnel (render_hdr10()): the view, the size of the output, the mapping to the
++     * display and the upscaler (the picture of a plain one is compared as its metadata) */
++    struct dvbridge_view view;
++    int out_w, out_h;
++    struct dvbridge_hdr10_mapping hdr10_mapping;
++    uintptr_t upscaler;
+ };
+ 
+ /* Hades: what the last render left that a render of the same picture takes (dvbridge_render_reused()):
+  * nothing; the composed planes with their rows and the codes of the IPT tunnel (the source
+  * transport); or the converted picture (rgb) */
+-enum { REUSE_NONE, REUSE_SOURCE, REUSE_CONVERTED };
++enum { REUSE_NONE, REUSE_SOURCE, REUSE_CONVERTED, REUSE_TUNNEL };
+ 
+ struct dvbridge_renderer {
+     pl_gpu gpu;
+@@ -3299,8 +3305,13 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+     /* Hades: (why nothing is drawn, for the log: dvbridge_render_refused(), dvbridge_render_not_drawn()) */
+     r->refused = NULL;
+     r->not_drawn = NULL;
+-    /* (Hades: it may draw into rgb: nothing of render() is taken after it) */
+-    reuse_forget(r);
++    /* (Hades: it may draw into rgb: nothing of render() is taken after it; a picture over the tunnel takes
++     * what its render before left where it draws the same one, below) */
++    const int left = r->reuse_kind;
++    r->reuse_kind = REUSE_NONE;
++    r->reused = false;
++    if (!r->tunnel)
++        r->rgb_kept_valid = false;
+     /* (HDR over the tunnel: a picture that is not drawn leaves no frame to pack) */
+     if (r->tunnel) {
+         r->tunnel_frame = false;
+@@ -3509,6 +3520,42 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+                                       .height = view.dst_height};
+     const bool fills = view.dst_x == 0 && view.dst_y == 0 && view.dst_width == 3840 &&
+                        view.dst_height == 2160;
++    /* Hades: HDR over the tunnel drawn again, the same picture the same way (a pause with the OSD over
++     * it, a picture shown for another refresh: the tunnel keeps no picture on the screen): rgb as its
++     * render before left it, where nothing was drawn into it since, else from the copy of it that the
++     * first render of the same picture again kept, as render() takes a converted picture. The key: that
++     * of render() with the view, the size of the output, the mapping to the display and the upscaler;
++     * the plain picture (its colour, HDR10+ and scene) compared byte for byte as its metadata. */
++    const void *blob = plain ? (const void *)plain : metadata;
++    const size_t blob_bytes = plain ? sizeof(*plain) : bytes;
++    struct reuse_key key_store;
++    struct reuse_key *key = NULL;
++    if (tunnel && !r->reuse_off &&
++        reuse_key_of(r, source, blob_bytes, pts, el_pts,
++                     (struct dvbridge_geometry){.source_width = (int)source->crop.x1,
++                                                .source_height = (int)source->crop.y1, .x = place.x,
++                                                .y = place.y, .width = place.width,
++                                                .height = place.height},
++                     NULL, false, false, &key_store)) {
++        key_store.view = view;
++        key_store.out_w = width;
++        key_store.out_h = height;
++        key_store.hdr10_mapping = r->hdr10_mapping;
++        key_store.upscaler = (uintptr_t)r->upscaler;
++        key = &key_store;
++    }
++    const bool repeat = reuse_same(r, left, REUSE_TUNNEL, key, blob, blob_bytes);
++    bool reused = false;
++    if (repeat && !r->rgb_drawn) {
++        reused = true;
++    } else if (repeat && r->rgb_kept && r->rgb_kept_valid) {
++        dvbridge_gl_drain_errors();
++        pl_tex_blit(r->gpu, pl_tex_blit_params(.src = r->rgb_kept, .dst = r->rgb));
++        reused = glGetError() == GL_NO_ERROR;
++        r->rgb_clean = reused && !fills;
++        memcpy(r->clean_place, (int[4]){place.x, place.y, place.width, place.height},
++               sizeof(r->clean_place));
++    }
+     if (tunnel) {
+         r->tunnel_frame = false;
+         r->ready = false;
+@@ -3519,7 +3566,7 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         r->scaled_source = false;
+         r->gui_drawn = 0;
+         dvbridge_source_forget(r->source_packer);
+-        if (!fills && (!r->rgb_clean || !same_place(r->clean_place, place))) {
++        if (!reused && !fills && (!r->rgb_clean || !same_place(r->clean_place, place))) {
+             pl_tex_clear(r->gpu, r->rgb, (float[4]){0, 0, 0, 2});
+             r->rgb_clean = true;
+             r->clean_place[0] = place.x;
+@@ -3545,8 +3592,17 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+         params.num_hooks += up->num_hooks;
+     }
+     r->upscale_tried = upscale && params.hooks == with_upscaler;
+-    time_render(r, &params);
+-    const bool rendered = pl_render_image(r->renderer, &image, &target, &params);
++    bool rendered;
++    if (reused) {
++        /* (what the hooks of that render found, which it succeeded with) */
++        rendered = true;
++        to_display.called = clamped.called = true;
++        signal_clamped = plain != NULL;
++        trim.called = trim.on;
++    } else {
++        time_render(r, &params);
++        rendered = pl_render_image(r->renderer, &image, &target, &params);
++    }
+     bool ok = rendered && (peak_hook ? to_display.called : clamped.called) && (!plain || signal_clamped) &&
+               (!trim.on || trim.called);
+     struct pl_render_errors errors = pl_renderer_get_errors(r->renderer);
+@@ -3572,6 +3628,27 @@ static bool render_hdr10(struct dvbridge_renderer *r, const struct pl_frame *sou
+             r->rgb_clean = false;
+         r->ready = ok;
+         r->tunnel_frame = ok;
++        /* Hades: what it leaves for the next picture (above): a copy of rgb made by the first render of
++         * the same picture again into which the caller had drawn, kept until the stream ends */
++        if (ok) {
++            if (repeat && !reused) {
++                if (!r->rgb_kept)
++                    r->rgb_kept = pl_tex_create(r->gpu, pl_tex_params(.w = r->rgb->params.w,
++                        .h = r->rgb->params.h, .format = r->rgb->params.format, .sampleable = true,
++                        .renderable = true, .blit_src = true, .blit_dst = true));
++                r->rgb_kept_valid = false;
++                if (r->rgb_kept) {
++                    dvbridge_gl_drain_errors();
++                    pl_tex_blit(r->gpu, pl_tex_blit_params(.src = r->rgb, .dst = r->rgb_kept));
++                    r->rgb_kept_valid = glGetError() == GL_NO_ERROR;
++                }
++            } else if (!repeat) {
++                r->rgb_kept_valid = false;
++            }
++            r->rgb_drawn = false;
++            r->reused = reused;
++            reuse_leave(r, REUSE_TUNNEL, key, blob, blob_bytes);
++        }
+     } else if (ok) {
+         r->hdr10_shown = into;
+         r->hdr10_whole = true;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+index f2dc193..eb194c5 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/DVBridgeGLES.cpp
+@@ -1965,6 +1965,14 @@ bool CDVBridgeGLES::PrepareTunnel(const Layer& base,
+   // (the raster of the output: the bridge refuses any other size)
+   const bool drawn = dvbridge_render_plain(m_renderer, &bl.frame, &plain, view, 3840, 2160);
+   LogNotes();
++  // Hades: the same picture drawn again, taken as its frame before made it (said once)
++  if (drawn && dvbridge_render_reused(m_renderer) && !m_reusedSaid)
++  {
++    m_reusedSaid = true;
++    CLog::Log(LOGINFO, "DVBridge: a picture of HDR over the tunnel drawn again (a pause with the OSD, "
++                       "for example) takes what its frame before made of it: it is not drawn again (the "
++                       "same bytes; the guard of the tunnel does not time such frames; video/dvreuse)");
++  }
+   dvbridge_gl_frame_release(&bl);
+   if (!drawn)
+   {
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 92ca767..b242dd7 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -7581,7 +7581,11 @@ int CWinSystemGbmGLESContext::RenderHdr10Tunnel(const CDVBridgeGLES::Layer& laye
+     m_dvBridge->SetLut(LutFor(DISPLAY_LUT::Output::HDR_DISPLAY_MAPS));
+   m_dvFrame = m_dvBridge && m_dvBridge->PrepareTunnel(layer, plain, view);
+   LutDrawn(m_dvFrame, false, false);
+-  DVGpuTimerTag(false, false, false, false, false, 0, true, false, 0, false, 0, false, false, false);
++  // Hades: a picture drawn again that took what its frame before made (CDVBridgeGLES::Reused())
++  // costs less than a picture: the guard of the tunnel does not take its time
++  const bool reused = m_dvFrame && m_dvBridge->Reused();
++  DVGpuTimerTag(false, false, false, false, false, 0, !reused, false, 0, false, 0, false, false,
++                false);
+   if (!m_dvFrame)
+   {
+     m_dvShown = {};
+-- 
+2.53.0
+

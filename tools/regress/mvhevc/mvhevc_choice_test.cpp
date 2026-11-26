@@ -9,7 +9,8 @@
 //     where the record lacks the second layer's SPS or PPS, nothing for a set of one layer, of another scalability,
 //     or cut short;
 //   - the eye of the base view by the container and by the stream, Dolby Vision profile 20 kept to one view,
-//     TwoViews() as a whole, and Paced(): the processor that does not keep up.
+//     TwoViews() as a whole, and Paced(): the processor that does not keep up; Worked(): the same, found sooner by
+//     the work of the decoder (two windows in a row under nine tenths of the rate of the video, after a skip).
 //   - the private data of files that FFmpeg wrote and read back (an MP4 with 'lhvC', a Matroska file made of it):
 //     the layer of the second view, or nothing;
 //   - the parameter sets of the second view looked for in packets (LookInPacket(), HvccWithSets()), the choice of
@@ -377,6 +378,65 @@ static void Pacing()
   }
 }
 
+// Worked(): the processor that cannot keep up found by the work of the decoder, sooner than Paced()
+static void Working()
+{
+  const double fps = 24000.0 / 1001.0;
+  const double frameMs = 1000.0 / fps;
+  // a decoder that needs 25 % more than a picture's time: given up after its skip and two windows, about four
+  // seconds of film, long before Paced() could
+  {
+    Work w;
+    int at = -1;
+    for (int i = 0; i < 2000 && at < 0; ++i)
+      if (Worked(w, 1.25 * frameMs, fps, true))
+        at = i;
+    CHECK(at == static_cast<int>(WORK_SKIP + 2 * WORK_WINDOW - 1), "too slow: given up at %d", at);
+    CHECK(at < static_cast<int>(PACE_GRACE + 2 * PACE_WINDOW - 1), "too slow: not sooner than Paced()");
+    CHECK(w.rate > 0.79 * fps && w.rate < 0.81 * fps, "the rate measured: %.3f", w.rate);
+  }
+  // nearly in time (5 % more than a picture's time), in time, or waiting for nothing: never by the work
+  for (const double share : {1.05, 1.0, 0.5, 0.0})
+  {
+    Work w;
+    bool gave = false;
+    for (int i = 0; i < 20000; ++i)
+      gave = gave || Worked(w, share * frameMs, fps, true);
+    CHECK(!gave, "given up at %.2f of a picture's time", share);
+  }
+  // a slow window between quick ones (a start, a moment of load): never; two in a row: given up
+  {
+    Work w;
+    bool gave = false;
+    for (unsigned int win = 0; win < 200; ++win)
+      for (unsigned int i = 0; i < WORK_WINDOW + (win == 0 ? WORK_SKIP : 0); ++i)
+        gave = gave || Worked(w, (win % 2 == 0 ? 2.0 : 0.5) * frameMs, fps, true);
+    CHECK(!gave, "slow windows apart: given up");
+  }
+  // the first pictures after a start or a seek cost more (the threads fill): not counted
+  {
+    Work w;
+    bool gave = false;
+    for (unsigned int i = 0; i < 20000; ++i)
+      gave = gave || Worked(w, (i < WORK_SKIP ? 100.0 : 0.8) * frameMs, fps, true);
+    CHECK(!gave, "the skipped pictures counted");
+  }
+  // not judged (another speed, before the target of a seek), or the rate of the video not known: never
+  {
+    Work w, u;
+    bool gave = false;
+    for (int i = 0; i < 20000; ++i)
+      gave = gave || Worked(w, 3.0 * frameMs, fps, false) || Worked(u, 3.0 * frameMs, 0.0, true);
+    CHECK(!gave, "not judged or no rate: given up");
+  }
+  // the stream given up for slowness, opened again while the same file plays: its base view at once
+  const SlowStream slow{"/storage/videos/a.mp4", 3840, 2160};
+  CHECK(StillSlow(slow, "/storage/videos/a.mp4", 3840, 2160), "the same stream of the same file: not kept");
+  CHECK(!StillSlow(slow, "/storage/videos/b.mp4", 3840, 2160), "another file: kept");
+  CHECK(!StillSlow(slow, "/storage/videos/a.mp4", 1920, 1080), "another stream of the file: kept");
+  CHECK(!StillSlow(SlowStream{}, "", 0, 0), "a stream of no file: kept as slow");
+}
+
 //! units into one packet of a Matroska or MP4 sample: each behind its length in lengthSize bytes
 static Bytes Packet(const std::vector<const Bytes*>& units, unsigned int lengthSize = 4)
 {
@@ -546,6 +606,7 @@ int main(int argc, char** argv)
   Eyes();
   Tracks(argv[1]);
   Pacing();
+  Working();
   InBandSets(argv[1]);
   NvdecChoice();
   Disparity();

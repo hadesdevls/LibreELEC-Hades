@@ -27,6 +27,7 @@
  */
 #include "DRMStereo.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -279,9 +280,120 @@ static void HeldInfoFrame()
         "arrangement: side by side whatever was asked before");
 }
 
+// (Hades) the 2160p formats in what the EDID says of 3D, for nvidia-drm, which lists no 3D modes (VicOf(),
+// Supports(), HasHdmiVic(), EdidLayouts()): a display whose EDID names 3840x2160 at 60 Hz in side by side
+static void Edid2160()
+{
+  Mode uhd60;
+  uhd60.hdisplay = 3840;
+  uhd60.vdisplay = 2160;
+  uhd60.htotal = 4400;
+  uhd60.vtotal = 2250;
+  uhd60.clock = 594000;
+  Mode uhd5994 = uhd60;
+  uhd5994.clock = 593407;
+  Mode uhd24 = uhd60;
+  uhd24.htotal = 5500;
+  uhd24.clock = 297000;
+  Mode uhd50 = uhd60;
+  uhd50.htotal = 5280;
+  Mode dci24 = uhd24;
+  dci24.hdisplay = 4096;
+  Mode dci60 = uhd60;
+  dci60.hdisplay = 4096;
+  Mode uhd60i = uhd60;
+  uhd60i.flags |= FLAG_INTERLACE;
+  Check(VicOf(uhd60) == 97 && VicOf(uhd5994) == 97 && VicOf(uhd24) == 93 && VicOf(uhd50) == 96,
+        "VicOf(): 3840x2160 at 60 (and 59.94), 24 and 50 Hz: formats 97, 93, 96");
+  Check(VicOf(dci24) == 98 && VicOf(dci60) == 102 && VicOf(uhd60i) == 0,
+        "VicOf(): 4096x2160 at 24 and 60 Hz: 98 and 102; an interlaced 2160 lines: none");
+  Edid3D e;
+  e.read = true;
+  e.listed = {{16, STRUCTURE_SIDE_BY_SIDE_HALF | STRUCTURE_TOP_AND_BOTTOM}, {97, STRUCTURE_SIDE_BY_SIDE_HALF}};
+  Check(Supports(e, VicOf(uhd60), Layout::SIDE_BY_SIDE_HALF) && !Supports(e, VicOf(uhd60), Layout::TOP_AND_BOTTOM) &&
+            !Supports(e, VicOf(uhd50), Layout::SIDE_BY_SIDE_HALF) && !Supports(e, VicOf(dci60), Layout::SIDE_BY_SIDE_HALF),
+        "Supports(): side by side at 2160p60 where the EDID names it there, and nowhere else at 2160p");
+  Check(HasHdmiVic(uhd24) && HasHdmiVic(dci24) && !HasHdmiVic(uhd60) && !HasHdmiVic(uhd50),
+        "HasHdmiVic(): 2160p at 24 Hz has a format number of HDMI's own (not told by Kodi's InfoFrame); 50 and 60 Hz "
+        "none");
+  const std::string said = EdidLayouts(e);
+  Check(said == "top-and-bottom at 1920x1080@60; side-by-side (half) at 1920x1080@60, 3840x2160@60",
+        "EdidLayouts(): what the EDID declares, by format (" + said + ")");
+  Edid3D none;
+  none.read = true;
+  Edid3D other;
+  other.read = true;
+  other.listed = {{200, STRUCTURE_FRAME_PACKING}};
+  Check(EdidLayouts(none).empty() && EdidLayouts(other) == "frame packing at VIC 200",
+        "EdidLayouts(): nothing declared; a format of no name by its number");
+}
+
+// (Hades) an EDID of a base block and one CTA-861 extension of revision 3 with these data blocks, each checksum right
+static std::vector<uint8_t> EdidWith(const std::vector<std::vector<uint8_t>>& blocks)
+{
+  std::vector<uint8_t> e(256, 0);
+  const uint8_t header[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+  std::copy(header, header + 8, e.begin());
+  e[18] = 1;
+  e[19] = 3;
+  e[126] = 1;
+  e[128] = 0x02;
+  e[129] = 3;
+  std::size_t at = 132;
+  for (const auto& b : blocks)
+  {
+    std::copy(b.begin(), b.end(), e.begin() + static_cast<std::ptrdiff_t>(at));
+    at += b.size();
+  }
+  e[130] = static_cast<uint8_t>(at - 128);
+  for (std::size_t base : {std::size_t{0}, std::size_t{128}})
+  {
+    unsigned int sum = 0;
+    for (std::size_t i = 0; i < 127; ++i)
+      sum += e[base + i];
+    e[base + 127] = static_cast<uint8_t>(0x100 - (sum & 0xFF));
+  }
+  return e;
+}
+
+// (Hades) where a half layout is told at 2160p at 24 to 30 Hz on nvidia-drm (FormatNamed()): the rule of
+// nvidia-open-kernel-modules-9086 and nvidia-legacy-open-9083 (nvHadesStereoAviCtaVic(), their host test
+// stereo_cta_vic_test.c), which is the kernel's (vic_for_avi_infoframe()): whatever the HDMI version of the display
+static void Edid2160HdmiVic()
+{
+  // VIC 93 (3840x2160 at 24 Hz) as the first format, side by side and top and bottom for it by 3D_Structure_ALL
+  const std::vector<uint8_t> vdb = {0x42, 93, 16};
+  const std::vector<uint8_t> vsdb = {0x6C, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x00, 0x3C, 0x20, 0xA0, 0x02, 0x01, 0x41};
+  const std::vector<uint8_t> hfVsdb = {0x67, 0xD8, 0x5D, 0xC4, 0x01, 0x78, 0x80, 0x00};
+
+  const Edid3D hdmi14 = Parse(EdidWith({vdb, vsdb}));
+  Check(hdmi14.read && Supports(hdmi14, 93, Layout::SIDE_BY_SIDE_HALF) && Supports(hdmi14, 93, Layout::TOP_AND_BOTTOM),
+        "EDID: an HDMI 1.4 display that declares both half layouts for VIC 93");
+  const Edid3D hdmi20 = Parse(EdidWith({vdb, vsdb, hfVsdb}));
+  Check(hdmi20.read && Supports(hdmi20, 93, Layout::SIDE_BY_SIDE_HALF) && Supports(hdmi20, 93, Layout::TOP_AND_BOTTOM),
+        "EDID: the same with an HF-VSDB (an HDMI 2.0 display) declares the same");
+  Check(!Parse(EdidWith({vdb, hfVsdb})).read, "EDID: no HDMI vendor block, nothing read");
+
+  Mode uhd24;
+  uhd24.hdisplay = 3840;
+  uhd24.vdisplay = 2160;
+  uhd24.htotal = 5500;
+  uhd24.vtotal = 2250;
+  uhd24.clock = 297000;
+  Mode uhd60 = uhd24;
+  uhd60.htotal = 4400;
+  uhd60.clock = 594000;
+  Check(!FormatNamed(uhd24, false) && FormatNamed(uhd24, true),
+        "FormatNamed(): 2160p24 only with NV_HDMI_3D_AVI_CTA_VIC, whatever the HDMI version of the display");
+  Check(FormatNamed(uhd60, false) && FormatNamed(uhd60, true), "FormatNamed(): 2160p60 always (a CTA-861 number of its own)");
+  Check(std::string(NVIDIA_3D_AVI_CTA_VIC) == "NV_HDMI_3D_AVI_CTA_VIC", "the property of nvidia-drm");
+}
+
 int main()
 {
   HeldInfoFrame();
+  Edid2160();
+  Edid2160HdmiVic();
   // ---- the displays
   Display none{"2D only", Modes2D(), nullptr};
   Display mand{"HDMI 1.4 mandatory 3D only", Modes2D(), nullptr};
@@ -555,12 +667,23 @@ int main()
     a.pictureRate = 24.0;
     Check(Describe(uhd, Output(o, u24, Src::FRAME_PACKED_MVC, a), u24) == "FP 1920x1080@24.000",
           "2160p24 desktop: frame packing at 1080p24, another size (the largest that has it)");
+    // (Hades, 1.2.2: a half layout of fewer lines than Kodi's mode is never taken: it would halve each eye
+    // again, both ways. Side by side and top and bottom of a 2160p mode go out at 2160p, told to the display
+    // where it declares them there, else not told; frame packing still goes to 1080p24, where it exists.)
     a.pictureRate = 60.0;
-    Check(Describe(uhd, Output(o, u60, Src::SBS_HALF, a), u60) == "SBS 2560x1440@60.000",
-          "2160p60 desktop: SBS at the largest size not above it that has it (1440p over 1080p)");
+    Check(Describe(uhd, Output(o, u60, Src::SBS_HALF, a), u60) == "2D",
+          "2160p60 desktop, SBS only at 1440p and 1080p: 2D at 2160p, not SBS of fewer lines");
     a.pictureRate = 30.0;
-    Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, a), u30) == "SBS 2560x1440@60.000 x2",
-          "2160p30 desktop, nothing at 30: SBS at 1440p60, another size at twice the rate");
+    Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, a), u30) == "2D",
+          "2160p30 desktop, SBS only at 1440p60: 2D at 2160p, not SBS of fewer lines at twice the rate");
+    {
+      // a 1080p60 desktop on the same display: SBS of its own size, as before
+      const int p60 = Find(uhd.modes, 1080, 60.0);
+      Allowed b;
+      b.pictureRate = 60.0;
+      Check(Describe(uhd, Output(o, p60, Src::SBS_HALF, b), p60) == "SBS 1920x1080@60.000",
+            "1080p60 desktop: SBS at 1080p60, as before");
+    }
     a.otherSize = false; // a whitelist: another size only where the whitelist has its 2D mode
     Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, a), u30) == "2D", "2160p30, whitelist without 1440p/1080p: 2D");
     // a 3D layout at 2160p60 itself (the logic is the same for any size): Kodi's size wins
@@ -570,6 +693,21 @@ int main()
     a.pictureRate = 30.0;
     Check(Describe(uhd3, Output(OffersOf(uhd3), u30, Src::SBS_HALF, a), u30) == "SBS 3840x2160@60.000 x2",
           "2160p30 with SBS at 2160p60: Kodi's size at twice the rate first");
+    // (Hades) what kodi.log says the driver lists: DeclaredLayouts()
+    const std::string listed = DeclaredLayouts(uhd.modes);
+    Check(listed.find("frame packing at 1920x1080@24.000") == 0 &&
+              listed.find("; side-by-side (half) at ") != std::string::npos &&
+              listed.find("2560x1440@60.000") != std::string::npos && listed.find("3840x2160") == std::string::npos &&
+              listed.find("top-and-bottom") == std::string::npos,
+          "DeclaredLayouts(): the layouts listed, by size and rate, none at 2160p (" + listed + ")");
+    Check(DeclaredLayouts(uhd3.modes).find("side-by-side (half) at ") != std::string::npos &&
+              DeclaredLayouts(uhd3.modes).find("3840x2160@60.000") != std::string::npos,
+          "DeclaredLayouts(): SBS at 2160p60 where it is listed");
+    std::vector<Mode> flat;
+    for (const Mode& m : uhd.modes)
+      if (LayoutOf(m.flags) == Layout::NONE)
+        flat.push_back(m);
+    Check(DeclaredLayouts(flat).empty(), "DeclaredLayouts(): nothing where no 3D mode is listed");
   }
   {
     // the modes in another order: a 3D mode first in the list, a second 1080p60 timing that has the

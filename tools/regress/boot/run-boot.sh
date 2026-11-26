@@ -56,19 +56,35 @@
 #                the setting "Wake from sleep" run) on a /sys of files with the USB devices of issue 32 and others (a
 #                Media Center IR receiver, a mouse, a game pad, a TV tuner with IR, an IR receiver on the board), each
 #                HID interface with a report descriptor of bytes: each choice of the setting, a device plugged in, a
-#                device seen before all its interfaces, the hook after a sleep, another device on a port, and what
-#                sleep.sh then says of each device (wake_test.sh, with the busybox of the image); each of its 14
+#                device seen before all its interfaces, the hook after a sleep, another device on a port, the list of
+#                devices (on and off, by IDs, serial number or port; a wired Xbox controller of xpad), Bluetooth (a
+#                stand-in for busctl: WakeAllowed of each paired input device, the adapters, the hook before a sleep)
+#                and what sleep.sh then says of each device (wake_test.sh, with the busybox of the image); each of its
+#                25 mutations must fail a check
+#   wakesettings the setting "Wake from sleep" of the LibreELEC settings add-on and its list of devices
+#                (LibreELEC-settings-9093 and 9094, system.py and its strings, with stand-ins for Kodi:
+#                wake_settings_test.py) on the add-on of the recipe (archive checked against PKG_SHA256, every patch
+#                with -F0), and the same with 9094 reversed, and with 9093 reversed, each of which must fail
+#   logfilter    the filter of the diagnostics for a log in a file, in parts at once (redact.sh file, which the share
+#                Logfiles uses): the same bytes as from standard input, nothing of what it takes out left, no part
+#                left behind, a part that fails (log_filter_test.sh, with the busybox of the image); each of its 5
 #                mutations must fail a check
-#   wakesettings the setting "Wake from sleep" of the LibreELEC settings add-on (LibreELEC-settings-9093, system.py and
-#                its strings, with stand-ins for Kodi: wake_settings_test.py) on the add-on of the recipe (archive
-#                checked against PKG_SHA256, every patch with -F0), and the same with 9093 reversed, which must fail
+#   netaccess    what sshd is told while root has the default password (no password logins, and a banner that says
+#                why), not with the boot parameter ssh nor with Network access As in LibreELEC, and the line of the
+#                diagnostic report that says the network access in effect (sshd_password_test.sh, with the busybox
+#                of the image); each of its 5 mutations must fail a check
+#   servicessettings Services of the LibreELEC settings add-on: Samba's How to connect and the question before sharing
+#                without a password, the button of the SSH password, Network access and its page of the wizard
+#                (LibreELEC-settings-9095 and 9096, with stand-ins for Kodi: services_settings_test.py); the same with
+#                9096 reversed, and with 9095 reversed, must fail, and so must each of its 5 mutations of the add-on
 # Not a stage (it needs an image and KVM): picture_race_qemu.sh, Kodi's "hades-picture release" that comes while a
 # picture of the start is being drawn, in QEMU (its head says what it checks).
 # Host test only: it writes under $REGRESS_WORK/boot and reads the tree at $REGRESS_LE_REF and the busybox of the build
 # folder ($REGRESS_LE_BUILD/install_pkg/busybox-*).
 # usage: run-boot.sh all | verdict [<log>] | <stage>...       stages: menus today olderlook oldertext notice themeupdate installer picture
 #                                                              scripts netwait notreturned afternvidia nvidiasleep
-#                                                              sleepreport wake wakesettings
+#                                                              sleepreport wake wakesettings logfilter netaccess
+#                                                              servicessettings
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -388,10 +404,109 @@ stage_wake() {
     "$T/$W/sleep.d/hades-wake"
   v=$(rg_pass "$L" '^WAKE PASSED$' '^  FAIL ')
   rg_item wake "$(rg_say "$v")" "$(rg_rest "$v")"
-  for m in M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13 M14; do
+  for m in $(seq -f 'M%g' 1 33); do
     if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item wake.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
     else rg_item wake.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
   done
+}
+
+# the filter of the diagnostics for a log in a file, in parts at once (redact.sh file)
+stage_logfilter() {
+  local bb L m v T=$RG_W/le-logfilter SD=packages/sysutils/hades-diag/scripts
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $SD
+  if [ -z "$bb" ] || [ ! -f "$T/$SD/redact.sh" ]; then
+    rg_item logfilter FAILED "no busybox of the image, or no redact.sh at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/logfilter.log
+  rg_log "$L" bash "$HERE/log_filter_test.sh" "$bb" "$T/$SD"
+  v=$(rg_pass "$L" '^LOGFILTER PASSED$' '^  FAIL ')
+  rg_item logfilter "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item logfilter.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item logfilter.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+# what sshd is told while root has the default password, and the line of the report on the network access
+stage_netaccess() {
+  local bb L m v T=$RG_W/le-netaccess SP=packages/network/openssh/scripts/sshd-default-password NA=packages/sysutils/hades-diag/scripts/net-access.sh
+  bb=$(busybox_of_image)
+  rg_le_tree "$T" $SP $NA
+  if [ -z "$bb" ] || [ ! -f "$T/$SP" ] || [ ! -f "$T/$NA" ]; then
+    rg_item netaccess FAILED "no busybox of the image, or no sshd-default-password or net-access.sh at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/netaccess.log
+  rg_log "$L" bash "$HERE/sshd_password_test.sh" "$bb" "$T/$SP" "$T/$NA"
+  v=$(rg_pass "$L" '^SSHD PASSED$' '^  FAIL ')
+  rg_item netaccess "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item netaccess.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item netaccess.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+# the add-on of the recipe with every patch at -F0 into $1, or a FAILED item for $2 and status 1
+addon_of_recipe() {
+  local P=packages/mediacenter/LibreELEC-settings ver sha tb p
+  ver=$(rg_pkgvar $P PKG_VERSION); sha=$(rg_pkgvar $P PKG_SHA256)
+  tb=$(rg_source LibreELEC-settings "LibreELEC-settings-$ver.tar.gz")
+  rg_le_tree $1.le $P/patches
+  if [ -z "$tb" ] || [ "$(sha256sum < "$tb" | cut -c1-64)" != "$sha" ]; then
+    rg_item $2 FAILED "no LibreELEC-settings-$ver.tar.gz with PKG_SHA256 in REGRESS_SOURCES"; return 1
+  fi
+  tar -xzf "$tb" --strip-components=1 -C $1
+  for p in $(ls $1.le/$P/patches/*.patch | sort); do
+    patch -d $1 -p1 -F0 -s --no-backup-if-mismatch < "$p" ||
+      { rg_item $2 FAILED "patch $(basename $p) does not apply with -F0"; return 1; }
+  done
+}
+# a copy of the add-on $1 with the patches from number $2 on reversed (the last first) into $3
+addon_without() {
+  local P=packages/mediacenter/LibreELEC-settings p n
+  rg_fresh $3; cp -a $1/. $3/
+  for p in $(ls $1.le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
+    n=$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')
+    [ "$n" -ge "$2" ] || continue
+    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $3 < "$p" || return 1
+  done
+}
+
+# Services of the LibreELEC settings add-on (9095, 9096): the add-on of the recipe, the same without 9096 and without
+# 9095, and mutations of the patched add-on
+stage_servicessettings() {
+  local S=$RG_W/servicessettings L n v m
+  rg_fresh $S/src
+  addon_of_recipe $S/src services-settings || return 1
+  L=$RG_W/logs/services-settings.log
+  rg_log "$L" python3 -I "$HERE/services_settings_test.py" $S/src
+  v=$(rg_pass "$L" '^ALL PASSED$')
+  rg_item services-settings "$(rg_say "$v")" "$(rg_rest "$v") ($(grep -c '^ok:' $L) ok)"
+  for n in 9096 9095; do
+    addon_without $S/src $n $S/without || { rg_item services-settings.without-$n FAILED "it does not reverse"; continue; }
+    L=$RG_W/logs/services-settings.without-$n.log
+    rg_log "$L" python3 -I "$HERE/services_settings_test.py" $S/without
+    [ "$(rg_exit $L)" != 0 ] && rg_item services-settings.without-$n PASSED "it fails without $n: $(rg_last $L | cut -c1-120)" ||
+      rg_item services-settings.without-$n FAILED "it passes without $n"
+  done
+  # mutations of the add-on: <name> <file under resources/lib> <sed program>
+  while IFS='|' read -r m f prog; do
+    [ -n "$m" ] || continue
+    rg_fresh $S/mut; cp -a $S/src/. $S/mut/
+    sed -i -e "$prog" "$S/mut/resources/lib/$f"
+    if cmp -s "$S/mut/resources/lib/$f" "$S/src/resources/lib/$f"; then rg_item services-settings.mut.$m FAILED "its text is no longer in $f"; continue; fi
+    L=$RG_W/logs/services-settings.mut.$m.log
+    rg_log "$L" python3 -I "$HERE/services_settings_test.py" $S/mut
+    [ "$(rg_exit $L)" != 0 ] && rg_item services-settings.mut.$m PASSED "caught: $(rg_last $L | cut -c1-100)" ||
+      rg_item services-settings.mut.$m FAILED "not caught"
+  done <<'MUT'
+M1|modules/services.py|s/            if xbmcDialog.yesno(title, oe._(34149), defaultbutton=xbmcgui.DLG_YESNO_NO_BTN) is not True:/            if False:/
+M2|modules/services.py|s/        if xbmcDialog.yesno(oe._(34129), oe._(34130), defaultbutton=xbmcgui.DLG_YESNO_NO_BTN) is True and \\/        if xbmcDialog.yesno(oe._(34129), oe._(34130), defaultbutton=xbmcgui.DLG_YESNO_YES_BTN) is True and \\/
+M3|hades_netaccess.py|s/        return {'samba': 'open', 'ssh': 'accepts', 'firewall': 'none', 'airplay': True}/        return {'samba': 'open', 'ssh': 'accepts', 'firewall': 'home', 'airplay': True}/
+M4|modules/services.py|s/                if samba\['samba_password'\]\['value'\] in ('', 'libreelec'):/                if samba['samba_password']['value'] in ('',):/
+M5|modules/services.py|s/            state = 34143/            state = 34121/
+MUT
+  rg_rm $S/without $S/mut
 }
 
 # the setting "Wake from sleep" of the LibreELEC settings add-on: the add-on of the recipe (archive checked against
@@ -416,18 +531,21 @@ stage_wakesettings() {
   rg_log "$L" python3 -I "$HERE/wake_settings_test.py" $S/src
   v=$(rg_pass "$L" '^ALL PASSED$')
   rg_item wake-settings "$(rg_say "$v")" "$(rg_rest "$v") ($(grep -c '^ok:' $L) ok)"
-  cp -a $S/src/. $S/without/
-  for p in $(ls $S/le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
-    n=$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')
-    [ "$n" -ge 9093 ] || continue
-    patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without < "$p" ||
-      { rg_item wake-settings.without-9093 FAILED "$(basename $p) does not reverse"; return 1; }
+  # (the same without 9094, the list of devices, and without 9093, the setting: each reversed with what comes after it)
+  for n in 9094 9093; do
+    rg_fresh $S/without; cp -a $S/src/. $S/without/
+    for p in $(ls $S/le/$P/patches/LibreELEC-settings-[0-9]*-*.patch | sort -r); do
+      v=$(basename "$p" | sed -E 's/^LibreELEC-settings-([0-9]+)-.*/\1/')
+      [ "$v" -ge $n ] || continue
+      patch -R -p1 -F0 -s --no-backup-if-mismatch -d $S/without < "$p" ||
+        { rg_item wake-settings.without-$n FAILED "$(basename $p) does not reverse"; continue 2; }
+    done
+    L=$RG_W/logs/wake-settings.without-$n.log
+    rg_log "$L" python3 -I "$HERE/wake_settings_test.py" $S/without
+    [ "$(rg_exit $L)" != 0 ] && rg_item wake-settings.without-$n PASSED "it fails without $n: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
+      rg_item wake-settings.without-$n FAILED "it passes without $n"
   done
-  L=$RG_W/logs/wake-settings.without-9093.log
-  rg_log "$L" python3 -I "$HERE/wake_settings_test.py" $S/without
-  [ "$(rg_exit $L)" != 0 ] && rg_item wake-settings.without-9093 PASSED "it fails without 9093: exit $(rg_exit $L); $(rg_last $L | cut -c1-120)" ||
-    rg_item wake-settings.without-9093 FAILED "it passes without 9093"
   rg_rm $S/without
 }
 
-rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep sleepreport wake wakesettings" "$@"
+rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep sleepreport wake wakesettings logfilter netaccess servicessettings" "$@"
