@@ -19,7 +19,7 @@ A short version after 1.2: a 1D LUT for the calibration of a display, the frame 
 
 **3D**
 
-- **HDMI 3D frame packing on NVIDIA** (issue #33). Where NVIDIA's driver refuses the picture buffer of a frame-packed mode, Hades now draws the two eyes into buffers of its own that the display engine can show, and the 3D mode goes out in frame packing instead of falling back to top and bottom or side by side; `kodi.log` says which buffer was used.
+- **HDMI 3D frame packing on NVIDIA** (issue #33). Where NVIDIA's driver refuses the picture buffer of a frame-packed mode, Hades now draws the two eyes into buffers of its own that the display engine can show, so that the 3D mode can go out in frame packing instead of falling back to top and bottom or side by side; `kodi.log` says which buffer was used.
 - **3D subtitles no longer leave old menus and subtitles in the right eye** (issue #34). With an HDR video in frame packing, top and bottom or side by side, the right eye showed the menus from before the video and earlier subtitles over the picture whenever a subtitle was on screen. The layer of the menus and subtitles is now cleared for both eyes, so each eye shows only the current subtitle, at its depth. Found by cinemaONE.
 - **A Dolby Vision 3D film keeps its colours after going back to 2D** (issue #34). Where the processor cannot keep up with both views and the video goes on in 2D, a profile 20 film turned green and purple from that point; it is now rebuilt exactly as when it plays in 2D from the start. Found by cinemaONE.
 
