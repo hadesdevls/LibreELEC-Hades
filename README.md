@@ -9,7 +9,7 @@
 <p align="center"><b>Native Dolby Vision, HDR10+, HD audio and 3D from your PC, on LibreELEC.</b></p>
 
 <p align="center">
-  <a href="https://github.com/hadesdevls/LibreELEC-Hades/releases/latest"><img alt="Version 1.2.1" src="docs/images/version.svg" height="28"></a>
+  <a href="https://github.com/hadesdevls/LibreELEC-Hades/releases/latest"><img alt="LibreELEC Hades, the latest version" src="docs/images/version.svg" height="28"></a>
 </p>
 
 <p align="center">
