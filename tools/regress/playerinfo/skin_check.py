@@ -205,6 +205,10 @@ SAMPLES = {
     # what a downmix folds (7.1 to stereo, the most folds) and what it leaves out
     "hades.audio.decl": ["12.1.9", "5.1.2"],
     "hades.audio.declby": "SONY TV  *00",
+    # (1.2.3: the speakers that a Room Configuration or Speaker Location Data Block says the room has: a layout as
+    # hades.audio.decl is, SpeakerPlan.h RoomPlaces(); which device declares them, and that the room is not said, are
+    # tested as conditions)
+    "hades.audio.declroom": ["12.1.9", "5.1.2"],
     "hades.audio.sent": "7.1",
     "hades.audio.fold": "FC > FL+FR; BL+BR > FL+FR; SL+SR > FL+FR",
     "hades.audio.folddrop": "LFE",
@@ -239,9 +243,14 @@ SAMPLES = {
     # parts: Estuary #54781 the lens memory, its picture and where its shape comes from, #54782 to #54784; #54785 the
     # picture mode by its name on the projector without what the settings add in brackets; #54786 to #54793 what
     # stands in the way, alone)
+    # (Hades 1.2.3: the anamorphic mode of a JVC, A to D after the number of the memory, "10 + D", or alone where no
+    # memory was sent, #54795 with Off, #54703, or a letter)
     "hades.video.projector": [
         [("JVC: $ADDON[skin.estuary 54781]", "10", "2.39", "$ADDON[skin.estuary 54784]"),
          ("$ADDON[skin.estuary 54785]", "User 4")],
+        [("JVC: $ADDON[skin.estuary 54781]", "10 + D", "2.39", "$ADDON[skin.estuary 54783]"),
+         ("$ADDON[skin.estuary 54785]", "Frame Adapt HDR3")],
+        [("JVC: $ADDON[skin.estuary 54795]", "$ADDON[skin.estuary 54703]"), ("$ADDON[skin.estuary 54785]", "Frame Adapt HDR3")],
         [("Sony (ADCP): $ADDON[skin.estuary 54781]", "7", "2.39", "$ADDON[skin.estuary 54782]"),
          ("$ADDON[skin.estuary 54785]", "Cinema Film 1")],
         [("Sony (SDCP): $ADDON[skin.estuary 54794]", "5"), ("$ADDON[skin.estuary 54785]", "Bright Cinema")],
@@ -892,6 +901,7 @@ def kodi_cell(font):
 
 
 labels = [c for c in dialog.iter("control") if c.get("type") in ("label", "button", "fadelabel", "textbox")]
+SPEAKER_NAME = re.compile(r"(FL|FR|FC|FLC|FRC|LFE|SL|SR|BL|BR|BC|TFL|TFC|TFR|TC|TSL|TSR|TBL|TBC|TBR)")
 measured = 0
 over_msgs = set()
 closest = (0, 0.0, 0.0, "", "")
@@ -916,6 +926,14 @@ for c in labels:
     if limit is None:
         continue
     limit -= 2 * off
+    # (Hades, 1.2.3: the names of the speakers of the plan, HadesSpeaker, have room for themselves twice over: a
+    # projector's photo of 1.2.2 showed every height cut to "T...", which no font, scale, 3D layout or skin zoom
+    # measured here reproduces; a label as wide as its disc left a name a few pixels to spare)
+    if t == "label" and SPEAKER_NAME.fullmatch(text.strip()):
+        name = text.strip()
+        if 2 * measure(name, font) > limit:
+            fail("speaker %s: a label of %.0f px for a name of %.0f px in %s (room for it twice over is wanted, never \"T...\")"
+                 % (name, limit, measure(name, font), font))
     wrap = (default(c, "wrapmultiline", "false") or "").strip() == "true" or t == "textbox"
     scrolls = t == "label" and not wrap and (default(c, "scroll", "false") or "").strip() == "true"
     measured += 1

@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:12:44 +0000
+Subject: [PATCH] avcodec/hevc: keep the hardware decoder when only the scaling
+ lists of the SPS change
+
+An SPS that comes again with the id of the active one but another content
+replaces it (ff_hevc_decode_nal_sps()), and hevc_frame_start() then takes
+the whole path of a new sequence: set_sps(), export_stream_params() and
+get_format(), whose ff_get_format() uninitialises the hwaccel and
+initialises it again. A caller that opens its own decoder again there,
+such as Kodi with VA-API, shows it as a freeze of half a second to a
+second and a half. The base layer of some Dolby Vision profile 7 films
+switches between two SPS that differ only in their scaling lists, at IDR
+pictures, several times a minute in some scenes (first reported in
+CroqueMr's build, libreelec-CB1 issue 338: an AMD Radeon 780M with
+VA-API).
+
+Every hwaccel but VideoToolbox takes the scaling lists, and the flag that
+enables them, with each picture (the IQ matrix buffer of VA-API,
+CUVIDHEVCPICPARAMS of NVDEC, VdpPictureInfoHEVC of VDPAU,
+DXVA_Qmatrix_HEVC of DXVA2, D3D11VA and D3D12VA, and the parameters that
+Vulkan takes with each picture or makes again after each parameter set),
+and sets nothing up from them. So when the new SPS of the base layer
+differs from the active one only in scaling_list_enabled_flag,
+sps_scaling_list_data_present_flag and scaling_list_data(), and one of
+those hwaccels is in use, the format negotiated before and the hwaccel
+are kept. Everything else is done as before: the references cleared, the
+SPS of the other layers dropped, set_sps(), the stream parameters
+exported, the multilayer state set up again and a new sequence for the
+output. A line of AV_LOG_VERBOSE says so.
+
+The comparison is of the parsed SPS
+(ff_hevc_sps_differs_only_in_scaling_lists()): a copy of the new one
+given the lists, the flag and the NAL unit of the active one must be the
+same byte for byte, its VPS included, so that a difference in any other
+field, also one added later, takes the old path. Without a hwaccel, with
+VideoToolbox, for a layer above the base one, or when the copy cannot be
+allocated, nothing changes. Upstream FFmpeg has no change for this (its
+master and release branches of 2026-11-27).
+
+Hades: tested on the host with FFmpeg's VA-API hwaccel on a VA-API driver
+that decodes nothing and writes what each picture is given
+(tools/regress/ffmpeg, stage slkeep): x265 streams of 8 and 10 bits whose
+SPS changes only in its scaling lists, at 4 and 2 joints, call
+get_format() and make the hardware decoder once instead of at each joint,
+with every buffer of every picture the same as without this change, with
+1 and 4 frame threads; a stream whose SPS changes in SAO, strong intra
+smoothing, the latency of its DPB, its scaling lists with SAO, or its bit
+depth takes the old path at each of its 5 joints; the pictures of the
+software decoder are those without this change; and FATE's HEVC tests
+pass. Not tested on a graphics card.
+---
+ libavcodec/hevc/hevcdec.c | 66 +++++++++++++++++++++++++++++++++++++--
+ libavcodec/hevc/ps.c      | 24 ++++++++++++++
+ libavcodec/hevc/ps.h      |  8 +++++
+ 3 files changed, 95 insertions(+), 3 deletions(-)
+
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index 0cf7bc3..b45777f 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -763,6 +763,52 @@ static enum AVPixelFormat get_format(HEVCContext *s, const HEVCSPS *sps)
+     return 0;
+ }
+ 
++/**
++ * Whether the hardware decoder in use takes the scaling lists of the SPS (and
++ * the flag that enables them) with each picture, and so goes on decoding a
++ * stream whose SPS changed in nothing else
++ * (ff_hevc_sps_differs_only_in_scaling_lists()): the rest of the SPS that it
++ * was set up with stays as it was.
++ */
++static int hwaccel_takes_scaling_lists(const AVCodecContext *avctx)
++{
++    if (!avctx->hwaccel || avctx->pix_fmt != avctx->hwaccel->pix_fmt)
++        return 0;
++
++    switch (avctx->hwaccel->pix_fmt) {
++    case AV_PIX_FMT_VAAPI:          // the IQ matrix buffer of vaapi_hevc_start_frame()
++    case AV_PIX_FMT_CUDA:           // CUVIDHEVCPICPARAMS of nvdec_hevc_start_frame()
++    case AV_PIX_FMT_CUARRAY:
++    case AV_PIX_FMT_VDPAU:          // VdpPictureInfoHEVC of vdpau_hevc_start_frame()
++    case AV_PIX_FMT_DXVA2_VLD:      // DXVA_Qmatrix_HEVC of dxva2_hevc_start_frame()
++    case AV_PIX_FMT_D3D11VA_VLD:
++    case AV_PIX_FMT_D3D11:
++    case AV_PIX_FMT_D3D12:          // and of d3d12va_hevc_start_frame()
++    case AV_PIX_FMT_VULKAN:         // the parameters of each picture, or session
++                                    // parameters made again after each parameter
++                                    // set (ff_vk_params_invalidate())
++        return 1;
++    default:                        // VideoToolbox: a session made from the
++                                    // parameter sets that it started with
++        return 0;
++    }
++}
++
++/**
++ * What get_format() does besides asking for a format, for a base layer whose
++ * SPS changed only in what the hardware decoder takes with each picture
++ * (hwaccel_takes_scaling_lists()): the format, the hardware decoder and its
++ * frames stay as they are.
++ */
++static int keep_format(HEVCContext *s, const HEVCSPS *sps)
++{
++    int ret = export_multilayer(s, sps->vps);
++    if (ret < 0)
++        return ret;
++
++    return setup_multilayer(s, sps->vps);
++}
++
+ static int set_sps(HEVCContext *s, HEVCLayerContext *l, const HEVCSPS *sps)
+ {
+     int ret;
+@@ -3445,6 +3491,11 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+     if (l->sps != sps) {
+         const HEVCSPS *sps_base = s->layers[0].sps;
+         enum AVPixelFormat pix_fmt = sps->pix_fmt;
++        // the SPS of the base layer changed only in its scaling lists, which
++        // the hardware decoder takes with each picture: it is kept
++        const int keep_hwaccel = l == &s->layers[0] &&
++                                 hwaccel_takes_scaling_lists(s->avctx) &&
++                                 ff_hevc_sps_differs_only_in_scaling_lists(l->sps, sps);
+ 
+         if (l != &s->layers[0]) {
+             if (!sps_base) {
+@@ -3486,9 +3537,18 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+             return ret;
+ 
+         if (l == &s->layers[0]) {
+-            export_stream_params(s, sps);
+-
+-            ret = get_format(s, sps);
++            if (keep_hwaccel) {
++                const enum AVPixelFormat hw_pix_fmt = s->avctx->pix_fmt;
++
++                av_log(s->avctx, AV_LOG_VERBOSE, "SPS %u changed only in its "
++                       "scaling lists: the hardware decoder is kept\n", pps->sps_id);
++                export_stream_params(s, sps);
++                s->avctx->pix_fmt = hw_pix_fmt;
++                ret = keep_format(s, sps);
++            } else {
++                export_stream_params(s, sps);
++                ret = get_format(s, sps);
++            }
+             if (ret < 0) {
+                 set_sps(s, l, NULL);
+                 return ret;
+diff --git a/libavcodec/hevc/ps.c b/libavcodec/hevc/ps.c
+index 3341458..23b4bfd 100644
+--- a/libavcodec/hevc/ps.c
++++ b/libavcodec/hevc/ps.c
+@@ -1732,6 +1732,30 @@ static int compare_sps(const HEVCSPS *sps1, const HEVCSPS *sps2)
+            !memcmp(sps1->data, sps2->data, sps1->data_size);
+ }
+ 
++int ff_hevc_sps_differs_only_in_scaling_lists(const HEVCSPS *ref, const HEVCSPS *sps)
++{
++    HEVCSPS *tmp;
++    int same;
++
++    if (!ref || !sps)
++        return 0;
++
++    // a copy of sps given the scaling lists and the NAL unit of ref: any other
++    // difference, also in a field added later, is then one of its bytes (both
++    // are zeroed when allocated, so their padding is too)
++    tmp = av_memdup(sps, sizeof(*sps));
++    if (!tmp)
++        return 0;
++    tmp->scaling_list_enabled = ref->scaling_list_enabled;
++    tmp->scaling_list         = ref->scaling_list;
++    tmp->data                 = ref->data;
++    tmp->data_size            = ref->data_size;
++    same = !memcmp(tmp, ref, sizeof(*ref));
++    av_free(tmp);
++
++    return same;
++}
++
+ int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
+                            HEVCParamSets *ps, unsigned nuh_layer_id,
+                            int apply_defdispwin)
+diff --git a/libavcodec/hevc/ps.h b/libavcodec/hevc/ps.h
+index f5c5f81..2afe5eb 100644
+--- a/libavcodec/hevc/ps.h
++++ b/libavcodec/hevc/ps.h
+@@ -526,6 +526,14 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
+ 
+ int ff_hevc_decode_nal_vps(GetBitContext *gb, AVCodecContext *avctx,
+                            HEVCParamSets *ps);
++/**
++ * Whether sps differs from ref at most in its scaling lists (the syntax
++ * elements scaling_list_enabled_flag, sps_scaling_list_data_present_flag and
++ * scaling_list_data()): every other field of the two, parsed or derived, the
++ * same byte for byte, and the same VPS. 0 when that cannot be told.
++ */
++int ff_hevc_sps_differs_only_in_scaling_lists(const HEVCSPS *ref, const HEVCSPS *sps);
++
+ int ff_hevc_decode_nal_sps(GetBitContext *gb, AVCodecContext *avctx,
+                            HEVCParamSets *ps, unsigned nuh_layer_id,
+                            int apply_defdispwin);

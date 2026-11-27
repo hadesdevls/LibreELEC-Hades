@@ -5,7 +5,7 @@
 // driven from the command line, against the simulators of projector_link_test.py.
 // usage: projector_cli <jvc|adcp|sdcp|epson> <port> <password|-> [option|op]...
 //   options: hash (JVC: the hashed password first), lens-ms=N, mode-ms=N, answer-ms=N, gap-ms=N
-//   ops:     open, power, model, lens=N, mode=N (decimal), close
+//   ops:     open, power, model, lens=N, mode=N (decimal), anamorphic=N (Hades 1.2.3), close
 // Every line of the session's log is printed as "LOG <line>", every result as "RESULT <op> <failure> <detail>",
 // and at the end "HASHED yes|no". The SHA-256 here is the test's own (FIPS 180-4), which the simulators check
 // against Python's hashlib: Kodi gives its own (CDigest).
@@ -152,6 +152,8 @@ int main(int argc, char** argv)
       Say("lens", session.SetLensMemory(std::atoi(a.c_str() + 5)));
     else if (a.rfind("mode=", 0) == 0)
       Say("mode", session.SetPictureMode(std::atoi(a.c_str() + 5)));
+    else if (a.rfind("anamorphic=", 0) == 0)
+      Say("anamorphic", session.SetAnamorphic(std::atoi(a.c_str() + 11)));
     else if (a == "close")
       session.Close();
     std::fflush(stdout);

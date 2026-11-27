@@ -1035,7 +1035,9 @@ stage_hostpol() {
 # composed way the same bytes; the compute pass of the tunnel (9c, as Kodi asks for it by default) and its fragment
 # passes (9a and 9b) the same bytes, each saying which made the pictures; the GUI over it; a profile 5 picture taken
 # from the matrices of its RPU to those of the tunnel (a licensed core's), the direct and the composed way the same
-# bytes, and decoded as the picture as composed is; six mutants that these must see
+# bytes, and decoded as the picture as composed is; every picture of these byte for byte as ref/render/ipt-bytes.sha256
+# (ipt-bytes: the bytes of the tunnel, which a change that makes its passes lighter keeps); seven mutants that these
+# must see
 # (PQ from the tables of pass 9, 2026-11; with PQ computed in the shader, "I 0.043% off max 1 | P 0.029% max 1 | T
 # 0.036% max 1", and with the matrices of the RPUs of profile 5 in the tunnel before that, "I 0.036% off max 1 | P
 # 0.034% max 1 | T 0.041% max 1": the shares move with the rounding of the matrices and of PQ, the maximum of one code
@@ -1065,6 +1067,10 @@ stage_ipt() {
   }
   # computed <log> <0|1>: how many pictures of a run say that the compute pass did (1) or did not (0) convert them
   computed() { grep -a -c -E "^picture [0-9]+: IPT 1, computed $2\$" "$1"; }
+  # ipt_sums <folder> <tag> <label>: the SHA256 of every picture that a run wrote, each named <label>:p<N>-<way>.rgba,
+  # into $O/bytes.sums (ipt-bytes)
+  ipt_sums() { ( cd "$O/$1" && sha256sum "$2"-p*.rgba ) | sed "s/ \*\?$2-/ $3:/" >> "$O/bytes.sums"; }
+  : > "$O/bytes.sums"
   # --- ipt-oracle and ipt-ways: the 14 pictures, with the compute pass of the tunnel as Kodi asks for it
   ipt_run ipt "$O/fb" "$PICS" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1
   # shellcheck disable=SC2086
@@ -1101,12 +1107,14 @@ PY
   else
     rg_item ipt-forms FAILED "by the compute pass: $c1 of 14 (asked), by the fragment passes: $c0 of 14 (not asked); $(grep -a -m1 '^SAME' "$O/forms.log")"
   fi
+  ipt_sums ipt ipt ipt; ipt_sums frag frag frag
   rg_rm "$O/ipt" "$O/frag"
   # --- ipt-gui: the GUI over the IPT tunnel; every pixel not drawn over as the direct way
   ipt_run gui "$O/fb" "51 960 2640" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1 FB_GUI=2
   rg_log "$O/gui-check.log" nice -n 19 $RG_PY "$TS/ipt_check.py" gui "$O/gui" gui 51 960 2640
   v=$(rg_pass "$O/gui-check.log" '^GUI PASSED$')
   rg_item ipt-gui "$(rg_say "$v")" "the pixels the GUI does not reach as the direct way, pictures 51 960 2640: $(rg_rest "$v")"
+  ipt_sums gui gui gui
   rg_rm "$O/gui"
   # --- ipt-p5: a profile 5 picture (its base layer is IPT-PQ-c2 in the matrices of its RPU): with the tunnel asked,
   # in the matrices of the tunnel, the direct and the composed way the same bytes, and decoded from its header as the
@@ -1145,19 +1153,30 @@ PY
       rg_item ipt-p5-mutant PASSED "profile 5 converted through the RGBtoLMS of BT.2020: caught, $(grep -a -m1 '^p1 ' "$O/p5-m-check.log" | sed 's/^p1 *//' | cut -c1-150)" ||
       rg_item ipt-p5-mutant FAILED "profile 5 converted through the RGBtoLMS of BT.2020: not caught; $(grep -a -m1 -E '^(p1 |P5-IPT|Traceback)' "$O/p5-m-check.log")"
   else rg_item ipt-p5-mutant FAILED "the mutant no longer applies or does not build"; fi
+  ipt_sums p5-1 p5 p5
   rg_rm "$O/p5-0" "$O/p5-1" "$O/p5-m" "$O/data5" "$O/fb-p5lms" "$RG_W/mut/ipt-p5lms"
+  # --- ipt-bytes: the pictures of the tunnel above (the 14 by its compute and by its fragment passes, the three with
+  # the GUI over them, the profile 5 chart), byte for byte as ref/render/ipt-bytes.sha256. The oracle counts the codes
+  # off as shares rounded to a thousandth of a percent, which a change of a few codes of a picture can leave as they
+  # were; this sees every byte. Made from the tunnel of 1.2.3 before its passes were made lighter (the same bytes);
+  # a change of its arithmetic changes the file, and says why.
+  sort -k 2 "$O/bytes.sums" > "$O/bytes.sorted"
+  v=$(same "$O/bytes.sorted" "$REF/ipt-bytes.sha256") &&
+    rg_item ipt-bytes PASSED "every picture of the tunnel above $v" || rg_item ipt-bytes FAILED "$v"
   # --- ipt-mutants, each run on pictures 51 and 960 by both forms of the tunnel, and caught by the check it is
   # written for: "oracle" where the checker fails, or where those pictures are not as far from the float64 oracle as
   # the bridge as it is puts them (the lines of check.log: ipt-oracle); "forms" where the two forms differ, or a run
   # was not made by the pass it asked for (ipt-forms). A coefficient of the matrix of the tunnel and Cb and Cr swapped
   # (oracle), the EOTF table read one cell off (oracle), the OETF table without the low part of its values (oracle:
   # every code within one, the shares of codes off grown), the compute pass rounding the chroma of the odd pixels down
-  # (forms), the compute pass never used (forms)
+  # (forms), the compute pass never used (forms), the I of a pixel rounded up from 0.49999 of a code in place of 0.5
+  # (bytes: a few codes of each picture; on pictures 51 and 960 the shares of the oracle move too)
   v=""; n=0
   f64() { grep -a -E "^p(51|960) " "$1" | sed 's/.*| vs float64 oracle: \([^|]*\) | vs ideal.*/\1/'; }
   local m t w caught
   for m in matrix:dvbridge_ipt.h:oracle swap:dvbridge_source.c:oracle eotfcell:dvbridge_source.c:oracle \
-           oetflo:dvbridge_source.c:oracle computeodd:dvbridge_source.c:forms nocompute:dvbridge_source.c:forms; do
+           oetflo:dvbridge_source.c:oracle computeodd:dvbridge_source.c:forms nocompute:dvbridge_source.c:forms \
+           round:dvbridge_source.c:bytes; do
     t=${m%%:*}; w=${m##*:}; m=${m#*:}; m=${m%%:*}
     if mutant "ipt-$t" "$TS/mut-ipt-$t.py" "$m" && rg_bridge "$RG_W/mut/ipt-$t" "$L" "$F" "$O/fidbench-ipt.c" "$O/fb-$t" "$SRC"; then
       ipt_run "mut-$t" "$O/fb-$t" "51 960" FB_SOURCE=1 FB_IPT=1 FB_COMPUTE=1
@@ -1169,12 +1188,17 @@ PY
          { [ -n "$(f64 "$O/check.log")" ] && [ "$(f64 "$O/mut-$t-check.log")" != "$(f64 "$O/check.log")" ]; }; then caught="oracle"; fi
       if ! grep -a -q '^SAME PASSED$' "$O/mut-$t-forms.log" || [ "$(computed "$O/mut-$t.log" 1)" != 2 ] ||
          [ "$(computed "$O/mutf-$t.log" 0)" != 2 ]; then caught="${caught:+$caught }forms"; fi
+      # (bytes: a picture of either form that is not as ref/render/ipt-bytes.sha256 has it)
+      { ( cd "$O/mut-$t" && sha256sum "mut-$t"-p*.rgba ) | sed "s/ \*\?mut-$t-/ ipt:/"
+        ( cd "$O/mutf-$t" && sha256sum "mutf-$t"-p*.rgba ) | sed "s/ \*\?mutf-$t-/ frag:/"; } > "$O/mut-$t.sums"
+      if [ -s "$REF/ipt-bytes.sha256" ] && [ -s "$O/mut-$t.sums" ] &&
+         grep -F -x -v -q -f "$REF/ipt-bytes.sha256" "$O/mut-$t.sums"; then caught="${caught:+$caught }bytes"; fi
       case " $caught " in *" $w "*) n=$((n + 1)) ;; esac
       v="$v $t (by $w): caught by ${caught:-nothing}, $(grep -a -m1 '^ALL vs float64' "$O/mut-$t-check.log" | cut -c1-90), $(grep -a -m1 '^BRIDGE-IPT' "$O/mut-$t-check.log"), $(grep -a -m1 '^SAME' "$O/mut-$t-forms.log"), computed $(computed "$O/mut-$t.log" 1) of 2;"
     else v="$v $t: THE MUTANT NO LONGER APPLIES OR DOES NOT BUILD;"; fi
     rg_rm "$O/mut-$t" "$O/mutf-$t" "$O/fb-$t" "$RG_W/mut/ipt-$t"
   done
-  [ "$n" = 6 ] && rg_item ipt-mutants PASSED "6 of 6 caught by the check each is written for:$v" || rg_item ipt-mutants FAILED "$n of 6 caught by their check:$v"
+  [ "$n" = 7 ] && rg_item ipt-mutants PASSED "7 of 7 caught by the check each is written for:$v" || rg_item ipt-mutants FAILED "$n of 7 caught by their check:$v"
   rg_rm "$O/fb"
 }
 

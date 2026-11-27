@@ -89,11 +89,13 @@ makeinstall_target() {
   # grub_verifiers_open); font.c looks in (memdisk) itself for that reason. Nothing of GRUB's checks is changed. The
   # theme picks the copy (theme.cfg): the memdisk only when GRUB runs locked down (lockdown=y, which GRUB sets when it
   # starts with Secure Boot: kern/efi/init.c), the fonts of EFI/BOOT/hades/fonts otherwise, as before. The pictures of
-  # the theme are read from the disk in both cases (the verifier lets them through). The licence of the fonts
-  # (OFL.txt) goes with them. The tar is made the same every time: names sorted, owner and times 0.
+  # the theme are read from the disk in both cases (the verifier lets them through). The licences of the fonts
+  # (OFL.txt of Jost, mono-LICENSE.txt of Liberation Mono, which Hades Mono, the font of the terminal, is made from)
+  # go with them. The tar is made the same every time: names sorted, owner and times 0.
   rm -rf ${PKG_BUILD}/.memdisk
   mkdir -p ${PKG_BUILD}/.memdisk/fonts
-  cp ${PKG_DIR}/theme/hades/fonts/*.pf2 ${PKG_DIR}/theme/hades/fonts/OFL.txt ${PKG_BUILD}/.memdisk/fonts
+  cp ${PKG_DIR}/theme/hades/fonts/*.pf2 ${PKG_DIR}/theme/hades/fonts/OFL.txt ${PKG_DIR}/theme/hades/fonts/mono-LICENSE.txt \
+    ${PKG_BUILD}/.memdisk/fonts
   (
     cd ${PKG_BUILD}/.memdisk
     LC_ALL=C tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --mode=u=rwX,go=rX \
@@ -124,6 +126,13 @@ makeinstall_target() {
     [ -f ${PKG_BUILD}/.memdisk/fonts/${f} ] || die "grub: theme.cfg loads ${f}, which the memdisk has not"
   done
   grep -q -F 'loadfont "${hades_fonts}/' ${PKG_DIR}/theme/hades/theme.cfg || die "grub: theme.cfg loads no font from hades_fonts"
+  # (the terminal's font, Hades Mono, which every theme names as its terminal-font: the editor of an entry and the
+  # command line are written with it, grub-9002)
+  [ -z "$(grep -L '^terminal-font: "Hades Mono Regular [0-9]*"$' ${PKG_DIR}/theme/hades/*/theme.txt)" ] ||
+    die "grub: a theme of the boot menu does not write its terminal with Hades Mono"
+  for f in $(sed -n 's|^terminal-font: "Hades Mono Regular \([0-9]*\)"$|mono-\1.pf2|p' ${PKG_DIR}/theme/hades/*/theme.txt | sort -u); do
+    grep -q -F "loadfont \"\${hades_fonts}/${f}\"" ${PKG_DIR}/theme/hades/theme.cfg || die "grub: theme.cfg does not load ${f}"
+  done
 
   mkdir -p ${INSTALL}/usr/share/grub
      cp -P bootia32.efi bootx64.efi ${INSTALL}/usr/share/grub

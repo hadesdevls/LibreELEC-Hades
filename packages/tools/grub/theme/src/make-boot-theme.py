@@ -7,7 +7,8 @@
 # (Jost) and each entry of the menu explained in a line.
 #
 #   make-boot-theme.py --jost <Jost-VariableFont_wght.ttf> --brand <make-brand-images.py> --out <folder>
-#                      --bios-out <folder> --splash <folder> [--zopflipng <zopflipng>]
+#                      --bios-out <folder> --splash <folder> --mono <LiberationMono-Regular.ttf>
+#                      --mono-licence <LICENSE of liberation-fonts-ttf> [--zopflipng <zopflipng>]
 #
 # writes into <folder> what GRUB reads from EFI/BOOT/hades: theme.cfg (which grub.cfg reads), fonts/
 # (the fonts that GRUB writes its own text with, .pf2, and the licence of Jost), and a folder for each
@@ -21,7 +22,8 @@
 #     The names and the explanations of the entries are therefore drawn here, smooth, as one picture per
 #     entry, which GRUB puts in its row (the "icon" of the class of the entry, as wide as the row); the
 #     title that GRUB would write itself has a transparent colour. GRUB writes only the countdown, and
-#     its console, with fonts made here from Jost at sizes where one bit per pixel reads well.
+#     its console, with fonts made here from Jost at sizes where one bit per pixel reads well; its terminal
+#     (the editor of an entry, the command line) with a monospaced font made from Liberation Mono (mono_pf2).
 #   - The sizes of a theme are pixels. Each mode in SETS has its own set, and the menu is drawn in the
 #     mode that the firmware is in where it has one (write_cfg): in the common case nothing switches.
 #   - When an entry starts, GRUB clears its terminal (and, with grub-9001 and quiet_start, does so also
@@ -221,6 +223,11 @@ def pf2(name, px, weight, path, chars=range(32, 127)):
         section(b"ASCE", struct.pack(">H", ascent)),
         section(b"DESC", struct.pack(">H", descent)),
     ])
+    write_pf2(path, head, glyphs)
+
+
+def write_pf2(path, head, glyphs):
+    """The index (CHIX) and the glyphs (DATA) after the sections of the head; glyphs in ascending codes."""
     at = len(head) + 8 + 9 * len(glyphs) + 8
     index, blob = b"", b""
     for code, w, h, xo, yo, adv, data in glyphs:
@@ -230,7 +237,139 @@ def pf2(name, px, weight, path, chars=range(32, 127)):
         at += len(g)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
-        fh.write(head + section(b"CHIX", index) + b"DATA" + struct.pack(">I", 0xFFFFFFFF) + blob)
+        fh.write(head + struct.pack(">4sI", b"CHIX", len(index)) + index + b"DATA" + struct.pack(">I", 0xFFFFFFFF) + blob)
+
+
+# ---- the font of GRUB's terminal: its editor of an entry, its command line and its messages
+#
+# GRUB's terminal is a grid of cells as wide as the widest letter of its font (gfxterm.c), and it draws the frame of
+# the editor with the heavy lines of Unicode's box drawing (normal/menu_text.c: U+250F, U+2501, U+2513, U+2503,
+# U+2517, U+251B) and marks lines that go on with arrows (U+2190 to U+2195). Jost is not a font of cells and has
+# none of them: its letters stood far apart and every line of the frame was the glyph of a missing letter. The
+# terminal writes with a monospaced font made here from Liberation Mono (--mono), with the lines of the frame drawn
+# here to fill their cell exactly, so that they join.
+#
+# Liberation Mono is under the SIL Open Font License 1.1 with the Reserved Font Name "Liberation" (and, in its
+# digitized data, "Cousine"): a font made from it is a Modified Version, which may not carry those names, so it is
+# called "Hades Mono", and the licence goes with it (--mono-licence, fonts/mono-LICENSE.txt).
+
+MONO_NAME = "Hades Mono Regular"
+# the letters of the terminal: ASCII, Latin-1, the arrows and the blocks and lines of box drawing that the font has
+MONO_CHARS = list(range(32, 127)) + list(range(160, 256)) + [0x2190, 0x2191, 0x2192, 0x2193, 0x2195] + \
+    list(range(0x2500, 0x25A0))
+# the lines drawn here, by their arms (left, up, right, down): 0 none, 1 light, 2 heavy
+BOX = {}
+for _code, _arms in (
+        (0x2500, (1, 0, 1, 0)), (0x2501, (2, 0, 2, 0)), (0x2502, (0, 1, 0, 1)), (0x2503, (0, 2, 0, 2)),
+        (0x250C, (0, 0, 1, 1)), (0x250F, (0, 0, 2, 2)), (0x2510, (1, 0, 0, 1)), (0x2513, (2, 0, 0, 2)),
+        (0x2514, (0, 1, 1, 0)), (0x2517, (0, 2, 2, 0)), (0x2518, (1, 1, 0, 0)), (0x251B, (2, 2, 0, 0)),
+        (0x251C, (0, 1, 1, 1)), (0x2523, (0, 2, 2, 2)), (0x2524, (1, 1, 0, 1)), (0x252B, (2, 2, 0, 2)),
+        (0x252C, (1, 0, 1, 1)), (0x2533, (2, 0, 2, 2)), (0x2534, (1, 1, 1, 0)), (0x253B, (2, 2, 2, 0)),
+        (0x253C, (1, 1, 1, 1)), (0x254B, (2, 2, 2, 2)),
+        (0x2574, (1, 0, 0, 0)), (0x2575, (0, 1, 0, 0)), (0x2576, (0, 0, 1, 0)), (0x2577, (0, 0, 0, 1)),
+        (0x2578, (2, 0, 0, 0)), (0x2579, (0, 2, 0, 0)), (0x257A, (0, 0, 2, 0)), (0x257B, (0, 0, 0, 2))):
+    BOX[_code] = _arms
+
+
+def mono_px(s):
+    """The size of the terminal's font on a screen of scale s: 25 pixels on 1080 lines, in steps of 5 (Liberation
+    Mono is 0.6 em wide: every cell is then a whole number of pixels), at least 15."""
+    return max(15, 5 * int(round(25.0 * s / 5.0)))
+
+
+def mono_pf2(px, path):
+    """The terminal's font at px pixels: every glyph in a cell of the advance of the font by its ascent and descent
+    (the cell of gfxterm is as high as the highest glyph, so nothing is higher than the cell, and lines that fill it
+    join the lines of the next row), the lines of BOX drawn on the cell, the rest as FreeType draws it without
+    smoothing. Returns the name of the font."""
+    f = ImageFont.truetype(ARGS.mono, px, layout_engine=ImageFont.Layout.BASIC)
+    ascent, descent = f.getmetrics()
+    adv = f.getlength("M")
+    if abs(adv - round(adv)) > 1e-6:
+        raise SystemExit("mono: a cell of %s pixels at %d pixels is not a whole number" % (adv, px))
+    adv = int(round(adv))
+    cell_h = ascent + descent
+    missing = f.getmask("￿")
+    missing = (missing.size, bytes(missing))
+    # the weight of the lines: the thickness of the font's own light line (its U+2500), the heavy one twice that
+    probe = Image.new("1", (adv * 3, cell_h * 3), 0)
+    ImageDraw.Draw(probe).text((adv, cell_h * 2), "─", font=f, fill=1, anchor="ls")
+    rows = np.asarray(probe, dtype=np.uint8).any(axis=1)
+    light = max(1, int(rows.sum()))
+    heavy = max(light + 1, 2 * light)
+    glyphs = []
+    for code in MONO_CHARS:
+        ch = chr(code)
+        cell = np.zeros((cell_h, adv), np.uint8)
+        if code in BOX:
+            # (the lines on the middle of the cell; an arm runs from its edge across the band of the lines that
+            # cross it, so that a corner closes without a step)
+            cx, cy = adv // 2, cell_h // 2
+            thick = lambda w: 0 if not w else (light if w == 1 else heavy)
+            left, up, right, down = BOX[code]
+            tv, th = max(thick(up), thick(down)), max(thick(left), thick(right))
+            for arm, weight in enumerate(BOX[code]):
+                t = thick(weight)
+                if not t:
+                    continue
+                if arm in (0, 2):
+                    b = tv or t
+                    x0, x1 = (0, cx - b // 2 + b) if arm == 0 else (cx - b // 2, adv)
+                    cell[cy - t // 2:cy - t // 2 + t, x0:x1] = 1
+                else:
+                    b = th or t
+                    y0, y1 = (0, cy - b // 2 + b) if arm == 1 else (cy - b // 2, cell_h)
+                    cell[y0:y1, cx - t // 2:cx - t // 2 + t] = 1
+        else:
+            m = f.getmask(ch)
+            if (m.size, bytes(m)) == missing:
+                continue
+            img = Image.new("1", (adv + 2 * px, cell_h + 2 * px), 0)
+            d = ImageDraw.Draw(img)
+            d.fontmode = "1"
+            d.text((px, px + ascent), ch, font=f, fill=1, anchor="ls")
+            full = np.asarray(img, dtype=np.uint8)
+            if 0x2500 <= code < 0x25A0:
+                # (the rest of box drawing and the blocks fill their cell: what the font draws past it is cut off)
+                cell = full[px:px + cell_h, px:px + adv].copy()
+            else:
+                ys, xs = np.nonzero(full)
+                if len(ys) == 0:
+                    glyphs.append((code, 0, 0, 0, 0, adv, b""))
+                    continue
+                # (a letter keeps its own box, cut to the height of the cell)
+                y0, y1 = max(ys.min(), px), min(ys.max() + 1, px + cell_h)
+                x0, x1 = xs.min(), xs.max() + 1
+                bits = full[y0:y1, x0:x1]
+                packed = np.concatenate([bits.reshape(-1), np.zeros((-bits.size) % 8, np.uint8)])
+                glyphs.append((code, x1 - x0, y1 - y0, x0 - px, (px + ascent) - y1, adv, np.packbits(packed).tobytes()))
+                continue
+        packed = np.concatenate([cell.reshape(-1), np.zeros((-cell.size) % 8, np.uint8)])
+        glyphs.append((code, adv, cell_h, 0, -descent, adv, np.packbits(packed).tobytes()))
+    for code in (0x2501, 0x2503, 0x250F, 0x2513, 0x2517, 0x251B, 0x2190, 0x2191, 0x2192, 0x2193, 0x2195):
+        if code not in [g[0] for g in glyphs]:
+            raise SystemExit("mono: no glyph for U+%04X, which GRUB's terminal writes" % code)
+    name = "%s %d" % (MONO_NAME, px)
+
+    def section(tag, payload):
+        return tag + struct.pack(">I", len(payload)) + payload
+
+    head = b"".join([
+        section(b"FILE", b"PFF2"),
+        section(b"NAME", name.encode() + b"\0"),
+        section(b"FAMI", b"Hades Mono\0"),
+        section(b"WEIG", b"normal\0"),
+        section(b"SLAN", b"normal\0"),
+        section(b"PTSZ", struct.pack(">H", px)),
+        section(b"MAXW", struct.pack(">H", max(g[1] for g in glyphs))),
+        section(b"MAXH", struct.pack(">H", max(g[2] for g in glyphs))),
+        section(b"ASCE", struct.pack(">H", ascent)),
+        section(b"DESC", struct.pack(">H", descent)),
+    ])
+    if max(g[2] for g in glyphs) != cell_h:
+        raise SystemExit("mono: the highest glyph is not the cell")
+    write_pf2(path, head, glyphs)
+    return name
 
 
 # ---- the bar of the chosen entry
@@ -373,7 +512,7 @@ LOOK = dict(mark_right=420, mark_y=500, mark_r=250, col_x=150, head_base=300,
 
 
 def theme_set(name, W, H, d):
-    """The folder of one size of screen; returns the name of its font."""
+    """The folder of one size of screen; returns the names of its fonts: the theme's (Jost) and the terminal's."""
     s, dy = geometry(W, H)
     save(name + "/background.png", background(W, H, s, dy, d))
     row_h = int(round(d["row_h"] * s))
@@ -398,15 +537,17 @@ def theme_set(name, W, H, d):
     boot, made_from = boot_picture(W, H)
     save(name + "/boot.png", boot)
     fname = "Jost Regular %d" % count_px
+    mname = mono_pf2(mono_px(s), os.path.join(ARGS.out, "fonts", "mono-%d.pf2" % mono_px(s)))
     lines = [
         "# LibreELEC Hades: the boot menu on a screen of %dx%d (written by make-boot-theme.py)" % (W, H),
         'title-text: ""',
         'desktop-image: "background.png"',
         'desktop-color: "#000000"',
-        'terminal-font: "%s"' % fname,
+        'terminal-font: "%s"' % mname,
         "# (the terminal is the whole screen, and theme.cfg gives it boot.png as its background, the splash",
         "# screen of the system on this screen (%s): GRUB clears the terminal when an entry starts, and" % made_from,
-        "# the screen is then that picture, not a black box over the menu)",
+        "# the screen is then that picture, not a black box over the menu; the editor of an entry and the",
+        "# command line take the picture off while they are shown (grub-9002) and write with a monospaced font)",
         'terminal-left: "0"', 'terminal-top: "0"', 'terminal-width: "100%"', 'terminal-height: "100%"',
         'terminal-border: "0"',
         "+ boot_menu {",
@@ -457,7 +598,7 @@ def theme_set(name, W, H, d):
     with open(os.path.join(ARGS.out, name, "theme.txt"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
     pf2(fname, count_px, 400, os.path.join(ARGS.out, "fonts", "jost-%d.pf2" % count_px))
-    return fname
+    return fname, mname
 
 
 # The menu of syslinux on a BIOS computer: vesamenu.c32 at 1024x768, the mode that the VESA BIOS of every
@@ -529,11 +670,13 @@ def write_cfg(made):
     error of an entry is written there, on the picture, as before.
 
     Where a theme is used, the picture of the start is the background of its terminal (background_image),
-    and quiet_start is set (grub-9001): when an entry starts, by a key or when the wait runs out, GRUB
+    named in start_picture (and start_picture_mode), and quiet_start is set (grub-9001): when an entry starts, by a key or when the wait runs out, GRUB
     clears the terminal, which the theme makes the whole screen, and the screen is that picture. It is
     the user's own oemsplash where the boot partition has one, found as the init finds it (load_splash)
     and stretched over the screen as the init stretches it; or else boot.png of the set. Where it cannot
-    be loaded, quiet_start is not set: the entries start as before.
+    be loaded, quiet_start is not set: the entries start as before. The editor of an entry and the command
+    line take the picture off while they are shown and put it back when the menu returns (grub-9002), so
+    that their text stands on black, written with Hades Mono (the terminal-font of the theme).
 
     The fonts are loaded from hades_fonts: with Secure Boot GRUB is locked down (lockdown=y) and refuses a
     font from a disk (the shim_lock verifier, grub-core/kern/efi/sb.c), so it takes them from the memdisk
@@ -552,8 +695,12 @@ def write_cfg(made):
         "fi",
     ]
     fonts = []
-    for _, _, _, fname in made:
+    for _, _, _, (fname, _) in made:
         f = "jost-%s.pf2" % fname.split()[-1]
+        if f not in fonts:
+            fonts.append(f)
+    for _, _, _, (_, mname) in made:
+        f = "mono-%s.pf2" % mname.split()[-1]
         if f not in fonts:
             fonts.append(f)
 
@@ -570,8 +717,9 @@ def write_cfg(made):
     lines += ['  loadfont "${hades_fonts}/%s"' % f for f in fonts[1:]]
     # (the terminal writes with the font that gfxterm_font names, or else with the last one loaded,
     # here the largest: with it the terminal does not start, "glyphs too large to fit on screen"
-    # (gfxterm.c), measured in QEMU. The smallest one, which fits every mode of the list.)
-    smallest = min((int(f.split()[-1]), f) for _, _, _, f in made)[1]
+    # (gfxterm.c), measured in QEMU. The smallest one, which fits every mode of the list: of the terminal's own
+    # font, Hades Mono, which the theme of each mode names as well (terminal-font).)
+    smallest = min((int(m.split()[-1]), m) for _, _, _, (_, m) in made)[1]
     lines += ['  set gfxterm_font="%s"' % smallest, "  set gfxmode=auto", "  if terminal_output gfxterm; then"]
     lines += pick("    ", made)
     lines += ["    fi", "  fi", '  if [ -z "${theme}" ]; then', "    terminal_output console",
@@ -594,11 +742,14 @@ def write_cfg(made):
         '  if [ -n "${hades_start}" ]; then',
         '    if background_image "${hades_start}"; then',
         "      set quiet_start=1",
+        '      set start_picture="${hades_start}"',
         "    fi",
         "  fi",
         '  if [ "${quiet_start}" != "1" ]; then',
         '    if background_image -m normal "${hades_boot}"; then',
         "      set quiet_start=1",
+        '      set start_picture="${hades_boot}"',
+        "      set start_picture_mode=normal",
         "    fi",
         "  fi",
         "fi",
@@ -617,6 +768,9 @@ def main():
     p.add_argument("--splash", required=True,
                    help="the splash screens of the system (distributions/LibreELEC/splash), for boot.png")
     p.add_argument("--zopflipng", help="zopflipng, to make every picture smaller without changing a pixel")
+    p.add_argument("--mono", required=True,
+                   help="LiberationMono-Regular.ttf of liberation-fonts-ttf (packages/x11/font), for the terminal's font")
+    p.add_argument("--mono-licence", required=True, help="the LICENSE of that package, which goes with the font")
     ARGS = p.parse_args()
     B = load_brand(ARGS.brand, ARGS.jost)
     d = LOOK
@@ -628,6 +782,7 @@ def main():
     write_bios(d)
     shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(ARGS.jost)), "OFL.txt"),
                     os.path.join(ARGS.out, "fonts", "OFL.txt"))
+    shutil.copyfile(ARGS.mono_licence, os.path.join(ARGS.out, "fonts", "mono-LICENSE.txt"))
     for root, _, files in sorted(os.walk(ARGS.out)):
         for f in sorted(files):
             path = os.path.join(root, f)

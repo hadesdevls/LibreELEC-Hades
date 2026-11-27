@@ -120,6 +120,23 @@ uint32_t oc_pixel(const struct oc_picture *p, uint64_t seed, uint32_t index)
 	return z;
 }
 
+/* The words of linux-9889 (amdgpu_dm_crc.c), each time the CRC is set for a Dolby Vision tunnel on DCE */
+#define OC_POINT_WORDS "Dolby Vision tunnel, DCE: its CRC is taken "
+
+enum oc_point oc_crc_point_line(const char *line, enum oc_point before)
+{
+	const char *p = strstr(line, OC_POINT_WORDS);
+
+	if (!p)
+		return before;
+	p += strlen(OC_POINT_WORDS);
+	if (!strncmp(p, "after the formatter", strlen("after the formatter")))
+		return OC_POINT_DCE_FORMATTER;
+	if (!strncmp(p, "in the CRTC", strlen("in the CRTC")))
+		return OC_POINT_DCE_CRTC;
+	return before;
+}
+
 const char *oc_channel_name(unsigned int channel)
 {
 	static const char *const names[] = {"red", "green", "blue"};

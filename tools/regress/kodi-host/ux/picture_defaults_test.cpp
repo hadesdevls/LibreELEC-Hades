@@ -49,7 +49,9 @@ static Kodi Defaults()
          {"videoscreen.hadesdvhdr10map", {0, 0}},    {"videoscreen.hadesdvtrimpass", {0, 0}},
          {"videoscreen.hadeshdr10adapt", {0, 0}},    {"videoscreen.hadeshdr10scenes", {0, 0}},
          {"videoscreen.hadeshdr10limiton", {0, 0}},  {"videoscreen.hadesdvfromhdr10", {0, 0}},
-         {"videoscreen.hadesdvfromhdr10plus", {0, 0}}, {"videoscreen.hadeshlgasdv", {0, 0}}};
+         {"videoscreen.hadesdvfromhdr10plusmode", {0, 0}}, {"videoscreen.hadeshlgasdv", {0, 0}},
+         // (1.2.3: the boolean that videoscreen.hadesdvfromhdr10plusmode took over, kept hidden for earlier builds)
+         {"videoscreen.hadesdvfromhdr10plus", {0, 0}}};
   return k;
 }
 
@@ -162,11 +164,12 @@ int main()
     Kodi k = Defaults();
     k.s["videoscreen.hadesdvfromhdr10"].first = 1;
     k.s["videoscreen.hadesdvnotrims"].first = 1;
-    expect(Line(ChangedFor(ScopeOf("hdr10", "native", "dv"), read(k)), nullptr) ==
+    expect(Line(ChangedFor(ScopeOf("hdr10", "native", "dv", "measured"), read(k)), nullptr) ==
                "trims left out, made Dolby Vision",
-           "HDR10 as Dolby Vision: both kinds");
-    expect(Line(ChangedFor(ScopeOf("hdr10", "", "pq"), read(k)), nullptr) == "made Dolby Vision",
-           "HDR10 as HDR10: only its own");
+           "HDR10 made Dolby Vision by its setting: both kinds");
+    // (up to 1.2.3 "made Dolby Vision" was named here too: a setting that made nothing of the video)
+    expect(ChangedFor(ScopeOf("hdr10", "", "pq"), read(k)).empty(),
+           "HDR10 sent as HDR10: the setting that would make it Dolby Vision made nothing");
     k = Defaults();
     k.s["videoscreen.hadesdvhdr10map"].first = 1;
     expect(Line(ChangedFor(ScopeOf("dolbyvision", "hdr10", "pq"), read(k)), nullptr) ==
@@ -177,6 +180,100 @@ int main()
     k = Defaults();
     k.s["videoscreen.hadeshdr10adapt"].first = 2;
     expect(Line(ChangedFor(HDR10, read(k)), nullptr) == "adapted to your TV", "HDR10 adapted, any value");
+  }
+
+  // the video's own choice of its output ("HDR output (this video)") overrides the settings: a setting
+  // that it overrode is neither named, nor counted, nor put back by the button (the ids are what the
+  // button resets)
+  {
+    const auto ids = [](const std::vector<Changed>& c)
+    {
+      std::string s;
+      for (const Changed& x : c)
+        s += (s.empty() ? "" : ";") + x.setting;
+      return s;
+    };
+    // Hokum, 2026-11-26: "HDR10 as Dolby Vision, measured" on, the video played without Dolby Vision
+    Kodi k = Defaults();
+    k.s["videoscreen.hadesdvfromhdr10"].first = 1;
+    unsigned sc = ScopeOf("hdr10", "", "pq", "", false);
+    expect(ChangedFor(sc, read(k)).empty(), "HDR10, choice without Dolby Vision: the setting is not named");
+    expect(Words(ChangedFor(sc, read(k))).empty(), "... nor counted");
+    expect(ids(ChangedFor(sc, read(k))).empty(), "... nor put back");
+    // the video's choice "measured" made it Dolby Vision: not the setting, on or off
+    sc = ScopeOf("hdr10", "native", "dv", "measured", false);
+    expect(ChangedFor(sc, read(k)).empty(), "HDR10 measured by the video's choice: the setting is not named");
+    k.s["videoscreen.hadesdvnotrims"].first = 1;
+    expect(ids(ChangedFor(sc, read(k))) == "videoscreen.hadesdvnotrims",
+           "... the settings of the Dolby Vision that goes out still are");
+    k = Defaults();
+    k.s["videoscreen.hadesdvfromhdr10"].first = 1;
+    expect(ids(ChangedFor(ScopeOf("hdr10", "native", "dv", "measured", true), read(k))) ==
+               "videoscreen.hadesdvfromhdr10",
+           "HDR10 measured by the setting, choice Automatic: named");
+    expect(ChangedFor(ScopeOf("hdr10", "native", "dv", "measuredauto", true), read(k)).empty(),
+           "HDR10 measured because the output cannot send HDR10: not the setting");
+    expect(ChangedFor(ScopeOf("hdr10", "", "pq", "", true), read(k)).empty(),
+           "HDR10, choice Automatic, display without Dolby Vision: the setting made nothing");
+    // HDR10+: its own setting, not the one of HDR10, made it Dolby Vision (1.2.3: the setting of three values, which
+    // took over the boolean of before; the boolean, kept hidden and true for earlier builds, is never named: the button
+    // puts the setting back, and the boolean follows it)
+    k.s["videoscreen.hadesdvfromhdr10plusmode"].first = 1;
+    k.s["videoscreen.hadesdvfromhdr10plus"].first = 1;
+    expect(ids(ChangedFor(ScopeOf("hdr10plus", "native", "dv", "hdr10plus", true), read(k))) ==
+               "videoscreen.hadesdvfromhdr10plusmode",
+           "HDR10+ made Dolby Vision by its setting: that one only");
+    expect(ids(ChangedFor(ScopeOf("hdr10plus", "native", "dv", "hdr10pluscurve", true), read(k))) ==
+               "videoscreen.hadesdvfromhdr10plusmode",
+           "... also mapped by its HDR10+ curve");
+    expect(ChangedFor(ScopeOf("hdr10plus", "native", "dv", "hdr10plus", false), read(k)).empty(),
+           "HDR10+, the video's choice Dolby Vision: not the setting");
+    expect(ChangedFor(ScopeOf("hdr10plus", "", "hdr10plus", "", true), read(k)).empty(),
+           "HDR10+ sent as HDR10+: the setting made nothing");
+    // (1.2.3) Always makes the picture from the video's HDR10+ the same way, also for a display that takes HDR10+: it
+    // counts the same, with the same words, and kodi.log says its value
+    k.s["videoscreen.hadesdvfromhdr10plusmode"].first = 2;
+    const unsigned madeHdr10Plus = ScopeOf("hdr10plus", "native", "dv", "hdr10plus", true);
+    const auto always = ChangedFor(madeHdr10Plus, read(k));
+    expect(ids(always) == "videoscreen.hadesdvfromhdr10plusmode", "HDR10+ made Dolby Vision by Always: named");
+    expect(Line(always, nullptr) == "made Dolby Vision", "... with the words of the other value");
+    expect(LogLine(KindName(madeHdr10Plus), always).find("videoscreen.hadesdvfromhdr10plusmode=2 (made Dolby Vision)") !=
+               std::string::npos,
+           "... and kodi.log says its value");
+    expect(ids(ChangedFor(ScopeOf("hdr10plus", "native", "dv", "hdr10pluscurve", true), read(k))) ==
+               "videoscreen.hadesdvfromhdr10plusmode",
+           "Always, mapped by its HDR10+ curve: named");
+    expect(ChangedFor(ScopeOf("hdr10plus", "native", "dv", "hdr10plus", false), read(k)).empty(),
+           "Always, the video's choice Dolby Vision: not the setting");
+    expect(ChangedFor(ScopeOf("hdr10plus", "", "hdr10plus", "", true), read(k)).empty(),
+           "Always, sent as HDR10+ all the same (no native Dolby Vision): the setting made nothing");
+    expect(ids(ChangedFor(ScopeOf("hdr10", "native", "dv", "measured", true), read(k))) ==
+               "videoscreen.hadesdvfromhdr10",
+           "Always: not named for an HDR10 video measured, only the setting of HDR10");
+    // HLG
+    k = Defaults();
+    k.s["videoscreen.hadeshlgasdv"].first = 1;
+    expect(ids(ChangedFor(ScopeOf("hlg", "native", "dv", "measuredhlg", true), read(k))) ==
+               "videoscreen.hadeshlgasdv",
+           "HLG made Dolby Vision by its setting: named");
+    expect(ChangedFor(ScopeOf("hlg", "native", "dv", "measuredhlg", false), read(k)).empty(),
+           "HLG, the video's choice Dolby Vision: not the setting");
+    expect(ChangedFor(ScopeOf("hlg", "", "hlg", "", false), read(k)).empty(),
+           "HLG, the video's choice as Kodi plays it: not the setting");
+    // as SDR, the video's choice or "HDR as SDR": no setting of HDR output reaches its picture
+    k = Defaults();
+    k.s["videoscreen.hadesdvfromhdr10"].first = 1;
+    k.s["videoscreen.hadeshdr10adapt"].first = 2;
+    k.s["videoscreen.hadeshdrdepth"].first = 8;
+    expect(ScopeOf("hdr10", "", "sdr", "", false) == 0, "HDR10 as SDR: no scope");
+    expect(ScopeOf("hlg", "", "sdr", "", true) == 0, "HLG as SDR: no scope");
+    expect(ScopeOf("dolbyvision", "", "sdr", "", false) == 0, "Dolby Vision as SDR: no scope");
+    expect(ChangedFor(ScopeOf("hdr10", "", "sdr", "", false), read(k)).empty(), "HDR10 as SDR: nothing named");
+    // the origin is read only for a video that goes out as Dolby Vision, and never for the video's own
+    // Dolby Vision
+    expect(ScopeOf("dolbyvision", "native", "dv", "measured", true) == DV_NATIVE,
+           "Dolby Vision measured in place of its own: no setting made it Dolby Vision");
+    expect(ScopeOf("hdr10", "", "pq", "measured", true) == HDR10, "an origin without Dolby Vision out");
   }
 
   // kodi.log where nothing counts

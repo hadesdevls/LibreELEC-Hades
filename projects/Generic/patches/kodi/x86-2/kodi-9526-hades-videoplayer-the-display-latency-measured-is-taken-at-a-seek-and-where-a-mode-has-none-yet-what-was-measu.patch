@@ -1,0 +1,296 @@
+From 3a1bb3d8e129215e7f412e1c9989b07fe11eb7cd Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:22:15 +0000
+Subject: [PATCH] [Hades][VideoPlayer] The display latency measured is taken at
+ a seek, and where a mode has none yet, what was measured elsewhere
+
+On the owner's RTX 4080 SUPER with a new build, Avatar (TrueHD, native
+Dolby Vision at 23.976 Hz) played -38 ms against its sound for the
+whole film, and Carrie (E-AC-3 at 24 Hz) -62 ms, while Hokum (DTS-HD MA)
+played -2 ms. The difference was not the sound: Kodi's display latency
+in GBM is a refresh period longer than the time a frame takes to the
+screen (MeasuredLatency.h), and Hades measures that and corrects it in
+whole periods for each GPU, driver, build, display mode and way of
+presenting. Avatar and Carrie were the first videos at their rates with
+the new build: nothing was measured for them yet, and the picture went
+out a period (41.7 ms) before its sound. Hokum came after.
+
+Two things kept that period:
+
+- A measurement said "the frames are chosen 1 refresh period later than
+  it says from the next video or seek on", and a seek did not take it.
+  A seek empties the render queue through CRenderManager::DiscardBuffer()
+  (VideoPlayer::FlushBuffers(), CVideoPlayerVideo's GENERAL_FLUSH), and
+  the measurement was taken only in Flush(), which a seek never calls:
+  Carrie kept -42 ms through four seeks. DiscardBuffer() now marks it,
+  and FrameMove() takes it on the main thread before a picture after the
+  seek is chosen (VideoLatencyCommit(false), as Flush() does).
+
+- A new build is a new key, and its first video at each rate played a
+  period early until it was measured, with every build. The periods are
+  the code's, not the mode's (two from the choice of a frame to its flip,
+  one for the way that waits, for three that Kodi takes), and every
+  measurement agrees: -0.98 to -1.04 periods at 23.976, 24, 120 Hz and
+  1080p on this PC. CLatencyMemory::Provisional(): where nothing is
+  measured for a mode with this key, the periods that every entry of
+  this key measured at its other modes for that way, or, with none, that
+  every entry of the keys before measured at this mode for that way,
+  when they all agree; nothing where they disagree. It is applied with
+  "Picture in step with its sound" on, and said in kodi.log with where
+  it comes from; the frames are measured as before, and what they say is
+  kept and taken from the next video or seek on. Nothing provisional is
+  written to the memory.
+---
+ .../VideoRenderers/RenderManager.cpp          | 18 ++++
+ .../VideoRenderers/RenderManager.h            |  3 +
+ xbmc/windowing/gbm/MeasuredLatency.h          | 89 ++++++++++++++++++-
+ .../windowing/gbm/WinSystemGbmGLESContext.cpp | 47 +++++++++-
+ 4 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+index c1c0872..fcd2a95 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.cpp
+@@ -411,6 +411,16 @@ void CRenderManager::FrameMove()
+ 
+     CheckEnableClockSync();
+   }
++#ifdef HAVE_DVBRIDGE
++  // Hades: a seek (or a decoder reset) since the last pass: what was measured of the display latency
++  // until it is taken from here on, before a picture after it is chosen (DiscardBuffer())
++  if (m_latencyDiscarded.exchange(false))
++  {
++    if (auto* dvWindow = dynamic_cast<KODI::WINDOWING::GBM::CWinSystemGbmGLESContext*>(
++            CServiceBroker::GetWinSystem()))
++      dvWindow->VideoLatencyCommit(false);
++  }
++#endif
+   {
+     std::unique_lock lock2(m_presentlock);
+ 
+@@ -1991,6 +2001,14 @@ void CRenderManager::DiscardBuffer()
+   // Hades: the player's flush (a seek, a decoder reset or reopened): the first picture after it is
+   // zoomed to its own area, without waiting for the pictures before it (ActiveAreaZoom.h)
+   m_activeArea.Reset();
++#ifdef HAVE_DVBRIDGE
++  // Hades: ... and it takes what was measured of the display latency until it (CMeasuredLatency),
++  // where the picture changes anyway: FrameMove() commits it on the main thread before a picture
++  // after it is chosen. A seek comes here, not to Flush(): up to 1.2.3 a measurement said "from the
++  // next video or seek on" and a seek did not take it (the owner's Carrie and Avatar kept a period
++  // before their sound through every seek)
++  m_latencyDiscarded = true;
++#endif
+ 
+   if(m_presentstep == PRESENT_READY)
+     m_presentstep = PRESENT_IDLE;
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+index d50400a..25ea7d0 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/RenderManager.h
+@@ -323,6 +323,9 @@ protected:
+   //! clock runs from the first picture ready, and the output may show its first frame some
+   //! refreshes later (a change of mode, the renderer set up for it); not counted in m_QueueSkip
+   KODI::RENDERQUEUE::CStartSkips m_startSkips;
++  //! Hades: queued pictures were discarded (a seek, a decoder reset) since the last pass of
++  //! FrameMove(), which takes what was measured of the display latency (CMeasuredLatency)
++  std::atomic<bool> m_latencyDiscarded{false};
+ 
+   struct SPresent
+   {
+diff --git a/xbmc/windowing/gbm/MeasuredLatency.h b/xbmc/windowing/gbm/MeasuredLatency.h
+index 6f68d84..31a4d8a 100644
+--- a/xbmc/windowing/gbm/MeasuredLatency.h
++++ b/xbmc/windowing/gbm/MeasuredLatency.h
+@@ -174,7 +174,18 @@ private:
+  * ENTRIES at most, a space between them; the key is DVPathKey() of what tells the GPU, its driver
+  * and the build (as CDVPathMemory), in 16 hexadecimal digits; the way is w (the way that waits), a
+  * (a frame ahead) or o (the ordinary output). A new driver or build is a new key: what was found
+- * with the one before is not taken for it.
++ * with the one before is not kept as measured for it.
++ *
++ * Hades 1.2.3: until a mode is measured with a key, it is not left at Kodi's latency (a period
++ * before its sound everywhere it was measured) when what was measured says otherwise: Provisional()
++ * takes what the same key measured at its other modes for that way, or, with nothing of that key,
++ * what the keys before measured at this mode for that way, when all of them agree. The periods are
++ * the code's (DVLatency.h: two periods from the choice of a frame to its flip, one for the way that
++ * waits, for three that Kodi takes), not the mode's, and every measurement so far agrees: on the
++ * owner's RTX 4080 SUPER, each new build put the first video at each rate a period before its sound
++ * (-38 ms of TrueHD at 23.976 Hz, -62 of E-AC-3 at 24 Hz) until it was measured, at -0.98 to -1.04
++ * periods in every mode. The frames of the video are measured as before, and what they say is kept
++ * and taken from the next video or seek on, as for a mode with nothing provisional.
+  */
+ class CLatencyMemory
+ {
+@@ -240,7 +251,83 @@ public:
+     return false;
+   }
+ 
++  //! Where Provisional() took the periods from
++  enum class From
++  {
++    NOTHING, //!< nothing to take: Kodi's latency
++    THIS_KEY, //!< the same GPU, driver and build, at its other modes
++    OTHER_KEYS, //!< other drivers or builds, at this mode
++  };
++
++  /*!
++   * \brief What is taken for a name that the text has nothing for, until its own measurement: the
++   *        periods of every entry of the same key and way at other modes, where there is one and
++   *        all of them agree; with no entry of the same key and way, those of every entry of the
++   *        same mode and way with other keys, where there is one and all of them agree; nothing
++   *        otherwise (entries of the same key that disagree: nothing, never the other keys)
++   */
++  static From Provisional(const std::string& all, const std::string& name, int& periods)
++  {
++    std::string key, mode;
++    char way = 0;
++    if (!Split(name + "=0", key, mode, way))
++      return From::NOTHING;
++    int same = 0, others = 0;
++    int sameValue = 0, othersValue = 0;
++    bool sameAgree = true, othersAgree = true;
++    for (size_t at = 0; at < all.size();)
++    {
++      const size_t end = std::min(all.find(' ', at), all.size());
++      const std::string entry = all.substr(at, end - at);
++      at = end + 1;
++      std::string eKey, eMode;
++      char eWay = 0;
++      if (!Well(entry) || !Split(entry, eKey, eMode, eWay) || eWay != way)
++        continue;
++      const int value = std::stoi(entry.substr(entry.find('=') + 1));
++      if (eKey == key && eMode != mode)
++      {
++        sameAgree = sameAgree && (same == 0 || value == sameValue);
++        sameValue = value;
++        ++same;
++      }
++      else if (eKey != key && eMode == mode)
++      {
++        othersAgree = othersAgree && (others == 0 || value == othersValue);
++        othersValue = value;
++        ++others;
++      }
++    }
++    if (same > 0)
++    {
++      if (!sameAgree)
++        return From::NOTHING;
++      periods = sameValue;
++      return From::THIS_KEY;
++    }
++    if (others > 0 && othersAgree)
++    {
++      periods = othersValue;
++      return From::OTHER_KEYS;
++    }
++    return From::NOTHING;
++  }
++
+ private:
++  //! the key, the mode ("<w>x<h>@<mHz>[i]") and the way of an entry that is Well()
++  static bool Split(const std::string& entry, std::string& key, std::string& mode, char& way)
++  {
++    if (!Well(entry))
++      return false;
++    const size_t slash = entry.find('/', 17);
++    if (slash == std::string::npos || slash + 1 >= entry.size())
++      return false;
++    key = entry.substr(0, 16);
++    mode = entry.substr(17, slash - 17);
++    way = entry[slash + 1];
++    return true;
++  }
++
+   //! "<16 hex>/<digits>x<digits>@<digits>[i]/<w|a|o>=<-1..2>"
+   static bool Well(const std::string& entry)
+   {
+diff --git a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+index 475da29..46f6dac 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp
+@@ -12247,7 +12247,16 @@ double CWinSystemGbmGLESContext::MeasuredLatencyMs(bool clockSync)
+   int periods = 0;
+   const bool known =
+       !name.empty() && period > 0.0 && CLatencyMemory::Get(LatencyMemory(), name, periods);
+-  const int applied = known ? CLatencyMemory::Taken(LatencyOn(), LatencyMemory(), name) : 0;
++  // (Hades: nothing measured for this mode with this GPU, driver and build: what was measured at its
++  // other modes, or with the builds before at this one, until the frames of this video say it)
++  int provisional = 0;
++  const CLatencyMemory::From from =
++      !known && !name.empty() && period > 0.0
++          ? CLatencyMemory::Provisional(LatencyMemory(), name, provisional)
++          : CLatencyMemory::From::NOTHING;
++  const int applied = known ? CLatencyMemory::Taken(LatencyOn(), LatencyMemory(), name)
++                      : from != CLatencyMemory::From::NOTHING && LatencyOn() ? provisional
++                                                                             : 0;
+   // (told when it changes: with each video, a mode, a way of presenting, or a seek that takes a
+   // new measurement)
+   if (!name.empty() && (name != m_latencyAppliedName || applied != m_latencyApplied))
+@@ -12255,7 +12264,18 @@ double CWinSystemGbmGLESContext::MeasuredLatencyMs(bool clockSync)
+     m_latencyAppliedName = name;
+     m_latencyApplied = applied;
+     const double latency = LagLatencyMs();
+-    if (applied != 0)
++    const char* const fromWhat = from == CLatencyMemory::From::THIS_KEY
++                                     ? "with this GPU, driver and build at its other display modes"
++                                     : "with the drivers or builds before at this display mode";
++    if (applied != 0 && !known)
++      CLog::Log(LOGINFO,
++                "Video: frames are chosen {} refresh period{} ({:.1f} ms) {} than Kodi's display "
++                "latency of {:.1f} ms says, at {}: nothing is measured there with this GPU, driver "
++                "and build yet, so as measured {}, until the frames of this video are (\"Picture in "
++                "step with its sound\" in Settings > Player > Videos turns it off)",
++                std::abs(applied), std::abs(applied) == 1 ? "" : "s", std::abs(applied) * period,
++                applied > 0 ? "later" : "sooner", latency, MeasuredWhere(way), fromWhat);
++    else if (applied != 0)
+       CLog::Log(LOGINFO,
+                 "Video: frames are chosen {} refresh period{} ({:.1f} ms) {} than Kodi's display "
+                 "latency of {:.1f} ms says, at {}: as measured with this GPU, driver and build, so "
+@@ -12263,6 +12283,13 @@ double CWinSystemGbmGLESContext::MeasuredLatencyMs(bool clockSync)
+                 "Settings > Player > Videos turns it off)",
+                 std::abs(applied), std::abs(applied) == 1 ? "" : "s", std::abs(applied) * period,
+                 applied > 0 ? "later" : "sooner", latency, MeasuredWhere(way));
++    else if (!known && from != CLatencyMemory::From::NOTHING && provisional != 0)
++      CLog::Log(LOGINFO,
++                "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}, although the "
++                "frames were measured {} to be chosen {} refresh period{} {}: \"Picture in step with "
++                "its sound\" is off",
++                latency, MeasuredWhere(way), fromWhat, std::abs(provisional),
++                std::abs(provisional) == 1 ? "" : "s", provisional > 0 ? "later" : "sooner");
+     else if (known && periods != 0)
+       CLog::Log(LOGINFO,
+                 "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}, although with "
+@@ -12274,8 +12301,13 @@ double CWinSystemGbmGLESContext::MeasuredLatencyMs(bool clockSync)
+       CLog::Log(LOGINFO, "Video: Kodi's display latency of {:.1f} ms is taken as it is at {}: {}",
+                 latency, MeasuredWhere(way),
+                 known ? "it was measured right with this GPU, driver and build"
+-                      : "nothing is measured with this GPU, driver and build yet (the frames of "
+-                        "this video are)");
++                : from != CLatencyMemory::From::NOTHING
++                    ? StringUtils::Format("nothing is measured there with this GPU, driver and "
++                                          "build yet, and it was measured right {} (the frames of "
++                                          "this video are measured)",
++                                          fromWhat)
++                    : std::string("nothing is measured with this GPU, driver and build yet (the "
++                                  "frames of this video are)"));
+   }
+   return applied * period;
+ }
+@@ -12340,6 +12372,13 @@ void CWinSystemGbmGLESContext::MeasuredJudge(bool now)
+                                  "they are",
+                                  std::abs(v.periods), std::abs(v.periods) == 1 ? "" : "s",
+                                  v.periods > 0 ? "later" : "sooner");
++    // (Hades: taken before this mode was measured, from what was measured elsewhere: kept now)
++    else if (!known && m_latencyAppliedName == name && m_latencyApplied == v.periods)
++      then = StringUtils::Format("the frames are chosen {} refresh period{} {} than it says, as "
++                                 "they were taken from what was measured elsewhere: kept for this "
++                                 "GPU, driver and build",
++                                 std::abs(v.periods), std::abs(v.periods) == 1 ? "" : "s",
++                                 v.periods > 0 ? "later" : "sooner");
+     else
+       then = StringUtils::Format("the frames are chosen {} refresh period{} {} than it says from "
+                                  "the next video or seek on, and so with this GPU, driver and "
+-- 
+2.53.0
+

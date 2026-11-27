@@ -842,6 +842,29 @@ int main(void)
 		CHECK(q.verdict == OC_NOT_EXACT && q.reasons == OC_R_UNSTABLE, "Z held for one entry only");
 	}
 
+	/* Where the kernel took the CRC of a tunnel on DCE (linux-9889): the records of its log */
+	{
+		static const char *const fmt = "6,2071,109323016,-;amdgpu 0000:01:00.0: [drm] [CRTC:89:crtc-0] Dolby Vision "
+					       "tunnel, DCE: its CRC is taken after the formatter, before the HDMI encoder "
+					       "(FMT_CRC_CNTL 0x11, masks 0xffffffff 0xffff)\n";
+		static const char *const crtc = "6,2072,109400000,-;amdgpu 0000:01:00.0: [drm] [CRTC:89:crtc-0] Dolby Vision "
+						"tunnel, DCE: its CRC is taken in the CRTC, before the formatter (the "
+						"formatter's CRC is off: amdgpu.dvbridge_dce_crc=0)\n";
+		static const char *const other = "6,2073,109500000,-;amdgpu 0000:01:00.0: [drm] [CRTC:89:crtc-0] Dolby Vision "
+						 "tunnel, DCE 11.2 (Polaris): read back as the tunnel needs: prescale bypass 1\n";
+		static const char *const odd = "6,2074,109600000,-;Dolby Vision tunnel, DCE: its CRC is taken somewhere\n";
+
+		CHECK(oc_crc_point_line(fmt, OC_POINT_UNKNOWN) == OC_POINT_DCE_FORMATTER, "point: after the formatter");
+		CHECK(oc_crc_point_line(crtc, OC_POINT_DCE_FORMATTER) == OC_POINT_DCE_CRTC, "point: in the CRTC, the last");
+		CHECK(oc_crc_point_line(fmt, OC_POINT_DCE_CRTC) == OC_POINT_DCE_FORMATTER, "point: the formatter, the last");
+		CHECK(oc_crc_point_line(other, OC_POINT_DCE_FORMATTER) == OC_POINT_DCE_FORMATTER,
+		      "point: another record keeps what was found");
+		CHECK(oc_crc_point_line(other, OC_POINT_UNKNOWN) == OC_POINT_UNKNOWN, "point: none found");
+		CHECK(oc_crc_point_line(odd, OC_POINT_DCE_CRTC) == OC_POINT_DCE_CRTC,
+		      "point: a record of other words keeps what was found");
+		CHECK(oc_crc_point_line("", OC_POINT_DCE_FORMATTER) == OC_POINT_DCE_FORMATTER, "point: an empty record");
+	}
+
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

@@ -240,6 +240,7 @@ namespace Hades.Installer
         // hash is another), "unreadable" or "unusable" (with imageDetail)
         string imageState = "";
         string imageDetail;      // what the system or the engine said, in the language that was in use then
+        OriginCheck origin;      // of imagePath: what its signed list (SHA256SUMS and SHA256SUMS.sig next to it) says; null until known
         bool scanning;
         List<DiskInfo> excluded = new List<DiskInfo>();
         bool busy;
@@ -695,6 +696,7 @@ namespace Hades.Installer
             plan = null;
             imageState = "";
             imageDetail = null;
+            origin = null;
             if (path == null)
             {
                 imageState = "none";
@@ -710,10 +712,15 @@ namespace Hades.Installer
             probe.DoWork += delegate { Engine.ProbeSecureBoot(probed); };
             probe.RunWorkerCompleted += delegate { if (plan == probed || (plan != null && plan.Path == probed.Path)) UpdateState(); };
             probe.RunWorkerAsync();
+            // Whether it arrived complete (its .sha256 file) and whether it is the image that LibreELEC Hades published (since
+            // 1.2.3: SHA256SUMS signed with the keys of the update channel, and SHA256SUMS.sig, next to it). Both need its
+            // SHA-256, worked out once; with neither file next to it there is nothing to compare it with.
             string expected = Engine.ExpectedHash(path);
-            if (expected == null)
+            if (expected == null && !Release.Present(path))
             {
+                origin = Release.Check(path, null, Release.PublisherKeys());
                 imageState = "unchecked";
+                Log.Line("image " + path + ": no .sha256; signature: " + origin.Result + ": " + origin.Why);
                 UpdateState();
                 if (Where == Place.Internal) Scan();
                 return;
@@ -721,13 +728,23 @@ namespace Hades.Installer
             imageState = "checking";
             UpdateState();
             var check = new BackgroundWorker();
-            check.DoWork += delegate(object s, DoWorkEventArgs e) { e.Result = Engine.FileHash(path, null, null); };
+            check.DoWork += delegate(object s, DoWorkEventArgs e)
+            {
+                string hash = Engine.FileHash(path, null, null);
+                e.Result = new object[] { hash, Release.Check(path, hash, Release.PublisherKeys()) };
+            };
             check.RunWorkerCompleted += delegate(object s, RunWorkerCompletedEventArgs e)
             {
                 if (path != imagePath) return;
-                imageState = e.Error != null ? "unreadable" : (string)e.Result == expected ? "ok" : "damaged";
+                string hash = e.Error != null ? null : (string)((object[])e.Result)[0];
+                origin = e.Error != null ? null : (OriginCheck)((object[])e.Result)[1];
+                // (without a .sha256 file, a signed list that has its SHA-256 says that it arrived complete as well)
+                imageState = e.Error != null ? "unreadable"
+                           : expected != null ? (hash == expected ? "ok" : "damaged")
+                           : origin.Result == Origin.Verified ? "ok" : "unchecked";
                 imageDetail = e.Error != null ? e.Error.Message : null;
-                Log.Line("image " + path + ": " + imageState + (imageDetail != null ? ": " + imageDetail : ""));
+                Log.Line("image " + path + ": " + imageState + (imageDetail != null ? ": " + imageDetail : "") +
+                         (origin != null ? "; signature: " + origin.Result + ": " + origin.Why : ""));
                 UpdateState();
                 if (Where == Place.Internal) Scan();
             };
@@ -1013,20 +1030,32 @@ namespace Hades.Installer
             string name = imagePath == null ? "" : Path.GetFileName(imagePath) + "\r\n";
             Color color = Ui.Text;
             bool usable = false;
-            switch (imageState)
+            // (what the signed list says comes first: an image whose signature does not hold is never written, whatever its
+            // .sha256 says; one that is not signed is written only after its question, AskUnsigned)
+            bool signedOk = origin != null && origin.Result == Origin.Verified;
+            bool noMatch = origin != null && origin.Result == Origin.NoMatch && (imageState == "ok" || imageState == "unchecked");
+            if (noMatch)
+            {
+                imageLabel.Text = name + L.T("Not the image that LibreELEC Hades signed: it is not written",
+                                             "No es la imagen que firmó LibreELEC Hades: no se escribe");
+                color = Ui.Danger;
+            }
+            else switch (imageState)
             {
                 case "ok":
-                    imageLabel.Text = name + Words.Size(plan.Size) + L.T(", checked: it arrived complete", ", comprobada: ha llegado entera");
-                    color = Ui.Ok;
+                    imageLabel.Text = name + Words.Size(plan.Size) +
+                                      (signedOk ? L.T(", signed by LibreELEC Hades, and complete", ", firmada por LibreELEC Hades, y entera")
+                                                : L.T(", complete, but not signed by LibreELEC Hades", ", entera, pero sin la firma de LibreELEC Hades"));
+                    color = signedOk ? Ui.Ok : Ui.Warn;
                     usable = true;
                     break;
                 case "checking":
-                    imageLabel.Text = name + L.T("Checking that it arrived complete...", "Comprobando que ha llegado entera...");
+                    imageLabel.Text = name + L.T("Checking the image...", "Comprobando la imagen...");
                     break;
                 case "unchecked":
                     imageLabel.Text = name + Words.Size(plan.Size) +
-                                      L.T(", its .sha256 file is missing: there is no way to check that it arrived complete",
-                                          ", sin su archivo .sha256: no se puede comprobar que llegó entera");
+                                      L.T(", not signed, and without its .sha256 file: it cannot be checked",
+                                          ", sin firma y sin su archivo .sha256: no se puede comprobar");
                     color = Ui.Warn;
                     usable = true;
                     break;
@@ -1085,6 +1114,7 @@ namespace Hades.Installer
 
             string problem = null;
             if (busy) problem = null;
+            else if (noMatch) problem = OriginText(origin);
             else if (!usable) problem = "";
             else if (list.Items.Count == 0)
                 problem = Disks.NothingToOffer(excluded, Where);
@@ -1342,6 +1372,7 @@ namespace Hades.Installer
             ImagePlan chosen = plan;
             bool diagnose = diagnostics.Checked && chosen.SwitchOffset >= 0;
             SbJob secureJob = NewSecureJob(chosen);
+            if (!OriginAccepted(secureJob != null)) return;
 
             if (besideMode)
             {
@@ -1374,9 +1405,26 @@ namespace Hades.Installer
             Place place = Where;
             ImagePlan chosen = plan;
             bool diagnose = diagnostics.Checked && chosen.SwitchOffset >= 0;
+            if (!OriginAccepted(NewSecureJob(chosen) != null)) return;
             using (ConfirmForm confirm = AskUpdate(disk, Path.GetFileName(imagePath), place == Place.Internal && chosen.HidesOtherDisks, SecureNote(true)))
                 if (confirm.ShowDialog(this) != DialogResult.OK) return;
             RunUpdate(disk, chosen, place, diagnose, imagePath, false, false);
+        }
+
+        // Whether the image may be written: one that LibreELEC Hades signed, at once; one that it did not sign (an image of an
+        // earlier release, one without SHA256SUMS and SHA256SUMS.sig next to it, a build of one's own), only after its
+        // question (AskUnsigned); one whose signature does not hold never (the buttons are off for it). What was decided is
+        // in the log.
+        bool OriginAccepted(bool secure)
+        {
+            if (origin == null || origin.Result == Origin.Verified) return origin != null;
+            if (origin.Result == Origin.NoMatch) return false;
+            using (ConfirmForm ask = AskUnsigned(Path.GetFileName(imagePath), origin, secure))
+            {
+                bool yes = ask.ShowDialog(this) == DialogResult.OK;
+                Log.Line("image not signed (" + origin.Why + "): " + (yes ? "written all the same, as the user typed" : "not written"));
+                return yes;
+            }
         }
 
         // The job of Secure Boot of this install or update, from the box (null: the box is off, and nothing changes in what is written)
@@ -1728,6 +1776,77 @@ namespace Hades.Installer
                 "Si ahora mismo estás copiando algo desde ella, cancela y espera a que termine la copia.");
             return new ConfirmForm(L.T("Windows is using that partition", "Windows tiene en uso esa partición"), false, details, null,
                                    L.T("Take it and update", "Tomarla y actualizar"));
+        }
+
+        // What was found of an image that LibreELEC Hades did not sign, or whose signature does not hold, in one line (the
+        // line of the window under the list, for the second; the first sentence of AskUnsigned, for the first)
+        public static string OriginText(OriginCheck found)
+        {
+            string text = OriginWhat(found);
+            // (copies of a second download next to it, "SHA256SUMS (1)", were tried too: Release.Check)
+            if (found.OtherCopies)
+                text += " " + L.T("The other copies of them there (such as SHA256SUMS (1)) are not of this image either.",
+                                  "Las otras copias que hay allí (como SHA256SUMS (1)) tampoco son de esta imagen.");
+            return text;
+        }
+
+        static string OriginWhat(OriginCheck found)
+        {
+            switch (found.What)
+            {
+                case Found.NoSignature:
+                    return L.T("There is no SHA256SUMS.sig next to it.", "No hay ningún SHA256SUMS.sig junto a ella.");
+                case Found.NoList:
+                    return L.T("There is a SHA256SUMS.sig next to it, but no SHA256SUMS.", "Hay un SHA256SUMS.sig junto a ella, pero ningún SHA256SUMS.");
+                case Found.NotListed:
+                case Found.NotHashed:
+                    return L.T("The signed SHA256SUMS next to it does not list this image.",
+                               "El SHA256SUMS firmado que hay junto a ella no incluye esta imagen.");
+                case Found.NotASignature:
+                    return L.T("SHA256SUMS.sig next to it is not a signature of LibreELEC Hades. Download the release again.",
+                               "El SHA256SUMS.sig que hay junto a ella no es una firma de LibreELEC Hades. Vuelve a descargarla.");
+                case Found.OtherKey:
+                    return L.T("SHA256SUMS.sig next to it was not made with a key of LibreELEC Hades. Download the release again.",
+                               "El SHA256SUMS.sig que hay junto a ella no se hizo con una clave de LibreELEC Hades. Vuelve a descargarla.");
+                case Found.Changed:
+                    // (most often a list and a signature of two releases in one folder of downloads)
+                    return L.T("SHA256SUMS and SHA256SUMS.sig next to it are not of the same release, or one of them was changed. " +
+                               "Put the two of this image's release next to it (download them again, into a folder of their own) " +
+                               "and choose it again.",
+                               "SHA256SUMS y SHA256SUMS.sig, junto a ella, no son de la misma versión, o uno de los dos se cambió. " +
+                               "Pon junto a ella los dos de la versión de esta imagen (descárgalos otra vez, en una carpeta propia) " +
+                               "y vuelve a elegirla.");
+                case Found.OtherHash:
+                    return L.T("The signed SHA256SUMS gives this image another checksum: it was changed. Download it again.",
+                               "El SHA256SUMS firmado da otra huella para esta imagen: se cambió. Vuelve a descargarla.");
+                default:
+                    return L.T("SHA256SUMS or SHA256SUMS.sig next to it cannot be read.",
+                               "No se puede leer SHA256SUMS o SHA256SUMS.sig, junto a ella.");
+            }
+        }
+
+        // An image that LibreELEC Hades did not sign: written only when the user types a word, after what that means is said.
+        // secure: the box of Secure Boot is ticked, so this PC's own key will sign its start.
+        public static ConfirmForm AskUnsigned(string imageName, OriginCheck found, bool secure)
+        {
+            string details = imageName + "\r\n" + OriginText(found) + "\r\n\r\n" + L.T(
+                "LibreELEC Hades signs the list of the files of each release (SHA256SUMS, with its signature SHA256SUMS.sig), " +
+                "and this installer checks it with the keys of LibreELEC Hades. This image has no such signature, so nothing " +
+                "says who made it.\r\n\r\n" +
+                "If you downloaded it from the release page of LibreELEC Hades, cancel, put SHA256SUMS and SHA256SUMS.sig of the " +
+                "same release next to it, and choose it again. Releases before 1.2.3 have no signature.\r\n\r\n" +
+                "Write it anyway only if you trust where it comes from, such as an image you built yourself.",
+                "LibreELEC Hades firma la lista de los archivos de cada versión (SHA256SUMS, con su firma SHA256SUMS.sig), y " +
+                "este instalador la comprueba con las claves de LibreELEC Hades. Esta imagen no tiene esa firma, así que nada " +
+                "dice quién la hizo.\r\n\r\n" +
+                "Si la descargaste de la página de la versión de LibreELEC Hades, cancela, pon junto a ella SHA256SUMS y " +
+                "SHA256SUMS.sig de esa misma versión, y vuelve a elegirla. Las versiones anteriores a 1.2.3 no tienen firma.\r\n\r\n" +
+                "Escríbela de todos modos solo si te fías de su origen, como una imagen que compilaste tú.");
+            if (secure)
+                details += L.T("\r\n\r\nSecure Boot is ticked: this PC's own key will sign the start of this image, so the PC will trust it.",
+                               "\r\n\r\nSecure Boot está marcado: la clave propia de este PC firmará el arranque de esta imagen, así que el PC se fiará de ella.");
+            return new ConfirmForm(L.T("This image is not signed by LibreELEC Hades", "Esta imagen no está firmada por LibreELEC Hades"), true,
+                                   details, L.T("UNSIGNED", "SIN FIRMA"), L.T("Use this image", "Usar esta imagen"));
         }
 
         // usb: a USB drive, which is then left as a normal drive

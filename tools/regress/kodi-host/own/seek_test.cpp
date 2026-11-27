@@ -340,8 +340,10 @@ static void TestSourceRate()
   CHECK(Has(speed, "  if (m_caching == CACHESTATE_FULL)\n  {\n    // Hades: what the source sends while "
                    "the player buffers (SourceRate.h)\n    WatchBuffering(false);"));
   const std::string watch = BodyOf(player, "void CVideoPlayer::WatchBuffering(bool ends)");
-  CHECK(Has(watch, "  if (m_buffering.told || !SOURCE_RATE::Slower(ms, sent, status.maxrate))\n    return;\n"
-                   "  m_buffering.told = true;"));
+  // (1.2.3: told only where the source is what the player waited for; what the cache took from it, SourceRate.h)
+  CHECK(Has(watch, "  if (m_buffering.told || !limited || !SOURCE_RATE::Slower(ms, sent, status.maxrate))\n"
+                   "    return;\n  m_buffering.told = true;"));
+  CHECK(Has(watch, "status.sourceCounted"));
   CHECK(Has(watch, "position + static_cast<int64_t>(status.forward)"));
   const std::string open = BodyOf(player, "bool CVideoPlayer::OpenInputStream()");
   CHECK(Has(open, "  m_buffering = BufferingState{};"));

@@ -3,15 +3,16 @@
 //
 // pc3d_test.cpp (1.2.2: 3D on PCs, the reports of 1.2.1 and 1.2): what the tree under test decides, and where it
 // decides it in the source, for
-//  - the subtitles of a 3D output side by side and top and bottom: libass is given Kodi's pixel ratio as it is
+//  - the subtitles of a 3D output side by side and top and bottom: libass is given 1 / Kodi's pixel ratio
 //    (SubtitlesStyle.h, LibassPixelAspect()). Kodi's pixel ratio is the width of a pixel over its height as it is
 //    shown (Resolution.cpp: the aspect of the display over that of its pixels); in a 3D output it is 2 side by side
-//    and 0.5 top and bottom (GraphicContext.cpp, ResInfo()); libass draws its glyphs that much narrower (libass
-//    0.17.5, ass.h: "1.0 means square pixels, 0 means default"; ass_render.c: scale.x / par_scale_x). The ratio was
-//    turned around as 2 - ratio (Kodi 20 to 22): 0 side by side, libass's default, the glyphs twice as wide on the
-//    display; 1.5 for 2 top and bottom. -DOLD_RULE computes it as before: those checks fail.
-//    Each eye: a glyph of h lines is drawn w * h / ratio columns wide, and shown ratio times wider: the same
-//    aspect as in 2D (checked for 2D, side by side and top and bottom)
+//    and 0.5 top and bottom (GraphicContext.cpp, ResInfo()); libass draws its glyphs par times wider (libass 0.17.5,
+//    ass_render.c: the outline transform multiplies x by par_scale_x; 1.2.2 read it the other way round and gave
+//    the ratio itself: four times as wide; measured with the libass of the build in libass_par_test.cpp). The ratio
+//    was turned around as 2 - ratio (Kodi 20 to 22): 0 side by side, libass's default, the glyphs twice as wide on
+//    the display; 1.5 for 2 top and bottom. -DOLD_RULE computes it as before: those checks fail.
+//    Each eye: a glyph of h lines is drawn w * par columns wide, and shown ratio times wider: the same aspect as in
+//    2D (checked for 2D, side by side and top and bottom)
 //  - the badge of Dolby Atmos (HadesPlayerInfo.h, AudioBadge()): "+ objects" passed through, "no Atmos" decoded
 //  - holding Start on a game controller (joystick.xml): the player information, in FullscreenVideo and
 //    FullscreenInfo, the short press as it was
@@ -98,11 +99,11 @@ void Subtitles()
 {
   // libass's par as it uses it: 0 is its default, which with no storage size is square (ass_render.c)
   const auto used = [](double par) { return par == 0.0 ? 1.0 : par; };
-  // a glyph of 100 lines that is 60 columns wide on square pixels: its columns in the frame, and its width on the
-  // display, where each pixel is shown 'ratio' times as wide as tall
+  // a glyph of 100 lines that is 60 columns wide on square pixels: its columns in the frame (libass: par times
+  // wider), and its width on the display, where each pixel is shown 'ratio' times as wide as tall
   const auto shownAspect = [&](float ratio)
   {
-    const double columns = 60.0 / used(Par(ratio));
+    const double columns = 60.0 * used(Par(ratio));
     return columns * static_cast<double>(ratio) / 100.0;
   };
   check(std::fabs(shownAspect(1.0f) - 0.6) < 1e-9, "2D, square pixels: the glyph as it is");
@@ -315,7 +316,9 @@ void Exit3D()
   check(Has(full, "if (!appPlayer->IsPlayingVideo() && m_nextStereoMode != RenderStereoMode::OFF &&") &&
             Has(full, "CSettings::SETTING_VIDEOPLAYER_QUITSTEREOMODEONSTOP") &&
             Has(full, "        m_stereoMode = RenderStereoMode::OFF;\n        m_nextStereoMode = "
-                      "RenderStereoMode::OFF;\n        SetVideoResolution(targetResolutionOnStop, false);"),
+                      "RenderStereoMode::OFF;\n") &&
+            // (1.2.3: forced, r3d_test.cpp: the menus' resolution is often the one the video played in)
+            Has(full, "        SetVideoResolution(targetResolutionOnStop, true);\n        CServiceBroker::GetGUI()"),
         "a 3D playback that stops: 3D off with the change of resolution of the menus, one mode set");
   const std::string sm = Read("xbmc/guilib/StereoscopicsManager.cpp");
   check(Has(sm, "  if (currentMode != mode)\n  {\n    CServiceBroker::GetWinSystem()->GetGfxContext().SetStereoMode(mode);"),

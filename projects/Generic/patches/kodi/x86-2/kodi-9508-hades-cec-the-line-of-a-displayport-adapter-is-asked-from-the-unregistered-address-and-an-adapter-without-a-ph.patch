@@ -1,0 +1,255 @@
+From 965ac828c02c9ce7ee960cc7f387a50e6cfa5976 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:59:25 +0000
+Subject: [PATCH] [Hades][CEC] The line of a DisplayPort adapter is asked from
+ the unregistered address, and an adapter without a physical address is opened
+ once it has one
+
+1.2 asks the line of a kernel adapter with a poll of the TV from the
+unregistered address (0xf0) before libCEC opens it, so that a line on
+which nothing answers (issue #24: the DisplayPort output whose converter
+passes no CEC, every message timed out) is not opened by libCEC, whose
+open waited there for minutes. But the kernel refuses every message of
+an adapter that needs the HPD of its display while it has no logical
+address, that poll too (cec_transmit_msg_fh(): "adapter is unconfigured
+and needs HPD", -ENONET), and every CEC adapter of a DisplayPort output
+is one (drm_dp_cec.c sets CEC_CAP_NEEDS_HPD). So on the very adapters
+issue #24 is about, the poll said nothing, and libCEC opened the line as
+before.
+
+AskLine() now plans the poll by what the adapter is (CEC_LINE::
+PlanPoll()): one that needs the HPD is given the unregistered address
+first (CEC_LOG_ADDR_TYPE_UNREGISTERED, which the kernel takes without
+polls, as libCEC's own open sets it), asked, and left without a logical
+address again for libCEC's open; one with logical addresses set by
+someone is not asked, as before.
+
+Such an adapter without a physical address (its display is not there,
+or is off behind the converter) can send nothing at all: libCEC's open
+failed on it every 10 s with "Could not initialise CEC adapter". It is
+now opened as soon as it has a physical address, looked at every second,
+and kodi.log says when it has none and when it has one.
+
+TestPeripheralCecState: the plan of the poll for each kind of adapter.
+---
+ .../devices/PeripheralCecAdapter.cpp          | 78 ++++++++++++++++++-
+ xbmc/peripherals/devices/PeripheralCecLine.h  | 43 ++++++++++
+ .../test/TestPeripheralCecState.cpp           | 19 +++++
+ 3 files changed, 136 insertions(+), 4 deletions(-)
+
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+index 8fc316d..0a7de21 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -386,8 +386,10 @@ bool CPeripheralCecAdapter::OpenConnection(void)
+       CServiceBroker::GetResourcesComponent().GetLocalizeStrings().Get(36000), strMessage);
+ 
+   bool bConnectionFailedDisplayed(false);
+-  // Hades: whether the log said that nothing answers on the line
++  // Hades: whether the log said that nothing answers on the line, or that the adapter has no
++  // physical address
+   bool deadTold = false;
++  bool noAddressTold = false;
+ 
+   while (!m_bStop && !bIsOpen)
+   {
+@@ -405,6 +407,26 @@ bool CPeripheralCecAdapter::OpenConnection(void)
+         asked);
+     if (m_bStop)
+       continue;
++    // Hades: an adapter of a DisplayPort output without a physical address can send nothing: it is
++    // opened once its display is there (CEC_LINE::PollPlan::NO_ADDRESS), without an open of libCEC
++    // that fails every 10 s with "could not initialise" meanwhile
++    if (line == CEC_LINE::Line::NO_ADDRESS)
++    {
++      if (!noAddressTold)
++        CLog::Log(LOGINFO,
++                  "CEC: the adapter {} has no physical address: the display behind its output is "
++                  "not there (or is off, behind a DisplayPort converter); it is opened as soon as "
++                  "it has one",
++                  m_strComPort);
++      noAddressTold = true;
++      WaitUnlessStopped(std::chrono::seconds(CEC_LINE::NO_ADDRESS_SECONDS));
++      continue;
++    }
++    if (noAddressTold)
++    {
++      CLog::Log(LOGINFO, "CEC: the adapter {} has a physical address now", m_strComPort);
++      noAddressTold = false;
++    }
+     if (line == CEC_LINE::Line::DEAD)
+     {
+       if (!deadTold)
+@@ -2140,23 +2162,71 @@ CEC_LINE::Line CPeripheralCecAdapter::AskLine()
+   const int fd = open(m_strComPort.c_str(), O_RDWR | O_CLOEXEC);
+   if (fd < 0)
+     return CEC_LINE::Line::UNKNOWN;
+-  // (an adapter that has logical addresses is in use, by libCEC or by another program: not asked)
++  // (an adapter that has logical addresses is in use, by libCEC or by another program: not asked;
++  // Hades: one that needs the hot-plug of its display is given the unregistered address first,
++  // CEC_LINE::PlanPoll())
++  struct cec_caps caps = {};
+   struct cec_log_addrs addrs = {};
+-  if (ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &addrs) != 0 || addrs.log_addr_mask != 0)
++  uint16_t physicalAddress = CEC_PHYS_ADDR_INVALID;
++  if (ioctl(fd, CEC_ADAP_G_CAPS, &caps) != 0 || ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &addrs) != 0 ||
++      ioctl(fd, CEC_ADAP_G_PHYS_ADDR, &physicalAddress) != 0)
+   {
+     close(fd);
+     return CEC_LINE::Line::UNKNOWN;
+   }
++  const CEC_LINE::PollPlan plan =
++      CEC_LINE::PlanPoll((caps.capabilities & CEC_CAP_NEEDS_HPD) != 0, physicalAddress,
++                         addrs.num_log_addrs, addrs.log_addr_mask);
++  if (plan == CEC_LINE::PollPlan::IN_USE)
++  {
++    close(fd);
++    return CEC_LINE::Line::UNKNOWN;
++  }
++  if (plan == CEC_LINE::PollPlan::NO_ADDRESS)
++  {
++    close(fd);
++    return CEC_LINE::Line::NO_ADDRESS;
++  }
++  if (plan == CEC_LINE::PollPlan::CLAIM_FIRST)
++  {
++    // (the unregistered address, as libCEC's own open sets it first; taken at once, no polls)
++    struct cec_log_addrs unregistered = {};
++    unregistered.cec_version = CEC_OP_CEC_VERSION_1_4;
++    unregistered.vendor_id = CEC_VENDOR_ID_NONE;
++    unregistered.num_log_addrs = 1;
++    unregistered.log_addr[0] = CEC_LOG_ADDR_UNREGISTERED;
++    unregistered.log_addr_type[0] = CEC_LOG_ADDR_TYPE_UNREGISTERED;
++    unregistered.primary_device_type[0] = CEC_OP_PRIM_DEVTYPE_SWITCH;
++    unregistered.all_device_types[0] = CEC_OP_ALL_DEVTYPE_SWITCH;
++    if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &unregistered) != 0 || unregistered.log_addr_mask == 0)
++    {
++      struct cec_log_addrs none = {};
++      ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &none);
++      close(fd);
++      CLog::Log(LOGDEBUG,
++                "CEC: the line of {} could not be asked: the unregistered address was "
++                "not taken",
++                m_strComPort);
++      return CEC_LINE::Line::UNKNOWN;
++    }
++  }
+   // a poll from the unregistered address to the TV, blocking: the kernel returns once the line
+   // gave a result or its retries ended
+   struct cec_msg poll = {};
+   poll.len = 1;
+   poll.msg[0] = 0xf0;
+   const bool transmitted = ioctl(fd, CEC_TRANSMIT, &poll) == 0;
++  if (plan == CEC_LINE::PollPlan::CLAIM_FIRST)
++  {
++    // (left as it was found: no logical address, for libCEC's open)
++    struct cec_log_addrs none = {};
++    ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &none);
++  }
+   close(fd);
+   const CEC_LINE::Line line = CEC_LINE::Of(transmitted, poll.tx_status);
+-  CLog::Log(LOGDEBUG, "CEC: a poll of the TV on the line of {}: {} (tx_status 0x{:02x})",
++  CLog::Log(LOGDEBUG, "CEC: a poll of the TV on the line of {}{}: {} (tx_status 0x{:02x})",
+             m_strComPort,
++            plan == CEC_LINE::PollPlan::CLAIM_FIRST ? ", from the unregistered address" : "",
+             line == CEC_LINE::Line::ALIVE  ? "a result of the line"
+             : line == CEC_LINE::Line::DEAD ? "no result of the line"
+                                            : "nothing said",
+diff --git a/xbmc/peripherals/devices/PeripheralCecLine.h b/xbmc/peripherals/devices/PeripheralCecLine.h
+index 3c2a0ba..a93c0cb 100644
+--- a/xbmc/peripherals/devices/PeripheralCecLine.h
++++ b/xbmc/peripherals/devices/PeripheralCecLine.h
+@@ -39,6 +39,9 @@ enum class Line
+   ALIVE, //!< the poll got a result of the line: an acknowledgement, or a negative one
+   DEAD, //!< it got no result of the line at all
+   UNKNOWN, //!< the poll could not be asked, or ended without saying (aborted)
++  //! Hades: an adapter that needs the hot-plug of its display has no physical address yet: it can
++  //! send nothing, and libCEC is not asked to open it until it has one (PollPlan::NO_ADDRESS)
++  NO_ADDRESS,
+ };
+ 
+ //! The bits of tx_status of the kernel's struct cec_msg (linux/cec.h), here so that this is tested
+@@ -67,6 +70,46 @@ constexpr Line Of(bool transmitted, uint8_t status)
+   return Line::UNKNOWN;
+ }
+ 
++/*!
++ * \brief How the line of an adapter is asked (CPeripheralCecAdapter::AskLine())
++ *
++ * The kernel refuses every message of an adapter that needs the hot-plug of its display
++ * (CEC_CAP_NEEDS_HPD: the adapters of DisplayPort outputs, drm_dp_cec.c, which issue 24 is about)
++ * while it has no logical address, the poll of the unregistered address too (cec_transmit_msg_fh():
++ * "adapter is unconfigured and needs HPD", -ENONET). So in 1.2 the poll of such an adapter said
++ * nothing, and libCEC opened the line of issue 24 as before. Such an adapter is given the
++ * unregistered address first (CEC_LOG_ADDR_TYPE_UNREGISTERED, which the kernel takes without
++ * polls, as libCEC's own open does), asked, and left as it was; without a physical address it can
++ * send nothing at all, and it is not opened until it has one.
++ */
++enum class PollPlan
++{
++  AS_IS, //!< the poll of the unregistered address, as it is
++  CLAIM_FIRST, //!< the unregistered address first, the poll, and the address taken away again
++  NO_ADDRESS, //!< no physical address on an adapter that needs one: nothing can be sent yet
++  IN_USE, //!< logical addresses set by someone (libCEC, another program): not asked
++};
++
++//! \param needsHpd CEC_CAP_NEEDS_HPD of the adapter
++//! \param physicalAddress its physical address (CEC_ADAP_G_PHYS_ADDR); 0xffff for none
++//! \param logicalAddresses num_log_addrs of CEC_ADAP_G_LOG_ADDRS
++//! \param claimed log_addr_mask of CEC_ADAP_G_LOG_ADDRS
++constexpr PollPlan PlanPoll(bool needsHpd,
++                            uint16_t physicalAddress,
++                            unsigned int logicalAddresses,
++                            uint16_t claimed)
++{
++  if (logicalAddresses != 0 || claimed != 0)
++    return PollPlan::IN_USE;
++  if (!needsHpd)
++    return PollPlan::AS_IS;
++  return physicalAddress == 0xffff ? PollPlan::NO_ADDRESS : PollPlan::CLAIM_FIRST;
++}
++
++//! How long the thread of the adapter waits between two looks at an adapter without a physical
++//! address (PollPlan::NO_ADDRESS), in seconds
++inline constexpr int NO_ADDRESS_SECONDS = 1;
++
+ //! A line is given up on (libCEC is not asked to open it) after this many polls in a row that got no
+ //! result: one may be a line that is busy
+ inline constexpr int DEAD_IN_ROW = 2;
+diff --git a/xbmc/peripherals/test/TestPeripheralCecState.cpp b/xbmc/peripherals/test/TestPeripheralCecState.cpp
+index ffdceb3..ccdcf45 100644
+--- a/xbmc/peripherals/test/TestPeripheralCecState.cpp
++++ b/xbmc/peripherals/test/TestPeripheralCecState.cpp
+@@ -6,6 +6,7 @@
+  *  See LICENSES/README.md for more information.
+  */
+ 
++#include "peripherals/devices/PeripheralCecLine.h"
+ #include "peripherals/devices/PeripheralCecState.h"
+ 
+ #include <chrono>
+@@ -200,3 +201,21 @@ TEST(TestPeripheralCecState, ALongLossWithoutAFailedClaimIsNotAskedAgain)
+     EXPECT_FALSE(run.Look(Claiming()).reclaim);
+ }
+ 
++TEST(TestPeripheralCecState, ThePollOfALineThatNeedsTheHotPlug)
++{
++  using CEC_LINE::PlanPoll;
++  using CEC_LINE::PollPlan;
++  // the adapter of a DisplayPort output (CEC_CAP_NEEDS_HPD) with a display: the unregistered
++  // address first, else the kernel refuses the poll (1.2 asked it as it was: nothing said)
++  EXPECT_TRUE(PlanPoll(true, 0x1000, 0, 0) == PollPlan::CLAIM_FIRST);
++  // ... without a display: nothing can be sent, libCEC waits
++  EXPECT_TRUE(PlanPoll(true, 0xffff, 0, 0) == PollPlan::NO_ADDRESS);
++  // an adapter that does not need it: as before
++  EXPECT_TRUE(PlanPoll(false, 0x1000, 0, 0) == PollPlan::AS_IS);
++  EXPECT_TRUE(PlanPoll(false, 0xffff, 0, 0) == PollPlan::AS_IS);
++  // logical addresses set by someone, claimed or not: not asked, whatever the rest
++  EXPECT_TRUE(PlanPoll(true, 0x1000, 1, 0) == PollPlan::IN_USE);
++  EXPECT_TRUE(PlanPoll(true, 0x1000, 1, 1u << 4) == PollPlan::IN_USE);
++  EXPECT_TRUE(PlanPoll(false, 0x1000, 0, 1u << 15) == PollPlan::IN_USE);
++  EXPECT_TRUE(PlanPoll(true, 0xffff, 1, 0) == PollPlan::IN_USE);
++}
+-- 
+2.53.0
+

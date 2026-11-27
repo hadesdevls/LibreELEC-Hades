@@ -227,10 +227,14 @@ bluetooth() {
   done
   echo "btusb: enable_autosuspend=$(cat /sys/module/btusb/parameters/enable_autosuspend 2>/dev/null) (Y: a USB controller may sleep while no device is connected to it)"
   echo "iwlwifi: bt_coex_active=$(cat /sys/module/iwlwifi/parameters/bt_coex_active 2>/dev/null)"
+  # (Hades, 1.2.3: and the rates of the link, and the regulatory domain that the kernel applies, which decides the
+  # channels and bands that may be used: a network share over Wi-Fi at 2.4 GHz sent less than a 3D film takes, on a
+  # laptop whose 5 and 6 GHz bands iwd could not rate)
   for n in /sys/class/net/*; do
     [ -d $n/wireless ] || continue
-    echo "${n##*/}: $(lim iw dev ${n##*/} link | grep -E 'freq:|signal:|Not connected' | tr -s ' \t\n' ' ')"
+    echo "${n##*/}: $(lim iw dev ${n##*/} link | grep -E 'freq:|signal:|rx bitrate:|tx bitrate:|Not connected' | tr -s ' \t\n' ' ')"
   done
+  echo "wireless regulatory domain: $(lim iw reg get | grep -m 1 -E '^country' | tr -s ' \t' ' ')"
   echo "== rfkill"; lim rfkill list
   echo "== the service and the settings that BlueZ runs with"
   echo "bluetooth: $(lim systemctl is-active bluetooth)"

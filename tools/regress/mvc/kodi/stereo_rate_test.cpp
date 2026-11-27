@@ -667,15 +667,44 @@ int main()
     a.pictureRate = 24.0;
     Check(Describe(uhd, Output(o, u24, Src::FRAME_PACKED_MVC, a), u24) == "FP 1920x1080@24.000",
           "2160p24 desktop: frame packing at 1080p24, another size (the largest that has it)");
-    // (Hades, 1.2.2: a half layout of fewer lines than Kodi's mode is never taken: it would halve each eye
-    // again, both ways. Side by side and top and bottom of a 2160p mode go out at 2160p, told to the display
-    // where it declares them there, else not told; frame packing still goes to 1080p24, where it exists.)
+    // (Hades, 1.2.3: where the display takes a half layout only at fewer lines than Kodi's mode, "Switch the
+    // display to 3D (HDMI)" decides. Automatic, the default (Allowed::fewerLines): the largest timing of that rate
+    // that has it, told, so that the display switches to 3D by itself (most 3D TVs declare 3D only up to 1080p;
+    // an RTX 5050 with such a TV stayed in 2D at 2160p with 1.2.2). "Automatic, keep 2160p": 2D at 2160p, the
+    // display switched by hand, each eye at 1920x2160, as 1.2.2 did for every display. Frame packing still goes
+    // to 1080p24, where it exists.)
     a.pictureRate = 60.0;
-    Check(Describe(uhd, Output(o, u60, Src::SBS_HALF, a), u60) == "2D",
-          "2160p60 desktop, SBS only at 1440p and 1080p: 2D at 2160p, not SBS of fewer lines");
+    Check(Describe(uhd, Output(o, u60, Src::SBS_HALF, a), u60) == "SBS 2560x1440@60.000",
+          "2160p60 desktop, SBS only at 1440p and 1080p, Automatic: SBS at 1440p60, the largest that has it");
     a.pictureRate = 30.0;
-    Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, a), u30) == "2D",
-          "2160p30 desktop, SBS only at 1440p60: 2D at 2160p, not SBS of fewer lines at twice the rate");
+    Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, a), u30) == "SBS 2560x1440@60.000 x2",
+          "2160p30 desktop, SBS only at 1440p60, Automatic: SBS at 1440p60, twice the rate");
+    {
+      Allowed keep;
+      keep.fewerLines = false;
+      keep.pictureRate = 60.0;
+      Check(Describe(uhd, Output(o, u60, Src::SBS_HALF, keep), u60) == "2D",
+            "2160p60 desktop, SBS only at 1440p and 1080p, Automatic, keep 2160p: 2D at 2160p, not SBS of fewer lines");
+      keep.pictureRate = 30.0;
+      Check(Describe(uhd, Output(o, u30, Src::SBS_HALF, keep), u30) == "2D",
+            "2160p30 desktop, SBS only at 1440p60, Automatic, keep 2160p: 2D at 2160p, not at twice the rate either");
+      // frame packing is not changed by it
+      keep.pictureRate = 24.0;
+      Check(Describe(uhd, Output(o, u24, Src::FRAME_PACKED_MVC, keep), u24) == "FP 1920x1080@24.000",
+            "2160p24 desktop, Automatic, keep 2160p: frame packing at 1080p24 all the same");
+      // never fewer lines than a 3D film has (1080), at Automatic either: a 720p60 SBS is not taken from 2160p60
+      Display low = uhd;
+      for (Mode& m : low.modes)
+        if (LayoutOf(m.flags) == Layout::SIDE_BY_SIDE_HALF)
+          m.flags &= ~FLAG_3D_MASK;
+      Mode p720 = Timing(1280, 720, 60, false);
+      low.modes.push_back(p720);
+      low.modes.push_back(As(p720, FLAG_3D_SIDE_BY_SIDE_HALF));
+      Allowed automatic;
+      automatic.pictureRate = 60.0;
+      Check(Describe(low, Output(OffersOf(low), u60, Src::SBS_HALF, automatic), u60) == "2D",
+            "2160p60 desktop, SBS only at 720p60, Automatic: 2D, never fewer lines than a film has");
+    }
     {
       // a 1080p60 desktop on the same display: SBS of its own size, as before
       const int p60 = Find(uhd.modes, 1080, 60.0);

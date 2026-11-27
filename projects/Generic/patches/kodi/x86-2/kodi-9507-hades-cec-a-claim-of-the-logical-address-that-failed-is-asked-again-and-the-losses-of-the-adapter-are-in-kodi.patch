@@ -1,0 +1,692 @@
+From 7500d5a8a39a3fdd33509676e8a84e27b7427bff Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:59:25 +0000
+Subject: [PATCH] [Hades][CEC] A claim of the logical address that failed is
+ asked again, and the losses of the adapter are in kodi.log
+
+Issue #24, a report of 2026-11-26: with the picture and the sound on the
+DisplayPort output of an Intel board (a DisplayPort to HDMI converter
+with CEC tunnelling), the TV's remote did nothing in Kodi until a video
+started, and stopped after another video that changed the display mode
+(HLG, HDR). kodi.log had nothing of it.
+
+The CEC adapter of a DisplayPort output (drm_dp_cec.c) needs the HPD of
+its display (CEC_CAP_NEEDS_HPD): the kernel takes its logical address
+away whenever its physical address goes, at every hot-plug of the
+display and every detection of the output by i915, and claims it again
+by itself when the address comes back, with polls on the line. A claim
+that gets no answer (the port's IRQ_HPD masked after an HPD storm, which
+that PC's kernel log shows on DP-1; a busy line) fails, with
+CEC_LOG_ADDRS_FL_CONFIG_FAILED, and nothing asks again until the address
+changes once more: libCEC does not look at the logical addresses in the
+state changes of the adapter (its "TODO: handle
+ev.state_change.log_addr_mask change"). The adapter then acknowledges
+nothing the TV sends it, and the kernel refuses what libCEC sends.
+
+The thread of the adapter now looks at a kernel adapter once a second
+while libCEC uses it (CPeripheralCecAdapter::ProcessAdapterState(),
+PeripheralCecState.h):
+
+- a claim that failed is asked again with the logical addresses libCEC
+  set (CEC_ADAP_S_LOG_ADDRS, on a file that does not block), after 2, 4,
+  8, 16 and then every 30 s, until it works;
+- a loss of the logical address of 2 s or more is said in kodi.log, with
+  why (no physical address: the display is not there; a claim under way;
+  a claim that failed; the adapter gone), and its end, with how long it
+  lasted and how many shorter losses came before it, which are only
+  counted (one comes with every detection of the output);
+- a logical address other than the one before the loss, which libCEC
+  still sends from, opens the connection again.
+
+Kodi is not made the active source again by itself after a loss: while
+the adapter has no logical address the kernel drops what it receives,
+so a change of the input on the TV or a receiver meanwhile is not known,
+and that would take the input back from the user. The kernel says the
+physical address of the PC again once the claim works (<Report Physical
+Address>), as at libCEC's open.
+
+TestPeripheralCecState: the phases of an adapter, a short loss counted,
+a failed claim asked again with its waits, another logical address, an
+adapter that libCEC does not use, a long loss without a failed claim.
+---
+ .../devices/PeripheralCecAdapter.cpp          |  67 +++++
+ .../devices/PeripheralCecAdapter.h            |   8 +
+ xbmc/peripherals/devices/PeripheralCecState.h | 279 ++++++++++++++++++
+ xbmc/peripherals/test/CMakeLists.txt          |   1 +
+ .../test/TestPeripheralCecState.cpp           | 202 +++++++++++++
+ 5 files changed, 557 insertions(+)
+ create mode 100644 xbmc/peripherals/devices/PeripheralCecState.h
+ create mode 100644 xbmc/peripherals/test/TestPeripheralCecState.cpp
+
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+index b250c7c..8fc316d 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.cpp
+@@ -160,6 +160,9 @@ void CPeripheralCecAdapter::ResetMembers(void)
+   m_currentButton.iDuration = 0;
+   m_standbySent.SetValid(false);
+   m_configuration.Clear();
++  // Hades: a new connection watches its adapter from the start (ProcessAdapterState())
++  m_stateWatch = CEC_STATE::CWatch();
++  m_stateNext = {};
+ }
+ 
+ void CPeripheralCecAdapter::Announce(ANNOUNCEMENT::AnnouncementFlag flag,
+@@ -494,6 +497,9 @@ void CPeripheralCecAdapter::Process(void)
+     if (!m_bStop)
+       ProcessPictureChange();
+ 
++    if (!m_bStop)
++      ProcessAdapterState();
++
+     if (!m_bStop)
+       CThread::Sleep(5ms);
+   }
+@@ -2304,6 +2310,67 @@ void CPeripheralCecAdapter::ProcessPictureChange(void)
+   TellTakesNoTvInput();
+ }
+ 
++void CPeripheralCecAdapter::ProcessAdapterState(void)
++{
++#if defined(TARGET_LINUX)
++  if (!m_strComPort.starts_with("/dev/cec"))
++    return;
++  const auto now = std::chrono::steady_clock::now();
++  if (now < m_stateNext)
++    return;
++  m_stateNext = now + std::chrono::seconds(1);
++
++  CEC_STATE::Observation seen;
++  struct cec_log_addrs addrs = {};
++  const int fd = open(m_strComPort.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
++  if (fd >= 0)
++  {
++    uint16_t physicalAddress = CEC_PHYS_ADDR_INVALID;
++    if (ioctl(fd, CEC_ADAP_G_PHYS_ADDR, &physicalAddress) == 0 &&
++        ioctl(fd, CEC_ADAP_G_LOG_ADDRS, &addrs) == 0)
++    {
++      seen.asked = true;
++      seen.physicalAddress = physicalAddress;
++      seen.logicalAddresses = addrs.num_log_addrs;
++      seen.claimed = addrs.log_addr_mask;
++      seen.claimFailed = (addrs.flags & CEC_LOG_ADDRS_FL_CONFIG_FAILED) != 0;
++    }
++  }
++  std::string name = m_strComPort;
++  {
++    std::unique_lock lock(m_noteLock);
++    if (!m_noteAdapter.empty())
++      name += " (" + m_noteAdapter + ")";
++  }
++  const CEC_STATE::Action action = m_stateWatch.Next(seen, now, name);
++  if (action.reclaim && fd >= 0 && seen.asked)
++  {
++    // the logical addresses that libCEC set, asked again as they are (the kernel claims them in
++    // the background on this file, which is not blocking)
++    struct cec_log_addrs again = addrs;
++    again.flags &= CEC_LOG_ADDRS_FL_ALLOW_UNREG_FALLBACK | CEC_LOG_ADDRS_FL_ALLOW_RC_PASSTHRU |
++                   CEC_LOG_ADDRS_FL_CDC_ONLY;
++    if (ioctl(fd, CEC_ADAP_S_LOG_ADDRS, &again) != 0)
++      CLog::Log(LOGDEBUG,
++                "CEC: the claim of the logical address of {} could not be asked again: {}",
++                m_strComPort, strerror(errno));
++    else
++      CLog::Log(m_stateWatch.Reclaims() == 1 ? LOGINFO : LOGDEBUG,
++                "CEC: the claim of the logical address of {} is asked again (time {})",
++                m_strComPort, m_stateWatch.Reclaims());
++  }
++  if (fd >= 0)
++    close(fd);
++  if (!action.log.empty())
++    CLog::Log(LOGINFO, "{}", action.log);
++  if (action.reopen)
++  {
++    ReopenConnection(true);
++    return;
++  }
++#endif
++}
++
+ void CPeripheralCecAdapter::TellTakesNoTvInput(void)
+ {
+ #if defined(CEC_HADES_TAKES_NO_TV_INPUT)
+diff --git a/xbmc/peripherals/devices/PeripheralCecAdapter.h b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+index d4e13c8..6f37c46 100644
+--- a/xbmc/peripherals/devices/PeripheralCecAdapter.h
++++ b/xbmc/peripherals/devices/PeripheralCecAdapter.h
+@@ -43,6 +43,7 @@ public:
+ 
+ #include "PeripheralCecLine.h"
+ #include "PeripheralCecPicture.h"
++#include "PeripheralCecState.h"
+ #include "PeripheralHID.h"
+ #include "XBDateTime.h"
+ #include "input/cec/ICecInputProvider.h"
+@@ -172,6 +173,10 @@ private:
+   void WaitUnlessStopped(std::chrono::milliseconds duration);
+   //! Hades: the configuration made again when Kodi's picture moves to another output
+   void ProcessPictureChange(void);
++  //! Hades: the adapter of the kernel looked at once a second while libCEC uses it: a claim of its
++  //! logical address that failed is asked again, and its losses are said in the log (CEC_STATE,
++  //! issue #24)
++  void ProcessAdapterState(void);
+   //! Hades: libCEC told whether a route to Kodi takes the TV's input through this adapter
+   //! (CECSetTakesNoTvInput() of libcec-9015): not through an adapter of another output
+   void TellTakesNoTvInput(void);
+@@ -266,6 +271,9 @@ private:
+   mutable std::mutex m_noteLock;
+   std::string m_noteAdapter;
+   std::string m_notePicture;
++  //! Hades: ProcessAdapterState(): what the adapter was found to be, and when it is looked at next
++  CEC_STATE::CWatch m_stateWatch;
++  std::chrono::steady_clock::time_point m_stateNext{};
+ };
+ 
+ class CPeripheralCecAdapterUpdateThread : public CThread
+diff --git a/xbmc/peripherals/devices/PeripheralCecState.h b/xbmc/peripherals/devices/PeripheralCecState.h
+new file mode 100644
+index 0000000..5d8e025
+--- /dev/null
++++ b/xbmc/peripherals/devices/PeripheralCecState.h
+@@ -0,0 +1,279 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++namespace PERIPHERALS
++{
++namespace CEC_STATE
++{
++
++/*!
++ * \brief Hades: the state of a CEC adapter of the kernel while libCEC uses it, as the thread of
++ *        the adapter watches it (CPeripheralCecAdapter::ProcessAdapterState(), issue #24)
++ *
++ * The CEC adapter of a DisplayPort output (drm_dp_cec.c) has a physical address only while the
++ * display behind the output is there, and the kernel takes its logical addresses away whenever
++ * that address goes (CEC_CAP_NEEDS_HPD): at every hot-plug of the display (an AV receiver or a TV
++ * behind a DisplayPort to HDMI converter does one at many changes of the display mode, for HDR or
++ * a refresh rate), and at every detection of the output by i915 (intel_dp_set_edid() drops the
++ * address before it sets it again). When the address comes back, the kernel claims the logical
++ * addresses again by itself, with polls on the line; where none of them gets an answer (the
++ * interrupts of the output are polled after a storm of hot-plugs, so the converter's answers are
++ * not read; or the line is busy at that moment), the claim fails (CEC_LOG_ADDRS_FL_CONFIG_FAILED)
++ * and nothing asks again until the address goes and comes once more: libCEC does not handle it
++ * (its "TODO: handle ev.state_change.log_addr_mask change"), and the TV's remote did nothing from
++ * then on (issue #24: "when I switch to playing a different video (HLG or HDR), the CEC service
++ * stops working"). Nothing of it was in kodi.log.
++ *
++ * So the adapter is asked once a second: a claim that failed is asked again by the same request
++ * (CEC_ADAP_S_LOG_ADDRS with the logical addresses libCEC set), 2, 4, 8, 16 and then every 30 s;
++ * a loss of more than LONG_LOSS is said in kodi.log, and so is its end, and the shorter ones are
++ * counted in the next line. Once the logical address is back, the kernel says the physical address
++ * of the PC on the line again (<Report Physical Address>), as at the claim of libCEC's open, and the
++ * TV sends the keys of its remote to the device on the input it shows. Kodi is not made the active
++ * source again by itself: while the adapter has no logical address the kernel drops what it
++ * receives, so a change of input on the TV or a receiver meanwhile is not known, and Kodi would
++ * take the input back from what the user chose.
++ */
++
++//! What one look at the adapter found (CEC_ADAP_G_PHYS_ADDR, CEC_ADAP_G_LOG_ADDRS)
++struct Observation
++{
++  bool asked{false}; //!< the adapter could be opened and asked
++  uint16_t physicalAddress{0xffff}; //!< CEC_PHYS_ADDR_INVALID: none
++  unsigned int logicalAddresses{0}; //!< num_log_addrs: how many the user of the adapter set
++  uint16_t claimed{0}; //!< log_addr_mask: the ones claimed now
++  bool claimFailed{false}; //!< CEC_LOG_ADDRS_FL_CONFIG_FAILED
++};
++
++enum class Phase
++{
++  WORKING, //!< logical addresses claimed
++  GONE, //!< the adapter could not be opened (its output went, or it is being made again)
++  UNUSED, //!< no logical address was set on it (libCEC closed it)
++  NO_ADDRESS, //!< no physical address: the display behind its output is not there
++  CLAIMING, //!< a physical address, the claim of the logical addresses under way
++  FAILED, //!< the claim failed: nothing asks again by itself
++};
++
++constexpr Phase PhaseOf(const Observation& o)
++{
++  if (!o.asked)
++    return Phase::GONE;
++  if (o.logicalAddresses == 0)
++    return Phase::UNUSED;
++  if (o.claimed != 0)
++    return Phase::WORKING;
++  if (o.physicalAddress == 0xffff)
++    return Phase::NO_ADDRESS;
++  return o.claimFailed ? Phase::FAILED : Phase::CLAIMING;
++}
++
++//! A loss of the logical addresses shorter than this is not said by itself (an instant of every
++//! detection of the output), only counted
++inline constexpr std::chrono::milliseconds LONG_LOSS{2000};
++
++//! The waits before a claim that failed is asked again, the last one repeated
++inline constexpr int RECLAIM_SECONDS[] = {2, 4, 8, 16, 30};
++
++//! The lowest logical address of a mask; 0xff for none
++constexpr uint8_t FirstAddress(uint16_t mask)
++{
++  for (uint8_t a = 0; a < 16; ++a)
++  {
++    if (mask & (1u << a))
++      return a;
++  }
++  return 0xff;
++}
++
++//! What the caller does after a look
++struct Action
++{
++  bool reclaim{false}; //!< ask the kernel to claim the logical addresses again
++  //! the logical address is another one than before the loss: libCEC sends from the one it had,
++  //! which the kernel refuses; the connection is opened again
++  bool reopen{false};
++  std::string log; //!< a line for kodi.log (LOGINFO); empty for none
++};
++
++//! The physical address as CEC writes it ("1.0.0.0"); "none" for the invalid one
++inline std::string AddressText(uint16_t pa)
++{
++  if (pa == 0xffff)
++    return "none";
++  char text[16];
++  std::snprintf(text, sizeof(text), "%u.%u.%u.%u", (pa >> 12) & 0xf, (pa >> 8) & 0xf,
++                (pa >> 4) & 0xf, pa & 0xf);
++  return text;
++}
++
++class CWatch
++{
++public:
++  using Clock = std::chrono::steady_clock;
++
++  /*!
++   * \param o what the adapter says now
++   * \param now the time of the look
++   * \param name the adapter, for the log ("/dev/cec0 (DP-1)")
++   */
++  Action Next(const Observation& o, Clock::time_point now, const std::string& name)
++  {
++    Action action;
++    const Phase phase = PhaseOf(o);
++
++    if (phase == Phase::UNUSED)
++    {
++      // (libCEC is not using it: nothing is judged, and a loss under way is forgotten)
++      m_lost = false;
++      m_said = false;
++      m_saidPhases = 0;
++      m_failedSeen = false;
++      m_reclaims = 0;
++      return action;
++    }
++
++    if (phase == Phase::WORKING)
++    {
++      const uint8_t address = FirstAddress(o.claimed);
++      if (m_lost)
++      {
++        const auto lasted =
++            std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lostSince).count();
++        action.reopen = m_working != 0xff && address != m_working;
++        if (m_said || m_failedSeen || action.reopen)
++        {
++          char head[256];
++          std::snprintf(head, sizeof(head),
++                        "CEC: the adapter %s has its logical address again (%u, physical address "
++                        "%s) after %lld.%01lld s without it",
++                        name.c_str(), static_cast<unsigned int>(address),
++                        AddressText(o.physicalAddress).c_str(),
++                        static_cast<long long>(lasted / 1000),
++                        static_cast<long long>((lasted % 1000) / 100));
++          action.log = head;
++          if (m_reclaims)
++            action.log += ", by a claim that Kodi asked again (" + std::to_string(m_reclaims) +
++                          (m_reclaims == 1 ? " time)" : " times)");
++          if (m_short)
++            action.log += ", and " + std::to_string(m_short) + " shorter losses before it";
++          if (action.reopen)
++            action.log += ": it had " + std::to_string(m_working) +
++                          ", which libCEC still sends from: the connection is opened again";
++          m_short = 0;
++        }
++        else
++          ++m_short;
++      }
++      m_working = address;
++      m_lost = false;
++      m_said = false;
++      m_saidPhases = 0;
++      m_failedSeen = false;
++      m_reclaims = 0;
++      m_phase = phase;
++      return action;
++    }
++
++    if (!m_lost)
++    {
++      m_lost = true;
++      m_lostSince = now;
++      m_said = false;
++      m_saidPhases = 0;
++      m_failedSeen = false;
++      m_reclaims = 0;
++    }
++
++    if (phase == Phase::FAILED)
++    {
++      if (!m_failedSeen)
++      {
++        m_failedSeen = true;
++        m_nextReclaim = now + std::chrono::seconds(RECLAIM_SECONDS[0]);
++      }
++      else if (now >= m_nextReclaim)
++      {
++        action.reclaim = true;
++        const int last = static_cast<int>(std::size(RECLAIM_SECONDS)) - 1;
++        ++m_reclaims;
++        m_nextReclaim = now + std::chrono::seconds(RECLAIM_SECONDS[std::min(m_reclaims, last)]);
++      }
++    }
++
++    // said once a loss lasts, and again when the claim fails, or the adapter goes, meanwhile
++    const bool longNow = now - m_lostSince >= LONG_LOSS;
++    const unsigned int bit = 1u << static_cast<unsigned int>(phase);
++    const bool worse = (phase == Phase::FAILED || phase == Phase::GONE) && !(m_saidPhases & bit);
++    if (longNow && (!m_said || worse))
++    {
++      const char* why = "";
++      switch (phase)
++      {
++        case Phase::GONE:
++          why = "the adapter is gone (its output went away, or the kernel is making it again)";
++          break;
++        case Phase::NO_ADDRESS:
++          why = "it has no physical address: the display behind its output is not there, or is "
++                "being detected again";
++          break;
++        case Phase::CLAIMING:
++          why = "it has its physical address, and the kernel claims its logical address on the "
++                "line";
++          break;
++        case Phase::FAILED:
++          why = "the kernel's claim of its logical address got no answer on the line (the "
++                "interrupts of its output may be polled after a storm of hot-plugs, or the device "
++                "behind it is off), and nothing asks again by itself: Kodi asks again, after 2, 4, "
++                "8, 16 and then every 30 s";
++          break;
++        default:
++          break;
++      }
++      char text[640];
++      std::snprintf(
++          text, sizeof(text),
++          "CEC: the adapter %s has had no logical address for %lld s (physical address "
++          "%s): %s; the TV's remote does not reach Kodi through it meanwhile",
++          name.c_str(),
++          static_cast<long long>(
++              std::chrono::duration_cast<std::chrono::seconds>(now - m_lostSince).count()),
++          AddressText(o.physicalAddress).c_str(), why);
++      action.log = text;
++      m_said = true;
++      m_saidPhases |= bit;
++    }
++    m_phase = phase;
++    return action;
++  }
++
++  int Reclaims() const { return m_reclaims; }
++
++private:
++  Phase m_phase{Phase::UNUSED};
++  bool m_lost{false};
++  bool m_said{false};
++  unsigned int m_saidPhases{0};
++  bool m_failedSeen{false};
++  int m_reclaims{0};
++  int m_short{0};
++  uint8_t m_working{0xff};
++  Clock::time_point m_lostSince{};
++  Clock::time_point m_nextReclaim{};
++};
++
++} // namespace CEC_STATE
++} // namespace PERIPHERALS
+diff --git a/xbmc/peripherals/test/CMakeLists.txt b/xbmc/peripherals/test/CMakeLists.txt
+index 646ffde..23f4a8f 100644
+--- a/xbmc/peripherals/test/CMakeLists.txt
++++ b/xbmc/peripherals/test/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ set(SOURCES TestPeripheralCecKeys.cpp
+             TestPeripheralCecPicture.cpp
++            TestPeripheralCecState.cpp
+             TestPeripheralMappings.cpp)
+ 
+ core_add_test_library(test_peripherals)
+diff --git a/xbmc/peripherals/test/TestPeripheralCecState.cpp b/xbmc/peripherals/test/TestPeripheralCecState.cpp
+new file mode 100644
+index 0000000..ffdceb3
+--- /dev/null
++++ b/xbmc/peripherals/test/TestPeripheralCecState.cpp
+@@ -0,0 +1,202 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "peripherals/devices/PeripheralCecState.h"
++
++#include <chrono>
++#include <string>
++
++#include <gtest/gtest.h>
++
++using namespace PERIPHERALS;
++using CEC_STATE::Action;
++using CEC_STATE::CWatch;
++using CEC_STATE::Observation;
++using CEC_STATE::Phase;
++
++namespace
++{
++// The adapter of a DisplayPort output of issue #24 while libCEC uses it: logical address 1
++// (recording device 1), physical address 1.0.0.0
++Observation Working(uint16_t claimed = 1u << 1)
++{
++  Observation o;
++  o.asked = true;
++  o.physicalAddress = 0x1000;
++  o.logicalAddresses = 1;
++  o.claimed = claimed;
++  return o;
++}
++Observation NoAddress()
++{
++  Observation o = Working(0);
++  o.physicalAddress = 0xffff;
++  return o;
++}
++Observation Claiming()
++{
++  return Working(0);
++}
++Observation Failed()
++{
++  Observation o = Working(0);
++  o.claimFailed = true;
++  return o;
++}
++
++struct Watching
++{
++  CWatch watch;
++  CWatch::Clock::time_point now{std::chrono::seconds(1000)};
++  Action Look(const Observation& o, std::chrono::milliseconds after = std::chrono::seconds(1))
++  {
++    now += after;
++    return watch.Next(o, now, "/dev/cec0 (DP-1)");
++  }
++};
++} // namespace
++
++TEST(TestPeripheralCecState, ThePhaseOfAnAdapter)
++{
++  EXPECT_TRUE(CEC_STATE::PhaseOf(Working()) == Phase::WORKING);
++  EXPECT_TRUE(CEC_STATE::PhaseOf(NoAddress()) == Phase::NO_ADDRESS);
++  EXPECT_TRUE(CEC_STATE::PhaseOf(Claiming()) == Phase::CLAIMING);
++  EXPECT_TRUE(CEC_STATE::PhaseOf(Failed()) == Phase::FAILED);
++  EXPECT_TRUE(CEC_STATE::PhaseOf(Observation{}) == Phase::GONE);
++  Observation closed = Working(0);
++  closed.logicalAddresses = 0;
++  EXPECT_TRUE(CEC_STATE::PhaseOf(closed) == Phase::UNUSED);
++  EXPECT_EQ(1, CEC_STATE::FirstAddress(1u << 1));
++  EXPECT_EQ(4, CEC_STATE::FirstAddress((1u << 4) | (1u << 8)));
++  EXPECT_EQ(0xff, CEC_STATE::FirstAddress(0));
++  EXPECT_EQ(std::string("1.0.0.0"), CEC_STATE::AddressText(0x1000));
++  EXPECT_EQ(std::string("3.4.0.0"), CEC_STATE::AddressText(0x3400));
++  EXPECT_EQ(std::string("none"), CEC_STATE::AddressText(0xffff));
++}
++
++TEST(TestPeripheralCecState, AShortLossIsOnlyCounted)
++{
++  // a detection of the output by i915: the address goes and comes in a fraction of a second
++  Watching run;
++  EXPECT_TRUE(run.Look(Working()).log.empty());
++  EXPECT_TRUE(run.Look(NoAddress(), std::chrono::milliseconds(100)).log.empty());
++  EXPECT_TRUE(run.Look(Claiming(), std::chrono::milliseconds(300)).log.empty());
++  const Action back = run.Look(Working(), std::chrono::milliseconds(400));
++  EXPECT_TRUE(back.log.empty());
++  EXPECT_FALSE(back.reclaim);
++  EXPECT_FALSE(back.reopen);
++  // ... and said with the next loss that is said
++  run.Look(NoAddress());
++  const Action said = run.Look(NoAddress(), std::chrono::seconds(2));
++  EXPECT_NE(std::string::npos, said.log.find("has had no logical address for 2 s"));
++  EXPECT_NE(std::string::npos, said.log.find("/dev/cec0 (DP-1)"));
++  EXPECT_NE(std::string::npos, said.log.find("no physical address"));
++  const Action again = run.Look(Working());
++  EXPECT_NE(std::string::npos, again.log.find("has its logical address again (1, physical address "
++                                              "1.0.0.0) after 3.0 s"));
++  EXPECT_NE(std::string::npos, again.log.find("1 shorter losses before it"));
++}
++
++TEST(TestPeripheralCecState, AFailedClaimIsAskedAgain)
++{
++  // issue #24: after an HDR video the claim of the logical address got no answer on the line
++  Watching run;
++  run.Look(Working());
++  run.Look(NoAddress());
++  run.Look(Claiming());
++  // the claim failed: not asked at once (the line may still be busy)
++  Action a = run.Look(Failed());
++  EXPECT_FALSE(a.reclaim);
++  EXPECT_NE(std::string::npos, a.log.find("got no answer on the line"));
++  a = run.Look(Failed());
++  EXPECT_FALSE(a.reclaim);
++  a = run.Look(Failed());
++  EXPECT_TRUE(a.reclaim);
++  EXPECT_EQ(1, run.watch.Reclaims());
++  // said once: the claim under way, and failed again, says nothing more
++  EXPECT_TRUE(run.Look(Claiming()).log.empty());
++  a = run.Look(Failed());
++  EXPECT_TRUE(a.log.empty());
++  EXPECT_FALSE(a.reclaim);
++  // then 4 s after the first (two looks of it above), 8 s, 16 s and every 30 s
++  // (each wait at most a minute of looks: a test that never ends finds nothing)
++  int looks = 2;
++  do
++    ++looks;
++  while (!run.Look(Failed()).reclaim && looks < 60);
++  EXPECT_EQ(4, looks);
++  EXPECT_EQ(2, run.watch.Reclaims());
++  for (const int wait : {8, 16, 30, 30})
++  {
++    looks = 0;
++    do
++      ++looks;
++    while (!run.Look(Failed()).reclaim && looks < 60);
++    EXPECT_EQ(wait, looks);
++  }
++  // the claim works: said, with the number of times it was asked
++  const Action back = run.Look(Working());
++  EXPECT_FALSE(back.reopen);
++  EXPECT_NE(std::string::npos, back.log.find("has its logical address again (1"));
++  EXPECT_NE(std::string::npos, back.log.find("by a claim that Kodi asked again (6 times)"));
++  EXPECT_EQ(0, run.watch.Reclaims());
++}
++
++TEST(TestPeripheralCecState, AnotherLogicalAddressOpensTheConnectionAgain)
++{
++  Watching run;
++  run.Look(Working(1u << 1));
++  run.Look(Failed());
++  run.Look(Failed());
++  run.Look(Failed());
++  // the kernel claimed 2: libCEC sends from 1, which the kernel refuses
++  const Action back = run.Look(Working(1u << 2));
++  EXPECT_TRUE(back.reopen);
++  EXPECT_NE(std::string::npos, back.log.find("it had 1, which libCEC still sends from"));
++  // ... also after a short loss
++  Watching quick;
++  quick.Look(Working(1u << 1));
++  quick.Look(NoAddress(), std::chrono::milliseconds(200));
++  const Action other = quick.Look(Working(1u << 2), std::chrono::milliseconds(300));
++  EXPECT_TRUE(other.reopen);
++  EXPECT_FALSE(other.log.empty());
++}
++
++TEST(TestPeripheralCecState, AnAdapterThatLibCecDoesNotUseIsLeftAlone)
++{
++  Watching run;
++  Observation closed = Working(0);
++  closed.logicalAddresses = 0;
++  closed.claimFailed = true;
++  for (int i = 0; i < 40; ++i)
++  {
++    const Action a = run.Look(closed);
++    EXPECT_FALSE(a.reclaim);
++    EXPECT_TRUE(a.log.empty());
++  }
++  // the adapter that goes is said, once; libCEC opens it again by itself (CEC_ALERT_CONNECTION_LOST)
++  run.Look(Working());
++  run.Look(Observation{});
++  const Action gone = run.Look(Observation{}, std::chrono::seconds(2));
++  EXPECT_NE(std::string::npos, gone.log.find("the adapter is gone"));
++  EXPECT_FALSE(gone.reclaim);
++  EXPECT_TRUE(run.Look(Observation{}).log.empty());
++}
++
++TEST(TestPeripheralCecState, ALongLossWithoutAFailedClaimIsNotAskedAgain)
++{
++  // the receiver or the TV is off: no physical address; nothing is asked of the kernel
++  Watching run;
++  run.Look(Working());
++  for (int i = 0; i < 100; ++i)
++    EXPECT_FALSE(run.Look(NoAddress()).reclaim);
++  // a claim under way for long (every poll times out) is waited for
++  for (int i = 0; i < 30; ++i)
++    EXPECT_FALSE(run.Look(Claiming()).reclaim);
++}
++
+-- 
+2.53.0
+

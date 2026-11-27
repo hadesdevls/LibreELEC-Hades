@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:10:38 +0000
+Subject: [PATCH] nvidia-drm: HDMI 3D frame packing from a block linear
+ framebuffer too
+
+The frame packing patch of nvidia-drm takes a frame-packed frame only from
+a framebuffer of DRM_FORMAT_MOD_LINEAR: it makes a surface of each eye over
+the memory of the one framebuffer, the right eye from line vtotal, and in a
+pitch layout any line begins at a byte offset.
+
+NVIDIA's own EGL draws into no such buffer that can be scanned out. On an
+RTX 4080 SUPER with 620.73.04 (LibreELEC Hades 1.2.3, a 1080p24 frame-packed
+mode): its GBM refuses a 2048x2205 AR24 buffer of DRM_FORMAT_MOD_LINEAR for
+scanout and rendering (EINVAL); the window of its EGL with that modifier is
+in system memory, which has no NVKMS surface; and a dumb buffer of
+nvidia-drm, which is video memory, pitch linear, imported into EGL is no
+target of GL (glEGLImageTargetRenderbufferStorageOES: GL_INVALID_OPERATION,
+framebuffer incomplete). So the client read every frame back and copied it
+into a dumb buffer by the processor: 40.45 ms a frame on average, 45.48 ms
+at most, longer than a frame of 23.976 Hz (41.7 ms).
+
+What NVIDIA's EGL draws into and scans out is block linear. In an
+uncompressed block linear layout the lines are stored in block rows of
+8 << log2GobsPerBlockY lines, each pitch x that many bytes from the one
+before, and the memory of a block row read from its first byte is a block
+linear surface of the same pitch and block height. So a framebuffer of such
+a modifier is taken too, as long as its right eye begins on a block row:
+the first line at or after vtotal that begins one and lies a multiple of
+1024 bytes into the framebuffer (the offset alignment of an NVKMS surface),
+nv_drm_frame_packed_block_linear_row(). The client draws the right eye
+there (Kodi of LibreELEC Hades: DRMStereo.h, BlockLinearRightEyeRow(),
+which computes the same line), and the lines between the eyes are never
+read, as before: the display hardware makes the active space of the signal
+itself. Both surfaces are registered with the layout and block height of
+the modifier, as nv_drm_framebuffer_init() registers the framebuffer's own.
+
+Only uncompressed block linear modifiers of NVIDIA with a block of at most
+32 GOBs (those that nvidia-drm offers) are taken, and only from the first
+byte of the framebuffer's memory; any other is refused as before, and so is
+a block linear framebuffer with no such block row, with the reason in the
+kernel log ("Hades: HDMI 3D frame packing refused: ..."). A framebuffer of
+DRM_FORMAT_MOD_LINEAR is taken exactly as before. NVKMS validates both
+surfaces when it registers them, as before.
+---
+ kernel-open/nvidia-drm/nvidia-drm-fb.c | 102 +++++++++++++++++++++++--
+ 1 file changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/kernel-open/nvidia-drm/nvidia-drm-fb.c b/kernel-open/nvidia-drm/nvidia-drm-fb.c
+index 6a42b41..e0e98ec 100644
+--- a/kernel-open/nvidia-drm/nvidia-drm-fb.c
++++ b/kernel-open/nvidia-drm/nvidia-drm-fb.c
+@@ -358,12 +358,22 @@ struct drm_framebuffer *nv_drm_framebuffer_create(
+  * right eye one starts right_eye_row lines further. The lines of the active
+  * space are never read: the hardware fills that part of the signal itself.
+  *
+- * This is only possible if a line offset is a byte offset:
++ * This is only possible where the right eye begins at a byte offset whose
++ * memory holds its lines as those of a surface of their own:
+  *
+- *  - the memory layout has to be pitch. In a block linear surface the lines
+- *    are stored in blocks of 8 lines or more, and the right eye does not start
+- *    on a block. Without a format modifier the layout is not known here, so
+- *    the framebuffer has to be created with DRM_FORMAT_MOD_LINEAR;
++ *  - in a pitch layout, any line: the framebuffer has to be created with
++ *    DRM_FORMAT_MOD_LINEAR (without a format modifier the layout is not known
++ *    here);
++ *
++ *  - Hades: in an uncompressed block linear layout of NVIDIA, the lines are
++ *    stored in block rows of 8 << log2GobsPerBlockY lines, each pitch x that
++ *    many bytes, and a block row read from its first byte is a block linear
++ *    surface of the same pitch and block height. The right eye then starts on
++ *    the first block row at or after line right_eye_row (the vtotal of the
++ *    mode) that NVKMS takes an offset of
++ *    (nv_drm_frame_packed_block_linear_row()), and the client draws it there.
++ *    This is the layout that NVIDIA's EGL draws into: it draws into no pitch
++ *    linear buffer that can be scanned out;
+  *
+  *  - a single plane, so that both eyes are described by one offset;
+  *
+@@ -373,6 +383,52 @@ struct drm_framebuffer *nv_drm_framebuffer_create(
+  * Returns 0 and the two surfaces, which live as long as the framebuffer, or a
+  * negative errno if the framebuffer cannot be scanned out that way.
+  */
++
++/*
++ * Hades: whether a format modifier is an uncompressed block linear one of
++ * NVIDIA (DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D with no compression, a block of
++ * at most 32 GOBs: those that nvidia-drm offers).
++ */
++static bool nv_drm_modifier_is_plain_block_linear(uint64_t modifier)
++{
++    return ((modifier >> 56) == DRM_FORMAT_MOD_VENDOR_NVIDIA) &&
++           ((modifier & 0x10) != 0) &&
++           (((modifier >> 23) & 0x7) == 0) &&
++           ((modifier & 0xf) <= 5);
++}
++
++/*
++ * Hades: the line that the right eye begins on in an uncompressed block linear
++ * framebuffer of this modifier and pitch (in bytes): the first line at or after
++ * vtotal that begins a block row and lies a multiple of 1024 bytes into the
++ * framebuffer, the offset alignment of an NVKMS surface (nvkms-surface.c). 0
++ * where there is none. The client computes the same line to draw the right eye
++ * on (Kodi of LibreELEC Hades: DRMStereo.h, BlockLinearRightEyeRow()).
++ */
++static uint32_t nv_drm_frame_packed_block_linear_row(uint64_t modifier,
++                                                     uint32_t pitch,
++                                                     uint32_t vtotal)
++{
++    const uint32_t block_lines = 8u << (modifier & 0xf);
++    uint32_t row;
++    int step;
++
++    if ((pitch == 0) || ((pitch & 63) != 0) || (vtotal == 0)) {
++        return 0;
++    }
++
++    row = ((vtotal + block_lines - 1) / block_lines) * block_lines;
++
++    /* (a pitch of 64 bytes or more puts every 16th line on 1024 bytes) */
++    for (step = 0; step < 64; step++, row += block_lines) {
++        if ((((uint64_t)pitch * row) & 1023) == 0) {
++            return row;
++        }
++    }
++
++    return 0;
++}
++
+ int nv_drm_framebuffer_get_frame_packed_surfaces(
+     struct drm_framebuffer *fb,
+     uint32_t eye_height,
+@@ -387,6 +443,7 @@ int nv_drm_framebuffer_get_frame_packed_surfaces(
+     struct NvKmsKapiSurface *pLeftSurface, *pRightSurface;
+     enum NvKmsSurfaceMemoryFormat format;
+     uint64_t right_eye_offset;
++    bool block_linear = false;
+     int ret = -EINVAL;
+ 
+     /* The framebuffer has to be one that can be scanned out at all */
+@@ -402,15 +459,40 @@ int nv_drm_framebuffer_get_frame_packed_surfaces(
+     }
+ 
+     if (((fb->flags & DRM_MODE_FB_MODIFIERS) == 0) ||
+-        (fb->modifier != DRM_FORMAT_MOD_LINEAR)) {
++        ((fb->modifier != DRM_FORMAT_MOD_LINEAR) &&
++         !nv_drm_modifier_is_plain_block_linear(fb->modifier))) {
+         NV_DRM_FP_REFUSED(
+             nv_dev,
+             "it needs a framebuffer created with DRM_FORMAT_MOD_LINEAR "
+-            "(this one: flags 0x%x, modifier 0x%llx)",
++            "or an uncompressed block linear modifier of NVIDIA (this one: "
++            "flags 0x%x, modifier 0x%llx)",
+             fb->flags, (unsigned long long)fb->modifier);
+         return -EINVAL;
+     }
+ 
++    /*
++     * Hades: in a block linear framebuffer the right eye begins on a block
++     * row, from the first byte of the framebuffer's memory
++     */
++    if (fb->modifier != DRM_FORMAT_MOD_LINEAR) {
++        const uint32_t vtotal = right_eye_row;
++
++        right_eye_row = nv_drm_frame_packed_block_linear_row(fb->modifier,
++                                                             fb->pitches[0],
++                                                             vtotal);
++        if ((right_eye_row == 0) || (fb->offsets[0] != 0)) {
++            NV_DRM_FP_REFUSED(
++                nv_dev,
++                "in a block linear framebuffer (modifier 0x%llx, pitch %u, "
++                "at byte %u) no block row at or after line %u can begin the "
++                "right eye",
++                (unsigned long long)fb->modifier, fb->pitches[0],
++                fb->offsets[0], vtotal);
++            return -EINVAL;
++        }
++        block_linear = true;
++    }
++
+     if ((fb->format->num_planes != 1) ||
+         nv_drm_format_is_yuv(fb->format->format) ||
+         !nv_drm_format_to_nvkms_format(fb->format->format, &format)) {
+@@ -471,6 +553,12 @@ int nv_drm_framebuffer_get_frame_packed_surfaces(
+     params.format = format;
+     params.explicit_layout = true;
+     params.layout = NvKmsSurfaceMemoryLayoutPitch;
++    if (block_linear) {
++        /* Hades: the layout and block height of the framebuffer, as
++         * nv_drm_framebuffer_init() gives them for its own surface */
++        params.layout = NvKmsSurfaceMemoryLayoutBlockLinear;
++        params.log2GobsPerBlockY = fb->modifier & 0xf;
++    }
+ 
+     pLeftSurface = nvKms->createSurface(nv_dev->pDevice, &params);
+ 

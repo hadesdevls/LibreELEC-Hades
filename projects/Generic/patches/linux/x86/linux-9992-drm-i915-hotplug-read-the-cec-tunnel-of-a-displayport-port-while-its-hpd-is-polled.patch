@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:45:53 +0000
+Subject: [PATCH] drm/i915/hotplug: read the CEC tunnel of a DisplayPort port
+ while its HPD is polled
+
+A DisplayPort sink with CEC tunnelling (a DisplayPort to HDMI converter)
+tells the source that a CEC message came in, or that one it was given
+is sent or failed, with an IRQ_HPD: drm_dp_cec_irq() is called from the
+short pulse handler of the port. When an HPD storm is detected on the
+pin of the port, its interrupt is masked and the port is polled for two
+minutes (HPD_STORM_REENABLE_DELAY). For that time the adapter receives
+nothing (the keys of the TV's remote), every message it sends waits for
+the CEC core's timeout, and a claim of its logical addresses fails.
+
+The pin of a DisplayPort output storms where the display behind the
+converter, or an AV receiver between them, pulls its HPD several times
+in a row, as some do at a change of the display mode. Issue #24 of
+LibreELEC Hades: "HPD interrupt storm detected on connector DP-1" in
+the kernel log of an Intel board whose DisplayPort output carries CEC
+to an AV receiver and a TV, whose remote stopped working after a video
+that changed the display mode.
+
+So while the HPD pin of a DisplayPort connector is disabled, a delayed
+work reads its CEC tunnel every 100 ms, as the short pulse would have
+it read: drm_dp_cec_irq() reads DP_DEVICE_SERVICE_IRQ_VECTOR_ESI1 and
+handles a CEC_IRQ, and does nothing where the port has no CEC adapter.
+The work is queued when the storm switches the pin to polling, queues
+itself again while a DisplayPort pin is disabled, ends when none is,
+and is cancelled with the other detection work. The kernel log says
+which connector it is read for.
+---
+ .../gpu/drm/i915/display/intel_display_core.h |  6 ++
+ drivers/gpu/drm/i915/display/intel_hotplug.c  | 77 +++++++++++++++++++
+ 2 files changed, 83 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_core.h b/drivers/gpu/drm/i915/display/intel_display_core.h
+index c80b4a2..f28a7e8 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_core.h
++++ b/drivers/gpu/drm/i915/display/intel_display_core.h
+@@ -180,6 +180,12 @@ struct intel_hotplug {
+ 	u32 event_bits;
+ 	u32 retry_bits;
+ 	struct delayed_work reenable_work;
++	/*
++	 * Hades: the CEC tunnel of the DisplayPort connectors whose HPD pin is
++	 * disabled after a storm, serviced without the IRQ_HPD that it signals
++	 * with (intel_hpd_cec_poll_work())
++	 */
++	struct delayed_work cec_poll_work;
+ 
+ 	u32 long_hpd_pin_mask;
+ 	u32 short_hpd_pin_mask;
+diff --git a/drivers/gpu/drm/i915/display/intel_hotplug.c b/drivers/gpu/drm/i915/display/intel_hotplug.c
+index 5b97985..bfa9dd6 100644
+--- a/drivers/gpu/drm/i915/display/intel_hotplug.c
++++ b/drivers/gpu/drm/i915/display/intel_hotplug.c
+@@ -24,6 +24,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ 
++#include <drm/display/drm_dp_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ 
+@@ -105,6 +106,8 @@ enum hpd_pin intel_hpd_pin_default(enum port port)
+ #define HPD_STORM_DETECT_PERIOD		1000
+ #define HPD_STORM_REENABLE_DELAY	(2 * 60 * 1000)
+ #define HPD_RETRY_DELAY			1000
++/* Hades: how often the CEC tunnel of a port whose HPD is disabled is read */
++#define HPD_CEC_POLL_PERIOD		100
+ 
+ static enum hpd_pin
+ intel_connector_hpd_pin(struct intel_connector *connector)
+@@ -249,6 +252,11 @@ intel_hpd_irq_storm_switch_to_polling(struct intel_display *display)
+ 			 "HPD interrupt storm detected on connector %s: "
+ 			 "switching from hotplug detection to polling\n",
+ 			 connector->base.name);
++		if (connector->base.connector_type == DRM_MODE_CONNECTOR_DisplayPort)
++			drm_info(display->drm,
++				 "Hades: [CONNECTOR:%d:%s] its CEC tunnel, if it has one, is read every %d ms while its HPD is polled\n",
++				 connector->base.base.id, connector->base.name,
++				 HPD_CEC_POLL_PERIOD);
+ 
+ 		display->hotplug.stats[pin].state = HPD_DISABLED;
+ 		connector->base.polled = DRM_CONNECTOR_POLL_CONNECT |
+@@ -263,7 +271,72 @@ intel_hpd_irq_storm_switch_to_polling(struct intel_display *display)
+ 		mod_delayed_detection_work(display,
+ 					   &display->hotplug.reenable_work,
+ 					   msecs_to_jiffies(HPD_STORM_REENABLE_DELAY));
++		/* Hades: the CEC tunnels of the ports that are polled now */
++		mod_delayed_detection_work(display,
++					   &display->hotplug.cec_poll_work, 0);
++	}
++}
++
++/*
++ * Hades: a DisplayPort sink (a DisplayPort to HDMI converter with CEC
++ * tunnelling) tells the source that a CEC message came in, or that one it sent
++ * is done, with an IRQ_HPD, a short pulse of the HPD pin: drm_dp_cec_irq() is
++ * called from the short pulse handler. While the pin is disabled after an HPD
++ * storm (two minutes, HPD_STORM_REENABLE_DELAY), there are no pulses, so the
++ * adapter received nothing (the keys of the TV's remote) and every message it
++ * sent timed out; a claim of its logical addresses in that time failed, which
++ * left it without one until the next change of its physical address. Issue
++ * #24 of LibreELEC Hades: the CEC of a board's DisplayPort output stopped after
++ * a video that changed the display mode, and "HPD interrupt storm detected on
++ * connector DP-1" was in the kernel log of that PC. So the tunnel of such a
++ * port is read every HPD_CEC_POLL_PERIOD ms instead, as the short pulse would
++ * have it read (drm_dp_cec_irq() does nothing where the port has no CEC
++ * adapter), until the pin is enabled again.
++ */
++static void intel_hpd_cec_poll_work(struct work_struct *work)
++{
++	struct intel_display *display =
++		container_of(work, typeof(*display), hotplug.cec_poll_work.work);
++	struct drm_connector_list_iter conn_iter;
++	struct intel_connector *connector;
++	bool polled = false;
++
++	drm_connector_list_iter_begin(display->drm, &conn_iter);
++	for_each_intel_connector_iter(connector, &conn_iter) {
++		struct intel_encoder *encoder;
++		enum hpd_pin pin;
++		bool disabled;
++
++		if (connector->base.connector_type != DRM_MODE_CONNECTOR_DisplayPort ||
++		    connector->mst.dp)
++			continue;
++
++		encoder = intel_attached_encoder(connector);
++		if (!encoder || !intel_encoder_is_dp(encoder))
++			continue;
++
++		pin = intel_connector_hpd_pin(connector);
++		if (pin == HPD_NONE)
++			continue;
++
++		spin_lock_irq(&display->irq.lock);
++		disabled = display->hotplug.stats[pin].state == HPD_DISABLED;
++		spin_unlock_irq(&display->irq.lock);
++		if (!disabled)
++			continue;
++
++		polled = true;
++		drm_dp_cec_irq(&enc_to_intel_dp(encoder)->aux);
+ 	}
++	drm_connector_list_iter_end(&conn_iter);
++
++	if (!polled)
++		return;
++
++	spin_lock_irq(&display->irq.lock);
++	mod_delayed_detection_work(display, &display->hotplug.cec_poll_work,
++				   msecs_to_jiffies(HPD_CEC_POLL_PERIOD));
++	spin_unlock_irq(&display->irq.lock);
+ }
+ 
+ static void intel_hpd_irq_storm_reenable_work(struct work_struct *work)
+@@ -950,6 +1023,8 @@ void intel_hpd_init_early(struct intel_display *display)
+ 	INIT_WORK(&display->hotplug.poll_init_work, i915_hpd_poll_init_work);
+ 	INIT_DELAYED_WORK(&display->hotplug.reenable_work,
+ 			  intel_hpd_irq_storm_reenable_work);
++	INIT_DELAYED_WORK(&display->hotplug.cec_poll_work,
++			  intel_hpd_cec_poll_work);
+ 
+ 	display->hotplug.hpd_storm_threshold = HPD_STORM_DEFAULT_THRESHOLD;
+ 	/* If we have MST support, we want to avoid doing short HPD IRQ storm
+@@ -971,6 +1046,8 @@ static bool cancel_all_detection_work(struct intel_display *display)
+ 		was_pending = true;
+ 	if (cancel_delayed_work_sync(&display->hotplug.reenable_work))
+ 		was_pending = true;
++	if (cancel_delayed_work_sync(&display->hotplug.cec_poll_work))
++		was_pending = true;
+ 
+ 	return was_pending;
+ }
+-- 
+2.53.0
+

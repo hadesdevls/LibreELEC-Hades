@@ -14,7 +14,10 @@
 //   - the private data of files that FFmpeg wrote and read back (an MP4 with 'lhvC', a Matroska file made of it):
 //     the layer of the second view, or nothing;
 //   - the parameter sets of the second view looked for in packets (LookInPacket(), HvccWithSets()), the choice of
-//     NVIDIA's decoder (NvidiaDriverSeries(), NvdecForTwoViews()) and the disparity adjustment (LeftEyeShift()).
+//     NVIDIA's decoder (NvidiaDriverSeries(), NvdecForTwoViews()) and the disparity adjustment (LeftEyeShift());
+//   - the graphics card's decoder for the base view (HybridBaseForTwoViews(), HybridInsteadOf2D(): by default only
+//     where the processor alone does not keep up, the processor's path of 1.2.2 everywhere else) and what Kodi does
+//     with what each picture of the decoder says of its base view (HybridSaw()).
 // usage: mvhevc_choice_test <folder of MVHEVCS_*.bit> [<private data file> <layer|none>]...
 // Prints FAIL lines and "N checks, M failed".
 #include "MultiviewChoice.h"
@@ -575,6 +578,70 @@ static void NvdecChoice()
   std::printf("NVDEC: asked with a 610 driver or later only, never against the user or for MVC\n");
 }
 
+static void HybridChoice()
+{
+  using H = KODI::MULTIVIEW::HybridBase;
+  const auto f = [](int setting, bool slow, bool device = true, bool nvdec = false, bool allowed = true,
+                    bool failed = false, bool software = false, bool hevc = true) {
+    return HybridBaseForTwoViews(hevc, software, allowed, failed, nvdec, setting, slow, device);
+  };
+  // by default the processor decodes both views of a stream it keeps up with, as before the card's decoder came
+  CHECK(HYBRID_DEFAULT == HYBRID_WHERE_SLOW, "the default is not where the processor does not keep up");
+  CHECK(f(HYBRID_DEFAULT, false) == H::PROCESSOR_KEEPS_UP, "default, the processor keeps up: asked");
+  CHECK(f(HYBRID_DEFAULT, true) == H::ASKED, "default, the processor does not keep up: not asked");
+  CHECK(f(HYBRID_ALWAYS, false) == H::ASKED, "always: not asked");
+  CHECK(f(HYBRID_NEVER, true) == H::TURNED_OFF && f(HYBRID_NEVER, false) == H::TURNED_OFF, "never: asked");
+  CHECK(f(7, false) == H::PROCESSOR_KEEPS_UP && f(-1, true) == H::ASKED, "a value that is none not the default");
+  CHECK(f(HYBRID_ALWAYS, true, true, true) == H::NVDEC, "NVDEC for both: asked");
+  CHECK(f(HYBRID_ALWAYS, true, true, false, false) == H::NOT_ALLOWED, "hardware off: asked");
+  CHECK(f(HYBRID_ALWAYS, true, true, false, true, true) == H::FAILED_BEFORE, "failed before: asked");
+  CHECK(f(HYBRID_ALWAYS, true, true, false, true, false, true) == H::SOFTWARE, "software asked: asked");
+  CHECK(f(HYBRID_ALWAYS, true, true, false, true, false, false, false) == H::NOT_HEVC, "MVC: asked");
+  CHECK(f(HYBRID_ALWAYS, true, false) == H::NO_DEVICE, "no device: asked");
+  // the first reason that holds is the one said
+  CHECK(f(HYBRID_NEVER, false, false, false, false, true) == H::NOT_ALLOWED, "order of the reasons");
+  CHECK(f(HYBRID_DEFAULT, false, false) == H::PROCESSOR_KEEPS_UP, "order of the reasons");
+  for (H h : {H::ASKED, H::NOT_HEVC, H::SOFTWARE, H::NOT_ALLOWED, H::FAILED_BEFORE, H::NVDEC, H::TURNED_OFF,
+              H::PROCESSOR_KEEPS_UP, H::NO_DEVICE})
+    CHECK(HybridBaseWhyNot(h)[0] != '\0', "a reason without words");
+  // the processor did not keep up: the card for the base view once, then 2D
+  CHECK(HybridInsteadOf2D(false, false, H::ASKED), "slow: 2D before the card");
+  CHECK(!HybridInsteadOf2D(true, false, H::ASKED), "slow with the card: the card again, not 2D");
+  CHECK(!HybridInsteadOf2D(false, true, H::ASKED), "slow after the card was tried: the card again");
+  CHECK(!HybridInsteadOf2D(false, false, H::TURNED_OFF) && !HybridInsteadOf2D(false, false, H::NO_DEVICE),
+        "slow, the card not to be asked: asked");
+
+  using S = KODI::MULTIVIEW::HybridStep;
+  // checked, then used, then given up: the stream is opened again, once
+  HybridState a;
+  CHECK(HybridSaw(a, "checking", "") == S::NONE, "checking: a step");
+  CHECK(HybridSaw(a, "separate", "") == S::FIRST_SEPARATE, "the first used picture not said");
+  CHECK(HybridSaw(a, "separate", "") == S::NONE, "said twice");
+  CHECK(HybridSaw(a, "internal", "its picture of POC 9 is not this decoder's") == S::REOPEN, "given up after use: kept");
+  CHECK(HybridSaw(a, "internal", "its picture of POC 9 is not this decoder's") == S::NONE, "opened again twice");
+  // given up while it was checked: the processor goes on, said once
+  HybridState b;
+  CHECK(HybridSaw(b, "checking", "") == S::NONE, "checking: a step");
+  CHECK(HybridSaw(b, "internal", "the hardware device does not decode this stream's base layer (yuv420p)") ==
+            S::GIVEN_UP,
+        "given up before use: not said, or opened again");
+  CHECK(HybridSaw(b, "internal", "the same") == S::NONE, "said twice");
+  CHECK(HybridSaw(b, "separate", "") == S::NONE, "used after it was given up");
+  // a picture of the card returned after its decoder was given up (FFmpeg marks it so as it is returned), the first of
+  // the card that Kodi sees (set up while frame threads still decoded the picture that found the card wrong): not
+  // shown, the stream opened again
+  HybridState d;
+  CHECK(HybridSaw(d, "checking", "") == S::NONE, "checking: a step");
+  CHECK(HybridSaw(d, "separate", "its picture of POC 9 is not this decoder's") == S::REOPEN,
+        "a picture of the card given up, the first one seen: shown");
+  CHECK(HybridSaw(d, "internal", "its picture of POC 9 is not this decoder's") == S::NONE, "opened again twice");
+  // pictures that say nothing (an FFmpeg without the option): nothing
+  HybridState c;
+  CHECK(HybridSaw(c, "", "") == S::NONE && !c.separate && !c.givenUp, "nothing said: a step");
+  std::printf("graphics card for the base view: by default only where the processor alone does not keep up, once, "
+              "never against the user or NVDEC; the stream opened again where it was given up after use\n");
+}
+
 static void Disparity()
 {
   // 0.02 of 1920 (a value of iPhone's spatial video): 38.4 pixels between the eyes, 19.2 each, in steps of
@@ -609,6 +676,7 @@ int main(int argc, char** argv)
   Working();
   InBandSets(argv[1]);
   NvdecChoice();
+  HybridChoice();
   Disparity();
   for (int i = 2; i + 1 < argc; i += 2)
   {

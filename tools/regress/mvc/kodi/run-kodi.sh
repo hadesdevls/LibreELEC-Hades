@@ -7,7 +7,7 @@
 # says of the 3D output, the same header) and mvcc_count_test.cpp (finding 11 as Kodi reads
 # 'mvcC', xbmc/cores/VideoPlayer/MultiviewChoice.h). Each against the header as it is (must pass) and against
 # copies of it with one rule changed (each must fail). MUTATE=1 also runs mutate_range.py on every mutation site
-# of the choice (lines 316-481 of DRMStereo.h) and of what it reads of the modes (147-263): survivors are listed
+# of the choice (lines 330-495 of DRMStereo.h) and of what it reads of the modes (147-263): survivors are listed
 # for the reader. Prints STEREO-RATE PASSED / STEREO-SHOWN PASSED / MVCC PASSED, or FAILED.
 set -u
 . "$(dirname "$0")/../env.sh"
@@ -39,7 +39,9 @@ sem $T $H permission-ignored 's/  if (!allowed.doubleRate || std::fabs(allowed.p
 sem $T $H double-first 's/DETAIL::ChooseAtRate(offers, own, own.refresh, arrangement, allowed);/DETAIL::ChooseAtRate(offers, own, 2.0 * own.refresh, arrangement, allowed);/'
 sem $T $H loose-rate 's/std::fabs(offer.refresh - rate) < 0.01; };/std::fabs(offer.refresh - rate) < 0.1; };/'
 sem $T $H whitelist-ignored-at-twice 's/^          otherSize(offer))$/          true)/'
-sem $T $H half-fewer-lines-before 's/^        offer.height >= own.height \&\& half(offer).layout != Layout::NONE \&\&$/        enoughLines(offer) \&\& half(offer).layout != Layout::NONE \&\&/'
+sem $T $H half-fewer-lines-never 's/^        (allowed.fewerLines || offer.height >= own.height) \&\& enoughLines(offer) \&\&$/        offer.height >= own.height \&\& enoughLines(offer) \&\&/'
+sem $T $H half-fewer-lines-always 's/^        (allowed.fewerLines || offer.height >= own.height) \&\& enoughLines(offer) \&\&$/        enoughLines(offer) \&\&/'
+sem $T $H half-film-lines-off 's/^        (allowed.fewerLines || offer.height >= own.height) \&\& enoughLines(offer) \&\&$/        (allowed.fewerLines || offer.height >= own.height) \&\&/'
 sem $T $H 1080-line-rule-off 's/    return offer.height >= (own.height < FILM_LINES ? own.height : FILM_LINES);/    return offer.height >= 0 * (own.height < FILM_LINES ? own.height : FILM_LINES);/'
 sem $T $H triple-not-double 's/2.0 \* own.refresh/3.0 * own.refresh/'
 sem $T $H held-infoframe-any-mode 's/  return layoutMode \&\& held != 0 \&\& held != own;/  return (layoutMode || held) \&\& held != 0 \&\& held != own;/'
@@ -77,7 +79,7 @@ sem $T $M merge-of-32 's/if (baseSps.size() + moreSps.size() > 31 ||/if (baseSps
 [ $fails = 0 ] && echo "MVCC PASSED" || echo "MVCC FAILED ($fails)"
 if [ "${MUTATE:-}" = 1 ]; then
   export MVC_KODI=$K MVC_WORK=$D
-  python3 -I $TOOLS/kodi/mutate_range.py $TOOLS/kodi/stereo_rate_test.cpp xbmc/windowing/gbm/drm/DRMStereo.h 316 481
+  python3 -I $TOOLS/kodi/mutate_range.py $TOOLS/kodi/stereo_rate_test.cpp xbmc/windowing/gbm/drm/DRMStereo.h 330 495
   python3 -I $TOOLS/kodi/mutate_range.py $TOOLS/kodi/stereo_rate_test.cpp xbmc/windowing/gbm/drm/DRMStereo.h 147 263
 fi
 rm -rf $D/sem

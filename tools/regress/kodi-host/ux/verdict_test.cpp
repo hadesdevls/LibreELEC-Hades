@@ -196,6 +196,90 @@ int main()
     in.dropped = 3; // counted, but not sustained
     expect(Decide(in).code == "ok", "frames lost but not sustained: the sentence stays OK");
   }
+  {
+    // Hades: an HDR10+ video that "Play HDR10+ videos as Dolby Vision", on, did not send as Dolby Vision: the note of each
+    // of the four causes and what to do; none where the setting is off, where it went out as Dolby Vision, or for
+    // another video
+    SummaryInput h;
+    h.video = true;
+    h.source = "hdr10plus";
+    h.signal = "hdr10plus";
+    const auto one = [](const SummaryInput& in, const char* arg, const char* todo)
+    {
+      const std::vector<Note> notes = Notes(in);
+      return notes.size() == 1 && notes[0].code == "hdr10plus_not_dv" && notes[0].arg == arg &&
+             notes[0].todo == todo && notes[0].severity == Severity::NOTE;
+    };
+    h.hdr10PlusAsDv = "hdr10plus";
+    expect(one(h, "hdr10plus", "dvthisvideo"), "HDR10+ not as Dolby Vision, the display takes HDR10+: said, with Dolby "
+                                               "Vision for this video");
+    const Summary s = Decide(h);
+    expect(s.state == Severity::NOTE && s.code == "hdr10plus_not_dv" && s.arg == "hdr10plus" && s.todo == "dvthisvideo",
+           "... it is the sentence of the page");
+    h.hdr10PlusAsDv = "choice";
+    expect(one(h, "choice", "choice"), "HDR10+ not as Dolby Vision, another output chosen for the video: said");
+    h.signal = "pq";
+    h.hdr10PlusAsDv = "nodv";
+    h.dvReason = "nodv";
+    expect(one(h, "nodv", "tv"), "HDR10+ not as Dolby Vision, a display without Dolby Vision: said, the TV input to check");
+    h.dvReason = "rate";
+    expect(one(h, "nodv", "mode"), "HDR10+ not as Dolby Vision, no mode that carries it: said, the mode to check");
+    h.hdr10PlusAsDv = "off";
+    expect(Notes(h).empty(), "HDR10+ not as Dolby Vision with the setting off: nothing said");
+    h.hdr10PlusAsDv = "";
+    expect(Notes(h).empty(), "HDR10+ with nothing decided: nothing said");
+    h.hdr10PlusAsDv = "nodv";
+    h.signal = "dv";
+    expect(Notes(h).empty(), "HDR10+ sent as Dolby Vision: nothing said of it");
+    h.signal = "pq";
+    h.source = "hdr10";
+    expect(Notes(h).empty(), "an HDR10 video: nothing said of HDR10+");
+    // a Dolby Vision video on a display that takes HDR10+ and no Dolby Vision, sent as HDR10+: the page says that the
+    // display offers no Dolby Vision (as before)
+    SummaryInput d;
+    d.video = true;
+    d.source = "dolbyvision";
+    d.signal = "hdr10plus";
+    d.dvReason = "nodv";
+    const Summary sd = Decide(d);
+    expect(sd.state == Severity::WARN && sd.code == "dv_not_native" && sd.arg == "nodv" && sd.todo == "tv",
+           "Dolby Vision on a display with HDR10+ and without Dolby Vision: the display has none, said");
+  }
+  {
+    // Hades (1.2.3): an HDR10+ video that "Play HDR10+ videos as Dolby Vision", Always, sent as Dolby Vision to a display
+    // that takes HDR10+: said as a note, with the setting as what to do (its own HDR10+ is the more faithful picture
+    // there); nothing where Dolby Vision was chosen for the video (the page shows that choice), where it did not go out
+    // as Dolby Vision, or for another video
+    SummaryInput a;
+    a.video = true;
+    a.source = "hdr10plus";
+    a.dvState = "native";
+    a.signal = "dv";
+    a.rateFit = "exact";
+    const Summary plain = Decide(a);
+    expect(plain.code == "ok" && plain.state == Severity::OK, "HDR10+ made Dolby Vision, nothing to say: OK, as before");
+    a.hdr10PlusOver = "always";
+    const std::vector<Note> notes = Notes(a);
+    expect(notes.size() == 1 && notes[0].code == "hdr10plus_as_dv" && notes[0].arg == "always" &&
+               notes[0].todo == "hdr10plusmode" && notes[0].severity == Severity::NOTE,
+           "HDR10+ sent as Dolby Vision by Always to a display that takes HDR10+: said, with the setting");
+    const Summary s = Decide(a);
+    expect(s.state == Severity::NOTE && s.code == "hdr10plus_as_dv" && s.arg == "always" && s.todo == "hdr10plusmode",
+           "... it is the sentence of the page, a note and not a warning");
+    expect(s.head == plain.head, "... under the heading of what goes out, as before");
+    a.dvState = "";
+    expect(Notes(a).size() == 1, "... also where only the signal says Dolby Vision");
+    a.signal = "hdr10plus";
+    expect(Notes(a).empty(), "Always, but it did not go out as Dolby Vision: nothing said of it");
+    a.signal = "dv";
+    a.hdr10PlusOver = "choice";
+    expect(Notes(a).empty(), "Dolby Vision chosen for the video, a display that takes HDR10+: nothing said");
+    a.hdr10PlusOver = "";
+    expect(Notes(a).empty(), "sent as Dolby Vision to a display without HDR10+: nothing said");
+    a.hdr10PlusOver = "always";
+    a.source = "hdr10";
+    expect(Notes(a).empty(), "an HDR10 video: nothing said of HDR10+");
+  }
   expect(CLostFrames::MIN_LOST == 6 && CLostFrames::WINDOW_S == 30.0 && CLostFrames::PART_S == 10.0 &&
              CLostFrames::SETTLE_S == 5.0 && LOST_GPU_BUSY == 90,
          "the thresholds: 6 frames over 30 s in two parts of 10 s, 5 s left out after a change, the graphics busy from 90 %");

@@ -226,6 +226,9 @@ PY
     rg_item skin-check-textbox-lines NOT-RUN "the panel of this tree has no text box of automatic height"
     rg_item skin-check-autorow-room NOT-RUN "the panel of this tree has no row of automatic height"
   fi
+  # (1.2.3) the names of the speakers: a copy whose labels are as wide as their discs again (44 and 54, 1.2.2) must fail
+  sc_mutant skin-check-speaker-room-before 's2 = s.replace("<width>$PARAM[room]</width>", "<width>$PARAM[size]</width>")' \
+    "the labels of the speakers as wide as their discs (1.2.2)" 'speaker'
   # a button of one page under its columns (the upscaler's, 5562, on the Video page): a copy with it moved up into the
   # column of the video output, and a copy with it on the button of the output of this video in the bar, must fail
   local D=addons/skin.estuary/xml/DialogPlayerProcessInfo.xml

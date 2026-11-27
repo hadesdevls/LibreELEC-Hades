@@ -1,0 +1,1410 @@
+From d8ce4e59b095fcdcbce567b16682f298267f0484 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 10:17:41 +0000
+Subject: [PATCH] [Hades][GBM] Frame packing on nvidia-drm drawn by the GPU
+ into block-linear buffers
+
+The owner's RTX 4080 SUPER (620.73.04, open modules) with 1.2.3 in a
+1080p24 frame-packed mode: NVIDIA's GBM made no linear buffer of
+2048x2205 for scanout and rendering ("Invalid argument"), and GL could
+not draw into the driver's dumb buffers imported into EGL ("storage
+error 0x502, framebuffer status 0x8cd6"), so each frame was read back
+and copied by the processor: 40.45 ms a frame on average, 45.48 ms at
+most, where a frame of 23.976 Hz lasts 41.7 ms.
+
+NVIDIA's EGL draws into no buffer whose lines lie one after another
+that its display engine can scan out; what it draws into and scans out
+is block linear. nvidia-drm with Hades' patch
+(nvidia-open-kernel-modules-9087) takes a frame-packed frame from an
+uncompressed block-linear framebuffer too, its right eye from the first
+block row at or after vtotal that lies a multiple of 1024 bytes into
+it. So the first buffers that Kodi makes for such a mode, where the
+driver refuses the window's, are now block-linear buffers of GBM
+(COwnScanout::Memory::GBM_EYES): with the plane's block-linear
+modifiers only, BlockLinearBufferHeight() lines high, the right eye's
+line computed from the modifier and pitch of what GBM made
+(BlockLinearRightEyeRow(), the kernel's rule). Kodi draws the frame as
+before into the framebuffer object of the frame, and the GPU puts each
+eye, flipped, where the buffer holds it (EyesBlit(): two blits, each
+value copied as it is). Nothing is read back. Before use each buffer is
+probed (EyesProbe(): the first and last line of each eye, of values that
+differ from line to line, read back from the rows the display engine
+reads, the lines next to them black) and asked in a test commit of the
+mode, as the others are. Where they cannot be made or are refused, the
+linear buffers and the dumb ones follow as before.
+
+The copy of the processor, where it stays, is faster and the same
+bytes: the frame is read back through pixel buffers in eight bands,
+each with a fence, so that the processor writes one band while the GPU
+sends the next; the lines are written into the write-combined mapping
+of the dumb buffer with 16-byte streaming stores, never read, red and
+blue exchanged four pixels at a time where they must be; a dumb buffer
+is made black the same way. Where a step of the pixel buffers fails,
+the frame is read back at once as before. kodi.log says after 240
+frames, and every 2400 frames after, what a frame costs: waiting for
+the GPU, writing, and at most. Where GL cannot draw into a dumb buffer,
+kodi.log also says what EGL lists DRM_FORMAT_MOD_LINEAR of the format
+as (external only, or drawn into).
+
+Check this setup > 3D: frame packing asks for the block-linear buffers
+first as a video would ("eyes", "eyeswhy", "buffers": "blocklinear",
+"draw": "gpu"), and where the dumb buffers are copied into, what the
+copy of a frame costs here ("copyms", ten black frames into a buffer
+that never goes out).
+
+2D, Dolby Vision and the buffers of more than 8 bits are not touched:
+everything here is of a frame-packed mode of nvidia-drm.
+---
+ xbmc/windowing/gbm/FramePackedOwn.h           |  14 +
+ xbmc/windowing/gbm/OwnScanout.cpp             | 589 ++++++++++++++++--
+ xbmc/windowing/gbm/OwnScanout.h               |  97 ++-
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp | 176 +++++-
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.h   |   3 +
+ xbmc/windowing/gbm/drm/DRMStereo.h            |  64 ++
+ xbmc/windowing/gbm/drm/DRMUtils.cpp           |  31 +
+ 7 files changed, 899 insertions(+), 75 deletions(-)
+
+diff --git a/xbmc/windowing/gbm/FramePackedOwn.h b/xbmc/windowing/gbm/FramePackedOwn.h
+index c807d2a..5d48fa3 100644
+--- a/xbmc/windowing/gbm/FramePackedOwn.h
++++ b/xbmc/windowing/gbm/FramePackedOwn.h
+@@ -82,6 +82,20 @@ inline bool TryDumb(bool ownMade, Asked ownTaken)
+   return !ownMade || ownTaken != Asked::TAKEN;
+ }
+ 
++/*!
++ * \brief (1.2.3) Whether the block-linear buffers that the GPU draws into are used
++ *        (COwnScanout::Memory::GBM_EYES), which come first: NVIDIA's EGL draws into no linear
++ *        buffer (its GBM makes none for scanout and rendering, and a dumb buffer imported into it
++ *        is no target of GL, "storage error 0x502": RTX 4080 SUPER, 620.73.04), so where the
++ *        driver takes those, nothing is read back; otherwise the linear ones as before
++ * \param made they were made and passed their checks (COwnScanout::EyesProbe())
++ * \param taken what the test commits said of them: taken only where every one of them was taken
++ */
++inline bool EyesTaken(bool made, Asked taken)
++{
++  return made && taken == Asked::TAKEN;
++}
++
+ //! Which buffers the frame-packed frame goes to the driver in
+ enum class Use
+ {
+diff --git a/xbmc/windowing/gbm/OwnScanout.cpp b/xbmc/windowing/gbm/OwnScanout.cpp
+index 45eefd1..ff16ced 100644
+--- a/xbmc/windowing/gbm/OwnScanout.cpp
++++ b/xbmc/windowing/gbm/OwnScanout.cpp
+@@ -9,6 +9,7 @@
+ #include "OwnScanout.h"
+ 
+ #include "drm/DRMFramebuffer.h"
++#include "drm/DRMStereo.h"
+ #include "rendering/OutputFramebuffer.h"
+ #include "utils/log.h"
+ 
+@@ -27,6 +28,10 @@
+ 
+ #include "system_gl.h"
+ 
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
+ #ifndef GL_BGRA_EXT
+ #define GL_BGRA_EXT 0x80E1
+ #endif
+@@ -85,6 +90,104 @@ void ProbeColour(int pixel, int bits)
+                  PROBE_CODES[pixel][2] / 1023.0f, 1.0f);
+ }
+ 
++// (Hades) A row of 4-byte pixels written into a buffer that may be memory of the card through a
++// write-combined mapping (a dumb buffer of nvidia-drm: drm_gem_mmap_obj(), its range reserved
++// write-combined by ioremap_wc() in nvidia-drm-gem-nvkms-memory.c): never read, written front to
++// back in whole 16-byte stores that bypass the caches (streaming stores), which the processor
++// combines into whole lines of 64 bytes for the bus. Red and blue exchanged where \p swap, four
++// pixels at a time. The same bytes as a pixel-by-pixel copy. The caller fences (StoresDone()).
++void WriteRow(uint8_t* to, const uint8_t* from, size_t bytes, bool swap)
++{
++  size_t i = 0;
++#if defined(__SSE2__)
++  if ((reinterpret_cast<uintptr_t>(to) & 15) == 0)
++  {
++    const __m128i greenAlpha = _mm_set1_epi32(static_cast<int>(0xff00ff00u));
++    const __m128i low = _mm_set1_epi32(0xff);
++    for (; i + 16 <= bytes; i += 16)
++    {
++      __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(from + i));
++      if (swap)
++        // (the bytes R, G, B, A of a pixel are the 32 bits 0xAABBGGRR: B and R change places)
++        v = _mm_or_si128(_mm_and_si128(v, greenAlpha),
++                         _mm_or_si128(_mm_and_si128(_mm_srli_epi32(v, 16), low),
++                                      _mm_slli_epi32(_mm_and_si128(v, low), 16)));
++      _mm_stream_si128(reinterpret_cast<__m128i*>(to + i), v);
++    }
++  }
++#endif
++  if (!swap)
++  {
++    std::memcpy(to + i, from + i, bytes - i);
++    return;
++  }
++  for (; i + 4 <= bytes; i += 4)
++  {
++    const uint8_t pixel[4] = {from[i + 2], from[i + 1], from[i], from[i + 3]};
++    std::memcpy(to + i, pixel, 4);
++  }
++}
++
++// (Hades) What EGL says of buffers of DRM_FORMAT_MOD_LINEAR of a format
++// (EGL_EXT_image_dma_buf_import_modifiers): whether it draws into them or only samples them
++// ("external only"), for kodi.log where GL cannot draw into a dumb buffer; empty where it cannot
++// be asked
++std::string LinearSaid(EGLDisplay display, uint32_t format)
++{
++  if (!HasEGLExtension(display, "EGL_EXT_image_dma_buf_import_modifiers"))
++    return {};
++  const auto query = reinterpret_cast<PFNEGLQUERYDMABUFMODIFIERSEXTPROC>(
++      eglGetProcAddress("eglQueryDmaBufModifiersEXT"));
++  EGLint count = 0;
++  if (!query || !query(display, static_cast<EGLint>(format), 0, nullptr, nullptr, &count) ||
++      count <= 0)
++    return {};
++  std::vector<EGLuint64KHR> modifiers(static_cast<size_t>(count));
++  std::vector<EGLBoolean> externalOnly(static_cast<size_t>(count));
++  if (!query(display, static_cast<EGLint>(format), count, modifiers.data(), externalOnly.data(),
++             &count))
++    return {};
++  for (EGLint i = 0; i < count && i < static_cast<EGLint>(modifiers.size()); ++i)
++    if (modifiers[i] == DRM_FORMAT_MOD_LINEAR)
++      return externalOnly[i]
++                 ? "EGL lists DRM_FORMAT_MOD_LINEAR of " + FourCC(format) +
++                       " as external only: it samples such a buffer, and draws into "
++                       "none"
++                 : "EGL lists DRM_FORMAT_MOD_LINEAR of " + FourCC(format) + " as one it draws into";
++  return "EGL does not list DRM_FORMAT_MOD_LINEAR among the modifiers of " + FourCC(format);
++}
++
++// (Hades) The streaming stores of WriteRow() reach memory before what follows them
++void StoresDone()
++{
++#if defined(__SSE2__)
++  _mm_sfence();
++#endif
++}
++
++// (Hades) A dumb buffer made opaque black (as the probe of a buffer drawn into leaves it), in
++// streaming stores as WriteRow() writes
++void FillBlack(uint8_t* map, size_t size)
++{
++  size_t i = 0;
++#if defined(__SSE2__)
++  if ((reinterpret_cast<uintptr_t>(map) & 15) == 0)
++  {
++    const __m128i black = _mm_set1_epi32(static_cast<int>(0xff000000u));
++    for (; i + 16 <= size; i += 16)
++      _mm_stream_si128(reinterpret_cast<__m128i*>(map + i), black);
++  }
++#endif
++  const uint32_t black = 0xff000000u;
++  for (; i + 4 <= size; i += 4)
++    std::memcpy(map + i, &black, 4);
++  StoresDone();
++}
++
++// (Hades) The bands of lines that the copy of the processor reads back one by one (CopyOut()):
++// while the processor writes one, the GPU sends the next
++constexpr int COPY_BANDS = 8;
++
+ // (Hades) The side of the small buffer of GBM that stands for a dumb one in Kodi's queue
+ // (OwnScanout.h): it is never drawn into or shown
+ constexpr uint32_t STAND_IN_SIZE = 64;
+@@ -285,28 +388,15 @@ bool COwnScanout::CopyRowsFlipped(const uint8_t* rows,
+   if (!bgra || !rows || !target || width <= 0 || height <= 0 || pitch < rowBytes)
+     return false;
+   const bool swap = *bgra != rowsBgra;
+-  std::vector<uint8_t> row(swap ? rowBytes : 0);
+   for (int r = 0; r < height; ++r)
+   {
+-    // (row 0 of what glReadPixels() gives is the bottom row of the picture)
++    // (row 0 of what glReadPixels() gives is the bottom row of the picture; the buffer may be
++    // memory of the card, written through a write-combined mapping: WriteRow())
+     const uint8_t* from = rows + static_cast<size_t>(r) * rowBytes;
+     uint8_t* to = target + static_cast<size_t>(height - 1 - r) * pitch;
+-    if (!swap)
+-    {
+-      std::memcpy(to, from, rowBytes);
+-      continue;
+-    }
+-    // (red and blue exchanged in a row of its own, then written whole: the buffer may be memory
+-    // of the card, written through a write-combined mapping)
+-    for (size_t i = 0; i < rowBytes; i += 4)
+-    {
+-      row[i] = from[i + 2];
+-      row[i + 1] = from[i + 1];
+-      row[i + 2] = from[i];
+-      row[i + 3] = from[i + 3];
+-    }
+-    std::memcpy(to, row.data(), rowBytes);
++    WriteRow(to, from, rowBytes, swap);
+   }
++  StoresDone();
+   return true;
+ }
+ 
+@@ -468,6 +558,155 @@ void COwnScanout::FlipBlit(unsigned int source, unsigned int target, int width,
+     glEnable(GL_SCISSOR_TEST);
+ }
+ 
++void COwnScanout::EyesBlit(
++    unsigned int source, unsigned int target, int width, int frameHeight, const EyeRows& eyes)
++{
++  GLint draw = 0, read = 0;
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glDisable(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target);
++  // (GL's row 0 of the frame is its bottom line. The left eye, its top eye lines, from GL's rows
++  // frameHeight - eye to frameHeight - 1, into rows eye - 1 down to 0; the right eye, its bottom
++  // eye lines, from GL's rows 0 to eye - 1, into rows bufferRight + eye - 1 down to bufferRight.
++  // NEAREST and 1:1: each value is copied as it is)
++  glBlitFramebuffer(0, frameHeight - eyes.eye, width, frameHeight, 0, eyes.eye, width, 0,
++                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  glBlitFramebuffer(0, 0, width, eyes.eye, 0, eyes.bufferRight + eyes.eye, width, eyes.bufferRight,
++                    GL_COLOR_BUFFER_BIT, GL_NEAREST);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++}
++
++bool COwnScanout::EyesProbe(unsigned int frame,
++                            unsigned int target,
++                            int width,
++                            int frameHeight,
++                            const EyeRows& eyes,
++                            std::string& failed)
++{
++  if (eyes.eye <= 0 || eyes.frameRight < eyes.eye || eyes.frameRight + eyes.eye != frameHeight ||
++      eyes.bufferRight < eyes.eye || width < 4)
++  {
++    failed = "the lines of the eyes do not fit the frame";
++    return false;
++  }
++  GLint draw = 0, read = 0, box[4]{}, packAlignment = 4, packBuffer = 0;
++  GLfloat clear[4]{};
++  GLboolean mask[4]{};
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glGetIntegerv(GL_SCISSOR_BOX, box);
++  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
++  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++  glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
++  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++  while (glGetError() != GL_NO_ERROR)
++  {
++  }
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++  glPixelStorei(GL_PACK_ALIGNMENT, 4);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++
++  // The first and the last line of each eye of the frame (GL's rows), and the row of the buffer
++  // where each has to come out
++  struct Line
++  {
++    int frameRow;
++    int bufferRow;
++    const char* name;
++  };
++  const Line lines[4] = {{frameHeight - 1, 0, "the first line of the left eye"},
++                         {frameHeight - eyes.eye, eyes.eye - 1, "the last line of the left eye"},
++                         {eyes.eye - 1, eyes.bufferRight, "the first line of the right eye"},
++                         {0, eyes.bufferRight + eyes.eye - 1, "the last line of the right eye"}};
++
++  // Black in both, then four pixels in each of those lines, of values that differ from line to
++  // line (a line that came out in the place of another is seen)
++  glDisable(GL_SCISSOR_TEST);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  glBindFramebuffer(GL_FRAMEBUFFER, target);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glBindFramebuffer(GL_FRAMEBUFFER, frame);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glEnable(GL_SCISSOR_TEST);
++  for (int l = 0; l < 4; ++l)
++    for (int pixel = 0; pixel < 4; ++pixel)
++    {
++      glScissor(pixel, lines[l].frameRow, 1, 1);
++      ProbeColour((pixel + l) % 4, 8);
++      glClear(GL_COLOR_BUFFER_BIT);
++    }
++  glDisable(GL_SCISSOR_TEST);
++
++  EyesBlit(frame, target, width, frameHeight, eyes);
++  const GLenum blitError = glGetError();
++
++  bool same = true;
++  char text[240] = "";
++  if (blitError != GL_NO_ERROR)
++  {
++    snprintf(text, sizeof(text), "the GPU could not put the eyes into the buffer (GL error 0x%x)",
++             blitError);
++    failed = text;
++    same = false;
++  }
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, target);
++  for (int l = 0; same && l < 6; ++l)
++  {
++    // (and two lines that stay black: the first one between the eyes, and the one before the
++    // right eye)
++    const int row = l < 4 ? lines[l].bufferRow : (l == 4 ? eyes.eye : eyes.bufferRight - 1);
++    uint8_t bytes[16]{};
++    glReadPixels(0, row, 4, 1, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
++    if (glGetError() != GL_NO_ERROR)
++    {
++      failed = "the buffer cannot be read back as 8-bit values";
++      same = false;
++      break;
++    }
++    for (int pixel = 0; same && pixel < 4; ++pixel)
++      for (int c = 0; c < 3; ++c)
++      {
++        const unsigned int expected = l < 4 ? PROBE_BYTES[(pixel + l) % 4][c] : 0;
++        if (bytes[pixel * 4 + c] != expected)
++        {
++          snprintf(text, sizeof(text),
++                   "the GPU's eyes of a frame did not give the values written (%u for %u in row %d "
++                   "of the buffer, %s, pixel %d component %d)",
++                   bytes[pixel * 4 + c], expected, row,
++                   l < 4 ? lines[l].name : "a line between the eyes", pixel, c);
++          failed = text;
++          same = false;
++          break;
++        }
++      }
++  }
++
++  // Black, before anything is shown through it
++  glBindFramebuffer(GL_FRAMEBUFFER, target);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glBindFramebuffer(GL_FRAMEBUFFER, frame);
++  glClear(GL_COLOR_BUFFER_BIT);
++
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
++  glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
++  glColorMask(mask[0], mask[1], mask[2], mask[3]);
++  glClearColor(clear[0], clear[1], clear[2], clear[3]);
++  glScissor(box[0], box[1], box[2], box[3]);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  return same;
++}
++
+ bool COwnScanout::FlipProbe(
+     unsigned int frame, unsigned int target, int width, int height, int bits, std::string& failed)
+ {
+@@ -783,7 +1022,8 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+                                                  bool linear,
+                                                  std::string& failed,
+                                                  Memory memory,
+-                                                 int drmFd)
++                                                 int drmFd,
++                                                 const STEREO::Mode* framePacked)
+ {
+   if (!Supported(format))
+   {
+@@ -795,6 +1035,7 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+   own->m_display = display;
+   own->m_width = width;
+   own->m_height = height;
++  own->m_bufferHeight = height;
+   own->m_format = format;
+ 
+   own->m_memory = memory;
+@@ -806,6 +1047,31 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+     return nullptr;
+   }
+ 
++  // (Hades: block-linear buffers of a frame-packed mode, taller than the frame by the block rows
++  // that the right eye begins on; only the block-linear modifiers of NVIDIA that the plane offers)
++  std::vector<uint64_t> blockLinear;
++  if (memory == Memory::GBM_EYES)
++  {
++    const auto rows = framePacked ? STEREO::ScanoutHeight(*framePacked) : 0;
++    if (!framePacked || !flipOnGpu || bits != 8 || rows != height ||
++        STEREO::BlockLinearBufferHeight(*framePacked) <= height)
++    {
++      failed = "block-linear buffers of a frame-packed mode are made only of 8 bits, for the "
++               "frame of the mode, flipped by the GPU";
++      return nullptr;
++    }
++    for (uint64_t modifier : modifiers)
++      if (STEREO::IsNvidiaBlockLinear(modifier))
++        blockLinear.push_back(modifier);
++    if (blockLinear.empty())
++    {
++      failed = "the plane takes no uncompressed block-linear modifier of NVIDIA";
++      return nullptr;
++    }
++    own->m_bufferHeight = STEREO::BlockLinearBufferHeight(*framePacked);
++  }
++  const int bufferHeight = own->m_bufferHeight;
++
+   if (memory == Memory::DUMB)
+   {
+     own->m_drmFd = drmFd;
+@@ -831,9 +1097,7 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+         return nullptr;
+       }
+       // (opaque black, as the probe of a buffer drawn into leaves it)
+-      const uint32_t black = 0xff000000u;
+-      for (size_t offset = 0; offset + 4 <= buffer.mapSize; offset += 4)
+-        std::memcpy(buffer.map + offset, &black, 4);
++      FillBlack(buffer.map, buffer.mapSize);
+       if (own->m_copy)
+         continue;
+       std::string drawFailed;
+@@ -861,33 +1125,71 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+       {
+         own->m_copy = true;
+         own->m_copyReason = drawFailed;
++        // (Hades, 1.2.3: and what EGL says of such buffers, where it says it)
++        const std::string said = LinearSaid(display, format);
++        if (!said.empty())
++          own->m_copyReason += "; " + said;
+       }
+       continue;
+     }
+ #if defined(HAS_GBM_MODIFIERS)
+-    if (!buffer.bo && !modifiers.empty())
+-      buffer.bo = gbm_bo_create_with_modifiers2(device, width, height, format, modifiers.data(),
+-                                                static_cast<unsigned int>(modifiers.size()),
++    // (Hades: the block-linear ones alone for Memory::GBM_EYES, and nothing else: a buffer made
++    // without them would be of a layout that the right eye cannot be found in)
++    const std::vector<uint64_t>& asked = memory == Memory::GBM_EYES ? blockLinear : modifiers;
++    if (!buffer.bo && !asked.empty())
++      buffer.bo = gbm_bo_create_with_modifiers2(device, width, bufferHeight, format, asked.data(),
++                                                static_cast<unsigned int>(asked.size()),
+                                                 GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+ #endif
+     // (Hades: buffers whose lines have to lie one after another, a frame-packed mode of
+     // nvidia-drm, say so where they are made without modifiers)
+-    if (!buffer.bo)
++    if (!buffer.bo && memory != Memory::GBM_EYES)
+       buffer.bo = gbm_bo_create(device, width, height, format,
+                                 GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING |
+                                     (linear ? static_cast<uint32_t>(GBM_BO_USE_LINEAR) : 0u));
+     if (!buffer.bo)
+     {
+-      failed = "GBM could not allocate a " + std::to_string(width) + "x" + std::to_string(height) +
+-               " buffer of " + FourCC(format) + " for scanout and rendering (" +
+-               std::strerror(errno) + ")";
++      failed = "GBM could not allocate a " + std::to_string(width) + "x" +
++               std::to_string(bufferHeight) + " buffer of " + FourCC(format) +
++               (memory == Memory::GBM_EYES ? " (block-linear)" : "") +
++               " for scanout and rendering (" + std::strerror(errno) + ")";
+       return nullptr;
+     }
+ 
++#if defined(HAS_GBM_MODIFIERS)
++    // (Hades: where the right eye begins in it, by its modifier and pitch; the same in each)
++    if (memory == Memory::GBM_EYES)
++    {
++      const uint64_t modifier = gbm_bo_get_modifier(buffer.bo);
++      const uint32_t pitch = gbm_bo_get_stride_for_plane(buffer.bo, 0);
++      const uint32_t right = STEREO::BlockLinearRightEyeRow(*framePacked, modifier, pitch,
++                                                            STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT);
++      const EyeRows eyes{framePacked->vdisplay, framePacked->vtotal, static_cast<int>(right)};
++      if (gbm_bo_get_plane_count(buffer.bo) != 1 || right == 0 ||
++          static_cast<int>(right) + eyes.eye > bufferHeight ||
++          (i > 0 && (eyes.bufferRight != own->m_eyes.bufferRight)))
++      {
++        char hex[24];
++        snprintf(hex, sizeof(hex), "%llx", static_cast<unsigned long long>(modifier));
++        failed = std::string("GBM made a buffer (modifier 0x") + hex + ", pitch " +
++                 std::to_string(pitch) + ", " + std::to_string(gbm_bo_get_plane_count(buffer.bo)) +
++                 " planes) that the right eye of the mode cannot begin a block row of";
++        return nullptr;
++      }
++      own->m_eyes = eyes;
++    }
++#else
++    if (memory == Memory::GBM_EYES)
++    {
++      failed = "the layout of a buffer cannot be asked (GBM without modifiers)";
++      return nullptr;
++    }
++#endif
++
+     OwnDmaBuf dmabuf;
+     dmabuf.fourcc = format;
+     dmabuf.width = width;
+-    dmabuf.height = height;
++    dmabuf.height = bufferHeight;
+ #if defined(HAS_GBM_MODIFIERS)
+     dmabuf.planes = gbm_bo_get_plane_count(buffer.bo);
+     dmabuf.modifier = gbm_bo_get_modifier(buffer.bo);
+@@ -998,7 +1300,18 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+       else
+         return own;
+     }
+-    // (Hades: or the copy of the processor, where the frames go that way)
++    // (Hades: the eyes of a frame-packed frame put by the GPU into each block-linear buffer)
++    if (memory == Memory::GBM_EYES)
++    {
++      for (const Buffer& buffer : own->m_buffers)
++        if (!EyesProbe(fb, buffer.framebuffer, width, height, own->m_eyes, failed))
++          return nullptr;
++      return own;
++    }
++    // (Hades: or the copy of the processor, where the frames go that way: through pixel buffers,
++    // a band at a time, where GL gives them, checked with the rest)
++    if (own->m_copy)
++      own->MakePackBuffers();
+     if (own->m_copy
+             ? !own->CopyProbe(failed)
+             : !FlipProbe(fb, own->m_buffers.front().framebuffer, width, height, bits, failed))
+@@ -1031,13 +1344,184 @@ void COwnScanout::ReleaseTargets()
+   }
+ }
+ 
+-bool COwnScanout::CopyOut(unsigned int index, std::string& failed)
++void COwnScanout::MakePackBuffers()
++{
++  ReleasePackBuffers();
++  if (m_width <= 0 || m_height < COPY_BANDS)
++    return;
++  GLint packBuffer = 0;
++  glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++  while (glGetError() != GL_NO_ERROR)
++  {
++  }
++  // (bands of about the same number of lines, from GL's row 0, the bottom line of the frame)
++  const size_t rowBytes = static_cast<size_t>(m_width) * 4;
++  for (int b = 0; b < COPY_BANDS; ++b)
++  {
++    const int first = m_height * b / COPY_BANDS;
++    const int end = m_height * (b + 1) / COPY_BANDS;
++    GLuint buffer = 0;
++    glGenBuffers(1, &buffer);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, buffer);
++    // (read by the processor once per frame: GL_STREAM_READ)
++    glBufferData(GL_PIXEL_PACK_BUFFER, static_cast<GLsizeiptr>(rowBytes * (end - first)), nullptr,
++                 GL_STREAM_READ);
++    m_packBuffers.push_back(buffer);
++    m_bands.emplace_back(first, end);
++  }
++  glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
++  if (glGetError() != GL_NO_ERROR)
++  {
++    CLog::Log(LOGINFO, "COwnScanout: GL gave no pixel buffers for the copy of the frames: the "
++                       "frames are read back at once");
++    ReleasePackBuffers();
++  }
++}
++
++void COwnScanout::ReleasePackBuffers()
++{
++  if (!m_packBuffers.empty())
++    glDeleteBuffers(static_cast<GLsizei>(m_packBuffers.size()), m_packBuffers.data());
++  m_packBuffers.clear();
++  m_bands.clear();
++}
++
++bool COwnScanout::CopyOutInBands(
++    uint8_t* target, uint32_t pitch, std::string& failed, double& readMs, double& writeMs)
++{
++  using clock = std::chrono::steady_clock;
++  const size_t rowBytes = static_cast<size_t>(m_width) * 4;
++  const GLenum format = m_readBgra ? GL_BGRA_EXT : GL_RGBA;
++  std::vector<GLsync> fences(m_packBuffers.size(), nullptr);
++  bool ok = true;
++  // Every band asked of the GPU first, each with a fence of its own...
++  for (size_t b = 0; b < m_packBuffers.size(); ++b)
++  {
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_packBuffers[b]);
++    glReadPixels(0, m_bands[b].first, m_width, m_bands[b].second - m_bands[b].first, format,
++                 GL_UNSIGNED_BYTE, nullptr);
++    fences[b] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    if (glGetError() != GL_NO_ERROR || !fences[b])
++    {
++      failed = "a band of the frame could not be asked of the GPU";
++      ok = false;
++      break;
++    }
++  }
++  glFlush();
++  // ...then each one written by the processor as soon as it is there, while the GPU sends the next
++  for (size_t b = 0; ok && b < m_packBuffers.size(); ++b)
++  {
++    const auto waited = clock::now();
++    // (a second at most: a GPU that sends nothing in a second is not waited for any longer)
++    const GLenum status = glClientWaitSync(fences[b], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_packBuffers[b]);
++    const int lines = m_bands[b].second - m_bands[b].first;
++    const auto* rows = static_cast<const uint8_t*>(
++        status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED
++            ? glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, static_cast<GLsizeiptr>(rowBytes * lines),
++                               GL_MAP_READ_BIT)
++            : nullptr);
++    const auto mapped = clock::now();
++    readMs += std::chrono::duration<double, std::milli>(mapped - waited).count();
++    if (!rows)
++    {
++      failed = status == GL_TIMEOUT_EXPIRED || status == GL_WAIT_FAILED
++                   ? "the GPU did not send a band of the frame within a second"
++                   : "a band of the frame could not be mapped";
++      ok = false;
++      break;
++    }
++    // (GL's rows first to end - 1 of the band are the lines height - end to height - first - 1 of
++    // the buffer, from its top line)
++    ok = CopyRowsFlipped(rows, m_width, lines, m_readBgra, m_format,
++                         target + static_cast<size_t>(m_height - m_bands[b].second) * pitch, pitch);
++    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
++    writeMs += std::chrono::duration<double, std::milli>(clock::now() - mapped).count();
++    if (!ok)
++      failed = "the frame does not fit the buffer";
++  }
++  for (GLsync fence : fences)
++    if (fence)
++      glDeleteSync(fence);
++  return ok;
++}
++
++bool COwnScanout::MeasureCopy(int frames, double& ms)
++{
++  ms = 0.0;
++  if (!m_copy || frames <= 0 || m_buffers.empty())
++    return false;
++  GLint draw = 0;
++  GLfloat clear[4]{};
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glDisable(GL_SCISSOR_TEST);
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_frameFramebuffer);
++  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++  bool ok = true;
++  for (int i = 0; ok && i < frames; ++i)
++  {
++    // (a frame drawn, then read back and copied as Swap() does)
++    glClear(GL_COLOR_BUFFER_BIT);
++    const auto start = std::chrono::steady_clock::now();
++    std::string failed;
++    ok = CopyOut(0, failed);
++    ms +=
++        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++  }
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glClearColor(clear[0], clear[1], clear[2], clear[3]);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  ms /= frames;
++  return ok;
++}
++
++bool COwnScanout::CopyOut(unsigned int index, std::string& failed, double* readMs, double* writeMs)
+ {
+   if (index >= m_buffers.size() || !m_buffers[index].map || !m_frameFramebuffer)
+   {
+     failed = "there is no buffer to copy the frame into";
+     return false;
+   }
++  // (Hades: through the pixel buffers, a band at a time; where a step of GL fails there, the
++  // frame is read back at once as before, and so are the frames after it)
++  if (!m_packBuffers.empty())
++  {
++    GLint read = 0, packBuffer = 0;
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
++    GLint packAlignment = 4;
++    glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
++    while (glGetError() != GL_NO_ERROR)
++    {
++    }
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_frameFramebuffer);
++    glPixelStorei(GL_PACK_ALIGNMENT, 4);
++    double readTime = 0.0, writeTime = 0.0;
++    std::string bandFailed;
++    const bool ok = CopyOutInBands(m_buffers[index].map, m_buffers[index].pitch, bandFailed,
++                                   readTime, writeTime);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(packBuffer));
++    glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
++    if (ok)
++    {
++      if (readMs)
++        *readMs = readTime;
++      if (writeMs)
++        *writeMs = writeTime;
++      return true;
++    }
++    CLog::Log(LOGWARNING,
++              "COwnScanout: the copy of a frame through pixel buffers failed ({}): the frames are "
++              "read back at once from now on",
++              bandFailed);
++    ReleasePackBuffers();
++  }
++  const auto start = std::chrono::steady_clock::now();
+   GLint read = 0, packAlignment = 4, packBuffer = 0;
+   glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+   glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
+@@ -1062,6 +1546,7 @@ bool COwnScanout::CopyOut(unsigned int index, std::string& failed)
+     failed = text;
+     return false;
+   }
++  const auto readBack = std::chrono::steady_clock::now();
+   const Buffer& buffer = m_buffers[index];
+   if (!CopyRowsFlipped(m_rows.data(), m_width, m_height, m_readBgra, m_format, buffer.map,
+                        buffer.pitch))
+@@ -1069,6 +1554,12 @@ bool COwnScanout::CopyOut(unsigned int index, std::string& failed)
+     failed = "the frame does not fit the buffer";
+     return false;
+   }
++  if (readMs)
++    *readMs = std::chrono::duration<double, std::milli>(readBack - start).count();
++  if (writeMs)
++    *writeMs =
++        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readBack)
++            .count();
+   return true;
+ }
+ 
+@@ -1117,9 +1608,7 @@ bool COwnScanout::CopyProbe(std::string& failed)
+   glBindFramebuffer(GL_FRAMEBUFFER, m_frameFramebuffer);
+   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+   glClear(GL_COLOR_BUFFER_BIT);
+-  const uint32_t black = 0xff000000u;
+-  for (size_t offset = 0; offset + 4 <= buffer.mapSize; offset += 4)
+-    std::memcpy(buffer.map + offset, &black, 4);
++  FillBlack(buffer.map, buffer.mapSize);
+ 
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
+@@ -1203,6 +1692,7 @@ bool COwnScanout::DumbLayoutProbe(std::string& failed)
+ 
+ COwnScanout::~COwnScanout()
+ {
++  ReleasePackBuffers();
+   const auto destroy =
+       reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+   if (m_frameFramebuffer)
+@@ -1267,25 +1757,42 @@ bool COwnScanout::Swap(bool finish)
+   // that was chosen for it, which goes to the screen (a frame with no buffer chosen is not
+   // flipped anywhere: below)
+   // (Hades: or, where the GPU cannot draw into the buffers, read back and copied by the processor;
+-  // what it costs is said once, after 240 frames)
++  // what it costs is said after 240 frames, and again every 2400 frames, of the frames since)
+   if (m_copy && m_ring.BackIndex() >= 0)
+   {
+     const auto start = std::chrono::steady_clock::now();
+     std::string failed;
+-    if (!CopyOut(static_cast<unsigned int>(m_ring.BackIndex()), failed))
++    double readMs = 0.0, writeMs = 0.0;
++    if (!CopyOut(static_cast<unsigned int>(m_ring.BackIndex()), failed, &readMs, &writeMs))
+       CLog::Log(LOGERROR, "COwnScanout: a frame could not be copied into its buffer: {}", failed);
+     const double ms =
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+     m_copyMs += ms;
++    m_readMs += readMs;
++    m_writeMs += writeMs;
+     m_copyMaxMs = std::max(m_copyMaxMs, ms);
+-    if (++m_copies == 240)
++    ++m_copies;
++    const uint64_t told = m_copies <= 240 ? 240 : 2400;
++    if (m_copies == 240 || (m_copies > 240 && (m_copies - 240) % 2400 == 0))
++    {
+       CLog::Log(LOGINFO,
+                 "3D output: the frames of the frame-packed mode are read back and copied by the "
+-                "processor into the buffer that goes to the screen: {:.2f} ms a frame on average, "
+-                "{:.2f} ms at most, over 240 frames of {}x{} ({}, {})",
+-                m_copyMs / 240.0, m_copyMaxMs, m_width, m_height, FourCC(m_format),
+-                m_readBgra ? "read as BGRA" : "read as RGBA, red and blue exchanged");
++                "processor into the buffer that goes to the screen: {:.2f} ms a frame on average "
++                "({:.2f} ms waiting for the GPU to read it back, {:.2f} ms writing it), {:.2f} ms "
++                "at most, over {} frames of {}x{} ({}, {}, {})",
++                m_copyMs / told, m_readMs / told, m_writeMs / told, m_copyMaxMs, told, m_width,
++                m_height, FourCC(m_format),
++                m_readBgra ? "read as BGRA" : "read as RGBA, red and blue exchanged",
++                m_packBuffers.empty() ? "read back at once"
++                                      : "read back through pixel buffers in " +
++                                            std::to_string(m_packBuffers.size()) + " bands");
++      m_copyMs = m_readMs = m_writeMs = m_copyMaxMs = 0.0;
++    }
+   }
++  // (Hades: block-linear buffers of a frame-packed mode: each eye where the buffer holds it)
++  else if (m_frameFramebuffer && m_ring.BackIndex() >= 0 && m_memory == Memory::GBM_EYES)
++    EyesBlit(m_frameFramebuffer, m_buffers[m_ring.BackIndex()].framebuffer, m_width, m_height,
++             m_eyes);
+   else if (m_frameFramebuffer && m_ring.BackIndex() >= 0)
+     FlipBlit(m_frameFramebuffer, m_buffers[m_ring.BackIndex()].framebuffer, m_width, m_height);
+   if (finish)
+diff --git a/xbmc/windowing/gbm/OwnScanout.h b/xbmc/windowing/gbm/OwnScanout.h
+index e709853..eea66ad 100644
+--- a/xbmc/windowing/gbm/OwnScanout.h
++++ b/xbmc/windowing/gbm/OwnScanout.h
+@@ -14,6 +14,7 @@
+ #include <memory>
+ #include <optional>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include "system_egl.h"
+@@ -26,6 +27,10 @@ namespace WINDOWING
+ {
+ namespace GBM
+ {
++namespace STEREO
++{
++struct Mode;
++}
+ 
+ /*!
+  * \brief Hades: which of a few buffers a frame is drawn into, and which are held for the screen,
+@@ -191,6 +196,17 @@ struct OwnDmaBuf
+  * mapping before use (DumbLayoutProbe()); otherwise, or where that check fails, the frame drawn
+  * into the framebuffer object of the frame is read back and copied by the processor into the
+  * buffer, flipped, in each frame (CopiesOnCpu(): checked before use like the rest).
++ *
++ * (Hades, 1.2.3) NVIDIA's EGL draws into neither (its GBM makes no linear buffer for scanout and
++ * rendering; a dumb buffer imported into it is no target of GL: "storage error 0x502", RTX 4080
++ * SUPER), so before them come block-linear buffers of GBM (Memory::GBM_EYES), as every buffer that
++ * NVIDIA's GPU draws into and scans out is: nvidia-drm with Hades' patch takes a frame-packed frame
++ * from one where its right eye begins a block row (STEREO::BlockLinearRightEyeRow()). The frame is
++ * drawn upright into the framebuffer object of the frame as for the others, and the GPU puts each
++ * eye where the buffer holds it, flipped (EyesBlit()); nothing is read back. Checked before use
++ * (EyesProbe()). The copy of the processor reads the frame back through pixel buffers, a band of
++ * lines at a time, while the GPU sends the next band, and writes the lines with streaming stores
++ * (the mapping of a dumb buffer is write-combined), the same bytes as before.
+  */
+ class COwnScanout : public IOwnBuffers
+ {
+@@ -204,6 +220,21 @@ public:
+   {
+     GBM, //!< gbm_bo_create*(), for scanout and rendering
+     DUMB, //!< dumb buffers of the DRM driver, with framebuffers of their own (8 bits only)
++    //! (1.2.3) block-linear buffers of GBM of NVIDIA for a frame-packed mode, each eye put by
++    //! the GPU where the buffer holds it (8 bits only; Create() takes the mode)
++    GBM_EYES,
++  };
++
++  /*!
++   * \brief (Hades) Where the eyes of a frame-packed frame lie: in the frame that Kodi draws (the
++   *        right eye from line frameRight, its top line first) and in the buffers (from line
++   *        bufferRight); the left eye from the first line of both
++   */
++  struct EyeRows
++  {
++    int eye{0}; //!< lines of each eye (vdisplay)
++    int frameRight{0}; //!< vtotal
++    int bufferRight{0}; //!< STEREO::BlockLinearRightEyeRow()
+   };
+ 
+   ~COwnScanout() override;
+@@ -219,7 +250,10 @@ public:
+    * DRM_FORMAT_MOD_LINEAR alone
+    * \param[out] failed which step failed, in plain words
+    * \param memory (Hades) what the buffers are made of; Memory::DUMB needs \p drmFd, the DRM file
+-   * of \p device, flipOnGpu and a format of 8 bits, and is linear whatever \p linear says
++   * of \p device, flipOnGpu and a format of 8 bits, and is linear whatever \p linear says;
++   * Memory::GBM_EYES needs \p framePacked, flipOnGpu and a format of 8 bits: \p height is then that
++   * of the frame (STEREO::ScanoutHeight()), the buffers are STEREO::BlockLinearBufferHeight() lines
++   * high and made with the block-linear ones of \p modifiers only
+    * \return nullptr when a step failed; nothing is left of what was made
+    */
+   static std::shared_ptr<COwnScanout> Create(gbm_device* device,
+@@ -232,7 +266,34 @@ public:
+                                              bool linear,
+                                              std::string& failed,
+                                              Memory memory = Memory::GBM,
+-                                             int drmFd = -1);
++                                             int drmFd = -1,
++                                             const STEREO::Mode* framePacked = nullptr);
++
++  /*!
++   * \brief (Hades) The whole of \p source (width x frameHeight, a frame-packed frame drawn upright,
++   *        its bottom line in GL's row 0) put into \p target flipped, each eye where a block-linear
++   *        buffer holds it: the left eye (the top \p eyes.eye lines) into rows 0 to eye - 1, the
++   *        right eye (from line eyes.frameRight) into rows bufferRight to bufferRight + eye - 1
++   *        (row m of \p target is the line m of the buffer in memory); the lines between are not
++   *        touched. The scissor test is off for it, and put back.
++   */
++  static void EyesBlit(
++      unsigned int source, unsigned int target, int width, int frameHeight, const EyeRows& eyes);
++  /*!
++   * \brief (Hades) EyesBlit() checked: the first and the last line of each eye of \p frame (four
++   *        pixels each, 8-bit values that differ from line to line) are read back from the rows of
++   *        \p target where the display engine reads them, and the first line between the eyes and
++   *        the one before the right eye stay black. \p target is then black. The GL state that it
++   *        touches is put back.
++   */
++  static bool EyesProbe(unsigned int frame,
++                        unsigned int target,
++                        int width,
++                        int frameHeight,
++                        const EyeRows& eyes,
++                        std::string& failed);
++  //! (Hades) The eyes of Memory::GBM_EYES; eye 0 for any other
++  const EyeRows& Eyes() const { return m_eyes; }
+ 
+   //! (Hades) Whether the bytes of a pixel of the format lie in memory as B, G, R, A (ARGB8888,
+   //! XRGB8888: true) or as R, G, B, A (ABGR8888, XBGR8888: false); nothing for any other format
+@@ -313,6 +374,15 @@ public:
+   //! GPU (dumb buffers that the EGL of the driver cannot draw into); CopyReason() says why
+   bool CopiesOnCpu() const { return m_copy; }
+   const std::string& CopyReason() const { return m_copyReason; }
++  /*!
++   * \brief (Hades) What the copy of a frame costs here: \p frames black frames read back and copied
++   *        into the first buffer as a frame is (CopyOut()), on the render thread, before anything
++   *        goes out through the buffers (the check of frame packing, Check this setup)
++   * \return false where the frames are not copied, or a copy failed; \p ms the average of a frame
++   */
++  bool MeasureCopy(int frames, double& ms);
++  //! (Hades) The copy reads the frame back through pixel buffers, a band at a time (else at once)
++  bool CopiesInBands() const { return !m_packBuffers.empty(); }
+ 
+   //! The first buffer, for the driver's test before anything is shown through these
+   gbm_bo* FirstBuffer() const { return m_buffers.empty() ? nullptr : m_buffers.front().bo; }
+@@ -348,8 +418,19 @@ private:
+   };
+   //! (Hades) The EGL images and framebuffers of the buffers, given back (the buffers stay)
+   void ReleaseTargets();
+-  //! (Hades) The frame read back from its framebuffer object and copied into the buffer at index
+-  bool CopyOut(unsigned int index, std::string& failed);
++  //! (Hades) The frame read back from its framebuffer object and copied into the buffer at index;
++  //! \p readMs and \p writeMs: what the reading back (waiting for the GPU) and the writing took
++  bool CopyOut(unsigned int index,
++               std::string& failed,
++               double* readMs = nullptr,
++               double* writeMs = nullptr);
++  //! (Hades) CopyOut() through the pixel buffers, a band of lines at a time; false where a step
++  //! of GL failed (said in \p failed), and then nothing was written
++  bool CopyOutInBands(
++      uint8_t* target, uint32_t pitch, std::string& failed, double& readMs, double& writeMs);
++  //! (Hades) The pixel buffers of the copy, one for each band (none where GL gave none)
++  void MakePackBuffers();
++  void ReleasePackBuffers();
+   //! (Hades) The copy checked: four pixels of the bottom row of the frame come back from the
+   //! bottom row of the first buffer (its last one in memory, the last line that the display
+   //! shows), and its top row stays black; the buffer is black after
+@@ -368,6 +449,14 @@ private:
+   uint64_t m_copies{0};
+   double m_copyMs{0.0};
+   double m_copyMaxMs{0.0};
++  double m_readMs{0.0};
++  double m_writeMs{0.0};
++  //! (Hades) the pixel buffers of the copy and the lines of each band (from GL's row 0)
++  std::vector<unsigned int> m_packBuffers;
++  std::vector<std::pair<int, int>> m_bands;
++  //! (Hades) Memory::GBM_EYES: where the eyes lie, and the lines of the buffers
++  EyeRows m_eyes;
++  int m_bufferHeight{0};
+   EGLDisplay m_display{EGL_NO_DISPLAY};
+   int m_width{0};
+   int m_height{0};
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index b2c81bb..a720591 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -26,6 +26,7 @@
+ #include "utils/Variant.h"
+ #include "utils/log.h"
+ 
++#include <cmath>
+ #include <cstring>
+ #include <set>
+ #include <string>
+@@ -1117,6 +1118,16 @@ void CWinSystemGbmEGLContext::OwnScanoutRetire(bool rendered, bool refused)
+ // Otherwise the window's buffer goes to the driver as before, and where the driver refuses the
+ // mode, Kodi takes the 3D layout that comes next (CWinSystemGbm::CheckStereoOutput()). kodi.log
+ // says which buffer the frame goes out in, and what the two answers say of the refusal.
++std::vector<uint64_t> CWinSystemGbmEGLContext::PlaneModifiersOf(uint32_t format) const
++{
++  if (!m_DRM)
++    return {};
++  for (const auto& fmt : m_DRM->GetOutputFormats())
++    if (fmt.drm == format && fmt.active)
++      return fmt.modifiers;
++  return {};
++}
++
+ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+ {
+   // (every other mode, and every other driver: nothing, not even a test)
+@@ -1151,16 +1162,6 @@ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+   const int height = static_cast<int>(gbm_bo_get_height(window));
+   std::string failed;
+   std::shared_ptr<COwnScanout> own;
+-  if (!plane || !m_GBM)
+-    failed = "there is no plane or GBM device";
+-  else if (!FP_OWN::HoldsFrame(mode, width, height))
+-    failed = StringUtils::Format("the window's buffer of {}x{} does not hold the frame of the mode",
+-                                 width, height);
+-  else
+-    // (the size and format of the window's buffer: as wide as the second eye needs,
+-    // CDRMUtils::FramePackedBufferDemands(), and of 8 bits, CreateNewWindow())
+-    own = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), width, height,
+-                              format, {DRM_FORMAT_MOD_LINEAR}, true, true, failed);
+ 
+   // Each buffer as nvidia-drm asks a frame-packed one to be, and taken in a test of the mode
+   const auto ask =
+@@ -1184,8 +1185,47 @@ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+     }
+     return taken;
+   };
++
++  // Hades (1.2.3): first the buffers that the GPU draws into on NVIDIA, block-linear ones of GBM,
++  // each eye on a block row of its own (FramePackedOwn.h, EyesFirst(); OwnScanout.h, GBM_EYES):
++  // nothing is read back. Where they cannot be made or are refused, the linear ones as before.
++  std::string eyesWhat;
+   std::string ownWhy;
+-  FP_OWN::Asked ownAsked = ask(own, failed, ownWhy);
++  FP_OWN::Asked ownAsked = FP_OWN::Asked::NOT_ASKED;
++  if (plane && m_GBM && FP_OWN::HoldsFrame(mode, width, height))
++  {
++    std::string eyesFailed, eyesWhy;
++    auto eyes = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), width,
++                                    height, format, PlaneModifiersOf(format), true, false,
++                                    eyesFailed, COwnScanout::Memory::GBM_EYES, -1, &mode);
++    const FP_OWN::Asked eyesAsked = ask(eyes, eyesFailed, eyesWhy);
++    if (FP_OWN::EyesTaken(eyes != nullptr, eyesAsked))
++    {
++      own = eyes;
++      ownAsked = eyesAsked;
++    }
++    else
++      eyesWhat = !eyesFailed.empty() ? "the block-linear ones could not be made: " + eyesFailed
++                 : eyesAsked == FP_OWN::Asked::REFUSED
++                     ? "the driver refused the block-linear ones (" + eyesWhy + ")"
++                     : std::string("the block-linear ones could not be asked in a test commit");
++  }
++
++  // (the block-linear ones taken: nothing else is made)
++  if (!own)
++  {
++    if (!plane || !m_GBM)
++      failed = "there is no plane or GBM device";
++    else if (!FP_OWN::HoldsFrame(mode, width, height))
++      failed = StringUtils::Format(
++          "the window's buffer of {}x{} does not hold the frame of the mode", width, height);
++    else
++      // (the size and format of the window's buffer: as wide as the second eye needs,
++      // CDRMUtils::FramePackedBufferDemands(), and of 8 bits, CreateNewWindow())
++      own = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), width,
++                                height, format, {DRM_FORMAT_MOD_LINEAR}, true, true, failed);
++    ownAsked = ask(own, failed, ownWhy);
++  }
+ 
+   // Hades: where GBM's own buffers could not be made (NVIDIA's GBM refuses a linear buffer for
+   // scanout and rendering) or were refused, the driver's dumb buffers, which nvidia-drm makes in
+@@ -1218,6 +1258,8 @@ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+       what = "Kodi's own buffers could not be asked in a test commit";
+     if (!gbmWhat.empty())
+       what = "of Kodi's own buffers, " + gbmWhat + "; of the driver's dumb buffers, " + what;
++    if (!eyesWhat.empty())
++      what = "of Kodi's own buffers, " + eyesWhat + "; " + what;
+     CLog::LogF(LOGWARNING,
+                "3D output: the driver refused the window's buffer in a test commit of the "
+                "frame-packed mode ({}); {}: {}. The frame goes out in the window's buffer; where "
+@@ -1241,17 +1283,41 @@ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+     return;
+   const auto rows = FP_OWN::RowsOf(mode);
+   const bool dumb = own->MemoryKind() == COwnScanout::Memory::DUMB;
++  const bool eyes = own->MemoryKind() == COwnScanout::Memory::GBM_EYES;
++  if (eyes)
++  {
++    // (Hades, 1.2.3: the GPU draws the frame-packed frame itself; nothing is read back)
++    const COwnScanout::EyeRows& at = own->Eyes();
++    CLog::LogF(LOGINFO,
++               "3D output: the driver refused the window's buffer in a test commit of the "
++               "frame-packed mode ({}) and takes Kodi's own: {}. The frame goes out in {} "
++               "block-linear buffers that Kodi allocates itself in video memory, for scanout and "
++               "rendering, each {}; the GPU draws the frame: drawn upright and put by the GPU, "
++               "each eye flipped where the buffer holds it, when each frame is swapped, nothing "
++               "read back (the plane of a frame-packed mode takes no rotation): the left eye in "
++               "lines 0-{} of the buffer, the right eye in lines {}-{} (lines {}-{} of the frame "
++               "drawn), the lines between them never read; checked before use (8-bit values "
++               "written and read back, both eyes put by the GPU and read back from each buffer, a "
++               "test commit of the mode with each buffer)",
++               why, FP_OWN::CauseText(verdict.cause), COwnScanout::BUFFERS,
++               m_DRM->DescribeFramePackedBuffer(own->FirstBuffer()), at.eye - 1, at.bufferRight,
++               at.bufferRight + at.eye - 1, at.frameRight, at.frameRight + at.eye - 1);
++    return;
++  }
+   const std::string made =
+       dumb ? "that the driver allocates as dumb buffers (video memory, for scanout; each with a "
+              "framebuffer of its own, without GBM; of Kodi's own buffers, " +
+-                 gbmWhat + ")"
++                 (eyesWhat.empty() ? gbmWhat : eyesWhat + "; " + gbmWhat) + ")"
+            : std::string("that Kodi allocates itself for scanout");
+   const std::string how =
+       own->CopiesOnCpu()
+           ? "drawn upright, read back and copied from top to bottom by the processor into the "
+             "buffer when each frame is swapped, the same bytes (the EGL of the driver cannot draw "
+             "into them: " +
+-                own->CopyReason() + ")"
++                own->CopyReason() + "; " +
++                (own->CopiesInBands() ? "read back through pixel buffers, a band at a time"
++                                      : "read back at once") +
++                ")"
+           : std::string(dumb ? "drawn upright and flipped from top to bottom by the GPU when each "
+                                "frame is swapped (the EGL of the driver imports them; what the "
+                                "GPU draws was read back by the processor where the display "
+@@ -1313,6 +1379,12 @@ std::string CWinSystemGbmEGLContext::FramePackingCheck()
+   answer["ownwhy"] = "";
+   answer["draw"] = "";
+   answer["drawwhy"] = "";
++  // (Hades, 1.2.3: the block-linear buffers that the GPU draws into, which buffers the frame would
++  // go out in, and what the copy of the processor costs a frame where it copies)
++  answer["eyes"] = Name(Answer::NONE);
++  answer["eyeswhy"] = "";
++  answer["buffers"] = "";
++  answer["copyms"] = 0.0;
+   const auto finish = [&answer]()
+   {
+     std::string text;
+@@ -1403,35 +1475,79 @@ std::string CWinSystemGbmEGLContext::FramePackingCheck()
+   }
+   answer["window"] = Name(window);
+ 
+-  // Kodi's own dumb buffers, on nvidia-drm (as FramePackedOwnStart() makes them for a video)
++  // Kodi's own buffers, on nvidia-drm, as FramePackedOwnStart() makes them for a video: (1.2.3)
++  // the block-linear ones that the GPU draws into first, and where those are not taken, the dumb
++  // ones (and if the GPU draws into those, or the processor copies each picture, and what that
++  // costs here)
+   Answer own = Answer::NONE;
+ #if defined(HAS_GLES)
+   if (nvidia && m_renderableType != EGL_OPENGL_BIT)
+   {
+-    std::string failed;
+-    auto buffers =
+-        COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), width, height,
+-                            format, {DRM_FORMAT_MOD_LINEAR}, true, true, failed,
+-                            COwnScanout::Memory::DUMB, m_DRM->GetFileDescriptor());
+-    if (!buffers)
++    const auto askEach =
++        [this, &info](const std::shared_ptr<COwnScanout>& buffers, std::string& refusal)
++    {
++      Answer taken = Answer::TAKEN;
++      for (unsigned int i = 0; i < COwnScanout::BUFFERS && taken == Answer::TAKEN; ++i)
++      {
++        std::string wrong;
++        if (!m_DRM->FramePackedBufferUsable(buffers->BufferAt(i), wrong))
++        {
++          refusal = "a buffer that Kodi made is not one that the driver takes for frame packing: " +
++                    wrong;
++          return Answer::NOT_ASKED;
++        }
++        const std::optional<bool> answered =
++            m_DRM->TestFramePackedMode(info, buffers->BufferAt(i), refusal);
++        taken = !answered ? Answer::NOT_ASKED : *answered ? Answer::TAKEN : Answer::REFUSED;
++      }
++      return taken;
++    };
++
++    std::string eyesWhy;
++    Answer eyes = Answer::NOT_MADE;
++    {
++      auto buffers = COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(),
++                                         width, height, format, PlaneModifiersOf(format), true,
++                                         false, eyesWhy, COwnScanout::Memory::GBM_EYES, -1, &mode);
++      if (buffers)
++        eyes = askEach(buffers, eyesWhy);
++      // (black and never shown: they go here, as nothing holds them)
++    }
++    answer["eyes"] = Name(eyes);
++    answer["eyeswhy"] = eyesWhy;
++    if (eyes == Answer::TAKEN)
+     {
+-      own = Answer::NOT_MADE;
+-      answer["ownwhy"] = failed;
++      own = Answer::TAKEN;
++      answer["buffers"] = "blocklinear";
++      answer["draw"] = "gpu";
+     }
+     else
+     {
+-      own = Answer::TAKEN;
+-      for (unsigned int i = 0; i < COwnScanout::BUFFERS && own == Answer::TAKEN; ++i)
++      std::string failed;
++      auto buffers =
++          COwnScanout::Create(m_GBM->GetDevice().Get(), m_eglContext.GetEGLDisplay(), width, height,
++                              format, {DRM_FORMAT_MOD_LINEAR}, true, true, failed,
++                              COwnScanout::Memory::DUMB, m_DRM->GetFileDescriptor());
++      if (!buffers)
++      {
++        own = Answer::NOT_MADE;
++        answer["ownwhy"] = failed;
++      }
++      else
+       {
+         std::string why;
+-        const std::optional<bool> taken =
+-            m_DRM->TestFramePackedMode(info, buffers->BufferAt(i), why);
+-        own = !taken ? Answer::NOT_ASKED : *taken ? Answer::TAKEN : Answer::REFUSED;
++        own = askEach(buffers, why);
+         answer["ownwhy"] = why;
++        answer["buffers"] = "dumb";
++        answer["draw"] = buffers->CopiesOnCpu() ? "copy" : "gpu";
++        answer["drawwhy"] = buffers->CopyReason();
++        // (what the copy of a frame costs here, as a video would copy it: ten black frames into a
++        // buffer that never goes out)
++        double ms = 0.0;
++        if (buffers->CopiesOnCpu() && buffers->MeasureCopy(10, ms))
++          answer["copyms"] = std::round(ms * 100.0) / 100.0;
++        // (black and never shown: they go here, as nothing holds them)
+       }
+-      answer["draw"] = buffers->CopiesOnCpu() ? "copy" : "gpu";
+-      answer["drawwhy"] = buffers->CopyReason();
+-      // (black and never shown: they go here, as nothing holds them)
+     }
+   }
+ #endif
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+index 5f2dd66..c36de2b 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.h
+@@ -155,6 +155,9 @@ protected:
+   //! Nothing in any other mode or with any other driver.
+   //! \param window the window's buffer, of its first swap
+   void FramePackedOwnStart(struct gbm_bo* window);
++  //! \brief Hades: the modifiers that the plane of the output takes for a format (none where it
++  //! takes none, or the format is not active)
++  std::vector<uint64_t> PlaneModifiersOf(uint32_t format) const;
+ 
+   //! Kodi's own buffers in use
+   std::shared_ptr<COwnScanout> m_ownScanout;
+diff --git a/xbmc/windowing/gbm/drm/DRMStereo.h b/xbmc/windowing/gbm/drm/DRMStereo.h
+index aa5f06c..b3a9b76 100644
+--- a/xbmc/windowing/gbm/drm/DRMStereo.h
++++ b/xbmc/windowing/gbm/drm/DRMStereo.h
+@@ -541,6 +541,70 @@ constexpr int FramePackedBufferWidth(const Mode& mode, uint32_t bytesPerPixel, u
+   return 0;
+ }
+ 
++/*!
++ * \brief Hades: frame packing from a block-linear buffer of NVIDIA, which the GPU draws into
++ *
++ * NVIDIA's EGL draws into no buffer whose lines lie one after another (its GBM makes none for
++ * scanout and rendering, and a dumb buffer of nvidia-drm imported into it is no target of GL:
++ * issue #33, RTX 4080 SUPER, "storage error 0x502"), so a frame drawn by the GPU is in a
++ * block-linear buffer, whose lines lie in block rows of 8 << log2GobsPerBlockY lines (the last
++ * four bits of the modifier). nvidia-drm with Hades' patch (nvidia-open-kernel-modules-9087)
++ * takes a frame-packed frame from such a buffer too, uncompressed: the left eye from its first
++ * line, the right eye from the first line at or after vtotal that begins a block row and lies
++ * a multiple of 1024 bytes into the buffer (BlockLinearRightEyeRow(), which the kernel computes
++ * the same way: nv_drm_frame_packed_block_linear_row()). The lines between the eyes are never
++ * read: the display engine makes the active space of the signal itself. Kodi draws the frame as
++ * for any frame-packed mode, the right eye from line vtotal, and the GPU puts each eye where the
++ * buffer holds it (COwnScanout::EyesBlit()).
++ */
++inline constexpr uint64_t NVIDIA_MODIFIER_VENDOR = 0x03; // DRM_FORMAT_MOD_VENDOR_NVIDIA
++inline constexpr uint32_t BLOCK_LINEAR_MAX_LOG2_GOBS = 5; // nvidia-drm offers 0 to 5
++inline constexpr uint32_t GOB_LINES = 8;
++inline constexpr uint32_t GOB_BYTES_WIDE = 64;
++
++//! \brief Whether a modifier is an uncompressed block-linear one of NVIDIA (DRM_FORMAT_MOD_NVIDIA_
++//! BLOCK_LINEAR_2D: the vendor, bit 4, no compression in bits 23-25, a block of at most 32 GOBs)
++constexpr bool IsNvidiaBlockLinear(uint64_t modifier)
++{
++  return (modifier >> 56) == NVIDIA_MODIFIER_VENDOR && (modifier & 0x10) != 0 &&
++         ((modifier >> 23) & 0x7) == 0 && (modifier & 0xf) <= BLOCK_LINEAR_MAX_LOG2_GOBS;
++}
++
++/*!
++ * \brief The first line of the right eye in a block-linear buffer of this modifier and pitch (in
++ *        bytes, a multiple of the 64 bytes of a GOB) for a frame-packed mode
++ * \return the first line at or after vtotal that begins a block row and whose offset
++ *         (pitch x line) is a multiple of alignment; 0 without one
++ */
++constexpr uint32_t BlockLinearRightEyeRow(const Mode& mode,
++                                          uint64_t modifier,
++                                          uint32_t pitch,
++                                          uint32_t alignment)
++{
++  if (!IsNvidiaBlockLinear(modifier) || pitch == 0 || pitch % GOB_BYTES_WIDE != 0 ||
++      alignment == 0 || mode.vtotal == 0 || mode.vtotal <= mode.vdisplay)
++    return 0;
++  const uint32_t blockLines = GOB_LINES << (modifier & 0xf);
++  uint32_t row = (static_cast<uint32_t>(mode.vtotal) + blockLines - 1) / blockLines * blockLines;
++  // (a pitch of 64 bytes or more puts every 16th line on 1024 bytes: two steps at most)
++  for (int step = 0; step < 64; ++step, row += blockLines)
++  {
++    if ((static_cast<uint64_t>(pitch) * row) % alignment == 0)
++      return row;
++  }
++  return 0;
++}
++
++//! \brief The lines of a block-linear buffer of a frame-packed mode: room for the right eye
++//! after the largest block row that nvidia-drm offers (32 GOBs, 256 lines); 0 for no such mode
++constexpr int BlockLinearBufferHeight(const Mode& mode)
++{
++  if (mode.vtotal == 0 || mode.vtotal <= mode.vdisplay)
++    return 0;
++  constexpr int largest = static_cast<int>(GOB_LINES << BLOCK_LINEAR_MAX_LOG2_GOBS);
++  return (mode.vtotal + largest - 1) / largest * largest + mode.vdisplay;
++}
++
+ /*!
+  * \brief The video format number of CTA-861 (VIC) of a 2D mode, of those that an EDID names in 3D
+  * \return the number of its 16:9 form (of 3840x2160; 256:135 of 4096x2160), or 0 for any other
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 231403b..bd02aeb 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -2306,8 +2306,25 @@ bool CDRMUtils::FramePackedBufferUsable(struct gbm_bo* bo, std::string& wrong) c
+ #if defined(HAS_GBM_MODIFIERS)
+   const uint64_t modifier = gbm_bo_get_modifier(bo);
+   const uint32_t pitch = gbm_bo_get_stride_for_plane(bo, 0);
++  // Hades (1.2.3): a block-linear buffer of NVIDIA, its right eye on the block row that
++  // nvidia-drm takes it from (DRMStereo.h, BlockLinearRightEyeRow())
++  const uint32_t blockRight = STEREO::BlockLinearRightEyeRow(
++      StereoModeOf(*m_mode), modifier, pitch, STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT);
+   if (gbm_bo_get_plane_count(bo) != 1)
+     wrong = "it has more than one plane";
++  else if (STEREO::IsNvidiaBlockLinear(modifier))
++  {
++    if (blockRight == 0)
++      wrong = StringUtils::Format("with its modifier {} and pitch of {} bytes, no block row at or "
++                                  "after line {} lies a multiple of {} bytes into it",
++                                  DRMHELPERS::ModifierToString(modifier), pitch, m_mode->vtotal,
++                                  STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT);
++    else if (gbm_bo_get_width(bo) < m_mode->hdisplay ||
++             gbm_bo_get_height(bo) < blockRight + m_mode->vdisplay)
++      wrong = StringUtils::Format("it is {}x{}, smaller than {}x{} for the right eye from line {}",
++                                  gbm_bo_get_width(bo), gbm_bo_get_height(bo), m_mode->hdisplay,
++                                  blockRight + m_mode->vdisplay, blockRight);
++  }
+   else if (modifier != DRM_FORMAT_MOD_LINEAR)
+     wrong = StringUtils::Format("its lines do not lie one after another (it was made with the "
+                                 "modifier {}, not DRM_FORMAT_MOD_LINEAR)",
+@@ -2344,6 +2361,20 @@ std::string CDRMUtils::DescribeFramePackedBuffer(struct gbm_bo* bo) const
+         ScanoutHeight());
+ #if defined(HAS_GBM_MODIFIERS)
+   const uint32_t pitch = gbm_bo_get_stride_for_plane(bo, 0);
++  // Hades (1.2.3): a block-linear buffer of NVIDIA, its right eye on a block row of its own
++  const uint32_t blockRight =
++      STEREO::BlockLinearRightEyeRow(StereoModeOf(*m_mode), gbm_bo_get_modifier(bo), pitch,
++                                     STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT);
++  if (blockRight != 0)
++    return StringUtils::Format(
++        "a block-linear buffer of {}x{} ({}), pitch {} bytes, modifier {}, the second eye from "
++        "line {} (byte {}, the first block row at or after line {}), for a mode of {}x{} with {} "
++        "lines in all",
++        gbm_bo_get_width(bo), gbm_bo_get_height(bo),
++        DRMHELPERS::FourCCToString(gbm_bo_get_format(bo)), pitch,
++        DRMHELPERS::ModifierToString(gbm_bo_get_modifier(bo)), blockRight,
++        static_cast<uint64_t>(pitch) * blockRight, m_mode->vtotal, m_mode->hdisplay,
++        m_mode->vdisplay, ScanoutHeight());
+   return StringUtils::Format(
+       "a buffer of {}x{} ({}), pitch {} bytes, modifier {}, the second eye from line {} (byte "
+       "{}), for a mode of {}x{} with {} lines in all",
+-- 
+2.53.0
+

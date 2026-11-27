@@ -73,7 +73,8 @@ L = {
                         ('videoscreen.hadesdvconverter', 3), ('videoscreen.hadesdvdce', 3), ('videoscreen.hadesdvnotrims', 3),
                         ('videoscreen.hadesdvtrimpass', 3), ('videoscreen.hadesdvcm40', 3),
                         ('videoscreen.hadesdvcm40manual', 3), ('videoscreen.hadesdvcm40peak', 3)]),
-        ('10', '62500', [('videoscreen.hadesdvfromhdr10plus', 2), ('videoscreen.hadesdvfromhdr10', 2),
+        # (1.2.3: "Play HDR10+ videos as Dolby Vision" of three values; its boolean of before stays, hidden)
+        ('10', '62500', [('videoscreen.hadesdvfromhdr10plusmode', 2), ('videoscreen.hadesdvfromhdr10', 2),
                          ('videoscreen.hadeshlgasdv', 2), ('videoscreen.hadesdualhdr', 3)]),
         ('8', '61106', [('videoscreen.hadesdvashdr10', 2), ('videoscreen.hadesdvashdr10fel', 3),
                         ('videoscreen.hadesdvashdr10plus', 3), ('videoscreen.hadesdvhdr10map', 3),
@@ -85,12 +86,20 @@ L = {
         ('11', '62700', [('videoscreen.hadesprojector', 2), ('videoscreen.hadesprojectoraddress', 2),
                          ('videoscreen.hadesprojectorpassword', 2), ('videoscreen.hadesprojectorconfirmed', 4),
                          ('videoscreen.hadesprojectortest', 2), ('videoscreen.hadesprojectorlens', 2),
-                         ('videoscreen.hadesprojectorlensnarrow', 2), ('videoscreen.hadesprojectorlenswidefrom', 2),
-                         ('videoscreen.hadesprojectorlenswide', 2), ('videoscreen.hadesprojectorlenswidest', 3),
+                         # (1.2.3: the anamorphic mode of a JVC next to the lens memory of each class of shape)
+                         ('videoscreen.hadesprojectorlensnarrow', 2), ('videoscreen.hadesprojectoranamorphicnarrow', 2),
+                         ('videoscreen.hadesprojectorlenswidefrom', 2),
+                         ('videoscreen.hadesprojectorlenswide', 2), ('videoscreen.hadesprojectoranamorphicwide', 2),
+                         ('videoscreen.hadesprojectorlenswidest', 3), ('videoscreen.hadesprojectoranamorphicwidest', 3),
                          ('videoscreen.hadesprojectorlenswidestfrom', 3), ('videoscreen.hadesprojectorlenshold', 3),
-                         ('videoscreen.hadesprojectorlensstop', 2), ('videoscreen.hadesprojectormodesdr', 2),
+                         # (1.2.3: the menus before SDR video, SDR in BT.2020 and DCI-P3 after it; the player controls
+                         # inside a scope picture last)
+                         ('videoscreen.hadesprojectorlensstop', 2), ('videoscreen.hadesprojectormodemenus', 2),
+                         ('videoscreen.hadesprojectormodesdr', 2), ('videoscreen.hadesprojectormodesdr2020', 2),
+                         ('videoscreen.hadesprojectormodesdrp3', 3),
                          ('videoscreen.hadesprojectormodehdr10', 2), ('videoscreen.hadesprojectormodehlg', 2),
-                         ('videoscreen.hadesprojectormodedv', 2), ('videoscreen.hadesprojectormode3d', 2)]),
+                         ('videoscreen.hadesprojectormodedv', 2), ('videoscreen.hadesprojectormode3d', 2),
+                         ('videoscreen.hadesprojectorosd', 2)]),
         # (the 3D LUT of the display, after the mapping to it: a group of its own, expert)
         ('12', '62800', [('videoscreen.hadeslut3d', 3), ('videoscreen.hadeslut3dsdr', 3), ('videoscreen.hadeslut3dhdr', 3),
                          ('videoscreen.hadeslut3drange', 3), ('videoscreen.hadeslut3dsdrgamut', 3)]),
@@ -108,7 +117,7 @@ L = {
                         ('videoplayer.hadesactiveareazoom', 3)]),
         ('6', '62501', [('videoscreen.hadesplaybackmode', 2), ('videoscreen.hadeskodiplayerinfo', 2)]),
         ('3', None, [('videoplayer.hadesupscalerhd', 3), ('videoplayer.hadesfilmfields', 2)]),
-        ('4', '14232', [('videoplayer.hades3dmvc', 3)]),
+        ('4', '14232', [('videoplayer.hades3dmvc', 3), ('videoplayer.hades3dmvcbase', 3)]),
         ('5', None, []),
     ],
     ('player', 'subtitles'): [

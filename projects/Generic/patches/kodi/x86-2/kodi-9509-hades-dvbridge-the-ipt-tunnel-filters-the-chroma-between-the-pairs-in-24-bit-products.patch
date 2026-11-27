@@ -1,0 +1,170 @@
+From edeea9a13b2c39af7c37bb278345acb766189d36 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:34:47 +0000
+Subject: [PATCH] [Hades][dvbridge] The IPT tunnel filters the chroma between
+ the pairs in 24-bit products
+
+Pass 9 (the IPT tunnel) gives every odd pixel the chroma between the
+pairs around it: twelve integer weights of a Lanczos 6 filter (over
+2^14) times the chroma codes of twelve pairs. The weights were a
+uniform, of either sign, so a GPU had to make each product as a full
+32-bit multiply: on RDNA2 v_mul_lo_u32, which runs at a quarter of the
+rate of the other operations, 48 of them in every invocation of the
+compute form (9c), 24 in every odd pixel of the fragment form (9a).
+
+The weights are those of dvbridge_source_filter(0.5), always the same.
+The shaders now hold them as constants, split by sign (hpos and hneg,
+one of them 0 for each tap), and the codes are read as the 16 bits they
+are: every product is of two values below 2^16, which the GPU makes in
+one multiply-add at the full rate (v_mad_u32_u16), and the products by
+0 are gone. The sum of the twelve products is the difference of the two
+sums: the same integers, the same bytes.
+
+The programs of pass 9 are made only where dvbridge_source_filter()
+gives these weights (the log says so otherwise, and the pictures go
+out as composed, as where the passes cannot be made).
+
+Measured, the same bytes: the 14 pictures of the profile 7 FEL stream
+by the compute pass and by the fragment passes, and three of them with
+the GUI over them, are those of the tree before (62 files). radeonsi
+(ACO, gfx1030 through Mesa's drm-shim), 9c: 48 32-bit multiplies to
+none, 700 vector instructions to 680, ACO's estimate of the cycles of
+a wave of 64 invocations 805 to 559.
+---
+ tools/dvbridge/dvbridge_source.c | 67 ++++++++++++++++++++++----------
+ 1 file changed, 46 insertions(+), 21 deletions(-)
+
+diff --git a/tools/dvbridge/dvbridge_source.c b/tools/dvbridge/dvbridge_source.c
+index 6e52263..4b6a684 100644
+--- a/tools/dvbridge/dvbridge_source.c
++++ b/tools/dvbridge/dvbridge_source.c
+@@ -1701,6 +1701,19 @@ struct common_uniforms {
+  * and 0.036 %. What is left is the single precision of the matrices: the chain with PQ exact and
+  * each matrix product rounded once to float, emulated on the processor, is off on 0.008 %, 0.007 %
+  * and 0.001 % of them. */
++/* Hades: the weights of the chroma between the pairs (dvbridge_source_filter(0.5): Lanczos 6 over
++ * 2^14, -85, 348, -785, 1538, -3128, 10304, 10304, -3128, 1538, -785, 348, -85), each the difference
++ * of hpos and hneg, one of them 0. The shaders hold them as constants and take the sums of the
++ * positive and of the negative taps apart: every product is then of two values that a GPU knows to
++ * be below 2^16 (a weight, and a code read as 16 bits), which it makes in one multiply-add at the
++ * full rate (RDNA2: v_mad_u32_u16), where the product of a weight held in a uniform, of either sign,
++ * by a code is a 32-bit multiply at a quarter of it (v_mul_lo_u32, 48 in an invocation of 9c). The
++ * same integers: the sum of the twelve products is the difference of the two sums. The programs
++ * are made only where dvbridge_source_filter() gives these weights (create_packer()). */
++#define IPT_HPOS 0, 348, 0, 1538, 0, 10304, 10304, 0, 1538, 0, 348, 0
++#define IPT_HNEG 85, 0, 785, 0, 3128, 0, 0, 3128, 0, 785, 0, 85
++#define IPT_LIST2(...) #__VA_ARGS__
++#define IPT_LIST(...) IPT_LIST2(__VA_ARGS__)
+ #define IPT_HEAD "#version 300 es\n" IPT_BODY
+ /* (Hades: and 9c, the compute form, after its own first line) */
+ #define IPT_BODY                                                                                  \
+@@ -1713,7 +1726,8 @@ struct common_uniforms {
+     "uniform vec3 off_src;\n"                                                                     \
+     "uniform ivec4 active_box;\n" /* x0, y0, x1, y1 of the active picture, in the picture */          \
+     "uniform ivec2 pairs;\n"  /* the first and the last pair of the active picture */             \
+-    "uniform int hweights[12];\n"                                                                 \
++    "const int hpos[12] = int[12](" IPT_LIST(IPT_HPOS) ");\n"                                     \
++    "const int hneg[12] = int[12](" IPT_LIST(IPT_HNEG) ");\n"                                     \
+     "uniform highp sampler2D eotf_table, oetf_table;\n" /* dvbridge_source_to_ipt() */            \
+     /* the PQ EOTF of e in [0, 1] from eotf_table: a quadratic in each cell, of 1/4096 from 2^-6 on, */ \
+     /* of 1/256 of an octave from 2^-22 to 2^-6 (cells 4096 on; e by the bits of its float), 0 below */ \
+@@ -1818,9 +1832,13 @@ static const char IPT_LUMA[] =
+     "    if ((q.x & 1) == 0) {\n"
+     "        c = vec2(pair(n, q.y));\n"
+     "    } else {\n"
+-    "        ivec2 acc = ivec2(0);\n"
+-    "        for (int k = 0; k < 12; k++)\n"
+-    "            acc += hweights[k] * ivec2(pair(n - 5 + k, q.y));\n"
++    "        ivec2 accp = ivec2(0), accn = ivec2(0);\n"
++    "        for (int k = 0; k < 12; k++) {\n"
++    "            ivec2 t = ivec2(pair(n - 5 + k, q.y) & 0xFFFFu);\n"
++    "            accp += hpos[k] * t;\n"
++    "            accn += hneg[k] * t;\n"
++    "        }\n"
++    "        ivec2 acc = accp - accn;\n"
+     "        c = vec2(clamp((acc + (1 << 13)) >> 14, ivec2(0), ivec2(4095)));\n"
+     "    }\n"
+     "    color = vec4(float(ipt_i(luma_at(q), c)) * (1.0 / code_scale), 0.0, 0.0, 1.0);\n"
+@@ -1870,10 +1888,14 @@ static const char IPT_COMPUTE[] =
+     "    if (q.x >= size.x || q.y >= size.y)\n"
+     "        return;\n"
+     /* the chroma of the odd pixels of rows 2 q.y (xy) and 2 q.y + 1 (zw), as 9a makes it */
+-    "    ivec4 acc = ivec4(0);\n"
+-    "    for (int k = 0; k < 12; k++)\n"
+-    "        acc += hweights[k] * ivec4(texelFetch(chroma_rows,\n"
+-    "                                              ivec2(clamp(q.x - 5 + k, pairs.x, pairs.y), q.y), 0));\n"
++    "    ivec4 accp = ivec4(0), accn = ivec4(0);\n"
++    "    for (int k = 0; k < 12; k++) {\n"
++    "        ivec4 t = ivec4(texelFetch(chroma_rows, ivec2(clamp(q.x - 5 + k, pairs.x, pairs.y), q.y), 0)\n"
++    "                        & 0xFFFFu);\n"
++    "        accp += hpos[k] * t;\n"
++    "        accn += hneg[k] * t;\n"
++    "    }\n"
++    "    ivec4 acc = accp - accn;\n"
+     "    ivec4 odd = clamp((acc + (1 << 13)) >> 14, ivec4(0), ivec4(4095));\n"
+     "    uvec4 even = texelFetch(chroma_rows, ivec2(clamp(q.x, pairs.x, pairs.y), q.y), 0);\n"
+     "    uvec4 out_ = uvec4(0u);\n"
+@@ -2063,8 +2085,7 @@ struct dvbridge_source_packer {
+      * those (rows_ipt: set by it, cleared by dvbridge_source_rows() and dvbridge_source_scale()) */
+     GLuint ipt_luma_program, ipt_rows_program;
+     struct ipt_uniforms {
+-        GLint luma, rows, code_scale, ycc_src, to_lms, to_ipt, off_src, active, pairs, eotf, oetf,
+-            hweights;
++        GLint luma, rows, code_scale, ycc_src, to_lms, to_ipt, off_src, active, pairs, eotf, oetf;
+     } il, ir;
+     GLint ir_rows;
+     struct texture ipt_luma, ipt_rows;
+@@ -2483,16 +2504,25 @@ static struct dvbridge_source_packer *create_packer(bool allow_quad)
+     {
+         static const char *const ipt[] = {"luma_plane", "chroma_rows", "code_scale", "ycc_src",
+                                           "to_lms", "to_ipt", "off_src", "active_box", "pairs",
+-                                          "eotf_table", "oetf_table", "hweights"};
++                                          "eotf_table", "oetf_table"};
+         _Static_assert(sizeof(p->il) == COUNT(ipt) * sizeof(GLint), "ipt uniforms");
+-        p->ipt_luma_program = link(IPT_LUMA);
+-        p->ipt_rows_program = link(IPT_ROWS);
++        /* (Hades: only where the filter is the one whose weights its shaders hold, IPT_HPOS and
++         * IPT_HNEG) */
++        static const int hpos[12] = {IPT_HPOS}, hneg[12] = {IPT_HNEG};
++        int weights[DVBRIDGE_SOURCE_TAPS], first = 0, taps = 0;
++        dvbridge_source_filter(0.5, weights, &first, &taps);
++        bool filter = taps == 12 && first == -5;
++        for (int k = 0; filter && k < 12; ++k)
++            filter = weights[k] == hpos[k] - hneg[k] && !(hpos[k] && hneg[k]);
++        p->ipt_luma_program = filter ? link(IPT_LUMA) : 0;
++        p->ipt_rows_program = filter ? link(IPT_ROWS) : 0;
+         p->ir_rows = p->ipt_rows_program ? glGetUniformLocation(p->ipt_rows_program, "rows") : -1;
+-        p->ir.hweights = -1;
++        if (!filter)
++            fprintf(stderr, "DV source transport: the filter of the chroma of the IPT tunnel is not the "
++                            "one its shaders hold\n");
+         if (!p->ipt_luma_program || !p->ipt_rows_program || p->ir_rows < 0 ||
+             !locate(p->ipt_luma_program, &p->il.luma, ipt, COUNT(ipt)) ||
+-            /* (pass 9b reads no weights: the last name, which GL gives -1 for, is not looked for) */
+-            !locate(p->ipt_rows_program, &p->ir.luma, ipt, COUNT(ipt) - 1)) {
++            !locate(p->ipt_rows_program, &p->ir.luma, ipt, COUNT(ipt))) {
+             glDeleteProgram(p->ipt_luma_program);
+             glDeleteProgram(p->ipt_rows_program);
+             p->ipt_luma_program = p->ipt_rows_program = 0;
+@@ -3180,10 +3210,6 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+     const int first_pair = (a + 1) / 2, last_pair = (b + 1) / 2 - 1;
+     if (a >= b || c >= d || first_pair > last_pair)
+         return false;
+-    int weights[DVBRIDGE_SOURCE_TAPS], first = 0, taps = 0;
+-    dvbridge_source_filter(0.5, weights, &first, &taps);
+-    if (taps != 12 || first != -5)
+-        return false;
+     /* YCCtoRGB of the RPU; the T of the RPU (linear BT.2020 RGB for profiles 7 and 8, the LMS of
+      * profile 5 without its crosstalk) to the LMS of the tunnel without its crosstalk, through the
+      * RPU's own RGBtoLMS (Hades: so that a picture of profile 5 goes from the matrices of its RPU to
+@@ -3234,7 +3260,6 @@ bool dvbridge_source_to_ipt(struct dvbridge_source_packer *p,
+             glUniform3fv(u->off_src, 1, src->offset);
+             glUniform4i(u->active, a, c, b, d);
+             glUniform2i(u->pairs, first_pair, last_pair);
+-            glUniform1iv(u->hweights, DVBRIDGE_SOURCE_TAPS, weights);
+             bind(p, 2, p->ipt_eotf);
+             bind(p, 3, p->ipt_oetf);
+             glUniform1i(u->eotf, 2);
+-- 
+2.53.0
+

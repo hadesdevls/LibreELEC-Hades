@@ -13,8 +13,20 @@
 //    Plus Atmos with a 5.1 bed to a 5.1.2 receiver), and never a speaker shown as used where nothing says so;
 //  - what a downmix folds, by the matrix that libswresample builds (swr_build_matrix2(), the host's FFmpeg, with the
 //    levels that Kodi gives it);
-//  - where WinSystemGbmGLESContext.cpp takes each of them (in the source).
+//  - where WinSystemGbmGLESContext.cpp takes each of them (in the source);
+//  - (1.2.3, Ryudoadema: "not known yet" with a receiver of 5.1.2) where what is declared comes from (DeclaredBy()):
+//    the EDID of the display the sound goes to, shown or on an output of its own, with its Room Configuration and
+//    Speaker Location Data Blocks (CTA-861-G, as libdisplay-info 0.4.0 reads them), else its ELD (no heights), and
+//    "not known yet" only where the output or its display is not known; a receiver of 5.1.2 with Atmos passed
+//    through: its heights as the speakers it renders the objects to.
+//  - (1.2.3, the owner's TCL Q85H Pro: "9.1.6 (LG TV SSCR2)" read as his speakers) the two bits that CTA-861-H
+//    deprecates place no speaker of their own (F33, TpLS/TpRS, never; F16, RLC/RRC, only in the form of
+//    CTA-861-D); which device declares them, by the physical address of the HDMI vendor block: a repeater between
+//    the PC and the display (the sound bar, 2.2.0.0), the display or what is on its eARC (4.0.0.0, the bar on the
+//    TV's eARC), the TV's own speakers (4.0.0.0, none declared), none at all (DisplayPort); the speakers of the room
+//    only from a Room Configuration or Speaker Location Data Block.
 // usage: speaker_plan_test <Kodi tree> <lg-c5-direct> <lg-c5-sound-bar> <receiver-denon> <receiver-onkyo> <tv-lg-1>
+//                          <lg-c5-tv-speakers>
 #include "utils/SpeakerPlan.h"
 
 extern "C"
@@ -23,6 +35,7 @@ extern "C"
 #include <libswresample/swresample.h>
 }
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -124,23 +137,31 @@ std::string Fold(const std::vector<std::string>& in,
   AVChannelLayout i = {}, o = {};
   av_channel_layout_from_mask(&i, inMask);
   av_channel_layout_from_mask(&o, outMask);
-  std::vector<double> m(static_cast<std::size_t>(i.nb_channels * o.nb_channels));
-  const int r = swr_build_matrix2(&i, &o, M_SQRT1_2, M_SQRT1_2, lfe, 1.0, 1.0, m.data(), i.nb_channels,
-                                  AV_MATRIX_ENCODING_NONE, nullptr);
-  const std::size_t stride = static_cast<std::size_t>(i.nb_channels);
+  // (1.2.3: the block that libswresample writes, as WinSystemGbmGLESContext.cpp gives it, and a guard after it of
+  // 1.0 that nothing may change: the library is not instrumented, so an overrun of the matrix is seen there. A matrix
+  // of the layouts' channels alone, as 1.2.2 gave it, was overrun and the heap of Kodi corrupted)
+  constexpr std::size_t GUARD = 4096;
+  std::vector<double> m(SP::SWR_MATRIX_SIZE + GUARD, 0.0);
+  std::fill(m.begin() + static_cast<std::ptrdiff_t>(SP::SWR_MATRIX_SIZE), m.end(), 1.0);
+  const int r = swr_build_matrix2(&i, &o, M_SQRT1_2, M_SQRT1_2, lfe, 1.0, 1.0, m.data(),
+                                  static_cast<ptrdiff_t>(SP::SWR_MATRIX_STRIDE), AV_MATRIX_ENCODING_NONE, nullptr);
   av_channel_layout_uninit(&i);
   av_channel_layout_uninit(&o);
+  Check(std::all_of(m.begin() + static_cast<std::ptrdiff_t>(SP::SWR_MATRIX_SIZE), m.end(),
+                    [](double v) { return v == 1.0; }),
+        "swr_build_matrix2() writes nothing past the block that SpeakerPlan.h gives it");
   if (r < 0)
     return "swr_build_matrix2 failed";
-  return SP::Folded(in, out, m, stride, dropped);
+  m.resize(SP::SWR_MATRIX_SIZE);
+  return SP::Folded(in, out, m, SP::SWR_MATRIX_STRIDE, dropped);
 }
 } // namespace
 
 int main(int argc, char** argv)
 {
-  if (argc < 7)
+  if (argc < 8)
   {
-    std::printf("usage: speaker_plan_test <Kodi tree> <5 EDIDs>\n");
+    std::printf("usage: speaker_plan_test <Kodi tree> <6 EDIDs>\n");
     return 2;
   }
   const std::string kodi = argv[1];
@@ -151,12 +172,16 @@ int main(int argc, char** argv)
   const SP::EdidAudio c5a = SP::AudioOfEdid(c5);
   Check(c5a.allocation && c5a.allocation->bytes == std::array<uint8_t, 3>{0x6F, 0x0F, 0x0C},
         "LG C5: its speaker allocation, 6f 0f 0c");
-  Check(Join(DeclaredOf(c5)) == "BL BR FC FL FLOC FR FROC LFE SL SR TC TFC TFL TFR TSL TSR",
-        "LG C5: FL/FR, LFE, FC, FLc/FRc, LS/RS as the sides and BL/BR (RL/RR, RLC/RRC) as the backs; TpFL/TpFR, TpC, "
-        "TpFC, TpLS/TpRS", Join(DeclaredOf(c5)));
-  Check(SP::LayoutName(DeclaredOf(c5)) == "9.1.6" && c5a.allocation &&
-            SP::DeclaredOffPlan(*c5a.allocation) == std::vector<std::string>{"BtFL/BtFR"},
-        "LG C5: 9.1.6 declared, and BtFL/BtFR, which the plan has no place for", SP::LayoutName(DeclaredOf(c5)));
+  // (up to 1.2.3 its deprecated TpLS/TpRS made two more heights, TSL/TSR: "9.1.6"; CTA-861-H deprecates the bit,
+  // libdisplay-info 0.4.0 reads nothing of it, and the top sides are TpSiL/TpSiR's, which it does not set)
+  Check(Join(DeclaredOf(c5)) == "BL BR FC FL FLOC FR FROC LFE SL SR TC TFC TFL TFR",
+        "LG C5: FL/FR, LFE, FC, FLc/FRc, LS/RS as the sides and BL/BR as the backs (RLC/RRC, deprecated, adds "
+        "nothing); TpFL/TpFR, TpC, TpFC; TpLS/TpRS, deprecated, not placed", Join(DeclaredOf(c5)));
+  Check(SP::LayoutName(DeclaredOf(c5)) == "9.1.4" && c5a.allocation &&
+            SP::DeclaredOffPlan(*c5a.allocation) ==
+                std::vector<std::string>{"BtFL/BtFR", "TpLS/TpRS (deprecated)"},
+        "LG C5: up to 9.1.4 accepted, and BtFL/BtFR and the deprecated TpLS/TpRS, which the plan does not place",
+        SP::LayoutName(DeclaredOf(c5)));
   Check(DeclaredOf(bar) == DeclaredOf(c5) && SP::AudioOfEdid(bar).eac3Joc && SP::AudioOfEdid(c5).eac3Joc,
         "LG C5 through the sound bar: the same allocation; Atmos over Dolby Digital Plus (JOC) declared");
   Check(Join(DeclaredOf(denon)) == "BC BL BR FC FL FR LFE SL SR" && SP::LayoutName(DeclaredOf(denon)) == "8.1",
@@ -176,6 +201,72 @@ int main(int argc, char** argv)
             eld.find("header.lfe                 = (data[7 ] & 0x02) == 0x02;") != std::string::npos &&
             eld.find("header.flr                 = (data[7 ] & 0x01) == 0x01;") != std::string::npos,
         "Kodi's ELD parser: byte 7 by the bits of DRM_ELD_SPEAKER_* (RLRC 0x40 ... FLR 0x01), the SADB's first byte");
+
+  // ---- 1b. which device declares them, by the physical address of the HDMI vendor block (the owner's EDIDs of
+  // 2026-10-21 and of 1.2.3); and the speakers of the room only where a block says them
+  {
+    const auto tvSpeakers = ReadFile(argv[7]);
+    const SP::EdidAudio barA = SP::AudioOfEdid(bar), c5A = SP::AudioOfEdid(c5), tvA = SP::AudioOfEdid(tvSpeakers);
+    Check(SP::PhysicalAddressText(barA.physicalAddress) == "2.2.0.0" && SP::DeclarerOf(barA) == SP::Declarer::REPEATER,
+          "through the sound bar (2.2.0.0, two levels): the bar between the PC and the TV declares them, not the TV",
+          SP::PhysicalAddressText(barA.physicalAddress));
+    Check(SP::PhysicalAddressText(c5A.physicalAddress) == "4.0.0.0" &&
+              SP::DeclarerOf(c5A) == SP::Declarer::DISPLAY_OR_ITS_ARC,
+          "the PC on the TV with the bar on its eARC (4.0.0.0, a speaker allocation): the TV or what is on its eARC",
+          SP::PhysicalAddressText(c5A.physicalAddress));
+    Check(SP::PhysicalAddressText(tvA.physicalAddress) == "4.0.0.0" && !tvA.allocation && DeclaredOf(tvSpeakers).empty(),
+          "the PC on the TV with its own speakers (4.0.0.0): no speaker allocation, none declared");
+    Check(!barA.room && barA.located.empty() && !SP::RoomPlaces(barA) && !SP::RoomPlaces(c5A),
+          "the bar and the TV: no Room Configuration nor Speaker Location Data Block, so no speakers of the room");
+    SP::SinkFacts f;
+    f.output = true;
+    f.kind = SP::SinkFacts::Kind::DISPLAY;
+    f.identity = true;
+    f.shown = true;
+    f.edid = bar;
+    SP::SinkDeclared d = SP::DeclaredBy(f);
+    Check(d.places && SP::LayoutName(*d.places) == "9.1.4" && d.declarer == SP::Declarer::REPEATER && !d.room,
+          "DeclaredBy(), the bar: accepts up to 9.1.4, declared by the device between, its speakers not said");
+    f.edid = c5;
+    d = SP::DeclaredBy(f);
+    Check(d.places && d.declarer == SP::Declarer::DISPLAY_OR_ITS_ARC, "DeclaredBy(), the bar on the TV's eARC");
+    f.edid = tvSpeakers;
+    Check(SP::DeclaredBy(f).why == "none", "DeclaredBy(), the TV's own speakers: none declared");
+    // depths
+    Check(SP::PhysicalDepth(0x1000) == 1 && SP::PhysicalDepth(0x2200) == 2 && SP::PhysicalDepth(0x1230) == 3 &&
+              SP::PhysicalDepth(0x1234) == 4 && SP::PhysicalDepth(0x0000) == 0 && SP::PhysicalDepth(0x1020) == 0 &&
+              SP::PhysicalDepth(0xFFFF) == 0,
+          "the depth of a physical address: its levels before the first 0; 0.0.0.0, a gap or none: 0");
+    // made: an EDID without an HDMI vendor block (DisplayPort): the device it names; an ELD: the same
+    const SP::EdidAudio noVsdb = SP::AudioOfEdid(MadeEdid({0x0F, 0x00, 0x00}, Sads(true, true)));
+    Check(noVsdb.physicalAddress == 0xFFFF && SP::DeclarerOf(noVsdb) == SP::Declarer::NAMED,
+          "made: no HDMI vendor block, no address: the device it names");
+    SP::EdidAudio eldOne;
+    eldOne.fromEld = true;
+    eldOne.physicalAddress = 0x2200;
+    Check(SP::DeclarerOf(eldOne) == SP::Declarer::NAMED, "an ELD: no address is read from it");
+    // a Room Configuration Data Block of 5.1.2 behind an allocation of 7.1.4: the speakers of the room are its own
+    std::vector<uint8_t> roomEdid = c5;
+    SP::EdidAudio roomA = SP::AudioOfEdid(roomEdid);
+    roomA.room = SP::Allocation{{0x0F, 0x01, 0x00}};
+    Check(SP::RoomPlaces(roomA) && SP::LayoutName(*SP::RoomPlaces(roomA)) == "5.1.2",
+          "a Room Configuration Data Block: the speakers it says the room has (5.1.2), apart from what it accepts");
+    roomA.room.reset();
+    roomA.located = {0x00, 0x01, 0x02, 0x03};
+    Check(SP::RoomPlaces(roomA) && SP::LayoutName(*SP::RoomPlaces(roomA)) == "3.1",
+          "a Speaker Location Data Block alone: the speakers it names");
+  }
+  // the deprecated bits, made: F33 (TpLS/TpRS) alone places nothing; F16 (RLC/RRC) with the surrounds named and
+  // no BL/BR places nothing; in the form of CTA-861-D (no surrounds named) it is the backs
+  {
+    std::vector<std::string> off;
+    const SP::EdidAudio f33 = SP::AudioOfEdid(MadeEdid({0x0F, 0x00, 0x08}, Sads(true, true)));
+    Check(Join(SP::DeclaredPlaces(f33, off)) == "FC FL FR LFE SL SR" &&
+              off == std::vector<std::string>{"TpLS/TpRS (deprecated)"},
+          "made: TpLS/TpRS (F33) alone: no height placed, named off the plan", Join(SP::DeclaredPlaces(f33, off)));
+    const SP::Places f16 = DeclaredOf(MadeEdid({0x47, 0x08, 0x00}, Sads(true, true)));
+    Check(Join(f16) == "FC FL FR LFE SL SR", "made: RLC/RRC (F16) with LS/RS and no BL/BR: no backs", Join(f16));
+  }
 
   // ---- 2. made EDIDs
   struct Made
@@ -260,7 +351,7 @@ int main(int argc, char** argv)
     const SP::Plan p = SP::PlanOf(SP::Path::DECODED, SP::Positions(SP::Names("FL,FR,FC,LFE,BL,BR,SL,SR")), sent,
                                   DeclaredOf(c5), SP::ObjectStream::ATMOS_TRUEHD, SP::Objects::DECLARED);
     Check(p.sound == ";FC;FL;FR;LFE;SL;SR;" && p.objects.empty() && p.objectsSaid.empty() &&
-              p.declared == ";BL;BR;FLOC;FROC;TC;TFC;TFL;TFR;TSL;TSR;",
+              p.declared == ";BL;BR;FLOC;FROC;TC;TFC;TFL;TFR;",
           "decoded to 5.1 on the LG C5: the six channels sent; the rest declared, no objects", p.sound + " " + p.declared);
     const SP::Plan s = SP::PlanOf(SP::Path::PASSTHROUGH, SP::Positions(SP::Names("FL,FR")), {},
                                   DeclaredOf(MadeEdid({0x0F}, Sads(true, true))), SP::ObjectStream::NONE,
@@ -292,15 +383,111 @@ int main(int argc, char** argv)
 
   // ---- 5. where Kodi takes them
   const std::string ctx = ReadText(kodi + "/xbmc/windowing/gbm/WinSystemGbmGLESContext.cpp");
-  Check(ctx.find("    SpeakerPlanInfo(info, speakers.lit, channels, audio.codecName);") != std::string::npos,
+  Check(ctx.find("    SpeakerPlanInfo(info, speakers.lit, channels, audio.codecName,") != std::string::npos,
         "the plan from what the player said of the stream");
-  Check(ctx.find("return o.role.find(\"the output that the sink opened\") != std::string::npos;") !=
+  Check(ctx.find("    auto output = withRole(\"the output that the sink opened\");\n"
+                 "    if (output == outputs.end())\n"
+                 "      output = withRole(path == SP::Path::PASSTHROUGH ? \"the passthrough output in use\"\n"
+                 "                                                      : \"the audio output in use\");") !=
+                std::string::npos,
+        "the output the sink opened, else the output of the path in use (never nothing while one is said)");
+  Check(ctx.find("          facts.edid = m_DRM->EdidOfSoundDisplay(output->identity);") != std::string::npos &&
+            ctx.find("  const SP::SinkDeclared declared = SP::DeclaredBy(facts);") != std::string::npos &&
+            ctx.find("      facts.eld = output->eld;") != std::string::npos,
+        "the EDID of the display on any output, its ELD, decided by DeclaredBy()");
+  const std::string ae = ReadText(kodi + "/xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAE.cpp");
+  const size_t change = ae.find("void CActiveAE::HandleDeviceCountChange(");
+  const size_t said = ae.find("  PublishSoundOutputs();", change);
+  const size_t decision = ae.find("  if (!INTERNAL::ShouldReconfigure(decision))", change);
+  Check(change != std::string::npos && said != std::string::npos && decision != std::string::npos && said < decision,
+        "a listing of the outputs again is said, also where the sink stays as it is");
+  Check(ReadText(kodi + "/xbmc/cores/AudioEngine/Sinks/AESinkALSA.cpp").find("    info.m_eld.assign(eld, eld + dataLength);") !=
                 std::string::npos &&
-            ctx.find("    else if (!display || !KODI::UTILS::SameDisplay(opened->identity,") != std::string::npos,
-        "declared speakers only where the sink opened the output of the display that Kodi shows on");
+            ae.find("        out.eld = d.m_eld;") != std::string::npos,
+        "the ELD of each output kept and said with it");
+
+  // ---- 6. where what is declared comes from (1.2.3)
+  {
+    // an EDID made of a base block and one CTA-861 extension with the data blocks given
+    const auto made = [](const std::vector<uint8_t>& blocks)
+    {
+      std::vector<uint8_t> e(256, 0);
+      const uint8_t header[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+      std::copy(header, header + 8, e.begin());
+      e[126] = 1;
+      e[128] = 0x02;
+      e[129] = 0x03;
+      e[130] = static_cast<uint8_t>(4 + blocks.size());
+      std::copy(blocks.begin(), blocks.end(), e.begin() + 132);
+      return e;
+    };
+    // a receiver of 5.1.2 that declares Atmos over Dolby Digital Plus: an E-AC-3 descriptor with JOC, 5.1 with
+    // front heights (TpFL/TpFR)
+    const std::vector<uint8_t> r512 = made({0x23, 0x55, 0x07, 0x01, 0x83, 0x0F, 0x01, 0x00});
+    // 5.1 in its allocation, its middle heights (TpSiL/TpSiR) in its Room Configuration Data Block (speaker count 8),
+    // FLw, TpBL and TpBR named in its Speaker Location Data Block
+    const std::vector<uint8_t> room = made({0x83, 0x0F, 0x00, 0x00, 0xE5, 0x13, 0x47, 0x0F, 0x80, 0x00,
+                                            0xE7, 0x14, 0x20, 0x18, 0x21, 0x10, 0x22, 0x11});
+    std::vector<std::string> off;
+    const SP::Places roomPlaces = SP::DeclaredPlaces(SP::AudioOfEdid(room), off);
+    Check(Join(roomPlaces) == "FC FL FR LFE SL SR TBL TBR TSL TSR",
+          "the Room Configuration and Speaker Location Data Blocks with the allocation: 5.1, TpSiL/TpSiR, TpBL/TpBR",
+          Join(roomPlaces));
+    Check(off == std::vector<std::string>{"FLw"}, "FLw named, no place on the plan: said apart");
+    // the ELD of a Denon (as the RTX 5090 of Khazar321 read it, 1.2.2: speakers 0x5f, CTA-861-D), with an E-AC-3
+    // descriptor with JOC
+    std::vector<uint8_t> eld = {0x10, 0x00, 0x08, 0x00, 0x69, 0x10, 0x00, 0x5F, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0x11, 0xEE, 0x76, 0x00, 'D', 'E', 'N', 'O', 'N', '-', 'A', 'V', 'R'};
+    eld.insert(eld.end(), {0x55, 0x07, 0x01});
+    const SP::EdidAudio eldAudio = SP::AudioOfEld(eld);
+    Check(eldAudio.read && eldAudio.fromEld && eldAudio.eac3Joc && eldAudio.allocation &&
+              eldAudio.allocation->bytes == std::array<uint8_t, 3>{0x5F, 0, 0},
+          "the ELD: its speaker byte alone and its descriptors (Atmos over Dolby Digital Plus)");
+
+    SP::SinkFacts f;
+    Check(SP::DeclaredBy(f).why == "notknown" && !SP::DeclaredBy(f).places, "no output said yet: not known yet");
+    f.output = true;
+    f.kind = SP::SinkFacts::Kind::OTHER;
+    Check(SP::DeclaredBy(f).why == "other", "an output without a display: not read");
+    f.kind = SP::SinkFacts::Kind::DISPLAY;
+    Check(SP::DeclaredBy(f).why == "notknown", "an HDMI output whose display is not known yet (no ELD): not known yet");
+    f.identity = true;
+    Check(SP::DeclaredBy(f).why == "otherdisplay", "a display that no output has, without its ELD: not read");
+    f.eld = eld;
+    SP::SinkDeclared d = SP::DeclaredBy(f);
+    Check(d.from == "eld" && d.places && Join(*d.places) == "BC BL BR FC FL FR LFE SL SR",
+          "no output has the display, its ELD is known: 8.1 from the ELD, no heights", d.places ? Join(*d.places) : "");
+    f.edid = r512;
+    d = SP::DeclaredBy(f);
+    Check(d.from == "edidother" && d.places && SP::LayoutName(*d.places) == "5.1.2",
+          "the receiver on an output of its own: 5.1.2 from its EDID, heights included",
+          d.from + " " + (d.places ? SP::LayoutName(*d.places) : ""));
+    f.shown = true;
+    d = SP::DeclaredBy(f);
+    Check(d.from == "edid" && d.places && SP::LayoutName(*d.places) == "5.1.2",
+          "the receiver Kodi shows through: 5.1.2 from the EDID of the display shown");
+    // Ryudoadema: Dolby Digital Plus Atmos with a 5.1 bed passed through to it
+    const SP::Plan plan = SP::PlanOf(SP::Path::PASSTHROUGH, SP::Positions(SP::Names("FL FR FC LFE BL BR")), {},
+                                     d.places, SP::ObjectStream::ATMOS_EAC3,
+                                     SP::ObjectsDeclared(d.audio, SP::ObjectStream::ATMOS_EAC3));
+    Check(plan.objects == ";TFL;TFR;" && plan.objectsSaid == "yes",
+          "DD+ Atmos 5.1 passed through to it: its heights as the speakers it renders the objects to",
+          plan.objects + " " + plan.objectsSaid);
+    f.edid = ReadFile(argv[6]);
+    Check(SP::DeclaredBy(f).why == "none" && !SP::DeclaredBy(f).places,
+          "an EDID without a speaker allocation: none declared");
+  }
   Check(ctx.find("swr_build_matrix2(&inLayout, &outLayout, M_SQRT1_2, M_SQRT1_2, lfe, 1.0, 1.0,") !=
             std::string::npos,
         "the downmix by the matrix of libswresample with Kodi's levels");
+  Check(ctx.find("  std::vector<double> matrix(SP::SWR_MATRIX_SIZE);") != std::string::npos &&
+            ctx.find("static_cast<ptrdiff_t>(SP::SWR_MATRIX_STRIDE), AV_MATRIX_ENCODING_NONE,") != std::string::npos &&
+            ctx.find("SP::Folded(inOrdered, outOrdered, matrix, SP::SWR_MATRIX_STRIDE, dropped);") != std::string::npos,
+        "Kodi gives libswresample the whole block it writes (1.2.2: the layouts' channels alone, the heap corrupted)");
+  Check(ctx.find("  const SP::Path path = !sound               ? SP::Path::NOT_KNOWN\n") != std::string::npos &&
+            ctx.find("SpeakerPlanInfo(info, speakers.lit, channels, audio.codecName, player->GetAudioStream() >= 0);") !=
+                std::string::npos,
+        "a video without a stream of sound: no speaker gets sound (the sink only plays silence)");
   Check(ctx.find("Player information: what the player said of the sound names no speaker") != std::string::npos,
         "the line of kodi.log of a sound that names no speaker stays");
   std::printf("%d checks, %d failed\n%s\n", checks, failed,

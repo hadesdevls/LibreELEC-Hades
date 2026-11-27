@@ -1,0 +1,294 @@
+From dfed39bf9e5d2955b0b9a3ccfda54fbb617e5649 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:36:58 +0000
+Subject: [PATCH] [Hades][DRM] No commit of a request before that cannot show
+ the frame
+
+Issue #33: after a refused test of the change to a frame-packed mode,
+Kodi committed the request it took last with the new frame in its
+plane. The frame's buffer (2048x2205) was smaller than what that plane
+shows (3840x2160 of a 2D mode), which the kernel refuses before
+anything else (drm_framebuffer_check_src_coords(): "No space left on
+device"): three error lines for each 3D video, the next mode taken all
+the same.
+
+Such a request is not made now (FALLBACK_FRAME::GoesOut(), the kernel's
+own check): the screen keeps what it shows, and Kodi goes on as after a
+refused commit, as the kernel would have answered, so the next mode is
+taken as before. And a refused change to a frame-packed mode, which
+Kodi follows with the 3D layout that comes next, is said as a warning
+that says so; every other refused test is an error as before.
+---
+ xbmc/windowing/gbm/drm/CMakeLists.txt  |  1 +
+ xbmc/windowing/gbm/drm/DRMAtomic.cpp   | 79 ++++++++++++++++++++++----
+ xbmc/windowing/gbm/drm/DRMAtomic.h     |  5 +-
+ xbmc/windowing/gbm/drm/FallbackFrame.h | 77 +++++++++++++++++++++++++
+ 4 files changed, 150 insertions(+), 12 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/drm/FallbackFrame.h
+
+diff --git a/xbmc/windowing/gbm/drm/CMakeLists.txt b/xbmc/windowing/gbm/drm/CMakeLists.txt
+index 1a8bac4..2094b54 100644
+--- a/xbmc/windowing/gbm/drm/CMakeLists.txt
++++ b/xbmc/windowing/gbm/drm/CMakeLists.txt
+@@ -25,6 +25,7 @@ set(HEADERS BootOption.h
+             DRMStereo.h
+             DRMUtils.h
+             DetectedProperty.h
++            FallbackFrame.h
+             LinkStatus.h
+             OffScreenModeSetting.h)
+ 
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.cpp b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+index 6d1c9cc..6dfd0df 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.cpp
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "DRMRequestQueue.h"
+ #include "DVBridgeRefused.h"
++#include "FallbackFrame.h"
+ #include "LinkStatus.h"
+ #include "ServiceBroker.h"
+ #include "application/ApplicationComponents.h"
+@@ -138,6 +139,8 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+   };
+   m_lastCommitRefused = false;
+   bool fellBack = false; // (Hades: the request before this one went out in its place)
++  // Hades: ... or would have, but cannot show the frame: nothing is committed (FALLBACK_FRAME)
++  bool notMade = false;
+   // Declared at function scope so the blob outlives drmModeAtomicCommit.
+   // DRM requires the blob to remain alive for the duration of the commit;
+   // destroying it before the commit returns leaves the atomic request
+@@ -521,10 +524,23 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+       return reject();
+     }
+     const int refused = errno; // (Hades)
+-    CLog::LogF(LOGERROR,
+-               "test commit failed: ({}) - falling back to last successful atomic "
+-               "request",
+-               strerror(refused));
++    // Hades: a change to a mode with HDMI 3D frame packing that the driver refuses is followed by the
++    // 3D layout that comes next (CWinSystemGbm::CheckStereoOutput()): a warning that says so, not an
++    // error (FALLBACK_FRAME::FramePackingRefusal()); every other refused test as before
++    const bool framePacking = FALLBACK_FRAME::FramePackingRefusal(
++        modeset, m_mode && STEREO::LayoutOf(m_mode->flags) == STEREO::Layout::FRAME_PACKING);
++    if (framePacking)
++      CLog::LogF(LOGWARNING,
++                 "test commit of the change to the frame-packed mode {}x{} failed: ({}) - the "
++                 "request before it is the one that goes out, and Kodi takes the 3D layout that "
++                 "comes next (the kernel log says why the driver refused it, in its lines \"Hades: "
++                 "HDMI 3D frame packing refused\")",
++                 m_mode->hdisplay, m_mode->vdisplay, strerror(refused));
++    else
++      CLog::LogF(LOGERROR,
++                 "test commit failed: ({}) - falling back to last successful atomic "
++                 "request",
++                 strerror(refused));
+     // (Hades: the outputs that it turned off stay on: asked for again later)
+     if (othersOff)
+       OtherOutputsOffRefused(refused);
+@@ -563,14 +579,45 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+       m_refusedFlags = flags;
+     }
+     auto oldRequest = m_atomicRequestQueue.front().get();
+-    CDRMAtomicRequest::LogAtomicDiff(m_req, oldRequest);
++    CDRMAtomicRequest::LogAtomicDiff(m_req, oldRequest, framePacking ? LOGWARNING : LOGERROR);
+     // Hades: where the refused request changes the colour tag of the output to BT.2020, kodi.log
+     // says whether that tag is what the driver refused (TellBt2020Refused())
+     TellBt2020Refused(refused, flags);
+     m_req = oldRequest;
+ 
+-    // update the old atomic request with the new fb id to avoid tearing
++    // Hades: ... where its plane can show the frame's buffer: one that is smaller than what it shows
++    // of a buffer (a frame of a mode that it does not set) the kernel refuses ("No space left on
++    // device"), and that commit is not made (FALLBACK_FRAME::GoesOut())
+     if (rendered)
++    {
++      std::optional<FALLBACK_FRAME::Source> source;
++      const auto value = [&](const char* name)
++      {
++        const std::optional<uint64_t> asked = m_req->Value(outputPlane, name);
++        return asked ? asked : outputPlane->GetPropertyValue(name);
++      };
++      if (const auto w = value("SRC_W"), h = value("SRC_H"); w && h)
++        source =
++            FALLBACK_FRAME::Source{value("SRC_X").value_or(0), value("SRC_Y").value_or(0), *w, *h};
++      std::optional<std::pair<uint32_t, uint32_t>> size;
++      if (drmModeFBPtr info = drmModeGetFB(m_fd, static_cast<uint32_t>(fb_id)))
++      {
++        size = std::make_pair(info->width, info->height);
++        drmModeFreeFB(info);
++      }
++      if (!FALLBACK_FRAME::GoesOut(source, size))
++      {
++        notMade = true;
++        CLog::LogF(framePacking ? LOGINFO : LOGWARNING,
++                   "the request before it cannot show this frame (its plane shows {}x{} of a "
++                   "buffer, the frame's buffer is {}x{}): it is not committed, as the driver "
++                   "would refuse it; the screen keeps what it shows",
++                   source->w >> 16, source->h >> 16, size->first, size->second);
++      }
++    }
++
++    // update the old atomic request with the new fb id to avoid tearing
++    if (rendered && !notMade)
+     {
+       AddProperty(outputPlane, "FB_ID", fb_id);
+       // Hades: with the rotation of that buffer (SetReflectY())
+@@ -579,7 +626,7 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     }
+     // Hades: ... and with the fences of the frame: those it names are of its own commit, its
+     // in-fence closed since (FenceFallback())
+-    const bool fenced = rendered && m_inFenceFd != -1;
++    const bool fenced = rendered && !notMade && m_inFenceFd != -1;
+     FenceFallback(*m_req, static_cast<CDRMObject*>(outputPlane), static_cast<CDRMObject*>(m_crtc),
+                   fenced ? std::optional<std::pair<uint64_t, uint64_t>>(
+                                {static_cast<uint64_t>(m_inFenceFd),
+@@ -602,7 +649,14 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+       FRL_MODE_CHANGE::OffFirst(linkBefore, m_mode ? m_mode->clock : 0, m_active, moving))
+     CommitOutputOffFirst(linkBefore);
+   const auto commitStart = std::chrono::steady_clock::now();
+-  ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
++  // Hades: (a request before that cannot show the frame is not made: what the kernel answers it)
++  if (notMade)
++  {
++    ret = -1;
++    errno = ENOSPC;
++  }
++  else
++    ret = drmModeAtomicCommit(m_fd, m_req->Get(), flags, nullptr);
+   // Hades: how long a commit that changes the mode took, for the report of a slow pass of the GUI
+   if (modeset)
+     CModeChangeTime::Add(commitStart);
+@@ -670,7 +724,9 @@ bool CDRMAtomic::DrmAtomicCommit(int fb_id, int flags, bool rendered, bool video
+     }
+     else
+     {
+-      CLog::LogF(LOGERROR, "atomic commit failed: {}", strerror(error));
++      // Hades: (a commit not made is said where it is not: above)
++      if (!notMade)
++        CLog::LogF(LOGERROR, "atomic commit failed: {}", strerror(error));
+       // (Hades: the outputs that it turned off stay on: asked for again later)
+       if (othersOff)
+         OtherOutputsOffRefused(error);
+@@ -2001,7 +2057,8 @@ void CDRMAtomic::CDRMAtomicRequest::CacheProperties()
+ }
+ 
+ void CDRMAtomic::CDRMAtomicRequest::LogAtomicDiff(CDRMAtomicRequest* current,
+-                                                  CDRMAtomicRequest* old)
++                                                  CDRMAtomicRequest* old,
++                                                  int logLevel)
+ {
+   std::map<CDRMObject*, std::map<uint32_t, uint64_t>> atomicDiff;
+ 
+@@ -2026,7 +2083,7 @@ void CDRMAtomic::CDRMAtomicRequest::LogAtomicDiff(CDRMAtomicRequest* current,
+ 
+   CLog::LogF(LOGDEBUG, "DRM Atomic Request Diff:");
+ 
+-  LogAtomicRequest(LOGERROR, atomicDiff);
++  LogAtomicRequest(static_cast<uint8_t>(logLevel), atomicDiff);
+ }
+ 
+ void CDRMAtomic::CDRMAtomicRequest::LogAtomicRequest()
+diff --git a/xbmc/windowing/gbm/drm/DRMAtomic.h b/xbmc/windowing/gbm/drm/DRMAtomic.h
+index c78ae9b..40c2270 100644
+--- a/xbmc/windowing/gbm/drm/DRMAtomic.h
++++ b/xbmc/windowing/gbm/drm/DRMAtomic.h
+@@ -383,7 +383,10 @@ private:
+     void LogAtomicRequest();
+     void LogAtomicRequest(uint8_t logLevel) { LogAtomicRequest(logLevel, m_atomicRequestItems); }
+ 
+-    static void LogAtomicDiff(CDRMAtomicRequest* current, CDRMAtomicRequest* old);
++    //! (Hades: \p logLevel of the lines; an error, as before, where nothing else is said)
++    static void LogAtomicDiff(CDRMAtomicRequest* current,
++                              CDRMAtomicRequest* old,
++                              int logLevel = LOGERROR);
+ 
+   private:
+     static void LogAtomicRequest(
+diff --git a/xbmc/windowing/gbm/drm/FallbackFrame.h b/xbmc/windowing/gbm/drm/FallbackFrame.h
+new file mode 100644
+index 0000000..d56aa06
+--- /dev/null
++++ b/xbmc/windowing/gbm/drm/FallbackFrame.h
+@@ -0,0 +1,77 @@
++/*
++ *  Copyright (C) 2026 Hades
++ *  This file is part of LibreELEC Hades. It is not in Kodi as Team Kodi publishes it.
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <utility>
++
++/*!
++ * \brief Hades: the request that goes out in place of one whose test the driver refused
++ *        (CDRMAtomic::DrmAtomicCommit())
++ *
++ * Kodi then commits the request that the driver took last, with the frame of the refused one in
++ * its plane (so that the picture does not tear). Where that frame's buffer is smaller than what
++ * the plane of the request before it shows of a buffer (its source rectangle), the kernel refuses
++ * the request before it checks anything else (drm_atomic_plane_check() ->
++ * drm_framebuffer_check_src_coords(): -ENOSPC, "No space left on device"). That is what happened
++ * after each refused change to an HDMI 3D frame-packed mode on nvidia-drm (issue #33): the frame
++ * of 2048x2205 in the plane of a 2D mode of 3840x2160. Such a request is not made: nothing goes
++ * out, the screen keeps what it shows, and Kodi goes on as after a refused commit, which is what
++ * the kernel would have answered.
++ */
++namespace KODI::WINDOWING::GBM::FALLBACK_FRAME
++{
++
++//! The source rectangle of a plane, in the 16.16 fixed point of DRM
++struct Source
++{
++  uint64_t x{0};
++  uint64_t y{0};
++  uint64_t w{0};
++  uint64_t h{0};
++};
++
++/*!
++ * \brief Whether a buffer of this size holds the source rectangle, as the kernel checks it
++ *        (drm_framebuffer_check_src_coords(), drivers/gpu/drm/drm_framebuffer.c)
++ */
++constexpr bool Holds(const Source& source, uint32_t width, uint32_t height)
++{
++  const uint64_t w = static_cast<uint64_t>(width) << 16;
++  const uint64_t h = static_cast<uint64_t>(height) << 16;
++  return !(source.w > w || source.x > w - source.w || source.h > h || source.y > h - source.h);
++}
++
++/*!
++ * \brief Whether the request before goes out with the frame of the refused one
++ * \param source the source rectangle that the request before gives its plane (nothing where it
++ *        is not known: as before, it goes out)
++ * \param size the size of the frame's buffer (nothing where it is not known: it goes out)
++ */
++constexpr bool GoesOut(std::optional<Source> source,
++                       std::optional<std::pair<uint32_t, uint32_t>> size)
++{
++  return !source || !size || Holds(*source, size->first, size->second);
++}
++
++/*!
++ * \brief Whether a refused test is that of a change to a mode with HDMI 3D frame packing: Kodi
++ *        takes the 3D layout that comes next after it (CWinSystemGbm::CheckStereoOutput()), so the
++ *        refusal is said as a warning, not as an error. Any other refused test is an error, as
++ *        before.
++ * \param modeset the request changes the mode
++ * \param framePacked the mode it sets is frame packed
++ */
++constexpr bool FramePackingRefusal(bool modeset, bool framePacked)
++{
++  return modeset && framePacked;
++}
++
++} // namespace KODI::WINDOWING::GBM::FALLBACK_FRAME
+-- 
+2.53.0
+

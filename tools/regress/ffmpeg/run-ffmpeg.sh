@@ -21,7 +21,10 @@
 #   mvcmkv    ffmpeg-9953 (the second view of H.264 MVC declared by a block addition mapping or only by the
 #             stream of a Matroska file), against FFmpeg without it, and what Kodi's MultiviewChoice.h decides
 #             of what it gives (the function mvcmkv() says what is checked)
-# usage: run-ffmpeg.sh all | verdict [<log>] | <stage>...       stages: inputs build fate hls playback mvcmkv
+#   slkeep    ffmpeg-9977 (the hardware decoder kept when the SPS of the base layer comes again changed only in its
+#             scaling lists): FFmpeg with VA-API, with and without the patch, on a VA-API driver that decodes nothing
+#             and writes what each picture is given (tools/fakeva.c, tools/slkeep.c), and the mutants of the patch
+# usage: run-ffmpeg.sh all | verdict [<log>] | <stage>...       stages: inputs build fate hls playback mvcmkv slkeep
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -498,4 +501,176 @@ stage_mvcmkv() {
   else rg_item mvc-matroska FAILED "no FFmpeg built without ffmpeg-9953, or with all"; fi
 }
 
-rg_main "inputs build fate hls playback mvcmkv" "$@"
+# ------------------------------------------------------------------------------------------------- slkeep
+# ffmpeg-9977: the hardware decoder is kept when the SPS of the base layer comes again changed only in its scaling
+# lists. FFmpeg of the recipe is built with VA-API against libva of the recipe (its core, without a display backend)
+# and decodes on the display of tools/slkeep.c, whose driver (tools/fakeva.c) decodes nothing and writes what each
+# picture was given; the inputs are x265 streams of segments whose SPS changes at each joint (tools/make-slswitch.sh).
+# With the patch and without it ("before"), with 1 and 4 frame threads: how many times get_format() is called and the
+# hardware decoder is made (vaCreateContext()), the buffers of every picture the same with and without the patch (its
+# picture parameters, scaling lists, slice parameters and slice data), the scaling lists of each segment its own, and
+# the pictures of the software decoder the same with and without the patch, MD5 for MD5. Mutants of the patch
+# (SL_MUTANTS, mutants/slkeep-*.py) must make the checks fail.
+SL=$RG_W/slkeep
+SL_FF="--disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect --disable-x86asm
+  --enable-static --disable-shared --enable-decoder=hevc --enable-parser=hevc --enable-demuxer=hevc --enable-protocol=file
+  --enable-vaapi --enable-hwaccel=hevc_vaapi"
+# stream : pictures : the scaling lists of its segments : get_format() and hardware decoders with the patch : without
+# it : the lines of the decoder that say the hardware decoder is kept, with the patch
+SL_STREAMS="slswitch8:40:ab-ca:1:5:4
+slswitch10:24:aba:1:3:2
+slother8:48:aaaaba:6:6:0"
+# mutant : the failed checks measured when they were written : what it takes out
+SL_MUTANTS="always:2:the comparison of the SPS (every change keeps the hardware decoder)
+never:4:the comparison of the SPS (no change keeps it)
+pixfmt:4:the format of the hardware decoder given back to the context after export_stream_params()"
+
+# sl_libva <dest>: libva of the recipe (archive checked against PKG_SHA256), its core built by hand into <dest>/prefix
+# (its meson build wants libdrm even without the DRM backend, which slkeep.c does not use), and fakeva.c into
+# <dest>/drivers/hadesfake_drv_video.so
+sl_libva() {
+  local D=$1 ver sha tb maj min mic
+  ver=$(rg_pkgvar packages/multimedia/libva PKG_VERSION); sha=$(rg_pkgvar packages/multimedia/libva PKG_SHA256)
+  tb=$(rg_source libva "libva-$ver.tar.gz") || { echo "VA: no libva-$ver.tar.gz in REGRESS_SOURCES"; return 1; }
+  [ "$(sha256sum < "$tb" | cut -c1-64)" = "$sha" ] || { echo "VA: sha256 of $tb is not PKG_SHA256 $sha"; return 1; }
+  rg_fresh "$D"
+  mkdir -p "$D/src" "$D/prefix/include/va" "$D/prefix/lib/pkgconfig" "$D/gen/va" "$D/drivers"
+  tar --no-same-owner -xzf "$tb" --strip-components=1 -C "$D/src" || { echo "VA: unpack $tb"; return 1; }
+  maj=$(sed -n 's/^va_api_major_version = \([0-9]*\)$/\1/p' "$D/src/meson.build")
+  min=$(sed -n 's/^va_api_minor_version = \([0-9]*\)$/\1/p' "$D/src/meson.build")
+  mic=$(sed -n 's/^va_api_micro_version = \([0-9]*\)$/\1/p' "$D/src/meson.build")
+  [ -n "$maj" ] && [ -n "$min" ] && [ -n "$mic" ] || { echo "VA: no VA-API version in meson.build"; return 1; }
+  sed -e "s/@VA_API_MAJOR_VERSION@/$maj/" -e "s/@VA_API_MINOR_VERSION@/$min/" -e "s/@VA_API_MICRO_VERSION@/$mic/" \
+    -e "s/@VA_API_VERSION@/$maj.$min.$mic/" "$D/src/va/va_version.h.in" > "$D/gen/va/va_version.h"
+  ( cd "$D/src/va" && cp va.h va_backend.h va_backend_prot.h va_backend_vpp.h va_compat.h va_dec_*.h va_drmcommon.h \
+      va_egl.h va_enc_*.h va_fei*.h va_str.h va_tpi.h va_prot.h va_vpp.h "$D/gen/va/va_version.h" "$D/prefix/include/va/" ) \
+    || { echo "VA: headers"; return 1; }
+  gcc -shared -fPIC -O1 -g -I "$D/gen" -I "$D/src" -I "$D/src/va" -D_GNU_SOURCE -DHAVE_SECURE_GETENV \
+    -DSYSCONFDIR='"/nonexistent"' -DVA_DRIVERS_PATH='"/nonexistent"' -Wl,-version-script,"$D/src/va/libva.syms" \
+    -Wl,-soname,libva.so.2 -o "$D/prefix/lib/libva.so.2" \
+    "$D/src/va/va.c" "$D/src/va/va_compat.c" "$D/src/va/va_str.c" "$D/src/va/va_trace.c" -ldl -lpthread \
+    > "$D/build.log" 2>&1 || { tail -n 20 "$D/build.log"; echo "VA: BUILD FAILED"; return 1; }
+  ln -sfn libva.so.2 "$D/prefix/lib/libva.so"
+  # shellcheck disable=SC2016
+  printf '%s\n' "prefix=$D/prefix" 'libdir=${prefix}/lib' 'includedir=${prefix}/include' 'Name: libva' \
+    "Description: libva $ver of the recipe, its core only" "Version: $maj.$min.$mic" \
+    'Libs: -L${libdir} -lva -Wl,-rpath,${libdir}' 'Cflags: -I${includedir}' > "$D/prefix/lib/pkgconfig/libva.pc"
+  gcc -shared -fPIC -O1 -g -Wall -Wextra -Werror -I "$D/prefix/include" -o "$D/drivers/hadesfake_drv_video.so" \
+    "$HERE/tools/fakeva.c" >> "$D/build.log" 2>&1 || { tail -n 20 "$D/build.log"; echo "VA: fakeva.c does not build"; return 1; }
+  rg_rm "$D/src"
+  echo "VA: libva $ver (VA-API $maj.$min.$mic) and fakeva.c built in $D"
+}
+
+# sl_ff <dest> <ERE of patch names left out, or -> <edit file, or ->: that FFmpeg with VA-API (SL_FF) into
+# <dest>/prefix, and slkeep.c linked with it into <dest>/slkeep. The edit file defines FILE (a path in FFmpeg's source)
+# and PAIRS (rg_edit). Made again only when the archive, the patches, the edit, slkeep.c or libva changed.
+sl_ff() {
+  local D=$1 skip=$2 edit=$3 rc f stamp
+  stamp="slkeep $SL_FF $(cat "$HERE/tools/slkeep.c" "$SL/va/prefix/lib/pkgconfig/libva.pc" | sha256sum | cut -c1-64)"
+  [ "$edit" = - ] || stamp="$stamp $(sha256sum < "$edit" | cut -c1-64)"
+  rg_ff_source "$D" "$skip" "$stamp"
+  rc=$?
+  [ $rc = 2 ] && { echo "FF: $D already built from the same archive, patches, edit and options"; return 0; }
+  [ $rc = 0 ] || return 1
+  if [ "$edit" != - ]; then
+    f=$($RG_PY -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["FILE"])' "$edit") || { echo "FF: no FILE in $edit"; return 1; }
+    rg_edit "$D/src/$f" "$edit" || { echo "FF: EDIT NOT APPLIED $edit"; return 1; }
+  fi
+  # shellcheck disable=SC2086
+  ( cd "$D/src" && PKG_CONFIG_PATH=$SL/va/prefix/lib/pkgconfig nice -n 19 ./configure --prefix="$D/prefix" $SL_FF \
+      > "$D/configure.log" 2>&1 < /dev/null &&
+    nice -n 19 make -j"$RG_JOBS" > "$D/make.log" 2>&1 < /dev/null && make install > "$D/install.log" 2>&1 < /dev/null ) \
+    || { tail -n 30 "$D/configure.log" "$D/make.log" 2> /dev/null; echo "FF: BUILD FAILED $D"; return 1; }
+  # shellcheck disable=SC2046
+  gcc -O1 -g -Wall -Wextra -Werror -o "$D/slkeep" "$HERE/tools/slkeep.c" \
+    $(PKG_CONFIG_PATH="$D/prefix/lib/pkgconfig:$SL/va/prefix/lib/pkgconfig" pkg-config --cflags --libs --static \
+      libavformat libavcodec libavutil libva) > "$D/slkeep.log" 2>&1 \
+    || { cat "$D/slkeep.log"; echo "FF: slkeep.c does not build with $D"; return 1; }
+  rg_rm "$D/src"
+  : > "$D/built"
+  echo "FF: built in $D, and slkeep.c with it"
+}
+
+# sl_run <variant> <stream> <threads>: slkeep.c of a variant on a stream, on fakeva.c and in software, into $SL/out
+sl_run() {
+  local o=$SL/out/$1-$2-t$3
+  rm -f "$o.va"
+  LIBVA_DRIVERS_PATH=$SL/va/drivers LIBVA_MESSAGING_LEVEL=1 HADES_FAKEVA_LOG=$o.va \
+    "$SL/$1/slkeep" vaapi "$IN/slkeep/$2.hevc" "$3" > "$o.hw" 2>&1 || echo "FAIL: $1 $2 (frame threads: $3): slkeep vaapi, exit $?"
+  "$SL/$1/slkeep" sw "$IN/slkeep/$2.hevc" "$3" > "$o.sw" 2>&1 || echo "FAIL: $1 $2 (frame threads: $3): slkeep sw, exit $?"
+}
+# the get_format() calls, pictures and lines of a kept decoder of a run; the hardware decoders made
+sl_sum() { sed -n 's/^SUMMARY get_format \([0-9]*\) frames \([0-9]*\) kept \([0-9]*\)$/\1 \2 \3/p' "$1.hw"; }
+sl_ctx() { grep -c '^CONTEXT ' "$1.va"; }
+# the buffers of each picture, without its number and context (a context is new where the decoder is made again)
+sl_bufs() { grep -E '^(PIC|IQ) ' "$1.va" | sed -e 's/ context [0-9]*//' -e 's/^PIC [0-9]*/PIC/' -e 's/^IQ [0-9]*/IQ/'; }
+# the scaling lists of each segment of 8 pictures, letters in the order they come (- for none), or "mixed"
+sl_lists() {
+  awk '/^PIC / {print $8}' "$1.va" | awk '
+    { g = int((NR - 1) / 8); if ((g in s) && s[g] != $1) bad = 1; s[g] = $1; n = g }
+    END { if (bad || NR == 0) { print "mixed"; exit }
+          for (i = 0; i <= n; i++) { k = s[i]; if (k == "-") { o = o "-"; continue }
+            if (!(k in l)) l[k] = sprintf("%c", 97 + c++); o = o l[k] } print o }'
+}
+
+# slcheck <variant>: the checks of a variant against "before" ("before" itself is checked as a premise)
+slcheck() {
+  local v=$1 s fr lists gfa gfb kept t gf fc kp ctx o b
+  while IFS=: read -r s fr lists gfa gfb kept; do
+    for t in 1 4; do
+      sl_run "$v" "$s" "$t"
+      [ -f "$SL/out/before-$s-t$t.va" ] || sl_run before "$s" "$t"
+      o=$SL/out/$v-$s-t$t; b=$SL/out/before-$s-t$t
+      read -r gf fc kp <<< "$(sl_sum "$o")"; ctx=$(sl_ctx "$o")
+      if [ "$gf $ctx $kp $fc" = "$gfa $gfa $kept $fr" ]; then
+        echo "ok: $v $s (frame threads: $t): get_format() $gf, hardware decoders $ctx, kept $kp times, $fc pictures"
+      else echo "FAIL: $v $s (frame threads: $t): get_format() $gf, hardware decoders $ctx, kept $kp times, $fc pictures (want $gfa, $gfa, $kept, $fr)"; fi
+      read -r gf fc kp <<< "$(sl_sum "$b")"; ctx=$(sl_ctx "$b")
+      if [ "$gf $ctx $kp $fc" = "$gfb $gfb 0 $fr" ]; then
+        echo "ok: before $s (frame threads: $t): get_format() $gf, hardware decoders $ctx, $fc pictures"
+      else echo "FAIL: before $s (frame threads: $t): get_format() $gf, hardware decoders $ctx, kept $kp times, $fc pictures (want $gfb, $gfb, 0, $fr)"; fi
+      if [ "$(sl_bufs "$o" | grep -c '^PIC')" = "$fr" ] && cmp -s <(sl_bufs "$o") <(sl_bufs "$b") &&
+         [ "$(sl_lists "$o")" = "$lists" ]; then
+        echo "ok: $v $s (frame threads: $t): the buffers of the $fr pictures are those without the patch; scaling lists $lists"
+      else echo "FAIL: $v $s (frame threads: $t): $(sl_bufs "$o" | grep -c '^PIC') pictures, buffers $(cmp -s <(sl_bufs "$o") <(sl_bufs "$b") && echo same || echo different) from those without the patch, scaling lists $(sl_lists "$o") (want $fr, the same, $lists)"; fi
+      if [ "$(grep -c '^FRAME .* md5 ' "$o.sw")" = "$fr" ] && cmp -s <(grep '^FRAME' "$o.sw") <(grep '^FRAME' "$SL/out/before-$s-t1.sw"); then
+        echo "ok: $v $s (frame threads: $t): the $fr pictures of the software decoder are those without the patch with one thread"
+      else echo "FAIL: $v $s (frame threads: $t): the pictures of the software decoder differ from those without the patch with one thread"; fi
+    done
+  done < <(printf '%s\n' "$SL_STREAMS")
+  echo "$(grep -c . <<< "$SL_STREAMS") streams, 1 and 4 threads"
+}
+
+stage_slkeep() {
+  local L=$RG_W/logs v m n what P
+  mkdir -p "$SL"
+  rg_fresh "$SL/out"
+  rg_log "$L/build-slkeep-va.log" sl_libva "$SL/va"
+  v=$(rg_pass "$L/build-slkeep-va.log" '^VA: libva .* built' '^VA: (no |sha256|unpack|headers|BUILD|fakeva)')
+  rg_item build-slkeep-va "$(rg_say "$v")" "$(rg_rest "$v")"
+  P=$(git -C "$REGRESS_LE_GIT" ls-tree --name-only "$REGRESS_LE_REF" projects/Generic/patches/ffmpeg/ | grep -m1 '/ffmpeg-9977-')
+  [ -n "$P" ] || { rg_item slkeep FAILED "no ffmpeg-9977 in the tree"; return 1; }
+  rg_log "$L/build-slkeep-after.log" sl_ff "$SL/after" - -
+  rg_log "$L/build-slkeep-before.log" sl_ff "$SL/before" '^ffmpeg-9977-' -
+  for n in after before; do
+    v=$(rg_pass "$L/build-slkeep-$n.log" '^FF: (built in|.*already built)' '^FF: (PATCH FAILED|BUILD FAILED|EDIT|sha256|no |slkeep.c does not)')
+    rg_item "build-slkeep-$n" "$(rg_say "$v")" "$(rg_rest "$v")$(grep -a -m1 '^FFSRC' "$L/build-slkeep-$n.log" | sed 's/^FFSRC/;/')"
+  done
+  if [ -x "$SL/after/slkeep" ] && [ -x "$SL/before/slkeep" ] && [ -f "$SL/va/drivers/hadesfake_drv_video.so" ]; then
+    rg_log "$L/slkeep.log" slcheck after
+    v=$(rg_pass "$L/slkeep.log" '^[0-9]+ streams, 1 and 4 threads$' '^FAIL')
+    rg_item slkeep "$(rg_say "$v")" "ffmpeg-9977: $(grep -c '^ok:' "$L/slkeep.log") ok; $(rg_rest "$v")"
+  else rg_item slkeep FAILED "no libva and fakeva.c, or no FFmpeg with and without ffmpeg-9977"; fi
+  while IFS=: read -r m n what; do
+    rg_log "$L/build-slkeep-mutant-$m.log" sl_ff "$SL/mutant-$m" - "$HERE/mutants/slkeep-$m.py"
+    if [ -x "$SL/mutant-$m/slkeep" ]; then
+      rg_log "$L/slkeep-mutant-$m.log" slcheck "mutant-$m"
+      v=$(rg_fails "$L/slkeep-mutant-$m.log" "$n" '^FAIL')
+      rg_item "slkeep.mutant-$m" "$(rg_say "$v")" "$what: $(rg_rest "$v")"
+    else
+      rg_item "slkeep.mutant-$m" FAILED "the mutant does not build or its edit is no longer in the patch: $(grep -a -m1 -E '^FF: |EDIT NOT' "$L/build-slkeep-mutant-$m.log")"
+    fi
+  done < <(printf '%s\n' "$SL_MUTANTS")
+}
+
+rg_main "inputs build fate hls playback mvcmkv slkeep" "$@"

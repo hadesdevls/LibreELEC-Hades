@@ -574,12 +574,326 @@ wakeonlan() {
   fi
 }
 
+# Hades: the boot partition (mount_flash), and what the screen says when it is not there.
+#
+# LibreELEC tries to mount it for 15 seconds (mount_common) and then opens a shell under one line, "Could not mount
+# UUID=...". The entries that start the system for use (Run and Live from a USB drive, and the entry of an internal
+# installation) ask for DMA translation (PROTECT_DMA in scripts/mkimage): the USB controllers, as every device, are in
+# a translated domain of the IOMMU, where LibreELEC leaves them in passthrough (also on a laptop whose firmware has the
+# kernel turn the IOMMU on: there only the devices that the kernel does not trust are translated). On the way from a
+# USB controller to the boot drive that is all those entries do differently from LibreELEC: the other words of their
+# kernel line name two drivers that are not of USB (initcall_blacklist), lock the kernel down (the lockdown has no
+# check on that way) or are options of the display drivers. A laptop on which the same USB drive starts another
+# LibreELEC, and from which a desktop starts Hades, stopped here (issue 35, an Intel Core Ultra 5 225H): a firmware
+# can leave some of what its USB controllers reach in memory out of its tables of the IOMMU, and translated they then
+# do not find the drive, or cannot read it.
+#
+# So, in a start that asked for the translation, when the boot partition is still not there after that wait, or
+# after a shorter one (HADES_FLASH_FAULT_WAIT seconds) when the kernel log has a fault of the IOMMU for one of them,
+# the USB controllers whose group of the IOMMU is translated are taken out of the translation for this start: the
+# drivers of the group let go of its devices, the group goes to passthrough (identity), the drivers take them again
+# (and look for the drive again), and the wait begins again. Only USB host controllers are taken out (with what shares
+# their group, named on the screen), and only in a start that would stop here otherwise, where what was left was the
+# entry "Run (internal disks read-only)", with no translation for any device, no lockdown and no hidden disks. A fault
+# alone is not taken for that: some controllers have faults that do no harm, and a drive can be slow to come; by then
+# check_disks has waited for it too (up to about 10 s, while fsck does not find it). Left as they are: a controller
+# that takes its firmware from a file (Renesas uPD720201 and uPD720202, which a firmware put there by root could turn
+# against the memory of the kernel: what the translation is there for), a group with graphics that a driver has (the
+# screen would go), and a device that the kernel does not trust (it refuses passthrough to it). Each step is said on
+# the screen and in the kernel log ("hades-boot:"), and the line of hades-iommu at the end of the start counts those
+# groups in passthrough.
+#
+# When the partition is not found at all, the screen says, before the shell: how long the wait was, what this entry
+# asked for, the disks and file systems that the kernel sees, the USB controllers (with their driver and their domain
+# of the IOMMU), the USB devices, the faults of the IOMMU and the errors of USB in the kernel log, what was done with
+# the translation, and what to try. A photo of it is a report.
+#
+# Once the partition is mounted, a start with DMA translation keeps every group of the IOMMU as it is from then on
+# (hades_iommu_lock), before /flash/post-flash.sh or any program of the system runs: the step above is the init's.
+# (Set here, as the other variables of the init: the kernel hands every NAME=value of its command line that it does
+# not know to the init as a variable.)
+HADES_FLASH_WAIT=15
+HADES_FLASH_FAULT_WAIT=5
+HADES_BOOT_SYS=/sys
+HADES_BOOT_PROC=/proc
+HADES_BOOT_KMSG=/dev/kmsg
+HADES_USB_PT=""
+HADES_USB_PT_LEFT=""
+HADES_USB_PT_TRIED=""
+HADES_FAULT_RE='DMAR: \[(DMA|INTR)|DRHD: handling fault|PTE (Read|Write) access|AMD-Vi: Event logged|IO_PAGE_FAULT|iommu fault'
+HADES_USBERR_RE='(usb|xhci|ehci|ohci|uhci|uas|scsi|sd )[^:]*:.*([Ee]rror|[Ff]ail|[Tt]imeout|not respond|dead|halt|[Cc]annot|[Uu]nable|reset)'
+
+# a line on the screen, and in the kernel log
+hades_boot_say() {
+  echo "$1" >&2
+  echo "hades-boot: $1" 2>/dev/null >>"$HADES_BOOT_KMSG"
+}
+
+# the kernel log, without the lines of this step
+hades_boot_klog() {
+  dmesg 2>/dev/null | grep -v 'hades-boot:'
+}
+
+# the seconds since the kernel started
+hades_boot_now() {
+  local u r
+  read -r u r 2>/dev/null <"$HADES_BOOT_PROC/uptime"
+  u=${u%.*}
+  echo "${u:-0}"
+}
+
+# "<bus:device.function> [<vendor>:<device>]" of the PCI device whose folder of sysfs is $1
+hades_boot_pci() {
+  local f=${1##*/} v p
+  v=$(cat "$1/vendor" 2>/dev/null)
+  p=$(cat "$1/device" 2>/dev/null)
+  echo "${f#0000:} [${v#0x}:${p#0x}]"
+}
+
+# the folders of sysfs of the USB host controllers on PCI: UHCI, OHCI, EHCI and xHCI (not the host interface of USB4)
+hades_usb_hcs() {
+  local d
+  for d in "$HADES_BOOT_SYS"/bus/pci/devices/*; do
+    case "$(cat "$d/class" 2>/dev/null)" in
+      0x0c0300 | 0x0c0310 | 0x0c0320 | 0x0c0330) echo "$d" ;;
+    esac
+  done
+}
+
+# the kind of domain of the group of the IOMMU of a PCI device (DMA, DMA-FQ, identity...); nothing without one
+hades_domain_of() {
+  cat "$1/iommu_group/type" 2>/dev/null
+}
+
+# the USB host controllers whose group is translated
+hades_usb_translated() {
+  local d
+  for d in $(hades_usb_hcs); do
+    case "$(hades_domain_of "$d")" in
+      DMA | DMA-FQ) echo "$d" ;;
+    esac
+  done
+}
+
+# whether the kernel log has a fault of the IOMMU that names one of the translated USB controllers
+hades_usb_faulted() {
+  local d f faults
+  faults=$(hades_boot_klog | grep -E "$HADES_FAULT_RE")
+  [ -n "$faults" ] || return 1
+  for d in $(hades_usb_translated); do
+    f=${d##*/}
+    case "$faults" in
+      *"${f#0000:}"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# The USB host controllers whose group is translated go to passthrough, each group once, but for those left as they
+# are (above). HADES_USB_PT: the devices of the groups that went; HADES_USB_PT_LEFT: the controllers left, and why.
+hades_usb_passthrough() {
+  local d g x why drv took names seen=""
+  for d in $(hades_usb_translated); do
+    g=$(sys_path "$d/iommu_group")
+    [ -n "$g" ] || continue
+    case " $seen " in
+      *" $g "*) continue ;;
+    esac
+    seen="$seen $g"
+    why=""
+    names=""
+    for x in "$g"/devices/*; do
+      [ -e "$x" ] || continue
+      names="$names, $(hades_boot_pci "$x")"
+      case "$(cat "$x/vendor" 2>/dev/null)/$(cat "$x/class" 2>/dev/null)" in
+        0x1912/0x0c03*) why="$(hades_boot_pci "$x") is a controller of Renesas, which takes its firmware from a file" ;;
+        */0x03*) [ -e "$x/driver" ] && why="its group has the graphics $(hades_boot_pci "$x"), which would lose the screen" ;;
+      esac
+    done
+    if [ -n "$why" ]; then
+      HADES_USB_PT_LEFT="$HADES_USB_PT_LEFT; $(hades_boot_pci "$d"): $why"
+      continue
+    fi
+    # the drivers that hold the group let go (not that of a bridge: the port driver does not take part in its DMA)
+    took=""
+    for x in "$g"/devices/*; do
+      [ -e "$x/driver" ] || continue
+      case "$(cat "$x/class" 2>/dev/null)" in
+        0x0604* | 0x0609*) continue ;;
+      esac
+      drv=$(sys_path "$x/driver")
+      drv=${drv##*/}
+      echo "${x##*/}" 2>/dev/null >"$x/driver/unbind" && took="$took ${x##*/}=$drv"
+    done
+    if echo identity 2>/dev/null >"$g/type"; then
+      HADES_USB_PT="$HADES_USB_PT${names} (group ${g##*/})"
+    else
+      HADES_USB_PT_LEFT="$HADES_USB_PT_LEFT; $(hades_boot_pci "$d"): the kernel kept its group translated (a device that it does not trust, or a driver that still holds the group)"
+    fi
+    # and take them again, whatever came of it
+    for x in $took; do
+      echo "${x%%=*}" 2>/dev/null >"$HADES_BOOT_SYS/bus/pci/drivers/${x#*=}/bind" ||
+        echo "${x%%=*}" 2>/dev/null >"$HADES_BOOT_SYS/bus/pci/drivers_probe" ||
+        HADES_USB_PT_LEFT="$HADES_USB_PT_LEFT; ${x%%=*}: its driver ${x#*=} did not take it again"
+    done
+  done
+}
+
+# What the screen says when the boot partition is not found ($1: what was looked for, $2: when the wait began, $3: what
+# mount said the last time)
+hades_flash_report() {
+  local now c w="" b d q t s list="" fs hcs="" drv dom cnt=0 stor="" x f log faults errs
+  now=$(hades_boot_now)
+  echo "" >&2
+  hades_boot_say "LibreELEC Hades did not find its boot partition $1 (waited $((now - $2)) s; $now s since the kernel started)."
+  c=" $(cat "$HADES_BOOT_PROC/cmdline" 2>/dev/null) "
+  case "$c" in
+    *" initcall_blacklist="*nvme_init* | *" hades.otherdisks=hide "*) w="internal disks hidden" ;;
+  esac
+  case "$c" in
+    *" lockdown="*) w="${w:+$w, }kernel locked down" ;;
+  esac
+  case "$c" in
+    *" iommu.passthrough=0 "*) w="${w:+$w, }DMA translation" ;;
+  esac
+  hades_boot_say "Entry: ${w:-as LibreELEC starts}; kernel $(cat "$HADES_BOOT_PROC/sys/kernel/osrelease" 2>/dev/null)"
+  for b in "$HADES_BOOT_SYS"/block/*; do
+    [ -e "$b" ] || continue
+    d=${b##*/}
+    case "$d" in
+      loop* | ram* | zram* | nbd* | dm-*) continue ;;
+    esac
+    q=$(sys_path "$b")
+    case "$q" in
+      */usb[0-9]*) t=USB ;;
+      */nvme*) t=NVMe ;;
+      */ata[0-9]*) t=ATA ;;
+      */mmc_host/*) t=MMC ;;
+      */virtio*) t=virtio ;;
+      *) t=other ;;
+    esac
+    s=$(cat "$b/size" 2>/dev/null)
+    list="$list, $d $t $(awk -v s="${s:-0}" 'BEGIN { printf "%.1f GB", s * 512 / 1e9 }')"
+  done
+  [ -n "$list" ] || list=", none"
+  # (each file system as: its partition, its type, its label, its identifier)
+  fs=$(blkid 2>/dev/null | awk '{
+      n = $1; sub(/^\/dev\//, "", n); sub(/:$/, "", n); l = ""; u = ""; t = ""
+      for (i = 2; i <= NF; i++) {
+        v = $i; gsub(/"/, "", v)
+        if (v ~ /^LABEL=/) l = substr(v, 7); else if (v ~ /^UUID=/) u = substr(v, 6); else if (v ~ /^TYPE=/) t = substr(v, 6)
+      }
+      printf "%s%s %s %s %s", (NR > 1 ? "; " : ""), n, t, l, u
+    }' | sed -e 's/  */ /g')
+  hades_boot_say "Disks: ${list#, }. File systems: ${fs:-none}"
+  # the partition is there and mount said why it was not mounted
+  case "$fs" in
+    *" ${1#*=}"*) [ -n "$3" ] && hades_boot_say "mount said: $(echo "$3" | head -n 1)" ;;
+  esac
+  for x in $(hades_usb_hcs); do
+    drv=$(sys_path "$x/driver")
+    drv=${drv##*/}
+    dom=$(hades_domain_of "$x")
+    hcs="$hcs, $(hades_boot_pci "$x") ${drv:-no driver} ${dom:-no IOMMU}"
+  done
+  [ -n "$hcs" ] || hcs=", none on PCI"
+  for d in "$HADES_BOOT_SYS"/bus/usb/devices/*; do
+    f=${d##*/}
+    case "$f" in
+      usb* | *:*) continue ;;
+    esac
+    [ -e "$d/idVendor" ] || continue
+    cnt=$((cnt + 1))
+    for x in "$d"/*:*/bInterfaceClass; do
+      [ "$(cat "$x" 2>/dev/null)" = 08 ] || continue
+      stor="$stor, $f [$(cat "$d/idVendor"):$(cat "$d/idProduct")] $(cat "$d/product" 2>/dev/null) $(cat "$d/speed" 2>/dev/null) Mb/s"
+      break
+    done
+  done
+  [ -n "$stor" ] || stor=", none"
+  hades_boot_say "USB controllers: ${hcs#, }. USB devices: $cnt; storage: ${stor#, }"
+  # (busybox's dmesg starts each line with its level, <6>, and the time; a cache that cannot be synchronised is the
+  # drive that went with its controller in the step above)
+  log=$(hades_boot_klog | sed -e 's/^<[0-9]*>//' -e 's/^\[[^]]*\] *//' | grep -v 'Synchronize Cache')
+  faults=$(echo "$log" | grep -E "$HADES_FAULT_RE")
+  errs=$(echo "$log" | grep -E "$HADES_USBERR_RE")
+  hades_boot_say "Kernel log: $(echo "$faults" | grep -c .) fault(s) of the IOMMU, $(echo "$errs" | grep -c .) error(s) of USB"
+  [ -n "$faults" ] && hades_boot_say "First fault: $(echo "$faults" | head -n 1 | sed -e 's/^\(.\{150\}\).*/\1/')"
+  [ -n "$errs" ] && hades_boot_say "First error: $(echo "$errs" | head -n 1 | sed -e 's/^\(.\{150\}\).*/\1/')"
+  if [ -n "$HADES_USB_PT" ]; then
+    hades_boot_say "The USB controllers were taken out of DMA translation, and the drive is still not there."
+  elif [ -n "$HADES_USB_PT_TRIED" ]; then
+    hades_boot_say "The USB controllers kept DMA translation: ${HADES_USB_PT_LEFT#; }"
+  fi
+  hades_boot_say "Try: restart, choose \"Run (internal disks read-only)\", or another USB port. A photo of this screen is a report."
+}
+
+# Mounts the boot partition $1 (UUID=... or LABEL=...) on /flash, as mount_common did, with the step of the USB
+# controllers and the report above
+hades_mount_flash() {
+  local t0 n=0 out why
+  progress "mount filesystem $1 ..."
+  t0=$(hades_boot_now)
+  while :; do
+    out=$(mount -o ro,noatime "$1" /flash 2>&1) && break
+    n=$((n + 1))
+    if [ -z "$HADES_USB_PT_TRIED" ] && [ -n "$(hades_usb_translated)" ]; then
+      why=""
+      if hades_usb_faulted && [ $n -ge $HADES_FLASH_FAULT_WAIT ]; then
+        why="an IOMMU fault for one of them in the kernel log, none after $n s"
+      elif [ $n -ge $HADES_FLASH_WAIT ]; then
+        why="none after $n s"
+      fi
+      if [ -n "$why" ]; then
+        HADES_USB_PT_TRIED=yes
+        hades_usb_passthrough
+        if [ -n "$HADES_USB_PT" ]; then
+          hades_boot_say "LibreELEC Hades: no boot drive with DMA translation on the USB controllers ($why). For this start they go without it: ${HADES_USB_PT#, }"
+          n=0
+        fi
+        [ -n "$HADES_USB_PT_LEFT" ] && hades_boot_say "Left translated: ${HADES_USB_PT_LEFT#; }"
+        continue
+      fi
+    fi
+    if [ $n -ge $HADES_FLASH_WAIT ]; then
+      hades_flash_report "$1" "$t0" "$out"
+      error "mount_common" "Could not mount $1"
+      return 1
+    fi
+    usleep 1000000
+  done
+  [ -n "$HADES_USB_PT" ] &&
+    hades_boot_say "the boot partition was found with the USB controllers in passthrough, $(($(hades_boot_now) - t0)) s after the wait began"
+  return 0
+}
+
+# Once the boot partition is mounted, in a start with DMA translation, no group of the IOMMU changes its domain any more
+# (kernel.iommu_group_type_locked, linux-9806): without it, a program that runs as root would take any device out of the
+# translation the way the step above takes the USB controllers, and the lockdown does not look at that.
+hades_iommu_lock() {
+  local s=$HADES_BOOT_PROC/sys/kernel/iommu_group_type_locked
+  case " $(cat "$HADES_BOOT_PROC/cmdline" 2>/dev/null) " in
+    *" iommu.passthrough=0 "*) ;;
+    *) return 0 ;;
+  esac
+  echo 1 2>/dev/null >"$s" && [ "$(cat "$s" 2>/dev/null)" = 1 ] && return 0
+  echo "hades-iommu: this kernel cannot keep the domains of the IOMMU as they are (kernel.iommu_group_type_locked): a program that runs as root can take a device out of DMA translation" 2>/dev/null >>"$HADES_BOOT_KMSG"
+}
+
 mount_flash() {
   progress "Mounting flash"
 
   wakeonlan
 
-  mount_part "$boot" "/flash" "ro,noatime"
+  # Hades: a boot partition named by its file system is waited for by hades_mount_flash, which says on the screen what
+  # the kernel sees when it is not there; the others as before
+  case "$boot" in
+    UUID=* | LABEL=*) hades_mount_flash "${boot//@UID@/$MACHINE_UID}" ;;
+    *) mount_part "$boot" "/flash" "ro,noatime" ;;
+  esac
+
+  # Hades: from here on no group of the IOMMU changes its domain (hades_iommu_lock), also not by the hook below
+  hades_iommu_lock
 
   if [ -f /flash/post-flash.sh ]; then
     . /flash/post-flash.sh
@@ -750,6 +1064,64 @@ hades_sb_proof() {
   StopProgress "FAILED"
   tail -n 1 "$log"
   hades_sb_fail "the update is not one that the update channel of this system signed ($(tail -n 1 "$log" | sed 's/^hades_update: //'))"
+  return 1
+}
+
+# An update placed in the update folder by hand (over the network, with SSH, from Kodi's file manager) replaces the
+# whole system, as one of the update channel does. On a system without Secure Boot, before anything of it is read or run
+# and before the folder is touched: it is installed only when it is the .tar of a release that the update channel of
+# this system signed, with its signed manifest next to it, or when it is, byte for byte, the update approved on this
+# system (the question that the settings add-on asks on the screen as soon as it sees one, or a version chosen from a
+# channel added by hand): "hades_update.py check-update", run by the Python, the client and the keys of the system that
+# runs (hades_in_sysroot). Otherwise it is left where it is, not installed, and the system starts: the settings add-on
+# asks about it. The choice "any" (Settings > LibreELEC > Updates, "Ask before installing an update placed by hand"
+# off) installs any update, as LibreELEC does. With Secure Boot, hades_sb_proof decides, and takes only a signed one.
+# 1: not installed (said on the screen and in the kernel log).
+HADES_UPDATE_STATE=/storage/.cache/hades-update
+hades_update_say() {
+  echo "hades-update: $1" >/dev/kmsg 2>/dev/null
+}
+
+hades_update_gate() {
+  local log=/tmp/hades-update-gate.log
+  hades_sb_installed && return 0
+  if [ "$(cat "$HADES_UPDATE_STATE/manual-updates" 2>/dev/null)" = any ]; then
+    hades_update_say "an update placed in the update folder is installed without a check: chosen in the settings (as in LibreELEC)"
+    return 0
+  fi
+  if [ -f "$UPDATE_TAR" ]; then
+    set -- "$UPDATE_TAR"
+  elif [ -f "$UPDATE_IMG_GZ" ]; then
+    set -- "$UPDATE_IMG_GZ"
+  elif [ -f "$UPDATE_IMG" ]; then
+    set -- "$UPDATE_IMG"
+  else
+    set -- "$UPDATE_DIR/$UPDATE_KERNEL" "$UPDATE_DIR/$UPDATE_SYSTEM"
+  fi
+  rm -f "$log"
+  StartProgress spinner "Checking the update... "
+  if [ -x /sysroot/usr/bin/python3 ] && [ -f "/sysroot$HADES_UPDATE_CLIENT" ] &&
+     hades_in_sysroot "$log" /usr/bin/python3 -I "$HADES_UPDATE_CLIENT" check-update "$UPDATE_ROOT" \
+       "$HADES_UPDATE_STATE/approved-update.json" "$@"; then
+    StopProgress "done"
+    hades_update_say "$(tail -n 1 "$log" | sed 's/^hades_update: //')"
+    # (an approval is for one update: used now)
+    rm -f "$HADES_UPDATE_STATE/approved-update.json"
+    return 0
+  fi
+  StopProgress "FAILED"
+  echo ""
+  if [ -f "$log" ]; then
+    tail -n 1 "$log"
+  else
+    echo "This system cannot check an update (no Python or no client of the update channel)."
+  fi
+  echo ""
+  echo "The update was not installed: it is not signed by the update channel of LibreELEC Hades,"
+  echo "and it was not approved on this system. It is left in the update folder:"
+  echo "LibreELEC Hades asks about it once it has started."
+  echo ""
+  hades_update_say "not installed, left in the update folder: $(tail -n 1 "$log" 2>/dev/null | sed -e 's/^hades_update: //' -e 's/^not installed: //')"
   return 1
 }
 
@@ -1075,6 +1447,15 @@ check_update() {
     echo ""
     do_cleanup
     StartProgress countdown "Normal startup in 10s... " 10 "NOW"
+    return 0
+  fi
+
+  # Hades: without Secure Boot, an update that the update channel did not sign is installed only when it was approved
+  # on this system (hades_update_gate); otherwise it is left as it is, for the question of the settings add-on (which
+  # asks as soon as Kodi has started: a short wait here, at each start while it is not answered, and the kernel log has
+  # the reason too)
+  if ! hades_update_gate; then
+    StartProgress countdown "Normal startup in 5s... " 5 "NOW"
     return 0
   fi
 

@@ -1,0 +1,852 @@
+From 8bf8d0790de53dd81422b1f8db9ce79945990a52 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:36:58 +0000
+Subject: [PATCH] [Hades][GBM] Frame packing on nvidia-drm through dumb buffers
+ without GBM
+
+Issue #33, RTX 5090 with 1.2.2: in an HDMI 3D frame-packed mode the
+driver refused the window's buffer ("its memory is not video memory"),
+NVIDIA's GBM refused a linear buffer for scanout and rendering, and the
+driver's dumb buffers, which 1.2.2 made next, never reached the driver:
+NVIDIA's GBM refused to import them ("GBM could not import the dumb
+buffer (Invalid argument)"). The 3D video went out in another layout.
+
+The dumb buffers now take no part of GBM. Each is made on Kodi's DRM
+file, its framebuffer is made of its handle with DRM_FORMAT_MOD_LINEAR
+(which nvidia-drm asks of a frame-packed one), and it is mapped for the
+processor. Kodi's queue holds buffers of GBM, so a small buffer of GBM
+stands for each dumb one there; its user data is the dumb buffer's
+framebuffer (drm_fb::own, DRMFramebuffer.h), which DrmFbGetFromBo()
+gives first, and what the framebuffer is made of is asked of it, never
+of the small buffer (FramePackedBufferUsable(),
+DescribeFramePackedBuffer(), DrmOpaqueFbGetFromBo()).
+
+nvidia-drm makes a dumb buffer pitch linear, of the SCANOUT kind, in
+video memory on a card that has it, and fails it rather than place it
+in system memory (nv_drm_dumb_create(), AllocateMemory()); such a
+framebuffer has an NVKMS surface (nv_drm_framebuffer_init()).
+
+Where NVIDIA's EGL imports a dumb buffer (its dma-buf), the GPU flips
+each frame into it, and before use the processor reads, through the
+mapping, that the GPU wrote a probe frame where the display engine
+reads it at the driver's pitch (DumbLayoutProbe()). Otherwise, or where
+that check fails, each frame is read back and copied by the processor,
+the same bytes. The check of that copy looked for the probe pixels in
+the first row of the buffer, where a right copy leaves black: they are
+in its last row (RowHolds()). The order stays: the window's buffer,
+then Kodi's own; kodi.log says which went out and how.
+---
+ xbmc/windowing/gbm/OwnScanout.cpp             | 383 +++++++++++++-----
+ xbmc/windowing/gbm/OwnScanout.h               |  43 +-
+ xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp |  15 +-
+ xbmc/windowing/gbm/drm/CMakeLists.txt         |   1 +
+ xbmc/windowing/gbm/drm/DRMFramebuffer.h       |  64 +++
+ xbmc/windowing/gbm/drm/DRMUtils.cpp           |  47 +++
+ xbmc/windowing/gbm/drm/DRMUtils.h             |   9 +-
+ 7 files changed, 428 insertions(+), 134 deletions(-)
+ create mode 100644 xbmc/windowing/gbm/drm/DRMFramebuffer.h
+
+diff --git a/xbmc/windowing/gbm/OwnScanout.cpp b/xbmc/windowing/gbm/OwnScanout.cpp
+index c8cbc82..45eefd1 100644
+--- a/xbmc/windowing/gbm/OwnScanout.cpp
++++ b/xbmc/windowing/gbm/OwnScanout.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "OwnScanout.h"
+ 
++#include "drm/DRMFramebuffer.h"
+ #include "rendering/OutputFramebuffer.h"
+ #include "utils/log.h"
+ 
+@@ -22,6 +23,7 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <xf86drm.h>
++#include <xf86drmMode.h>
+ 
+ #include "system_gl.h"
+ 
+@@ -83,18 +85,41 @@ void ProbeColour(int pixel, int bits)
+                  PROBE_CODES[pixel][2] / 1023.0f, 1.0f);
+ }
+ 
+-// (Hades) A dumb buffer of the driver, of 32 bits a pixel, as a buffer of GBM: made on the DRM file
+-// of the GBM device, given a dma-buf, its handle closed at once (the dma-buf holds the memory:
+-// drm_gem_prime_export() takes a reference of the object), and imported into GBM by the dma-buf, so
+-// that the buffer of GBM holds the only handle of it on that file and gbm_bo_destroy() closes nothing
+-// else. Its pitch is the driver's (DRM_IOCTL_MODE_CREATE_DUMB).
+-gbm_bo* MakeDumb(gbm_device* device,
+-                 int drmFd,
+-                 int width,
+-                 int height,
+-                 uint32_t format,
+-                 uint32_t& pitch,
+-                 std::string& failed)
++// (Hades) The side of the small buffer of GBM that stands for a dumb one in Kodi's queue
++// (OwnScanout.h): it is never drawn into or shown
++constexpr uint32_t STAND_IN_SIZE = 64;
++
++// (Hades) The framebuffer of a dumb buffer, which is the user data of the small buffer of GBM that
++// stands for it, goes with that buffer (gbm_bo_destroy()), as CDRMUtils' framebuffers of GBM's
++// buffers go with theirs; the dumb buffer itself is the COwnScanout's to destroy
++void DumbFramebufferGone(gbm_bo* bo, void* data)
++{
++  auto* fb = static_cast<drm_fb*>(data);
++  const int fd = gbm_device_get_fd(gbm_bo_get_device(bo));
++  if (fb->opaque_fb_id > 0)
++    drmModeRmFB(fd, fb->opaque_fb_id);
++  if (fb->fb_id > 0)
++    drmModeRmFB(fd, fb->fb_id);
++  delete fb;
++}
++
++// (Hades) A dumb buffer of the driver, of 32 bits a pixel, made on the DRM file of the GBM device,
++// with no part of GBM in it (NVIDIA's GBM imports none: "Invalid argument", issue #33): its
++// framebuffer made of its handle, with DRM_FORMAT_MOD_LINEAR said (nvidia-drm-fb.c,
++// nv_drm_framebuffer_get_frame_packed_surfaces(), takes a frame-packed frame only from such a one),
++// and a small buffer of GBM, whose user data is that framebuffer, to stand for it in Kodi's queue
++// (CDRMUtils::DrmFbGetFromBo() gives the user data first). Its pitch is the driver's
++// (DRM_IOCTL_MODE_CREATE_DUMB). What was made stays in \p handle and \p standIn for the caller to
++// destroy, also where a later step fails.
++bool MakeDumb(gbm_device* device,
++              int drmFd,
++              int width,
++              int height,
++              uint32_t format,
++              uint32_t& handle,
++              uint32_t& pitch,
++              gbm_bo*& standIn,
++              std::string& failed)
+ {
+   drm_mode_create_dumb create{};
+   create.width = static_cast<uint32_t>(width);
+@@ -104,60 +129,61 @@ gbm_bo* MakeDumb(gbm_device* device,
+   {
+     failed = "the driver could not make a dumb buffer of " + std::to_string(width) + "x" +
+              std::to_string(height) + " (" + std::strerror(errno) + ")";
+-    return nullptr;
++    return false;
+   }
+-  int fd = -1;
+-  const int exported = drmPrimeHandleToFD(drmFd, create.handle, DRM_CLOEXEC | DRM_RDWR, &fd);
+-  const int exportError = errno;
+-  drm_mode_destroy_dumb destroy{};
+-  destroy.handle = create.handle;
+-  drmIoctl(drmFd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+-  if (exported != 0 || fd < 0)
++  handle = create.handle;
++  pitch = create.pitch;
++  if (pitch < static_cast<uint32_t>(width) * 4 ||
++      create.size < static_cast<uint64_t>(pitch) * static_cast<uint64_t>(height))
+   {
+-    failed = std::string("the dumb buffer has no dma-buf (") + std::strerror(exportError) + ")";
+-    return nullptr;
++    failed = "the driver made a dumb buffer too small for " + std::to_string(width) + "x" +
++             std::to_string(height) + " (pitch " + std::to_string(pitch) + ", " +
++             std::to_string(create.size) + " bytes)";
++    return false;
+   }
+ 
+-  gbm_bo* bo = nullptr;
+-#if defined(HAS_GBM_MODIFIERS)
+-  gbm_import_fd_modifier_data data{};
+-  data.width = create.width;
+-  data.height = create.height;
+-  data.format = format;
+-  data.num_fds = 1;
+-  data.fds[0] = fd;
+-  data.strides[0] = static_cast<int>(create.pitch);
+-  data.offsets[0] = 0;
+-  data.modifier = DRM_FORMAT_MOD_LINEAR;
+-  bo = gbm_bo_import(device, GBM_BO_IMPORT_FD_MODIFIER, &data,
+-                     GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+-#else
+-  gbm_import_fd_data data{};
+-  data.fd = fd;
+-  data.width = create.width;
+-  data.height = create.height;
+-  data.stride = create.pitch;
+-  data.format = format;
+-  bo = gbm_bo_import(device, GBM_BO_IMPORT_FD, &data, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+-#endif
+-  const int importError = errno;
+-  // (GBM holds the buffer by its own handle now: the descriptor is not needed any more)
+-  close(fd);
+-  if (!bo)
++  uint32_t handles[4] = {handle, 0, 0, 0};
++  uint32_t pitches[4] = {pitch, 0, 0, 0};
++  uint32_t offsets[4] = {0, 0, 0, 0};
++  uint64_t modifiers[4] = {DRM_FORMAT_MOD_LINEAR, 0, 0, 0};
++  uint32_t fbId = 0;
++  if (drmModeAddFB2WithModifiers(drmFd, static_cast<uint32_t>(width), static_cast<uint32_t>(height),
++                                 format, handles, pitches, offsets, modifiers, &fbId,
++                                 DRM_MODE_FB_MODIFIERS) != 0)
+   {
+-    failed =
+-        std::string("GBM could not import the dumb buffer (") + std::strerror(importError) + ")";
+-    return nullptr;
++    failed = std::string("the driver made no framebuffer of the dumb buffer (") +
++             std::strerror(errno) + ")";
++    return false;
+   }
+-  pitch = create.pitch;
+-  return bo;
++
++  standIn = gbm_bo_create(device, STAND_IN_SIZE, STAND_IN_SIZE, format, GBM_BO_USE_RENDERING);
++  if (!standIn)
++    standIn = gbm_bo_create(device, STAND_IN_SIZE, STAND_IN_SIZE, format,
++                            GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
++  if (!standIn)
++  {
++    failed = std::string("GBM could not make the small buffer that stands for the dumb one in "
++                         "Kodi's queue (") +
++             std::strerror(errno) + ")";
++    drmModeRmFB(drmFd, fbId);
++    return false;
++  }
++  auto* fb = new drm_fb;
++  fb->bo = standIn;
++  fb->fb_id = fbId;
++  fb->format = format;
++  fb->own = drm_fb::Own{handle, static_cast<uint32_t>(width), static_cast<uint32_t>(height), pitch,
++                        DRM_FORMAT_MOD_LINEAR};
++  gbm_bo_set_user_data(standIn, fb, DumbFramebufferGone);
++  return true;
+ }
+ 
+-// (Hades) The buffer of GBM made of a dumb buffer, mapped for the processor to write into
+-uint8_t* MapDumb(int drmFd, gbm_bo* bo, size_t size, std::string& failed)
++// (Hades) A dumb buffer, mapped for the processor (nvidia-drm maps video memory write-combined:
++// drm_gem_mmap_obj())
++uint8_t* MapDumb(int drmFd, uint32_t handle, size_t size, std::string& failed)
+ {
+   drm_mode_map_dumb map{};
+-  map.handle = gbm_bo_get_handle(bo).u32;
++  map.handle = handle;
+   if (drmIoctl(drmFd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0)
+   {
+     failed = std::string("the dumb buffer cannot be mapped (") + std::strerror(errno) + ")";
+@@ -284,6 +310,35 @@ bool COwnScanout::CopyRowsFlipped(const uint8_t* rows,
+   return true;
+ }
+ 
++bool COwnScanout::RowHolds(
++    const uint8_t* row, uint32_t format, bool probe, const char* where, std::string& failed)
++{
++  const std::optional<bool> bgra = MemoryIsBgra(format);
++  if (!bgra || !row)
++  {
++    failed = "the format " + FourCC(format) + " is not one of 8 bits";
++    return false;
++  }
++  for (int pixel = 0; pixel < 4; ++pixel)
++    for (int c = 0; c < 3; ++c)
++    {
++      // (the bytes of a pixel as the format lays them: B, G, R, A or R, G, B, A)
++      const unsigned int value = row[pixel * 4 + (*bgra ? 2 - c : c)];
++      const unsigned int expected = probe ? PROBE_BYTES[pixel][c] : 0;
++      if (value != expected)
++      {
++        char text[200];
++        snprintf(text, sizeof(text),
++                 "the buffer did not hold the values written (%u for %u in its %s row, pixel %d "
++                 "component %d)",
++                 value, expected, where, pixel, c);
++        failed = text;
++        return false;
++      }
++    }
++  return true;
++}
++
+ EGLImageKHR COwnScanout::ImportDmaBuf(EGLDisplay display, const OwnDmaBuf& buffer,
+                                       std::string& failed)
+ {
+@@ -751,16 +806,63 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+     return nullptr;
+   }
+ 
++  if (memory == Memory::DUMB)
++  {
++    own->m_drmFd = drmFd;
++    own->m_modifier = DRM_FORMAT_MOD_LINEAR;
++  }
++
+   for (unsigned int i = 0; i < BUFFERS; ++i)
+   {
+     own->m_buffers.emplace_back();
+     Buffer& buffer = own->m_buffers.back();
+-    // (Hades: the driver's dumb buffers, made and given to GBM: MakeDumb())
++    // (Hades: the driver's dumb buffers, without GBM: MakeDumb(); each mapped, black, and imported
++    // into EGL where it takes them, or copied into by the processor: below)
+     if (memory == Memory::DUMB)
+     {
+-      buffer.bo = MakeDumb(device, drmFd, width, height, format, buffer.pitch, failed);
+-      if (!buffer.bo)
++      if (!MakeDumb(device, drmFd, width, height, format, buffer.dumbHandle, buffer.pitch,
++                    buffer.bo, failed))
++        return nullptr;
++      buffer.mapSize = static_cast<size_t>(buffer.pitch) * static_cast<size_t>(height);
++      buffer.map = MapDumb(drmFd, buffer.dumbHandle, buffer.mapSize, failed);
++      if (!buffer.map)
++      {
++        buffer.mapSize = 0;
+         return nullptr;
++      }
++      // (opaque black, as the probe of a buffer drawn into leaves it)
++      const uint32_t black = 0xff000000u;
++      for (size_t offset = 0; offset + 4 <= buffer.mapSize; offset += 4)
++        std::memcpy(buffer.map + offset, &black, 4);
++      if (own->m_copy)
++        continue;
++      std::string drawFailed;
++      int fd = -1;
++      if (drmPrimeHandleToFD(drmFd, buffer.dumbHandle, DRM_CLOEXEC | DRM_RDWR, &fd) != 0 || fd < 0)
++        drawFailed = std::string("the dumb buffer has no dma-buf (") + std::strerror(errno) + ")";
++      else
++      {
++        OwnDmaBuf dmabuf;
++        dmabuf.fourcc = format;
++        dmabuf.width = width;
++        dmabuf.height = height;
++        dmabuf.planes = 1;
++        dmabuf.fd[0] = fd;
++        dmabuf.pitch[0] = buffer.pitch;
++        dmabuf.modifier = DRM_FORMAT_MOD_LINEAR;
++        dmabuf.hasModifier = true;
++        buffer.image = ImportDmaBuf(display, dmabuf, drawFailed);
++        // (EGL keeps what it needs of the buffer: the descriptor is closed after the import)
++        close(fd);
++      }
++      if (buffer.image == EGL_NO_IMAGE_KHR ||
++          !MakeTarget(buffer.image, buffer.renderbuffer, buffer.framebuffer, drawFailed) ||
++          !Probe(buffer.framebuffer, bits, drawFailed))
++      {
++        own->m_copy = true;
++        own->m_copyReason = drawFailed;
++      }
++      continue;
+     }
+ #if defined(HAS_GBM_MODIFIERS)
+     if (!buffer.bo && !modifiers.empty())
+@@ -819,7 +921,6 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+       own->m_modifier = dmabuf.modifier;
+ 
+     // (EGL keeps what it needs of the buffer: the descriptor is closed after the import)
+-    // (Hades: a dumb buffer that EGL cannot draw into is copied into by the processor: below)
+     std::string drawFailed;
+     buffer.image = ImportDmaBuf(display, dmabuf, drawFailed);
+     close(fd);
+@@ -829,38 +930,17 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+         Probe(buffer.framebuffer, bits, drawFailed);
+     if (!drawn)
+     {
+-      if (memory != Memory::DUMB)
+-      {
+-        failed = drawFailed;
+-        return nullptr;
+-      }
+-      own->m_copy = true;
+-      own->m_copyReason = drawFailed;
++      failed = drawFailed;
++      return nullptr;
+     }
+   }
+ 
+-  // (Hades) Dumb buffers that EGL cannot draw into: each one mapped, black, and written by the
+-  // processor from the frame read back (CopyOut()); the EGL images and framebuffers made of some of
+-  // them are given back, so that every frame goes the same way
++  // (Hades) Dumb buffers that EGL cannot draw into are written by the processor from the frame
++  // read back (CopyOut()); the EGL images and framebuffers made of some of them are given back, so
++  // that every frame goes the same way
+   if (own->m_copy)
+   {
+     own->ReleaseTargets();
+-    for (Buffer& buffer : own->m_buffers)
+-    {
+-      buffer.mapSize = static_cast<size_t>(buffer.pitch) * static_cast<size_t>(height);
+-      buffer.map = MapDumb(drmFd, buffer.bo, buffer.mapSize, failed);
+-      if (!buffer.map)
+-      {
+-        buffer.mapSize = 0;
+-        failed = "EGL could not draw into the dumb buffers (" + own->m_copyReason +
+-                 "), and copying into them failed too: " + failed;
+-        return nullptr;
+-      }
+-      // (opaque black, as the probe of a buffer drawn into leaves it)
+-      const uint32_t black = 0xff000000u;
+-      for (size_t offset = 0; offset + 4 <= buffer.mapSize; offset += 4)
+-        std::memcpy(buffer.map + offset, &black, 4);
+-    }
+     own->m_readBgra = *MemoryIsBgra(format) && HasGLExtension("GL_EXT_read_format_bgra");
+   }
+ 
+@@ -902,6 +982,22 @@ std::shared_ptr<COwnScanout> COwnScanout::Create(gbm_device* device,
+     own->m_frameFramebuffer = fb;
+     if (!Probe(fb, bits, failed))
+       return nullptr;
++    // (Hades: dumb buffers that EGL took: that the GPU writes them where the display engine reads
++    // them, through their mappings; where it does not, the processor copies the frames into them)
++    if (!own->m_copy && memory == Memory::DUMB)
++    {
++      std::string layout;
++      if (!FlipProbe(fb, own->m_buffers.front().framebuffer, width, height, bits, layout) ||
++          !own->DumbLayoutProbe(layout))
++      {
++        own->ReleaseTargets();
++        own->m_copy = true;
++        own->m_copyReason = "EGL imported them, but " + layout;
++        own->m_readBgra = *MemoryIsBgra(format) && HasGLExtension("GL_EXT_read_format_bgra");
++      }
++      else
++        return own;
++    }
+     // (Hades: or the copy of the processor, where the frames go that way)
+     if (own->m_copy
+             ? !own->CopyProbe(failed)
+@@ -1004,31 +1100,17 @@ bool COwnScanout::CopyProbe(std::string& failed)
+   glDisable(GL_SCISSOR_TEST);
+ 
+   bool same = CopyOut(0, failed);
+-  // (the top row of the buffer has the pixels, its bottom row is black; the bytes of a pixel as the
+-  // format lays them)
++  // (the bottom row of the frame is the last row of the buffer in memory, the last line that the
++  // display shows: it has the pixels, and the first row is black; the bytes of a pixel as the
++  // format lays them; as FlipProbe() finds them after the GPU's flip)
+   const Buffer& buffer = m_buffers.front();
+-  const bool bgra = *MemoryIsBgra(m_format);
+-  for (int pass = 0; same && pass < 2; ++pass)
++  std::string wrong;
++  if (same && (!RowHolds(buffer.map + static_cast<size_t>(m_height - 1) * buffer.pitch, m_format,
++                         true, "last", wrong) ||
++               !RowHolds(buffer.map, m_format, false, "first", wrong)))
+   {
+-    const uint8_t* row =
+-        buffer.map + static_cast<size_t>(pass == 0 ? 0 : m_height - 1) * buffer.pitch;
+-    for (int pixel = 0; same && pixel < 4; ++pixel)
+-      for (int c = 0; c < 3; ++c)
+-      {
+-        const unsigned int value = row[pixel * 4 + (bgra ? 2 - c : c)];
+-        const unsigned int expected = pass == 0 ? PROBE_BYTES[pixel][c] : 0;
+-        if (value != expected)
+-        {
+-          char text[200];
+-          snprintf(text, sizeof(text),
+-                   "the copy of a frame into the buffer did not give the values written (%u for "
+-                   "%u in the %s row, pixel %d component %d)",
+-                   value, expected, pass == 0 ? "top" : "bottom", pixel, c);
+-          failed = text;
+-          same = false;
+-          break;
+-        }
+-      }
++    failed = "the copy of a frame by the processor: " + wrong;
++    same = false;
+   }
+ 
+   // Black, before anything is shown through them
+@@ -1049,6 +1131,76 @@ bool COwnScanout::CopyProbe(std::string& failed)
+   return same;
+ }
+ 
++bool COwnScanout::DumbLayoutProbe(std::string& failed)
++{
++  GLint draw = 0, read = 0, box[4]{};
++  GLfloat clear[4]{};
++  GLboolean mask[4]{};
++  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
++  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
++  const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++  glGetIntegerv(GL_SCISSOR_BOX, box);
++  glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
++  glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++
++  bool same = true;
++  for (unsigned int i = 0; same && i < m_buffers.size(); ++i)
++  {
++    Buffer& buffer = m_buffers[i];
++    if (!buffer.map || !buffer.framebuffer)
++    {
++      failed = "a dumb buffer has no mapping or no framebuffer to draw into";
++      same = false;
++      break;
++    }
++    // Black, then the four pixels in the bottom row of the frame, as FlipProbe() draws them
++    glBindFramebuffer(GL_FRAMEBUFFER, m_frameFramebuffer);
++    glDisable(GL_SCISSOR_TEST);
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glEnable(GL_SCISSOR_TEST);
++    for (int pixel = 0; pixel < 4; ++pixel)
++    {
++      glScissor(pixel, 0, 1, 1);
++      ProbeColour(pixel, 8);
++      glClear(GL_COLOR_BUFFER_BIT);
++    }
++    glDisable(GL_SCISSOR_TEST);
++    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
++    glBindFramebuffer(GL_FRAMEBUFFER, buffer.framebuffer);
++    glClear(GL_COLOR_BUFFER_BIT);
++    FlipBlit(m_frameFramebuffer, buffer.framebuffer, m_width, m_height);
++    // (the GPU's writes reach the memory before the processor reads it)
++    glFinish();
++    std::string wrong;
++    if (!RowHolds(buffer.map + static_cast<size_t>(m_height - 1) * buffer.pitch, m_format, true,
++                  "last", wrong) ||
++        !RowHolds(buffer.map, m_format, false, "first", wrong))
++    {
++      failed = "what the GPU drew into dumb buffer " + std::to_string(i + 1) +
++               " is not where the display engine reads it at the pitch of the driver (" +
++               std::to_string(buffer.pitch) + " bytes): " + wrong;
++      same = false;
++    }
++    // Black, before anything is shown through it
++    glBindFramebuffer(GL_FRAMEBUFFER, buffer.framebuffer);
++    glClear(GL_COLOR_BUFFER_BIT);
++  }
++  glBindFramebuffer(GL_FRAMEBUFFER, m_frameFramebuffer);
++  glClear(GL_COLOR_BUFFER_BIT);
++  glFinish();
++
++  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
++  glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
++  glColorMask(mask[0], mask[1], mask[2], mask[3]);
++  glClearColor(clear[0], clear[1], clear[2], clear[3]);
++  glScissor(box[0], box[1], box[2], box[3]);
++  if (scissor)
++    glEnable(GL_SCISSOR_TEST);
++  return same;
++}
++
+ COwnScanout::~COwnScanout()
+ {
+   const auto destroy =
+@@ -1075,12 +1227,21 @@ COwnScanout::~COwnScanout()
+       glDeleteRenderbuffers(1, &buffer.renderbuffer);
+     if (buffer.image != EGL_NO_IMAGE_KHR && destroy)
+       destroy(m_display, buffer.image);
+-    // (Hades: the mapping of a dumb buffer that the frames were copied into)
++    // (Hades: the mapping of a dumb buffer)
+     if (buffer.map)
+       munmap(buffer.map, buffer.mapSize);
+-    // (the framebuffer of the kernel made for it goes with it: CDRMUtils::DrmFbGetFromBo())
++    // (the framebuffer of the kernel made for it goes with it: CDRMUtils::DrmFbGetFromBo(); Hades:
++    // for a dumb buffer, that of the dumb buffer goes with the small buffer that stands for it,
++    // DumbFramebufferGone())
+     if (buffer.bo)
+       gbm_bo_destroy(buffer.bo);
++    // (Hades: and the dumb buffer, after its framebuffer)
++    if (buffer.dumbHandle && m_drmFd >= 0)
++    {
++      drm_mode_destroy_dumb destroy{};
++      destroy.handle = buffer.dumbHandle;
++      drmIoctl(m_drmFd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
++    }
+   }
+ }
+ 
+diff --git a/xbmc/windowing/gbm/OwnScanout.h b/xbmc/windowing/gbm/OwnScanout.h
+index 9bd658a..e709853 100644
+--- a/xbmc/windowing/gbm/OwnScanout.h
++++ b/xbmc/windowing/gbm/OwnScanout.h
+@@ -180,12 +180,17 @@ struct OwnDmaBuf
+  * Where GBM cannot make those (NVIDIA's GBM refuses a linear buffer for scanout and rendering), they
+  * are the driver's own dumb buffers (Memory::DUMB): nvidia-drm makes a dumb buffer pitch linear, for
+  * scanout, in video memory on a card that has it (nvidia-drm-gem-nvkms-memory.c,
+- * nv_drm_dumb_create()), which its display engine scans out. Each is made on Kodi's DRM file, given
+- * a dma-buf, its handle closed at once (the dma-buf holds the memory), and imported into GBM, whose
+- * buffer then holds the only handle of it: gbm_bo_destroy() closes nothing else. Where the EGL of
+- * the driver cannot draw into such a buffer, the frame drawn into the framebuffer object of the
+- * frame is read back and copied by the processor into the buffer, flipped, in each frame
+- * (CopiesOnCpu(): checked before use like the rest).
++ * nv_drm_dumb_create()), which its display engine scans out. GBM takes no part in them: NVIDIA's
++ * GBM refuses to import one ("Invalid argument", issue #33, RTX 5090 with 1.2.2). Each is made on
++ * Kodi's DRM file, its framebuffer is made of its handle with DRM_FORMAT_MOD_LINEAR, and a small
++ * buffer of GBM stands for it in Kodi's queue, which holds buffers of GBM: the user data of that
++ * small buffer is the framebuffer (drm_fb::own, DRMFramebuffer.h), which CDRMUtils::DrmFbGetFromBo()
++ * gives for it. The small buffer is never drawn into or shown. Each dumb buffer is mapped for the
++ * processor. Where the EGL of the driver imports it (its dma-buf), the GPU flips each frame into it,
++ * as into GBM's, and that the GPU writes where the display engine reads is checked through the
++ * mapping before use (DumbLayoutProbe()); otherwise, or where that check fails, the frame drawn
++ * into the framebuffer object of the frame is read back and copied by the processor into the
++ * buffer, flipped, in each frame (CopiesOnCpu(): checked before use like the rest).
+  */
+ class COwnScanout : public IOwnBuffers
+ {
+@@ -198,7 +203,7 @@ public:
+   enum class Memory
+   {
+     GBM, //!< gbm_bo_create*(), for scanout and rendering
+-    DUMB, //!< dumb buffers of the DRM driver, imported into GBM by their dma-buf (8 bits only)
++    DUMB, //!< dumb buffers of the DRM driver, with framebuffers of their own (8 bits only)
+   };
+ 
+   ~COwnScanout() override;
+@@ -245,6 +250,14 @@ public:
+                               uint32_t format,
+                               uint8_t* target,
+                               uint32_t pitch);
++  /*!
++   * \brief (Hades) Whether a row of a buffer of \p format (8 bits, MemoryIsBgra()) holds, in its
++   *        first four pixels, the values of the probes (\p probe) or black: what the GPU's flip or
++   *        the processor's copy of a probe frame leaves in its bottom row and in its top row
++   * \param[out] failed which value was not, in plain words (\p where names the row)
++   */
++  static bool RowHolds(
++      const uint8_t* row, uint32_t format, bool probe, const char* where, std::string& failed);
+ 
+   //! The format is one these buffers can be made of (8-bit, 10-bit or half-float RGB)
+   static bool Supported(uint32_t format);
+@@ -321,11 +334,14 @@ private:
+ 
+   struct Buffer
+   {
++    //! (Hades: for Memory::DUMB, the small buffer of GBM that stands for the dumb one in Kodi's
++    //! queue, whose user data is the framebuffer of the dumb one: drm_fb::own)
+     gbm_bo* bo{nullptr};
+     EGLImageKHR image{EGL_NO_IMAGE_KHR};
+     unsigned int renderbuffer{0};
+     unsigned int framebuffer{0};
+-    //! (Hades) Memory::DUMB: its pitch and, where the frames are copied, its mapping
++    //! (Hades) Memory::DUMB: its handle on the DRM file, its pitch and its mapping
++    uint32_t dumbHandle{0};
+     uint32_t pitch{0};
+     uint8_t* map{nullptr};
+     size_t mapSize{0};
+@@ -334,10 +350,17 @@ private:
+   void ReleaseTargets();
+   //! (Hades) The frame read back from its framebuffer object and copied into the buffer at index
+   bool CopyOut(unsigned int index, std::string& failed);
+-  //! (Hades) The copy checked: four pixels of the bottom row of the frame come back from the top
+-  //! row of the first buffer, and its bottom row stays black; the buffer is black after
++  //! (Hades) The copy checked: four pixels of the bottom row of the frame come back from the
++  //! bottom row of the first buffer (its last one in memory, the last line that the display
++  //! shows), and its top row stays black; the buffer is black after
+   bool CopyProbe(std::string& failed);
++  //! (Hades) Memory::DUMB drawn by the GPU: for each buffer, four pixels of the bottom row of the
++  //! frame, flipped by the GPU into it, are read by the processor through its mapping where the
++  //! display engine reads them, at its pitch (its last row), and its first row is black; each
++  //! buffer is black after
++  bool DumbLayoutProbe(std::string& failed);
+   Memory m_memory{Memory::GBM};
++  int m_drmFd{-1}; //!< (Hades) Memory::DUMB: the DRM file that the dumb buffers are of
+   bool m_copy{false};
+   bool m_readBgra{false};
+   std::string m_copyReason;
+diff --git a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+index 6c5e970..d3007ea 100644
+--- a/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
++++ b/xbmc/windowing/gbm/WinSystemGbmEGLContext.cpp
+@@ -1236,17 +1236,22 @@ void CWinSystemGbmEGLContext::FramePackedOwnStart(struct gbm_bo* window)
+   const auto rows = FP_OWN::RowsOf(mode);
+   const bool dumb = own->MemoryKind() == COwnScanout::Memory::DUMB;
+   const std::string made =
+-      dumb ? "that the driver allocates as dumb buffers (video memory, for scanout; of Kodi's own "
+-             "buffers, " +
++      dumb ? "that the driver allocates as dumb buffers (video memory, for scanout; each with a "
++             "framebuffer of its own, without GBM; of Kodi's own buffers, " +
+                  gbmWhat + ")"
+            : std::string("that Kodi allocates itself for scanout");
+   const std::string how =
+       own->CopiesOnCpu()
+           ? "drawn upright, read back and copied from top to bottom by the processor into the "
+-            "buffer when each frame is swapped (the EGL of the driver cannot draw into them: " +
++            "buffer when each frame is swapped, the same bytes (the EGL of the driver cannot draw "
++            "into them: " +
+                 own->CopyReason() + ")"
+-          : std::string("drawn upright and flipped from top to bottom by the GPU when each frame "
+-                        "is swapped");
++          : std::string(dumb ? "drawn upright and flipped from top to bottom by the GPU when each "
++                               "frame is swapped (the EGL of the driver imports them; what the "
++                               "GPU draws was read back by the processor where the display "
++                               "engine reads it)"
++                             : "drawn upright and flipped from top to bottom by the GPU when each "
++                               "frame is swapped");
+   CLog::LogF(LOGINFO,
+              "3D output: the driver refused the window's buffer in a test commit of the "
+              "frame-packed mode ({}) and takes Kodi's own: {}. The frame goes out in {} buffers "
+diff --git a/xbmc/windowing/gbm/drm/CMakeLists.txt b/xbmc/windowing/gbm/drm/CMakeLists.txt
+index d11272f..1a8bac4 100644
+--- a/xbmc/windowing/gbm/drm/CMakeLists.txt
++++ b/xbmc/windowing/gbm/drm/CMakeLists.txt
+@@ -15,6 +15,7 @@ set(HEADERS BootOption.h
+             DRMCrtc.h
+             DRMDisplayWatch.h
+             DRMEncoder.h
++            DRMFramebuffer.h
+             DRMLegacy.h
+             DRMMonitorConfirm.h
+             DRMObject.h
+diff --git a/xbmc/windowing/gbm/drm/DRMFramebuffer.h b/xbmc/windowing/gbm/drm/DRMFramebuffer.h
+new file mode 100644
+index 0000000..fd0fad4
+--- /dev/null
++++ b/xbmc/windowing/gbm/drm/DRMFramebuffer.h
+@@ -0,0 +1,64 @@
++/*
++ *  Copyright (C) 2005-2018 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++#include <gbm.h>
++
++namespace KODI
++{
++namespace WINDOWING
++{
++namespace GBM
++{
++
++/*!
++ * \brief The framebuffer of the kernel made of a buffer that goes to the screen, kept as the user
++ *        data of its buffer of GBM (CDRMUtils::DrmFbGetFromBo())
++ */
++struct drm_fb
++{
++  struct gbm_bo* bo = nullptr;
++  uint32_t fb_id;
++  uint32_t format;
++  uint32_t opaque_fb_id = 0;
++
++  /*!
++   * \brief Hades: what a framebuffer is made of where it is not the memory of its buffer of GBM:
++   *        a dumb buffer of the driver (COwnScanout, Memory::DUMB; issue #33). NVIDIA's GBM
++   *        imports no dumb buffer, and Kodi's queue holds buffers of GBM (IOwnBuffers): a small
++   *        buffer of GBM stands for the dumb one there, and its user data is this framebuffer,
++   *        made of the dumb buffer's handle. Nothing reads the small buffer: what the framebuffer
++   *        is made of is asked here, never of it (CDRMUtils::FramePackedBufferUsable(),
++   *        DescribeFramePackedBuffer(), DrmOpaqueFbGetFromBo()).
++   */
++  struct Own
++  {
++    uint32_t handle{0}; //!< of the dumb buffer, on the DRM file of the GBM device
++    uint32_t width{0};
++    uint32_t height{0};
++    uint32_t pitch{0};
++    uint64_t modifier{0};
++  };
++  std::optional<Own> own;
++};
++
++//! \brief Hades: what the framebuffer of a buffer of GBM is made of, where that is not the buffer
++//!        itself (drm_fb::own); nothing for any other buffer, or one that has no framebuffer yet
++inline const drm_fb::Own* OwnFramebufferOf(struct gbm_bo* bo)
++{
++  const auto* fb = bo ? static_cast<const drm_fb*>(gbm_bo_get_user_data(bo)) : nullptr;
++  return fb && fb->own ? &*fb->own : nullptr;
++}
++
++} // namespace GBM
++} // namespace WINDOWING
++} // namespace KODI
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.cpp b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+index 8d8c695..28a2b4f 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.cpp
++++ b/xbmc/windowing/gbm/drm/DRMUtils.cpp
+@@ -520,6 +520,23 @@ uint32_t CDRMUtils::DrmOpaqueFbGetFromBo(struct gbm_bo* bo)
+   // extra pixel storage. Never let scanout alpha blend a packed DV transport.
+   uint32_t handles[4]{}, strides[4]{}, offsets[4]{};
+   uint64_t modifiers[4]{};
++  // Hades: a framebuffer made of a dumb buffer of the driver (drm_fb::own): the view of that buffer,
++  // never of the small buffer of GBM that stands for it in Kodi's queue
++  if (const drm_fb::Own* own = OwnFramebufferOf(bo))
++  {
++    handles[0] = own->handle;
++    strides[0] = own->pitch;
++    modifiers[0] = own->modifier;
++    if (drmModeAddFB2WithModifiers(m_fd, own->width, own->height, DRM_FORMAT_XRGB8888, handles,
++                                   strides, offsets, modifiers, &fb->opaque_fb_id,
++                                   DRM_MODE_FB_MODIFIERS) != 0)
++    {
++      fb->opaque_fb_id = 0;
++      CLog::LogF(LOGERROR, "Cannot create opaque transport framebuffer of a dumb buffer: {}",
++                 strerror(errno));
++    }
++    return fb->opaque_fb_id;
++  }
+ #if defined(HAS_GBM_MODIFIERS)
+   const int planes = gbm_bo_get_plane_count(bo);
+   if (planes < 1 || planes > 4)
+@@ -2226,6 +2243,26 @@ bool CDRMUtils::FramePackedBufferUsable(struct gbm_bo* bo, std::string& wrong) c
+     return false;
+   }
+ 
++  // Hades: a dumb buffer of the driver, which the buffer of GBM only stands for (drm_fb::own): what
++  // its framebuffer was made of
++  if (const drm_fb::Own* own = OwnFramebufferOf(bo))
++  {
++    if (own->modifier != DRM_FORMAT_MOD_LINEAR)
++      wrong = StringUtils::Format("its framebuffer was made with the modifier {}, not "
++                                  "DRM_FORMAT_MOD_LINEAR",
++                                  DRMHELPERS::ModifierToString(own->modifier));
++    else if (!STEREO::SecondEyeAligned(own->pitch, StereoModeOf(*m_mode),
++                                       STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT))
++      wrong = StringUtils::Format("with its pitch of {} bytes the second eye begins at byte {}, "
++                                  "which is no multiple of {}",
++                                  own->pitch, static_cast<uint64_t>(own->pitch) * m_mode->vtotal,
++                                  STEREO::NVKMS_SURFACE_OFFSET_ALIGNMENT);
++    else if (own->width < m_mode->hdisplay || own->height < ScanoutHeight())
++      wrong = StringUtils::Format("it is {}x{}, smaller than the frame of {}x{}", own->width,
++                                  own->height, m_mode->hdisplay, ScanoutHeight());
++    return wrong.empty();
++  }
++
+ #if defined(HAS_GBM_MODIFIERS)
+   const uint64_t modifier = gbm_bo_get_modifier(bo);
+   const uint32_t pitch = gbm_bo_get_stride_for_plane(bo, 0);
+@@ -2255,6 +2292,16 @@ std::string CDRMUtils::DescribeFramePackedBuffer(struct gbm_bo* bo) const
+ {
+   if (!bo || !FramePackedByOffsets())
+     return {};
++  // Hades: a dumb buffer of the driver (drm_fb::own), as its framebuffer was made
++  if (const drm_fb::Own* own = OwnFramebufferOf(bo))
++    return StringUtils::Format(
++        "a dumb buffer of {}x{} ({}), pitch {} bytes, modifier {}, the second eye from line {} "
++        "(byte {}), for a mode of {}x{} with {} lines in all",
++        own->width, own->height,
++        DRMHELPERS::FourCCToString(static_cast<const drm_fb*>(gbm_bo_get_user_data(bo))->format),
++        own->pitch, DRMHELPERS::ModifierToString(own->modifier), m_mode->vtotal,
++        static_cast<uint64_t>(own->pitch) * m_mode->vtotal, m_mode->hdisplay, m_mode->vdisplay,
++        ScanoutHeight());
+ #if defined(HAS_GBM_MODIFIERS)
+   const uint32_t pitch = gbm_bo_get_stride_for_plane(bo, 0);
+   return StringUtils::Format(
+diff --git a/xbmc/windowing/gbm/drm/DRMUtils.h b/xbmc/windowing/gbm/drm/DRMUtils.h
+index 210be6d..2d60708 100644
+--- a/xbmc/windowing/gbm/drm/DRMUtils.h
++++ b/xbmc/windowing/gbm/drm/DRMUtils.h
+@@ -11,6 +11,7 @@
+ #include "DRMConnector.h"
+ #include "DRMCrtc.h"
+ #include "DRMEncoder.h"
++#include "DRMFramebuffer.h"
+ #include "DRMOutputChoice.h"
+ #include "DRMPlane.h"
+ #include "DRMSoundOutputs.h"
+@@ -46,14 +47,6 @@ constexpr const char* SETTING_VIDEOSCREEN_COLORRANGE = "videoscreen.colorrange";
+ // amdgpu drm driver needs at least 1 primary plane to active when doing a modeset
+ inline constexpr int QUIRK_NEEDSPRIMARY = 1 << 0;
+ 
+-struct drm_fb
+-{
+-  struct gbm_bo* bo = nullptr;
+-  uint32_t fb_id;
+-  uint32_t format;
+-  uint32_t opaque_fb_id = 0;
+-};
+-
+ struct outputformat
+ {
+   uint32_t drm;
+-- 
+2.53.0
+

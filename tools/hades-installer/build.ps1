@@ -16,9 +16,9 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path -LiteralPath $csc)) { throw "The C# compiler of Windows was not found: $csc" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 $product = 'AssemblyInfo.cs', 'Model.cs', 'Image.cs', 'BootMenus.cs', 'Diagnostics.cs', 'Disks.cs', 'SecureBoot.cs', 'Ext4.cs', 'Fat.cs',
-           'SecureJob.cs', 'Operations.cs', 'Ui.cs', 'Window.cs', 'FirmwareBoot.cs', 'Program.cs'
+           'SecureJob.cs', 'Operations.cs', 'Ui.cs', 'Signature.cs', 'Window.cs', 'FirmwareBoot.cs', 'Program.cs'
 $tests = 'TestVectors.cs', 'SecureBootTests.cs', 'SecureBootCapture.cs', 'SecureBootVhd.cs', 'Tests.cs', 'BootTests.cs', 'VhdTest.cs',
-         'FirmwareBootTests.cs'
+         'FirmwareBootTests.cs', 'SignatureTests.cs'
 # The sources are UTF-8 without a byte order mark: /codepage says so, or the accents and quotes of the texts
 # would depend on what the compiler guesses.
 # There is no /deterministic: the compiler that Windows brings is the one of C# 5 (.NET Framework 4), which does
@@ -31,7 +31,7 @@ function Build-Installer([string]$name, [string[]]$files, [string[]]$extra)
   & $csc /nologo /target:winexe /platform:anycpu /optimize+ /warn:4 /warnaserror+ /codepage:65001 @extra `
     "/win32manifest:$(Join-Path $PSScriptRoot 'app.manifest')" "/win32icon:$(Join-Path $PSScriptRoot 'app.ico')" `
     "/resource:$(Join-Path $PSScriptRoot 'app.ico'),Hades.Installer.app.ico" "/out:$exe" `
-    /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll $sources | Out-Host
+    /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll /r:System.Numerics.dll $sources | Out-Host
   if ($LASTEXITCODE -ne 0) { throw "The build of $name failed ($LASTEXITCODE)" }
   $exe
 }
@@ -46,10 +46,10 @@ $bytes = [System.IO.File]::ReadAllBytes($published)
 $text = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
 $wide = [System.Text.Encoding]::Unicode.GetString($bytes, 0, $bytes.Length - ($bytes.Length % 2)) +
         [System.Text.Encoding]::Unicode.GetString($bytes, 1, ($bytes.Length - 1) - (($bytes.Length - 1) % 2))
-$words = @("PRIVATE KEY-----`nMII", 'H4sI', 'SbVectors', 'SelfTest', 'VhdTest', 'FakeFirmware', 'TestKeyPem', 'Ext4Small', 'Ext4Big')
+$words = @("PRIVATE KEY-----`nMII", 'H4sI', 'SbVectors', 'SelfTest', 'VhdTest', 'FakeFirmware', 'TestKeyPem', 'Ext4Small', 'Ext4Big', 'SignatureVectors')
 $vectors = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'TestVectors.cs'))
 foreach ($m in [regex]::Matches($vectors, '"([^"]{64,})"')) { $words += [regex]::Match($m.Groups[1].Value, '(?<!\\)[A-Za-z0-9+/=]{40}').Value }
-if ($words.Count -lt 18) { throw "TestVectors.cs gave $($words.Count - 9) values to look for, not the 9 or more that it has" }
+if ($words.Count -lt 19) { throw "TestVectors.cs gave $($words.Count - 10) values to look for, not the 9 or more that it has" }
 foreach ($word in $words)
 {
   if ($word.Length -eq 0 -or $text.Contains($word) -or $wide.Contains($word)) { throw "The published program carries '$word', which belongs to the tests" }

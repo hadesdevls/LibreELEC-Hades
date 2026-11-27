@@ -459,6 +459,34 @@ static void lockdown_state(char *buf, size_t size)
 	fclose(f);
 }
 
+/*
+ * Where the kernel took the CRC of the tunnel on AMD DCE (output-check.h, linux-9889): the last record of the kernel
+ * log that says it, read once the measure is over. OC_POINT_UNKNOWN where none says it.
+ */
+static enum oc_point crc_point = OC_POINT_UNKNOWN;
+
+static enum oc_point crc_point_from_kernel_log(void)
+{
+	enum oc_point p = OC_POINT_UNKNOWN;
+	char rec[2048];
+	ssize_t n;
+	int fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+
+	if (fd < 0)
+		return p;
+	for (;;) {
+		n = read(fd, rec, sizeof(rec) - 1);
+		if (n < 0 && errno == EPIPE)
+			continue;	/* records overwritten while reading: go on with the next */
+		if (n <= 0)
+			break;		/* EAGAIN: the end of the log */
+		rec[n] = '\0';
+		p = oc_crc_point_line(rec, p);
+	}
+	close(fd);
+	return p;
+}
+
 /* Whether amdgpu was loaded with dvbridge_dce=1 */
 static bool amdgpu_dce_on(void)
 {
@@ -1123,9 +1151,13 @@ static void steps_text(const struct oc_result *res, unsigned int values)
 	case OC_FIT_NONE:
 		return;
 	case OC_FIT_WIDENING_12:
-		fit = "a widening of each 8-bit component to 12 bits by scaling, in the pipe before the CRC: the 8 bits "
-		      "that a formatter after the CRC keeps would be those drawn (on AMD DCE the CRC is taken before "
-		      "the formatter); not a change of those 8 bits by a curve, a gain or a range";
+		if (crc_point == OC_POINT_DCE_FORMATTER)
+			fit = "values that a widening keeps linear went through, others did not; the CRC was taken "
+			      "after the formatter, so the bytes that go to the HDMI encoder change";
+		else
+			fit = "a widening of each 8-bit component to 12 bits by scaling, in the pipe before the CRC: the "
+			      "8 bits that a formatter after the CRC keeps would be those drawn (on AMD DCE the CRC is "
+			      "taken before the formatter); not a change of those 8 bits by a curve, a gain or a range";
 		break;
 	case OC_FIT_WIDENING_10:
 		fit = "a widening of each 8-bit component to 10 bits by scaling, or a range conversion (16 to 235)";
@@ -1168,6 +1200,12 @@ static void verdict_text(const struct oc_result *res, const struct run *r)
 			if (res->lost_bits & (1u << (8 * c + b)))
 				ll += (size_t)snprintf(lost + ll, sizeof(lost) - ll, "%sbit %u of %s", ll ? ", " : "", b,
 						       oc_channel_name(c));
+	if (crc_point == OC_POINT_DCE_FORMATTER)
+		say("where the CRC is taken: after the formatter, the last stage of the display pipe before the HDMI "
+		    "encoder (the formatter's own CRC)\n");
+	else if (crc_point == OC_POINT_DCE_CRTC)
+		say("where the CRC is taken: in the CRTC, before the formatter (amdgpu.dvbridge_dce_crc=0): what the "
+		    "formatter does is not measured\n");
 	say("pictures: %u shown, each held for two frames or more (CRC entries a frame %d after the flip; %u "
 	    "entries came later than expected)\n",
 	    r->pictures, r->offset, r->skipped);
@@ -1200,7 +1238,7 @@ static void verdict_text(const struct oc_result *res, const struct run *r)
 			       "the display pipe does not pass the bytes through as they are (a dither in time, "
 			       "for example): a Dolby Vision display cannot read its metadata from them, and shows "
 			       "black or wrong colours.");
-		else if (res->fit == OC_FIT_WIDENING_12)
+		else if (res->fit == OC_FIT_WIDENING_12 && crc_point != OC_POINT_DCE_FORMATTER)
 			/* still "not-exact" for Kodi: Dolby Vision stays converted to HDR10 on this output */
 			finish("not-exact", reason,
 			       "the card's CRC saw the test pictures changed, in a way that fits only a widening of each "
@@ -1572,6 +1610,7 @@ next:
 		say_crc("Z at the end", &r.m.z_end, r.values);
 		say_crc("Zs of k * 0x11", &r.m.step_z[OC_SET_0X11], r.values);
 		say_crc("Zs of k * 0x55", &r.m.step_z[OC_SET_0X55], r.values);
+		crc_point = crc_point_from_kernel_log();
 		verdict_text(&res, &r);
 	}
 	for (i = 0; i < BUFFERS; i++)

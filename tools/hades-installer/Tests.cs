@@ -440,6 +440,8 @@ namespace Hades.Installer
                 File.WriteAllBytes(raw, img);
                 Check("the hash in the .sha256 file is compared with that of the image, and a changed image does not match",
                       match && Engine.FileHash(raw, null, null) != Engine.ExpectedHash(raw) && Engine.ExpectedHash(packed) == null);
+                // whether an image is the one that LibreELEC Hades published: SHA256SUMS signed (SignatureTests.cs)
+                Signatures(directory);
 
                 // A partition that a program does not let go of. The program that serves the files of Windows
                 // to WSL is told from the others that Windows starts in the same way; and the question that is
@@ -1807,6 +1809,9 @@ namespace Hades.Installer
                 File.Delete(on);
                 File.Delete(on + ".sha256");
             }
+            // an image with its signed list: verified (with the key of the tests trusted), and the same list with the keys of
+            // the publisher (it does not match); and the question before an image that is not signed
+            CaptureSignatures(directory, stick);
             using (var form = new MainForm(image))
             {
                 form.Show();

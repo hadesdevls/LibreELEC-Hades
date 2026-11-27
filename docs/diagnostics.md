@@ -41,6 +41,7 @@ On the running system the folder is `/flash/hades-diag`; Kodi's file manager rea
 - the newest crash log of Kodi;
 - `io-timeline.txt`, while the diagnostics are on;
 - what the firmware offers for sleep, how the last sleeps went and what may wake the PC;
+- the network: the Wi-Fi link (its band and signal, and the rates it sends and receives at) and the wireless regulatory domain, which decides the bands that Linux may use;
 - `saved/`: the folders of the starts that the diagnostics saved, the newest first, 16 MB at most;
 - at its top, the settings that make the picture differ from what the film carries, and the answers of the A/B comparison of *Check this setup*, kept with the name of the TV;
 - `filter.txt` and `report.txt`: what is in it, and what was left out and why.
@@ -55,6 +56,8 @@ Where the bytes change, the report says where: for each value of the card's CRC 
 
 Where the card's CRC is taken matters. On AMD graphics with DCE (Radeon RX 400, RX 500 and Vega) it is taken inside the display pipe, before the formatter that brings each colour back to the 8 bits that leave the card, so it sees each colour at 12 bits. A pipe that widens 8 bits to 12 by scaling changes the low bits that the formatter then drops, and the measure finds it although the 8 bits are kept. The check therefore also measures two sets of test pictures whose colours take only the values that any widening keeps intact (k x 0x11 and k x 0x55), and the report says what a change fits: a widening to 12 bits (the 8 bits kept), a widening to 10 bits or a range conversion, or a change of the 8 bits themselves (a curve or a gain); the kernel log gets `hades-output-check: fits: ...`. It is a fit, not a proof, and it does not change the result: an output found not exact stays without native Dolby Vision.
 
+Since 1.2.3 the kernel takes that CRC from the formatter itself on these cards, once the Dolby Vision path is on: after the last stage that can change a colour, on the 8 bits that go to the HDMI encoder. The report then says `where the CRC is taken: after the formatter`, and a change it finds is a change of the bytes that leave the card; the fit above no longer decides anything there. The kernel log says where it took it each time (`Dolby Vision tunnel, DCE: its CRC is taken ...`), and `amdgpu.dvbridge_dce_crc=0` takes it before the formatter again, as up to 1.2.2 ([settings](settings.md#outside-the-settings-screens)). The kernel log of the Dolby Vision path on these cards also has a second line, `stages up to the HDMI encoder`, with each stage that the path sets (what it found, what it set and what reads back) and each one it only reads.
+
 ## From a system on an internal disk
 
 Windows does not show the boot partition of a system installed on a disk inside the PC. There are two ways to copy the diagnostics to a USB drive that Windows can read (FAT32, exFAT or NTFS):
@@ -65,6 +68,10 @@ Windows does not show the boot partition of a system installed on a disk inside 
 Either way the copy goes into the folder `hades-diag` of the drive, in a folder named after the date and time, with the sums of its files in `SHA256SUMS.txt`. It is read back from the drive, file by file, before it counts as done, and nothing on the drive is written over.
 
 A folder that an earlier version wrote before its filter took the names of Bluetooth devices, or the names in the paths of drives and shares, out is put through the filter again at the next start with the switch on, and is left out of a copy until then.
+
+## When a start cannot find its boot partition
+
+If a start stops at `Could not mount ...` and a debug shell, the screen shows first how long it waited, what the boot entry asked for, the disks, file systems, USB controllers and USB devices that the kernel sees, the IOMMU faults and USB errors in its log, and what to try. A photo of that screen is a report. On *Run*, a start that does not find its drive with DMA translation on takes the USB controllers out of it for that start, looks again, and says so on the screen.
 
 ## When a display shows nothing
 
@@ -186,7 +193,7 @@ Kodi's log is `/storage/.kodi/temp/kodi.log`; the diagnostics keep its end, and 
 | `Video frame: .../videoNNNNN.png saved, WxH, the video's own size, the video alone (...): <how>; N ms on the thread that draws; coded in ...` | A frame of the video saved (Shift+Print Screen): its size, and whether it is the video's own; how it was taken (the picture of Kodi's renderer before its scaler, drawn again at its own size, or read where it is drawn, from the picture of native Dolby Vision before it is packed); how long it held the thread that draws; and its coding (PQ or HLG with its SDR copy in the line before, or SDR). `read at the size it is shown, not its own (WxH): ...` says why it is not at its own size |
 | `Video frame: nothing saved: ...` | Why no frame of the video was saved: no video drawn, a picture zoomed past the edges of the screen or stretched, a video on a plane of the display that gives no picture, or the file that could not be written |
 | `CDVDDemuxFFmpeg::AddStream - stream N: H.264 with a second view (MVC), declared by ...` | Which form a file uses to declare the second view of a 3D video, and whether both views are decoded or why not |
-| `3D output: ...` | On NVIDIA, the buffer of a frame-packed frame, its 8-bit window, and the vendor InfoFrame taken away with a 3D mode. The kernel log says why the driver refused frame packing (`Hades: HDMI 3D frame packing refused: ...`) |
+| `3D output: ...` | On NVIDIA, the buffer of a frame-packed frame (the driver's dumb buffers, and whether the graphics draw into them or the processor copies each picture, with what the copy costs after 240 frames), its 8-bit window, and the vendor InfoFrame taken away with a 3D mode. The kernel log says why the driver refused frame packing (`Hades: HDMI 3D frame packing refused: ...`) |
 | `3D (...): the video under the GUI composited into ... is drawn in the view of each eye shown ...` | An HDR video in a 3D output: each eye gets its own half or view, with the interface over the whole frame |
 | `CEC: the connection to the adapter ... is open: the keys of the TV's remote are taken from now on ...` | The keys of the TV remote are taken from the start; a later line says when the TV answered that it is on. `CEC: nothing answers on the line of the adapter ...` says that a line is left alone, and is asked again every 30 seconds |
 | `BootOption: ... names i915.pcon_hd_audio (HADES_BOOT_OPTION): the setting "audiooutput.hadespconaudio" is offered` | A DisplayPort to HDMI converter (a USB-C hub or adapter) is behind a port of Intel graphics, and *Surround sound through this USB-C adapter or hub* is shown. The kernel log names the converter (`HADES_BOOT_OPTION i915.pcon_hd_audio: a DisplayPort to HDMI converter is behind this port ...`) |

@@ -46,6 +46,13 @@
  * depth 36 bpp), before the formatter brings it back to the 8 bits that leave the card; nothing that the
  * formatter does is measured. i915 and xe take it at the end of the pipe.
  *
+ * Since LibreELEC Hades 1.2.3 (linux-9889, issue #20) the kernel takes the CRC of a Dolby Vision tunnel on DCE 11.2
+ * and 12 from the formatter itself (FMT_CRC_CNTL and its signatures): after its truncation, dither, clamp and
+ * subsampling, the last stage that can change a component before the HDMI encoder, on the 8 bits that leave. Its
+ * log says where it took it each time the CRC is set for a tunnel (oc_crc_point_line()); the report says it, and
+ * the widening below no longer applies there: a change found after the formatter is a change of the bytes that go
+ * to the encoder. amdgpu.dvbridge_dce_crc=0 takes it in the CRTC again, as up to 1.2.2.
+ *
  * Widening (issue #20, an RX 550 whose CRC broke the relation in each component alone). A pipe that carries
  * each 8-bit component at 12 bits widens it: by appending zeros (linear), by repeating its high bits (linear),
  * or by scaling it, v * 4095 / 255 rounded (not linear: the bits added depend on the value by arithmetic).
@@ -172,6 +179,18 @@ struct oc_result {
 };
 
 void oc_analyse(const struct oc_measure *m, struct oc_result *r);
+
+/*
+ * Where amdgpu took the CRC of a Dolby Vision tunnel on DCE (linux-9889): one record of the kernel log read, what it
+ * says of that, or before when it says nothing of it. The last such record of the log counts.
+ */
+enum oc_point {
+	OC_POINT_UNKNOWN,	/* the log says nothing: DCN, Intel, or a kernel before 1.2.3 */
+	OC_POINT_DCE_CRTC,	/* in the CRTC, before the formatter (amdgpu.dvbridge_dce_crc=0) */
+	OC_POINT_DCE_FORMATTER,	/* the formatter's own CRC, after it and before the HDMI encoder */
+};
+
+enum oc_point oc_crc_point_line(const char *line, enum oc_point before);
 
 /* The names of the components, for the report */
 const char *oc_channel_name(unsigned int channel);

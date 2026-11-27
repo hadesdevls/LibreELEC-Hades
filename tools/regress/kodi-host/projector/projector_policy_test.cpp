@@ -46,9 +46,11 @@ Shape Unknown(double ratio, unsigned int video = 1)
 }
 
 //! the lens fed a shape every 0.1 s from t0 to t1 (playing), the memory at the end and the times it changed
+//! (Hades 1.2.3: and the anamorphic mode at the end)
 struct Run
 {
   int memory = 0;
+  int anamorphic = NO_ANAMORPHIC;
   int changes = 0;
   double lastChange = -1.0;
 };
@@ -64,8 +66,19 @@ Run Feed(CLensFollow& f, double t0, double t1, const Shape& shape, const LensSet
       r.lastChange = t;
     }
     r.memory = w.memory;
+    r.anamorphic = w.anamorphic;
   }
   return r;
+}
+
+//! Hades 1.2.3: the kinds that a signal follower takes, fed a kind every 0.5 s from t0 to t1
+std::string Taken(CSignalFollow& f, double t0, double t1, Signal kind)
+{
+  std::string taken;
+  for (double t = t0; t < t1 - 1e-9; t += 0.5)
+    if (const Signal k = f.Update(t, kind); k != Signal::NONE)
+      taken += std::string(taken.empty() ? "" : ",") + SignalName(k);
+  return taken;
 }
 } // namespace
 
@@ -211,6 +224,137 @@ int main()
           "no signal known: nothing changes");
   }
 
+  // ---- Hades 1.2.3: the anamorphic mode of a JVC for each class, with its lens memory
+  {
+    CLensFollow f;
+    Run r = Feed(f, 0.0, 30.0, Known(2.39), s);
+    Check(r.anamorphic == NO_ANAMORPHIC && r.memory == 2, "by default no anamorphic mode is ever wanted (as before)");
+    LensSettings a = s;
+    a.narrowAnamorphic = 0; // Off
+    a.wideAnamorphic = 1; // A
+    CLensFollow g;
+    r = Feed(g, 0.0, 2.5, Known(2.39), a);
+    Check(r.memory == 2 && r.anamorphic == 1 && r.changes == 1 && std::abs(r.lastChange - 2.0) < 0.15,
+          "a scope film: memory 2 and anamorphic A together, at 2 s, one change");
+    r = Feed(g, 2.5, 8.0, Shape{}, a, false);
+    Check(r.memory == 1 && r.anamorphic == 0 && r.changes == 1, "at its end: memory 1 and anamorphic Off together");
+    LensSettings b = a;
+    b.wideAnamorphic = 3; // C, changed during a film
+    CLensFollow h;
+    Feed(h, 0.0, 5.0, Known(2.39), a);
+    r = Feed(h, 5.0, 16.0, Known(2.39), b);
+    Check(r.anamorphic == 3 && r.memory == 2 && r.changes == 1 && std::abs(r.lastChange - 15.0) < 0.15,
+          "the anamorphic mode of the class changed in the settings during a film is taken after the hold, as a "
+          "memory changed is (the memory as it was)");
+    LensSettings only = a;
+    only.narrowMemory = 0; // a lens that stays in place: no memory, only the anamorphic mode
+    only.wideMemory = 0;
+    only.narrowAnamorphic = 2; // B, a 16:9 picture compressed for the lens
+    CLensFollow k;
+    r = Feed(k, 0.0, 2.5, Known(2.39), only);
+    Check(r.memory == 0 && r.anamorphic == 1 && r.changes == 1, "no lens memory: anamorphic A alone for a scope film");
+    r = Feed(k, 2.5, 20.0, Known(1.78), only);
+    Check(r.memory == 0 && r.anamorphic == 2 && std::abs(r.lastChange - 12.5) < 0.15,
+          "... and B for a 16:9 picture after the hold, no memory ever wanted");
+    LensSettings keep = a;
+    keep.backAtStop = false;
+    CLensFollow m;
+    Feed(m, 0.0, 5.0, Known(2.39), keep);
+    r = Feed(m, 5.0, 20.0, Shape{}, keep, false);
+    Check(r.anamorphic == 1 && r.changes == 0, "with the setting off, the anamorphic mode stays at the end too");
+    LensSettings third = s;
+    third.widestAnamorphic = 1; // no third memory, an anamorphic mode for the widest
+    third.widestFrom = 2.50;
+    Check(ClassOf(2.76, third, -1) == 2 && MemoryOfClass(2, third) == 0 && AnamorphicOfClass(2, third) == 1,
+          "the widest pictures are a class of their own with an anamorphic mode and no memory");
+    Check(ClassOf(2.76, s, -1) == 1, "... and without either, the wide class as before");
+  }
+
+  // ---- Hades 1.2.3: the kinds of signal of the menus and of SDR in a wide gamut, each where the user gave it a mode
+  Check(KindOf(Signal::SDR, false, 0, false, false, false) == Signal::SDR &&
+            KindOf(Signal::SDR, true, 1, false, false, false) == Signal::SDR &&
+            KindOf(Signal::SDR, true, 2, false, false, false) == Signal::SDR,
+        "with every mode at As for SDR video, the menus and SDR in BT.2020 and DCI-P3 are SDR (as before)");
+  Check(KindOf(Signal::SDR, false, 1, true, true, true) == Signal::MENUS, "no video plays: the menus");
+  Check(KindOf(Signal::SDR, true, 0, true, true, true) == Signal::SDR, "an SDR video in BT.709: SDR");
+  Check(KindOf(Signal::SDR, true, 1, true, true, true) == Signal::SDR_BT2020, "an SDR picture in BT.2020: SDR in BT.2020");
+  Check(KindOf(Signal::SDR, true, 2, true, true, true) == Signal::SDR_P3, "an SDR picture in DCI-P3: SDR in DCI-P3");
+  Check(KindOf(Signal::SDR, true, 2, true, true, false) == Signal::SDR, "DCI-P3 without a mode of its own: SDR, not BT.2020");
+  Check(KindOf(Signal::HDR10, false, 1, true, true, true) == Signal::HDR10 &&
+            KindOf(Signal::DOLBY_VISION, true, 1, true, true, true) == Signal::DOLBY_VISION &&
+            KindOf(Signal::THREE_D, true, 1, true, true, true) == Signal::THREE_D &&
+            KindOf(Signal::NONE, false, 0, true, true, true) == Signal::NONE,
+        "HDR, Dolby Vision, 3D and no signal are as they are (menus in HDR stay HDR)");
+  {
+    // the menus, an HDR film mapped to SDR in BT.2020, paused (still a video), the next of a playlist 1 s later, the menus
+    CSignalFollow f;
+    const auto kind = [](bool video, int gamut) { return KindOf(Signal::SDR, video, gamut, true, true, false); };
+    std::string got = Taken(f, 0.0, 5.0, kind(false, 0));
+    got += "/" + Taken(f, 5.0, 20.0, kind(true, 1));
+    got += "/" + Taken(f, 20.0, 21.0, kind(false, 0));
+    got += "/" + Taken(f, 21.0, 40.0, kind(true, 1));
+    got += "/" + Taken(f, 40.0, 50.0, kind(false, 0));
+    Check(got == "SDR of the menus/SDR in BT.2020///SDR of the menus",
+          "menus, a film in SDR BT.2020, 1 s between two films, the menus: each mode once, none between the films (" +
+              got + ")");
+    CSignalFollow g;
+    const auto plain = [](bool video, int gamut) { return KindOf(Signal::SDR, video, gamut, false, false, false); };
+    // (one call after the other: the operands of a + are evaluated in no set order)
+    got = Taken(g, 0.0, 5.0, plain(false, 0));
+    got += "/" + Taken(g, 5.0, 20.0, plain(true, 1));
+    got += "/" + Taken(g, 20.0, 30.0, plain(false, 0));
+    Check(got == "SDR//", "with the defaults, SDR once and nothing when a film starts or ends (" + got + ")");
+  }
+
+  // ---- Hades 1.2.3: the player controls inside the picture of a scope film
+  {
+    LensWanted w;
+    w.shapeClass = 1;
+    w.memory = 2;
+    Check(ShowsScope(w), "the wide class with a lens memory: the projector shows scope");
+    w.memory = 0;
+    w.anamorphic = 1;
+    Check(ShowsScope(w), "the wide class with anamorphic A and no memory: scope");
+    w.anamorphic = 0;
+    Check(!ShowsScope(w), "the wide class with neither (anamorphic Off): not scope");
+    LensWanted n;
+    n.shapeClass = 0;
+    n.memory = 1;
+    n.anamorphic = 2;
+    Check(!ShowsScope(n), "the class of narrower pictures: not scope");
+    Check(!ShowsScope(LensWanted{}), "nothing taken: not scope");
+    const int OFF = static_cast<int>(OsdSafe::OFF), SCOPE = static_cast<int>(OsdSafe::SCOPE),
+              ALWAYS = static_cast<int>(OsdSafe::ALWAYS);
+    Check(SafeBand(SCOPE, true, true, 2.39) == 2.40 && SafeBand(SCOPE, true, true, 2.20) == 2.40,
+          "a scope picture: a band of 2.40:1 (the narrowest scope screen) for 2.39:1 and 2.20:1");
+    Check(std::abs(SafeBand(SCOPE, true, true, 2.76) - 2.76) < 1e-9, "a wider film: its own band");
+    Check(SafeBand(SCOPE, true, false, 2.39) == 0.0 && SafeBand(SCOPE, false, true, 2.39) == 0.0,
+          "the default: nothing without a scope picture, nothing without a video");
+    Check(SafeBand(OFF, true, true, 2.39) == 0.0, "off: nothing");
+    Check(SafeBand(ALWAYS, true, false, 0.0) == 2.40 && SafeBand(ALWAYS, false, false, 0.0) == 0.0,
+          "always: 2.40:1 while a video plays, with no projector; nothing in the menus");
+    const double inset = InsetOf(2.40, 16.0 / 9.0);
+    Check(std::abs(inset * 1080.0 - 140.0) < 1e-6 && InsetSkinUnits(inset) == 140 && InsetSteps(140) == "_4_8_128_",
+          "2.40:1 in a 16:9 frame: 140 of 1080 above and below, the steps _4_8_128_ (" + InsetSteps(InsetSkinUnits(inset)) +
+              ")");
+    const int wide = InsetSkinUnits(InsetOf(2.76, 16.0 / 9.0));
+    Check(wide == 196 && InsetSteps(wide) == "_4_64_128_", "2.76:1: 192.2 rounded up to 196 (" + std::to_string(wide) + ")");
+    Check(InsetOf(16.0 / 9.0, 16.0 / 9.0) == 0.0 && InsetOf(1.50, 16.0 / 9.0) == 0.0 && InsetSkinUnits(0.0) == 0 &&
+              InsetSteps(0).empty(),
+          "a band not narrower than the frame: nothing, and no steps");
+    Check(InsetSkinUnits(InsetOf(10.0, 16.0 / 9.0)) == 252, "at most the sum of the steps of the skin (252)");
+    // (the band of 2.40:1 on a 3840x2160 view, as CRenderManager narrows the view of the subtitles)
+    Check(std::abs(InsetOf(2.40, 3840.0 / 2160.0) * 2160.0 - 280.0) < 1e-6, "on a 2160 view: 280 rows above and below");
+  }
+
+  // ---- Hades 1.2.3: JVC's anamorphic modes (INVS), and none for the other protocols
+  Check(AnamorphicModesOf(Brand::JVC) == 5 && AnamorphicModesOf(Brand::SONY_ADCP) == 0 &&
+            AnamorphicModesOf(Brand::SONY_SDCP) == 0 && AnamorphicModesOf(Brand::EPSON) == 0,
+        "JVC has Off and A to D; Sony and Epson no anamorphic mode");
+  Check(std::string(AnamorphicName(0)) == "Off" && std::string(AnamorphicName(4)) == "D" &&
+            std::string(AnamorphicName(5)).empty() && std::string(AnamorphicName(-1)).empty(),
+        "the names of the modes as the projector shows them");
+
   // ---- Hades: the wait of the thread of the control: none while it is off (it sleeps until a setting or the test
   // wakes it), 250 ms while it is on
   Check(ControlWaitMs(false) < 0, "while the control is off its thread waits until it is woken, not 4 times a second");
@@ -220,10 +364,12 @@ int main()
   {
     const Timeouts t;
     const int wait = TestWaitMs(t);
-    Check(wait == 106000, "the test is waited for 106 s at most with the timeouts of the protocols (" +
+    // (Hades 1.2.3: a talk now ends with an anamorphic mode after the lens memory: 106 s before)
+    Check(wait == 117000, "the test is waited for 117 s at most with the timeouts of the protocols (" +
                               std::to_string(wait) + " ms)");
-    Check(wait > t.lensMs + t.modeMs + t.connectMs + 2 * t.answerMs,
-          "longer than a talk that waits for a lens that moves, so that the test after it is seen");
+    Check(wait > t.lensMs + 2 * t.modeMs + t.connectMs + 2 * t.answerMs,
+          "longer than a talk that waits for a lens that moves and an anamorphic mode after it, so that the test after "
+          "it is seen");
     Timeouts quick;
     quick.lensMs = 1000;
     Check(TestWaitMs(quick) == wait - 59000, "the wait follows the timeout of a lens");

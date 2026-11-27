@@ -94,7 +94,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 
 - **Filmmaker Mode by itself.** While a video plays, Hades tells the TV over HDMI that it is a film (Game for games), where the TV says it takes that, so a TV with an automatic Filmmaker Mode switches to it for the film and back for the menus, with no black screen of its own. On by default.
 - **A LUT for each display,** an expert choice: the calibration of your display, a 3D LUT (`.cube`, `.3dl` or madVR's `.3dlut`), a 1D LUT (the `.cal` of DisplayCAL and ArgyllCMS, or a 1D `.cube`) or both, one for SDR and one for HDR, applied as the last step of the colour of the video, on SDR videos and on the HDR that Hades maps to the display. Each display keeps its own.
-- **A projector that follows the film,** an option: over the network, the lens memory of a home-cinema projector follows the shape of the picture, for a wide screen with constant image height, and its picture mode follows the signal (SDR, HDR10, HLG, Dolby Vision, 3D). JVC D-ILA, Sony and Epson.
+- **A projector that follows the film,** an option: over the network, the lens memory of a home-cinema projector follows the shape of the picture (on a JVC, its anamorphic mode too), for a wide screen with constant image height, and its picture mode follows the signal (SDR, HDR10, HLG, Dolby Vision, 3D, and the menus apart from SDR video if you like). While it shows a scope film, the player controls and subtitles stay inside the picture. JVC D-ILA, Sony and Epson.
 - **Settings for projectors:** HDR mapped by Hades to a dim screen, and a few questions at the first start that set it up (see [HDR10 and HDR10+](#hdr10-and-hdr10) above and [the settings guide](docs/settings.md#for-projectors-and-displays-that-map-hdr-poorly)).
 
 ### The refresh rate and the picture in time
@@ -107,16 +107,16 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 ### 3D
 
 - **3D Blu-ray video** (H.264 MVC): both views are decoded, and a 3D display is switched to 3D over HDMI, in frame packing where it takes it, or side by side and top and bottom.
-- **3D in MV-HEVC:** the spatial videos of an iPhone or a Vision Pro, and 3D films made for the Vision Pro, in MP4, MOV or Matroska, play in 3D the same way. NVIDIA graphics with driver 620 (Turing and later) decode both views on the card, other graphics on the processor; where the processor cannot keep up, the video goes on in 2D and the player information says why.
+- **3D in MV-HEVC:** the spatial videos of an iPhone or a Vision Pro, and 3D films made for the Vision Pro, in MP4, MOV or Matroska, play in 3D the same way. NVIDIA graphics with driver 620 (Turing and later) decode both views on the card, other graphics on the processor; where the processor cannot keep up, AMD and Intel graphics decode the first view and the processor the second, with the same pictures, and only where that cannot keep up either the video goes on in 2D, and the player information says why.
 - **The depth the video was made with.** A spatial video's own depth correction is applied, so far things sit behind the screen as on the Vision Pro, and a film at 3840x2160 per eye is reduced to each eye of the 3D mode.
 - **Subtitles and menus in front of the picture.** Where a 3D video carries no depth for its subtitles (MV-HEVC, side by side, top and bottom, and Blu-ray remuxes without it), Hades measures how near the picture comes where a subtitle goes and places the subtitle just in front, within a comfortable limit. The menus and the player information open in front of the picture too.
 - **HDR in 3D** shows in both eyes, and a Dolby Vision 3D film (profile 20) plays in 3D, each view rebuilt from its Dolby Vision metadata as HDR10 or SDR, since no display takes Dolby Vision in 3D. Whether a display shows HDR in 3D is decided display by display: SDR until *Check this setup > 3D: HDR* has asked you, then what you saw.
-- **Side by side and top and bottom of a 2160p mode stay at 2160p,** and the display is told of them where its EDID declares them, on NVIDIA at 24 to 30 Hz too.
+- **Side by side and top and bottom of a 2160p mode** go out at 2160p where the display declares 3D there, and at 1080p with the 3D signal where it declares 3D only up to 1080p, so that the TV switches to 3D by itself; on NVIDIA at 24 to 30 Hz too.
 
 ### Sound
 
 - **Dolby Atmos and the HD sound formats passed through untouched:** Dolby TrueHD and Dolby Digital Plus with Atmos, and DTS-HD. Sound that Hades decodes goes out in no more channels and bits than your display says it takes, so that it does not go silent.
-- **The sound follows the display you use,** and an AV receiver on its own output can keep it.
+- **The sound stays on the audio output you chose while its device is there,** also with the picture on another graphics card, and that output stays on for it; otherwise it follows the display you use.
 - **A plan of the speakers** in the player information: which speakers get sound, which ones your TV or receiver declares, and the Atmos objects that a receiver renders to its heights.
 
 ### Add-ons, streams and discs
@@ -128,7 +128,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 ### Easy to set up and to check
 
 - **Your display, set up from what it declares.** At the first start, *Your display* asks only what no display says of itself (whether it is a projector, and how bright, and whether you want HDR or SDR), says what Hades found (the display, a sound bar or receiver in between, the HDMI-CEC remote), and sets the picture to match.
-- **A check of your setup.** *Check this setup* plays test pictures in SDR, HDR10, HLG and Dolby Vision, each speaker in turn and a chime in each sound format, and a frame packing clip on a 3D display; it says what went out, asks what you saw or heard, and switches on the sound formats that you heard.
+- **A check of your setup.** *Check this setup* plays test pictures in SDR, HDR10, HLG and Dolby Vision, each speaker in turn and a chime in each sound format, and, on a 3D display, asks the graphics driver whether it takes frame packing and plays a frame packing clip; it says what went out, asks what you saw or heard, and switches on the sound formats that you heard.
 - **Share my results** gives one line about your setup and the results of the check, for the forum or an issue, without serial numbers or addresses.
 - **Settings in the order of what goes out,** each with help in plain words: *System > Display* goes from Kodi's own settings to HDR, Dolby Vision, projectors and the colour depth, with each setting under the one it depends on.
 
@@ -152,7 +152,7 @@ A Dolby Vision player decodes the film, puts its layers together and sends the p
 
 ## Installing and starting
 
-You need the image file (`LibreELEC-Hades-...img.gz`), from the [releases](https://github.com/hadesdevls/LibreELEC-Hades/releases) of this repository or built yourself. The Windows installer is in the same place and comes with its own README.
+You need the image file (`LibreELEC-Hades-...img.gz`), from the [releases](https://github.com/hadesdevls/LibreELEC-Hades/releases) of this repository or built yourself. The Windows installer is in the same place and comes with its own README. Download `SHA256SUMS` and `SHA256SUMS.sig` of the release with the image and keep them next to it: with them the installer checks that the image is the one I published ([how](docs/updates.md#the-list-of-a-release-sha256sumssig)).
 
 1. **Write the image to a USB drive.** On Windows, run `LibreELEC-Hades-Installer.exe`: it lists your drives with their model, size and serial number, asks you to type a word before it touches anything, and checks what it wrote. Any other program that writes disk images works too. The drive is erased.
 2. **Start the PC from the drive.** Restart the PC, open the firmware's boot menu (F8, F11, F12 or Esc on most PCs) and choose the USB drive.
@@ -215,6 +215,8 @@ Your settings, add-ons and the diagnostics folder are kept whichever way you upd
 
 **How Hades checks a new version.** It looks on GitHub every six hours while nothing plays. It takes a version only when it is signed with the key of LibreELEC Hades, which is not on GitHub, is newer than the one you run, and arrives whole and unchanged. Anything else is refused, and nothing of it is kept. Looking sends nothing about your system: no identifier, no hardware, no version. [How it works](docs/how-it-works.md#updates-from-the-system-itself).
 
+**How updates are kept safe**, including a file that you copy by hand: [docs/updates.md](docs/updates.md).
+
 **Your choices,** in *Settings > LibreELEC > Updates*:
 
 - *Automatic Updates* on "manual", the default: Hades tells you, and installs only after your yes.
@@ -228,6 +230,8 @@ Your settings, add-ons and the diagnostics folder are kept whichever way you upd
   1. In *Settings > LibreELEC > Services* turn Samba on. A window shows the name of the system, the user (`libreelec`) and the password that Hades generates for it; the same page keeps them if you need them again.
   2. On your computer open `\\<name of the system>\Update` (Windows) or `smb://<name of the system>/Update` (Mac, Linux), and sign in with that user and password.
   3. Copy the `.tar` file there and restart the system.
+
+  On 1.2.3 and later, a `.tar` that LibreELEC Hades cannot confirm as signed is installed only after you say yes on the TV. To skip the question, copy the release's `hades-manifest.json` and `hades-manifest.json.sig` with it, or just let the system reach GitHub: it recognises the newest release by itself.
 - **SSH is a separate switch.** While root still has LibreELEC's default password, SSH only accepts keys: set a password first (the first-run wizard asks for it when you turn SSH on) if you want to log in with one.
 
 Hades never contacts LibreELEC's update server, because an official LibreELEC update would remove Dolby Vision. Its versions are published at https://github.com/hadesdevls/LibreELEC-Hades/releases.
@@ -243,7 +247,7 @@ Nothing from LibreELEC is removed. LibreELEC is made for a box that does nothing
 - **To show the internal disks by default,** turn on *Settings > LibreELEC > System > Internal disks > Show the internal disks (read-only)*. It is off, and it explains what it means before it is turned on: shown disks can be read by everything that runs in Kodi, add-ons included; "read-only" is how they are mounted, not a lock; and that entry starts the kernel without lock-down. Choosing "Run" once in the boot menu, a reset to defaults or an update with the installer turns it off again.
 - **To show only some of them,** *Internal disks that are shown* keeps the NVMe and SATA disks that you untick (the one of Windows, a disk of personal files) away from the kernel. Disks are told by their model and serial number; one that cannot be told apart is kept away too while any is, and so is every disk if the list cannot be read. *Internal partitions that are shown* keeps the partitions that you untick from being mounted. A partition that is not mounted is still on its disk, where a program with full rights could read it.
 - **Kernel lock-down.** The entries that hide the disks start the kernel in "integrity" lock-down, and a start that keeps internal disks away locks it down before the system starts: it loads only the modules signed for that build.
-- **Devices keep to their own memory.** "Run" and "Live" start the kernel with DMA translation: where the PC has an IOMMU, a network card, a USB controller or the graphics card can use only the memory that the kernel gives it, so a device whose firmware was replaced cannot read the rest. On Intel, the integrated graphics are left out, as Debian does. "Run (internal disks read-only)" starts devices as LibreELEC does, and is the way back if a device misbehaves.
+- **Devices keep to their own memory.** "Run" and "Live" start the kernel with DMA translation: where the PC has an IOMMU, a network card, a USB controller or the graphics card can use only the memory that the kernel gives it, so a device whose firmware was replaced cannot read the rest. On Intel, the integrated graphics are left out, as Debian does. "Run (internal disks read-only)" starts devices as LibreELEC does, and is the way back if a device misbehaves. If the USB drive of the system is not found with DMA translation, the USB controllers go without it for that start, and the screen says so.
 - **The installer entry** of the boot menu is there, but Hades starts in "Run".
 
 ### Network and logins
@@ -257,7 +261,7 @@ Nothing from LibreELEC is removed. LibreELEC is made for a box that does nothing
 
 ### Updates and privacy
 
-- **Updates** come only from LibreELEC Hades on GitHub, signed, and never from LibreELEC's update server ([Updating](#updating)). Hades tells you of a new version and installs it after your yes ("manual", the default); "auto" downloads it by itself. Looking sends nothing about your system: no identifier, no hardware, no version. Update files that are not Hades are refused.
+- **Updates** come only from LibreELEC Hades on GitHub, signed, and never from LibreELEC's update server ([Updating](#updating)). Hades tells you of a new version and installs it after your yes ("manual", the default); "auto" downloads it by itself. Looking sends nothing about your system: no identifier, no hardware, no version. Update files that are not Hades are refused, and one copied by hand that is not signed is installed only after a yes on the screen (*Ask before installing an update placed by hand* turned off installs any, as LibreELEC does).
 - **No usage statistics** are sent by default.
 
 ### The rest

@@ -1,0 +1,1362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hades <15710513+hadesdevls@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:08:01 +0000
+Subject: [PATCH] avcodec/hevc: decode the base layer of a multilayer stream
+ with a separate decoder
+
+When more than one layer is decoded (MV-HEVC), the new option
+base_layer_decoder=separate has the base layer decoded by a second HEVC
+decoder of its own: on the hardware device of hw_device_ctx where the
+caller set one, in software otherwise. Most hardware decoders take the
+base layer of an MV-HEVC stream, plain Main or Main 10 HEVC, but not the
+layer above it; this one then decodes that layer in software, its
+inter-layer reference being the separate decoder's picture of the same
+access unit copied to memory (NV12, P010 or the decoder's own format).
+It still parses all of the base layer itself (parameter sets, slice
+headers, reference picture sets, POC, DPB and output) and only takes the
+samples of its pictures from the other decoder: about half the work of
+the processor for two views.
+
+The pictures are those of the software decoding of every layer:
+- the separate decoder gives each picture it decodes at once, in
+  decoding order, and its pictures are paired by POC with this
+  decoder's; anything else (no picture, another POC, an error, a
+  picture that is not 4:2:0 of 8 or 10 bits) and this decoder decodes
+  the base layer itself again, for good;
+- its pictures are used only once the first 8 were found the same, bit
+  for bit, as this decoder's own decoding of them, and 4 more are
+  compared about every 480 pictures from a random access point;
+- the only thing a layer above takes from its inter-layer reference
+  besides its samples is the motion field, where that picture is its
+  collocated picture; the separate decoder gives none, so that is
+  allowed only for an all-intra base picture (whose motion field is
+  known), found when the picture starts; a picture that would need it,
+  or that needs the motion of one the separate decoder gave after this
+  decoder took the base layer back, is marked corrupt.
+Each picture says how its base layer was decoded in its metadata
+(lavc.hevc.base_layer, lavc.hevc.base_layer_checks and, once the
+separate decoder was given up, lavc.hevc.base_layer_error), so that a
+caller can decode from the last key frame again without the option.
+A picture whose base layer the separate decoder gave and that is
+returned after it was given up (set up while an earlier picture whose
+comparison found the fault was still being decoded, or one whose
+picture could not be copied in) says so too and is marked corrupt
+(AV_FRAME_FLAG_CORRUPT): this is done as it is returned, when every
+frame thread that set a picture up before it has ended
+(FrameDecodeData.post_process, whose reference is now always released
+in decode.c). A picture that could not be copied in is mid grey of its
+bit depth.
+
+The work at the start of a picture of the base layer (giving the packet
+to the separate decoder and its picture to memory) is done while the
+frame thread sets the picture up, so that every fault is known before
+the next thread starts; the copy into the frame and the comparisons are
+done after. The value separate_semiplanar repacks the pictures of a
+separate decoder in software as NV12 or P010, to test that path without
+hardware. This decoder never uses a hardware decoder itself then: the
+device is the separate decoder's.
+
+Hades: tested on the host with the separate decoder in software (the
+ITU-T MV-HEVC conformance streams, x265 streams of 8 and 10 bits, MP4
+files, seeks, streams that start mid-GOP or lose a view, damaged
+streams, 22 single-layer conformance streams, 1 to 16 frame threads,
+injected faults of the separate decoder (also from a picture on, with
+frames in flight, and a copy that fails), mutants of each check, ASan
+and TSan): the pictures of FFmpeg without this change. The hardware
+path (VAAPI) is not tested on hardware by this change.
+---
+ libavcodec/decode.c         |   5 +-
+ libavcodec/hevc/Makefile    |   1 +
+ libavcodec/hevc/baselayer.c | 807 ++++++++++++++++++++++++++++++++++++
+ libavcodec/hevc/baselayer.h | 162 ++++++++
+ libavcodec/hevc/hevcdec.c   |  87 +++-
+ libavcodec/hevc/hevcdec.h   |  18 +
+ libavcodec/hevc/refs.c      |   6 +-
+ 7 files changed, 1080 insertions(+), 6 deletions(-)
+ create mode 100644 libavcodec/hevc/baselayer.c
+ create mode 100644 libavcodec/hevc/baselayer.h
+
+diff --git a/libavcodec/decode.c b/libavcodec/decode.c
+index c9ec6a4..e0d34a1 100644
+--- a/libavcodec/decode.c
++++ b/libavcodec/decode.c
+@@ -1741,10 +1741,7 @@ static void decode_data_free(AVRefStructOpaque unused, void *obj)
+ {
+     FrameDecodeData *fdd = obj;
+ 
+-    if (CONFIG_LIBLCEVC_DEC)
+-        av_refstruct_unref(&fdd->post_process_opaque);
+-    else
+-        av_assert1(!fdd->post_process_opaque);
++    av_refstruct_unref(&fdd->post_process_opaque);
+ 
+     if (fdd->hwaccel_priv_free)
+         fdd->hwaccel_priv_free(fdd->hwaccel_priv);
+diff --git a/libavcodec/hevc/Makefile b/libavcodec/hevc/Makefile
+index 87d6393..4c0d853 100644
+--- a/libavcodec/hevc/Makefile
++++ b/libavcodec/hevc/Makefile
+@@ -2,6 +2,7 @@ clean::
+ 	$(RM) $(CLEANSUFFIXES:%=libavcodec/hevc/%)
+ 
+ OBJS-$(CONFIG_HEVC_DECODER) += \
++    hevc/baselayer.o           \
+     hevc/cabac.o               \
+     hevc/data.o                \
+     hevc/dsp.o                 \
+diff --git a/libavcodec/hevc/baselayer.c b/libavcodec/hevc/baselayer.c
+new file mode 100644
+index 0000000..01f3400
+--- /dev/null
++++ b/libavcodec/hevc/baselayer.c
+@@ -0,0 +1,807 @@
++/*
++ * HEVC decoder: the base layer of a multilayer stream decoded by a separate decoder
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdarg.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "libavutil/common.h"
++#include "libavutil/container_fifo.h"
++#include "libavutil/dict.h"
++#include "libavutil/error.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/intreadwrite.h"
++#include "libavutil/mem.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/refstruct.h"
++#include "libavutil/thread.h"
++#include "libavutil/time.h"
++
++#include "libavcodec/avcodec.h"
++#include "libavcodec/codec_internal.h"
++#include "libavcodec/decode.h"
++#include "libavcodec/progressframe.h"
++
++#include "baselayer.h"
++#include "hevcdec.h"
++
++extern const FFCodec ff_hevc_decoder;
++
++enum {
++    STATE_CHECKING = 0,
++    STATE_TRUSTED,
++    STATE_GIVEN_UP,
++};
++
++/** What the separate decoder says of each picture it gives (AVFrame.opaque_ref) */
++typedef struct HEVCBaseLayerInfo {
++    int poc;
++    int intra;
++    int corrupt;
++} HEVCBaseLayerInfo;
++
++/** Whether, and why, the separate decoder was given up (RefStruct): shared with the
++ * pictures whose base layer it gave, which say so when they are returned (returned()) */
++typedef struct HEVCBaseLayerVerdict {
++    atomic_int given_up;
++    char       reason[256]; ///< written once, before given_up turns 1
++} HEVCBaseLayerVerdict;
++
++/** Shared by the frame threads (RefStruct) */
++struct HEVCBaseLayer {
++    AVMutex         lock;       ///< the separate decoder
++    AVCodecContext *dec;
++    AVPacket       *pkt;
++    AVFrame        *out;
++    int             want_hw;    ///< a hardware device was given
++    int             semiplanar;
++
++    atomic_int      state;
++    atomic_int      giving_up;
++    HEVCBaseLayerVerdict *verdict;
++
++    atomic_int      checks;     ///< pictures found the same
++    atomic_llong    used, checked, transfer_ns, fill_ns;
++
++    // touched only while a frame thread sets its picture up, one at a time
++    unsigned        aus;
++    unsigned        window_start;
++    int             window_left;
++};
++
++static void give_up(HEVCBaseLayer *bl, void *logctx, const char *fmt, ...)
++{
++    va_list vl;
++
++    if (atomic_exchange(&bl->giving_up, 1))
++        return;
++    va_start(vl, fmt);
++    vsnprintf(bl->verdict->reason, sizeof(bl->verdict->reason), fmt, vl);
++    va_end(vl);
++    av_log(logctx, AV_LOG_WARNING,
++           "The base layer is decoded here again, the separate decoder given up: %s.\n",
++           bl->verdict->reason);
++    atomic_store(&bl->verdict->given_up, 1);
++    atomic_store(&bl->state, STATE_GIVEN_UP);
++}
++
++/* FrameDecodeData.post_process of a picture whose base layer the separate
++ * decoder gave. It runs when the picture is returned to the caller: by then
++ * every frame thread that set a picture up before it has ended, and with it
++ * every comparison of such a picture (frame threads return their pictures in
++ * the order they were given packets). If the separate decoder was given up by
++ * then (a comparison of an earlier picture still being decoded when this one
++ * was set up found a difference, or its picture could not be copied in), the
++ * picture says so as the pictures after it do, and is marked corrupt: no
++ * picture of a separate decoder that was given up is returned unmarked. */
++static int returned(void *logctx, AVFrame *frame)
++{
++    const FrameDecodeData *fdd = frame->private_ref;
++    const HEVCBaseLayerVerdict *v = fdd->post_process_opaque;
++
++    if (!atomic_load(&v->given_up))
++        return 0;
++    frame->flags |= AV_FRAME_FLAG_CORRUPT;
++    // (a picture that cannot say it is not returned)
++    return av_dict_set(&frame->metadata, "lavc.hevc.base_layer_error", v->reason, 0);
++}
++
++/* whether returned() can be had for the picture f (another post-processing of
++ * it, LCEVC's, would be replaced) */
++static int returnable(const AVFrame *f)
++{
++    const FrameDecodeData *fdd = f->private_ref;
++
++    return fdd && (!fdd->post_process || fdd->post_process == returned);
++}
++
++static void say_when_returned(HEVCBaseLayer *bl, AVFrame *f)
++{
++    FrameDecodeData *fdd = f->private_ref;
++
++    if (fdd->post_process == returned)
++        return;
++    fdd->post_process_opaque = av_refstruct_ref(bl->verdict);
++    fdd->post_process        = returned;
++}
++
++static enum AVPixelFormat get_format(AVCodecContext *avctx, const enum AVPixelFormat *fmts)
++{
++    HEVCBaseLayer *bl = avctx->opaque;
++    const enum AVPixelFormat *p;
++
++    if (bl->want_hw && avctx->hw_device_ctx) {
++        const AVHWDeviceContext *dev = (const AVHWDeviceContext *)avctx->hw_device_ctx->data;
++
++        for (p = fmts; *p != AV_PIX_FMT_NONE; p++) {
++            const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
++            const AVCodecHWConfig *cfg;
++
++            if (!(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
++                continue;
++            for (int i = 0; (cfg = avcodec_get_hw_config(avctx->codec, i)); i++) {
++                if (cfg->pix_fmt == *p && cfg->device_type == dev->type &&
++                    (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
++                    return *p;
++            }
++        }
++    }
++    // the software format is the last one
++    for (p = fmts; p[0] != AV_PIX_FMT_NONE && p[1] != AV_PIX_FMT_NONE; p++)
++        ;
++    return *p;
++}
++
++static void base_layer_free(AVRefStructOpaque unused, void *obj)
++{
++    HEVCBaseLayer *bl = obj;
++    const long long used = atomic_load(&bl->used), checked = atomic_load(&bl->checked);
++
++    if (bl->dec || used || checked)
++        av_log(NULL, AV_LOG_VERBOSE,
++               "HEVC base layer: %lld pictures from the separate decoder, %lld compared "
++               "(%d found the same), %.2f ms to get each in memory, %.2f ms to copy each in%s%s\n",
++               used, checked, atomic_load(&bl->checks),
++               used + checked ? atomic_load(&bl->transfer_ns) / 1e6 / (used + checked) : 0.0,
++               used ? atomic_load(&bl->fill_ns) / 1e6 / used : 0.0,
++               atomic_load(&bl->state) == STATE_GIVEN_UP ? "; given up: " : "",
++               atomic_load(&bl->state) == STATE_GIVEN_UP ? bl->verdict->reason : "");
++    avcodec_free_context(&bl->dec);
++    av_frame_free(&bl->out);
++    av_packet_free(&bl->pkt);
++    av_refstruct_unref(&bl->verdict);
++    ff_mutex_destroy(&bl->lock);
++}
++
++int ff_hevc_base_layer_alloc(HEVCContext *s)
++{
++    AVCodecContext *avctx = s->avctx;
++    HEVCBaseLayer *bl;
++    AVCodecContext *dec;
++    HEVCContext *ds;
++    int ret;
++
++    bl = av_refstruct_alloc_ext(sizeof(*bl), 0, NULL, base_layer_free);
++    if (!bl)
++        return AVERROR(ENOMEM);
++    ff_mutex_init(&bl->lock, NULL);
++    s->base_layer = bl;
++    bl->verdict = av_refstruct_allocz(sizeof(*bl->verdict));
++    if (!bl->verdict)
++        return AVERROR(ENOMEM);
++
++    bl->semiplanar = s->base_layer_decoder == HEVC_BASE_LAYER_SEPARATE_SEMIPLANAR;
++    bl->out = av_frame_alloc();
++    bl->pkt = av_packet_alloc();
++    bl->dec = dec = avcodec_alloc_context3(&ff_hevc_decoder.p);
++    if (!bl->out || !bl->pkt || !dec)
++        return AVERROR(ENOMEM);
++
++    dec->opaque           = bl;
++    dec->get_format       = get_format;
++    dec->thread_count     = 1;
++    dec->apply_cropping   = 0;  // the coded picture: the reference of the other layers
++    dec->coded_width      = avctx->coded_width;
++    dec->coded_height     = avctx->coded_height;
++    dec->pkt_timebase     = avctx->pkt_timebase;
++    dec->workaround_bugs  = avctx->workaround_bugs;
++    dec->err_recognition  = avctx->err_recognition;
++    dec->flags           |= avctx->flags  & AV_CODEC_FLAG_OUTPUT_CORRUPT;
++    dec->flags2          |= avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL;
++    if (avctx->extradata_size > 0 && avctx->extradata) {
++        dec->extradata = av_mallocz(avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (!dec->extradata)
++            return AVERROR(ENOMEM);
++        memcpy(dec->extradata, avctx->extradata, avctx->extradata_size);
++        dec->extradata_size = avctx->extradata_size;
++    }
++    if (avctx->hw_device_ctx && !bl->semiplanar) {
++        dec->hw_device_ctx = av_buffer_ref(avctx->hw_device_ctx);
++        if (!dec->hw_device_ctx)
++            return AVERROR(ENOMEM);
++        bl->want_hw = 1;
++    }
++
++    // it gives every base-layer picture it decodes, at once, in decoding order
++    ds = dec->priv_data;
++    ds->base_layer_feeder = 1;
++
++    ret = avcodec_open2(dec, &ff_hevc_decoder.p, NULL);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_WARNING, "The separate decoder of the base layer could not be opened.\n");
++        avcodec_free_context(&bl->dec);
++        atomic_store(&bl->giving_up, 1);
++        snprintf(bl->verdict->reason, sizeof(bl->verdict->reason), "it could not be opened");
++        atomic_store(&bl->verdict->given_up, 1);
++        atomic_store(&bl->state, STATE_GIVEN_UP);
++    }
++    return 0;
++}
++
++void ff_hevc_base_layer_unit_reset(HEVCBaseLayerUnit *u)
++{
++    for (int i = 0; i < HEVC_BASE_LAYER_MAX_PICTURES; i++)
++        av_frame_free(&u->pic[i].frame);
++    memset(u, 0, sizeof(*u));
++}
++
++/* a software picture of 8 or 10 bits as a hardware decoder gives it in memory */
++static AVFrame *semiplanar(const AVFrame *src)
++{
++    const int ten = src->format == AV_PIX_FMT_YUV420P10;
++    AVFrame *dst;
++
++    if (src->format != AV_PIX_FMT_YUV420P && src->format != AV_PIX_FMT_YUVJ420P && !ten)
++        return NULL;
++    dst = av_frame_alloc();
++    if (!dst)
++        return NULL;
++    dst->format = ten ? AV_PIX_FMT_P010 : AV_PIX_FMT_NV12;
++    dst->width  = src->width;
++    dst->height = src->height;
++    if (av_frame_get_buffer(dst, 0) < 0) {
++        av_frame_free(&dst);
++        return NULL;
++    }
++    for (int y = 0; y < src->height; y++) {
++        const uint8_t *s0 = src->data[0] + (ptrdiff_t)y * src->linesize[0];
++        uint8_t       *d0 = dst->data[0] + (ptrdiff_t)y * dst->linesize[0];
++        if (ten) {
++            for (int x = 0; x < src->width; x++)
++                AV_WN16(d0 + 2 * x, AV_RN16(s0 + 2 * x) << 6);
++        } else
++            memcpy(d0, s0, src->width);
++    }
++    for (int y = 0; y < (src->height + 1) >> 1; y++) {
++        const uint8_t *u = src->data[1] + (ptrdiff_t)y * src->linesize[1];
++        const uint8_t *v = src->data[2] + (ptrdiff_t)y * src->linesize[2];
++        uint8_t       *d = dst->data[1] + (ptrdiff_t)y * dst->linesize[1];
++        for (int x = 0; x < (src->width + 1) >> 1; x++) {
++            if (ten) {
++                AV_WN16(d + 4 * x,     AV_RN16(u + 2 * x) << 6);
++                AV_WN16(d + 4 * x + 2, AV_RN16(v + 2 * x) << 6);
++            } else {
++                d[2 * x]     = u[x];
++                d[2 * x + 1] = v[x];
++            }
++        }
++    }
++    return dst;
++}
++
++void ff_hevc_base_layer_feed(HEVCContext *s, const AVPacket *pkt)
++{
++    HEVCBaseLayer   *bl = s->base_layer;
++    HEVCBaseLayerUnit *u = &s->base_unit;
++    int64_t t0;
++    int ret;
++
++    ff_hevc_base_layer_unit_reset(u);
++    if (!bl || atomic_load(&bl->state) == STATE_GIVEN_UP)
++        return;
++
++    ff_mutex_lock(&bl->lock);
++    if (!bl->dec) {
++        ff_mutex_unlock(&bl->lock);
++        return;
++    }
++    // what this decoder skips now, the other skips too
++    bl->dec->skip_frame       = s->avctx->skip_frame;
++    bl->dec->skip_loop_filter = s->avctx->skip_loop_filter;
++    bl->dec->skip_idct        = s->avctx->skip_idct;
++
++    t0  = av_gettime_relative();
++    u->fed = 1;
++    // every picture it decodes is wanted, also one the caller does not show
++    ret = av_packet_ref(bl->pkt, pkt);
++    if (ret >= 0) {
++        bl->pkt->flags &= ~AV_PKT_FLAG_DISCARD;
++        ret = avcodec_send_packet(bl->dec, bl->pkt);
++        av_packet_unref(bl->pkt);
++    }
++    if (ret < 0) {
++        u->failed = 1;
++        give_up(bl, s->avctx, "the separate decoder refused a packet (%s)", av_err2str(ret));
++    }
++    while (ret >= 0) {
++        const HEVCBaseLayerInfo *info;
++        HEVCBaseLayerPicture *p;
++        AVFrame *f = bl->out;
++
++        ret = avcodec_receive_frame(bl->dec, f);
++        if (ret == AVERROR(EAGAIN))
++            break;
++        if (ret < 0) {
++            u->failed = 1;
++            give_up(bl, s->avctx, "the separate decoder returned an error (%s)", av_err2str(ret));
++            break;
++        }
++        info = f->opaque_ref && f->opaque_ref->size >= sizeof(*info) ?
++               (const HEVCBaseLayerInfo *)f->opaque_ref->data : NULL;
++        if (u->nb_pics++ >= HEVC_BASE_LAYER_MAX_PICTURES || !info) {
++            av_frame_unref(f);
++            continue;
++        }
++        p = &u->pic[u->nb_pics - 1];
++        p->poc     = info->poc;
++        p->intra   = info->intra;
++        p->corrupt = info->corrupt;
++        if (f->hw_frames_ctx) {
++            // into memory, in the format of the device's pictures (NV12, P010)
++            p->frame = av_frame_alloc();
++            if (!p->frame || av_hwframe_transfer_data(p->frame, f, 0) < 0) {
++                av_frame_free(&p->frame);
++                u->failed = 1;
++                give_up(bl, s->avctx, "a picture of the separate decoder could not be had "
++                        "in memory");
++            }
++        } else if (bl->want_hw) {
++            u->failed = 1;
++            give_up(bl, s->avctx, "the hardware device does not decode this stream's base "
++                    "layer (%s)", av_get_pix_fmt_name(f->format));
++        } else if (bl->semiplanar) {
++            p->frame = semiplanar(f);
++            if (!p->frame) {
++                u->failed = 1;
++                give_up(bl, s->avctx, "no memory to repack a picture");
++            }
++        } else {
++            p->frame = av_frame_alloc();
++            if (p->frame)
++                av_frame_move_ref(p->frame, f);
++            else
++                u->failed = 1;
++        }
++        av_frame_unref(f);
++    }
++    u->transfer_ns = (av_gettime_relative() - t0) * 1000;
++    // once given up it is not needed any more
++    if (atomic_load(&bl->state) == STATE_GIVEN_UP)
++        avcodec_free_context(&bl->dec);
++    ff_mutex_unlock(&bl->lock);
++}
++
++static int supported_pix_fmt(enum AVPixelFormat fmt)
++{
++    return fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUVJ420P ||
++           fmt == AV_PIX_FMT_YUV420P10;
++}
++
++/* whether a picture of the separate decoder can be copied into a frame of this format */
++static int copyable(const AVFrame *src, enum AVPixelFormat dst_fmt, int width, int height)
++{
++    if (!src || src->width < width || src->height < height)
++        return 0;
++    if (src->format == dst_fmt)
++        return 1;
++    if (dst_fmt == AV_PIX_FMT_YUV420P || dst_fmt == AV_PIX_FMT_YUVJ420P)
++        return src->format == AV_PIX_FMT_NV12 ||
++               src->format == AV_PIX_FMT_YUV420P || src->format == AV_PIX_FMT_YUVJ420P;
++    if (dst_fmt == AV_PIX_FMT_YUV420P10)
++        return src->format == AV_PIX_FMT_P010;
++    return 0;
++}
++
++int ff_hevc_base_layer_lacks_motion(const HEVCFrame *f)
++{
++    return f && f->separate;
++}
++
++/* whether the collocated picture of the current slice has no motion field
++ * while the slice needs it: it came from the separate decoder, and is not the
++ * all-intra base picture of the access unit of a picture of a layer above */
++static int col_lacks_motion(const HEVCContext *s)
++{
++    const HEVCFrame *col = s->collocated_ref;
++
++    if (s->sh.slice_type == HEVC_SLICE_I || !s->sh.slice_temporal_mvp_enabled_flag ||
++        !ff_hevc_base_layer_lacks_motion(col))
++        return 0;
++    if (s->cur_layer > 0 && col == s->layers[0].cur_frame && col->intra)
++        return 0;
++    return 1;
++}
++
++/* the same, at the start of a picture: its first slice's lists made now (they
++ * are made again, the same, when its data is decoded) */
++static int picture_lacks_motion(HEVCContext *s)
++{
++    if (s->sh.slice_type == HEVC_SLICE_I || !s->sh.slice_temporal_mvp_enabled_flag)
++        return 0;
++    if (ff_hevc_slice_rpl(s) < 0)
++        return 0; // and so does its data, the same way
++    return col_lacks_motion(s);
++}
++
++static void set_metadata(HEVCContext *s, AVFrame *f, enum HEVCBaseLayerMode mode)
++{
++    HEVCBaseLayer *bl = s->base_layer;
++    char n[16];
++
++    av_dict_set(&f->metadata, "lavc.hevc.base_layer",
++                mode == HEVC_BASE_LAYER_USED    ? "separate" :
++                mode == HEVC_BASE_LAYER_CHECKED ? "checking" : "internal", 0);
++    snprintf(n, sizeof(n), "%d", atomic_load(&bl->checks));
++    av_dict_set(&f->metadata, "lavc.hevc.base_layer_checks", n, 0);
++    if (atomic_load(&bl->state) == STATE_GIVEN_UP)
++        av_dict_set(&f->metadata, "lavc.hevc.base_layer_error", bl->verdict->reason, 0);
++}
++
++enum HEVCBaseLayerMode ff_hevc_base_layer_choose(HEVCContext *s)
++{
++    HEVCBaseLayer     *bl = s->base_layer;
++    HEVCBaseLayerUnit *u  = &s->base_unit;
++    HEVCFrame         *f  = s->cur_frame;
++    const HEVCSPS   *sps  = s->layers[0].sps;
++    enum HEVCBaseLayerMode mode = HEVC_BASE_LAYER_INTERNAL;
++    const HEVCBaseLayerPicture *pic = NULL;
++    unsigned au;
++    int state;
++
++    s->base_pic = -1;
++    if (!bl)
++        return mode;
++    au = bl->aus++;
++
++    if (atomic_load(&bl->state) != STATE_GIVEN_UP) {
++        int nb_layers = av_popcount(s->layers_active_decode);
++
++        if (nb_layers < 2 || ff_hevc_is_alpha_video(s))
++            give_up(bl, s->avctx, "only one layer is decoded");
++        else if (!supported_pix_fmt(s->avctx->pix_fmt))
++            give_up(bl, s->avctx, "the pictures are %s, not 4:2:0 of 8 or 10 bits",
++                    av_get_pix_fmt_name(s->avctx->pix_fmt));
++        else if (!u->fed || u->failed)
++            give_up(bl, s->avctx, "the separate decoder gave nothing for the picture of POC %d",
++                    s->poc);
++        else {
++            for (int i = 0; i < FFMIN(u->nb_pics, HEVC_BASE_LAYER_MAX_PICTURES); i++)
++                if (u->pic[i].frame && u->pic[i].poc == s->poc) {
++                    pic = &u->pic[i];
++                    s->base_pic = i;
++                }
++            if (u->nb_pics != 1 || !pic)
++                give_up(bl, s->avctx, "the separate decoder gave %d picture(s) for the access "
++                        "unit of POC %d (POC %d)", u->nb_pics, s->poc,
++                        u->nb_pics ? u->pic[0].poc : -1);
++            else if (!copyable(pic->frame, s->avctx->pix_fmt, sps->width, sps->height) ||
++                     f->f->format != s->avctx->pix_fmt ||
++                     f->f->width < sps->width || f->f->height < sps->height)
++                give_up(bl, s->avctx, "the separate decoder gave a picture of %s %dx%d for one "
++                        "of %s %dx%d", av_get_pix_fmt_name(pic->frame->format),
++                        pic->frame->width, pic->frame->height,
++                        av_get_pix_fmt_name(s->avctx->pix_fmt), sps->width, sps->height);
++            else if (pic->corrupt)
++                give_up(bl, s->avctx, "the separate decoder said the picture of POC %d is "
++                        "corrupt", s->poc);
++            else if (!returnable(f->f))
++                give_up(bl, s->avctx, "the pictures are post-processed otherwise when they are "
++                        "returned");
++        }
++    }
++
++    state = atomic_load(&bl->state);
++    if (state == STATE_GIVEN_UP) {
++        // decoded here: as it would have been, unless it needs a motion field
++        // that was never decoded
++        if (picture_lacks_motion(s)) {
++            f->flags |= HEVC_FRAME_FLAG_CORRUPT;
++            av_log(s->avctx, AV_LOG_WARNING, "The picture of POC %d refers to the motion of one "
++                   "the separate decoder gave: corrupt.\n", s->poc);
++        }
++        s->base_pic = -1;
++    } else if (state == STATE_CHECKING) {
++        mode = HEVC_BASE_LAYER_CHECKED;
++    } else {
++        // trusted: a window of pictures compared now and then, from a random
++        // access point; a picture whose collocated picture came from the
++        // separate decoder can only come from it too
++        if (!bl->window_left && IS_IRAP(s) && au - bl->window_start >= HEVC_BASE_LAYER_PERIOD) {
++            bl->window_left  = HEVC_BASE_LAYER_WINDOW;
++            bl->window_start = au;
++        }
++        if (bl->window_left && !picture_lacks_motion(s)) {
++            bl->window_left--;
++            mode = HEVC_BASE_LAYER_CHECKED;
++        } else
++            mode = HEVC_BASE_LAYER_USED;
++    }
++
++    if (mode == HEVC_BASE_LAYER_USED) {
++        f->separate = 1;
++        s->base_fill_pending = 1;
++        say_when_returned(bl, f->f);
++    }
++    set_metadata(s, f->f, mode);
++    s->base_mode = mode;
++    return mode;
++}
++
++int ff_hevc_base_layer_check_upper(HEVCContext *s)
++{
++    HEVCBaseLayer *bl = s->base_layer;
++
++    if (!bl)
++        return 0;
++    if (s->base_mode == HEVC_BASE_LAYER_USED && picture_lacks_motion(s)) {
++        s->cur_frame->flags |= HEVC_FRAME_FLAG_CORRUPT;
++        give_up(bl, s->avctx, "the layer above the base predicts its motion from the base "
++                "picture of its access unit (POC %d), whose motion the separate decoder does "
++                "not give", s->poc);
++    } else if (s->base_mode == HEVC_BASE_LAYER_USED && !returnable(s->cur_frame->f)) {
++        s->cur_frame->flags |= HEVC_FRAME_FLAG_CORRUPT;
++        give_up(bl, s->avctx, "the pictures are post-processed otherwise when they are "
++                "returned");
++    } else if (s->base_mode == HEVC_BASE_LAYER_USED)
++        say_when_returned(bl, s->cur_frame->f);
++    set_metadata(s, s->cur_frame->f, s->base_mode);
++    return 0;
++}
++
++int ff_hevc_base_layer_check_slice(HEVCContext *s)
++{
++    // a slice after the first of its picture with another collocated picture:
++    // not allowed, and so only found here, after setup
++    if (s->base_layer && col_lacks_motion(s)) {
++        give_up(s->base_layer, s->avctx, "a slice of the picture of POC %d refers to the "
++                "motion of a picture the separate decoder gave", s->poc);
++        return 1;
++    }
++    return 0;
++}
++
++int ff_hevc_base_layer_copy(AVFrame *dst, const AVFrame *src, int width, int height)
++{
++    const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
++
++    if (!copyable(src, dst->format, width, height) ||
++        dst->width < width || dst->height < height)
++        return AVERROR(ENOSYS);
++
++    if (src->format == dst->format ||
++        (src->format != AV_PIX_FMT_NV12 && src->format != AV_PIX_FMT_P010)) {
++        const int bytes = dst->format == AV_PIX_FMT_YUV420P10 ? 2 : 1;
++        for (int i = 0; i < 3; i++)
++            av_image_copy_plane(dst->data[i], dst->linesize[i], src->data[i], src->linesize[i],
++                                (i ? cw : width) * bytes, i ? ch : height);
++        return 0;
++    }
++
++    if (src->format == AV_PIX_FMT_NV12) {
++        av_image_copy_plane(dst->data[0], dst->linesize[0], src->data[0], src->linesize[0],
++                            width, height);
++        for (int y = 0; y < ch; y++) {
++            const uint8_t *uv = src->data[1] + (ptrdiff_t)y * src->linesize[1];
++            uint8_t *u = dst->data[1] + (ptrdiff_t)y * dst->linesize[1];
++            uint8_t *v = dst->data[2] + (ptrdiff_t)y * dst->linesize[2];
++            for (int x = 0; x < cw; x++) {
++                u[x] = uv[2 * x];
++                v[x] = uv[2 * x + 1];
++            }
++        }
++        return 0;
++    }
++
++    // P010: 10 bits in the high bits of 16
++    for (int y = 0; y < height; y++) {
++        const uint8_t *s0 = src->data[0] + (ptrdiff_t)y * src->linesize[0];
++        uint8_t *d0 = dst->data[0] + (ptrdiff_t)y * dst->linesize[0];
++        for (int x = 0; x < width; x++)
++            AV_WN16(d0 + 2 * x, AV_RN16(s0 + 2 * x) >> 6);
++    }
++    for (int y = 0; y < ch; y++) {
++        const uint8_t *uv = src->data[1] + (ptrdiff_t)y * src->linesize[1];
++        uint8_t *u = dst->data[1] + (ptrdiff_t)y * dst->linesize[1];
++        uint8_t *v = dst->data[2] + (ptrdiff_t)y * dst->linesize[2];
++        for (int x = 0; x < cw; x++) {
++            AV_WN16(u + 2 * x, AV_RN16(uv + 4 * x)     >> 6);
++            AV_WN16(v + 2 * x, AV_RN16(uv + 4 * x + 2) >> 6);
++        }
++    }
++    return 0;
++}
++
++unsigned ff_hevc_base_layer_p010_low_bits(const AVFrame *src, int width, int height)
++{
++    unsigned bits = 0;
++
++    if (src->format != AV_PIX_FMT_P010)
++        return 0;
++    for (int y = 0; y < height; y++) {
++        const uint8_t *s0 = src->data[0] + (ptrdiff_t)y * src->linesize[0];
++        for (int x = 0; x < width; x++)
++            bits |= AV_RN16(s0 + 2 * x) & 0x3f;
++    }
++    for (int y = 0; y < (height + 1) >> 1; y++) {
++        const uint8_t *uv = src->data[1] + (ptrdiff_t)y * src->linesize[1];
++        for (int x = 0; x < ((width + 1) >> 1) * 2; x++)
++            bits |= AV_RN16(uv + 2 * x) & 0x3f;
++    }
++    return bits;
++}
++
++void ff_hevc_base_layer_fill(HEVCContext *s)
++{
++    HEVCBaseLayer *bl = s->base_layer;
++    HEVCFrame *f = s->layers[0].cur_frame;
++    const HEVCSPS *sps = s->layers[0].sps;
++    int64_t t0 = av_gettime_relative();
++
++    s->base_fill_pending = 0;
++    if (!f)
++        return;
++    if (s->base_pic < 0 ||
++        ff_hevc_base_layer_copy(f->f, s->base_unit.pic[s->base_pic].frame,
++                                sps->width, sps->height) < 0) {
++        // not to be: what it gave was checked when the picture started
++        give_up(bl, s->avctx, "its picture of POC %d could not be copied in", f->poc);
++        // mid grey of the bit depth, every sample a valid one
++        for (int i = 0; i < 3; i++) {
++            const int w    = i ? (sps->width + 1) >> 1 : sps->width;
++            const int h    = i ? (sps->height + 1) >> 1 : sps->height;
++            const int grey = 1 << ((i ? sps->bit_depth_chroma : sps->bit_depth) - 1);
++            for (int y = 0; y < h; y++) {
++                uint8_t *row = f->f->data[i] + (ptrdiff_t)y * f->f->linesize[i];
++                if (sps->pixel_shift) {
++                    for (int x = 0; x < w; x++)
++                        AV_WN16(row + 2 * x, grey);
++                } else
++                    memset(row, grey, w);
++            }
++        }
++        // (its flags cannot be changed now: setup has ended, the frame threads
++        // have copied them; the picture says the error and is marked corrupt
++        // when it is returned, returned(), as the pictures that follow say it)
++    }
++    // all intra as far as anything that reads it knows (col_lacks_motion())
++    memset(f->tab_mvf, 0, sizeof(*f->tab_mvf) * sps->min_pu_width * sps->min_pu_height);
++    atomic_fetch_add(&bl->used, 1);
++    atomic_fetch_add(&bl->transfer_ns, s->base_unit.transfer_ns);
++    atomic_fetch_add(&bl->fill_ns, (av_gettime_relative() - t0) * 1000);
++
++    if (s->avctx->active_thread_type == FF_THREAD_FRAME)
++        ff_progress_frame_report(&f->tf, INT_MAX);
++}
++
++void ff_hevc_base_layer_compare(HEVCContext *s, int decoded)
++{
++    HEVCBaseLayer *bl = s->base_layer;
++    HEVCFrame *f = s->layers[0].cur_frame;
++    const HEVCSPS *sps = s->layers[0].sps;
++    const HEVCBaseLayerPicture *p;
++    const int bytes = s->avctx->pix_fmt == AV_PIX_FMT_YUV420P10 ? 2 : 1;
++    AVFrame *tmp = s->base_compare;
++    int plane = -1, row = -1;
++
++    s->base_mode = HEVC_BASE_LAYER_INTERNAL;
++    // a picture with errors here is not compared: the separate decoder may
++    // have hidden them otherwise, and nothing it gave is used
++    if (!f || s->base_pic < 0 || !decoded || atomic_load(&bl->state) == STATE_GIVEN_UP)
++        return;
++    p = &s->base_unit.pic[s->base_pic];
++    atomic_fetch_add(&bl->checked, 1);
++    atomic_fetch_add(&bl->transfer_ns, s->base_unit.transfer_ns);
++
++    if (!tmp || tmp->format != f->f->format || tmp->width != sps->width ||
++        tmp->height != sps->height) {
++        av_frame_free(&s->base_compare);
++        tmp = s->base_compare = av_frame_alloc();
++        if (!tmp)
++            return;
++        tmp->format = f->f->format;
++        tmp->width  = sps->width;
++        tmp->height = sps->height;
++        if (av_frame_get_buffer(tmp, 0) < 0) {
++            av_frame_free(&s->base_compare);
++            return;
++        }
++    }
++    if (ff_hevc_base_layer_copy(tmp, p->frame, sps->width, sps->height) < 0) {
++        give_up(bl, s->avctx, "a picture of the separate decoder could not be copied");
++        return;
++    }
++    if (ff_hevc_base_layer_p010_low_bits(p->frame, sps->width, sps->height)) {
++        give_up(bl, s->avctx, "the picture of POC %d of the separate decoder has more than 10 "
++                "bits", s->poc);
++        return;
++    }
++    for (int i = 0; i < 3 && plane < 0; i++) {
++        const int w = (i ? (sps->width + 1) >> 1 : sps->width) * bytes;
++        const int h = i ? (sps->height + 1) >> 1 : sps->height;
++        for (int y = 0; y < h; y++) {
++            if (memcmp(tmp->data[i] + (ptrdiff_t)y * tmp->linesize[i],
++                       f->f->data[i] + (ptrdiff_t)y * f->f->linesize[i], w)) {
++                plane = i;
++                row = y;
++                break;
++            }
++        }
++    }
++    if (plane >= 0) {
++        give_up(bl, s->avctx, "its picture of POC %d is not this decoder's (plane %d, row %d)",
++                s->poc, plane, row);
++        return;
++    }
++    if (atomic_fetch_add(&bl->checks, 1) + 1 >= HEVC_BASE_LAYER_CHECKS) {
++        int checking = STATE_CHECKING;
++        atomic_compare_exchange_strong(&bl->state, &checking, STATE_TRUSTED);
++    }
++}
++
++void ff_hevc_base_layer_flush(HEVCContext *s)
++{
++    HEVCBaseLayer *bl = s->base_layer;
++
++    ff_hevc_base_layer_unit_reset(&s->base_unit);
++    s->base_fill_pending = 0;
++    s->base_mode = HEVC_BASE_LAYER_INTERNAL;
++    s->base_pic = -1;
++    if (!bl)
++        return;
++    ff_mutex_lock(&bl->lock);
++    if (bl->dec)
++        avcodec_flush_buffers(bl->dec);
++    ff_mutex_unlock(&bl->lock);
++}
++
++void ff_hevc_base_layer_uninit(HEVCContext *s)
++{
++    ff_hevc_base_layer_unit_reset(&s->base_unit);
++    av_frame_free(&s->base_compare);
++    av_refstruct_unref(&s->base_layer);
++}
++
++int ff_hevc_base_layer_give(HEVCContext *s, HEVCFrame *f)
++{
++    HEVCBaseLayerInfo *info;
++    AVBufferRef *buf = av_buffer_allocz(sizeof(*info));
++
++    if (!buf)
++        return AVERROR(ENOMEM);
++    info = (HEVCBaseLayerInfo *)buf->data;
++    info->poc     = f->poc;
++    info->intra   = f->intra;
++    info->corrupt = !!(f->flags & HEVC_FRAME_FLAG_CORRUPT);
++    av_buffer_unref(&f->f->opaque_ref);
++    f->f->opaque_ref = buf;
++    return av_container_fifo_write(s->output_fifo, f->f, AV_CONTAINER_FIFO_FLAG_REF);
++}
+diff --git a/libavcodec/hevc/baselayer.h b/libavcodec/hevc/baselayer.h
+new file mode 100644
+index 0000000..a8effd8
+--- /dev/null
++++ b/libavcodec/hevc/baselayer.h
+@@ -0,0 +1,162 @@
++/*
++ * HEVC decoder: the base layer of a multilayer stream decoded by a separate decoder
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_HEVC_BASELAYER_H
++#define AVCODEC_HEVC_BASELAYER_H
++
++#include "libavutil/frame.h"
++
++#include "libavcodec/packet.h"
++
++/*
++ * When more than one layer of a stream is decoded (MV-HEVC), the pictures of
++ * the base layer may come from a second, separate HEVC decoder that decodes
++ * that layer alone: on the hardware device of AVCodecContext.hw_device_ctx
++ * where the caller set one (no hardware decoder takes the layers above the base
++ * on most devices, but most take the base layer, which is plain Main or Main 10
++ * HEVC), in software otherwise. This decoder then decodes the other layers,
++ * whose inter-layer reference is the separate decoder's picture of the same
++ * access unit, copied to memory. Its own decoding of the base layer is only the
++ * part every layer above it depends on: parameter sets, slice headers,
++ * reference picture sets, POC, the DPB and output. Every picture the caller gets
++ * is the same as it would be with every layer decoded here, as long as the
++ * separate decoder's pictures are the same as this decoder's, which is checked
++ * as it goes (below).
++ *
++ * What a layer above the base takes from its inter-layer reference besides its
++ * samples is the motion field, where that picture is its collocated picture
++ * for temporal motion vector prediction (MV-HEVC allows it). The separate
++ * decoder gives samples only, so such a picture is decoded from it only where
++ * the base picture has no motion: every slice of it is intra, whose motion field
++ * is known (all intra) without decoding it. A stream that predicts the motion of
++ * a layer from an inter-coded base picture is decoded here entirely.
++ *
++ * The separate decoder is trusted only once its pictures were the same, bit for
++ * bit, as this decoder's own for HEVC_BASE_LAYER_CHECKS pictures in a row, the
++ * base layer being decoded here too meanwhile. After that, a window of
++ * HEVC_BASE_LAYER_WINDOW pictures is checked the same way about every
++ * HEVC_BASE_LAYER_PERIOD pictures, starting at a random access point. Any
++ * difference, a picture the separate decoder does not give, an error of it, or
++ * a picture it cannot be used for, and this decoder decodes the base layer
++ * itself again, for good. A picture whose base layer the separate decoder gave
++ * and that is returned after it was given up (one set up while an earlier
++ * picture whose comparison found the fault was still being decoded, or one whose
++ * picture could not be copied in) says so too, and is marked corrupt
++ * (AV_FRAME_FLAG_CORRUPT): this is done as it is returned, when every frame
++ * thread that set a picture up before it has ended (FrameDecodeData.post_process).
++ * Where a picture then needs the motion field of one
++ * that came from the separate decoder, it cannot be decoded as it would have
++ * been, and is marked corrupt, as is every picture that refers to it until the
++ * next random access point (HEVC_FRAME_FLAG_CORRUPT); a caller that wants every
++ * picture as it would have been decodes from the last key frame again with the
++ * option off.
++ *
++ * Each picture says how its base layer was decoded in its metadata:
++ * "lavc.hevc.base_layer" is "separate", "checking" (decoded here and compared)
++ * or "internal"; "lavc.hevc.base_layer_checks" the number of pictures found the
++ * same so far; and once the separate decoder was given up,
++ * "lavc.hevc.base_layer_error" says why.
++ */
++
++/** Pictures compared before the separate decoder is trusted */
++#define HEVC_BASE_LAYER_CHECKS 8
++/** Pictures compared in each later window */
++#define HEVC_BASE_LAYER_WINDOW 4
++/** Pictures between the starts of two windows, at least */
++#define HEVC_BASE_LAYER_PERIOD 480
++
++/** Values of the option base_layer_decoder */
++enum {
++    HEVC_BASE_LAYER_SAME = 0,
++    HEVC_BASE_LAYER_SEPARATE,
++    /** as SEPARATE, its software pictures repacked as a hardware decoder
++     * gives them in memory (NV12, P010) first: tests that path in software */
++    HEVC_BASE_LAYER_SEPARATE_SEMIPLANAR,
++};
++
++/** How the base layer of an access unit is decoded */
++enum HEVCBaseLayerMode {
++    HEVC_BASE_LAYER_INTERNAL = 0,
++    HEVC_BASE_LAYER_USED,     ///< its samples are the separate decoder's
++    HEVC_BASE_LAYER_CHECKED,  ///< decoded here, and compared with the separate decoder's
++};
++
++#define HEVC_BASE_LAYER_MAX_PICTURES 2
++
++/** The pictures the separate decoder gave for a packet, in memory */
++typedef struct HEVCBaseLayerPicture {
++    AVFrame *frame;
++    int      poc;
++    int      intra;     ///< every slice of it is intra
++    int      corrupt;
++} HEVCBaseLayerPicture;
++
++typedef struct HEVCBaseLayerUnit {
++    HEVCBaseLayerPicture pic[HEVC_BASE_LAYER_MAX_PICTURES];
++    int nb_pics;        ///< the pictures it gave (more than it keeps, if so)
++    int fed;            ///< the packet went to the separate decoder
++    int failed;         ///< it returned an error for it
++    int64_t transfer_ns;
++} HEVCBaseLayerUnit;
++
++struct HEVCContext;
++struct HEVCFrame;
++typedef struct HEVCBaseLayer HEVCBaseLayer;
++
++/** Make the shared state (the first frame thread, or the only context). */
++int  ff_hevc_base_layer_alloc(struct HEVCContext *s);
++/** Give the packet to the separate decoder and take what it gives (setup). */
++void ff_hevc_base_layer_feed(struct HEVCContext *s, const AVPacket *pkt);
++/** At the start of a base-layer picture (setup): how it is decoded. */
++enum HEVCBaseLayerMode ff_hevc_base_layer_choose(struct HEVCContext *s);
++/** At the start of a picture of a layer above the base, in an access unit whose
++ * base picture came from the separate decoder (setup): whether it can be
++ * decoded, i.e. does not need the motion of that picture. */
++int  ff_hevc_base_layer_check_upper(struct HEVCContext *s);
++/** Put the separate decoder's picture in the base-layer frame (after setup). */
++void ff_hevc_base_layer_fill(struct HEVCContext *s);
++/** Compare this decoder's base picture with the separate decoder's (after
++ * setup); decoded: this decoder decoded the packet without an error */
++void ff_hevc_base_layer_compare(struct HEVCContext *s, int decoded);
++/** A slice whose collocated picture has no motion field (after its lists are
++ * made): gives the separate decoder up, returns 1 */
++int  ff_hevc_base_layer_check_slice(struct HEVCContext *s);
++/** The separate decoder: give a base-layer picture it decoded, at once */
++int  ff_hevc_base_layer_give(struct HEVCContext *s, struct HEVCFrame *f);
++/** The end of a packet: drop what the separate decoder gave for it. */
++void ff_hevc_base_layer_unit_reset(HEVCBaseLayerUnit *u);
++void ff_hevc_base_layer_flush(struct HEVCContext *s);
++void ff_hevc_base_layer_uninit(struct HEVCContext *s);
++/** The motion field of a picture is needed: whether it was not decoded */
++int  ff_hevc_base_layer_lacks_motion(const struct HEVCFrame *f);
++
++/**
++ * Copy a picture of the separate decoder, in memory, into a frame of this
++ * decoder: width x height samples of luma and the chroma of 4:2:0.
++ * dst is YUV420P, YUVJ420P or YUV420P10; src is the same format, NV12 (8 bits)
++ * or P010 (10 bits, in the high bits).
++ * @return 0, or AVERROR(ENOSYS) for formats or sizes it does not take
++ */
++int ff_hevc_base_layer_copy(AVFrame *dst, const AVFrame *src, int width, int height);
++
++/** The low six bits of the samples of a P010 picture, ORed (0 for a 10-bit picture) */
++unsigned ff_hevc_base_layer_p010_low_bits(const AVFrame *src, int width, int height);
++
++#endif /* AVCODEC_HEVC_BASELAYER_H */
+diff --git a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+index b67e64b..0cf7bc3 100644
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -734,6 +734,11 @@ static enum AVPixelFormat get_format(HEVCContext *s, const HEVCSPS *sps)
+         break;
+     }
+ 
++    // with a separate decoder of the base layer, the device of hw_device_ctx is
++    // its own: this one decodes in software
++    if (s->base_layer_decoder != HEVC_BASE_LAYER_SAME)
++        fmt = pix_fmts;
++
+     if (alpha_fmt != AV_PIX_FMT_NONE)
+         *fmt++ = alpha_fmt;
+     *fmt++ = sps->pix_fmt;
+@@ -3211,6 +3216,12 @@ static int decode_slice_data(HEVCContext *s, const HEVCLayerContext *l,
+     if (s->avctx->hwaccel)
+         return FF_HW_CALL(s->avctx, decode_slice, nal->raw_data, nal->raw_size);
+ 
++    // the samples of this base-layer picture come from the separate decoder
++    if (s->cur_frame->separate)
++        return 0;
++    if (s->base_layer)
++        ff_hevc_base_layer_check_slice(s);
++
+     if (ff_decode_skip_all_pixels(s->avctx))
+         return 0;
+ 
+@@ -3559,6 +3570,15 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+     if (ret < 0)
+         goto fail;
+ 
++    // the base layer by a separate decoder: how it is decoded in this access
++    // unit, and whether a picture above it can be
++    if (s->base_layer) {
++        if (l == &s->layers[0])
++            ff_hevc_base_layer_choose(s);
++        else
++            ff_hevc_base_layer_check_upper(s);
++    }
++
+     if (s->cur_frame->needs_fg &&
+         (s->sei.common.film_grain_characteristics && s->sei.common.film_grain_characteristics->present &&
+          !ff_h274_film_grain_params_supported(s->sei.common.film_grain_characteristics->model_id,
+@@ -3605,9 +3625,22 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
+         s->finish_setup_nal_idx = find_finish_setup_nal(s);
+         // setup ends at a later layer's first slice: hold back the slice data
+         // until then, so the next frame thread does not wait for this picture
++        // (nothing to hold back where its samples come from the separate decoder)
+         s->defer_slices = s->avctx->active_thread_type == FF_THREAD_FRAME &&
+                           !s->avctx->hwaccel &&
++                          s->base_mode != HEVC_BASE_LAYER_USED &&
+                           s->finish_setup_nal_idx > nal_idx;
++
++        // with a separate decoder of the base layer: the picture is all intra
++        // as far as its slice headers read before setup ends say (decode_slice()),
++        // so that the frame threads that copy it see it settled; one with a
++        // slice after that is not taken for all intra
++        if (s->base_layer) {
++            for (unsigned i = nal_idx; i < s->pkt.nb_nals; i++)
++                if (s->pkt.nals[i].nuh_layer_id == 0 && s->pkt.nals[i].type <= HEVC_NAL_RSV_VCL31 &&
++                    i >= s->finish_setup_nal_idx)
++                    s->cur_frame->intra = 0;
++        }
+     }
+ 
+     if (s->defer_slices) {
+@@ -3894,10 +3927,11 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+ 
+     // switching to a new layer, mark previous layer's frame (if any) as done
+     // (a deferred picture is marked when its data has been decoded)
++    // (and one from the separate decoder when its picture has been copied in)
+     if (s->cur_layer != layer_idx &&
+         s->layers[s->cur_layer].cur_frame &&
+         s->avctx->active_thread_type == FF_THREAD_FRAME &&
+-        !s->defer_slices)
++        !s->defer_slices && !s->base_fill_pending)
+         ff_progress_frame_report(&s->layers[s->cur_layer].cur_frame->tf, INT_MAX);
+ 
+     s->cur_layer = layer_idx;
+@@ -3924,6 +3958,18 @@ static int decode_slice(HEVCContext *s, unsigned nal_idx, GetBitContext *gb)
+         return AVERROR_INVALIDDATA;
+     }
+ 
++    // (the separate base-layer decoder's own pictures, and this decoder's base
++    // pictures while setup lasts: see hevc_frame_start())
++    if (s->sh.slice_type != HEVC_SLICE_I &&
++        (s->base_layer_feeder ||
++         (s->base_layer && layer_idx == 0 && nal_idx < s->finish_setup_nal_idx)))
++        s->cur_frame->intra = 0;
++
++    // the picture of the separate decoder goes in before the layer above it
++    // decodes, once setup has ended
++    if (s->base_fill_pending && layer_idx > 0)
++        ff_hevc_base_layer_fill(s);
++
+     if (s->defer_slices)
+         return defer_slice(s, layer_idx, nal_idx, gb);
+ 
+@@ -4077,6 +4123,9 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+     s->slice_initialized = 0;
+     s->defer_slices = 0;
+     s->nb_deferred = 0;
++    s->base_mode = HEVC_BASE_LAYER_INTERNAL;
++    s->base_pic = -1;
++    s->base_fill_pending = 0;
+     if (s->last_eos)
+         decode_reset_recovery_point(s);
+ 
+@@ -4184,12 +4233,18 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
+     }
+ 
+ fail:
++    if (s->base_fill_pending)
++        ff_hevc_base_layer_fill(s);
++
+     if (s->nb_deferred) {
+         int err = decode_deferred_slices(s);
+         if (ret >= 0)
+             ret = err;
+     }
+ 
++    if (s->base_mode == HEVC_BASE_LAYER_CHECKED)
++        ff_hevc_base_layer_compare(s, ret >= 0);
++
+     for (int i = 0; i < FF_ARRAY_ELEMS(s->layers); i++) {
+         HEVCLayerContext *l = &s->layers[i];
+ 
+@@ -4198,6 +4253,8 @@ fail:
+ 
+         if (ret >= 0)
+             ret = hevc_frame_end(s, l);
++        if (ret >= 0 && s->base_layer_feeder && !i)
++            ret = ff_hevc_base_layer_give(s, l->cur_frame);
+ 
+         if (s->avctx->active_thread_type == FF_THREAD_FRAME)
+             ff_progress_frame_report(&l->cur_frame->tf, INT_MAX);
+@@ -4283,6 +4340,9 @@ static int hevc_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+                    old, s->dovi_ctx.cfg.dv_profile);
+     }
+ 
++    if (s->base_layer)
++        ff_hevc_base_layer_feed(s, avpkt);
++
+     ret    = decode_nal_units(s, avpkt->data, avpkt->size);
+     if (ret < 0)
+         return ret;
+@@ -4324,6 +4384,8 @@ static int hevc_ref_frame(HEVCFrame *dst, const HEVCFrame *src)
+     dst->flags      = src->flags;
+ 
+     dst->base_layer_frame = src->base_layer_frame;
++    dst->separate         = src->separate;
++    dst->intra            = src->intra;
+ 
+     av_refstruct_replace(&dst->hwaccel_picture_private,
+                           src->hwaccel_picture_private);
+@@ -4378,6 +4440,8 @@ static av_cold int hevc_decode_free(AVCodecContext *avctx)
+ 
+     ff_hevc_reset_sei(&s->sei);
+ 
++    ff_hevc_base_layer_uninit(s);
++
+     return 0;
+ }
+ 
+@@ -4580,6 +4644,14 @@ static av_cold int hevc_decode_init(AVCodecContext *avctx)
+ 
+     atomic_init(&s->wpp_err, 0);
+ 
++    s->base_pic = -1;
++    if (s->base_layer_decoder != HEVC_BASE_LAYER_SAME && !s->base_layer_feeder &&
++        ff_thread_sync_ref(avctx, offsetof(HEVCContext, base_layer)) != FF_THREAD_IS_COPY) {
++        ret = ff_hevc_base_layer_alloc(s);
++        if (ret < 0)
++            return ret;
++    }
++
+     if (!avctx->internal->is_copy) {
+         const AVPacketSideData *sd;
+ 
+@@ -4611,6 +4683,7 @@ static av_cold void hevc_decode_flush(AVCodecContext *avctx)
+     av_buffer_unref(&s->rpu_buf);
+     s->eos = 1;
+     s->skipping_frame = 0;
++    ff_hevc_base_layer_flush(s);
+ 
+     if (FF_HW_HAS_CB(avctx, flush))
+         FF_HW_SIMPLE_CALL(avctx, flush);
+@@ -4636,6 +4709,18 @@ static const AVOption options[] = {
+         { "unspecified", .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_UNSPEC }, .unit = "view_pos" },
+         { "left",        .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_LEFT },   .unit = "view_pos" },
+         { "right",       .type = AV_OPT_TYPE_CONST, .default_val = { .i64 = AV_STEREO3D_VIEW_RIGHT },  .unit = "view_pos" },
++    { "base_layer_decoder", "Decoder of the base layer when more layers are decoded",
++        OFFSET(base_layer_decoder), AV_OPT_TYPE_INT, { .i64 = HEVC_BASE_LAYER_SAME },
++        HEVC_BASE_LAYER_SAME, HEVC_BASE_LAYER_SEPARATE_SEMIPLANAR, PAR, .unit = "base_layer_decoder" },
++        { "same",       "this decoder", 0, AV_OPT_TYPE_CONST, { .i64 = HEVC_BASE_LAYER_SAME },
++            .flags = PAR, .unit = "base_layer_decoder" },
++        { "separate",   "a second decoder, on the device of hw_device_ctx where one is set, "
++                        "checked against this one", 0, AV_OPT_TYPE_CONST,
++            { .i64 = HEVC_BASE_LAYER_SEPARATE }, .flags = PAR, .unit = "base_layer_decoder" },
++        { "separate_semiplanar", "a second decoder in software, its pictures repacked as NV12 "
++                        "or P010 first (to test the path of hardware pictures)", 0,
++            AV_OPT_TYPE_CONST, { .i64 = HEVC_BASE_LAYER_SEPARATE_SEMIPLANAR }, .flags = PAR,
++            .unit = "base_layer_decoder" },
+ 
+     { NULL },
+ };
+diff --git a/libavcodec/hevc/hevcdec.h b/libavcodec/hevc/hevcdec.h
+index d309d05..293d34f 100644
+--- a/libavcodec/hevc/hevcdec.h
++++ b/libavcodec/hevc/hevcdec.h
+@@ -36,6 +36,7 @@
+ #include "libavcodec/progressframe.h"
+ #include "libavcodec/videodsp.h"
+ 
++#include "baselayer.h"
+ #include "dsp.h"
+ #include "hevc.h"
+ #include "pred.h"
+@@ -386,6 +387,13 @@ typedef struct HEVCFrame {
+      * A combination of HEVC_FRAME_FLAG_*
+      */
+     uint8_t flags;
++
++    // its samples came from the separate base-layer decoder (baselayer.h): its
++    // motion field was not decoded
++    uint8_t separate;
++    // every slice of it is intra (kept only with a separate base-layer decoder,
++    // for base pictures, see hevc_frame_start())
++    uint8_t intra;
+ } HEVCFrame;
+ 
+ typedef struct HEVCLocalContext {
+@@ -616,6 +624,16 @@ typedef struct HEVCContext {
+ 
+     AVBufferRef *rpu_buf;       ///< 0 or 1 Dolby Vision RPUs.
+     DOVIContext dovi_ctx;       ///< Dolby Vision decoding context
++
++    // the base layer decoded by a separate decoder (baselayer.h)
++    int base_layer_decoder;             ///< AVOption, HEVC_BASE_LAYER_*
++    int base_layer_feeder;              ///< this is that decoder
++    struct HEVCBaseLayer *base_layer;   ///< RefStruct reference, shared by the frame threads
++    HEVCBaseLayerUnit base_unit;        ///< what it gave for the packet being decoded
++    enum HEVCBaseLayerMode base_mode;   ///< of the access unit being decoded
++    int base_pic;                       ///< index of its picture in base_unit, or -1
++    int base_fill_pending;              ///< its picture is still to be copied in
++    AVFrame *base_compare;
+ } HEVCContext;
+ 
+ /**
+diff --git a/libavcodec/hevc/refs.c b/libavcodec/hevc/refs.c
+index 84418d2..9e26401 100644
+--- a/libavcodec/hevc/refs.c
++++ b/libavcodec/hevc/refs.c
+@@ -169,6 +169,9 @@ static HEVCFrame *alloc_frame(HEVCContext *s, HEVCLayerContext *l)
+             goto fail;
+         frame->nb_rpl_elems = s->pkt.nb_nals;
+ 
++        frame->separate = 0;
++        frame->intra    = 1;
++
+         frame->tab_mvf = av_refstruct_pool_get(l->tab_mvf_pool);
+         if (!frame->tab_mvf)
+             goto fail;
+@@ -304,7 +307,8 @@ int ff_hevc_output_frames(HEVCContext *s,
+              (nb_dpb[0] > max_dpb || nb_dpb[1] > max_dpb))) {
+             HEVCFrame *frame = &s->layers[min_layer].DPB[min_idx];
+             AVFrame *f = frame->needs_fg ? frame->frame_grain : frame->f;
+-            int output = !discard && (layers_active_output & (1 << min_layer));
++            int output = !discard && !s->base_layer_feeder &&
++                         (layers_active_output & (1 << min_layer));
+ 
+             if (output) {
+                 if (frame->flags & HEVC_FRAME_FLAG_CORRUPT)

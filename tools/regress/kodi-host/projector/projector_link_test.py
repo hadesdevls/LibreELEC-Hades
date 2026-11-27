@@ -388,6 +388,28 @@ s.stop()
 check([failure(x) for x in r[1:]] == ['not available with this protocol'] * 2 and
       not any(c[0] == 'op' for c in s.commands), 'JVC: a memory or a mode it has not is not sent (%s)' % r)
 
+# Hades 1.2.3: the anamorphic mode, INVS of JVC's External Command Communication Specification (NZ800/NZ900 Ver. 2.0,
+# table 4-58): "0" Off, "1" A, "2" B, "3" C, "4" D; after a lens memory in the same talk, as the control sends it
+s = Jvc()
+r, v, logs, out = cli('jvc', s.port, '', 'open', 'lens=2', 'anamorphic=1', 'anamorphic=0', 'anamorphic=4')
+s.stop()
+check([failure(x) for x in r] == ['done'] * 5, 'JVC: open, a lens memory, then anamorphic A, Off and D, done (%s)' % r)
+check([c[1] for c in s.commands if c[0] == 'op'] == ['INML1', 'INVS1', 'INVS0', 'INVS4'],
+      'JVC: INML1, then INVS1, INVS0 and INVS4 (%s)' % s.commands)
+check(b'!\x89\x01INVS1\n' in s.got() and s.connections == 1, 'JVC: the bytes of INVS1, on the one connection')
+s = Jvc()
+r, v, logs, out = cli('jvc', s.port, '', 'open', 'anamorphic=5', 'anamorphic=-1')
+s.stop()
+check([failure(x) for x in r[1:]] == ['not available with this protocol'] * 2 and
+      not any(c[0] == 'op' for c in s.commands), 'JVC: a value past D, or none, is not sent (%s)' % r)
+for kind, sim in (('adcp', Adcp), ('sdcp', Sdcp), ('epson', Epson)):
+    s = sim()
+    r, v, logs, out = cli(kind, s.port, '', 'open', 'anamorphic=1')
+    s.stop()
+    sent = [c for c in s.commands if c[0] in ('cmd', 'req') and 'power' not in str(c) and c[2:3] != (0x0102,)]
+    check(failure(r[-1]) == 'not available with this protocol' and not sent,
+          '%s: no anamorphic command, nothing sent for it (%s)' % (kind, r[-1]))
+
 # ---------------------------------------------------------------------------------------------- Sony ADCP
 s = Adcp()
 r, v, logs, out = cli('adcp', s.port, '', 'open', 'power', 'model', 'lens=2', 'mode=1')

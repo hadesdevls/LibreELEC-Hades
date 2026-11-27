@@ -28,19 +28,25 @@
 #            elsewhere, both views carry the metadata of the RPU, Kodi's packer keeps them on the picture of the two,
 #            the views are those of the same file without the RPU; and its mutants (profile 20 always one view, as before; the packer
 #            dropping the metadata)
-#   threads  frame threading of two layers (ffmpeg-9974, 9975): FFmpeg of this tree with and without them, every picture
+#   threads  frame threading of two layers (ffmpeg-9974, 9975, 9978, 9979): FFmpeg of this tree with and without them, every picture
 #            (mvhevc_frames.c) with 1 to 16 frame threads against the one without it with 1 thread, on the conformance
 #            streams, files, seeks, two x265 streams, streams made by mvhevc_au.py and the 22 single-layer HEVC
-#            conformance streams of FATE; where the slices of the base layer wait; and its mutants (stage_threads)
+#            conformance streams of FATE, and those with a PPS again after the first slice; where the slices of the
+#            base layer wait; and its mutants (stage_threads)
+#   base     the base layer by a separate decoder (ffmpeg-9976, base_layer_decoder): FFmpeg of this tree with and without
+#            it, the separate decoder in software standing in for a graphics card's (and repacked as NV12/P010 as a
+#            card gives them): every picture of FFmpeg without it with 1 thread, 1-16 threads, on the streams of
+#            threads and more (a stream of twenty times A, MP4 files, seeks); damaged streams with cleared buffers;
+#            injected faults of the separate decoder (fault_separate.py); and the mutants of its checks
 # Settings (environment):
 #   MVHEVC_WORK    the work folder (required; nothing is written anywhere else)
 #   MVHEVC_KODI    the Kodi tree under test (read only; required)
 #   MVHEVC_ITU     the folder with the nine MVHEVCS_*.zip (required)
 #   MVHEVC_FFMPEG  the FFmpeg release tarball (required); MVHEVC_FFMPEG_SHA256 its SHA256 (default: ffmpeg-9.1.tar.xz)
 #   MVHEVC_RPU     for p20: profile5.bin of dovi_tool's test assets (MIT, quietvoid; dovi_tool 614c816b, SHA256 below)
-#   MVHEVC_INPUTS  for threads: folders of inputs named by SHA256 (default REGRESS_INPUTS): the two x265 streams below and
+#   MVHEVC_INPUTS  for threads and base: folders of inputs named by SHA256 (default REGRESS_INPUTS): the two x265 streams below and
 #                  the single-layer conformance streams that ../ffmpeg/inputs-ffmpeg.tsv lists
-#   MVHEVC_LE      for threads: the LibreELEC tree whose FFmpeg patches are built (default: the one of this runner)
+#   MVHEVC_LE      for threads and base: the LibreELEC tree whose FFmpeg patches are built (default: the one of this runner)
 #   MVHEVC_JOBS    for threads: jobs at once (default 8)
 # usage: run-mvhevc.sh all | <stage>...     Prints MVHEVC PASSED or MVHEVC FAILED (n) at the end.
 set -uo pipefail
@@ -212,6 +218,24 @@ stage_choice() {
   try_choice inband-no-end '  return search.packets >= IN_BAND_PACKETS ? InBand::NOT_THERE : InBand::LOOKING;' '  return InBand::LOOKING;'
   try_choice nvdec-old-driver '  if (*driverSeries < NVDEC_TWO_VIEWS_DRIVER)' '  if (false)'
   try_choice nvdec-against-setting '  if (!hardwareAllowed)' '  if (!hardwareAllowed && false)'
+  try_choice hybrid-against-setting '         : !hardwareAllowed                              ? HybridBase::NOT_ALLOWED' '         : !hardwareAllowed && false                     ? HybridBase::NOT_ALLOWED'
+  try_choice hybrid-over-nvdec '         : nvdecAsked                                    ? HybridBase::NVDEC' '         : nvdecAsked && false                           ? HybridBase::NVDEC'
+  try_choice hybrid-after-failure '         : failedBefore                                  ? HybridBase::FAILED_BEFORE' '         : failedBefore && false                         ? HybridBase::FAILED_BEFORE'
+  try_choice hybrid-setting-ignored '         : wanted == HYBRID_NEVER                        ? HybridBase::TURNED_OFF' '         : wanted == HYBRID_NEVER && false               ? HybridBase::TURNED_OFF'
+  try_choice hybrid-for-everyone '         : wanted == HYBRID_WHERE_SLOW && !processorSlow ? HybridBase::PROCESSOR_KEEPS_UP' '         : wanted == HYBRID_WHERE_SLOW && !processorSlow && false ? HybridBase::PROCESSOR_KEEPS_UP'
+  try_choice hybrid-default-always 'inline constexpr int HYBRID_DEFAULT = HYBRID_WHERE_SLOW;' 'inline constexpr int HYBRID_DEFAULT = HYBRID_ALWAYS;'
+  try_choice hybrid-tried-again '  return !hybridNow && !hybridTried && wouldBe == HybridBase::ASKED;' '  return !hybridNow && (!hybridTried || true) && wouldBe == HybridBase::ASKED;'
+  try_choice hybrid-no-reopen '    return state.separate || mode == "separate" ? HybridStep::REOPEN : HybridStep::GIVEN_UP;' '    return HybridStep::GIVEN_UP;'
+  try_choice hybrid-reopen-always '    return state.separate || mode == "separate" ? HybridStep::REOPEN : HybridStep::GIVEN_UP;' '    return HybridStep::REOPEN;'
+  try_choice hybrid-given-up-picture-shown '    return state.separate || mode == "separate" ? HybridStep::REOPEN : HybridStep::GIVEN_UP;' '    return state.separate ? HybridStep::REOPEN : HybridStep::GIVEN_UP;'
+  try_choice hybrid-not-said '  if (mode == "separate" && !state.separate)' '  if (mode == "separate" && false)'
+  # the default of the setting is the one of the code (KODI::MULTIVIEW::HYBRID_DEFAULT)
+  local hd sd
+  hd=$(grep -o 'inline constexpr int HYBRID_DEFAULT = HYBRID_[A-Z_]*;' "$K/$M" | sed 's/.*= //; s/;//')
+  hd=$(grep -o "inline constexpr int $hd = [0-9]*;" "$K/$M" | sed 's/.*= //; s/;//')
+  sd=$(sed -n '/id="videoplayer.hades3dmvcbase"/,/<\/setting>/p' "$K/system/settings/settings.xml" | grep -o '<default>[0-9]*</default>' | tr -dc '0-9')
+  [ -n "$hd" ] && [ "$hd" = "$sd" ] && item choice-hybrid-default PASSED "videoplayer.hades3dmvcbase defaults to $sd, as HYBRID_DEFAULT" ||
+    item choice-hybrid-default FAILED "settings.xml $sd, HYBRID_DEFAULT $hd"
   try_choice disparity-sign '  return static_cast<int>(-steps * step);' '  return static_cast<int>(steps * step);'
 }
 
@@ -349,7 +373,14 @@ stage_p20() {
 # MP4 files of A and E and two seeks in each, two x265 streams of two views (MVHEVC_INPUTS: 8 bits, one slice a
 # picture, no WPP; 10 bits, four slices a picture and WPP), streams made of A, C, E, F and those by mvhevc_au.py (a
 # start in the middle of a GOP, the second view missing in ten access units and to the end), skip_frame, explode, the
-# base view alone, and the 22 single-layer HEVC conformance streams of FATE (MVHEVC_INPUTS). Where upstream itself
+# base view alone, and the 22 single-layer HEVC conformance streams of FATE (MVHEVC_INPUTS), and those of them with a
+# picture of more than one slice with their PPS sent again after its first slice (mvhevc_au.py latepps: setup ends at
+# a NAL unit of the base layer there; ffmpeg-9978 sets nothing aside then, as upstream; given as whole access units,
+# one packet each as in an MP4 or Matroska file, since FFmpeg's hevc parser would end an access unit at that PPS;
+# their pictures must be those of the original stream, and ffmpeg-9974 without 9978 sets them aside). ffmpeg-9979
+# (the POC of each layer's picture put back before its slices set aside are decoded) changes no picture of a
+# conforming stream, where every picture of an access unit has one POC; no stream here has layers that disagree, so
+# it has no mutant: these runs show only that it changes nothing else. Where upstream itself
 # gives other pictures with frame threads (D,
 # G, H, I; and the damaged streams: the base view missing in one access unit, a base-layer slice cut short or changed,
 # each decoded into cleared buffers, "zero"), the same pictures as the one without the patch with the same threads.
@@ -403,7 +434,8 @@ stage_threads() {
   ls "$LE"/projects/Generic/patches/ffmpeg/ffmpeg-9974-*.patch > /dev/null 2>&1 || { item threads FAILED "no ffmpeg-9974 in $LE"; return; }
   [ -s "$W/files/A.mp4" ] && [ -s "$W/files/E.mp4" ] || { item threads FAILED "no MP4 files: run the stage files first"; return; }
   rm -rf "$T" && mkdir -p "$TI"
-  { thr_build "$T/before" '^ffmpeg-997[45]-' > "$W/logs/threads-build-before.log" 2>&1 && thr_frames "$T/before" "$T/frames-before" &&
+  # (without 9976, 9978 and 9979 too, which are made on 9974; kept has them, 9976's option off)
+  { thr_build "$T/before" '^ffmpeg-997[45689]-' > "$W/logs/threads-build-before.log" 2>&1 && thr_frames "$T/before" "$T/frames-before" &&
     thr_build "$T/kept" '^$' > "$W/logs/threads-build-kept.log" 2>&1 && thr_frames "$T/kept" "$T/frames-kept"; } ||
     { item threads FAILED "the builds (logs/threads-build-*.log)"; return; }
   # the inputs: <label> <file> <views> [options]; "same" lines are compared with the same threads
@@ -442,6 +474,16 @@ stage_threads() {
   done >> "$L"
   grep -q '^MISSING' "$L" && { item threads FAILED "single-layer streams not in MVHEVC_INPUTS: $(grep -c '^MISSING' "$L")"; return; }
   [ $(($(wc -l < "$L") - n1)) = 22 ] || { item threads FAILED "not 22 single-layer conformance streams"; return; }
+  # the single-layer streams with a picture of more than one slice, their PPS sent again after its first slice
+  : > "$T/late.txt"
+  while read -r label f views extra; do
+    case $label in single-*) ;; *) continue ;; esac
+    m=$($A latepps "$f" "$TI/latepps-${label#single-}.aus") || { item threads FAILED "mvhevc_au.py latepps on $f"; return; }
+    if [ "${m%% *}" -gt 0 ]; then echo "single-latepps-${label#single-} $TI/latepps-${label#single-}.aus none" >> "$T/late.txt"
+    else rm -f "$TI/latepps-${label#single-}.aus"; fi
+  done < "$L"
+  [ "$(wc -l < "$T/late.txt")" -ge 3 ] || { item threads FAILED "$(wc -l < "$T/late.txt") single-layer streams with a picture of more than one slice"; return; }
+  cat "$T/late.txt" >> "$L"
   cat "$L" "$LS" > "$T/all.txt"
   thr_run "$T/frames-before" "$L" "$T/before" 1 1
   thr_run "$T/frames-before" "$LS" "$T/before" 1 1 2 4 8 16
@@ -458,7 +500,7 @@ stage_threads() {
       done
     done
   done < "$T/all.txt"
-  [ $bad = 0 ] && item threads PASSED "$total runs of $(wc -l < "$T/all.txt") streams with 1-16 threads: the pictures of the decoder without ffmpeg-9974 and 9975 with 1 thread ($(wc -l < "$LS") with the same threads, where upstream depends on them)" ||
+  [ $bad = 0 ] && item threads PASSED "$total runs of $(wc -l < "$T/all.txt") streams with 1-16 threads: the pictures of the decoder without ffmpeg-9974 to 9976 and 9978 with 1 thread ($(wc -l < "$LS") with the same threads, where upstream depends on them)" ||
     item threads FAILED "$bad of $total runs"
   # the kept path is taken where it is meant to and nowhere else
   bad=0
@@ -473,13 +515,18 @@ stage_threads() {
     done
     grep -q '^deferred 0 0$' "$T/kept/$x.1.1.err" || { echo "$x: kept with 1 thread"; bad=$((bad + 1)); }
   done
-  for x in unset-A $(grep '^single-' "$L" | cut -d' ' -f1); do
+  for x in unset-A $(grep -h '^single-' "$L" "$LS" | cut -d' ' -f1); do
     grep -q '^deferred 0 0$' "$T/kept/$x.8.1.err" || { echo "$x: kept"; bad=$((bad + 1)); }
+  done
+  # the streams with their PPS again: the pictures of the original stream, upstream with 1 thread (their MD5 in order)
+  for x in $(cut -d' ' -f1 "$T/late.txt"); do
+    cmp -s <(grep '^frame' "$T/before/single-${x#single-latepps-}.1.1.txt" | awk '{print $NF}') \
+      <(grep '^frame' "$T/before/$x.1.1.txt" | awk '{print $NF}') || { echo "$x: not the original's pictures"; bad=$((bad + 1)); }
   done
   [ $bad = 0 ] && item threads-kept PASSED "slices set aside in every plain AU with 2-16 threads (all their slices), never with 1 thread or one layer" ||
     item threads-kept FAILED "$bad"
   # the mutants: the tree's FFmpeg with one edit in hevcdec.c, rebuilt, on the streams of two views, 1 and 8 threads
-  grep -E '^(itu-[ACEF]|x265-|midgop-N8|dropview-S10|seek50-A) ' "$L" > "$T/mut.txt"
+  grep -h -E '^(itu-[ACEF]|x265-|midgop-N8|dropview-S10|seek50-A|single-latepps-[^ ]*) ' "$L" "$LS" > "$T/mut.txt"
   try_threads() { # <name> <old> <new>
     local M=$T/mut-$1 out=0
     rm -rf "$M" && cp -a "$T/kept" "$M"
@@ -496,7 +543,12 @@ PY
       { item "threads-mutant-$1" FAILED "does not build"; rm -rf "$M"; return; }
     thr_run "$M/frames" "$T/mut.txt" "$M/out" 2 1 8
     while read -r label f views extra; do
-      for x in 1.1 8.1 8.2; do cmp -s "$T/before/$label.1.1.txt" "$M/out/$label.$x.txt" || out=$((out + 1)); done
+      # (against upstream with 1 thread, or with the same threads where the list of those says so)
+      for x in 1.1 8.1 8.2; do
+        want=$T/before/$label.1.1.txt
+        grep -q "^$label " "$LS" && want=$T/before/$label.${x%.*}.1.txt
+        cmp -s "$want" "$M/out/$label.$x.txt" || out=$((out + 1))
+      done
       # (and the access units and slices kept, as the tree's FFmpeg keeps them)
       [ "$(grep -h '^deferred' "$M/out/$label.8.1.err")" = "$(grep -h '^deferred' "$T/kept/$label.8.1.err")" ] || out=$((out + 1))
     done < "$T/mut.txt"
@@ -505,12 +557,264 @@ PY
     rm -rf "$M"
   }
   try_threads never-kept '        s->defer_slices = s->avctx->active_thread_type == FF_THREAD_FRAME &&' '        s->defer_slices = 0 && s->avctx->active_thread_type == FF_THREAD_FRAME &&'
+  # (ffmpeg-9978: a single-layer stream whose setup ends at a parameter set after the first slice set aside again)
+  try_threads single-layer-kept '                          s->finish_setup_nal_idx > nal_idx &&
+                          s->pkt.nals[s->finish_setup_nal_idx].nuh_layer_id > 0;' '                          s->finish_setup_nal_idx > nal_idx;'
   try_threads header-not-restored '        s->sh = d->sh;
         if (d->own_short_term_rps)' '        if (d->own_short_term_rps)'
   rm -rf "$T/mut-"*
 }
 
-[ "${1:-}" = all ] && set -- ffmpeg streams views files choice pack mkv note depth p20 threads
+# base: the base layer by a separate decoder (ffmpeg-9976, the option base_layer_decoder): FFmpeg of this tree with
+# and without it, built for the host (C only, offline), the separate decoder in software standing in for the graphics
+# card's. With 1, 2, 4, 8 and 16 frame threads (two runs of each above 1), and the separate decoder's pictures as they
+# are (separate) and repacked as a hardware decoder gives them in memory (separate_semiplanar: NV12, P010), every
+# picture must be the one of FFmpeg without ffmpeg-9976 with 1 thread, on: the ITU streams A-C, E and F, MP4 files of
+# A and E and two seeks in each, a stream of twenty times A and its MP4 file and a seek in it (with the windows of
+# pictures compared after the first 8), the two x265 streams, the streams of mvhevc_au.py that start in the middle of
+# a GOP or lose the second view, skip_frame, explode, and the 22 single-layer conformance streams and A without
+# view_ids (the separate decoder given up: one layer); D, G, H and I with the same threads as the one without it.
+# Damaged streams (the base view missing in one access unit, a base-layer slice cut short or changed): the parts of a
+# damaged picture that no slice decodes are what the picture buffer held, in the separate decoder too, so they are
+# compared with its buffers cleared as this decoder's are ("zero", zero_separate.py): the pictures of the one without
+# it with 1 thread (the separate decoder runs one thread, and upstream itself gives other pictures with frame threads
+# there). The separate decoder must have been used to the end in every stream of two views that is not damaged.
+# Faults of the separate decoder (fault_separate.py): a wrong picture among the first 8 and in a later window: the
+# pictures of the one without it, the fault found; a wrong picture after those (a control: it is used, as designed);
+# a picture missing, and one out of step: found, and every picture not marked corrupt the reference's; the second view
+# predicting its motion from the base picture (made to count so): found, the same; every picture wrong from a window
+# on, with the pictures set up meanwhile in flight (8 threads), and a copy into a frame that fails (also of 10 bits):
+# found, and every picture not marked corrupt the reference's (the pictures of the separate decoder returned after it
+# was given up are marked as they are returned). No sample of any picture above its bit depth. And the mutants of the
+# checks.
+BASE_FAULT_WINDOW=482
+stage_base() {
+  local T=$W/base TI=$W/base/in LE=${MVHEVC_LE:-$(cd "$HERE/../../.." && pwd)} A="python3 -I $HERE/mvhevc_au.py"
+  local f n x m t r b sum name label views extra want got bad=0 total=0 used=0 L LS LZ
+  [ "$(sha256sum "$FFT" | cut -c1-64)" = "$FFSHA" ] || { item base FAILED "$FFT is not $FFSHA"; return; }
+  ls "$LE"/projects/Generic/patches/ffmpeg/ffmpeg-9976-*.patch > /dev/null 2>&1 || { item base FAILED "no ffmpeg-9976 in $LE"; return; }
+  [ -s "$W/files/A.mp4" ] && [ -s "$W/files/E.mp4" ] || { item base FAILED "no MP4 files: run the stage files first"; return; }
+  rm -rf "$T" && mkdir -p "$TI"
+  # (without 9978 too, whose lines are made on 9976's)
+  { thr_build "$T/before" '^ffmpeg-997[68]-' > "$W/logs/base-build-before.log" 2>&1 && thr_frames "$T/before" "$T/frames-before" &&
+    thr_build "$T/kept" '^$' > "$W/logs/base-build-kept.log" 2>&1 && thr_frames "$T/kept" "$T/frames-kept"; } ||
+    { item base FAILED "the builds (logs/base-build-*.log)"; return; }
+  # a copy of the build with an edit of baselayer.c (a test-only one, or a mutant), rebuilt: base_variant <dir> <cmd...>
+  base_variant() {
+    local D=$1; shift
+    rm -rf "$D" && cp -a "$T/kept" "$D" && "$@" > "$D/edit.log" 2>&1 &&
+      (cd "$D" && nice -n 19 make -j"${MVHEVC_JOBS:-8}" > make-variant.log 2>&1) && thr_frames "$D" "$D/frames"
+  }
+  base_variant "$T/zero" python3 -I "$HERE/zero_separate.py" "$T/zero" || { item base FAILED "the zero build"; return; }
+
+  L=$T/list.txt; LS=$T/same.txt; LZ=$T/zero.txt; : > "$L"; : > "$LS"; : > "$LZ"
+  for n in A B C E F; do echo "itu-$n $S/MVHEVCS_$n.bit -1" >> "$L"; done
+  for n in D G H I; do echo "itu-$n $S/MVHEVCS_$n.bit -1" >> "$LS"; done
+  for n in A E; do
+    echo "mp4-$n $W/files/$n.mp4 -1" >> "$L"
+    echo "seek50-$n $W/files/$n.mp4 -1 seek 50" >> "$L"
+    echo "seek20-$n $W/files/$n.mp4 -1 seek 20" >> "$L"
+  done
+  for r in $(seq 20); do cat "$S/MVHEVCS_A.bit"; done > "$TI/long-A.bit"
+  "$P/bin/ffmpeg" -nostdin -hide_banner -loglevel error -y -fflags +genpts -r 24 -i "$TI/long-A.bit" -c copy -tag:v hvc1 \
+    -disposition:v:0 +multilayer "$TI/long-A.mp4" || { item base FAILED "long-A.mp4"; return; }
+  echo "long-A $TI/long-A.bit -1" >> "$L"; echo "longmp4-A $TI/long-A.mp4 -1" >> "$L"
+  echo "longseek-A $TI/long-A.mp4 -1 seek 60" >> "$L"
+  while read -r sum name; do
+    f=$(thr_find "$sum" hevc) || { item base FAILED "$name ($sum) is not in MVHEVC_INPUTS"; return; }
+    cp "$f" "$TI/$name"
+    echo "x265-${name%.hevc} $TI/$name -1" >> "$L"
+  done <<< "$X265SUMS"
+  for r in 1 2 3 4; do cat "$TI/mv8-1080-nowpp.hevc"; done > "$TI/long-N8.hevc"
+  "$P/bin/ffmpeg" -nostdin -hide_banner -loglevel error -y -fflags +genpts -r 24 -i "$TI/long-N8.hevc" -c copy -tag:v hvc1     -disposition:v:0 +multilayer "$TI/long-N8.mp4" || { item base FAILED "long-N8.mp4"; return; }
+  echo "longmp4-N8 $TI/long-N8.mp4 -1" >> "$L"
+  "$P/bin/ffmpeg" -nostdin -hide_banner -loglevel error -y -fflags +genpts -r 24 -i "$TI/mv10-1080-s4.hevc" -c copy -tag:v hvc1 \
+    -disposition:v:0 +multilayer "$TI/mv10.mp4" || { item base FAILED "mv10.mp4"; return; }
+  echo "mp4-S10 $TI/mv10.mp4 -1" >> "$L"
+  for x in A:$S/MVHEVCS_A.bit C:$S/MVHEVCS_C.bit E:$S/MVHEVCS_E.bit F:$S/MVHEVCS_F.bit N8:$TI/mv8-1080-nowpp.hevc \
+    S10:$TI/mv10-1080-s4.hevc; do
+    n=${x%%:*}; f=${x#*:}
+    { $A midgop "$f" "$TI/midgop-$n.bit" > /dev/null && $A dropview "$f" "$TI/dropview-$n.bit" 5 15 &&
+      $A dropview "$f" "$TI/dropview-tail-$n.bit" 20 1000 && $A dropbase "$f" "$TI/dropbase-$n.bit" 7 &&
+      $A cut "$f" "$TI/cut-$n.bit" 9 60 && $A cut "$f" "$TI/cut-early-$n.bit" 13 10 && $A flip "$f" "$TI/flip-$n.bit" 11; } ||
+      { item base FAILED "mvhevc_au.py on $f"; return; }
+    for m in midgop dropview dropview-tail; do echo "$m-$n $TI/$m-$n.bit -1" >> "$L"; done
+    for m in dropbase cut cut-early flip; do echo "$m-$n $TI/$m-$n.bit -1 zero" >> "$LZ"; done
+  done
+  echo "skipnonref-A $S/MVHEVCS_A.bit -1 skip 8" >> "$L"
+  echo "skipbidir-N8 $TI/mv8-1080-nowpp.hevc -1 skip 16" >> "$L"
+  echo "explode-A $S/MVHEVCS_A.bit -1 explode" >> "$L"
+  echo "unset-A $S/MVHEVCS_A.bit none" >> "$L"
+  n=$(wc -l < "$L")
+  grep 'fate-suite/hevc-conformance/' "$HERE/../ffmpeg/inputs-ffmpeg.tsv" | while IFS=$'\t' read -r sum _ name _; do
+    f=$(thr_find "$sum" bit) && echo "single-$(basename "$name" .bit) $f none" || echo "MISSING $name"
+  done >> "$L"
+  grep -q '^MISSING' "$L" && { item base FAILED "single-layer streams not in MVHEVC_INPUTS"; return; }
+  [ $(($(wc -l < "$L") - n)) = 22 ] || { item base FAILED "not 22 single-layer conformance streams"; return; }
+
+  # the references, then every run (one list of command lines, run MVHEVC_JOBS at once)
+  base_runs() { # <tool> <list> <out> <base mode or -> <threads...>
+    local tool=$1 list=$2 O=$3 mode=$4 label input views extra t r; shift 4
+    mkdir -p "$O"
+    while read -r label input views extra; do
+      for t in "$@"; do for r in 1 2; do
+        [ "$t" = 1 ] && [ "$r" = 2 ] && continue
+        [ "$mode" = - ] && [ "$r" = 2 ] && continue
+        echo "$tool $input $t $views${extra:+ $extra}$([ "$mode" = - ] || echo " base $mode") > $O/$label.$t.$r.txt 2> $O/$label.$t.$r.err"
+      done; done
+    done < "$list"
+  }
+  {
+    base_runs "$T/frames-before" "$L" "$T/ref" - 1
+    base_runs "$T/frames-before" "$LZ" "$T/ref" - 1
+    base_runs "$T/frames-before" "$LS" "$T/ref" - 1 2 4 8 16
+    for b in separate separate_semiplanar; do
+      base_runs "$T/frames-kept" "$L" "$T/$b" $b 1 2 4 8 16
+      base_runs "$T/frames-kept" "$LS" "$T/$b" $b 1 2 4 8 16
+      base_runs "$T/zero/frames" "$LZ" "$T/$b-zero" $b 1 2 4 8 16
+      base_runs "$T/frames-kept" "$LZ" "$T/$b-plain" $b 1 4 16
+    done
+  } | xargs -P "${MVHEVC_JOBS:-8}" -I{} sh -c 'timeout 900 {}'
+  for b in separate separate_semiplanar; do
+    while read -r label f views extra; do
+      for t in 1 2 4 8 16; do for r in 1 2; do
+        [ "$t" = 1 ] && [ "$r" = 2 ] && continue
+        total=$((total + 1))
+        want=$T/ref/$label.1.1.txt
+        grep -q "^$label " "$LS" && want=$T/ref/$label.$t.1.txt
+        got=$T/$b/$label.$t.$r
+        grep -q "^$label " "$LZ" && got=$T/$b-zero/$label.$t.$r
+        grep -q '^eof' "$want" || { echo "$label: the reference did not end"; bad=$((bad + 1)); continue; }
+        cmp -s "$want" "$got.txt" || { echo "$label $b $t/$r: other pictures"; bad=$((bad + 1)); continue; }
+        x=$(grep '^base ' "$got.err")
+        case $label in
+          single-* | unset-*) echo "$x" | grep -q 'separate 0 .* error only one layer is decoded$' ||
+            { echo "$label $b $t/$r: not given up as one layer: $x"; bad=$((bad + 1)); } ;;
+          itu-[ABCEF] | mp4-* | seek* | long* | x265-* | dropview* | midgop-[EFNS]*)
+            echo "$x" | grep -q -- ' error -$' && ! echo "$x" | grep -q '^base separate 0 ' && used=$((used + 1)) ||
+              { echo "$label $b $t/$r: the separate decoder was not used to the end: $x"; bad=$((bad + 1)); } ;;
+        esac
+      done; done
+    done < <(cat "$L" "$LS" "$LZ")
+    # damaged, the separate decoder's buffers as the pool left them: it ends, and the pictures before the damage are
+    # the reference's (what follows is the separate decoder's concealment, as it would be a graphics card's)
+    while read -r label f views extra; do
+      for t in 1 4 16; do
+        total=$((total + 1))
+        grep -q '^eof' "$T/$b-plain/$label.$t.1.txt" || { echo "$label $b plain $t: did not end"; bad=$((bad + 1)); }
+      done
+    done < "$LZ"
+  done
+  [ $bad = 0 ] && item base PASSED "$total runs: the pictures of FFmpeg without ffmpeg-9976 with 1 thread (same threads for D, G, H, I); the separate decoder used to the end in $used runs of two views; one layer: given up" ||
+    item base FAILED "$bad of $total runs"
+
+  # faults: base_fault <name> <kind> <n> <input label> <expect: same|samemarks|differ|flagged> <error ERE>
+  # (samemarks: with 1 thread the same; with 8 the same pictures, some marked corrupt: those of the separate decoder set up
+  # before it was given up and returned after; flagged: every picture not marked corrupt the reference's, paired by the
+  # timestamps of the input, so an input with timestamps)
+  bad=0
+  base_fault() {
+    local D=$T/fault-$1 kind=$2 n=$3 in=$4 expect=$5 ere=$6 t ok=1 out
+    base_variant "$D" python3 -I "$HERE/fault_separate.py" "$D" "$kind" "$n" || { item "base-fault-$1" FAILED "not built"; return; }
+    f=$(awk -v l="$in" '$1 == l {print $2}' "$L")
+    for t in 1 8; do
+      timeout 300 "$D/frames" "$f" $t -1 base separate_semiplanar > "$D/run.$t.txt" 2> "$D/run.$t.err"
+      x=$(grep '^base ' "$D/run.$t.err")
+      case $expect in
+        same) cmp -s "$T/ref/$in.1.1.txt" "$D/run.$t.txt" || { echo "fault $1 $t: other pictures"; ok=0; } ;;
+        samemarks) if [ $t = 1 ]; then cmp -s "$T/ref/$in.1.1.txt" "$D/run.$t.txt"; else
+            cmp -s <(sed 's/ corrupt$//' "$T/ref/$in.1.1.txt") <(sed 's/ corrupt$//' "$D/run.$t.txt"); fi ||
+          { echo "fault $1 $t: other pictures"; ok=0; } ;;
+        differ) cmp -s "$T/ref/$in.1.1.txt" "$D/run.$t.txt" && { echo "fault $1 $t: the same pictures"; ok=0; } ;;
+        flagged | inflight) out=$(python3 -I "$HERE/mvhevc_base_check.py" "$T/ref/$in.1.1.txt" "$D/run.$t.txt") ||
+          { echo "fault $1 $t: $out"; ok=0; } ;;
+      esac
+      # (inflight: with 8 threads some pictures of the separate decoder were set up before it was given up and returned
+      # after, and are marked: the case the marking is there for is exercised)
+      [ "$expect" = inflight ] && [ $t = 8 ] && ! echo "$x" | grep -E -q ' corrupt [1-9]' &&
+        { echo "fault $1 $t: no picture in flight was marked: $x"; ok=0; }
+      echo "$x" | grep -E -q -- "error $ere" || { echo "fault $1 $t: $x (want error $ere)"; ok=0; }
+      grep -q -x 'range 0' "$D/run.$t.err" || { echo "fault $1 $t: samples above the bit depth ($(grep '^range ' "$D/run.$t.err"))"; ok=0; }
+      echo "fault $1 $t: $x${out:+; $out}" >> "$W/logs/base-faults.txt"
+    done
+    [ $ok = 1 ] && item "base-fault-$1" PASSED "$kind at picture $n of $in: $expect" || item "base-fault-$1" FAILED "$kind $n"
+  }
+  : > "$W/logs/base-faults.txt"
+  base_fault checked flip 3 long-A same "its picture of POC [0-9]+ is not this decoder's"
+  base_fault window flip $BASE_FAULT_WINDOW long-A samemarks "its picture of POC [0-9]+ is not this decoder's"
+  base_fault used flip 200 long-A differ "-$"
+  base_fault missing drop 200 longmp4-A flagged "the separate decoder gave"
+  base_fault stale stale 200 longmp4-A flagged "the separate decoder gave"
+  base_fault inter inter 0 longmp4-N8 flagged "the layer above the base predicts its motion"
+  base_fault inflight flipfrom $BASE_FAULT_WINDOW longmp4-A inflight "its picture of POC [0-9]+ is not this decoder's"
+  base_fault fillfail fillfail 30 longmp4-A flagged "its picture of POC [0-9]+ could not be copied in"
+  base_fault fillfail10 fillfail 1 mp4-S10 flagged "its picture of POC [0-9]+ could not be copied in"
+
+  # mutants of the checks, each with the fault it is there for: base_mutant <name> <old> <new> <fault kind or -> <n>
+  # <input> <same or flagged> <the error ERE>: caught where the run does not give what the fault must give
+  base_mutant() {
+    local D=$T/mut-$1 out=0 t
+    base_variant "$D" python3 -I - "$D/libavcodec/hevc/baselayer.c" "$2" "$3" << 'PY' || { item "base-mutant-$1" FAILED "not applied"; return; }
+import sys
+p, old, new = sys.argv[1:4]
+t = open(p, encoding='utf-8').read()
+if t.count(old) != 1:
+    print('MUTANT NOT APPLIED: the text is there %d times: %r' % (t.count(old), old[:80]))
+    sys.exit(3)
+open(p, 'w', encoding='utf-8').write(t.replace(old, new))
+PY
+    if [ "$4" != - ]; then
+      python3 -I "$HERE/fault_separate.py" "$D" "$4" "$5" > /dev/null && (cd "$D" && make -j"${MVHEVC_JOBS:-8}" > make-fault.log 2>&1) &&
+        thr_frames "$D" "$D/frames" || { item "base-mutant-$1" FAILED "fault not applied"; return; }
+    fi
+    f=$(awk -v l="$6" '$1 == l {print $2}' "$L")
+    for t in 1 8; do
+      timeout 120 "$D/frames" "$f" $t -1 base separate_semiplanar > "$D/run.$t.txt" 2> "$D/run.$t.err"
+      # caught where what the fault (or none) must give is not given: its pictures, or its error
+      case $7 in
+        same) cmp -s "$T/ref/$6.1.1.txt" "$D/run.$t.txt" || { out=$((out + 1)); continue; } ;;
+        flagged) python3 -I "$HERE/mvhevc_base_check.py" "$T/ref/$6.1.1.txt" "$D/run.$t.txt" > /dev/null ||
+          { out=$((out + 1)); continue; } ;;
+      esac
+      grep '^base ' "$D/run.$t.err" | grep -E -q -- "error $8" || out=$((out + 1))
+      grep -q -x 'range 0' "$D/run.$t.err" || out=$((out + 1))
+    done
+    [ $out -gt 0 ] && item "base-mutant-$1" PASSED "caught: $out of 2 runs" || item "base-mutant-$1" FAILED "NOT CAUGHT"
+    rm -rf "$D"
+  }
+  E1="its picture of POC [0-9]+ is not this decoder's"
+  base_mutant fill-no-copy '        ff_hevc_base_layer_copy(f->f, s->base_unit.pic[s->base_pic].frame,
+                                sps->width, sps->height) < 0) {' '        0) {' - 0 itu-A same '-$'
+  base_mutant no-progress '        ff_progress_frame_report(&f->tf, INT_MAX);
+}' '        ;
+}' - 0 x265-mv8-1080-nowpp same '-$'
+  base_mutant compare-blind '    if (plane >= 0) {' '    if (0) {' flip 3 long-A same "$E1"
+  base_mutant trusted-at-once '    } else if (state == STATE_CHECKING) {' '    } else if (0) {' flip 3 long-A same "$E1"
+  base_mutant no-window '        bl->window_left  = HEVC_BASE_LAYER_WINDOW;' '        bl->window_left  = 0;' flip $BASE_FAULT_WINDOW long-A same "$E1"
+  base_mutant poc-blind 'if (u->pic[i].frame && u->pic[i].poc == s->poc) {' 'if (u->pic[i].frame) {' stale 200 longmp4-A flagged 'the separate decoder gave'
+  base_mutant motion-blind '    return col_lacks_motion(s);
+}' '    return 0;
+}' drop 200 longmp4-A flagged 'the separate decoder gave'
+  base_mutant returned-blind '    if (!atomic_load(&v->given_up))
+        return 0;' '    if (1)
+        return 0;' flipfrom $BASE_FAULT_WINDOW longmp4-A flagged "$E1"
+  base_mutant returned-blind-fill '    if (!atomic_load(&v->given_up))
+        return 0;' '    if (1)
+        return 0;' fillfail 30 longmp4-A flagged 'could not be copied in'
+  base_mutant fill-bytes '                if (sps->pixel_shift) {
+                    for (int x = 0; x < w; x++)
+                        AV_WN16(row + 2 * x, grey);
+                } else
+                    memset(row, grey, w);' '                memset(row, 0x80, w << sps->pixel_shift);' fillfail 1 mp4-S10 flagged 'could not be copied in'
+  base_mutant upper-blind '    if (s->base_mode == HEVC_BASE_LAYER_USED && picture_lacks_motion(s)) {' '    if (0) {' inter 0 longmp4-N8 flagged 'the layer above the base predicts its motion'
+  # (the motion field of a picture of the separate decoder cleared, ff_hevc_base_layer_fill(): no mutant; in the
+  # streams at hand a picture above the base takes the base picture of its access unit for its collocated one only
+  # where that picture is intra and its own references are all inter-layer, long-term, so no motion vector is taken
+  # from it whatever it holds; measured: leaving the field uncleared changes no picture of them)
+  rm -rf "$T/fault-"* "$T/zero" "$T/before" "$T/kept"
+}
+
+[ "${1:-}" = all ] && set -- ffmpeg streams views files choice pack mkv note depth p20 threads base
 : > "$W/logs/items.txt"
 for s in "$@"; do "stage_$s"; done
 rm -rf "$W/mut"

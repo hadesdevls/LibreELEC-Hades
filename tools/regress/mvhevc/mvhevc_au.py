@@ -20,6 +20,13 @@
 #                                inside the slice data the change keeps for later)
 #   flip <in> <out> <n>          every 7th byte of the payload of the last base-layer slice of access unit n inverted,
 #                                past its first 8 bytes (slice data that decodes to something else, or fails)
+#   latepps <in> <out.aus>       in each access unit with more than one base-layer slice, the last PPS of the base
+#                                layer sent before its first slice sent again right after that slice, the same bytes
+#                                (legal before the last slice of a picture, and FFmpeg keeps the PPS it has when one
+#                                comes again unchanged): setup ends at a NAL unit of the base layer after the first
+#                                slice, the case ffmpeg-9978 keeps on upstream's path; prints the access units changed.
+#                                Written as access units (.aus, mvhevc_frames.c), each one packet as in an MP4 or
+#                                Matroska file: FFmpeg's hevc parser ends an access unit at a PPS after a slice
 import sys
 
 VCL_MAX = 31
@@ -110,6 +117,14 @@ def write(path, data, units):
             f.write(b'\x00\x00\x00\x01' + data[s:e])
 
 
+def write_aus(path, data, aus):
+    """each access unit as its length (4 bytes, big endian) and its NAL units in Annex B"""
+    with open(path, 'wb') as f:
+        for au in aus:
+            b = b''.join(b'\x00\x00\x00\x01' + data[s:e] for (_, _, s, e) in au)
+            f.write(len(b).to_bytes(4, 'big') + b)
+
+
 def main():
     cmd, src = sys.argv[1], sys.argv[2]
     data = open(src, 'rb').read()
@@ -166,6 +181,24 @@ def main():
                 row.append((tt, ll, ss, ee))
             aus2.append(row)
         write(out, data2, [u for a in aus2 for u in a])
+    elif cmd == 'latepps':
+        out_aus, last, n = [], None, 0
+        for au in aus:
+            base = [k for k, u in enumerate(au) if is_slice(u[0]) and u[1] == 0]
+            first = base[0] if base else len(au)
+            for u in au[:first]:
+                if u[0] == 34 and u[1] == 0:
+                    last = u
+            if len(base) > 1 and last is not None:
+                out_aus.append(au[:first + 1] + [last] + au[first + 1:])
+                n += 1
+            else:
+                out_aus.append(au)
+            for u in au[first:]:
+                if u[0] == 34 and u[1] == 0:
+                    last = u
+        write_aus(out, data, out_aus)
+        print('%d access units with their PPS again after the first slice' % n)
     else:
         sys.exit('unknown command ' + cmd)
 

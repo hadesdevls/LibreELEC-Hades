@@ -7,6 +7,9 @@
 # and the flow of hades_check_ui.py with stand-ins for Kodi (xbmc, xbmcgui, xbmcaddon, oe, log): skipped where no
 # display takes 3D or the 3D output of Hades is off, the clip played with the settings it needs and every one put back,
 # frame packing taken or refused with its reason, and "Everything" with the card only where a display takes 3D.
+# LibreELEC-settings-9098: the driver asked first without a picture (Kodi's builtin HadesFramePackingCheck, a stand-in
+# here that answers as Kodi's FramePackingCheck() does): its answer read, said as the clip is announced and kept as a
+# result of its own before the clip's, a reason of the driver not said twice, and no answer said as such.
 # usage: check_fp_test.py <resources/lib of the add-on>
 import importlib
 import json
@@ -120,15 +123,26 @@ def rpc(method, **params):
     return True, None
 
 
+# (Kodi's HadesFramePackingCheck: the answer of the scripted ASK['answer'] put in the property of the Home window, as
+# the builtin does before executebuiltin(..., True) returns; an empty one: no answer at all)
+ASK = {'answer': None, 'calls': []}
+
+
+def executebuiltin(function, wait=False):
+    ASK['calls'].append((function, wait))
+    if function == 'HadesFramePackingCheck' and ASK['answer']:
+        Window.props['hades.check.fp.result'] = ASK['answer']
+
+
 xbmc = types.SimpleNamespace(Player=Player, getLocalizedString=lambda n: 'k%d' % n,
                              getInfoLabel=lambda k: '', getCondVisibility=lambda c: True,
-                             executeJSONRPC=None)
+                             executeJSONRPC=None, executebuiltin=executebuiltin)
 xbmcgui = types.SimpleNamespace(Dialog=Dialog, Window=Window, DialogProgress=None, DLG_YESNO_YES_BTN=11,
                                 DLG_YESNO_NO_BTN=10)
 xbmcaddon = types.SimpleNamespace(Addon=lambda n: None)
 LOG = []
 log = types.SimpleNamespace(INFO=1, WARNING=2, ERROR=3, log=lambda m, l=1: LOG.append((l, m)))
-oe = types.SimpleNamespace(_=lambda n: ('s%d %%s' % n) if n in (33853, 33854, 33855) else
+oe = types.SimpleNamespace(_=lambda n: ('s%d %%s' % n) if n in (33853, 33854, 33855, 34200, 34204, 34205) else
                            ('s%d %%s %%s' % n) if n == 33866 else 's%d' % n, xbmcm=Monitor())
 for name, mod in (('xbmc', xbmc), ('xbmcgui', xbmcgui), ('xbmcaddon', xbmcaddon), ('log', log), ('oe', oe)):
     sys.modules[name] = mod
@@ -263,6 +277,63 @@ try:
           'settings_changed=videoplayer.stereoscopicplaybackmode=1' in f and f.endswith('answer=halves'),
           'the line of the summary: %s' % f)
 
+    # ---- the driver asked first, without a picture (LibreELEC-settings-9098)
+    def answer(**kw):
+        a = {'result': 'notasked', 'declared': True, 'mode': '1920x1080@23.976', 'driver': 'nvidia-drm',
+             'window': 'none', 'windowwhy': '', 'own': 'none', 'ownwhy': '', 'draw': '', 'drawwhy': ''}
+        a.update(kw)
+        return json.dumps(a)
+    check(hc.FP_CHECK_BUILTIN == 'HadesFramePackingCheck' and hc.FP_CHECK_PROPERTY == 'hades.check.fp.result',
+          'the builtin and the property of Kodi (FramePackingCheck.h)')
+    check(hc.parse_fp_check(answer(result='taken'))['mode'] == '1920x1080@23.976' and
+          hc.parse_fp_check('') is None and hc.parse_fp_check('{not json') is None and
+          hc.parse_fp_check('[1]') is None and hc.parse_fp_check('{"result": "maybe"}') is None,
+          'the answer read; nothing, not JSON, not an object or an unknown result: none')
+    gpu = hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='gpu'))
+    copy = hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='copy',
+                                    drawwhy='EGL refused to import the buffer'))
+    win = hc.parse_fp_check(answer(result='taken', window='taken', own='taken', draw='gpu'))
+    check(hc.fp_check_lines(gpu, []) == [[('f', 34200, [('t', '1920x1080@23.976')])], [('s', 34201)]],
+          'taken in the dumb buffers drawn by the GPU: the mode, and how')
+    check(hc.fp_check_lines(copy, [])[1] == [('s', 34202)], 'taken in the dumb buffers that the processor copies into')
+    check(hc.fp_check_lines(win, [])[1] == [('s', 34203)], 'taken in the window kind of buffer: that one is said')
+    # (1.2.3: the block-linear buffers that the graphics card draws into, and the cost of the copy where Kodi measured it)
+    eyes = hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='gpu', buffers='blocklinear',
+                                    eyes='taken'))
+    timed = hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='copy', buffers='dumb',
+                                     eyes='refused', eyeswhy='Invalid argument', copyms=6.25))
+    check(hc.fp_check_lines(eyes, [])[1] == [('s', 34201)], 'taken in the block-linear buffers: drawn by the graphics card')
+    check(hc.fp_check_lines(timed, [])[1] == [('f', 34210, [('t', '6.2')])] or
+          hc.fp_check_lines(timed, [])[1] == [('f', 34210, [('t', '6.3')])],
+          'taken in the dumb buffers that the processor copies into, with what a picture costs')
+    check(hc.fp_check_lines(hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='copy',
+                                                     copyms=0.0)), [])[1] == [('s', 34202)] and
+          hc.fp_check_lines(hc.parse_fp_check(answer(result='taken', window='notmade', own='taken', draw='copy',
+                                                     copyms=True)), [])[1] == [('s', 34202)],
+          'a copy not measured: said without a cost')
+    tf = hc.fp_check_facts(timed, [])
+    check('buffers=dumb' in tf and 'eyes=refused' in tf and 'copyms=6.25' in tf and 'eyeswhy=Invalid argument' in tf and
+          'buffers=blocklinear' in hc.fp_check_facts(eyes, []), 'the summary says which buffers, and the cost: %s' % tf)
+    refused = hc.parse_fp_check(answer(result='refused', window='notmade', own='refused', ownwhy='Invalid argument'))
+    kreason = 'the framebuffer (2048x2205) has no NVKMS surface'
+    check(hc.fp_check_lines(refused, [kreason]) == [[('f', 34204, [('t', '1920x1080@23.976')])],
+                                                     [('f', 33855, [('t', kreason)])]],
+          'refused: the mode, and the reason of the driver from its kernel line')
+    check(hc.fp_check_lines(refused, [])[1] == [('f', 34205, [('t', 'Invalid argument')])],
+          'refused with no kernel line: what the test commit answered')
+    check(hc.fp_check_lines(hc.parse_fp_check(answer(result='refused')), [])[1] == [('s', 33865)],
+          'refused and nothing said: said so')
+    check(hc.fp_check_lines(hc.parse_fp_check(answer(result='nomode')), []) == [[('s', 34206)]] and
+          hc.fp_check_lines(hc.parse_fp_check(answer(result='nomode', declared=False)), []) == [[('s', 33852)]],
+          'no frame-packed mode: the display declares 3D or not')
+    check(hc.fp_check_lines(hc.parse_fp_check(answer(result='busy')), []) == [[('s', 34207)]] and
+          hc.fp_check_lines(hc.parse_fp_check(answer()), []) == [[('s', 34208)]] and
+          hc.fp_check_lines(None, []) == [[('s', 34209)]], 'a video playing, not asked, no answer from Kodi')
+    ff = hc.fp_check_facts(copy, [kreason])
+    check(ff.startswith('driver asked: result=taken, mode=1920x1080@23.976, driver=nvidia-drm, window=notmade, '
+                        'own=taken, draw=copy') and 'drawwhy=EGL refused' in ff and 'kernel=' + kreason in ff and
+          hc.fp_check_facts(None, []) == 'driver asked: no answer from Kodi', 'the summary of the answer: %s' % ff)
+
     # ---- the flow, with stand-ins for Kodi
     clips = os.path.join(work, 'clips')
     os.makedirs(clips)
@@ -278,7 +349,9 @@ try:
     hc.kernel_lines_since = lambda epoch, run=None: list(KERNEL_NEW)
     USER = {P: 0, F: 100, R: 0, hc.FP_OUTPUT: 1, 'other.setting': 7}
 
-    def run(script, stereo='fp', user=None, displays=True, kodi=(), kernel=()):
+    def run(script, stereo='fp', user=None, displays=True, kodi=(), kernel=(), asked=None, stale=None):
+        ASK['answer'] = answer(result='taken', window='notmade', own='taken', draw='gpu') if asked is None else asked
+        ASK['calls'].clear()
         SETTINGS.clear()
         SETTINGS.update(user or USER)
         Player.played.clear()
@@ -288,6 +361,8 @@ try:
         Window.props['hades.out.stereo'] = stereo
         Window.props['hades.out.mode'] = '1920x2205 23.976 Hz' if stereo == 'fp' else '1920x1080 23.976 Hz'
         Window.props['hades.sum.head'] = 'sdr'
+        if stale is not None:
+            Window.props['hades.check.fp.result'] = stale
         DISPLAYS[:] = [('HDMI-A-1', 'GSM 0x5B9E LG TV SSCR2')] if displays else []
         KODI_NEW[:], KERNEL_NEW[:] = list(kodi), list(kernel)
         c = ui.CheckSetup(clips, os.path.join(work, 'st%d' % len(LOG)))
@@ -302,12 +377,37 @@ try:
     check(c.results[-1]['lines'][0] == [('f', 33853, [('t', '1920x2205 23.976 Hz')])] and
           c.results[-1]['lines'][-1] == [('s', 33867)] and 'outcome=fp' in c.results[-1]['facts'] and
           'answer=3d' in c.results[-1]['facts'], 'frame packing taken, seen in 3D: %s' % c.results[-1]['facts'])
+    check(ASK['calls'] == [('HadesFramePackingCheck', True)] and len(c.results) == 2 and
+          c.results[0]['lines'] == [[('f', 34200, [('t', '1920x1080@23.976')])], [('s', 34201)]] and
+          c.results[0]['facts'] == 'frame packing, driver asked: result=taken, mode=1920x1080@23.976, '
+                                   'driver=nvidia-drm, window=notmade, own=taken, draw=gpu',
+          'the driver asked once, waited for, before the clip: a result of its own before the clip\'s, in the '
+          'summary: %s' % c.results[0]['facts'])
+    oks = [d for d in Dialog.shown if d[0] == 'ok']
+    check(oks and oks[0][2].startswith('s34200 1920x1080@23.976') and oks[0][2].endswith('s33851'),
+          'what the driver answered said as the clip is announced: %r' % (oks[:1],))
     c = run([('select', 1)], stereo='tab', kodi=kodi[:1], kernel=kernel)
     lines = c.results[-1]['lines']
     check(lines[0] == [('f', 33854, [('s', 33861)])] and [('f', 33855, [('t', why[0][1])])] in lines and
           [('f', 33855, [('t', why[2][1])])] in lines and lines[-1] == [('s', 33868)] and SETTINGS == USER,
           'refused: top and bottom, why from Kodi and the driver, the two halves seen, the settings back')
     check('s33855 the framebuffer of plane 0' in Dialog.shown[-1][2], 'the result shown, with the reason')
+    # refused without a picture too: the driver's reason said with that answer, and not again for the clip
+    c = run([('select', 1)], stereo='tab', kodi=kodi[:1], kernel=kernel,
+            asked=answer(result='refused', window='notmade', own='refused', ownwhy='Invalid argument'))
+    lines = c.results[-1]['lines']
+    asked = c.results[-2]['lines']
+    dr = [('f', 33855, [('t', why[2][1])])]
+    check(asked == [[('f', 34204, [('t', '1920x1080@23.976')])], dr] and dr not in lines and
+          [('f', 33855, [('t', why[0][1])])] in lines and lines[-1] == [('s', 33868)],
+          'refused without a picture: the reason of the driver said once, with that answer: %r %r' % (asked, lines))
+    # no answer from Kodi: said, and the clip as before
+    c = run([('select', 0)], asked='')
+    check(c.results[-2]['lines'] == [[('s', 34209)]] and len(Player.played) == 1 and
+          c.results[-2]['facts'] == 'frame packing, driver asked: no answer from Kodi', 'no answer from Kodi: said so')
+    # an answer of before, left in the property, is not taken for this one
+    c = run([('select', 0)], asked='', stale=answer(result='taken', window='taken'))
+    check(c.results[-2]['lines'] == [[('s', 34209)]], 'an answer of before is not taken for this one')
     c = run([('select', -1)], stereo='')
     check(c.results[-1]['lines'][0] == [('s', 33856)] and c.results[-1]['lines'][-1] == [('s', hc.S['no_answer'])],
           'no 3D output, the question closed')

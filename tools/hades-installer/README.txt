@@ -10,6 +10,8 @@ In this folder
   LibreELEC-Hades-Installer.exe  the installer: double-click it
   LibreELEC-...img.gz            the Hades image (there is no need to unpack it)
   LibreELEC-...img.gz.sha256     its checksum: with it the installer checks that the image arrived complete
+  SHA256SUMS, SHA256SUMS.sig     the list of the files of the release and its signature: with them the
+                                 installer checks that the image is the one LibreELEC Hades published
   LEEME.txt                      this same text, in Spanish
 
 What you need
@@ -67,7 +69,8 @@ Starting Hades from Windows, without the key
   not add or remove anything in its boot menu, and the order of that menu stays as it is.
 
 Updating to a new version
-  1. Put the new image (.img.gz and its .sha256) in this folder, or pick it with "Choose another...".
+  1. Put the new image (.img.gz and its .sha256, with SHA256SUMS and SHA256SUMS.sig of its release) in
+     this folder, or pick it with "Choose another...".
   2. Open the installer and choose the drive or the disk that already has Hades (it says so under its
      name: "has LibreELEC Hades"). The green button "Update LibreELEC Hades" appears.
   3. Updating replaces only the system. Your settings, your add-ons and whatever you have saved stay as

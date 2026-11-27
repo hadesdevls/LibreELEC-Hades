@@ -28,6 +28,10 @@
 #                start" with the letters of notice/font-*, and that line against the typeface itself
 #                (version_check.py); a picture.c that puts the picture one pixel off, and one that spaces the letters
 #                a pixel wider, must fail
+#   termfont     the frame of GRUB's editor of an entry drawn as gfxterm draws it with the terminal's font of every
+#                theme of the boot menu (term_font_test.py: packages/tools/grub/theme/hades, its theme.txt and
+#                fonts/mono-*.pf2): every line glyph fills its cell, the top and bottom lines and the sides straight and
+#                joined on every screen of the theme; a corner a row off and a line a column short must fail
 #   scripts      what boot-picture, kodi-display-notice and kodi-failed-notice ask hades-picture to draw, with a
 #                hades-picture of the test and the busybox of the image (picture_scripts_test.sh); scripts that do
 #                nothing must fail its 17 checks
@@ -77,6 +81,11 @@
 #                without a password, the button of the SSH password, Network access and its page of the wizard
 #                (LibreELEC-settings-9095 and 9096, with stand-ins for Kodi: services_settings_test.py); the same with
 #                9096 reversed, and with 9095 reversed, must fail, and so must each of its 5 mutations of the add-on
+#   flash        how the init mounts the boot partition (mount_flash of packages/sysutils/busybox/scripts/init): the
+#                wait, the USB controllers taken out of DMA translation for that start when it is not there (after the
+#                wait, or after a shorter one on a fault of the IOMMU for one of them), what is left translated and why, and what
+#                the screen says when it is not found, on a /sys of files like the laptop of issue 35 (flash_test.sh,
+#                with the busybox of the initramfs), and kernel.iommu_group_type_locked set once it is mounted, before /flash/post-flash.sh; each of its 16 mutations must fail a check
 # Not a stage (it needs an image and KVM): picture_race_qemu.sh, Kodi's "hades-picture release" that comes while a
 # picture of the start is being drawn, in QEMU (its head says what it checks).
 # Host test only: it writes under $REGRESS_WORK/boot and reads the tree at $REGRESS_LE_REF and the busybox of the build
@@ -84,7 +93,7 @@
 # usage: run-boot.sh all | verdict [<log>] | <stage>...       stages: menus today olderlook oldertext notice themeupdate installer picture
 #                                                              scripts netwait notreturned afternvidia nvidiasleep
 #                                                              sleepreport wake wakesettings logfilter netaccess
-#                                                              servicessettings
+#                                                              servicessettings flash
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../lib/regress.sh"
@@ -221,6 +230,15 @@ stage_installer() {
   rg_log "$L" bash "$HERE/installer_modprobe_test.sh" "$bb" "$O/$I" "$mr" "$kv"
   v=$(rg_fails "$L" 3 '^FAIL ')
   rg_item installer-modprobe.old "$(rg_say "$v")" "$(rg_rest "$v") (the init of $old)"
+}
+
+stage_termfont() {
+  local T=$RG_W/le-termfont L v
+  rg_le_tree "$T" packages/tools/grub/theme/hades || { rg_item term-font FAILED "the tree at $REGRESS_LE_REF"; return 1; }
+  L=$RG_W/logs/term-font.log
+  rg_log "$L" $RG_PY "$HERE/term_font_test.py" "$T/packages/tools/grub/theme/hades"
+  v=$(rg_pass "$L" '^term-font: [0-9]+ checks passed, 0 failed$' '^FAIL ')
+  rg_item term-font "$(rg_say "$v")" "$(rg_rest "$v")"
 }
 
 stage_picture() {
@@ -548,4 +566,24 @@ stage_wakesettings() {
   rg_rm $S/without
 }
 
-rg_main "menus today olderlook oldertext notice themeupdate installer picture scripts netwait notreturned afternvidia nvidiasleep sleepreport wake wakesettings logfilter netaccess servicessettings" "$@"
+# the boot partition in the init (flash_test.sh, with the busybox of the initramfs): the wait, the USB controllers taken
+# out of DMA translation when it is not there (after a shorter wait on a fault of the IOMMU), what the screen says when it
+# is not found, and the switch of the IOMMU before /flash/post-flash.sh; each of its 16 mutations must fail a check
+stage_flash() {
+  local bb L v m T=$RG_W/le-flash I=packages/sysutils/busybox/scripts/init
+  bb=${REGRESS_LE_BUILD:?set REGRESS_LE_BUILD to a LibreELEC build folder}/initramfs/usr/bin/busybox
+  rg_le_tree "$T" $I
+  if [ ! -x "$bb" ] || [ ! -f "$T/$I" ]; then
+    rg_item flash FAILED "no busybox of the initramfs, or no init at $REGRESS_LE_REF"; return 1
+  fi
+  L=$RG_W/logs/flash.log
+  rg_log "$L" bash "$HERE/flash_test.sh" "$bb" "$T/$I"
+  v=$(rg_pass "$L" '^FLASH PASSED$' '^  FAIL ')
+  rg_item flash "$(rg_say "$v")" "$(rg_rest "$v")"
+  for m in M1 M2 M3 M4 M5 M6 M7 M8 M9 M10 M11 M12 M13 M14 M15 M16; do
+    if grep -a -q "^mutation $m (.*) caught" "$L"; then rg_item flash.mut.$m PASSED "$(grep -a -m1 "^mutation $m " "$L" | cut -c1-150)"
+    else rg_item flash.mut.$m FAILED "$(grep -a -m1 "^mutation $m " "$L" || echo 'no line of it')"; fi
+  done
+}
+
+rg_main "menus today olderlook oldertext notice themeupdate installer picture termfont scripts netwait notreturned afternvidia nvidiasleep sleepreport wake wakesettings logfilter netaccess servicessettings flash" "$@"

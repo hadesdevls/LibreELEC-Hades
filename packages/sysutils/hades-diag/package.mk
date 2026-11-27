@@ -3,7 +3,7 @@
 # boot/DIAG-OFF.TXT is that switch as an image carries it (scripts/image, scripts/mkimage).
 
 PKG_NAME="hades-diag"
-PKG_VERSION="30"
+PKG_VERSION="31"
 PKG_LICENSE="GPL-2.0-or-later"
 PKG_SITE=""
 PKG_URL=""
