@@ -5,7 +5,7 @@
 PKG_NAME="flex"
 PKG_VERSION="2.7.8"
 PKG_SHA256="88d80ba91c8f89251cdbef92b4cac598e87ee782a9467eff47715aeac92d6d86"
-PKG_LICENSE="BSD-3-Clause"
+PKG_LICENSE="BSD-3-Clause-flex"
 PKG_SITE="https://github.com/westes/flex"
 PKG_URL="https://github.com/westes/flex/releases/download/v${PKG_VERSION}/${PKG_NAME}-${PKG_VERSION}.tar.gz"
 PKG_DEPENDS_HOST="ccache:host m4:host autotools:host bison:host"
